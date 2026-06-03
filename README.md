@@ -197,10 +197,11 @@ cd control-plane && npm install && npm run build
 
 ## Roadmap
 
+Planned, not yet implemented:
+
 - Metrics-driven `CapacityProvider` (vLLM queue depth / KV-cache utilization).
 - Per-tenant SLO targets + attainment view.
 - Real BPE tokenizer (tiktoken / HF) behind the existing `Tokenizer` trait.
-- Pingora-based data plane for extreme connection counts.
 - CLI + Terraform provider generated from the OpenAPI spec.
 
 ## License

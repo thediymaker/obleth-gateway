@@ -1,11 +1,18 @@
 // Server-side client for the obleth Management API.
 
 const BASE = process.env.OBLETH_ADMIN_BASE_URL ?? "http://localhost:9090";
-const TOKEN = process.env.OBLETH_ADMIN_TOKEN;
-if (!TOKEN) {
-  throw new Error(
-    "OBLETH_ADMIN_TOKEN is not set. The control plane requires the management API admin token to operate.",
-  );
+
+// Resolve the admin token lazily, at request time. Validating it at module
+// scope would throw while Next.js evaluates server modules during `next build`
+// (and in any environment without the secret), breaking builds and previews.
+function adminToken(): string {
+  const token = process.env.OBLETH_ADMIN_TOKEN;
+  if (!token) {
+    throw new Error(
+      "OBLETH_ADMIN_TOKEN is not set. The control plane requires the management API admin token to operate.",
+    );
+  }
+  return token;
 }
 
 export interface Tenant {
@@ -227,7 +234,7 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}/api/v1${path}`, {
     ...init,
     headers: {
-      Authorization: `Bearer ${TOKEN}`,
+      Authorization: `Bearer ${adminToken()}`,
       "Content-Type": "application/json",
       ...(init?.headers ?? {}),
     },

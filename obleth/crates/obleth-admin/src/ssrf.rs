@@ -73,10 +73,22 @@ impl SsrfPolicy {
         let host = url.host_str().ok_or(SsrfError::NoHost)?.to_string();
         let port = url.port_or_known_default().unwrap_or(443);
 
+        // If the host is already a literal IP, classify it directly. This avoids
+        // relying on the platform resolver to normalize forms like the
+        // IPv4-mapped IPv6 address `::ffff:127.0.0.1`, whose representation after
+        // `to_socket_addrs()` differs across operating systems.
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            let ip = unmap(ip);
+            if !self.ip_allowed(ip) {
+                return Err(SsrfError::Blocked { host, ip });
+            }
+            return Ok(());
+        }
+
         let addrs: Vec<IpAddr> = (host.as_str(), port)
             .to_socket_addrs()
             .map_err(|_| SsrfError::Unresolvable(host.clone()))?
-            .map(|sa| sa.ip())
+            .map(|sa| unmap(sa.ip()))
             .collect();
         if addrs.is_empty() {
             return Err(SsrfError::Unresolvable(host));
