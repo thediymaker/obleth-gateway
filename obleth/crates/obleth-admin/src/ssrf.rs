@@ -76,8 +76,14 @@ impl SsrfPolicy {
         // If the host is already a literal IP, classify it directly. This avoids
         // relying on the platform resolver to normalize forms like the
         // IPv4-mapped IPv6 address `::ffff:127.0.0.1`, whose representation after
-        // `to_socket_addrs()` differs across operating systems.
-        if let Ok(ip) = host.parse::<IpAddr>() {
+        // `to_socket_addrs()` differs across operating systems. `host_str()`
+        // keeps the surrounding brackets on IPv6 literals, so strip them before
+        // attempting to parse.
+        let host_for_ip_parse = host
+            .strip_prefix('[')
+            .and_then(|h| h.strip_suffix(']'))
+            .unwrap_or(&host);
+        if let Ok(ip) = host_for_ip_parse.parse::<IpAddr>() {
             let ip = unmap(ip);
             if !self.ip_allowed(ip) {
                 return Err(SsrfError::Blocked { host, ip });
@@ -204,5 +210,29 @@ mod tests {
             policy.validate("http://[::ffff:127.0.0.1]:80"),
             Err(SsrfError::Blocked { .. })
         ));
+    }
+
+    #[test]
+    fn ipv6_loopback_is_blocked() {
+        let policy = SsrfPolicy::default();
+        assert!(matches!(
+            policy.validate("http://[::1]:80"),
+            Err(SsrfError::Blocked { .. })
+        ));
+    }
+
+    #[test]
+    fn ipv4_mapped_private_cannot_bypass() {
+        let policy = SsrfPolicy::default();
+        assert!(matches!(
+            policy.validate("http://[::ffff:10.1.2.3]:80"),
+            Err(SsrfError::Blocked { .. })
+        ));
+    }
+
+    #[test]
+    fn public_ipv6_literal_is_allowed() {
+        let policy = SsrfPolicy::default();
+        assert!(policy.validate("http://[2606:4700:4700::1111]:80").is_ok());
     }
 }
