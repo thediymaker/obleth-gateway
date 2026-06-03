@@ -1,0 +1,82 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/obleth-config",
+    "crates/obleth-tokenizer",
+    "crates/obleth-fairshare",
+    "crates/obleth-redis",
+    "crates/obleth-store",
+    "crates/obleth-telemetry",
+    "crates/obleth-admin",
+    "crates/obleth-proxy",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Elastic-2.0"
+repository = "https://github.com/thediymaker/obleth-gateway"
+
+[workspace.dependencies]
+# async runtime
+tokio = { version = "1", features = ["full"] }
+futures = "0.3"
+futures-util = "0.3"
+async-trait = "0.1"
+bytes = "1"
+
+# web / proxy
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+http = "1"
+
+# serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# datastores
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono"] }
+clickhouse = { version = "0.13", features = ["uuid"] }
+
+# caching
+moka = { version = "0.12", features = ["future"] }
+
+# observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+prometheus = "0.13"
+opentelemetry = "0.31"
+opentelemetry_sdk = "0.31"
+opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = "0.32"
+
+# openapi
+utoipa = { version = "4", features = ["axum_extras", "uuid", "chrono"] }
+
+# misc
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1"
+thiserror = "1"
+rand = "0.8"
+subtle = "2"
+ipnet = "2"
+aes-gcm = "0.10"
+base64 = "0.22"
+
+# internal
+obleth-config = { path = "crates/obleth-config" }
+obleth-tokenizer = { path = "crates/obleth-tokenizer" }
+obleth-fairshare = { path = "crates/obleth-fairshare" }
+obleth-redis = { path = "crates/obleth-redis" }
+obleth-store = { path = "crates/obleth-store" }
+obleth-telemetry = { path = "crates/obleth-telemetry" }
+obleth-admin = { path = "crates/obleth-admin" }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

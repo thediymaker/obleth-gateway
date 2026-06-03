@@ -1,0 +1,47 @@
+{{- if .Values.controlPlane.enabled }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ .Release.Name }}-control-plane-secret
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  DASHBOARD_USERNAME: {{ required "controlPlane.dashboardUsername is required" .Values.controlPlane.dashboardUsername | quote }}
+  DASHBOARD_PASSWORD: {{ required "controlPlane.dashboardPassword is required (set via --set or an external Secret; do not commit a real value)" .Values.controlPlane.dashboardPassword | quote }}
+  DASHBOARD_SESSION_SECRET: {{ required "controlPlane.dashboardSessionSecret is required and must be >=32 chars" .Values.controlPlane.dashboardSessionSecret | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-control-plane
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: {{ .Release.Name }}-control-plane } }
+  template:
+    metadata: { labels: { app: {{ .Release.Name }}-control-plane } }
+    spec:
+      containers:
+        - name: control-plane
+          image: {{ .Values.image.controlPlane }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - { name: OBLETH_ADMIN_BASE_URL, value: "http://{{ include "obleth.fullname" . }}:9090" }
+            - name: OBLETH_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "obleth.fullname" . }}-secret
+                  key: OBLETH_ADMIN_TOKEN
+          envFrom:
+            - secretRef:
+                name: {{ .Release.Name }}-control-plane-secret
+          ports: [{ containerPort: 3000 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: {{ .Release.Name }}-control-plane }
+spec:
+  type: ClusterIP
+  selector: { app: {{ .Release.Name }}-control-plane }
+  ports: [{ port: 3000, targetPort: 3000 }]
+{{- end }}

@@ -1,0 +1,67 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: obleth
+          POSTGRES_PASSWORD: obleth
+          POSTGRES_DB: obleth
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U obleth" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    env:
+      OBLETH_TEST_DATABASE_URL: postgres://obleth:obleth@localhost:5432/obleth
+      OBLETH_TEST_REDIS_URL: redis://localhost:6379
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: obleth
+      - name: clippy
+        working-directory: obleth
+        run: cargo clippy --workspace --all-targets
+      - name: test
+        working-directory: obleth
+        run: cargo test --workspace
+
+  benchmark-backend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: benchmark-backend
+      - working-directory: benchmark-backend
+        run: cargo build --release
+
+  control-plane:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - working-directory: control-plane
+        run: npm install --no-audit --no-fund
+      - working-directory: control-plane
+        run: npm run build

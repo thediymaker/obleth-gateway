@@ -1,0 +1,16 @@
+[package]
+name = "obleth-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+utoipa.workspace = true
+thiserror.workspace = true
+sha2 = "0.10"
+hex = "0.4"
+rand.workspace = true

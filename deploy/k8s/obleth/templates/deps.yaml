@@ -1,0 +1,119 @@
+{{- if .Values.postgres.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-postgres
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: {{ .Release.Name }}-postgres } }
+  template:
+    metadata: { labels: { app: {{ .Release.Name }}-postgres } }
+    spec:
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          env:
+            - { name: POSTGRES_USER, value: {{ .Values.postgres.user | quote }} }
+            - { name: POSTGRES_PASSWORD, value: {{ required "postgres.password is required (set via --set or an external Secret)" .Values.postgres.password | quote }} }
+            - { name: POSTGRES_DB, value: {{ .Values.postgres.db | quote }} }
+          ports: [{ containerPort: 5432 }]
+          volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
+      volumes: [{ name: data, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: {{ .Release.Name }}-postgres }
+spec:
+  selector: { app: {{ .Release.Name }}-postgres }
+  ports: [{ port: 5432, targetPort: 5432 }]
+{{- end }}
+{{- if .Values.redis.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-redis
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: {{ .Release.Name }}-redis } }
+  template:
+    metadata: { labels: { app: {{ .Release.Name }}-redis } }
+    spec:
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          args: ["redis-server", "--appendonly", "yes"]
+          ports: [{ containerPort: 6379 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: {{ .Release.Name }}-redis }
+spec:
+  selector: { app: {{ .Release.Name }}-redis }
+  ports: [{ port: 6379, targetPort: 6379 }]
+{{- end }}
+{{- if .Values.clickhouse.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-clickhouse
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: {{ .Release.Name }}-clickhouse } }
+  template:
+    metadata: { labels: { app: {{ .Release.Name }}-clickhouse } }
+    spec:
+      containers:
+        - name: clickhouse
+          image: {{ .Values.clickhouse.image }}
+          env:
+            - { name: CLICKHOUSE_USER, value: {{ .Values.clickhouse.user | quote }} }
+            - { name: CLICKHOUSE_PASSWORD, value: {{ required "clickhouse.password is required (set via --set or an external Secret)" .Values.clickhouse.password | quote }} }
+            - { name: CLICKHOUSE_DB, value: {{ .Values.clickhouse.db | quote }} }
+            - { name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT, value: "1" }
+          ports: [{ containerPort: 8123 }, { containerPort: 9000 }]
+          volumeMounts: [{ name: data, mountPath: /var/lib/clickhouse }]
+      volumes: [{ name: data, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: {{ .Release.Name }}-clickhouse }
+spec:
+  selector: { app: {{ .Release.Name }}-clickhouse }
+  ports: [{ name: http, port: 8123, targetPort: 8123 }, { name: native, port: 9000, targetPort: 9000 }]
+{{- end }}
+{{- if .Values.benchmarkBackend.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-benchmark-backend
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  selector: { matchLabels: { app: {{ .Release.Name }}-benchmark-backend } }
+  template:
+    metadata: { labels: { app: {{ .Release.Name }}-benchmark-backend } }
+    spec:
+      containers:
+        - name: benchmark-backend
+          image: {{ .Values.image.benchmarkBackend }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          env:
+            - { name: BENCHMARK_BACKEND_LISTEN, value: "0.0.0.0:8081" }
+            - { name: BENCHMARK_BACKEND_TTFT_MS, value: {{ .Values.benchmarkBackend.ttftMs | quote }} }
+            - { name: BENCHMARK_BACKEND_TOKEN_MS, value: {{ .Values.benchmarkBackend.tokenMs | quote }} }
+            - { name: BENCHMARK_BACKEND_CONCURRENCY, value: {{ .Values.benchmarkBackend.concurrency | quote }} }
+          ports: [{ containerPort: 8081 }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: {{ .Release.Name }}-benchmark-backend }
+spec:
+  selector: { app: {{ .Release.Name }}-benchmark-backend }
+  ports: [{ port: 8081, targetPort: 8081 }]
+{{- end }}

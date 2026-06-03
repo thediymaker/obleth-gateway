@@ -1,0 +1,110 @@
+image:
+  obleth: obleth/obleth:latest
+  benchmarkBackend: obleth/benchmark-backend:latest
+  controlPlane: obleth/control-plane:latest
+  pullPolicy: IfNotPresent
+
+obleth:
+  replicas: 3
+  globalMaxInFlight: 256
+  brownoutWaitMs: 500
+  failOpen: true
+  # REQUIRED. No default is shipped — supply via `--set obleth.adminToken=...`,
+  # a values override, or (preferred) an external Secret. `openssl rand -hex 32`.
+  adminToken: ""
+  # Encrypt upstream secrets at rest (model api_key, MCP auth_header). Base64 of
+  # 32 random bytes (`openssl rand -base64 32`). Empty = plaintext storage.
+  # Supply via an external Secret in production.
+  encryptionKey: ""
+  # Optional server-side pepper mixed into API-key hashes. Keep secret/stable;
+  # changing it invalidates issued keys. Supply via an external Secret.
+  apiKeyPepper: ""
+  # SSRF allowlist for admin-registered upstream URLs (comma-separated CIDRs).
+  # Empty = only public addresses allowed. Set to reach internal cluster targets,
+  # e.g. "10.0.0.0/8".
+  allowedPrivateCidrs: ""
+  upstreamBaseUrl: ""   # empty -> defaults to the in-chart benchmark fixture backend
+  # OTLP trace export endpoint (e.g. http://my-collector:4317). Empty disables.
+  otelEndpoint: ""
+  # Slack incoming-webhook alerts. Keep the webhook URL in an external Secret
+  # for production chart values.
+  slackWebhookUrl: ""
+  slackAlertMinIntervalSecs: 300
+  modelHealthEnabled: true
+  modelHealthIntervalSecs: 900
+  modelHealthTimeoutSecs: 30
+  modelHealthRetentionDays: 30
+  internalProxyBaseUrl: "http://127.0.0.1:8080"
+  resources:
+    requests: { cpu: "250m", memory: "256Mi" }
+    limits: { cpu: "2", memory: "1Gi" }
+
+hpa:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 70
+
+serviceMonitor:
+  enabled: false   # set true if the Prometheus Operator CRDs are installed
+
+# Optional Ingress (HAProxy's role in the Docker stack). Disabled by default;
+# enable and set host/className to expose the obleth proxy through a cluster LB.
+ingress:
+  enabled: false
+  className: ""
+  host: obleth.example.com
+  # Service port to route to: proxy (8080) for the data plane.
+  servicePort: 8080
+  annotations: {}
+  tls: []   # e.g. [{ secretName: obleth-tls, hosts: [obleth.example.com] }]
+
+# Bundled dependencies for a self-contained demo. In production, prefer the
+# CloudNativePG operator (Postgres), a managed/operator ClickHouse, and a real
+# Redis (the data plane treats Redis as a hot cache, so HA Redis is recommended).
+#
+# Set `enabled: false` and provide `external.url` to point obleth at an external,
+# operator-managed, or cloud endpoint instead of the bundled container.
+postgres:
+  enabled: true
+  image: postgres:16
+  user: obleth
+  # REQUIRED when postgres.enabled=true. Supply via --set or an external Secret.
+  password: ""
+  db: obleth
+  external:
+    # Full connection URL used when enabled=false, e.g.
+    # postgres://user:pass@my-pg-host:5432/obleth
+    url: ""
+
+redis:
+  enabled: true
+  image: redis:7
+  external:
+    # e.g. redis://my-redis-host:6379
+    url: ""
+
+clickhouse:
+  enabled: true
+  image: clickhouse/clickhouse-server:24.8
+  db: obleth
+  user: obleth
+  # REQUIRED when clickhouse.enabled=true. Supply via --set or an external Secret.
+  password: ""
+  external:
+    # e.g. http://my-clickhouse-host:8123
+    url: ""
+
+benchmarkBackend:
+  enabled: true
+  ttftMs: 20
+  tokenMs: 3
+  concurrency: 256
+
+controlPlane:
+  enabled: true
+  # Dashboard login. All REQUIRED (no defaults shipped) — supply via --set or an
+  # external Secret. dashboardSessionSecret MUST be at least 32 characters.
+  dashboardUsername: admin
+  dashboardPassword: ""
+  dashboardSessionSecret: ""

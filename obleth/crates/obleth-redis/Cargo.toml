@@ -1,0 +1,16 @@
+[package]
+name = "obleth-redis"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+redis.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+obleth-config.workspace = true
+tokio.workspace = true
+futures-util.workspace = true

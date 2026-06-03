@@ -1,0 +1,43 @@
+# ---- Rust ----
+**/target/
+**/*.rs.bk
+*.pdb
+
+# ---- Node / Next.js ----
+node_modules/
+.next/
+out/
+dist/
+build/
+.turbo/
+*.tsbuildinfo
+.npm
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ---- obleth runtime / bench artifacts ----
+*.wal
+/obleth-telemetry.wal
+/bench/*.log
+/bench/.keys.json
+/bench/.run-meta.json
+/bench/.fairshare-samples.jsonl
+
+# ---- internal planning (canonical plan lives in .cursor/plans) ----
+/plan.md
+
+# ---- env / secrets ----
+.env
+.env.*
+!.env.example
+
+# ---- editor / OS ----
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~

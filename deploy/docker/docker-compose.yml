@@ -1,0 +1,177 @@
+name: obleth
+
+# Modular stack. Core services (postgres, redis, clickhouse, obleth,
+# control-plane) have no profile and always start. Optional services are gated
+# behind profiles so production can strip them out:
+#   benchmark     -> GPU-free benchmark fixture backend
+#   mock          -> legacy alias for the benchmark profile
+#   edge          -> HAProxy front door (TLS/round-robin; use a real LB in prod)
+#   observability -> Prometheus + Grafana + Jaeger (OTLP traces)
+#
+# Enable extras per-command:    docker compose --profile benchmark --profile observability up
+# Or set COMPOSE_PROFILES in .env (see .env.example) to default them on for dev.
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-obleth}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/docker/.env (copy from .env.example)}
+      POSTGRES_DB: ${POSTGRES_DB:-obleth}
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-obleth}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7
+    command: ["redis-server", "--appendonly", "yes"]
+    ports: ["127.0.0.1:6379:6379"]
+    volumes: ["redisdata:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment:
+      # the image restricts the built-in `default` user to localhost; provision a
+      # network-accessible user instead.
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-obleth}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in deploy/docker/.env (copy from .env.example)}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-obleth}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports: ["127.0.0.1:8123:8123", "127.0.0.1:9000:9000"]
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes: ["chdata:/var/lib/clickhouse"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  benchmark-backend:
+    profiles: ["benchmark", "mock"]
+    build:
+      context: ../../benchmark-backend
+      dockerfile: ../deploy/docker/benchmark-backend.Dockerfile
+    environment:
+      BENCHMARK_BACKEND_LISTEN: 0.0.0.0:8081
+      BENCHMARK_BACKEND_TTFT_MS: "20"
+      BENCHMARK_BACKEND_TOKEN_MS: "3"
+      BENCHMARK_BACKEND_CONCURRENCY: "256"   # simulate a saturated cluster to exercise fairshare
+    ports: ["8081:8081"]
+    networks:
+      default:
+        aliases:
+          - mock-backend
+
+  obleth:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/obleth.Dockerfile
+    environment:
+      OBLETH_PROXY_LISTEN: 0.0.0.0:8080
+      OBLETH_ADMIN_LISTEN: 0.0.0.0:9090
+      OBLETH_METRICS_LISTEN: 0.0.0.0:9091
+      OBLETH_DATABASE_URL: postgres://${POSTGRES_USER:-obleth}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/docker/.env}@postgres:5432/${POSTGRES_DB:-obleth}
+      OBLETH_REDIS_URL: redis://redis:6379
+      OBLETH_CLICKHOUSE_URL: http://clickhouse:8123
+      OBLETH_CLICKHOUSE_DB: ${CLICKHOUSE_DB:-obleth}
+      OBLETH_CLICKHOUSE_USER: ${CLICKHOUSE_USER:-obleth}
+      OBLETH_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in deploy/docker/.env}
+      # Upstream LLM endpoint. Defaults to the benchmark fixture backend for dev/demo
+      # stack; point this at a real vLLM/Aibrix endpoint in production (and run
+      # without the `benchmark` profile).
+      OBLETH_UPSTREAM_BASE_URL: ${OBLETH_UPSTREAM_BASE_URL:-http://benchmark-backend:8081}
+      OBLETH_ADMIN_TOKEN: ${OBLETH_ADMIN_TOKEN:?set OBLETH_ADMIN_TOKEN in deploy/docker/.env (copy from .env.example)}
+      # Encrypt upstream secrets at rest (base64 of 32 bytes). Empty = plaintext.
+      OBLETH_ENCRYPTION_KEY: ${OBLETH_ENCRYPTION_KEY:-}
+      # SSRF allowlist for admin-registered upstream URLs (comma-separated CIDRs).
+      OBLETH_ALLOWED_PRIVATE_CIDRS: ${OBLETH_ALLOWED_PRIVATE_CIDRS:-}
+      # Optional server-side pepper mixed into API-key hashes.
+      OBLETH_API_KEY_PEPPER: ${OBLETH_API_KEY_PEPPER:-}
+      OBLETH_GLOBAL_MAX_IN_FLIGHT: "64"
+      OBLETH_FAIRSHARE_ALGORITHM: hierarchical
+      OBLETH_BROWNOUT_WAIT_MS: "500"
+      OBLETH_FAIL_OPEN: "true"
+      OBLETH_MODEL_HEALTH_ENABLED: ${OBLETH_MODEL_HEALTH_ENABLED:-true}
+      OBLETH_MODEL_HEALTH_INTERVAL_SECS: ${OBLETH_MODEL_HEALTH_INTERVAL_SECS:-900}
+      OBLETH_MODEL_HEALTH_TIMEOUT_SECS: ${OBLETH_MODEL_HEALTH_TIMEOUT_SECS:-30}
+      OBLETH_MODEL_HEALTH_RETENTION_DAYS: ${OBLETH_MODEL_HEALTH_RETENTION_DAYS:-30}
+      OBLETH_INTERNAL_PROXY_BASE_URL: ${OBLETH_INTERNAL_PROXY_BASE_URL:-http://127.0.0.1:8080}
+      # OTLP/HTTP trace export (base URL). Empty disables tracing; the
+      # observability profile ships a Jaeger collector on :4318.
+      OBLETH_OTEL_ENDPOINT: ${OBLETH_OTEL_ENDPOINT:-}
+      # Optional Slack incoming-webhook alerts. Keep the webhook URL secret.
+      OBLETH_SLACK_WEBHOOK_URL: ${OBLETH_SLACK_WEBHOOK_URL:-}
+      OBLETH_SLACK_ALERT_MIN_INTERVAL_SECS: ${OBLETH_SLACK_ALERT_MIN_INTERVAL_SECS:-300}
+      RUST_LOG: info,obleth=debug
+    # host 8088 -> container 8080 (8080 may be taken by other local stacks);
+    # internal networking + HAProxy still use 8080.
+    ports: ["8088:8080", "9090:9090", "9091:9091"]
+    # No hard dependency on the benchmark fixture service: the upstream is configurable, so obleth
+    # must not be coupled to the benchmark fixture. Real deps stay gated on health.
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      clickhouse: { condition: service_healthy }
+
+  control-plane:
+    build:
+      context: ../../control-plane
+      dockerfile: ../deploy/docker/control-plane.Dockerfile
+    environment:
+      OBLETH_ADMIN_BASE_URL: http://obleth:9090
+      OBLETH_ADMIN_TOKEN: ${OBLETH_ADMIN_TOKEN:?set OBLETH_ADMIN_TOKEN in deploy/docker/.env (copy from .env.example)}
+      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:?set DASHBOARD_USERNAME in deploy/docker/.env}
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD (or DASHBOARD_PASSWORD_HASH) in deploy/docker/.env}
+      DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:?set DASHBOARD_SESSION_SECRET (>=32 chars) in deploy/docker/.env}
+    ports: ["3002:3000"]
+    depends_on:
+      obleth: { condition: service_started }
+
+  haproxy:
+    profiles: ["edge"]
+    image: haproxy:2.9
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    ports: ["80:80"]
+    depends_on:
+      obleth: { condition: service_started }
+
+  prometheus:
+    profiles: ["observability"]
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    ports: ["9095:9090"]
+
+  grafana:
+    profiles: ["observability"]
+    image: grafana/grafana:latest
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    ports: ["3001:3000"]
+    depends_on:
+      prometheus: { condition: service_started }
+
+  # OTLP trace collector + UI. Set OBLETH_OTEL_ENDPOINT=http://jaeger:4317 (see
+  # .env.example) so obleth exports spans here. UI on http://localhost:16686.
+  jaeger:
+    profiles: ["observability"]
+    image: jaegertracing/all-in-one:1.60
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+    ports: ["16686:16686", "4317:4317", "4318:4318"]
+
+volumes:
+  pgdata:
+  redisdata:
+  chdata:

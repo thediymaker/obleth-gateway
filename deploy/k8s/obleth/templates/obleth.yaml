@@ -1,0 +1,124 @@
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "obleth.fullname" . }}-secret
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  OBLETH_ADMIN_TOKEN: {{ required "obleth.adminToken is required: set a strong token (via --set or an external Secret); do not commit a real value" .Values.obleth.adminToken | quote }}
+  OBLETH_DATABASE_URL: {{ include "obleth.databaseUrl" . | quote }}
+  OBLETH_SLACK_WEBHOOK_URL: {{ .Values.obleth.slackWebhookUrl | quote }}
+  OBLETH_ENCRYPTION_KEY: {{ .Values.obleth.encryptionKey | quote }}
+  OBLETH_API_KEY_PEPPER: {{ .Values.obleth.apiKeyPepper | quote }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "obleth.fullname" . }}
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.obleth.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: obleth
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: obleth
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      containers:
+        - name: obleth
+          image: {{ .Values.image.obleth }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - { name: proxy, containerPort: 8080 }
+            - { name: admin, containerPort: 9090 }
+            - { name: metrics, containerPort: 9091 }
+          env:
+            - { name: OBLETH_PROXY_LISTEN, value: "0.0.0.0:8080" }
+            - { name: OBLETH_ADMIN_LISTEN, value: "0.0.0.0:9090" }
+            - { name: OBLETH_METRICS_LISTEN, value: "0.0.0.0:9091" }
+            - { name: OBLETH_REDIS_URL, value: {{ include "obleth.redisUrl" . | quote }} }
+            - { name: OBLETH_CLICKHOUSE_URL, value: {{ include "obleth.clickhouseUrl" . | quote }} }
+            - { name: OBLETH_CLICKHOUSE_DB, value: {{ .Values.clickhouse.db | quote }} }
+            - { name: OBLETH_CLICKHOUSE_USER, value: {{ .Values.clickhouse.user | quote }} }
+            - { name: OBLETH_CLICKHOUSE_PASSWORD, value: {{ .Values.clickhouse.password | quote }} }
+            - { name: OBLETH_UPSTREAM_BASE_URL, value: {{ include "obleth.upstream" . | quote }} }
+            - { name: OBLETH_GLOBAL_MAX_IN_FLIGHT, value: {{ .Values.obleth.globalMaxInFlight | quote }} }
+            - { name: OBLETH_BROWNOUT_WAIT_MS, value: {{ .Values.obleth.brownoutWaitMs | quote }} }
+            - { name: OBLETH_FAIL_OPEN, value: {{ .Values.obleth.failOpen | quote }} }
+            - { name: OBLETH_ALLOWED_PRIVATE_CIDRS, value: {{ .Values.obleth.allowedPrivateCidrs | quote }} }
+            - { name: OBLETH_MODEL_HEALTH_ENABLED, value: {{ .Values.obleth.modelHealthEnabled | quote }} }
+            - { name: OBLETH_MODEL_HEALTH_INTERVAL_SECS, value: {{ .Values.obleth.modelHealthIntervalSecs | quote }} }
+            - { name: OBLETH_MODEL_HEALTH_TIMEOUT_SECS, value: {{ .Values.obleth.modelHealthTimeoutSecs | quote }} }
+            - { name: OBLETH_MODEL_HEALTH_RETENTION_DAYS, value: {{ .Values.obleth.modelHealthRetentionDays | quote }} }
+            - { name: OBLETH_INTERNAL_PROXY_BASE_URL, value: {{ .Values.obleth.internalProxyBaseUrl | quote }} }
+            - { name: OBLETH_OTEL_ENDPOINT, value: {{ .Values.obleth.otelEndpoint | quote }} }
+            - { name: OBLETH_SLACK_ALERT_MIN_INTERVAL_SECS, value: {{ .Values.obleth.slackAlertMinIntervalSecs | quote }} }
+            - { name: RUST_LOG, value: "info,obleth=info" }
+          envFrom:
+            - secretRef:
+                name: {{ include "obleth.fullname" . }}-secret
+          readinessProbe:
+            httpGet: { path: /health, port: proxy }
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: { path: /health, port: proxy }
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources: {{- toYaml .Values.obleth.resources | nindent 12 }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "obleth.fullname" . }}
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  selector:
+    app.kubernetes.io/name: obleth
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - { name: proxy, port: 8080, targetPort: proxy }
+    - { name: admin, port: 9090, targetPort: admin }
+    - { name: metrics, port: 9091, targetPort: metrics }
+{{- if .Values.hpa.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ include "obleth.fullname" . }}
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ include "obleth.fullname" . }}
+  minReplicas: {{ .Values.hpa.minReplicas }}
+  maxReplicas: {{ .Values.hpa.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.hpa.targetCPUUtilizationPercentage }}
+{{- end }}
+{{- if .Values.serviceMonitor.enabled }}
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "obleth.fullname" . }}
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: obleth
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  endpoints:
+    - port: metrics
+      interval: 5s
+{{- end }}

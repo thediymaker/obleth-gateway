@@ -1,0 +1,15 @@
+[package]
+name = "obleth-fairshare"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+tokio.workspace = true
+uuid.workspace = true
+obleth-config.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
