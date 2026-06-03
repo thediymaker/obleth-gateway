@@ -19,13 +19,15 @@ and graceful degradation under load.**
          whose fair share
 ```
 
-The killer feature: **real-time fairshare with priority boosts.** Give your chatbot
-key a weight boost so a flood of API or batch traffic can *never* choke it out — and
-tune it live from the dashboard or API, no restart. When the fleet saturates, obleth
-divides capacity **proportionally to tenant weight, measured in tokens**, with
-starvation-free guarantees. Built in Rust, fail-open by design.
+The core mechanism is contention-based weighted fair queuing. Each tenant has a
+weight; when aggregate demand exceeds capacity, obleth divides throughput
+proportionally to weight, measured in tokens, with starvation-free guarantees. A
+chatbot key with a higher weight retains its share under a flood of batch or API
+traffic. Weights are adjustable at runtime from the dashboard or Management API
+without a restart. The data plane is written in Rust and fails open when its
+datastores are unavailable.
 
-> **📚 Full documentation → [obleth.com](https://obleth.com)**
+> Full documentation: [obleth.com](https://obleth.com)
 
 ## Why obleth
 
@@ -33,10 +35,9 @@ Most self-hostable gateways (LiteLLM and friends) are provider-abstraction proxi
 with per-key rate limits. Under heavy load they degrade unpredictably or fall over,
 and none offer true contention-based weighted fairness for a shared GPU fleet.
 
-obleth slots in front of whatever you already run — put any load balancer ahead of
-it, point it at any OpenAI-compatible upstream behind it — and answers the one
-question those tools don't: *when there isn't enough capacity for everyone, who
-gets it?*
+obleth slots in front of whatever you already run: put any load balancer ahead of
+it, point it at any OpenAI-compatible upstream behind it. It answers the question
+those tools leave open: when there isn't enough capacity for everyone, who gets it?
 
 ## Architecture
 
@@ -60,16 +61,16 @@ flowchart LR
 ```
 
 The data plane authenticates the caller, decides admission against the weighted
-fairshare scheduler, then streams the response — reconciling the true token cost
+fairshare scheduler, then streams the response, reconciling the true token cost
 after the fact. Everything else (tenants, keys, weights, quotas, usage) lives in
 the control plane and is pushed to the data plane out of band.
 
 ### Datastores (three, by design)
-- **Postgres** — relational source of truth for config + audit (tenants, keys,
+- **Postgres**: relational source of truth for config + audit (tenants, keys,
   weights, quotas, change history). Off the hot path.
-- **Redis** — hot read-cache of resolved keys + atomic token-bucket budgets.
+- **Redis**: hot read-cache of resolved keys + atomic token-bucket budgets.
   The data plane reads only Redis.
-- **ClickHouse** — append-only usage/cost ledger, async-inserted, never blocking
+- **ClickHouse**: append-only usage/cost ledger, async-inserted, never blocking
   a request.
 
 Writes are single-sourced: **Management API → Postgres → Redis (sync + pub/sub
@@ -154,13 +155,13 @@ obleth is configured entirely through environment variables. The essentials:
 | --- | --- |
 | `OBLETH_UPSTREAM_BASE_URL` | your OpenAI-compatible provider (vLLM, Aibrix, OpenAI, …) |
 | `OBLETH_DATABASE_URL` / `OBLETH_REDIS_URL` / `OBLETH_CLICKHOUSE_URL` | the three datastores |
-| `OBLETH_ADMIN_TOKEN` | Management API bearer token (**required** — service refuses to start without it) |
+| `OBLETH_ADMIN_TOKEN` | Management API bearer token (**required**; service refuses to start without it) |
 | `OBLETH_FAIL_OPEN` | admit when Redis is down (default `true`; set `false` for strict multi-tenant) |
 
 Secrets at rest, SSRF allow-lists, brownout tuning, Slack alerts, dashboard auth,
 and the rest are documented in full at **[obleth.com](https://obleth.com)**. The
 credentials in `*.env.example`, `docker-compose.yml`, and `values.yaml` are
-**development examples only** — replace them and front the gateway with TLS before
+**development examples only**; replace them and front the gateway with TLS before
 deploying anywhere real.
 
 ## Repository layout
@@ -183,8 +184,7 @@ deploy/k8s/obleth/      Helm chart
 schema/               Postgres + ClickHouse schema
 ```
 
-Documentation lives at **[obleth.com](https://obleth.com)** (source in the separate
-[obleth-docs](https://github.com/thediymaker/obleth-docs) repository).
+Documentation lives at **[obleth.com](https://obleth.com)**.
 
 ## Development
 
