@@ -1,56 +1,68 @@
 # obleth-gateway
 
-**obleth** is a lightweight, high-performance, fairshare-first AI gateway. It sits
-between your front door (HAProxy) and your inference backend (Aibrix / vLLM) and
-owns the layer those tools deliberately don't: **multi-tenant identity,
-contention-based weighted fair queuing, token-accurate cost accounting, and
-reliability.**
+[![CI](https://github.com/thediymaker/obleth-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/thediymaker/obleth-gateway/actions/workflows/ci.yml)
+[![License: ELv2](https://img.shields.io/badge/license-ELv2-blue.svg)](LICENSE)
+[![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584.svg?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
-**Documentation:** [obleth-docs](https://github.com/thediymaker/obleth-docs) — run locally with `npm run dev` (port 3003).
+**obleth is the fair-queuing middleman between your users and your LLMs.**
 
-obleth decides *who* gets to send and at *what priority*. Aibrix decides *which
-pod* serves it. They compose; obleth does not re-implement pod routing.
+Point your clients at obleth and obleth at any OpenAI-compatible provider. It owns
+the layer load balancers and inference routers deliberately don't: **multi-tenant
+identity, contention-based weighted fair queuing, token-accurate cost accounting,
+and graceful degradation under load.**
 
-> Source-available core. The differentiator is real-time **fairshare with priority
-> boosts**: give your chatbot key a weight boost so a flood of API/batch traffic
-> can never choke it out — and adjust it live from the dashboard or API.
+```
+   clients ──▶ obleth ──▶ any OpenAI-compatible provider
+               │          (vLLM · Aibrix · OpenAI · Together · your own)
+        who gets to send,
+       at what priority, in
+         whose fair share
+```
+
+The killer feature: **real-time fairshare with priority boosts.** Give your chatbot
+key a weight boost so a flood of API or batch traffic can *never* choke it out — and
+tune it live from the dashboard or API, no restart. When the fleet saturates, obleth
+divides capacity **proportionally to tenant weight, measured in tokens**, with
+starvation-free guarantees. Built in Rust, fail-open by design.
+
+> **📚 Full documentation → [obleth.com](https://obleth.com)**
 
 ## Why obleth
 
-Existing self-hostable gateways (LiteLLM, etc.) are provider-abstraction proxies
-with per-key rate limits; under heavy load they degrade or fall over, and none
-offer true contention-based weighted fairness for a shared GPU fleet. obleth is
-built in Rust around a single idea: when the cluster is saturated, capacity is
-divided **proportionally to tenant weight**, measured in **tokens**, with
-starvation-free guarantees.
+Most self-hostable gateways (LiteLLM and friends) are provider-abstraction proxies
+with per-key rate limits. Under heavy load they degrade unpredictably or fall over,
+and none offer true contention-based weighted fairness for a shared GPU fleet.
+
+obleth slots in front of whatever you already run — put any load balancer ahead of
+it, point it at any OpenAI-compatible upstream behind it — and answers the one
+question those tools don't: *when there isn't enough capacity for everyone, who
+gets it?*
 
 ## Architecture
 
+obleth is a thin Rust data plane on the request path, plus a control plane that
+never touches the hot path.
+
 ```mermaid
 flowchart LR
-  client[Clients] --> haproxy[HAProxy: SSL + round-robin]
-  haproxy --> obleth[obleth Rust pod]
-  subgraph dataplane [obleth data plane]
-    auth[Auth: moka + Redis] --> est[Tokenize + estimate]
-    est --> admit[Fairshare admit: weighted queue + concurrency]
-    admit --> reserve[Redis Lua: reserve budget]
-    reserve --> proxy[Stream proxy]
-    proxy --> recon[Reconcile actual cost]
-    recon --> telem[Async telemetry]
+  clients[Clients] --> lb[Load balancer<br/>TLS · round-robin]
+  lb --> obleth
+
+  subgraph obleth [obleth data plane]
+    direction LR
+    authz[Authenticate] --> fair[Fairshare admit<br/>weighted token queue] --> stream[Stream proxy]
   end
-  obleth --> aibrix[Aibrix router] --> vllm[vLLM replicas]
-  obleth -. hot reads .-> redis[(Redis)]
-  telem -. batched .-> ch[(ClickHouse)]
-  telem -. fail-open .-> wal[(local WAL)]
-  subgraph control [obleth control surface]
-    api["Management API /api/v1"]
-  end
-  cp[Next.js dashboard] --> api
-  cli[CLI / Terraform] --> api
-  api -- write + audit --> pg[(Postgres)]
-  api -- sync + invalidate --> redis
-  api -- usage reads --> ch
+
+  obleth --> provider[Any OpenAI-compatible provider<br/>vLLM · Aibrix · OpenAI · …]
+
+  dash[Dashboard / API] --> control[Control plane<br/>Management API]
+  control -. config + budgets .-> obleth
 ```
+
+The data plane authenticates the caller, decides admission against the weighted
+fairshare scheduler, then streams the response — reconciling the true token cost
+after the fact. Everything else (tenants, keys, weights, quotas, usage) lives in
+the control plane and is pushed to the data plane out of band.
 
 ### Datastores (three, by design)
 - **Postgres** — relational source of truth for config + audit (tenants, keys,
@@ -134,36 +146,22 @@ Ships the obleth Deployment + HPA + Services, an optional ServiceMonitor, and
 bundled demo dependencies. For production, point at CloudNativePG, an operator-
 managed ClickHouse, and HA Redis (`postgres.enabled=false`, etc.).
 
-## Configuration (env)
+## Configuration
 
-| Variable | Default | Purpose |
-| --- | --- | --- |
-| `OBLETH_PROXY_LISTEN` | `0.0.0.0:8080` | data-plane listener |
-| `OBLETH_ADMIN_LISTEN` | `0.0.0.0:9090` | Management API listener |
-| `OBLETH_METRICS_LISTEN` | `0.0.0.0:9091` | Prometheus metrics |
-| `OBLETH_DATABASE_URL` | `postgres://obleth:obleth@127.0.0.1:5432/obleth` | config SoT |
-| `OBLETH_REDIS_URL` | `redis://127.0.0.1:6379` | hot cache + budgets |
-| `OBLETH_CLICKHOUSE_URL` | `http://127.0.0.1:8123` | usage ledger |
-| `OBLETH_UPSTREAM_BASE_URL` | `http://127.0.0.1:8081` | Aibrix/vLLM or benchmark fixture backend |
-| `OBLETH_ADMIN_TOKEN` | **required** | Management API bearer token (no default; service refuses to start if unset) |
-| `OBLETH_ENCRYPTION_KEY` | unset | base64 of 32 bytes; AES-256-GCM-encrypts upstream secrets (model `api_key`, MCP `auth_header`) at rest. Unset = plaintext storage |
-| `OBLETH_ALLOWED_PRIVATE_CIDRS` | unset | comma-separated CIDRs that admin-registered upstream URLs may resolve to. By default private/loopback/link-local (incl. cloud metadata) are blocked |
-| `OBLETH_API_KEY_PEPPER` | unset | optional server-side pepper mixed into API-key hashes; changing it invalidates issued keys |
-| `OBLETH_GLOBAL_MAX_IN_FLIGHT` | `256` | static capacity (v1) |
-| `OBLETH_BROWNOUT_WAIT_MS` | `750` | queue-wait before degradation |
-| `OBLETH_FAIL_OPEN` | `true` | If Redis is unavailable, admit requests (graceful) rather than reject. Default suits self-hosting; set `false` for multi-tenant/cloud where quota enforcement must never be bypassed |
-| `OBLETH_SLACK_WEBHOOK_URL` | unset | Slack incoming-webhook URL for gateway alerts |
-| `OBLETH_SLACK_ALERT_MIN_INTERVAL_SECS` | `300` | per-issue Slack alert cooldown |
+obleth is configured entirely through environment variables. The essentials:
 
-The dashboard (control plane) requires `DASHBOARD_USERNAME`, a password
-(`DASHBOARD_PASSWORD_HASH` bcrypt — recommended — or `DASHBOARD_PASSWORD`), and a
-`DASHBOARD_SESSION_SECRET` of at least 32 characters; it fails closed if any are
-missing. The credentials committed in `*.env.example`, `docker-compose.yml`, and
-`values.yaml` are **development examples only** — replace them before deploying,
-and front the gateway with TLS termination (HAProxy/ingress/managed LB).
+| Variable | Purpose |
+| --- | --- |
+| `OBLETH_UPSTREAM_BASE_URL` | your OpenAI-compatible provider (vLLM, Aibrix, OpenAI, …) |
+| `OBLETH_DATABASE_URL` / `OBLETH_REDIS_URL` / `OBLETH_CLICKHOUSE_URL` | the three datastores |
+| `OBLETH_ADMIN_TOKEN` | Management API bearer token (**required** — service refuses to start without it) |
+| `OBLETH_FAIL_OPEN` | admit when Redis is down (default `true`; set `false` for strict multi-tenant) |
 
-Newly minted API keys use the `sk_<random>` format. Existing keys remain valid
-because only the SHA-256 hash of the full secret is stored.
+Secrets at rest, SSRF allow-lists, brownout tuning, Slack alerts, dashboard auth,
+and the rest are documented in full at **[obleth.com](https://obleth.com)**. The
+credentials in `*.env.example`, `docker-compose.yml`, and `values.yaml` are
+**development examples only** — replace them and front the gateway with TLS before
+deploying anywhere real.
 
 ## Repository layout
 
@@ -185,7 +183,8 @@ deploy/k8s/obleth/      Helm chart
 schema/               Postgres + ClickHouse schema
 ```
 
-Documentation lives in the separate [obleth-docs](https://github.com/thediymaker/obleth-docs) repository (Nextra site).
+Documentation lives at **[obleth.com](https://obleth.com)** (source in the separate
+[obleth-docs](https://github.com/thediymaker/obleth-docs) repository).
 
 ## Development
 
