@@ -88,12 +88,62 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     };
     let mut json: serde_json::Value =
         serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
-    let model = json
+    let mut model = json
         .get("model")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown")
         .to_string();
-    let route = resolve_model(&state, &model).await;
+
+    // ---- auto model selection ----
+    // `model: "auto"` is resolved to a concrete registered model from request
+    // shape (estimated context size, required capabilities) and live load. From
+    // here on, everything downstream — admission, budgets, caching, telemetry,
+    // upstream dispatch — sees the concrete model as if the client named it.
+    let route = if model == crate::router::AUTO_MODEL_NAME {
+        let est = state.tokenizer.estimate_request(&json);
+        let max_tokens = json.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let features = crate::router::RequestFeatures::from_request(
+            &json,
+            est.input_tokens as u64,
+            max_tokens,
+        );
+        let candidates = state.model_registry.load();
+        let busyness = state
+            .fairshare
+            .snapshot()
+            .await
+            .map(|s| s.model_in_flight)
+            .unwrap_or_default();
+        let allowed = if resolved.internal {
+            None
+        } else {
+            resolved.allowed_models.as_deref()
+        };
+
+        // Derive intent tags: classifier (when enabled + resolvable) first,
+        // then cheap heuristics, then neutral capacity/cost routing.
+        let available_tags = union_candidate_tags(&candidates, allowed);
+        let desired_tags =
+            derive_desired_tags(&state, &json, est.input_tokens as u64, &available_tags).await;
+
+        match crate::router::select_model(&candidates, &features, &busyness, allowed, &desired_tags)
+        {
+            Some(chosen) => {
+                tracing::debug!(chosen = %chosen.model_name, "auto-routed request");
+                model = chosen.model_name.clone();
+                Some(chosen)
+            }
+            None => {
+                return error_json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "no model is available to satisfy the auto request",
+                );
+            }
+        }
+    } else {
+        resolve_model(&state, &model).await
+    };
+
     if requires_registered_model(&path) {
         if model == "unknown" {
             return error_json(StatusCode::BAD_REQUEST, "model is required");
@@ -143,6 +193,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                     est,
                     cached.input_tokens,
                     cached.output_tokens,
+                    0,
                     0,
                     0,
                     cached.status,
@@ -230,6 +281,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 0,
                 queue_wait_ms,
                 0,
+                0,
                 429,
                 cache_status_label,
             );
@@ -263,14 +315,14 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // ---- cumulative term budget (Phase 3): caps on lifetime/monthly/term usage ----
     let term_period = term_period_key(&resolved, chrono::Utc::now());
     if let Some(period) = &term_period {
-        match state.redis.term_usage_read(&resolved.tenant_id, period).await {
+        match state
+            .redis
+            .term_usage_read(&resolved.tenant_id, period)
+            .await
+        {
             Ok((used_tokens, used_cost)) => {
-                let token_exhausted = resolved
-                    .budget_tokens
-                    .is_some_and(|cap| used_tokens >= cap);
-                let cost_exhausted = resolved
-                    .budget_cost_usd
-                    .is_some_and(|cap| used_cost >= cap);
+                let token_exhausted = resolved.budget_tokens.is_some_and(|cap| used_tokens >= cap);
+                let cost_exhausted = resolved.budget_cost_usd.is_some_and(|cap| used_cost >= cap);
                 if token_exhausted || cost_exhausted {
                     drop(permit);
                     state.alerts.issue(
@@ -292,6 +344,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                         0,
                         0,
                         queue_wait_ms,
+                        0,
                         0,
                         403,
                         cache_status_label,
@@ -364,6 +417,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 0,
                 0,
                 queue_wait_ms,
+                0,
                 0,
                 502,
                 cache_status_label,
@@ -538,6 +592,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             output_tokens,
             queue_wait_ms,
             ttft_ms,
+            total_ms,
             status_code,
             cache_status_label,
         );
@@ -575,6 +630,100 @@ pub(crate) async fn resolve_key(state: &AppState, hash: &str) -> Option<Resolved
             );
             None
         }
+    }
+}
+
+/// Union of routing tags across the candidates the request may actually use.
+/// Restricting the classifier to achievable tags keeps it honest and cheap.
+fn union_candidate_tags(
+    candidates: &[crate::router::Candidate],
+    allowed_models: Option<&[String]>,
+) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for c in candidates {
+        if let Some(allowed) = allowed_models {
+            if !allowed.iter().any(|m| m == &c.model.model_name) {
+                continue;
+            }
+        }
+        for t in &c.model.tags {
+            if !out.contains(t) {
+                out.push(t.clone());
+            }
+        }
+    }
+    out
+}
+
+/// Intent tags for an `auto` request. Tries the classifier brain first (when
+/// enabled, configured, resolvable, and not itself `auto`), then falls back to
+/// cheap heuristics. Either may return empty, which routes on capacity/cost.
+async fn derive_desired_tags(
+    state: &AppState,
+    json: &serde_json::Value,
+    est_input_tokens: u64,
+    available_tags: &[String],
+) -> Vec<String> {
+    let settings = state.classifier.settings();
+    if settings.classifier_active() && !available_tags.is_empty() {
+        if let Some(name) = settings.classifier_model.as_deref() {
+            if name != crate::router::AUTO_MODEL_NAME {
+                if let Some(brain) = resolve_model(state, name).await {
+                    let prompt = classifier_prompt(json);
+                    if !prompt.trim().is_empty() {
+                        let tags = state
+                            .classifier
+                            .classify(&state.http, &brain, &prompt, available_tags)
+                            .await;
+                        if !tags.is_empty() {
+                            return tags;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    // Heuristic fallback (also used when the classifier is off or returns empty).
+    crate::router::heuristic_tags(json, est_input_tokens)
+}
+
+/// Build a compact prompt for the classifier: the system message (if any) plus
+/// the first user message's text.
+fn classifier_prompt(json: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
+        let mut have_user = false;
+        for msg in messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            let text = message_text(msg.get("content"));
+            if role == "system" && !text.is_empty() {
+                parts.push(text);
+            } else if role == "user" && !have_user && !text.is_empty() {
+                parts.push(text);
+                have_user = true;
+            }
+            if have_user {
+                break;
+            }
+        }
+    }
+    parts.join("\n")
+}
+
+fn message_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(parts)) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                    out.push_str(t);
+                    out.push('\n');
+                }
+            }
+            out
+        }
+        _ => String::new(),
     }
 }
 
@@ -652,10 +801,7 @@ fn tenant_active_now(
 /// `monthly` budgets roll over at each calendar month (in the tenant timezone),
 /// `term` budgets reset whenever `budget_started_at` changes, and `lifetime`
 /// budgets never reset.
-fn term_period_key(
-    resolved: &ResolvedKey,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Option<String> {
+fn term_period_key(resolved: &ResolvedKey, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
     if resolved.budget_tokens.is_none() && resolved.budget_cost_usd.is_none() {
         return None;
     }
@@ -688,12 +834,7 @@ fn term_period_key(
 
 /// Emit warning/exhaustion alerts when a tenant crosses 80% / 100% of either
 /// cumulative budget cap. Cooldown dedup lives in `SlackAlerts`.
-fn maybe_alert_budget(
-    state: &AppState,
-    resolved: &ResolvedKey,
-    used_tokens: i64,
-    used_cost: f64,
-) {
+fn maybe_alert_budget(state: &AppState, resolved: &ResolvedKey, used_tokens: i64, used_cost: f64) {
     let token_pct = resolved
         .budget_tokens
         .filter(|c| *c > 0)
@@ -861,6 +1002,7 @@ fn finalize(
     output_tokens: u32,
     queue_wait_ms: u32,
     ttft_ms: u32,
+    total_ms: u32,
     status_code: u16,
     cache_status: &str,
 ) {
@@ -885,7 +1027,7 @@ fn finalize(
         estimated_tokens: est.total(),
         queue_wait_ms,
         ttft_ms,
-        total_ms: 0,
+        total_ms,
         status_code,
         cache_status: cache_status.to_string(),
         ts_ms: now_ms(),
@@ -1050,4 +1192,3 @@ mod tests {
         assert!(tenant_active_now(&key, now).is_ok());
     }
 }
-

@@ -65,6 +65,11 @@ pub struct FairshareSnapshot {
     pub global_queued: usize,
     pub groups: Vec<GroupFairshare>,
     pub tenants: Vec<TenantFairshare>,
+    /// Live in-flight request count per model name. Used by the `auto` router
+    /// to prefer models with spare capacity. Only includes models that
+    /// currently have at least one in-flight request.
+    #[serde(default)]
+    pub model_in_flight: HashMap<String, usize>,
 }
 
 /// Context passed to the scheduler for a single admission attempt.
@@ -602,6 +607,7 @@ impl Scheduler {
             global_queued: self.backlog(),
             groups,
             tenants,
+            model_in_flight: self.model_in_flight.clone(),
         }
     }
 

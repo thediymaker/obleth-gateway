@@ -62,6 +62,23 @@ pub struct UsageModelAgg {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    /// Generation throughput in output tokens/sec, measured over decode time
+    /// (total latency minus time-to-first-token) for completed streamed responses.
+    pub gen_tokens_per_sec: f64,
+    /// Average time-to-first-token in milliseconds.
+    pub avg_ttft_ms: f64,
+    /// Average end-to-end latency in milliseconds.
+    pub avg_total_ms: f64,
+    /// Median (p50) time-to-first-token in milliseconds.
+    pub p50_ttft_ms: f64,
+    /// Median (p50) end-to-end latency in milliseconds.
+    pub p50_total_ms: f64,
+    /// Average prompt (input) tokens per request.
+    pub avg_prompt_tokens: f64,
+    /// Average generated (output) tokens per request.
+    pub avg_gen_tokens: f64,
+    /// Distinct API keys (users) that hit this model in the window.
+    pub users: u64,
 }
 
 /// Time-bucketed usage for charts.
@@ -170,7 +187,17 @@ pub async fn query_usage_by_model(
     let mut sql = String::from(
         "select model, count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
-         sum(input_tokens) + sum(output_tokens) as total_tok \
+         sum(input_tokens) + sum(output_tokens) as total_tok, \
+         round(if(sumIf(total_ms - ttft_ms, total_ms > ttft_ms and output_tokens > 0) > 0, \
+         sumIf(output_tokens, total_ms > ttft_ms and output_tokens > 0) / \
+         (sumIf(total_ms - ttft_ms, total_ms > ttft_ms and output_tokens > 0) / 1000), 0), 2) as gen_tps, \
+         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft, \
+         round(if(countIf(total_ms > 0) > 0, avgIf(total_ms, total_ms > 0), 0), 1) as avg_total, \
+         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft, \
+         round(if(countIf(total_ms > 0) > 0, quantileIf(0.5)(total_ms, total_ms > 0), 0), 1) as p50_total, \
+         round(avg(input_tokens), 1) as avg_prompt, \
+         round(avg(output_tokens), 1) as avg_gen, \
+         uniq(key_id) as users \
          from usage where ts_ms >= ?",
     );
     if q.tenant_id.is_some() {

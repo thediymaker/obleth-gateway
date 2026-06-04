@@ -234,6 +234,10 @@ pub struct ModelRoute {
     pub cache_enabled: bool,
     /// Time-to-live for cached responses, in seconds.
     pub cache_ttl_secs: i64,
+    /// Routing tags from the fixed [`MODEL_TAGS`] vocabulary. The `auto` router
+    /// prefers models whose tags match the request's classified intent.
+    #[serde(default)]
+    pub tags: Vec<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -299,6 +303,22 @@ pub struct ResolvedModel {
     pub input_cost_per_token: f64,
     #[serde(default)]
     pub output_cost_per_token: f64,
+    /// Maximum context window in tokens. Used by the `auto` router to filter
+    /// out models that cannot fit the request. `#[serde(default)]` keeps older
+    /// cached payloads (without this field) deserializable.
+    #[serde(default)]
+    pub context_window: i64,
+    #[serde(default)]
+    pub supports_function_calling: bool,
+    #[serde(default)]
+    pub supports_system_messages: bool,
+    #[serde(default)]
+    pub supports_response_schema: bool,
+    #[serde(default)]
+    pub supports_tool_choice: bool,
+    /// Routing tags from the fixed [`MODEL_TAGS`] vocabulary.
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// A registered MCP (Model Context Protocol) server. obleth fronts it with the
@@ -439,5 +459,88 @@ impl AlertSettings {
         self.email
             .as_ref()
             .is_some_and(|e| !e.smtp_host.trim().is_empty() && !e.recipients.is_empty())
+    }
+}
+
+/// Fixed vocabulary of model routing tags. Operators tag each model with a
+/// subset of these; the `auto` router's classifier maps a request to the
+/// best-matching tags and selection prefers models carrying them.
+pub const MODEL_TAGS: &[&str] = &[
+    "coding",
+    "general",
+    "reasoning",
+    "math",
+    "vision",
+    "long-context",
+    "fast",
+    "creative",
+];
+
+/// True when `tag` is part of the fixed [`MODEL_TAGS`] vocabulary.
+pub fn is_valid_tag(tag: &str) -> bool {
+    MODEL_TAGS.contains(&tag)
+}
+
+/// Normalize an arbitrary list of tag strings to the canonical form used in
+/// storage and matching: trimmed, lowercased, restricted to the known
+/// vocabulary, de-duplicated, and order-stable by first appearance.
+pub fn normalize_tags<I, S>(tags: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<String> = Vec::new();
+    for tag in tags {
+        let t = tag.as_ref().trim().to_ascii_lowercase();
+        if is_valid_tag(&t) && !out.contains(&t) {
+            out.push(t);
+        }
+    }
+    out
+}
+
+/// Runtime-editable configuration for the `auto` router's intent classifier.
+/// Persisted in `app_settings` under the `auto_router` key so it is editable
+/// from the control plane without a restart; seeded from environment on boot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AutoRouterSettings {
+    /// When true, an `auto` request is first sent to the classifier model to
+    /// derive intent tags. When false (or unavailable) the router falls back to
+    /// cheap heuristics, then capacity/cost scoring.
+    #[serde(default)]
+    pub classifier_enabled: bool,
+    /// `model_name` of the registered model used as the classifier "brain"
+    /// (e.g. a sub-1B model). `None` disables the model call regardless of
+    /// `classifier_enabled`.
+    #[serde(default)]
+    pub classifier_model: Option<String>,
+    /// Hard timeout for the classifier call. On timeout the router falls back
+    /// to heuristics so an `auto` request is never blocked on the brain.
+    #[serde(default = "default_classifier_timeout_ms")]
+    pub classifier_timeout_ms: u64,
+}
+
+fn default_classifier_timeout_ms() -> u64 {
+    250
+}
+
+impl Default for AutoRouterSettings {
+    fn default() -> Self {
+        AutoRouterSettings {
+            classifier_enabled: false,
+            classifier_model: None,
+            classifier_timeout_ms: default_classifier_timeout_ms(),
+        }
+    }
+}
+
+impl AutoRouterSettings {
+    /// True when the classifier is both enabled and points at a model.
+    pub fn classifier_active(&self) -> bool {
+        self.classifier_enabled
+            && self
+                .classifier_model
+                .as_ref()
+                .is_some_and(|m| !m.trim().is_empty())
     }
 }

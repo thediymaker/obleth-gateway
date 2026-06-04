@@ -213,11 +213,7 @@ impl RedisStore {
 
     /// Read a tenant's cumulative term usage `(tokens, cost_usd)`, rolling the
     /// period counters if `period_key` no longer matches the stored term.
-    pub async fn term_usage_read(
-        &self,
-        tenant: &Uuid,
-        period_key: &str,
-    ) -> Result<(i64, f64)> {
+    pub async fn term_usage_read(&self, tenant: &Uuid, period_key: &str) -> Result<(i64, f64)> {
         let mut conn = self.conn.clone();
         let (tokens, cost): (i64, String) = redis::Script::new(scripts::TERM_USAGE_READ)
             .key(Self::term_usage_key(tenant))

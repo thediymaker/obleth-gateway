@@ -78,6 +78,7 @@ export interface ModelRoute {
   enabled: boolean;
   cache_enabled: boolean;
   cache_ttl_secs: number;
+  tags: string[];
   created_at: string;
   updated_at: string;
 }
@@ -172,6 +173,14 @@ export interface UsageModelAgg {
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
+  gen_tokens_per_sec: number;
+  avg_ttft_ms: number;
+  avg_total_ms: number;
+  p50_ttft_ms: number;
+  p50_total_ms: number;
+  avg_prompt_tokens: number;
+  avg_gen_tokens: number;
+  users: number;
 }
 
 export interface UsageTimePoint {
@@ -281,6 +290,19 @@ export interface UpdateAlertSettings {
   clear_slack_webhook?: boolean;
   min_interval_secs?: number;
   email?: UpdateEmailSettings | null;
+}
+
+export interface AutoRouterSettingsView {
+  classifier_enabled: boolean;
+  classifier_model: string | null;
+  classifier_timeout_ms: number;
+  available_tags: string[];
+}
+
+export interface UpdateAutoRouterSettings {
+  classifier_enabled?: boolean;
+  classifier_model?: string | null;
+  classifier_timeout_ms?: number;
 }
 
 export interface ChannelResult {
@@ -477,4 +499,10 @@ export const obleth = {
       body: JSON.stringify(body),
     }),
   testAlert: () => api<TestAlertResult>("/settings/alerts/test", { method: "POST" }),
+  getAutoRouterSettings: () => api<AutoRouterSettingsView>("/settings/auto-router"),
+  setAutoRouterSettings: (body: UpdateAutoRouterSettings) =>
+    api<AutoRouterSettingsView>("/settings/auto-router", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
 };

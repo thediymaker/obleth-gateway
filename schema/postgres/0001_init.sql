@@ -144,6 +144,10 @@ create table if not exists models (
 
 create index if not exists models_enabled_idx on models (enabled) where enabled = true;
 
+-- Routing tags for the `auto` router (fixed vocabulary, stored as a JSON array
+-- so adding tags needs no migration). Added via if-not-exists for upgrades.
+alter table models add column if not exists tags jsonb not null default '[]'::jsonb;
+
 create index if not exists models_health_due_idx
     on models (health_next_check_at)
     where enabled = true and health_checks_enabled = true;

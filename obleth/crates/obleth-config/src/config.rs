@@ -61,6 +61,12 @@ pub struct Config {
 
     /// Optional Slack incoming-webhook alert delivery.
     pub slack_alerts: SlackAlertConfig,
+
+    /// Boot-time defaults for the `auto` router's intent classifier. Persisted
+    /// settings in Postgres override these once an operator saves them.
+    pub auto_classifier_enabled: bool,
+    pub auto_classifier_model: Option<String>,
+    pub auto_classifier_timeout_ms: u64,
 }
 
 /// Slack alerting configuration. The webhook URL is intentionally redacted from
@@ -129,6 +135,11 @@ impl Config {
                     300,
                 )),
             },
+            auto_classifier_enabled: parse_or("OBLETH_AUTO_CLASSIFIER_ENABLED", false),
+            auto_classifier_model: env::var("OBLETH_AUTO_CLASSIFIER_MODEL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            auto_classifier_timeout_ms: parse_or("OBLETH_AUTO_CLASSIFIER_TIMEOUT_MS", 250),
         }
     }
 }

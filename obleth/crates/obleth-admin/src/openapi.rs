@@ -5,13 +5,12 @@ use utoipa::OpenApi;
 use crate::model_health::{BulkModelHealthResult, UpdateModelHealthConfig};
 use crate::usage::UsageAgg;
 use crate::{
+    AlertSettingsView, EmailSettingsView, TestAlertResult, UpdateAlertSettings, UpdateEmailSettings,
+};
+use crate::{
     CapacityView, CreateKey, CreateTenant, CreatedKey, SetCapacity, SetDisabled,
     SetTenantAllowlist, SetTenantBudget, SetTenantSchedule, SetTenantStatus, UpdateQuota,
     UpdateTenant, UpdateWeight,
-};
-use crate::{
-    AlertSettingsView, EmailSettingsView, TestAlertResult, UpdateAlertSettings,
-    UpdateEmailSettings,
 };
 use obleth_config::{
     ApiKey, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, Tenant, WeeklyWindow,

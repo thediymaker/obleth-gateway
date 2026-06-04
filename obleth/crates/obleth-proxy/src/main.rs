@@ -7,7 +7,10 @@
 mod mcp;
 mod metrics;
 mod proxy;
+mod router;
 mod state;
+
+mod classifier;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -88,9 +91,28 @@ async fn main() -> anyhow::Result<()> {
         .max_capacity(10_000)
         .build();
 
+    let model_registry = router::ModelRegistry::new();
+
     let http = reqwest::Client::builder()
         .pool_max_idle_per_host(256)
         .build()?;
+
+    // Auto-router classifier settings live in Postgres (app_settings,
+    // key='auto_router') and are hot-reloadable. On boot, prefer saved settings;
+    // otherwise seed from env so existing deployments work until configured.
+    let initial_router_settings = match store.get_auto_router_settings().await {
+        Ok(Some(settings)) => settings,
+        Ok(None) => obleth_config::AutoRouterSettings {
+            classifier_enabled: cfg.auto_classifier_enabled,
+            classifier_model: cfg.auto_classifier_model.clone(),
+            classifier_timeout_ms: cfg.auto_classifier_timeout_ms,
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load auto-router settings; using defaults");
+            obleth_config::AutoRouterSettings::default()
+        }
+    };
+    let classifier = classifier::Classifier::new(initial_router_settings);
 
     // Alert settings are persisted in Postgres (app_settings, key='alerts') and
     // hot-reloadable at runtime. On boot, prefer the saved settings; otherwise
@@ -123,6 +145,8 @@ async fn main() -> anyhow::Result<()> {
         key_cache: key_cache.clone(),
         model_cache: model_cache.clone(),
         mcp_cache: mcp_cache.clone(),
+        model_registry: model_registry.clone(),
+        classifier: classifier.clone(),
         metrics: metrics.clone(),
         fail_open: cfg.fail_open,
         alerts: alerts.clone(),
@@ -137,9 +161,14 @@ async fn main() -> anyhow::Result<()> {
                 model_cache.insert(name.clone(), resolved.clone()).await;
             }
             tracing::info!(count = models.len(), "warmed model cache");
+            model_registry.store(build_candidates(&store, models).await);
         }
         Err(e) => tracing::warn!(error = %e, "failed to load models for warming"),
     }
+
+    // Keep the `auto`-router candidate list fresh: model edits, enable/disable,
+    // and health/maintenance transitions are all reflected within one interval.
+    spawn_model_registry_refresh(store.clone(), model_registry.clone(), classifier.clone());
 
     match store.all_resolved_mcp_servers().await {
         Ok(servers) => {
@@ -248,6 +277,67 @@ async fn metrics_handler(
         )],
         state.metrics.encode(),
     )
+}
+
+/// Build the `auto`-router candidate list from the registered models plus the
+/// latest health/maintenance state. A model is a candidate when enabled; it is
+/// marked unhealthy when its health check reports `unhealthy` or it is inside a
+/// maintenance window. Models without a health summary are treated as healthy.
+async fn build_candidates(
+    store: &Store,
+    models: Vec<(String, obleth_config::ResolvedModel)>,
+) -> Vec<router::Candidate> {
+    let now = chrono::Utc::now();
+    let health = store
+        .list_model_health_summaries()
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to load model health for auto router");
+            Vec::new()
+        });
+    let health_by_name: std::collections::HashMap<String, &obleth_config::ModelHealthSummary> =
+        health.iter().map(|h| (h.model_name.clone(), h)).collect();
+
+    models
+        .into_iter()
+        .map(|(name, model)| {
+            let healthy = match health_by_name.get(&name) {
+                Some(h) => {
+                    h.status != "unhealthy" && h.maintenance_until.map(|m| m <= now).unwrap_or(true)
+                }
+                None => true,
+            };
+            router::Candidate { model, healthy }
+        })
+        .collect()
+}
+
+/// Periodically rebuild the `auto`-router candidate list so enable/disable,
+/// metadata edits, and health/maintenance transitions take effect without a
+/// restart. Also refreshes the classifier settings (saved from the control
+/// plane) so they propagate within one interval. Runs every 15s; failures are
+/// logged and retried next tick.
+fn spawn_model_registry_refresh(
+    store: Store,
+    registry: router::ModelRegistry,
+    classifier: classifier::Classifier,
+) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(15));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            match store.all_resolved_models().await {
+                Ok(models) => registry.store(build_candidates(&store, models).await),
+                Err(e) => tracing::warn!(error = %e, "auto-router model refresh failed"),
+            }
+            match store.get_auto_router_settings().await {
+                Ok(Some(settings)) => classifier.update(settings),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "auto-router settings refresh failed"),
+            }
+        }
+    });
 }
 
 fn spawn_invalidation_listener(

@@ -6,8 +6,8 @@
 //! ClickHouse. The Next.js dashboard and any CLI/Terraform consume these exact
 //! endpoints.
 
-mod error;
 pub mod alerts;
+mod error;
 pub mod model_health;
 mod openapi;
 pub mod ssrf;
@@ -25,7 +25,7 @@ use obleth_config::{
     hash_api_key, ApiKey, FairshareGroup, McpServer, ModelRoute, ResolvedKey, ResolvedMcpServer,
     ResolvedModel, Tenant,
 };
-use obleth_config::{AlertSettings, EmailSettings};
+use obleth_config::{AlertSettings, AutoRouterSettings, EmailSettings};
 use obleth_fairshare::{FairShare, StaticCapacity, Stats};
 use obleth_redis::RedisStore;
 use obleth_store::{AuditEntry, Store};
@@ -34,8 +34,8 @@ use subtle::ConstantTimeEq;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-pub use error::AdminError;
 pub use alerts::AlertDispatcher;
+pub use error::AdminError;
 pub use model_health::{AlertSink, ModelHealthRuntime};
 pub use openapi::ApiDoc;
 
@@ -74,7 +74,10 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/tenants/:id/status", patch(patch_tenant_status))
         .route("/api/v1/tenants/:id/schedule", patch(patch_tenant_schedule))
         .route("/api/v1/tenants/:id/budget", patch(patch_tenant_budget))
-        .route("/api/v1/tenants/:id/allowlist", patch(patch_tenant_allowlist))
+        .route(
+            "/api/v1/tenants/:id/allowlist",
+            patch(patch_tenant_allowlist),
+        )
         .route("/api/v1/tenants/:id/weight", patch(patch_weight))
         .route("/api/v1/tenants/:id/quota", put(put_quota))
         .route("/api/v1/tenants/:id/keys", post(create_key))
@@ -140,6 +143,10 @@ pub fn router(state: AdminState) -> Router {
             get(get_alert_settings).put(put_alert_settings),
         )
         .route("/api/v1/settings/alerts/test", post(test_alert_settings))
+        .route(
+            "/api/v1/settings/auto-router",
+            get(get_auto_router_settings).put(put_auto_router_settings),
+        )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_admin,
@@ -346,6 +353,8 @@ pub struct CreateModel {
     pub supports_system_messages: Option<bool>,
     pub supports_response_schema: Option<bool>,
     pub supports_tool_choice: Option<bool>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -364,6 +373,8 @@ pub struct UpdateModel {
     pub supports_response_schema: Option<bool>,
     pub supports_tool_choice: Option<bool>,
     pub enabled: Option<bool>,
+    #[serde(default)]
+    pub tags: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -625,8 +636,7 @@ async fn patch_tenant_budget(
     }
     // Default the term start to now when a cap is set without an explicit start.
     let started_at = body.budget_started_at.or_else(|| {
-        (body.budget_tokens.is_some() || body.budget_cost_usd.is_some())
-            .then(chrono::Utc::now)
+        (body.budget_tokens.is_some() || body.budget_cost_usd.is_some()).then(chrono::Utc::now)
     });
     let tenant = state
         .store
@@ -780,9 +790,7 @@ fn default_true_bool() -> bool {
     get, path = "/api/v1/settings/alerts", tag = "settings",
     responses((status = 200, body = AlertSettingsView))
 )]
-async fn get_alert_settings(
-    State(state): State<AdminState>,
-) -> Result<Json<AlertSettingsView>> {
+async fn get_alert_settings(State(state): State<AdminState>) -> Result<Json<AlertSettingsView>> {
     let settings = state.store.get_alert_settings().await?.unwrap_or_default();
     Ok(Json(AlertSettingsView::from_settings(&settings)))
 }
@@ -827,7 +835,10 @@ async fn put_alert_settings(
             Some(EmailSettings {
                 smtp_host: upd.smtp_host.trim().to_string(),
                 smtp_port: upd.smtp_port,
-                username: upd.username.map(|u| u.trim().to_string()).filter(|u| !u.is_empty()),
+                username: upd
+                    .username
+                    .map(|u| u.trim().to_string())
+                    .filter(|u| !u.is_empty()),
                 password,
                 from_address: upd.from_address.trim().to_string(),
                 recipients: upd
@@ -866,6 +877,108 @@ async fn put_alert_settings(
     Ok(Json(AlertSettingsView::from_settings(&settings)))
 }
 
+// ---- auto router settings ----
+
+/// View of the persisted `auto` router classifier settings.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AutoRouterSettingsView {
+    pub classifier_enabled: bool,
+    pub classifier_model: Option<String>,
+    pub classifier_timeout_ms: u64,
+    /// The fixed tag vocabulary, surfaced so the UI can render tag pickers.
+    pub available_tags: Vec<String>,
+}
+
+impl AutoRouterSettingsView {
+    fn from_settings(s: &AutoRouterSettings) -> Self {
+        AutoRouterSettingsView {
+            classifier_enabled: s.classifier_enabled,
+            classifier_model: s.classifier_model.clone(),
+            classifier_timeout_ms: s.classifier_timeout_ms,
+            available_tags: obleth_config::MODEL_TAGS
+                .iter()
+                .map(|t| t.to_string())
+                .collect(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateAutoRouterSettings {
+    #[serde(default)]
+    pub classifier_enabled: Option<bool>,
+    /// `model_name` of the classifier brain. Empty string clears it.
+    #[serde(default)]
+    pub classifier_model: Option<String>,
+    #[serde(default)]
+    pub classifier_timeout_ms: Option<u64>,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/settings/auto-router", tag = "settings",
+    responses((status = 200, body = AutoRouterSettingsView))
+)]
+async fn get_auto_router_settings(
+    State(state): State<AdminState>,
+) -> Result<Json<AutoRouterSettingsView>> {
+    let settings = state
+        .store
+        .get_auto_router_settings()
+        .await?
+        .unwrap_or_default();
+    Ok(Json(AutoRouterSettingsView::from_settings(&settings)))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/settings/auto-router", tag = "settings",
+    request_body = UpdateAutoRouterSettings,
+    responses((status = 200, body = AutoRouterSettingsView))
+)]
+async fn put_auto_router_settings(
+    State(state): State<AdminState>,
+    Json(body): Json<UpdateAutoRouterSettings>,
+) -> Result<Json<AutoRouterSettingsView>> {
+    let existing = state
+        .store
+        .get_auto_router_settings()
+        .await?
+        .unwrap_or_default();
+
+    let classifier_model = match body.classifier_model.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.classifier_model.clone(),
+    };
+
+    let settings = AutoRouterSettings {
+        classifier_enabled: body
+            .classifier_enabled
+            .unwrap_or(existing.classifier_enabled),
+        classifier_model,
+        classifier_timeout_ms: body
+            .classifier_timeout_ms
+            .filter(|ms| *ms > 0)
+            .unwrap_or(existing.classifier_timeout_ms),
+    };
+
+    state.store.put_auto_router_settings(&settings).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "set_auto_router_settings",
+            "settings",
+            "auto_router",
+            serde_json::json!({
+                "classifier_enabled": settings.classifier_enabled,
+                "classifier_model": settings.classifier_model,
+                "classifier_timeout_ms": settings.classifier_timeout_ms,
+            }),
+        )
+        .await?;
+    Ok(Json(AutoRouterSettingsView::from_settings(&settings)))
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TestAlertResult {
     pub results: Vec<alerts::ChannelResult>,
@@ -875,9 +988,7 @@ pub struct TestAlertResult {
     post, path = "/api/v1/settings/alerts/test", tag = "settings",
     responses((status = 200, body = TestAlertResult))
 )]
-async fn test_alert_settings(
-    State(state): State<AdminState>,
-) -> Result<Json<TestAlertResult>> {
+async fn test_alert_settings(State(state): State<AdminState>) -> Result<Json<TestAlertResult>> {
     if !state.alerts.enabled() {
         return Err(AdminError::BadRequest(
             "no alert channels are configured".into(),
@@ -1284,6 +1395,7 @@ async fn create_model(
             body.supports_system_messages.unwrap_or(true),
             body.supports_response_schema.unwrap_or(false),
             body.supports_tool_choice.unwrap_or(false),
+            &body.tags.clone().unwrap_or_default(),
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -1359,6 +1471,7 @@ async fn update_model(
             body.supports_tool_choice
                 .unwrap_or(existing.supports_tool_choice),
             body.enabled.unwrap_or(existing.enabled),
+            &body.tags.clone().unwrap_or_else(|| existing.tags.clone()),
         )
         .await?;
     sync_model(&state, &model).await?;
@@ -1622,6 +1735,12 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         cache_ttl_secs: model.cache_ttl_secs,
         input_cost_per_token: model.input_cost_per_token,
         output_cost_per_token: model.output_cost_per_token,
+        context_window: model.context_window,
+        supports_function_calling: model.supports_function_calling,
+        supports_system_messages: model.supports_system_messages,
+        supports_response_schema: model.supports_response_schema,
+        supports_tool_choice: model.supports_tool_choice,
+        tags: model.tags.clone(),
     };
     if model.enabled {
         state

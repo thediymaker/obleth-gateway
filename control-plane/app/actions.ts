@@ -2,7 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { obleth, OblethApiError } from "@/lib/obleth";
-import type { UpdateAlertSettings } from "@/lib/obleth";
+import type { UpdateAlertSettings, UpdateAutoRouterSettings } from "@/lib/obleth";
 import { requireSession } from "@/lib/auth/session";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
@@ -227,6 +227,7 @@ export async function createModelAction(formData: FormData): Promise<ActionResul
       supports_system_messages: formData.get("supports_system_messages") === "on",
       supports_response_schema: formData.get("supports_response_schema") === "on",
       supports_tool_choice: formData.get("supports_tool_choice") === "on",
+      tags: tagsFromForm(formData),
     });
   } catch (e) {
     return actionError(e);
@@ -280,6 +281,7 @@ export async function updateModelAction(formData: FormData) {
     supports_response_schema: formData.get("supports_response_schema") === "on",
     supports_tool_choice: formData.get("supports_tool_choice") === "on",
     enabled: formData.get("enabled") === "on",
+    tags: tagsFromForm(formData),
   });
   revalidatePath("/models");
   revalidatePath("/fairshare");
@@ -357,6 +359,19 @@ export async function setAlertSettingsAction(
   return { ok: true };
 }
 
+export async function setAutoRouterSettingsAction(
+  body: UpdateAutoRouterSettings,
+): Promise<ActionResult> {
+  await requireSession();
+  try {
+    await obleth.setAutoRouterSettings(body);
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/settings");
+  return { ok: true };
+}
+
 export async function testAlertAction(): Promise<
   ActionResult & { results?: { channel: string; ok: boolean; detail: string }[] }
 > {
@@ -388,6 +403,18 @@ function numOr(v: FormDataEntryValue | null, fallback: number): number {
   if (v == null || v === "") return fallback;
   const n = Number(v);
   return Number.isFinite(n) ? n : fallback;
+}
+
+// Collects checked tag checkboxes (named `tag_<name>`) from a model form into
+// an array of tag names, e.g. { tag_coding: "on" } -> ["coding"].
+function tagsFromForm(formData: FormData): string[] {
+  const tags: string[] = [];
+  for (const [key, value] of formData.entries()) {
+    if (key.startsWith("tag_") && value === "on") {
+      tags.push(key.slice("tag_".length));
+    }
+  }
+  return tags;
 }
 
 function strOrNull(v: FormDataEntryValue | null): string | undefined {

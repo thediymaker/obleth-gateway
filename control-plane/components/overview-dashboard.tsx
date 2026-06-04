@@ -718,7 +718,7 @@ function ModelPanel({ rows }: { rows: ModelDisplayRow[] }) {
                 <UsageButton
                   key={row.model}
                   label={row.model}
-                  detail={`in ${formatCompact(row.inputTokens)} / out ${formatCompact(row.outputTokens)}`}
+                  detail={`${formatDecimal(row.genTps)} tok/s / in ${formatCompact(row.inputTokens)} / out ${formatCompact(row.outputTokens)}`}
                   value={formatNumber(row.requests)}
                   sub={row.status}
                   color={PALETTE[i % PALETTE.length]}
@@ -756,6 +756,14 @@ function ModelDetail({ row }: { row: ModelDisplayRow }) {
       <div className="mt-3 grid grid-cols-2 gap-2 text-xs md:grid-cols-4">
         <DetailStat label="Status" value={row.status} tone={row.status === "unhealthy" ? "hot" : row.status === "unknown" ? "warn" : "neutral"} />
         <DetailStat label="Tokens" value={formatCompact(row.tokens)} />
+        <DetailStat label="Throughput" value={`${formatDecimal(row.genTps)} tok/s`} />
+        <DetailStat label="TTFT" value={`${formatNumber(Math.round(row.avgTtftMs))} ms`} />
+        <DetailStat label="E2E" value={`${formatNumber(Math.round(row.avgTotalMs))} ms`} />
+        <DetailStat label="TTFT p50" value={`${formatNumber(Math.round(row.p50TtftMs))} ms`} />
+        <DetailStat label="E2E p50" value={`${formatNumber(Math.round(row.p50TotalMs))} ms`} />
+        <DetailStat label="Avg prompt" value={`${formatCompact(row.avgPromptTokens)} tok`} />
+        <DetailStat label="Avg gen" value={`${formatCompact(row.avgGenTokens)} tok`} />
+        <DetailStat label="Users" value={formatNumber(row.users)} />
         <DetailStat label="Weight" value={route ? formatNumber(route.admission_weight) : "--"} />
         <DetailStat label="Slots" value={route?.max_in_flight == null ? "unlimited" : formatNumber(route.max_in_flight)} />
         {route && <DetailStat className="md:col-span-4" label="Upstream" value={route.upstream_model} />}
@@ -1152,6 +1160,14 @@ interface ModelDisplayRow {
   inputTokens: number;
   outputTokens: number;
   tokens: number;
+  genTps: number;
+  avgTtftMs: number;
+  avgTotalMs: number;
+  p50TtftMs: number;
+  p50TotalMs: number;
+  avgPromptTokens: number;
+  avgGenTokens: number;
+  users: number;
   status: string;
   route?: ModelRoute;
 }
@@ -1171,6 +1187,14 @@ function buildModelRows(usage: UsageModelAgg[], routes: ModelRoute[], health: Mo
         inputTokens: Number(row.input_tokens),
         outputTokens: Number(row.output_tokens),
         tokens: Number(row.total_tokens),
+        genTps: Number(row.gen_tokens_per_sec),
+        avgTtftMs: Number(row.avg_ttft_ms),
+        avgTotalMs: Number(row.avg_total_ms),
+        p50TtftMs: Number(row.p50_ttft_ms),
+        p50TotalMs: Number(row.p50_total_ms),
+        avgPromptTokens: Number(row.avg_prompt_tokens),
+        avgGenTokens: Number(row.avg_gen_tokens),
+        users: Number(row.users),
         status: route && !route.enabled ? "disabled" : summary ? healthStatus(summary) : route ? "unknown" : "unrouted",
         route,
       };

@@ -335,14 +335,13 @@ impl Store {
     /// Hard-delete a tenant. Cascades to its API keys (FK `on delete cascade`).
     /// Returns the key hashes that were removed so callers can evict caches.
     pub async fn delete_tenant(&self, id: Uuid) -> Result<Vec<String>> {
-        let hashes: Vec<String> =
-            sqlx::query("select key_hash from api_keys where tenant_id = $1")
-                .bind(id)
-                .fetch_all(&self.pool)
-                .await?
-                .iter()
-                .map(|r| r.try_get::<String, _>("key_hash"))
-                .collect::<std::result::Result<_, _>>()?;
+        let hashes: Vec<String> = sqlx::query("select key_hash from api_keys where tenant_id = $1")
+            .bind(id)
+            .fetch_all(&self.pool)
+            .await?
+            .iter()
+            .map(|r| r.try_get::<String, _>("key_hash"))
+            .collect::<std::result::Result<_, _>>()?;
         let res = sqlx::query("delete from tenants where id = $1")
             .bind(id)
             .execute(&self.pool)
@@ -541,6 +540,7 @@ impl Store {
         supports_system_messages: bool,
         supports_response_schema: bool,
         supports_tool_choice: bool,
+        tags: &[String],
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -548,13 +548,13 @@ impl Store {
                 id, model_name, description, upstream_model, api_base, api_key,
                 input_cost_per_token, output_cost_per_token, context_window,
                 admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                supports_response_schema, supports_tool_choice
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                supports_response_schema, supports_tool_choice, tags
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
              returning id, model_name, description, upstream_model, api_base, api_key,
                        input_cost_per_token, output_cost_per_token, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
-                       cache_enabled, cache_ttl_secs,
+                       cache_enabled, cache_ttl_secs, tags,
                        created_at, updated_at",
         )
         .bind(Uuid::new_v4())
@@ -572,6 +572,7 @@ impl Store {
         .bind(supports_system_messages)
         .bind(supports_response_schema)
         .bind(supports_tool_choice)
+        .bind(sqlx::types::Json(obleth_config::normalize_tags(tags)))
         .fetch_one(&self.pool)
         .await?;
         model_from_row(&row)
@@ -583,7 +584,7 @@ impl Store {
                     input_cost_per_token, output_cost_per_token, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, enabled,
-                    cache_enabled, cache_ttl_secs,
+                    cache_enabled, cache_ttl_secs, tags,
                     created_at, updated_at
              from models order by model_name",
         )
@@ -598,7 +599,7 @@ impl Store {
                     input_cost_per_token, output_cost_per_token, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, enabled,
-                    cache_enabled, cache_ttl_secs,
+                    cache_enabled, cache_ttl_secs, tags,
                     created_at, updated_at
              from models where id = $1",
         )
@@ -615,7 +616,7 @@ impl Store {
                     input_cost_per_token, output_cost_per_token, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, enabled,
-                    cache_enabled, cache_ttl_secs,
+                    cache_enabled, cache_ttl_secs, tags,
                     created_at, updated_at
              from models where model_name = $1",
         )
@@ -644,6 +645,7 @@ impl Store {
         supports_response_schema: bool,
         supports_tool_choice: bool,
         enabled: bool,
+        tags: &[String],
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -654,13 +656,13 @@ impl Store {
                 max_in_flight = $10,
                 supports_function_calling = $11, supports_system_messages = $12,
                 supports_response_schema = $13, supports_tool_choice = $14,
-                enabled = $15, updated_at = now()
+                enabled = $15, tags = $16, updated_at = now()
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key,
                        input_cost_per_token, output_cost_per_token, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
-                       cache_enabled, cache_ttl_secs,
+                       cache_enabled, cache_ttl_secs, tags,
                        created_at, updated_at",
         )
         .bind(id)
@@ -678,6 +680,7 @@ impl Store {
         .bind(supports_response_schema)
         .bind(supports_tool_choice)
         .bind(enabled)
+        .bind(sqlx::types::Json(obleth_config::normalize_tags(tags)))
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -707,7 +710,7 @@ impl Store {
                        input_cost_per_token, output_cost_per_token, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
-                       cache_enabled, cache_ttl_secs,
+                       cache_enabled, cache_ttl_secs, tags,
                        created_at, updated_at",
         )
         .bind(id)
@@ -730,7 +733,7 @@ impl Store {
                        input_cost_per_token, output_cost_per_token, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
-                       cache_enabled, cache_ttl_secs,
+                       cache_enabled, cache_ttl_secs, tags,
                        created_at, updated_at",
         )
         .bind(id)
@@ -744,7 +747,9 @@ impl Store {
     pub async fn all_resolved_models(&self) -> Result<Vec<(String, ResolvedModel)>> {
         let rows = sqlx::query(
             "select model_name, upstream_model, api_base, api_key, admission_weight, max_in_flight, enabled,
-                    cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token
+                    cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token,
+                    context_window, supports_function_calling, supports_system_messages,
+                    supports_response_schema, supports_tool_choice, tags
              from models where enabled = true",
         )
         .fetch_all(&self.pool)
@@ -768,6 +773,15 @@ impl Store {
                         cache_ttl_secs: row.try_get("cache_ttl_secs")?,
                         input_cost_per_token: row.try_get("input_cost_per_token")?,
                         output_cost_per_token: row.try_get("output_cost_per_token")?,
+                        context_window: row.try_get("context_window")?,
+                        supports_function_calling: row.try_get("supports_function_calling")?,
+                        supports_system_messages: row.try_get("supports_system_messages")?,
+                        supports_response_schema: row.try_get("supports_response_schema")?,
+                        supports_tool_choice: row.try_get("supports_tool_choice")?,
+                        tags: row
+                            .try_get::<sqlx::types::Json<Vec<String>>, _>("tags")
+                            .map(|j| j.0)
+                            .unwrap_or_default(),
                     },
                 ))
             })
@@ -788,7 +802,7 @@ impl Store {
                        input_cost_per_token, output_cost_per_token, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
-                       cache_enabled, cache_ttl_secs,
+                       cache_enabled, cache_ttl_secs, tags,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1180,7 +1194,8 @@ impl Store {
             .await?;
         match row {
             Some(row) => {
-                let value: sqlx::types::Json<obleth_config::AlertSettings> = row.try_get("value")?;
+                let value: sqlx::types::Json<obleth_config::AlertSettings> =
+                    row.try_get("value")?;
                 Ok(Some(value.0))
             }
             None => Ok(None),
@@ -1188,13 +1203,43 @@ impl Store {
     }
 
     /// Persist the alert settings (upsert on the single `alerts` key).
-    pub async fn put_alert_settings(
-        &self,
-        settings: &obleth_config::AlertSettings,
-    ) -> Result<()> {
+    pub async fn put_alert_settings(&self, settings: &obleth_config::AlertSettings) -> Result<()> {
         sqlx::query(
             "insert into app_settings (key, value, updated_at)
              values ('alerts', $1, now())
+             on conflict (key) do update set value = excluded.value, updated_at = now()",
+        )
+        .bind(sqlx::types::Json(settings))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load the persisted `auto` router settings, or `None` if unset.
+    pub async fn get_auto_router_settings(
+        &self,
+    ) -> Result<Option<obleth_config::AutoRouterSettings>> {
+        let row = sqlx::query("select value from app_settings where key = 'auto_router'")
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => {
+                let value: sqlx::types::Json<obleth_config::AutoRouterSettings> =
+                    row.try_get("value")?;
+                Ok(Some(value.0))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the `auto` router settings (upsert on the single `auto_router` key).
+    pub async fn put_auto_router_settings(
+        &self,
+        settings: &obleth_config::AutoRouterSettings,
+    ) -> Result<()> {
+        sqlx::query(
+            "insert into app_settings (key, value, updated_at)
+             values ('auto_router', $1, now())
              on conflict (key) do update set value = excluded.value, updated_at = now()",
         )
         .bind(sqlx::types::Json(settings))
@@ -1374,6 +1419,12 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         enabled: row.try_get("enabled")?,
         cache_enabled: row.try_get("cache_enabled")?,
         cache_ttl_secs: row.try_get("cache_ttl_secs")?,
+        // Tolerant read: SQL statements that don't select `tags` (e.g. capacity
+        // toggles) degrade to an empty list rather than erroring.
+        tags: row
+            .try_get::<sqlx::types::Json<Vec<String>>, _>("tags")
+            .map(|j| j.0)
+            .unwrap_or_default(),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

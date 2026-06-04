@@ -41,6 +41,19 @@ import { Label } from "@/components/ui/label";
 import type { CacheStats, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import { cn, formatNumber } from "@/lib/utils";
 
+// Fixed routing-tag vocabulary; mirrors obleth-config `MODEL_TAGS`. Used by the
+// `auto` router to match requests to models.
+const MODEL_TAGS = [
+  "coding",
+  "general",
+  "reasoning",
+  "math",
+  "vision",
+  "long-context",
+  "fast",
+  "creative",
+] as const;
+
 export function ModelManager({
   models,
   cacheStats,
@@ -123,6 +136,14 @@ export function ModelManager({
               <Checkbox name="supports_tool_choice" label="Tool choice" />
             </div>
             <div className="md:col-span-2">
+              <Label className="mb-2 block">Routing tags (auto)</Label>
+              <div className="flex flex-wrap gap-3">
+                {MODEL_TAGS.map((tag) => (
+                  <Checkbox key={tag} name={`tag_${tag}`} label={tag} />
+                ))}
+              </div>
+            </div>
+            <div className="md:col-span-2">
               <Button type="submit" disabled={pending}>{pending ? "Adding..." : "Add model"}</Button>
             </div>
             {createError && (
@@ -178,6 +199,9 @@ export function ModelManager({
                         <div className="mt-2 flex flex-wrap gap-1.5">
                           <Badge className="border-border bg-background text-[10px] text-muted-foreground">{formatModelCost(model)}</Badge>
                           <Badge className="border-border bg-background text-[10px] text-muted-foreground">{formatNumber(model.context_window)} ctx</Badge>
+                          {model.tags?.map((tag) => (
+                            <Badge key={tag} className="border-primary/30 bg-primary/10 text-[10px] text-primary">{tag}</Badge>
+                          ))}
                         </div>
                         <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground md:hidden">{model.upstream_model}</p>
                       </td>
@@ -341,6 +365,19 @@ function ModelDetailPanel({
               <Checkbox name="supports_system_messages" label="System messages" defaultChecked={model.supports_system_messages} />
               <Checkbox name="supports_response_schema" label="Response schema" defaultChecked={model.supports_response_schema} />
               <Checkbox name="supports_tool_choice" label="Tool choice" defaultChecked={model.supports_tool_choice} />
+            </div>
+            <div className="md:col-span-2">
+              <Label className="mb-2 block">Routing tags (auto)</Label>
+              <div className="flex flex-wrap gap-3">
+                {MODEL_TAGS.map((tag) => (
+                  <Checkbox
+                    key={tag}
+                    name={`tag_${tag}`}
+                    label={tag}
+                    defaultChecked={model.tags?.includes(tag) ?? false}
+                  />
+                ))}
+              </div>
             </div>
             <div className="md:col-span-2">
               <Button type="submit" size="sm" disabled={pending}>

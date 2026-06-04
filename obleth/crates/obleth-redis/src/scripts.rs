@@ -109,4 +109,3 @@ local cost   = redis.call('HINCRBYFLOAT', key, 'cost', tonumber(ARGV[3]))
 redis.call('PEXPIRE', key, 31536000000)
 return { tokens, cost }
 "#;
-

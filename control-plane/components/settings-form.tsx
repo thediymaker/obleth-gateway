@@ -2,12 +2,18 @@
 
 import { useState, useTransition } from "react";
 import { Send } from "lucide-react";
-import { setAlertSettingsAction, testAlertAction } from "@/app/actions";
+import { setAlertSettingsAction, setAutoRouterSettingsAction, testAlertAction } from "@/app/actions";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import type { AlertSettingsView, UpdateAlertSettings } from "@/lib/obleth";
+import type {
+  AlertSettingsView,
+  AutoRouterSettingsView,
+  ModelRoute,
+  UpdateAlertSettings,
+  UpdateAutoRouterSettings,
+} from "@/lib/obleth";
 
 type ChannelResult = { channel: string; ok: boolean; detail: string };
 
@@ -315,5 +321,103 @@ export function AlertSettingsForm({ settings }: { settings: AlertSettingsView | 
         </Card>
       )}
     </div>
+  );
+}
+
+export function AutoRouterSettingsForm({
+  settings,
+  models,
+}: {
+  settings: AutoRouterSettingsView | null;
+  models: ModelRoute[];
+}) {
+  const [pending, start] = useTransition();
+  const [status, setStatus] = useState<{ ok: boolean; message: string } | null>(null);
+  const [enabled, setEnabled] = useState(settings?.classifier_enabled ?? false);
+  const [model, setModel] = useState(settings?.classifier_model ?? "");
+  const [timeout, setTimeoutMs] = useState(String(settings?.classifier_timeout_ms ?? 250));
+
+  function save() {
+    setStatus(null);
+    const body: UpdateAutoRouterSettings = {
+      classifier_enabled: enabled,
+      classifier_model: model.trim() ? model.trim() : "",
+      classifier_timeout_ms: Number(timeout) || 250,
+    };
+    start(async () => {
+      const result = await setAutoRouterSettingsAction(body);
+      setStatus(
+        result.ok
+          ? { ok: true, message: "Auto-router settings saved." }
+          : { ok: false, message: result.error },
+      );
+    });
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Auto routing</CardTitle>
+        <CardDescription>
+          When a client sends <code>model: &quot;auto&quot;</code>, the gateway picks the best model.
+          Optionally use a small, fast classifier model to derive intent tags; when disabled or
+          unavailable, routing falls back to heuristics then capacity/cost.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
+            className="h-4 w-4"
+          />
+          Enable intent classifier
+        </label>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-1">
+            <Label htmlFor="classifier_model">Classifier model</Label>
+            <select
+              id="classifier_model"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
+            >
+              <option value="">None</option>
+              {models
+                .filter((m) => m.model_name !== "auto")
+                .map((m) => (
+                  <option key={m.id} value={m.model_name}>
+                    {m.model_name}
+                  </option>
+                ))}
+            </select>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="classifier_timeout_ms">Timeout (ms)</Label>
+            <Input
+              id="classifier_timeout_ms"
+              type="number"
+              value={timeout}
+              onChange={(e) => setTimeoutMs(e.target.value)}
+            />
+          </div>
+        </div>
+        <Button onClick={save} disabled={pending}>
+          {pending ? "Saving..." : "Save auto routing"}
+        </Button>
+        {status && (
+          <p
+            className={
+              status.ok
+                ? "rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
+                : "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            }
+          >
+            {status.message}
+          </p>
+        )}
+      </CardContent>
+    </Card>
   );
 }

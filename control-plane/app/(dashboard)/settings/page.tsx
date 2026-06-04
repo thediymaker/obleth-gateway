@@ -1,4 +1,4 @@
-import { AlertSettingsForm } from "@/components/settings-form";
+import { AlertSettingsForm, AutoRouterSettingsForm } from "@/components/settings-form";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
@@ -6,6 +6,8 @@ export const dynamic = "force-dynamic";
 
 export default async function SettingsPage() {
   const settings = await safe(obleth.getAlertSettings(), null);
+  const autoRouter = await safe(obleth.getAutoRouterSettings(), null);
+  const models = await safe(obleth.listModels(), []);
 
   return (
     <div className="space-y-6">
@@ -17,6 +19,7 @@ export default async function SettingsPage() {
         </p>
       </div>
       <AlertSettingsForm settings={settings} />
+      <AutoRouterSettingsForm settings={autoRouter} models={models} />
     </div>
   );
 }
