@@ -6,57 +6,81 @@
 
 ![obleth dashboard overview](.github/assets/dashboard.png)
 
-**obleth is a multi-tenant gateway that sits between your users and your LLMs and
-decides, under load, who gets to send and at what priority.**
+**obleth is a multi-tenant gateway between your clients and your LLMs. It handles
+authentication, decides which requests to admit when capacity is tight, and routes
+each one to the right OpenAI-compatible backend.**
 
-Point your clients at obleth and obleth at any OpenAI-compatible provider (vLLM,
-Aibrix, OpenAI, Together, your own). It owns the layer load balancers and inference
-routers leave open: tenant identity, weighted fair queuing, model routing, token-
-accurate cost accounting, and graceful degradation when there isn't enough capacity
-for everyone.
+Point your clients at obleth and register your models, each mapped to its own
+upstream. Backends can be anything OpenAI-compatible (vLLM, Aibrix, OpenAI,
+Together, or your own), and different models can target different providers. obleth
+adds the layer that load balancers and inference routers don't: per-tenant
+identity, weighted fair queuing, model routing, token-accurate cost accounting, and
+defined behavior when demand exceeds capacity.
 
 ```
-   clients ──▶ obleth ──▶ any OpenAI-compatible provider
-               │          (vLLM · Aibrix · OpenAI · Together · your own)
-        who gets to send,
-       at what priority, in
-         whose fair share
+   clients ──▶ obleth ──▶ any OpenAI-compatible provider(s)
+                          (vLLM · Aibrix · OpenAI · Together · your own)
 ```
 
 ## Who it's for
 
-You run a shared GPU fleet or a shared API budget across more than one team, app,
-or customer, and you need fairness and control the upstream doesn't give you. If a
-single provider key behind a basic proxy is enough, you don't need obleth. If a
-batch job can starve your chatbot, or one tenant can burn the whole budget, you do.
+obleth is for teams running LLM capacity (or a budget) shared across multiple
+tenants — teams, apps, or customers — where you need to control how that shared
+capacity is divided. It prevents a batch job from starving an interactive workload
+and stops a single tenant from consuming the entire budget. A single-tenant setup
+behind one provider key does not need it.
 
 ## What it does
 
 - **Weighted fair queuing.** Each tenant has a weight. When demand exceeds
   capacity, throughput is divided proportionally to weight, measured in tokens,
-  with starvation-free guarantees. A high-weight chatbot key keeps its share under
-  a flood of batch traffic. Weights are tunable at runtime, no restart.
-- **Auto model routing.** Send `model: "auto"` and obleth picks a model by live
-  capacity, cost, and operator-assigned tags (`coding`, `reasoning`, `vision`, …).
-  An optional tiny-model classifier maps each request to the best-matching tags,
-  and degrades gracefully to heuristics if the classifier is unavailable.
-- **Time-of-use scheduling.** Give a tenant an activation window and/or recurring
-  weekly windows in its own timezone. Outside its windows the tenant doesn't admit
-  traffic — useful for off-peak batch tenants or time-boxed access.
-- **Token-accurate cost accounting.** Estimate at admission, reserve atomically,
-  reconcile the true token cost after the stream completes. Per-tenant token/USD
-  budgets with lifetime, monthly, or term reset.
-- **Graceful degradation.** Under saturation, low-priority traffic is browned out
-  (capped `max_tokens`) instead of rejected. If Redis or ClickHouse blink, the data
-  plane fails open from its in-process cache and replays telemetry on recovery.
-- **Observability.** Per-model throughput (tok/s), TTFT/E2E latency (avg + p50),
-  prompt/generation token averages, and unique users — all computed internally
-  from obleth's own usage ledger, plus a live fairshare view in the dashboard.
+  with starvation-free guarantees. A higher-weight tenant keeps its share while
+  lower-weight traffic is held back. Weights are adjustable at runtime, no restart.
+  Tenants can be grouped so capacity is split between groups first, then between
+  tenants within a group.
+- **Auto model routing.** Send `model: "auto"` and obleth selects a model based on
+  live capacity, cost, and operator-assigned tags (`coding`, `reasoning`, `vision`,
+  …), across every registered backend. An optional small-model classifier maps each
+  request to the best-matching tags, and falls back to heuristics if the classifier
+  is unavailable.
+- **Access windows.** A tenant can have an activation date, an expiry date, and/or
+  recurring weekly windows, evaluated in its own timezone. Outside those windows its
+  keys admit no traffic — useful for off-peak batch tenants or time-boxed access.
+- **Limits and budgets.** Per-tenant tokens-per-minute rate limits, per-tenant and
+  per-model in-flight concurrency caps, and per-tenant token and USD budgets that
+  reset on a lifetime, monthly, or term basis. Each tenant can also be restricted to
+  an allowlist of models.
+- **Token-accurate cost accounting.** obleth estimates tokens at admission, reserves
+  them atomically, and reconciles the true cost against per-model input/output
+  pricing after the stream completes.
+- **Model health and uptime tracking.** obleth probes each model through its own
+  proxy path on a schedule, tracks health status and consecutive failures, and trips
+  a model out of rotation after a failure threshold. Operators can set maintenance
+  windows to suppress alerts during planned downtime.
+- **Alerting.** Health failures, budget exhaustion, and other operational events are
+  dispatched to Slack webhooks and email (SMTP).
+- **Response caching.** Optional per-model exact-match response caching in Redis,
+  with an operator-controlled TTL.
+- **MCP proxying.** Register Model Context Protocol servers and expose them through
+  obleth's single authenticated endpoint.
+- **Audit log.** Every management action records the actor, entity, and a JSON
+  detail payload.
+- **Defined behavior under load.** When saturated, low-priority traffic is browned
+  out (capped `max_tokens`) rather than rejected. If Redis or ClickHouse become
+  unavailable, the data plane fails open from its in-process cache and replays
+  telemetry on recovery.
+- **Observability.** Per-model throughput (tok/s), TTFT and end-to-end latency
+  (average and p50), prompt/generation token averages, and unique users — all
+  computed from obleth's own usage ledger — plus a live fairshare view in the
+  dashboard.
+- **SSRF protection.** Admin-registered upstreams (model `api_base`, MCP URLs) are
+  validated against a policy that blocks cloud-metadata and link-local addresses.
 
 The data plane is a thin Rust service on the request path. The control plane
-(dashboard + Management API) configures everything out of band and never touches
-the hot path. Three datastores by design: Postgres (config source of truth), Redis
-(hot key cache + atomic token budgets), and ClickHouse (async usage/cost ledger).
+(dashboard and Management API) configures everything out of band and never touches
+the hot path. obleth uses three datastores: Postgres (config source of truth),
+Redis (hot key cache and atomic token budgets), and ClickHouse (async usage and
+cost ledger).
 
 ## Quick start (Docker)
 
@@ -108,7 +132,7 @@ obleth is configured through environment variables. The essentials:
 
 | Variable | Purpose |
 | --- | --- |
-| `OBLETH_UPSTREAM_BASE_URL` | your OpenAI-compatible provider |
+| `OBLETH_UPSTREAM_BASE_URL` | default upstream for requests without a registered model route (each model can override with its own `api_base`) |
 | `OBLETH_DATABASE_URL` / `OBLETH_REDIS_URL` / `OBLETH_CLICKHOUSE_URL` | the three datastores |
 | `OBLETH_ADMIN_TOKEN` | Management API bearer token (**required**) |
 | `OBLETH_FAIL_OPEN` | admit when Redis is down (default `true`) |
