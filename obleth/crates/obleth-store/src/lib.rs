@@ -1547,6 +1547,7 @@ mod tests {
                 true,
                 false,
                 false,
+                &[],
             )
             .await
             .expect("create model");
