@@ -11,7 +11,6 @@ use obleth_redis::RedisStore;
 use obleth_telemetry::TelemetrySink;
 use obleth_tokenizer::HeuristicTokenizer;
 
-use crate::alerts::SlackAlerts;
 use crate::metrics::Metrics;
 
 /// All handles needed on the request hot path. Cheap to clone.
@@ -29,5 +28,5 @@ pub struct AppState {
     pub mcp_cache: Cache<String, ResolvedMcpServer>,
     pub metrics: Arc<Metrics>,
     pub fail_open: bool,
-    pub alerts: SlackAlerts,
+    pub alerts: obleth_admin::AlertDispatcher,
 }

@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useState, useTransition, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, useTransition, type ReactNode } from "react";
 import {
   Activity,
   Check,
@@ -55,6 +55,8 @@ export function ModelManager({
   const [pending, start] = useTransition();
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [showBenchmarkRoutes, setShowBenchmarkRoutes] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const createFormRef = useRef<HTMLFormElement>(null);
   const healthByModel = useMemo(() => new Map(health.map((row) => [row.model_id, row])), [health]);
   const benchmarkRouteCount = models.filter(isBenchmarkRoute).length;
   const visibleModels = showBenchmarkRoutes ? models : models.filter((model) => !isBenchmarkRoute(model));
@@ -62,6 +64,18 @@ export function ModelManager({
   function removeModel(model: ModelRoute) {
     if (!window.confirm(`Remove model route "${model.model_name}"? This cannot be undone.`)) return;
     start(() => deleteModelAction(model.id));
+  }
+
+  function submitModel(formData: FormData) {
+    setCreateError(null);
+    start(async () => {
+      const result = await createModelAction(formData);
+      if (result.ok) {
+        createFormRef.current?.reset();
+      } else {
+        setCreateError(result.error);
+      }
+    });
   }
 
   function checkAll() {
@@ -87,7 +101,7 @@ export function ModelManager({
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <form action={(fd) => start(() => createModelAction(fd))} className="grid gap-4 md:grid-cols-2">
+          <form ref={createFormRef} action={submitModel} className="grid gap-4 md:grid-cols-2">
             <Field label="Model name (client)" name="model_name" placeholder="qwen3-vl-32b-instruct" required />
             <Field label="Upstream model" name="upstream_model" placeholder="asuair/qwen3-vl-32b-instruct" required />
             <div className="md:col-span-2">
@@ -111,6 +125,11 @@ export function ModelManager({
             <div className="md:col-span-2">
               <Button type="submit" disabled={pending}>{pending ? "Adding..." : "Add model"}</Button>
             </div>
+            {createError && (
+              <p className="md:col-span-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {createError}
+              </p>
+            )}
           </form>
         </CardContent>
       </Card>

@@ -16,6 +16,7 @@ const KEY_PREFIX: &str = "obleth:key:";
 const MODEL_PREFIX: &str = "obleth:model:";
 const MCP_PREFIX: &str = "obleth:mcp:";
 const BUDGET_PREFIX: &str = "obleth:budget:";
+const TERM_USAGE_PREFIX: &str = "obleth:term_usage:";
 const CACHE_PREFIX: &str = "obleth:cache:";
 const INVALIDATE_CHANNEL: &str = "obleth:invalidate";
 
@@ -49,6 +50,9 @@ impl RedisStore {
     }
     fn budget_key(tenant: &Uuid) -> String {
         format!("{BUDGET_PREFIX}{tenant}")
+    }
+    fn term_usage_key(tenant: &Uuid) -> String {
+        format!("{TERM_USAGE_PREFIX}{tenant}")
     }
 
     /// Hot-path lookup of a resolved key by its hash.
@@ -207,6 +211,42 @@ impl RedisStore {
         Ok(remaining)
     }
 
+    /// Read a tenant's cumulative term usage `(tokens, cost_usd)`, rolling the
+    /// period counters if `period_key` no longer matches the stored term.
+    pub async fn term_usage_read(
+        &self,
+        tenant: &Uuid,
+        period_key: &str,
+    ) -> Result<(i64, f64)> {
+        let mut conn = self.conn.clone();
+        let (tokens, cost): (i64, String) = redis::Script::new(scripts::TERM_USAGE_READ)
+            .key(Self::term_usage_key(tenant))
+            .arg(period_key)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok((tokens, cost.parse().unwrap_or(0.0)))
+    }
+
+    /// Add observed `(tokens, cost_usd)` to a tenant's term counters (rolling the
+    /// period first) and return the new cumulative `(tokens, cost_usd)`.
+    pub async fn term_usage_add(
+        &self,
+        tenant: &Uuid,
+        period_key: &str,
+        add_tokens: i64,
+        add_cost: f64,
+    ) -> Result<(i64, f64)> {
+        let mut conn = self.conn.clone();
+        let (tokens, cost): (i64, String) = redis::Script::new(scripts::TERM_USAGE_ADD)
+            .key(Self::term_usage_key(tenant))
+            .arg(period_key)
+            .arg(add_tokens)
+            .arg(add_cost)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok((tokens, cost.parse().unwrap_or(0.0)))
+    }
+
     /// Run `on_hash` for every invalidation message. Intended to drive a local
     /// moka cache eviction; loops until the connection drops.
     pub async fn run_invalidation_listener<F>(&self, mut on_hash: F) -> Result<()>
@@ -291,6 +331,16 @@ mod tests {
             tokens_per_minute: 1000,
             max_in_flight: None,
             disabled: false,
+            status: "active".into(),
+            timezone: "UTC".into(),
+            active_from: None,
+            active_until: None,
+            weekly_windows: None,
+            budget_tokens: None,
+            budget_cost_usd: None,
+            budget_period: None,
+            budget_started_at: None,
+            allowed_models: None,
             internal: false,
         };
         store.put_resolved_key(&hash, &key).await.unwrap();

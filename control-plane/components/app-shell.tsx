@@ -14,6 +14,7 @@ import {
   PanelLeftOpen,
   Plug,
   ScrollText,
+  Settings,
   Users,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -41,6 +42,7 @@ const nav = [
   { href: "/tenants", label: "Tenants", icon: Users },
   { href: "/keys", label: "API Keys", icon: KeyRound },
   { href: "/audit", label: "Audit", icon: ScrollText },
+  { href: "/settings", label: "Settings", icon: Settings },
 ];
 
 function userInitials(name: string) {

@@ -53,6 +53,33 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     if resolved.disabled {
         return error_json(StatusCode::FORBIDDEN, "api key disabled");
     }
+    // Internal probe keys bypass tenant lifecycle gating.
+    if !resolved.internal && resolved.status != "active" {
+        return error_json(StatusCode::FORBIDDEN, "tenant is not active");
+    }
+    // Schedule gate: activation start, expiry cutoff, and recurring weekly windows.
+    if !resolved.internal {
+        let now = chrono::Utc::now();
+        if let Err(reason) = tenant_active_now(&resolved, now) {
+            return error_json(StatusCode::FORBIDDEN, reason);
+        }
+        // Phase 5: warn operators when a tenant is within 72h of expiry.
+        if let Some(until) = resolved.active_until {
+            let remaining = until - now;
+            if remaining > chrono::Duration::zero() && remaining <= chrono::Duration::hours(72) {
+                state.alerts.issue(
+                    format!("tenant_expiry:{}", resolved.tenant_id),
+                    "Tenant access expiring soon",
+                    format!(
+                        "tenant `{}` expires at {} (~{}h remaining)",
+                        resolved.tenant_name,
+                        until.to_rfc3339(),
+                        remaining.num_hours()
+                    ),
+                );
+            }
+        }
+    }
 
     // ---- read + parse body ----
     let body_bytes = match axum::body::to_bytes(body, BODY_LIMIT).await {
@@ -79,6 +106,14 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         };
         if !route.enabled {
             return error_json(StatusCode::FORBIDDEN, "model is disabled");
+        }
+    }
+    // ---- per-tenant model allowlist (Phase 4) ----
+    if !resolved.internal {
+        if let Some(allowed) = &resolved.allowed_models {
+            if !allowed.iter().any(|m| m == &model) {
+                return error_json(StatusCode::FORBIDDEN, "model not permitted for tenant");
+            }
         }
     }
     let effective_weight = effective_admission_weight(resolved.weight, route.as_ref());
@@ -224,6 +259,62 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             );
         }
     }
+
+    // ---- cumulative term budget (Phase 3): caps on lifetime/monthly/term usage ----
+    let term_period = term_period_key(&resolved, chrono::Utc::now());
+    if let Some(period) = &term_period {
+        match state.redis.term_usage_read(&resolved.tenant_id, period).await {
+            Ok((used_tokens, used_cost)) => {
+                let token_exhausted = resolved
+                    .budget_tokens
+                    .is_some_and(|cap| used_tokens >= cap);
+                let cost_exhausted = resolved
+                    .budget_cost_usd
+                    .is_some_and(|cap| used_cost >= cap);
+                if token_exhausted || cost_exhausted {
+                    drop(permit);
+                    state.alerts.issue(
+                        format!("term_budget_exhausted:{}", resolved.tenant_id),
+                        "Tenant term budget exhausted",
+                        format!(
+                            "tenant `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
+                            resolved.tenant_name,
+                            resolved.budget_tokens,
+                            resolved.budget_cost_usd,
+                        ),
+                    );
+                    finalize(
+                        &state,
+                        &resolved,
+                        &model,
+                        Admission::Rejected,
+                        est,
+                        0,
+                        0,
+                        queue_wait_ms,
+                        0,
+                        403,
+                        cache_status_label,
+                    );
+                    return error_json(StatusCode::FORBIDDEN, "tenant term budget exhausted");
+                }
+            }
+            Err(e) => {
+                // Treat read failure like the per-minute bucket: fail open unless configured closed.
+                if !state.fail_open {
+                    drop(permit);
+                    return error_json(StatusCode::SERVICE_UNAVAILABLE, "budget check failed");
+                }
+                tracing::warn!(error = %e, "term usage read failed; failing open");
+            }
+        }
+    }
+    // Cost rates captured for the post-stream term-usage commit (route isn't
+    // moved into the streaming closure).
+    let (in_cost_rate, out_cost_rate) = route
+        .as_ref()
+        .map(|r| (r.input_cost_per_token, r.output_cost_per_token))
+        .unwrap_or((0.0, 0.0));
 
     // ---- proxy upstream ----
     let (upstream_base, mut send_bytes, upstream_model) =
@@ -405,6 +496,38 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             );
         }
 
+        // ---- term-usage commit + budget alerts (Phase 3 + Phase 5) ----
+        if let Some(period) = &term_period {
+            let cost = (input_tokens as f64) * in_cost_rate
+                + (output_tokens as f64) * out_cost_rate;
+            let added = input_tokens.saturating_add(output_tokens) as i64;
+            match stream_state
+                .redis
+                .term_usage_add(&resolved_for_stream.tenant_id, period, added, cost)
+                .await
+            {
+                Ok((total_tokens, total_cost)) => {
+                    maybe_alert_budget(
+                        &stream_state,
+                        &resolved_for_stream,
+                        total_tokens,
+                        total_cost,
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "term usage commit failed");
+                    stream_state.alerts.issue(
+                        "redis_term_usage_failed",
+                        "Redis term-usage commit failed",
+                        format!(
+                            "tenant `{}` model `{model}`: {e}",
+                            resolved_for_stream.tenant_name
+                        ),
+                    );
+                }
+            }
+        }
+
         finalize(
             &stream_state,
             &resolved_for_stream,
@@ -488,6 +611,123 @@ fn effective_admission_weight(tenant_weight: i64, route: Option<&ResolvedModel>)
 
 /// OpenAI-style endpoints that must resolve to a registered model route.
 /// Unregistered models must not fall through to the default benchmark fixture upstream.
+/// Evaluate a tenant's schedule against the current instant. Returns `Ok(())`
+/// when traffic is permitted, or `Err(reason)` with a client-facing message when
+/// the tenant is outside its activation window, expired, or outside its
+/// recurring weekly windows.
+fn tenant_active_now(
+    resolved: &ResolvedKey,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<(), &'static str> {
+    if let Some(from) = resolved.active_from {
+        if now < from {
+            return Err("tenant is not active yet");
+        }
+    }
+    if let Some(until) = resolved.active_until {
+        if now >= until {
+            return Err("tenant access has expired");
+        }
+    }
+    if let Some(windows) = resolved.weekly_windows.as_ref().filter(|w| !w.is_empty()) {
+        // Evaluate the recurring windows in the tenant's local timezone. An
+        // unparseable timezone falls back to UTC rather than blocking traffic.
+        let tz: chrono_tz::Tz = resolved.timezone.parse().unwrap_or(chrono_tz::UTC);
+        let local = now.with_timezone(&tz);
+        use chrono::{Datelike, Timelike};
+        let day = local.weekday().num_days_from_sunday() as u8; // 0=Sunday
+        let minute_of_day = (local.hour() * 60 + local.minute()) as u16;
+        let in_window = windows
+            .iter()
+            .any(|w| w.day == day && minute_of_day >= w.start_min && minute_of_day < w.end_min);
+        if !in_window {
+            return Err("tenant is outside its scheduled access window");
+        }
+    }
+    Ok(())
+}
+
+/// Compute the term-usage period key for a tenant, or `None` when no cumulative
+/// budget cap is configured. The key namespaces the Redis counters so that
+/// `monthly` budgets roll over at each calendar month (in the tenant timezone),
+/// `term` budgets reset whenever `budget_started_at` changes, and `lifetime`
+/// budgets never reset.
+fn term_period_key(
+    resolved: &ResolvedKey,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    if resolved.budget_tokens.is_none() && resolved.budget_cost_usd.is_none() {
+        return None;
+    }
+    let period = resolved.budget_period.as_deref().unwrap_or("lifetime");
+    let key = match period {
+        "monthly" => {
+            use chrono::Datelike;
+            let tz: chrono_tz::Tz = resolved.timezone.parse().unwrap_or(chrono_tz::UTC);
+            let local = now.with_timezone(&tz);
+            format!("m:{}-{:02}", local.year(), local.month())
+        }
+        "term" => {
+            let anchor = resolved
+                .budget_started_at
+                .map(|t| t.timestamp())
+                .unwrap_or(0);
+            format!("t:{anchor}")
+        }
+        // "lifetime" and any unknown value: a single non-rolling bucket.
+        _ => {
+            let anchor = resolved
+                .budget_started_at
+                .map(|t| t.timestamp())
+                .unwrap_or(0);
+            format!("l:{anchor}")
+        }
+    };
+    Some(key)
+}
+
+/// Emit warning/exhaustion alerts when a tenant crosses 80% / 100% of either
+/// cumulative budget cap. Cooldown dedup lives in `SlackAlerts`.
+fn maybe_alert_budget(
+    state: &AppState,
+    resolved: &ResolvedKey,
+    used_tokens: i64,
+    used_cost: f64,
+) {
+    let token_pct = resolved
+        .budget_tokens
+        .filter(|c| *c > 0)
+        .map(|cap| used_tokens as f64 / cap as f64);
+    let cost_pct = resolved
+        .budget_cost_usd
+        .filter(|c| *c > 0.0)
+        .map(|cap| used_cost / cap);
+    let pct = [token_pct, cost_pct]
+        .into_iter()
+        .flatten()
+        .fold(0.0_f64, f64::max);
+    if pct >= 1.0 {
+        state.alerts.issue(
+            format!("term_budget_exhausted:{}", resolved.tenant_id),
+            "Tenant term budget exhausted",
+            format!(
+                "tenant `{}` reached its budget cap (used {used_tokens} tokens / ${used_cost:.4})",
+                resolved.tenant_name
+            ),
+        );
+    } else if pct >= 0.8 {
+        state.alerts.issue(
+            format!("term_budget_warn:{}", resolved.tenant_id),
+            "Tenant term budget at 80%",
+            format!(
+                "tenant `{}` is at {:.0}% of its budget (used {used_tokens} tokens / ${used_cost:.4})",
+                resolved.tenant_name,
+                pct * 100.0
+            ),
+        );
+    }
+}
+
 fn requires_registered_model(path: &str) -> bool {
     matches!(
         path,
@@ -686,7 +926,40 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::build_upstream_url;
+    use super::{build_upstream_url, tenant_active_now};
+    use chrono::{DateTime, TimeZone, Utc};
+    use obleth_config::{ResolvedKey, WeeklyWindow};
+    use uuid::Uuid;
+
+    fn key_with_schedule(
+        timezone: &str,
+        active_from: Option<DateTime<Utc>>,
+        active_until: Option<DateTime<Utc>>,
+        weekly_windows: Option<Vec<WeeklyWindow>>,
+    ) -> ResolvedKey {
+        ResolvedKey {
+            key_id: Uuid::nil(),
+            tenant_id: Uuid::nil(),
+            tenant_name: "t".into(),
+            fairshare_group: "default".into(),
+            group_weight: 100,
+            weight: 100,
+            tokens_per_minute: 1000,
+            max_in_flight: None,
+            disabled: false,
+            status: "active".into(),
+            timezone: timezone.into(),
+            active_from,
+            active_until,
+            weekly_windows,
+            budget_tokens: None,
+            budget_cost_usd: None,
+            budget_period: None,
+            budget_started_at: None,
+            allowed_models: None,
+            internal: false,
+        }
+    }
 
     #[test]
     fn avoids_duplicate_v1_prefix() {
@@ -703,4 +976,78 @@ mod tests {
             "http://benchmark-backend:8081/v1/chat/completions"
         );
     }
+
+    #[test]
+    fn no_schedule_is_always_active() {
+        let key = key_with_schedule("UTC", None, None, None);
+        assert!(tenant_active_now(&key, Utc::now()).is_ok());
+    }
+
+    #[test]
+    fn before_active_from_is_blocked() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let from = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let key = key_with_schedule("UTC", Some(from), None, None);
+        assert!(tenant_active_now(&key, now).is_err());
+    }
+
+    #[test]
+    fn after_active_until_is_blocked() {
+        let now = Utc.with_ymd_and_hms(2026, 1, 3, 12, 0, 0).unwrap();
+        let until = Utc.with_ymd_and_hms(2026, 1, 2, 0, 0, 0).unwrap();
+        let key = key_with_schedule("UTC", None, Some(until), None);
+        assert!(tenant_active_now(&key, now).is_err());
+    }
+
+    #[test]
+    fn inside_weekly_window_is_allowed() {
+        // 2026-01-01 is a Thursday (weekday 4). 12:00 UTC = 720 minutes.
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 12, 0, 0).unwrap();
+        let key = key_with_schedule(
+            "UTC",
+            None,
+            None,
+            Some(vec![WeeklyWindow {
+                day: 4,
+                start_min: 9 * 60,
+                end_min: 17 * 60,
+            }]),
+        );
+        assert!(tenant_active_now(&key, now).is_ok());
+    }
+
+    #[test]
+    fn outside_weekly_window_is_blocked() {
+        // Thursday 20:00 UTC, window only covers 09:00-17:00.
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 20, 0, 0).unwrap();
+        let key = key_with_schedule(
+            "UTC",
+            None,
+            None,
+            Some(vec![WeeklyWindow {
+                day: 4,
+                start_min: 9 * 60,
+                end_min: 17 * 60,
+            }]),
+        );
+        assert!(tenant_active_now(&key, now).is_err());
+    }
+
+    #[test]
+    fn timezone_shifts_the_local_weekday() {
+        // 2026-01-01 02:00 UTC is still Wednesday (day 3) in New York (UTC-5).
+        let now = Utc.with_ymd_and_hms(2026, 1, 1, 2, 0, 0).unwrap();
+        let key = key_with_schedule(
+            "America/New_York",
+            None,
+            None,
+            Some(vec![WeeklyWindow {
+                day: 3,
+                start_min: 0,
+                end_min: 24 * 60,
+            }]),
+        );
+        assert!(tenant_active_now(&key, now).is_ok());
+    }
 }
+

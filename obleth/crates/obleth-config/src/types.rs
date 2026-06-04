@@ -53,8 +53,65 @@ pub struct Tenant {
     pub tokens_per_minute: i64,
     /// Optional per-tenant in-flight cap. `None` means only the global limit applies.
     pub max_in_flight: Option<i64>,
+    /// Free-text operator note shown in dashboards.
+    #[serde(default)]
+    pub description: String,
+    /// Optional grouping label (team, project, org unit, customer).
+    #[serde(default)]
+    pub organization: String,
+    /// Contact for budget/expiry notifications.
+    #[serde(default)]
+    pub contact_email: String,
+    /// Lifecycle: `active`, `suspended`, or `archived`. Only `active` admits traffic.
+    #[serde(default = "default_tenant_status")]
+    pub status: String,
+    /// IANA timezone (e.g. `America/Phoenix`) the schedule below is evaluated in.
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    /// Optional activation start. Before this instant the tenant is not active.
+    #[serde(default)]
+    pub active_from: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional expiry cutoff. After this instant the tenant is not active.
+    #[serde(default)]
+    pub active_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional recurring weekly windows. Empty/`None` means any time of week.
+    #[serde(default)]
+    pub weekly_windows: Option<Vec<WeeklyWindow>>,
+    /// Optional cumulative token budget for the current term. `None` = no cap.
+    #[serde(default)]
+    pub budget_tokens: Option<i64>,
+    /// Optional cumulative USD cost budget for the current term. `None` = no cap.
+    #[serde(default)]
+    pub budget_cost_usd: Option<f64>,
+    /// Term budget reset period: `lifetime`, `monthly`, or `term`. `None` = lifetime.
+    #[serde(default)]
+    pub budget_period: Option<String>,
+    /// When the current term began. Changing it resets cumulative term usage.
+    #[serde(default)]
+    pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional per-tenant model allowlist. Empty/`None` = all models permitted.
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+pub fn default_tenant_status() -> String {
+    "active".to_string()
+}
+
+/// Default tenant timezone used when deserializing legacy records.
+pub fn default_timezone() -> String {
+    "UTC".to_string()
+}
+
+/// A recurring weekly availability window. Times are minutes from local midnight
+/// in the tenant's `timezone`; `day` is 0=Sunday .. 6=Saturday (matches
+/// JavaScript `Date.getDay()`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct WeeklyWindow {
+    pub day: u8,
+    pub start_min: u16,
+    pub end_min: u16,
 }
 
 /// An API key. The raw secret is never stored; only its hash + a display prefix.
@@ -72,7 +129,7 @@ pub struct ApiKey {
 /// The compact, hot-path view resolved from an API key. This is what the data
 /// plane caches in moka and reads from Redis; it carries everything the
 /// fairshare admission step needs without a relational lookup.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedKey {
     pub key_id: Uuid,
     pub tenant_id: Uuid,
@@ -83,6 +140,36 @@ pub struct ResolvedKey {
     pub tokens_per_minute: i64,
     pub max_in_flight: Option<i64>,
     pub disabled: bool,
+    /// Tenant lifecycle status. Anything other than `active` blocks the request.
+    #[serde(default = "default_tenant_status")]
+    pub status: String,
+    /// IANA timezone the scheduling fields below are evaluated in.
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    /// Optional activation start; requests before this instant are blocked.
+    #[serde(default)]
+    pub active_from: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional expiry cutoff; requests after this instant are blocked.
+    #[serde(default)]
+    pub active_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional recurring weekly windows. Empty/`None` means any time of week.
+    #[serde(default)]
+    pub weekly_windows: Option<Vec<WeeklyWindow>>,
+    /// Optional cumulative token budget for the current term. `None` = no cap.
+    #[serde(default)]
+    pub budget_tokens: Option<i64>,
+    /// Optional cumulative USD cost budget for the current term. `None` = no cap.
+    #[serde(default)]
+    pub budget_cost_usd: Option<f64>,
+    /// Term budget reset period: `lifetime`, `monthly`, or `term`. `None` = lifetime.
+    #[serde(default)]
+    pub budget_period: Option<String>,
+    /// When the current term began. Changing it resets cumulative term usage.
+    #[serde(default)]
+    pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional per-tenant model allowlist. Empty/`None` = all models permitted.
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
     /// Internal keys are allowed through the proxy path but are omitted from
     /// the normal usage ledger. This is used for gateway-owned health probes.
     #[serde(default)]
@@ -196,7 +283,7 @@ pub struct ModelHealthDetail {
 }
 
 /// Hot-path view of a model route for the data plane cache.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedModel {
     pub model_name: String,
     pub upstream_model: String,
@@ -207,6 +294,11 @@ pub struct ResolvedModel {
     pub enabled: bool,
     pub cache_enabled: bool,
     pub cache_ttl_secs: i64,
+    /// Cost per input/output token, used for cumulative USD budget accounting.
+    #[serde(default)]
+    pub input_cost_per_token: f64,
+    #[serde(default)]
+    pub output_cost_per_token: f64,
 }
 
 /// A registered MCP (Model Context Protocol) server. obleth fronts it with the
@@ -267,4 +359,85 @@ pub struct UsageRecord {
     pub cache_status: String,
     /// Unix epoch milliseconds at request completion.
     pub ts_ms: i64,
+}
+
+/// Runtime-configurable alerting settings, editable from the control plane and
+/// persisted in Postgres so they survive restarts. The gateway loads these at
+/// boot (falling back to environment defaults) and applies live updates without
+/// a restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AlertSettings {
+    /// Slack incoming-webhook URL. `None` disables Slack delivery.
+    #[serde(default)]
+    pub slack_webhook_url: Option<String>,
+    /// SMTP email delivery. `None` disables email alerts.
+    #[serde(default)]
+    pub email: Option<EmailSettings>,
+    /// Minimum seconds between repeat alerts for the same dedup key (cooldown).
+    #[serde(default = "default_alert_min_interval_secs")]
+    pub min_interval_secs: u64,
+}
+
+/// SMTP relay configuration for email alerts (universities typically run an
+/// internal relay). Credentials are optional for unauthenticated relays.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EmailSettings {
+    pub smtp_host: String,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    /// Optional SMTP auth username. `None` for an open/unauthenticated relay.
+    #[serde(default)]
+    pub username: Option<String>,
+    /// Optional SMTP auth password. `None` for an open/unauthenticated relay.
+    #[serde(default)]
+    pub password: Option<String>,
+    /// Envelope/From address (e.g. `obleth-alerts@university.edu`).
+    pub from_address: String,
+    /// Where alert emails are delivered.
+    #[serde(default)]
+    pub recipients: Vec<String>,
+    /// Use STARTTLS (port 587) when true; plain SMTP (port 25) when false.
+    #[serde(default = "default_true")]
+    pub starttls: bool,
+}
+
+fn default_alert_min_interval_secs() -> u64 {
+    300
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AlertSettings {
+    fn default() -> Self {
+        AlertSettings {
+            slack_webhook_url: None,
+            email: None,
+            min_interval_secs: default_alert_min_interval_secs(),
+        }
+    }
+}
+
+impl AlertSettings {
+    /// True when at least one delivery channel is configured.
+    pub fn any_channel_enabled(&self) -> bool {
+        self.slack_enabled() || self.email_enabled()
+    }
+
+    pub fn slack_enabled(&self) -> bool {
+        self.slack_webhook_url
+            .as_ref()
+            .is_some_and(|u| !u.trim().is_empty())
+    }
+
+    pub fn email_enabled(&self) -> bool {
+        self.email
+            .as_ref()
+            .is_some_and(|e| !e.smtp_host.trim().is_empty() && !e.recipients.is_empty())
+    }
 }

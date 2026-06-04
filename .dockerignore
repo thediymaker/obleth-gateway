@@ -1,0 +1,27 @@
+# Keep the Docker build context small. The obleth image builds from the repo
+# root (it needs obleth/ + schema/), so without this every crate's target/
+# directory (tens of GB of Rust artifacts) would be uploaded as build context.
+
+# Rust build artifacts (rebuilt inside the image)
+**/target/
+
+# Node / Next.js
+**/node_modules/
+**/.next/
+**/npm-debug.log
+
+# VCS / editor / OS
+.git/
+.gitignore
+**/.DS_Store
+**/.idea/
+**/.vscode/
+
+# Local env + secrets (never bake into an image)
+**/.env
+**/.env.*
+!**/.env.example
+
+# Misc
+**/*.log
+bench/

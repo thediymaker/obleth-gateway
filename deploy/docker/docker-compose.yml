@@ -92,7 +92,10 @@ services:
       OBLETH_ADMIN_TOKEN: ${OBLETH_ADMIN_TOKEN:?set OBLETH_ADMIN_TOKEN in deploy/docker/.env (copy from .env.example)}
       # Encrypt upstream secrets at rest (base64 of 32 bytes). Empty = plaintext.
       OBLETH_ENCRYPTION_KEY: ${OBLETH_ENCRYPTION_KEY:-}
-      # SSRF allowlist for admin-registered upstream URLs (comma-separated CIDRs).
+      # SSRF: private/LAN/loopback upstreams are allowed by default (local-first).
+      # Set OBLETH_BLOCK_PRIVATE_NETWORKS=1 for strict mode; then list trusted
+      # internal ranges in OBLETH_ALLOWED_PRIVATE_CIDRS (comma-separated CIDRs).
+      OBLETH_BLOCK_PRIVATE_NETWORKS: ${OBLETH_BLOCK_PRIVATE_NETWORKS:-}
       OBLETH_ALLOWED_PRIVATE_CIDRS: ${OBLETH_ALLOWED_PRIVATE_CIDRS:-}
       # Optional server-side pepper mixed into API-key hashes.
       OBLETH_API_KEY_PEPPER: ${OBLETH_API_KEY_PEPPER:-}

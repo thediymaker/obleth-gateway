@@ -24,11 +24,53 @@ create table if not exists tenants (
     -- optional per-tenant in-flight cap; null = only the global limit applies
     max_in_flight     bigint,
     fairshare_group   text not null default 'default' references fairshare_groups (name),
+    -- free-text operator note plus optional grouping/contact metadata
+    description       text not null default '',
+    organization      text not null default '',
+    contact_email     text not null default '',
+    -- lifecycle: active (normal), suspended (temporarily blocked), archived
+    -- (retired but preserved). Only 'active' tenants admit traffic.
+    status            text not null default 'active',
+    -- scheduling: IANA timezone the windows/cutoffs are evaluated in, an
+    -- optional activation start and expiry cutoff, and optional recurring
+    -- weekly windows (jsonb array of {day:0-6 (0=Sunday), start_min, end_min}).
+    -- null active_from/active_until = no bound; null/empty weekly_windows = any time.
+    timezone          text not null default 'UTC',
+    active_from        timestamptz,
+    active_until       timestamptz,
+    weekly_windows     jsonb,
+    -- term budget cap: an optional cumulative token and/or USD-cost ceiling over
+    -- a rolling period (lifetime | monthly | term). budget_started_at marks when
+    -- the current term began; changing it (or a monthly roll) resets usage.
+    budget_tokens      bigint,
+    budget_cost_usd    double precision,
+    budget_period      text,
+    budget_started_at  timestamptz,
+    -- optional per-tenant model allowlist (jsonb array of model_name strings).
+    -- null/empty = every registered model is permitted.
+    allowed_models     jsonb,
     created_at        timestamptz not null default now(),
     updated_at        timestamptz not null default now()
 );
 
 create index if not exists tenants_fairshare_group_idx on tenants (fairshare_group);
+
+-- Idempotent column adds for databases provisioned before these fields existed.
+alter table tenants add column if not exists description text not null default '';
+alter table tenants add column if not exists organization text not null default '';
+alter table tenants add column if not exists contact_email text not null default '';
+alter table tenants add column if not exists status text not null default 'active';
+alter table tenants add column if not exists timezone text not null default 'UTC';
+alter table tenants add column if not exists active_from timestamptz;
+alter table tenants add column if not exists active_until timestamptz;
+alter table tenants add column if not exists weekly_windows jsonb;
+alter table tenants add column if not exists budget_tokens bigint;
+alter table tenants add column if not exists budget_cost_usd double precision;
+alter table tenants add column if not exists budget_period text;
+alter table tenants add column if not exists budget_started_at timestamptz;
+alter table tenants add column if not exists allowed_models jsonb;
+
+create index if not exists tenants_status_idx on tenants (status) where status <> 'active';
 
 create table if not exists api_keys (
     id          uuid primary key,
@@ -138,3 +180,11 @@ create table if not exists mcp_servers (
 );
 
 create index if not exists mcp_servers_enabled_idx on mcp_servers (enabled) where enabled = true;
+
+-- Runtime-editable application settings (alerting config, etc.). Single row per
+-- key, value held as JSON so new fields don't require migrations.
+create table if not exists app_settings (
+    key        text primary key,
+    value      jsonb not null,
+    updated_at timestamptz not null default now()
+);

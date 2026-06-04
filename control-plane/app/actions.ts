@@ -1,8 +1,16 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
-import { obleth } from "@/lib/obleth";
+import { obleth, OblethApiError } from "@/lib/obleth";
+import type { UpdateAlertSettings } from "@/lib/obleth";
 import { requireSession } from "@/lib/auth/session";
+
+export type ActionResult = { ok: true } | { ok: false; error: string };
+
+function actionError(e: unknown): ActionResult {
+  if (e instanceof OblethApiError) return { ok: false, error: e.message };
+  return { ok: false, error: e instanceof Error ? e.message : "Unexpected error" };
+}
 
 export async function createTenantAction(formData: FormData) {
   await requireSession();
@@ -15,6 +23,99 @@ export async function createTenantAction(formData: FormData) {
     max_in_flight: numOrUndef(formData.get("max_in_flight")),
   });
   revalidatePath("/tenants");
+  revalidatePath("/");
+}
+
+export async function updateTenantAction(formData: FormData) {
+  await requireSession();
+  const id = String(formData.get("id") ?? "").trim();
+  const name = String(formData.get("name") ?? "").trim();
+  if (!id || !name) return;
+  await obleth.updateTenant(id, {
+    name,
+    description: String(formData.get("description") ?? "").trim(),
+    organization: String(formData.get("organization") ?? "").trim(),
+    contact_email: String(formData.get("contact_email") ?? "").trim(),
+  });
+  revalidatePath("/tenants");
+  revalidatePath("/");
+}
+
+export async function setTenantStatusAction(id: string, status: string) {
+  await requireSession();
+  if (!id) return;
+  await obleth.setTenantStatus(id, status);
+  revalidatePath("/tenants");
+  revalidatePath("/fairshare");
+  revalidatePath("/");
+}
+
+export async function setTenantScheduleAction(
+  id: string,
+  body: {
+    timezone: string;
+    active_from?: string | null;
+    active_until?: string | null;
+    weekly_windows?: { day: number; start_min: number; end_min: number }[] | null;
+  },
+): Promise<ActionResult> {
+  await requireSession();
+  if (!id) return { ok: false, error: "Missing tenant id" };
+  try {
+    await obleth.setTenantSchedule(id, body);
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/tenants");
+  revalidatePath("/fairshare");
+  revalidatePath("/");
+  return { ok: true };
+}
+
+export async function setTenantBudgetAction(
+  id: string,
+  body: {
+    budget_tokens?: number | null;
+    budget_cost_usd?: number | null;
+    budget_period?: string | null;
+    budget_started_at?: string | null;
+  },
+): Promise<ActionResult> {
+  await requireSession();
+  if (!id) return { ok: false, error: "Missing tenant id" };
+  try {
+    await obleth.setTenantBudget(id, body);
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/tenants");
+  revalidatePath("/");
+  return { ok: true };
+}
+
+export async function setTenantAllowlistAction(
+  id: string,
+  allowed_models: string[],
+): Promise<ActionResult> {
+  await requireSession();
+  if (!id) return { ok: false, error: "Missing tenant id" };
+  try {
+    await obleth.setTenantAllowlist(id, allowed_models);
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/tenants");
+  revalidatePath("/");
+  return { ok: true };
+}
+
+export async function deleteTenantAction(id: string) {
+  await requireSession();
+  if (!id) return;
+  await obleth.deleteTenant(id);
+  revalidatePath("/tenants");
+  revalidatePath("/keys");
+  revalidatePath("/fairshare");
   revalidatePath("/");
 }
 
@@ -108,25 +209,30 @@ export async function setCapacityAction(max: number) {
   revalidatePath("/fairshare");
 }
 
-export async function createModelAction(formData: FormData) {
+export async function createModelAction(formData: FormData): Promise<ActionResult> {
   await requireSession();
-  await obleth.createModel({
-    model_name: String(formData.get("model_name") ?? "").trim(),
-    description: String(formData.get("description") ?? "").trim(),
-    upstream_model: String(formData.get("upstream_model") ?? "").trim(),
-    api_base: String(formData.get("api_base") ?? "").trim(),
-    api_key: strOrNull(formData.get("api_key")),
-    input_cost_per_token: numOr(formData.get("input_cost_per_token"), 0),
-    output_cost_per_token: numOr(formData.get("output_cost_per_token"), 0),
-    context_window: numOr(formData.get("context_window"), 8192),
-    admission_weight: numOr(formData.get("admission_weight"), 100),
-    max_in_flight: numOrNull(formData.get("max_in_flight")),
-    supports_function_calling: formData.get("supports_function_calling") === "on",
-    supports_system_messages: formData.get("supports_system_messages") === "on",
-    supports_response_schema: formData.get("supports_response_schema") === "on",
-    supports_tool_choice: formData.get("supports_tool_choice") === "on",
-  });
+  try {
+    await obleth.createModel({
+      model_name: String(formData.get("model_name") ?? "").trim(),
+      description: String(formData.get("description") ?? "").trim(),
+      upstream_model: String(formData.get("upstream_model") ?? "").trim(),
+      api_base: String(formData.get("api_base") ?? "").trim(),
+      api_key: strOrNull(formData.get("api_key")),
+      input_cost_per_token: numOr(formData.get("input_cost_per_token"), 0),
+      output_cost_per_token: numOr(formData.get("output_cost_per_token"), 0),
+      context_window: numOr(formData.get("context_window"), 8192),
+      admission_weight: numOr(formData.get("admission_weight"), 100),
+      max_in_flight: numOrNull(formData.get("max_in_flight")),
+      supports_function_calling: formData.get("supports_function_calling") === "on",
+      supports_system_messages: formData.get("supports_system_messages") === "on",
+      supports_response_schema: formData.get("supports_response_schema") === "on",
+      supports_tool_choice: formData.get("supports_tool_choice") === "on",
+    });
+  } catch (e) {
+    return actionError(e);
+  }
   revalidatePath("/models");
+  return { ok: true };
 }
 
 export async function setModelCapacityAction(id: string, max_in_flight: number | null) {
@@ -206,17 +312,24 @@ export async function setModelHealthConfigAction(formData: FormData) {
   revalidatePath("/models");
 }
 
-export async function createMcpServerAction(formData: FormData) {
+export async function createMcpServerAction(formData: FormData): Promise<ActionResult> {
   await requireSession();
   const name = String(formData.get("name") ?? "").trim();
   const upstream_url = String(formData.get("upstream_url") ?? "").trim();
-  if (!name || !upstream_url) return;
-  await obleth.createMcpServer({
-    name,
-    upstream_url,
-    auth_header: strOrNull(formData.get("auth_header")),
-  });
+  if (!name || !upstream_url) {
+    return { ok: false, error: "Name and upstream URL are required." };
+  }
+  try {
+    await obleth.createMcpServer({
+      name,
+      upstream_url,
+      auth_header: strOrNull(formData.get("auth_header")),
+    });
+  } catch (e) {
+    return actionError(e);
+  }
   revalidatePath("/mcp");
+  return { ok: true };
 }
 
 export async function toggleMcpServerAction(id: string, upstreamUrl: string, enabled: boolean) {
@@ -229,6 +342,31 @@ export async function deleteMcpServerAction(id: string) {
   await requireSession();
   await obleth.deleteMcpServer(id);
   revalidatePath("/mcp");
+}
+
+export async function setAlertSettingsAction(
+  body: UpdateAlertSettings,
+): Promise<ActionResult> {
+  await requireSession();
+  try {
+    await obleth.setAlertSettings(body);
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/settings");
+  return { ok: true };
+}
+
+export async function testAlertAction(): Promise<
+  ActionResult & { results?: { channel: string; ok: boolean; detail: string }[] }
+> {
+  await requireSession();
+  try {
+    const res = await obleth.testAlert();
+    return { ok: true, results: res.results };
+  } catch (e) {
+    return actionError(e);
+  }
 }
 
 async function deleteKeys(ids: string[]): Promise<{ deleted: number; failed: number }> {

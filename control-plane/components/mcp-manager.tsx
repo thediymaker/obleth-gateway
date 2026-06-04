@@ -1,6 +1,6 @@
 "use client";
 
-import { useTransition } from "react";
+import { useRef, useState, useTransition } from "react";
 import { Trash2 } from "lucide-react";
 import {
   createMcpServerAction,
@@ -16,10 +16,24 @@ import type { McpServer } from "@/lib/obleth";
 
 export function McpManager({ servers }: { servers: McpServer[] }) {
   const [pending, start] = useTransition();
+  const [createError, setCreateError] = useState<string | null>(null);
+  const createFormRef = useRef<HTMLFormElement>(null);
 
   function removeServer(server: McpServer) {
     if (!window.confirm(`Remove MCP server "${server.name}"? This cannot be undone.`)) return;
     start(() => deleteMcpServerAction(server.id));
+  }
+
+  function submitServer(formData: FormData) {
+    setCreateError(null);
+    start(async () => {
+      const result = await createMcpServerAction(formData);
+      if (result.ok) {
+        createFormRef.current?.reset();
+      } else {
+        setCreateError(result.error);
+      }
+    });
   }
 
   return (
@@ -35,7 +49,8 @@ export function McpManager({ servers }: { servers: McpServer[] }) {
         </CardHeader>
         <CardContent>
           <form
-            action={(fd) => start(() => createMcpServerAction(fd))}
+            ref={createFormRef}
+            action={submitServer}
             className="grid gap-4 md:grid-cols-2"
           >
             <Field label="Name (path segment)" name="name" placeholder="github" required />
@@ -58,6 +73,11 @@ export function McpManager({ servers }: { servers: McpServer[] }) {
                 {pending ? "Adding…" : "Register server"}
               </Button>
             </div>
+            {createError && (
+              <p className="md:col-span-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {createError}
+              </p>
+            )}
           </form>
         </CardContent>
       </Card>

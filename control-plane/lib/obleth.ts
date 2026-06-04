@@ -15,6 +15,12 @@ function adminToken(): string {
   return token;
 }
 
+export interface WeeklyWindow {
+  day: number; // 0=Sunday .. 6=Saturday
+  start_min: number; // minutes from local midnight
+  end_min: number;
+}
+
 export interface Tenant {
   id: string;
   name: string;
@@ -22,6 +28,19 @@ export interface Tenant {
   weight: number;
   tokens_per_minute: number;
   max_in_flight: number | null;
+  description: string;
+  organization: string;
+  contact_email: string;
+  status: string;
+  timezone: string;
+  active_from: string | null;
+  active_until: string | null;
+  weekly_windows: WeeklyWindow[] | null;
+  budget_tokens: number | null;
+  budget_cost_usd: number | null;
+  budget_period: string | null;
+  budget_started_at: string | null;
+  allowed_models: string[] | null;
   created_at: string;
   updated_at: string;
 }
@@ -230,6 +249,63 @@ export interface AuditEntry {
   detail: unknown;
 }
 
+export interface EmailSettingsView {
+  smtp_host: string;
+  smtp_port: number;
+  username: string | null;
+  password_set: boolean;
+  from_address: string;
+  recipients: string[];
+  starttls: boolean;
+}
+
+export interface AlertSettingsView {
+  slack_webhook_set: boolean;
+  min_interval_secs: number;
+  email: EmailSettingsView | null;
+}
+
+export interface UpdateEmailSettings {
+  smtp_host: string;
+  smtp_port: number;
+  username?: string | null;
+  smtp_password?: string | null;
+  clear_smtp_password?: boolean;
+  from_address: string;
+  recipients: string[];
+  starttls: boolean;
+}
+
+export interface UpdateAlertSettings {
+  slack_webhook_url?: string | null;
+  clear_slack_webhook?: boolean;
+  min_interval_secs?: number;
+  email?: UpdateEmailSettings | null;
+}
+
+export interface ChannelResult {
+  channel: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface TestAlertResult {
+  results: ChannelResult[];
+}
+
+/// Error thrown when the management API responds with a non-2xx status. Carries
+/// the parsed `error` message so the UI can display something actionable.
+export class OblethApiError extends Error {
+  constructor(
+    public readonly status: number,
+    message: string,
+    public readonly path: string,
+  ) {
+    super(message);
+    this.name = "OblethApiError";
+  }
+}
+
 async function api<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${BASE}/api/v1${path}`, {
     ...init,
@@ -242,7 +318,17 @@ async function api<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     const text = await res.text().catch(() => "");
-    throw new Error(`obleth api ${path} -> ${res.status}: ${text}`);
+    // The management API returns errors as `{"error": "..."}`. Surface that
+    // message directly so callers (and the UI) get something actionable instead
+    // of a raw status dump.
+    let message = text;
+    try {
+      const parsed = JSON.parse(text);
+      if (parsed && typeof parsed.error === "string") message = parsed.error;
+    } catch {
+      // Non-JSON body; fall back to the raw text.
+    }
+    throw new OblethApiError(res.status, message || `request failed with status ${res.status}`, path);
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
@@ -272,6 +358,49 @@ export const obleth = {
       method: "PUT",
       body: JSON.stringify({ tokens_per_minute, max_in_flight }),
     }),
+  updateTenant: (
+    id: string,
+    body: {
+      name: string;
+      description?: string;
+      organization?: string;
+      contact_email?: string;
+    },
+  ) => api<Tenant>(`/tenants/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  setTenantStatus: (id: string, status: string) =>
+    api<Tenant>(`/tenants/${id}/status`, { method: "PATCH", body: JSON.stringify({ status }) }),
+  setTenantSchedule: (
+    id: string,
+    body: {
+      timezone: string;
+      active_from?: string | null;
+      active_until?: string | null;
+      weekly_windows?: WeeklyWindow[] | null;
+    },
+  ) =>
+    api<Tenant>(`/tenants/${id}/schedule`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  setTenantBudget: (
+    id: string,
+    body: {
+      budget_tokens?: number | null;
+      budget_cost_usd?: number | null;
+      budget_period?: string | null;
+      budget_started_at?: string | null;
+    },
+  ) =>
+    api<Tenant>(`/tenants/${id}/budget`, {
+      method: "PATCH",
+      body: JSON.stringify(body),
+    }),
+  setTenantAllowlist: (id: string, allowed_models: string[]) =>
+    api<Tenant>(`/tenants/${id}/allowlist`, {
+      method: "PATCH",
+      body: JSON.stringify({ allowed_models }),
+    }),
+  deleteTenant: (id: string) => api<void>(`/tenants/${id}`, { method: "DELETE" }),
   listKeys: (tenantId?: string) =>
     api<ApiKey[]>(`/keys${tenantId ? `?tenant_id=${tenantId}` : ""}`),
   createKey: (tenantId: string, name: string) =>
@@ -341,4 +470,11 @@ export const obleth = {
       method: "PUT",
       body: JSON.stringify({ max_in_flight }),
     }),
+  getAlertSettings: () => api<AlertSettingsView>("/settings/alerts"),
+  setAlertSettings: (body: UpdateAlertSettings) =>
+    api<AlertSettingsView>("/settings/alerts", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  testAlert: () => api<TestAlertResult>("/settings/alerts/test", { method: "POST" }),
 };

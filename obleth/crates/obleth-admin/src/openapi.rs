@@ -5,10 +5,17 @@ use utoipa::OpenApi;
 use crate::model_health::{BulkModelHealthResult, UpdateModelHealthConfig};
 use crate::usage::UsageAgg;
 use crate::{
-    CapacityView, CreateKey, CreateTenant, CreatedKey, SetCapacity, SetDisabled, UpdateQuota,
-    UpdateWeight,
+    CapacityView, CreateKey, CreateTenant, CreatedKey, SetCapacity, SetDisabled,
+    SetTenantAllowlist, SetTenantBudget, SetTenantSchedule, SetTenantStatus, UpdateQuota,
+    UpdateTenant, UpdateWeight,
 };
-use obleth_config::{ApiKey, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, Tenant};
+use crate::{
+    AlertSettingsView, EmailSettingsView, TestAlertResult, UpdateAlertSettings,
+    UpdateEmailSettings,
+};
+use obleth_config::{
+    ApiKey, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, Tenant, WeeklyWindow,
+};
 
 #[derive(OpenApi)]
 #[openapi(
@@ -20,9 +27,18 @@ use obleth_config::{ApiKey, ModelHealthCheck, ModelHealthDetail, ModelHealthSumm
     paths(
         crate::create_tenant,
         crate::list_tenants,
+        crate::update_tenant,
+        crate::patch_tenant_status,
+        crate::patch_tenant_schedule,
+        crate::patch_tenant_budget,
+        crate::patch_tenant_allowlist,
+        crate::delete_tenant,
         crate::patch_weight,
         crate::create_key,
         crate::get_usage,
+        crate::get_alert_settings,
+        crate::put_alert_settings,
+        crate::test_alert_settings,
         crate::model_health::list_health,
         crate::model_health::get_health,
         crate::model_health::check_one,
@@ -38,6 +54,12 @@ use obleth_config::{ApiKey, ModelHealthCheck, ModelHealthDetail, ModelHealthSumm
         UpdateModelHealthConfig,
         BulkModelHealthResult,
         CreateTenant,
+        UpdateTenant,
+        SetTenantStatus,
+        SetTenantSchedule,
+        SetTenantBudget,
+        SetTenantAllowlist,
+        WeeklyWindow,
         UpdateWeight,
         UpdateQuota,
         CreateKey,
@@ -46,11 +68,18 @@ use obleth_config::{ApiKey, ModelHealthCheck, ModelHealthDetail, ModelHealthSumm
         SetCapacity,
         CapacityView,
         UsageAgg,
+        AlertSettingsView,
+        EmailSettingsView,
+        UpdateAlertSettings,
+        UpdateEmailSettings,
+        TestAlertResult,
+        crate::alerts::ChannelResult,
     )),
     tags(
         (name = "tenants", description = "Tenant + fairshare weight management"),
         (name = "keys", description = "API key lifecycle"),
-        (name = "usage", description = "Usage and cost analytics")
+        (name = "usage", description = "Usage and cost analytics"),
+        (name = "settings", description = "Runtime alerting configuration")
     )
 )]
 pub struct ApiDoc;

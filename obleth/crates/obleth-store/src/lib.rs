@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use obleth_config::{
     generate_api_key, ApiKey, FairshareGroup, McpServer, ModelHealthCheck, ModelHealthDetail,
     ModelHealthSummary, ModelRoute, ResolvedKey, ResolvedMcpServer, ResolvedModel, Tenant,
+    WeeklyWindow,
 };
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
@@ -116,7 +117,7 @@ impl Store {
     ) -> Result<Tenant> {
         let row = sqlx::query(
             "update tenants set fairshare_group = $2, updated_at = now() where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, created_at, updated_at",
         )
         .bind(id)
         .bind(fairshare_group)
@@ -140,7 +141,7 @@ impl Store {
         let row = sqlx::query(
             "insert into tenants (id, name, fairshare_group, weight, tokens_per_minute, max_in_flight)
              values ($1, $2, $3, $4, $5, $6)
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, created_at, updated_at",
         )
         .bind(Uuid::new_v4())
         .bind(name)
@@ -155,7 +156,7 @@ impl Store {
 
     pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
         let rows = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, created_at, updated_at
              from tenants order by created_at",
         )
         .fetch_all(&self.pool)
@@ -165,7 +166,7 @@ impl Store {
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Tenant> {
         let row = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, created_at, updated_at
              from tenants where id = $1",
         )
         .bind(id)
@@ -178,7 +179,7 @@ impl Store {
     pub async fn update_tenant_weight(&self, id: Uuid, weight: i64) -> Result<Tenant> {
         let row = sqlx::query(
             "update tenants set weight = $2, updated_at = now() where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, created_at, updated_at",
         )
         .bind(id)
         .bind(weight.max(1))
@@ -197,7 +198,7 @@ impl Store {
         let row = sqlx::query(
             "update tenants set tokens_per_minute = $2, max_in_flight = $3, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, created_at, updated_at",
         )
         .bind(id)
         .bind(tokens_per_minute.max(0))
@@ -206,6 +207,150 @@ impl Store {
         .await?
         .ok_or(StoreError::NotFound)?;
         tenant_from_row(&row)
+    }
+
+    /// Update the editable directory fields (name + metadata) of a tenant.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_tenant_details(
+        &self,
+        id: Uuid,
+        name: &str,
+        description: &str,
+        organization: &str,
+        contact_email: &str,
+    ) -> Result<Tenant> {
+        let row = sqlx::query(
+            "update tenants set name = $2, description = $3, organization = $4,
+                    contact_email = $5, updated_at = now()
+             where id = $1
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(description)
+        .bind(organization)
+        .bind(contact_email)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        tenant_from_row(&row)
+    }
+
+    /// Set a tenant's lifecycle status (`active`, `suspended`, `archived`).
+    pub async fn set_tenant_status(&self, id: Uuid, status: &str) -> Result<Tenant> {
+        let row = sqlx::query(
+            "update tenants set status = $2, updated_at = now() where id = $1
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(status)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        tenant_from_row(&row)
+    }
+
+    /// Update a tenant's schedule: timezone, optional activation/expiry instants,
+    /// and optional recurring weekly windows. Passing an empty window list clears
+    /// the recurring schedule (stored as SQL null).
+    pub async fn update_tenant_schedule(
+        &self,
+        id: Uuid,
+        timezone: &str,
+        active_from: Option<DateTime<Utc>>,
+        active_until: Option<DateTime<Utc>>,
+        weekly_windows: Option<Vec<WeeklyWindow>>,
+    ) -> Result<Tenant> {
+        let windows = weekly_windows
+            .filter(|w| !w.is_empty())
+            .map(sqlx::types::Json);
+        let row = sqlx::query(
+            "update tenants set timezone = $2, active_from = $3, active_until = $4,
+                    weekly_windows = $5, updated_at = now()
+             where id = $1
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(timezone)
+        .bind(active_from)
+        .bind(active_until)
+        .bind(windows)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        tenant_from_row(&row)
+    }
+
+    /// Set a tenant's term budget: optional token and/or USD-cost caps, the reset
+    /// period (`lifetime`/`monthly`/`term`), and the term start instant. Passing
+    /// `None` caps clears the corresponding ceiling.
+    pub async fn update_tenant_budget(
+        &self,
+        id: Uuid,
+        budget_tokens: Option<i64>,
+        budget_cost_usd: Option<f64>,
+        budget_period: Option<&str>,
+        budget_started_at: Option<DateTime<Utc>>,
+    ) -> Result<Tenant> {
+        let row = sqlx::query(
+            "update tenants set budget_tokens = $2, budget_cost_usd = $3, budget_period = $4,
+                    budget_started_at = $5, updated_at = now()
+             where id = $1
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(budget_tokens)
+        .bind(budget_cost_usd)
+        .bind(budget_period)
+        .bind(budget_started_at)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        tenant_from_row(&row)
+    }
+
+    /// Set a tenant's model allowlist. An empty list clears the allowlist (stored
+    /// as SQL null), meaning every registered model is permitted.
+    pub async fn update_tenant_allowlist(
+        &self,
+        id: Uuid,
+        allowed_models: Option<Vec<String>>,
+    ) -> Result<Tenant> {
+        let allowed = allowed_models
+            .filter(|m| !m.is_empty())
+            .map(sqlx::types::Json);
+        let row = sqlx::query(
+            "update tenants set allowed_models = $2, updated_at = now()
+             where id = $1
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(allowed)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        tenant_from_row(&row)
+    }
+
+    /// Hard-delete a tenant. Cascades to its API keys (FK `on delete cascade`).
+    /// Returns the key hashes that were removed so callers can evict caches.
+    pub async fn delete_tenant(&self, id: Uuid) -> Result<Vec<String>> {
+        let hashes: Vec<String> =
+            sqlx::query("select key_hash from api_keys where tenant_id = $1")
+                .bind(id)
+                .fetch_all(&self.pool)
+                .await?
+                .iter()
+                .map(|r| r.try_get::<String, _>("key_hash"))
+                .collect::<std::result::Result<_, _>>()?;
+        let res = sqlx::query("delete from tenants where id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        if res.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(hashes)
     }
 
     // ---- api keys --------------------------------------------------------
@@ -284,7 +429,9 @@ impl Store {
         let row = sqlx::query(
             "select k.id as key_id, k.tenant_id, k.disabled,
                     t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
-                    t.weight, t.tokens_per_minute, t.max_in_flight
+                    t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
+                    t.timezone, t.active_from, t.active_until, t.weekly_windows,
+                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at, t.allowed_models
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group
@@ -301,7 +448,9 @@ impl Store {
         let rows = sqlx::query(
             "select k.key_hash, k.id as key_id, k.tenant_id, k.disabled,
                     t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
-                    t.weight, t.tokens_per_minute, t.max_in_flight
+                    t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
+                    t.timezone, t.active_from, t.active_until, t.weekly_windows,
+                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at, t.allowed_models
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group",
@@ -322,7 +471,9 @@ impl Store {
         let rows = sqlx::query(
             "select k.key_hash, k.id as key_id, k.tenant_id, k.disabled,
                     t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
-                    t.weight, t.tokens_per_minute, t.max_in_flight
+                    t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
+                    t.timezone, t.active_from, t.active_until, t.weekly_windows,
+                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at, t.allowed_models
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group
@@ -593,7 +744,7 @@ impl Store {
     pub async fn all_resolved_models(&self) -> Result<Vec<(String, ResolvedModel)>> {
         let rows = sqlx::query(
             "select model_name, upstream_model, api_base, api_key, admission_weight, max_in_flight, enabled,
-                    cache_enabled, cache_ttl_secs
+                    cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token
              from models where enabled = true",
         )
         .fetch_all(&self.pool)
@@ -615,6 +766,8 @@ impl Store {
                         enabled: row.try_get("enabled")?,
                         cache_enabled: row.try_get("cache_enabled")?,
                         cache_ttl_secs: row.try_get("cache_ttl_secs")?,
+                        input_cost_per_token: row.try_get("input_cost_per_token")?,
+                        output_cost_per_token: row.try_get("output_cost_per_token")?,
                     },
                 ))
             })
@@ -1019,6 +1172,36 @@ impl Store {
             })
             .collect()
     }
+
+    /// Load the persisted alert settings, or `None` if none have been saved.
+    pub async fn get_alert_settings(&self) -> Result<Option<obleth_config::AlertSettings>> {
+        let row = sqlx::query("select value from app_settings where key = 'alerts'")
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => {
+                let value: sqlx::types::Json<obleth_config::AlertSettings> = row.try_get("value")?;
+                Ok(Some(value.0))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the alert settings (upsert on the single `alerts` key).
+    pub async fn put_alert_settings(
+        &self,
+        settings: &obleth_config::AlertSettings,
+    ) -> Result<()> {
+        sqlx::query(
+            "insert into app_settings (key, value, updated_at)
+             values ('alerts', $1, now())
+             on conflict (key) do update set value = excluded.value, updated_at = now()",
+        )
+        .bind(sqlx::types::Json(settings))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// A single audit-log entry.
@@ -1070,9 +1253,36 @@ fn tenant_from_row(row: &PgRow) -> Result<Tenant> {
         weight: row.try_get("weight")?,
         tokens_per_minute: row.try_get("tokens_per_minute")?,
         max_in_flight: row.try_get("max_in_flight")?,
+        description: row.try_get("description")?,
+        organization: row.try_get("organization")?,
+        contact_email: row.try_get("contact_email")?,
+        status: row.try_get("status")?,
+        timezone: row.try_get("timezone")?,
+        active_from: row.try_get("active_from")?,
+        active_until: row.try_get("active_until")?,
+        weekly_windows: weekly_windows_from_row(row)?,
+        budget_tokens: row.try_get("budget_tokens")?,
+        budget_cost_usd: row.try_get("budget_cost_usd")?,
+        budget_period: row.try_get("budget_period")?,
+        budget_started_at: row.try_get("budget_started_at")?,
+        allowed_models: allowed_models_from_row(row)?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+/// Decode the optional `weekly_windows` jsonb column. A SQL `null` or an empty
+/// array both collapse to `None` (meaning "any time of week").
+fn weekly_windows_from_row(row: &PgRow) -> Result<Option<Vec<WeeklyWindow>>> {
+    let json: Option<sqlx::types::Json<Vec<WeeklyWindow>>> = row.try_get("weekly_windows")?;
+    Ok(json.map(|j| j.0).filter(|v| !v.is_empty()))
+}
+
+/// Decode the optional `allowed_models` jsonb column. A SQL `null` or empty
+/// array both collapse to `None` (meaning "all models permitted").
+fn allowed_models_from_row(row: &PgRow) -> Result<Option<Vec<String>>> {
+    let json: Option<sqlx::types::Json<Vec<String>>> = row.try_get("allowed_models")?;
+    Ok(json.map(|j| j.0).filter(|v| !v.is_empty()))
 }
 
 fn fairshare_group_from_row(row: &PgRow) -> Result<FairshareGroup> {
@@ -1106,6 +1316,16 @@ fn resolved_from_row(row: &PgRow) -> Result<ResolvedKey> {
         tokens_per_minute: row.try_get("tokens_per_minute")?,
         max_in_flight: row.try_get("max_in_flight")?,
         disabled: row.try_get("disabled")?,
+        status: row.try_get("status")?,
+        timezone: row.try_get("timezone")?,
+        active_from: row.try_get("active_from")?,
+        active_until: row.try_get("active_until")?,
+        weekly_windows: weekly_windows_from_row(row)?,
+        budget_tokens: row.try_get("budget_tokens")?,
+        budget_cost_usd: row.try_get("budget_cost_usd")?,
+        budget_period: row.try_get("budget_period")?,
+        budget_started_at: row.try_get("budget_started_at")?,
+        allowed_models: allowed_models_from_row(row)?,
         internal: false,
     })
 }

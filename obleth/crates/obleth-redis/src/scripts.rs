@@ -64,3 +64,49 @@ if tokens < -cap then tokens = -cap end
 redis.call('HSET', key, 'tokens', tokens)
 return math.floor(tokens)
 "#;
+
+/// Read a tenant's cumulative term usage, rolling the period if it changed.
+///
+/// KEYS[1] = term-usage key
+/// ARGV[1] = period_key (opaque string identifying the current term/month)
+///
+/// If the stored period differs from the supplied one, the counters reset to
+/// zero before the read. Returns `{tokens, cost_string}`.
+pub const TERM_USAGE_READ: &str = r#"
+local key    = KEYS[1]
+local period = ARGV[1]
+
+local stored = redis.call('HGET', key, 'period')
+if stored ~= period then
+  redis.call('DEL', key)
+  redis.call('HSET', key, 'period', period)
+end
+local tokens = tonumber(redis.call('HGET', key, 'tokens')) or 0
+local cost   = redis.call('HGET', key, 'cost') or '0'
+return { tokens, cost }
+"#;
+
+/// Add observed usage to a tenant's cumulative term counters, rolling first.
+///
+/// KEYS[1] = term-usage key
+/// ARGV[1] = period_key
+/// ARGV[2] = add_tokens
+/// ARGV[3] = add_cost (USD)
+///
+/// Returns `{tokens_after, cost_after_string}`.
+pub const TERM_USAGE_ADD: &str = r#"
+local key    = KEYS[1]
+local period = ARGV[1]
+
+local stored = redis.call('HGET', key, 'period')
+if stored ~= period then
+  redis.call('DEL', key)
+  redis.call('HSET', key, 'period', period)
+end
+local tokens = redis.call('HINCRBY', key, 'tokens', tonumber(ARGV[2]))
+local cost   = redis.call('HINCRBYFLOAT', key, 'cost', tonumber(ARGV[3]))
+-- safety expiry so abandoned tenants don't linger forever (refreshed on use)
+redis.call('PEXPIRE', key, 31536000000)
+return { tokens, cost }
+"#;
+

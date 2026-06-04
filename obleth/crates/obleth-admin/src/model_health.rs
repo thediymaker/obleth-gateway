@@ -290,6 +290,16 @@ async fn gateway_health_probe(state: &AdminState, model: &ModelRoute) -> ProbeRe
         tokens_per_minute: 1_000_000,
         max_in_flight: Some(1),
         disabled: false,
+        status: "active".to_string(),
+        timezone: "UTC".to_string(),
+        active_from: None,
+        active_until: None,
+        weekly_windows: None,
+        budget_tokens: None,
+        budget_cost_usd: None,
+        budget_period: None,
+        budget_started_at: None,
+        allowed_models: None,
         internal: true,
     };
 

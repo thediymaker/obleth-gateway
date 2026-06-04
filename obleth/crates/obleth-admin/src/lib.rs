@@ -7,6 +7,7 @@
 //! endpoints.
 
 mod error;
+pub mod alerts;
 pub mod model_health;
 mod openapi;
 pub mod ssrf;
@@ -24,6 +25,7 @@ use obleth_config::{
     hash_api_key, ApiKey, FairshareGroup, McpServer, ModelRoute, ResolvedKey, ResolvedMcpServer,
     ResolvedModel, Tenant,
 };
+use obleth_config::{AlertSettings, EmailSettings};
 use obleth_fairshare::{FairShare, StaticCapacity, Stats};
 use obleth_redis::RedisStore;
 use obleth_store::{AuditEntry, Store};
@@ -33,6 +35,7 @@ use utoipa::ToSchema;
 use uuid::Uuid;
 
 pub use error::AdminError;
+pub use alerts::AlertDispatcher;
 pub use model_health::{AlertSink, ModelHealthRuntime};
 pub use openapi::ApiDoc;
 
@@ -51,6 +54,8 @@ pub struct AdminState {
     pub health: ModelHealthRuntime,
     /// SSRF allowlist policy applied to admin-supplied upstream URLs.
     pub ssrf: ssrf::SsrfPolicy,
+    /// Runtime-reloadable alert dispatcher shared with the data plane.
+    pub alerts: AlertDispatcher,
 }
 
 /// Build the `/api/v1` router. `/health` and the OpenAPI doc are public; every
@@ -62,7 +67,14 @@ pub fn router(state: AdminState) -> Router {
 
     let protected = Router::new()
         .route("/api/v1/tenants", post(create_tenant).get(list_tenants))
-        .route("/api/v1/tenants/:id", get(get_tenant))
+        .route(
+            "/api/v1/tenants/:id",
+            get(get_tenant).put(update_tenant).delete(delete_tenant),
+        )
+        .route("/api/v1/tenants/:id/status", patch(patch_tenant_status))
+        .route("/api/v1/tenants/:id/schedule", patch(patch_tenant_schedule))
+        .route("/api/v1/tenants/:id/budget", patch(patch_tenant_budget))
+        .route("/api/v1/tenants/:id/allowlist", patch(patch_tenant_allowlist))
         .route("/api/v1/tenants/:id/weight", patch(patch_weight))
         .route("/api/v1/tenants/:id/quota", put(put_quota))
         .route("/api/v1/tenants/:id/keys", post(create_key))
@@ -123,6 +135,11 @@ pub fn router(state: AdminState) -> Router {
         )
         .route("/api/v1/audit", get(get_audit))
         .route("/api/v1/capacity", get(get_capacity).put(set_capacity))
+        .route(
+            "/api/v1/settings/alerts",
+            get(get_alert_settings).put(put_alert_settings),
+        )
+        .route("/api/v1/settings/alerts/test", post(test_alert_settings))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_admin,
@@ -159,6 +176,58 @@ pub struct CreateTenant {
     pub tokens_per_minute: Option<i64>,
     pub max_in_flight: Option<i64>,
     pub fairshare_group: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateTenant {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub organization: String,
+    #[serde(default)]
+    pub contact_email: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetTenantStatus {
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetTenantSchedule {
+    /// IANA timezone the windows/cutoffs are evaluated in (e.g. `America/Phoenix`).
+    #[serde(default = "obleth_config::default_timezone")]
+    pub timezone: String,
+    #[serde(default)]
+    pub active_from: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub active_until: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub weekly_windows: Option<Vec<obleth_config::WeeklyWindow>>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetTenantBudget {
+    /// Cumulative token ceiling for the current term. `null` clears the cap.
+    #[serde(default)]
+    pub budget_tokens: Option<i64>,
+    /// Cumulative USD-cost ceiling for the current term. `null` clears the cap.
+    #[serde(default)]
+    pub budget_cost_usd: Option<f64>,
+    /// Reset period: `lifetime`, `monthly`, or `term`. `null` = lifetime.
+    #[serde(default)]
+    pub budget_period: Option<String>,
+    /// When the current term began (used by `term`/`lifetime` reset semantics).
+    #[serde(default)]
+    pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetTenantAllowlist {
+    /// Permitted model names. An empty list clears the allowlist (all permitted).
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -382,6 +451,467 @@ async fn list_tenants(State(state): State<AdminState>) -> Result<Json<Vec<Tenant
 
 async fn get_tenant(State(state): State<AdminState>, Path(id): Path<Uuid>) -> Result<Json<Tenant>> {
     Ok(Json(state.store.get_tenant(id).await?))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/tenants/{id}", tag = "tenants",
+    request_body = UpdateTenant,
+    responses((status = 200, body = Tenant))
+)]
+async fn update_tenant(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateTenant>,
+) -> Result<Json<Tenant>> {
+    let tenant = state
+        .store
+        .update_tenant_details(
+            id,
+            &body.name,
+            &body.description,
+            &body.organization,
+            &body.contact_email,
+        )
+        .await?;
+    // Name is denormalized into every resolved key; re-push the tenant's keys.
+    sync_tenant_keys(&state, id).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "update_tenant",
+            "tenant",
+            &id.to_string(),
+            serde_json::to_value(&tenant).unwrap_or_default(),
+        )
+        .await?;
+    Ok(Json(tenant))
+}
+
+#[utoipa::path(
+    patch, path = "/api/v1/tenants/{id}/status", tag = "tenants",
+    request_body = SetTenantStatus,
+    responses((status = 200, body = Tenant))
+)]
+async fn patch_tenant_status(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetTenantStatus>,
+) -> Result<Json<Tenant>> {
+    let status = body.status.trim().to_lowercase();
+    if !matches!(status.as_str(), "active" | "suspended" | "archived") {
+        return Err(AdminError::BadRequest(
+            "status must be one of: active, suspended, archived".into(),
+        ));
+    }
+    let tenant = state.store.set_tenant_status(id, &status).await?;
+    // Status gates admission in the data plane; refresh the cached keys.
+    sync_tenant_keys(&state, id).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "set_tenant_status",
+            "tenant",
+            &id.to_string(),
+            serde_json::json!({ "status": status }),
+        )
+        .await?;
+    Ok(Json(tenant))
+}
+
+#[utoipa::path(
+    patch, path = "/api/v1/tenants/{id}/schedule", tag = "tenants",
+    request_body = SetTenantSchedule,
+    responses((status = 200, body = Tenant))
+)]
+async fn patch_tenant_schedule(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetTenantSchedule>,
+) -> Result<Json<Tenant>> {
+    let timezone = body.timezone.trim();
+    if timezone.parse::<chrono_tz::Tz>().is_err() {
+        return Err(AdminError::BadRequest(format!(
+            "unknown timezone '{timezone}'; use an IANA name like 'America/Phoenix' or 'UTC'"
+        )));
+    }
+    if let (Some(from), Some(until)) = (body.active_from, body.active_until) {
+        if until <= from {
+            return Err(AdminError::BadRequest(
+                "active_until must be after active_from".into(),
+            ));
+        }
+    }
+    if let Some(windows) = &body.weekly_windows {
+        for w in windows {
+            if w.day > 6 {
+                return Err(AdminError::BadRequest(
+                    "weekly window day must be 0 (Sunday) through 6 (Saturday)".into(),
+                ));
+            }
+            if w.start_min > 1440 || w.end_min > 1440 || w.start_min >= w.end_min {
+                return Err(AdminError::BadRequest(
+                    "weekly window minutes must satisfy 0 <= start_min < end_min <= 1440".into(),
+                ));
+            }
+        }
+    }
+    let tenant = state
+        .store
+        .update_tenant_schedule(
+            id,
+            timezone,
+            body.active_from,
+            body.active_until,
+            body.weekly_windows,
+        )
+        .await?;
+    // Schedule gates admission in the data plane; refresh the cached keys.
+    sync_tenant_keys(&state, id).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "set_tenant_schedule",
+            "tenant",
+            &id.to_string(),
+            serde_json::json!({
+                "timezone": tenant.timezone,
+                "active_from": tenant.active_from,
+                "active_until": tenant.active_until,
+                "weekly_windows": tenant.weekly_windows,
+            }),
+        )
+        .await?;
+    Ok(Json(tenant))
+}
+
+#[utoipa::path(
+    patch, path = "/api/v1/tenants/{id}/budget", tag = "tenants",
+    request_body = SetTenantBudget,
+    responses((status = 200, body = Tenant))
+)]
+async fn patch_tenant_budget(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetTenantBudget>,
+) -> Result<Json<Tenant>> {
+    let period = match body.budget_period.as_deref().map(str::trim) {
+        None | Some("") => None,
+        Some(p) => {
+            let p = p.to_lowercase();
+            if !matches!(p.as_str(), "lifetime" | "monthly" | "term") {
+                return Err(AdminError::BadRequest(
+                    "budget_period must be one of: lifetime, monthly, term".into(),
+                ));
+            }
+            Some(p)
+        }
+    };
+    if let Some(tokens) = body.budget_tokens {
+        if tokens < 0 {
+            return Err(AdminError::BadRequest(
+                "budget_tokens must be non-negative".into(),
+            ));
+        }
+    }
+    if let Some(cost) = body.budget_cost_usd {
+        if cost < 0.0 || !cost.is_finite() {
+            return Err(AdminError::BadRequest(
+                "budget_cost_usd must be a non-negative number".into(),
+            ));
+        }
+    }
+    // Default the term start to now when a cap is set without an explicit start.
+    let started_at = body.budget_started_at.or_else(|| {
+        (body.budget_tokens.is_some() || body.budget_cost_usd.is_some())
+            .then(chrono::Utc::now)
+    });
+    let tenant = state
+        .store
+        .update_tenant_budget(
+            id,
+            body.budget_tokens,
+            body.budget_cost_usd,
+            period.as_deref(),
+            started_at,
+        )
+        .await?;
+    // Budget gates admission in the data plane; refresh the cached keys.
+    sync_tenant_keys(&state, id).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "set_tenant_budget",
+            "tenant",
+            &id.to_string(),
+            serde_json::json!({
+                "budget_tokens": tenant.budget_tokens,
+                "budget_cost_usd": tenant.budget_cost_usd,
+                "budget_period": tenant.budget_period,
+                "budget_started_at": tenant.budget_started_at,
+            }),
+        )
+        .await?;
+    Ok(Json(tenant))
+}
+
+#[utoipa::path(
+    patch, path = "/api/v1/tenants/{id}/allowlist", tag = "tenants",
+    request_body = SetTenantAllowlist,
+    responses((status = 200, body = Tenant))
+)]
+async fn patch_tenant_allowlist(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetTenantAllowlist>,
+) -> Result<Json<Tenant>> {
+    // Normalize: trim, drop blanks, de-duplicate while preserving order.
+    let mut seen = std::collections::HashSet::new();
+    let models: Vec<String> = body
+        .allowed_models
+        .into_iter()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty() && seen.insert(m.clone()))
+        .collect();
+    let allowed = (!models.is_empty()).then_some(models);
+    let tenant = state.store.update_tenant_allowlist(id, allowed).await?;
+    // Allowlist gates admission in the data plane; refresh the cached keys.
+    sync_tenant_keys(&state, id).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "set_tenant_allowlist",
+            "tenant",
+            &id.to_string(),
+            serde_json::json!({ "allowed_models": tenant.allowed_models }),
+        )
+        .await?;
+    Ok(Json(tenant))
+}
+
+// ---- alert settings ----
+
+/// Read-only view of the saved alert settings. Secrets (webhook URL, SMTP
+/// password) are never returned; presence is reported via boolean flags.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AlertSettingsView {
+    pub slack_webhook_set: bool,
+    pub min_interval_secs: u64,
+    pub email: Option<EmailSettingsView>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EmailSettingsView {
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    pub username: Option<String>,
+    pub password_set: bool,
+    pub from_address: String,
+    pub recipients: Vec<String>,
+    pub starttls: bool,
+}
+
+impl AlertSettingsView {
+    fn from_settings(s: &AlertSettings) -> Self {
+        AlertSettingsView {
+            slack_webhook_set: s.slack_enabled(),
+            min_interval_secs: s.min_interval_secs,
+            email: s.email.as_ref().map(|e| EmailSettingsView {
+                smtp_host: e.smtp_host.clone(),
+                smtp_port: e.smtp_port,
+                username: e.username.clone(),
+                password_set: e.password.as_ref().is_some_and(|p| !p.is_empty()),
+                from_address: e.from_address.clone(),
+                recipients: e.recipients.clone(),
+                starttls: e.starttls,
+            }),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateAlertSettings {
+    /// New Slack webhook URL. Empty/omitted leaves the existing value untouched
+    /// unless `clear_slack_webhook` is set.
+    #[serde(default)]
+    pub slack_webhook_url: Option<String>,
+    #[serde(default)]
+    pub clear_slack_webhook: bool,
+    /// Cooldown between repeat alerts for the same key. Omitted keeps current.
+    #[serde(default)]
+    pub min_interval_secs: Option<u64>,
+    /// Email delivery config. `null`/omitted disables email alerts.
+    #[serde(default)]
+    pub email: Option<UpdateEmailSettings>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateEmailSettings {
+    pub smtp_host: String,
+    #[serde(default = "default_smtp_port")]
+    pub smtp_port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    /// New SMTP password. Empty/omitted keeps the existing value unless
+    /// `clear_smtp_password` is set.
+    #[serde(default)]
+    pub smtp_password: Option<String>,
+    #[serde(default)]
+    pub clear_smtp_password: bool,
+    pub from_address: String,
+    #[serde(default)]
+    pub recipients: Vec<String>,
+    #[serde(default = "default_true_bool")]
+    pub starttls: bool,
+}
+
+fn default_smtp_port() -> u16 {
+    587
+}
+fn default_true_bool() -> bool {
+    true
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/settings/alerts", tag = "settings",
+    responses((status = 200, body = AlertSettingsView))
+)]
+async fn get_alert_settings(
+    State(state): State<AdminState>,
+) -> Result<Json<AlertSettingsView>> {
+    let settings = state.store.get_alert_settings().await?.unwrap_or_default();
+    Ok(Json(AlertSettingsView::from_settings(&settings)))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/settings/alerts", tag = "settings",
+    request_body = UpdateAlertSettings,
+    responses((status = 200, body = AlertSettingsView))
+)]
+async fn put_alert_settings(
+    State(state): State<AdminState>,
+    Json(body): Json<UpdateAlertSettings>,
+) -> Result<Json<AlertSettingsView>> {
+    let existing = state.store.get_alert_settings().await?.unwrap_or_default();
+
+    // Slack webhook: set / keep / clear.
+    let slack_webhook_url = match body.slack_webhook_url.as_deref().map(str::trim) {
+        Some(url) if !url.is_empty() => Some(url.to_string()),
+        _ if body.clear_slack_webhook => None,
+        _ => existing.slack_webhook_url.clone(),
+    };
+
+    let min_interval_secs = body.min_interval_secs.unwrap_or(existing.min_interval_secs);
+
+    // Email block: present => build (carrying over the password unless changed),
+    // absent => disabled.
+    let email = match body.email {
+        None => None,
+        Some(upd) => {
+            if upd.smtp_host.trim().is_empty() {
+                return Err(AdminError::BadRequest("smtp_host is required".into()));
+            }
+            if upd.from_address.trim().is_empty() {
+                return Err(AdminError::BadRequest("from_address is required".into()));
+            }
+            let prev_password = existing.email.as_ref().and_then(|e| e.password.clone());
+            let password = match upd.smtp_password.as_deref().map(str::trim) {
+                Some(p) if !p.is_empty() => Some(p.to_string()),
+                _ if upd.clear_smtp_password => None,
+                _ => prev_password,
+            };
+            Some(EmailSettings {
+                smtp_host: upd.smtp_host.trim().to_string(),
+                smtp_port: upd.smtp_port,
+                username: upd.username.map(|u| u.trim().to_string()).filter(|u| !u.is_empty()),
+                password,
+                from_address: upd.from_address.trim().to_string(),
+                recipients: upd
+                    .recipients
+                    .into_iter()
+                    .map(|r| r.trim().to_string())
+                    .filter(|r| !r.is_empty())
+                    .collect(),
+                starttls: upd.starttls,
+            })
+        }
+    };
+
+    let settings = AlertSettings {
+        slack_webhook_url,
+        email,
+        min_interval_secs,
+    };
+
+    state.store.put_alert_settings(&settings).await?;
+    state.alerts.update(settings.clone());
+    state
+        .store
+        .record_audit(
+            "admin",
+            "set_alert_settings",
+            "settings",
+            "alerts",
+            serde_json::json!({
+                "slack_enabled": settings.slack_enabled(),
+                "email_enabled": settings.email_enabled(),
+                "min_interval_secs": settings.min_interval_secs,
+            }),
+        )
+        .await?;
+    Ok(Json(AlertSettingsView::from_settings(&settings)))
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TestAlertResult {
+    pub results: Vec<alerts::ChannelResult>,
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/settings/alerts/test", tag = "settings",
+    responses((status = 200, body = TestAlertResult))
+)]
+async fn test_alert_settings(
+    State(state): State<AdminState>,
+) -> Result<Json<TestAlertResult>> {
+    if !state.alerts.enabled() {
+        return Err(AdminError::BadRequest(
+            "no alert channels are configured".into(),
+        ));
+    }
+    let results = state.alerts.send_test().await;
+    Ok(Json(TestAlertResult { results }))
+}
+
+#[utoipa::path(
+    delete, path = "/api/v1/tenants/{id}", tag = "tenants",
+    responses((status = 204))
+)]
+async fn delete_tenant(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+) -> Result<StatusCode> {
+    let hashes = state.store.delete_tenant(id).await?;
+    // Evict every cascaded key from the data-plane cache.
+    for hash in &hashes {
+        let _ = state.redis.delete_resolved_key(hash).await;
+        let _ = state.redis.publish_invalidation(hash).await;
+    }
+    state
+        .store
+        .record_audit(
+            "admin",
+            "delete_tenant",
+            "tenant",
+            &id.to_string(),
+            serde_json::json!({ "keys_removed": hashes.len() }),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -1090,6 +1620,8 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         enabled: model.enabled,
         cache_enabled: model.cache_enabled,
         cache_ttl_secs: model.cache_ttl_secs,
+        input_cost_per_token: model.input_cost_per_token,
+        output_cost_per_token: model.output_cost_per_token,
     };
     if model.enabled {
         state

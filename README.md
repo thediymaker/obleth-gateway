@@ -4,6 +4,8 @@
 [![License: ELv2](https://img.shields.io/badge/license-ELv2-blue.svg)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584.svg?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
+![obleth dashboard overview](.github/assets/dashboard.png)
+
 **obleth is the fair-queuing middleman between your users and your LLMs.**
 
 Point your clients at obleth and obleth at any OpenAI-compatible provider. It owns
@@ -158,11 +160,11 @@ obleth is configured entirely through environment variables. The essentials:
 | `OBLETH_ADMIN_TOKEN` | Management API bearer token (**required**; service refuses to start without it) |
 | `OBLETH_FAIL_OPEN` | admit when Redis is down (default `true`; set `false` for strict multi-tenant) |
 
-Secrets at rest, SSRF allow-lists, brownout tuning, Slack alerts, dashboard auth,
-and the rest are documented in full at **[obleth.com](https://obleth.com)**. The
-credentials in `*.env.example`, `docker-compose.yml`, and `values.yaml` are
-**development examples only**; replace them and front the gateway with TLS before
-deploying anywhere real.
+Secrets at rest, SSRF allow-lists, brownout tuning, alerting (Slack + email),
+dashboard auth, and the rest are documented in full at
+**[obleth.com](https://obleth.com)**. The credentials in `*.env.example`,
+`docker-compose.yml`, and `values.yaml` are **development examples only**; replace
+them and front the gateway with TLS before deploying anywhere real.
 
 ## Repository layout
 

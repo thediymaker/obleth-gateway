@@ -4,7 +4,6 @@
 //! a Prometheus metrics endpoint. Wires Postgres (config SoT), Redis (hot cache
 //! + budgets), ClickHouse (usage ledger) and the fairshare scheduler together.
 
-mod alerts;
 mod mcp;
 mod metrics;
 mod proxy;
@@ -24,7 +23,6 @@ use obleth_store::Store;
 use obleth_telemetry::{TelemetrySink, TelemetryStats};
 use obleth_tokenizer::HeuristicTokenizer;
 
-use crate::alerts::SlackAlerts;
 use crate::metrics::Metrics;
 use crate::state::AppState;
 
@@ -93,9 +91,26 @@ async fn main() -> anyhow::Result<()> {
     let http = reqwest::Client::builder()
         .pool_max_idle_per_host(256)
         .build()?;
-    let alerts = SlackAlerts::from_config(&cfg.slack_alerts, http.clone());
+
+    // Alert settings are persisted in Postgres (app_settings, key='alerts') and
+    // hot-reloadable at runtime. On boot, prefer the saved settings; otherwise
+    // seed from the legacy env-configured Slack webhook so existing deployments
+    // keep working until an operator saves settings from the control plane.
+    let initial_alert_settings = match store.get_alert_settings().await {
+        Ok(Some(settings)) => settings,
+        Ok(None) => obleth_config::AlertSettings {
+            slack_webhook_url: cfg.slack_alerts.webhook_url.clone(),
+            email: None,
+            min_interval_secs: cfg.slack_alerts.min_interval.as_secs(),
+        },
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load alert settings; starting with defaults");
+            obleth_config::AlertSettings::default()
+        }
+    };
+    let alerts = obleth_admin::AlertDispatcher::new(http.clone(), initial_alert_settings);
     if alerts.enabled() {
-        tracing::info!("slack alerts enabled");
+        tracing::info!("alerting enabled");
     }
 
     let app_state = AppState {
@@ -156,9 +171,7 @@ async fn main() -> anyhow::Result<()> {
         retention_days: cfg.model_health_retention_days,
         internal_proxy_base_url: cfg.internal_proxy_base_url.clone(),
         http: http.clone(),
-        alerts: alerts
-            .enabled()
-            .then(|| Arc::new(alerts.clone()) as Arc<dyn obleth_admin::AlertSink>),
+        alerts: Some(Arc::new(alerts.clone()) as Arc<dyn obleth_admin::AlertSink>),
     };
     let admin_state = obleth_admin::AdminState {
         store: store.clone(),
@@ -170,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
         admin_token: cfg.admin_token.clone(),
         health: health_runtime,
         ssrf: obleth_admin::ssrf::SsrfPolicy::from_env(),
+        alerts: alerts.clone(),
     };
     obleth_admin::model_health::spawn_worker(admin_state.clone());
     let admin_app = obleth_admin::router(admin_state);
