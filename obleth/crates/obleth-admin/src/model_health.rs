@@ -1,8 +1,10 @@
 //! Model health checks for registered model routes.
 //!
-//! A health check is a tiny chat completion sent through obleth's own proxy
-//! path with a temporary Redis-only key. This validates the same auth, route
-//! resolution, scheduler, model rewrite, and upstream call path that clients use.
+//! A health check is a tiny probe sent through obleth's own proxy path with a
+//! temporary Redis-only key. The probe targets the endpoint matching the
+//! model's modality (chat, embeddings, audio speech/transcription, image), so
+//! it validates the same auth, route resolution, scheduler, model rewrite, and
+//! upstream call path that real clients use.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -324,26 +326,70 @@ async fn send_health_probe_request(
     secret: &str,
 ) -> ProbeResult {
     let base = state.health.internal_proxy_base_url.trim_end_matches('/');
-    let url = format!("{base}/v1/chat/completions");
+    let timeout = Duration::from_secs(state.health.timeout_secs.max(1));
+    let client = &state.health.http;
+
+    // The probe targets the endpoint that matches the model's modality and
+    // sends the smallest valid request for it, so non-chat routes (embeddings,
+    // TTS, image, STT) get a real health signal instead of always failing a
+    // chat-completion probe.
+    let request = match model.model_type.as_str() {
+        "embedding" => client
+            .post(format!("{base}/v1/embeddings"))
+            .bearer_auth(secret)
+            .timeout(timeout)
+            .json(&serde_json::json!({ "model": model.model_name, "input": "ok" })),
+        "audio_speech" => client
+            .post(format!("{base}/v1/audio/speech"))
+            .bearer_auth(secret)
+            .timeout(timeout)
+            .json(&serde_json::json!({
+                "model": model.model_name,
+                "input": "ok",
+                "voice": "alloy"
+            })),
+        "image" => client
+            .post(format!("{base}/v1/images/generations"))
+            .bearer_auth(secret)
+            .timeout(timeout)
+            .json(&serde_json::json!({
+                "model": model.model_name,
+                "prompt": "ok",
+                "n": 1,
+                "size": "256x256"
+            })),
+        "audio_transcription" => {
+            let part = reqwest::multipart::Part::bytes(silent_wav())
+                .file_name("probe.wav")
+                .mime_str("audio/wav")
+                .expect("static audio/wav mime is valid");
+            let form = reqwest::multipart::Form::new()
+                .text("model", model.model_name.clone())
+                .part("file", part);
+            client
+                .post(format!("{base}/v1/audio/transcriptions"))
+                .bearer_auth(secret)
+                .timeout(timeout)
+                .multipart(form)
+        }
+        _ => client
+            .post(format!("{base}/v1/chat/completions"))
+            .bearer_auth(secret)
+            .timeout(timeout)
+            .json(&serde_json::json!({
+                "model": model.model_name,
+                "messages": [
+                    { "role": "system", "content": "obleth model health check. Reply with ok." },
+                    { "role": "user", "content": "ok" }
+                ],
+                "max_tokens": 4,
+                "temperature": 0,
+                "stream": false
+            })),
+    };
+
     let started = Instant::now();
-    let response = state
-        .health
-        .http
-        .post(url)
-        .bearer_auth(secret)
-        .timeout(Duration::from_secs(state.health.timeout_secs.max(1)))
-        .json(&serde_json::json!({
-            "model": model.model_name,
-            "messages": [
-                { "role": "system", "content": "obleth model health check. Reply with ok." },
-                { "role": "user", "content": "ok" }
-            ],
-            "max_tokens": 4,
-            "temperature": 0,
-            "stream": false
-        }))
-        .send()
-        .await;
+    let response = request.send().await;
     let latency_ms = started.elapsed().as_millis().try_into().ok();
 
     match response {
@@ -374,6 +420,30 @@ async fn send_health_probe_request(
             format!("gateway health probe request failed: {error}"),
         ),
     }
+}
+
+/// Minimal valid WAV (mono, 8 kHz, 16-bit PCM, ~0.1s of silence) used as the
+/// audio fixture for transcription health probes.
+fn silent_wav() -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 8000;
+    const SAMPLES: u32 = 800; // ~0.1s
+    let data_len: u32 = SAMPLES * 2; // 16-bit mono
+    let mut buf = Vec::with_capacity(44 + data_len as usize);
+    buf.extend_from_slice(b"RIFF");
+    buf.extend_from_slice(&(36 + data_len).to_le_bytes());
+    buf.extend_from_slice(b"WAVE");
+    buf.extend_from_slice(b"fmt ");
+    buf.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+    buf.extend_from_slice(&1u16.to_le_bytes()); // audio format = PCM
+    buf.extend_from_slice(&1u16.to_le_bytes()); // channels = mono
+    buf.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    buf.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
+    buf.extend_from_slice(&2u16.to_le_bytes()); // block align
+    buf.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    buf.extend_from_slice(b"data");
+    buf.extend_from_slice(&data_len.to_le_bytes());
+    buf.resize(44 + data_len as usize, 0); // silence
+    buf
 }
 
 fn maybe_alert(state: &AdminState, outcome: &ModelHealthRecordOutcome) {

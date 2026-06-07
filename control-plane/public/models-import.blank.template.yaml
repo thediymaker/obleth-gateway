@@ -1,0 +1,112 @@
+# Obleth model import template (BLANK)
+# -----------------------------------------------------------------------------
+# Upload this file on the Models page (Import button). It uses obleth's native
+# format: a top-level `models:` list where each entry is one model route.
+# Routes are matched by `model_name` — existing names are updated in place,
+# new names are created.
+#
+# How to use:
+#   1. Copy one of the example blocks below for each model you want.
+#   2. Fill in the values. Delete the examples you don't need.
+#   3. Save and upload.
+#
+# Fields:
+#   model_name                (required) Client-facing name callers request.
+#   upstream_model            (required) Provider/model id sent upstream,
+#                                        e.g. "openai/gpt-4o" or "vendor/name".
+#   api_base                  (required) Upstream OpenAI-compatible base URL,
+#                                        usually ending in /v1.
+#   api_key                   (optional) Upstream key. Leave blank if none.
+#   description               (optional) Free-text label shown in the UI.
+#   model_type                (optional) Modality / endpoint this route serves.
+#                                        Default "chat". One of:
+#                                          chat                -> /v1/chat/completions, /v1/completions
+#                                          embedding           -> /v1/embeddings
+#                                          audio_transcription -> /v1/audio/transcriptions, /v1/audio/translations
+#                                          audio_speech        -> /v1/audio/speech
+#                                          image               -> /v1/images/generations
+#                                        Only `chat` models take part in `auto` routing.
+#   input_cost_per_token      (optional) USD per input token.  Default 0.
+#                                        Used by chat + embedding models.
+#   output_cost_per_token     (optional) USD per output token. Default 0.
+#                                        Used by chat models.
+#   cost_per_image            (optional) USD per generated image. Default 0.
+#                                        Used by image models (x n images).
+#   cost_per_character        (optional) USD per input character. Default 0.
+#                                        Used by audio_speech (TTS) models.
+#   cost_per_audio_second     (optional) USD per second of audio. Default 0.
+#                                        Reserved for audio_transcription (STT) models.
+#   context_window            (optional) Max tokens. Default 8192.
+#   admission_weight          (optional) Fair-share weight. Default 100.
+#   max_in_flight             (optional) Concurrency cap. Blank = no cap.
+#   supports_function_calling (optional) true/false. Default false.
+#   supports_system_messages  (optional) true/false. Default true.
+#   supports_response_schema  (optional) true/false. Default false.
+#   supports_tool_choice      (optional) true/false. Default false.
+#   enabled                   (optional) true/false. Default true.
+#   tags                      (optional) Routing tags for the auto router.
+#                                        Allowed: coding, general, reasoning,
+#                                        math, vision, long-context, fast,
+#                                        creative.
+
+models:
+  # ---- Example 1: full template (every field shown) ----
+  - model_name: my-model-name
+    description: Short description of this model
+    upstream_model: vendor/model-id
+    api_base: https://your-endpoint.example.com/v1
+    api_key: sk-replace-me
+    model_type: chat
+    input_cost_per_token: 0.0
+    output_cost_per_token: 0.0
+    context_window: 131072
+    admission_weight: 100
+    max_in_flight:            # leave blank for no cap
+    supports_function_calling: true
+    supports_system_messages: true
+    supports_response_schema: false
+    supports_tool_choice: true
+    enabled: true
+    tags: [general]
+
+  # ---- Example 2: minimal (only the required fields) ----
+  - model_name: my-minimal-model
+    upstream_model: vendor/another-model-id
+    api_base: https://your-endpoint.example.com/v1
+
+  # ---- Example 3: embedding model (/v1/embeddings) ----
+  - model_name: text-embedding
+    description: Embedding model for retrieval / RAG
+    upstream_model: vendor/text-embedding-3-large
+    api_base: https://your-endpoint.example.com/v1
+    model_type: embedding
+    input_cost_per_token: 0.00000013
+
+  # ---- Example 4: image generation (/v1/images/generations) ----
+  # Works with any OpenAI-compatible image endpoint, including a Stable
+  # Diffusion server that exposes /v1/images/generations directly
+  # (pass-through, no adapter needed).
+  - model_name: sd-xl
+    description: Stable Diffusion XL image generation
+    upstream_model: stable-diffusion-xl
+    api_base: http://stable-diffusion.internal:8080/v1
+    model_type: image
+    cost_per_image: 0.04
+
+  # ---- Example 5: text-to-speech / TTS (/v1/audio/speech) ----
+  - model_name: tts
+    description: Text-to-speech voice synthesis
+    upstream_model: vendor/tts-1
+    api_base: https://your-endpoint.example.com/v1
+    model_type: audio_speech
+    cost_per_character: 0.000015
+
+  # ---- Example 6: speech-to-text / STT (/v1/audio/transcriptions) ----
+  # Clients upload audio as multipart/form-data; obleth swaps the model name
+  # and forwards the file upstream unchanged.
+  - model_name: whisper
+    description: Speech-to-text transcription
+    upstream_model: vendor/whisper-1
+    api_base: https://your-endpoint.example.com/v1
+    model_type: audio_transcription
+    cost_per_audio_second: 0.0001

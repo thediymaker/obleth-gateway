@@ -88,11 +88,44 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     };
     let mut json: serde_json::Value =
         serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
-    let mut model = json
-        .get("model")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
+
+    // Audio transcription/translation send the model as a `multipart/form-data`
+    // field alongside the uploaded file, not as JSON. Parse the fields once so
+    // we can resolve the model and later rebuild the upstream form with the
+    // model name swapped.
+    let content_type_in = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
         .to_string();
+    let multipart_fields = if is_multipart_endpoint(&path)
+        && content_type_in.starts_with("multipart/form-data")
+    {
+        match multer::parse_boundary(&content_type_in) {
+            Ok(boundary) => match parse_multipart(&body_bytes, &boundary).await {
+                Ok(fields) => Some(fields),
+                Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid multipart body"),
+            },
+            Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid multipart boundary"),
+        }
+    } else {
+        None
+    };
+
+    let mut model = if let Some(fields) = &multipart_fields {
+        fields
+            .iter()
+            .find(|f| f.name == "model")
+            .and_then(|f| std::str::from_utf8(&f.data).ok())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "unknown".to_string())
+    } else {
+        json.get("model")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string()
+    };
 
     // ---- auto model selection ----
     // `model: "auto"` is resolved to a concrete registered model from request
@@ -368,16 +401,15 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         .as_ref()
         .map(|r| (r.input_cost_per_token, r.output_cost_per_token))
         .unwrap_or((0.0, 0.0));
+    // Per-request modality surcharge (image generations, TTS) computed before
+    // the streaming closure takes ownership of the request state.
+    let modality_cost = compute_modality_cost(route.as_ref(), &json);
 
     // ---- proxy upstream ----
-    let (upstream_base, mut send_bytes, upstream_model) =
-        prepare_upstream(&route, &state.upstream_base, &model, &json, send_bytes);
-    if let Some(upstream_model) = upstream_model {
-        if let Ok(bytes) = serde_json::to_vec(&upstream_model) {
-            send_bytes = Bytes::from(bytes);
-            est = state.tokenizer.estimate_request(&upstream_model);
-        }
-    }
+    let upstream_base = route
+        .as_ref()
+        .map(|r| r.api_base.clone())
+        .unwrap_or_else(|| state.upstream_base.clone());
     let url = build_upstream_url(&upstream_base, &path, &query);
     let mut fwd_headers = forward_headers(&headers);
     if let Some(route) = &route {
@@ -387,11 +419,30 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             }
         }
     }
-    let upstream = state
-        .http
-        .request(method, &url)
-        .headers(fwd_headers)
-        .body(send_bytes)
+    let mut req_builder = state.http.request(method, &url);
+    if let Some(fields) = multipart_fields {
+        // Rebuild the multipart form, swapping the client model name for the
+        // upstream one. reqwest regenerates the Content-Type (with boundary), so
+        // the inbound multipart content-type header must be dropped.
+        fwd_headers.remove(header::CONTENT_TYPE);
+        let upstream_model = route
+            .as_ref()
+            .map(|r| r.upstream_model.clone())
+            .unwrap_or_else(|| model.clone());
+        let form = build_multipart_form(fields, &upstream_model);
+        req_builder = req_builder.headers(fwd_headers).multipart(form);
+    } else {
+        let (_, mut send_bytes, upstream_model) =
+            prepare_upstream(&route, &state.upstream_base, &model, &json, send_bytes);
+        if let Some(upstream_model) = upstream_model {
+            if let Ok(bytes) = serde_json::to_vec(&upstream_model) {
+                send_bytes = Bytes::from(bytes);
+                est = state.tokenizer.estimate_request(&upstream_model);
+            }
+        }
+        req_builder = req_builder.headers(fwd_headers).body(send_bytes);
+    }
+    let upstream = req_builder
         .send()
         .instrument(tracing::info_span!("upstream_request"))
         .await;
@@ -553,7 +604,8 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         // ---- term-usage commit + budget alerts (Phase 3 + Phase 5) ----
         if let Some(period) = &term_period {
             let cost = (input_tokens as f64) * in_cost_rate
-                + (output_tokens as f64) * out_cost_rate;
+                + (output_tokens as f64) * out_cost_rate
+                + modality_cost;
             let added = input_tokens.saturating_add(output_tokens) as i64;
             match stream_state
                 .redis
@@ -878,7 +930,117 @@ fn requires_registered_model(path: &str) -> bool {
             | "/v1/responses"
             | "/v1/audio/transcriptions"
             | "/v1/audio/translations"
+            | "/v1/audio/speech"
+            | "/v1/images/generations"
+            | "/v1/images/edits"
+            | "/v1/images/variations"
     )
+}
+
+/// True when the endpoint carries the model name in a multipart/form-data body
+/// (audio transcription/translation file uploads) rather than JSON.
+fn is_multipart_endpoint(path: &str) -> bool {
+    matches!(
+        path,
+        "/v1/audio/transcriptions" | "/v1/audio/translations"
+    )
+}
+
+/// A single parsed `multipart/form-data` field, held in memory so it can be
+/// rebuilt into an upstream form after model resolution.
+struct MultipartField {
+    name: String,
+    file_name: Option<String>,
+    content_type: Option<String>,
+    data: Bytes,
+}
+
+/// Parse an in-memory multipart body into its fields. The whole body is already
+/// buffered (bounded by `BODY_LIMIT`), so this just re-reads it through `multer`.
+async fn parse_multipart(body: &Bytes, boundary: &str) -> Result<Vec<MultipartField>, multer::Error> {
+    let bytes = body.clone();
+    let stream =
+        futures_util::stream::once(async move { Ok::<Bytes, std::convert::Infallible>(bytes) });
+    let mut multipart = multer::Multipart::new(stream, boundary.to_string());
+    let mut fields = Vec::new();
+    while let Some(field) = multipart.next_field().await? {
+        let name = field.name().unwrap_or("").to_string();
+        let file_name = field.file_name().map(|s| s.to_string());
+        let content_type = field.content_type().map(|m| m.to_string());
+        let data = field.bytes().await?;
+        fields.push(MultipartField {
+            name,
+            file_name,
+            content_type,
+            data,
+        });
+    }
+    Ok(fields)
+}
+
+/// Rebuild a reqwest multipart form from parsed fields, replacing the client
+/// `model` value with the upstream model name. File parts preserve their
+/// filename and content-type.
+fn build_multipart_form(
+    fields: Vec<MultipartField>,
+    upstream_model: &str,
+) -> reqwest::multipart::Form {
+    let mut form = reqwest::multipart::Form::new();
+    let mut had_model = false;
+    for f in fields {
+        if f.name == "model" {
+            had_model = true;
+            form = form.text("model", upstream_model.to_string());
+            continue;
+        }
+        if f.file_name.is_some() {
+            let file_name = f.file_name.unwrap_or_default();
+            let data = f.data.to_vec();
+            let part = match f.content_type {
+                // content_type came from a parsed Mime, so mime_str won't fail.
+                Some(ct) => reqwest::multipart::Part::bytes(data)
+                    .file_name(file_name)
+                    .mime_str(&ct)
+                    .unwrap_or_else(|_| reqwest::multipart::Part::text("")),
+                None => reqwest::multipart::Part::bytes(data).file_name(file_name),
+            };
+            form = form.part(f.name, part);
+        } else {
+            form = form.text(f.name, String::from_utf8_lossy(&f.data).into_owned());
+        }
+    }
+    if !had_model {
+        form = form.text("model", upstream_model.to_string());
+    }
+    form
+}
+
+/// Per-request surcharge for non-token-billed modalities: image generations are
+/// billed per image, text-to-speech per input character. Returns `0.0` for
+/// token-billed modalities (chat, embeddings) and audio transcription.
+fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value) -> f64 {
+    let Some(route) = route else {
+        return 0.0;
+    };
+    match route.model_type.as_str() {
+        "image" => {
+            let n = json
+                .get("n")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1)
+                .max(1);
+            n as f64 * route.cost_per_image
+        }
+        "audio_speech" => {
+            let chars = json
+                .get("input")
+                .and_then(|v| v.as_str())
+                .map(|s| s.chars().count())
+                .unwrap_or(0);
+            chars as f64 * route.cost_per_character
+        }
+        _ => 0.0,
+    }
 }
 
 fn prepare_upstream(
@@ -891,6 +1053,12 @@ fn prepare_upstream(
     let Some(route) = route else {
         return (default_base.to_string(), body, None);
     };
+    // Only rewrite when the original body is a JSON object we can edit; non-JSON
+    // bodies (e.g. multipart audio uploads) are handled separately and must pass
+    // through untouched.
+    if !json.is_object() {
+        return (route.api_base.clone(), body, None);
+    }
     let mut upstream_json = json.clone();
     if let Some(obj) = upstream_json.as_object_mut() {
         obj.insert(
@@ -903,7 +1071,15 @@ fn prepare_upstream(
 
 fn build_upstream_url(base: &str, path: &str, query: &str) -> String {
     let base = base.trim_end_matches('/');
-    let mut rel = path.trim_start_matches('/').to_string();
+    let rel_raw = path.trim_start_matches('/');
+    // Defensive: operators sometimes paste the full endpoint URL as api_base
+    // (e.g. ".../v1/embeddings" or ".../v1/audio/speech") instead of the base
+    // (".../v1"). If the configured base already ends with the request path,
+    // don't append it again — that would produce ".../v1/embeddings/v1/embeddings".
+    if !rel_raw.is_empty() && (base.ends_with(rel_raw) || base.ends_with(&format!("/{rel_raw}"))) {
+        return format!("{base}{query}");
+    }
+    let mut rel = rel_raw.to_string();
     // api_base is typically `…/v1` while clients call `/v1/chat/completions` — avoid `/v1/v1/…`
     if base.ends_with("/v1") && rel.starts_with("v1/") {
         rel = rel.trim_start_matches("v1/").to_string();
@@ -971,11 +1147,16 @@ fn append_tail(tail: &mut String, chunk: &[u8]) {
 
 /// Pull `prompt_tokens` / `completion_tokens` out of the (possibly streamed)
 /// response tail. Returns `None` if the upstream didn't report usage.
+///
+/// Embedding responses report `prompt_tokens` (and `total_tokens`) but no
+/// `completion_tokens`; those are treated as input-only usage.
 fn extract_usage(tail: &str) -> Option<(u32, u32)> {
     let input = find_int_after(tail, "\"prompt_tokens\"");
     let output = find_int_after(tail, "\"completion_tokens\"");
     match (input, output) {
         (Some(i), Some(o)) => Some((i, o)),
+        // Embeddings and other input-only modalities: count prompt tokens.
+        (Some(i), None) => Some((i, 0)),
         _ => None,
     }
 }
@@ -1116,6 +1297,23 @@ mod tests {
         assert_eq!(
             build_upstream_url("http://benchmark-backend:8081", "/v1/chat/completions", ""),
             "http://benchmark-backend:8081/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn api_base_with_full_endpoint_is_not_doubled() {
+        // Operator pasted the full endpoint URL as api_base instead of the base.
+        assert_eq!(
+            build_upstream_url("https://openai.rc.asu.edu/v1/embeddings", "/v1/embeddings", ""),
+            "https://openai.rc.asu.edu/v1/embeddings"
+        );
+        assert_eq!(
+            build_upstream_url(
+                "https://openai.rc.asu.edu/v1/audio/speech",
+                "/v1/audio/speech",
+                ""
+            ),
+            "https://openai.rc.asu.edu/v1/audio/speech"
         );
     }
 

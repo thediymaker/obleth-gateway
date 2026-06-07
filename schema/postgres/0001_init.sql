@@ -107,8 +107,16 @@ create table if not exists models (
     upstream_model              text not null,
     api_base                    text not null,
     api_key                     text,
+    -- modality of the model, which determines the OpenAI endpoint it serves:
+    -- 'chat' (default), 'embedding', 'audio_transcription', 'audio_speech', 'image'.
+    model_type                  text not null default 'chat',
     input_cost_per_token        double precision not null default 0,
     output_cost_per_token       double precision not null default 0,
+    -- per-unit costs for non-chat modalities (USD). image: per generated image;
+    -- audio_transcription: per second of audio; audio_speech: per input character.
+    cost_per_image              double precision not null default 0,
+    cost_per_audio_second       double precision not null default 0,
+    cost_per_character          double precision not null default 0,
     context_window              bigint not null default 8192 check (context_window >= 0),
     admission_weight            bigint not null default 100 check (admission_weight >= 1),
     -- optional per-model in-flight cap; null = no model-specific cap, the

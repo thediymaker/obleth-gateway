@@ -29,8 +29,9 @@ bytes = "1"
 axum = "0.7"
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "multipart"] }
 http = "1"
+multer = "3"
 
 # serde
 serde = { version = "1", features = ["derive"] }

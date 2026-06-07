@@ -1,16 +1,18 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useRef, useState, useTransition, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, useTransition, type ChangeEvent, type ReactNode } from "react";
 import {
   Activity,
   Check,
   ChevronDown,
   Database,
+  Download,
   HeartPulse,
   PauseCircle,
   RefreshCw,
   Save,
   Trash2,
+  Upload,
   XCircle,
 } from "lucide-react";
 import {
@@ -26,11 +28,15 @@ import {
   checkModelHealthAction,
   createModelAction,
   deleteModelAction,
+  importModelsAction,
+  planModelImportAction,
   setModelCacheAction,
   setModelCapacityAction,
   setModelHealthConfigAction,
   setModelWeightAction,
   updateModelAction,
+  type ImportModelsResult,
+  type ImportPlanItem,
 } from "@/app/actions";
 import { ChartShell, axisTick, chartGrid, compactAxis, tip, timeCursor } from "@/components/chart-tooltip";
 import { Badge } from "@/components/ui/badge";
@@ -54,6 +60,20 @@ const MODEL_TAGS = [
   "creative",
 ] as const;
 
+// Model modality vocabulary; mirrors obleth-config `MODEL_TYPES`. The type
+// determines which OpenAI endpoint the route serves and how it is billed.
+const MODEL_TYPE_OPTIONS = [
+  { value: "chat", label: "Chat / completions" },
+  { value: "embedding", label: "Embeddings" },
+  { value: "audio_transcription", label: "Audio transcription (STT)" },
+  { value: "audio_speech", label: "Text to speech (TTS)" },
+  { value: "image", label: "Image generation" },
+] as const;
+
+const MODEL_TYPE_LABELS: Record<string, string> = Object.fromEntries(
+  MODEL_TYPE_OPTIONS.map((o) => [o.value, o.label]),
+);
+
 export function ModelManager({
   models,
   cacheStats,
@@ -67,9 +87,15 @@ export function ModelManager({
 }) {
   const [pending, start] = useTransition();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [createType, setCreateType] = useState<string>("chat");
   const [showBenchmarkRoutes, setShowBenchmarkRoutes] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const createFormRef = useRef<HTMLFormElement>(null);
+  const importInputRef = useRef<HTMLInputElement>(null);
+  const [importResult, setImportResult] = useState<ImportModelsResult | null>(null);
+  const [importPlan, setImportPlan] = useState<ImportPlanItem[] | null>(null);
+  const [importText, setImportText] = useState<string>("");
+  const [importError, setImportError] = useState<string | null>(null);
   const healthByModel = useMemo(() => new Map(health.map((row) => [row.model_id, row])), [health]);
   const benchmarkRouteCount = models.filter(isBenchmarkRoute).length;
   const visibleModels = showBenchmarkRoutes ? models : models.filter((model) => !isBenchmarkRoute(model));
@@ -77,6 +103,63 @@ export function ModelManager({
   function removeModel(model: ModelRoute) {
     if (!window.confirm(`Remove model route "${model.model_name}"? This cannot be undone.`)) return;
     start(() => deleteModelAction(model.id));
+  }
+
+  function exportModels() {
+    const payload = {
+      version: 1 as const,
+      exported_at: new Date().toISOString(),
+      models: models.map(toExportShape),
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `obleth-models-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  }
+
+  function onImportFile(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+    setImportResult(null);
+    setImportPlan(null);
+    setImportError(null);
+    const reader = new FileReader();
+    reader.onload = () => {
+      const text = String(reader.result ?? "");
+      start(async () => {
+        const plan = await planModelImportAction(text);
+        if (plan.ok) {
+          setImportText(text);
+          setImportPlan(plan.plan);
+        } else {
+          setImportError(plan.error);
+        }
+      });
+    };
+    reader.onerror = () => setImportError("Could not read the selected file.");
+    reader.readAsText(file);
+  }
+
+  function confirmImport() {
+    if (!importText) return;
+    start(async () => {
+      const result = await importModelsAction(importText);
+      setImportResult(result);
+      setImportPlan(null);
+      setImportText("");
+    });
+  }
+
+  function cancelImport() {
+    setImportPlan(null);
+    setImportText("");
+    setImportError(null);
   }
 
   function submitModel(formData: FormData) {
@@ -118,6 +201,16 @@ export function ModelManager({
             <Field label="Model name (client)" name="model_name" placeholder="qwen3-vl-32b-instruct" required />
             <Field label="Upstream model" name="upstream_model" placeholder="asuair/qwen3-vl-32b-instruct" required />
             <div className="md:col-span-2">
+              <SelectField
+                label="Model type"
+                name="model_type"
+                value={createType}
+                onChange={setCreateType}
+                options={MODEL_TYPE_OPTIONS}
+                hint={modelTypeHint(createType)}
+              />
+            </div>
+            <div className="md:col-span-2">
               <Field label="Description" name="description" placeholder="Qwen3 235B instruction model for production chat and tool use" />
             </div>
             <div className="md:col-span-2">
@@ -126,23 +219,42 @@ export function ModelManager({
             <Field label="Upstream API key (optional)" name="api_key" placeholder="sk_..." />
             <Field label="Admission weight" name="admission_weight" type="number" defaultValue="100" />
             <Field label="Max in-flight (optional)" name="max_in_flight" type="number" placeholder="No cap" />
-            <Field label="Input cost / token" name="input_cost_per_token" placeholder="0.000000071" />
-            <Field label="Output cost / token" name="output_cost_per_token" placeholder="0.0000001" />
-            <Field label="Context window" name="context_window" type="number" defaultValue="131072" />
-            <div className="flex flex-wrap gap-4 md:col-span-2">
-              <Checkbox name="supports_function_calling" label="Function calling" />
-              <Checkbox name="supports_system_messages" label="System messages" defaultChecked />
-              <Checkbox name="supports_response_schema" label="Response schema" />
-              <Checkbox name="supports_tool_choice" label="Tool choice" />
-            </div>
-            <div className="md:col-span-2">
-              <Label className="mb-2 block">Routing tags (auto)</Label>
-              <div className="flex flex-wrap gap-3">
-                {MODEL_TAGS.map((tag) => (
-                  <Checkbox key={tag} name={`tag_${tag}`} label={tag} />
-                ))}
-              </div>
-            </div>
+            {(createType === "chat" || createType === "embedding") && (
+              <Field label="Input cost / token" name="input_cost_per_token" placeholder="0.000000071" />
+            )}
+            {createType === "chat" && (
+              <Field label="Output cost / token" name="output_cost_per_token" placeholder="0.0000001" />
+            )}
+            {createType === "image" && (
+              <Field label="Cost / image" name="cost_per_image" placeholder="0.04" />
+            )}
+            {createType === "audio_speech" && (
+              <Field label="Cost / character" name="cost_per_character" placeholder="0.000015" />
+            )}
+            {createType === "audio_transcription" && (
+              <Field label="Cost / audio second" name="cost_per_audio_second" placeholder="0.0001" />
+            )}
+            {(createType === "chat" || createType === "embedding") && (
+              <Field label="Context window" name="context_window" type="number" defaultValue="131072" />
+            )}
+            {createType === "chat" && (
+              <>
+                <div className="flex flex-wrap gap-4 md:col-span-2">
+                  <Checkbox name="supports_function_calling" label="Function calling" />
+                  <Checkbox name="supports_system_messages" label="System messages" defaultChecked />
+                  <Checkbox name="supports_response_schema" label="Response schema" />
+                  <Checkbox name="supports_tool_choice" label="Tool choice" />
+                </div>
+                <div className="md:col-span-2">
+                  <Label className="mb-2 block">Routing tags (auto)</Label>
+                  <div className="flex flex-wrap gap-3">
+                    {MODEL_TAGS.map((tag) => (
+                      <Checkbox key={tag} name={`tag_${tag}`} label={tag} />
+                    ))}
+                  </div>
+                </div>
+              </>
+            )}
             <div className="md:col-span-2">
               <Button type="submit" disabled={pending}>{pending ? "Adding..." : "Add model"}</Button>
             </div>
@@ -170,6 +282,21 @@ export function ModelManager({
                 {showBenchmarkRoutes ? "Hide benchmark" : "Show benchmark"}
               </Button>
             )}
+            <input
+              ref={importInputRef}
+              type="file"
+              accept=".yaml,.yml,.json,text/yaml,application/json"
+              className="hidden"
+              onChange={onImportFile}
+            />
+            <Button type="button" size="sm" variant="outline" disabled={pending} onClick={() => importInputRef.current?.click()}>
+              <Upload className="h-3.5 w-3.5" />
+              Import
+            </Button>
+            <Button type="button" size="sm" variant="outline" disabled={models.length === 0} onClick={exportModels}>
+              <Download className="h-3.5 w-3.5" />
+              Export
+            </Button>
             <Button type="button" size="sm" variant="secondary" disabled={pending || visibleModels.length === 0} onClick={checkAll}>
               <RefreshCw className="h-3.5 w-3.5" />
               Check listed
@@ -177,6 +304,26 @@ export function ModelManager({
           </div>
         </CardHeader>
         <CardContent className="p-0">
+          {importError && (
+            <div className="px-6 pt-4">
+              <div className="flex items-start justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                <span>Import failed: {importError}</span>
+                <button type="button" onClick={() => setImportError(null)} className="shrink-0 text-xs underline opacity-80 hover:opacity-100">
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
+          {importPlan && (
+            <div className="px-6 pt-4">
+              <ImportPreview plan={importPlan} pending={pending} onConfirm={confirmImport} onCancel={cancelImport} />
+            </div>
+          )}
+          {importResult && (
+            <div className="px-6 pt-4">
+              <ImportResultBanner result={importResult} onDismiss={() => setImportResult(null)} />
+            </div>
+          )}
           <table className="w-full table-fixed text-sm">
             <thead>
               <tr className="border-b border-border text-left text-xs text-muted-foreground">
@@ -197,6 +344,11 @@ export function ModelManager({
                         <p className="font-medium">{model.model_name}</p>
                         {model.description && <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{model.description}</p>}
                         <div className="mt-2 flex flex-wrap gap-1.5">
+                          {model.model_type && model.model_type !== "chat" && (
+                            <Badge className="border-primary/40 bg-primary/15 text-[10px] text-primary">
+                              {MODEL_TYPE_LABELS[model.model_type] ?? model.model_type}
+                            </Badge>
+                          )}
                           <Badge className="border-border bg-background text-[10px] text-muted-foreground">{formatModelCost(model)}</Badge>
                           <Badge className="border-border bg-background text-[10px] text-muted-foreground">{formatNumber(model.context_window)} ctx</Badge>
                           {model.tags?.map((tag) => (
@@ -283,6 +435,7 @@ function ModelDetailPanel({
   pending: boolean;
   onCacheToggle: () => void;
 }) {
+  const [editType, setEditType] = useState<string>(model.model_type || "chat");
   const checks = detail?.checks ?? [];
   const chartData = checks
     .slice()
@@ -353,32 +506,65 @@ function ModelDetailPanel({
             <div className="md:col-span-2">
               <Field label="Description" name="description" defaultValue={model.description} />
             </div>
+            <div className="md:col-span-2">
+              <SelectField
+                label="Model type"
+                name="model_type"
+                value={editType}
+                onChange={setEditType}
+                options={MODEL_TYPE_OPTIONS}
+                hint={modelTypeHint(editType)}
+              />
+            </div>
             <Field label="Upstream API key" name="api_key" placeholder="Leave blank to keep current" />
             <Field label="Admission weight" name="admission_weight" type="number" defaultValue={String(model.admission_weight)} />
             <Field label="Max in-flight" name="max_in_flight" type="number" defaultValue={model.max_in_flight == null ? "" : String(model.max_in_flight)} />
-            <Field label="Context window" name="context_window" type="number" defaultValue={String(model.context_window)} />
-            <Field label="Input cost / token" name="input_cost_per_token" defaultValue={String(model.input_cost_per_token)} />
-            <Field label="Output cost / token" name="output_cost_per_token" defaultValue={String(model.output_cost_per_token)} />
-            <div className="flex flex-wrap gap-4 md:col-span-2">
-              <Checkbox name="enabled" label="Enabled" defaultChecked={model.enabled} />
-              <Checkbox name="supports_function_calling" label="Function calling" defaultChecked={model.supports_function_calling} />
-              <Checkbox name="supports_system_messages" label="System messages" defaultChecked={model.supports_system_messages} />
-              <Checkbox name="supports_response_schema" label="Response schema" defaultChecked={model.supports_response_schema} />
-              <Checkbox name="supports_tool_choice" label="Tool choice" defaultChecked={model.supports_tool_choice} />
-            </div>
-            <div className="md:col-span-2">
-              <Label className="mb-2 block">Routing tags (auto)</Label>
-              <div className="flex flex-wrap gap-3">
-                {MODEL_TAGS.map((tag) => (
-                  <Checkbox
-                    key={tag}
-                    name={`tag_${tag}`}
-                    label={tag}
-                    defaultChecked={model.tags?.includes(tag) ?? false}
-                  />
-                ))}
+            {(editType === "chat" || editType === "embedding") && (
+              <Field label="Context window" name="context_window" type="number" defaultValue={String(model.context_window)} />
+            )}
+            {(editType === "chat" || editType === "embedding") && (
+              <Field label="Input cost / token" name="input_cost_per_token" defaultValue={toPlainDecimal(model.input_cost_per_token)} />
+            )}
+            {editType === "chat" && (
+              <Field label="Output cost / token" name="output_cost_per_token" defaultValue={toPlainDecimal(model.output_cost_per_token)} />
+            )}
+            {editType === "image" && (
+              <Field label="Cost / image" name="cost_per_image" defaultValue={toPlainDecimal(model.cost_per_image)} />
+            )}
+            {editType === "audio_speech" && (
+              <Field label="Cost / character" name="cost_per_character" defaultValue={toPlainDecimal(model.cost_per_character)} />
+            )}
+            {editType === "audio_transcription" && (
+              <Field label="Cost / audio second" name="cost_per_audio_second" defaultValue={toPlainDecimal(model.cost_per_audio_second)} />
+            )}
+            {editType === "chat" ? (
+              <>
+                <div className="flex flex-wrap gap-4 md:col-span-2">
+                  <Checkbox name="enabled" label="Enabled" defaultChecked={model.enabled} />
+                  <Checkbox name="supports_function_calling" label="Function calling" defaultChecked={model.supports_function_calling} />
+                  <Checkbox name="supports_system_messages" label="System messages" defaultChecked={model.supports_system_messages} />
+                  <Checkbox name="supports_response_schema" label="Response schema" defaultChecked={model.supports_response_schema} />
+                  <Checkbox name="supports_tool_choice" label="Tool choice" defaultChecked={model.supports_tool_choice} />
+                </div>
+                <div className="md:col-span-2">
+                  <Label className="mb-2 block">Routing tags (auto)</Label>
+                  <div className="flex flex-wrap gap-3">
+                    {MODEL_TAGS.map((tag) => (
+                      <Checkbox
+                        key={tag}
+                        name={`tag_${tag}`}
+                        label={tag}
+                        defaultChecked={model.tags?.includes(tag) ?? false}
+                      />
+                    ))}
+                  </div>
+                </div>
+              </>
+            ) : (
+              <div className="flex flex-wrap gap-4 md:col-span-2">
+                <Checkbox name="enabled" label="Enabled" defaultChecked={model.enabled} />
               </div>
-            </div>
+            )}
             <div className="md:col-span-2">
               <Button type="submit" size="sm" disabled={pending}>
                 <Save className="h-3.5 w-3.5" />
@@ -649,6 +835,59 @@ function Field({
   );
 }
 
+function modelTypeHint(type: string): string {
+  switch (type) {
+    case "chat":
+      return "Serves /v1/chat/completions and /v1/completions. Billed per token; eligible for `auto` routing.";
+    case "embedding":
+      return "Serves /v1/embeddings. Billed per input token.";
+    case "audio_transcription":
+      return "Serves /v1/audio/transcriptions and /v1/audio/translations (multipart audio upload).";
+    case "audio_speech":
+      return "Serves /v1/audio/speech. Billed per input character.";
+    case "image":
+      return "Serves /v1/images/generations. Billed per image.";
+    default:
+      return "";
+  }
+}
+
+function SelectField({
+  label,
+  name,
+  value,
+  onChange,
+  options,
+  hint,
+}: {
+  label: string;
+  name: string;
+  value: string;
+  onChange?: (value: string) => void;
+  options: readonly { value: string; label: string }[];
+  hint?: string;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label htmlFor={`${name}-${label}`}>{label}</Label>
+      <select
+        id={`${name}-${label}`}
+        name={name}
+        value={value}
+        onChange={(e) => onChange?.(e.target.value)}
+        className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+      >
+        {options.map((opt) => (
+          <option key={opt.value} value={opt.value}>
+            {opt.label}
+          </option>
+        ))}
+      </select>
+      {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
+    </div>
+  );
+}
+
 function CachePanel({ stats }: { stats?: CacheStats }) {
   const hits = stats?.hits ?? 0;
   const misses = stats?.misses ?? 0;
@@ -716,6 +955,150 @@ function isBenchmarkRoute(model: ModelRoute) {
   return values.includes("benchmark-endpoint") || values.includes("mock-model") || values.includes("mock-backend");
 }
 
+// Editable, secret-free projection of a model route used for the JSON backup.
+// `id`, timestamps and `api_key` are intentionally dropped: ids/timestamps are
+// server-assigned and upstream secrets must never land in a downloaded file.
+function toExportShape(model: ModelRoute) {
+  return {
+    model_name: model.model_name,
+    description: model.description,
+    upstream_model: model.upstream_model,
+    api_base: model.api_base,
+    model_type: model.model_type,
+    input_cost_per_token: model.input_cost_per_token,
+    output_cost_per_token: model.output_cost_per_token,
+    cost_per_image: model.cost_per_image,
+    cost_per_audio_second: model.cost_per_audio_second,
+    cost_per_character: model.cost_per_character,
+    context_window: model.context_window,
+    admission_weight: model.admission_weight,
+    max_in_flight: model.max_in_flight,
+    supports_function_calling: model.supports_function_calling,
+    supports_system_messages: model.supports_system_messages,
+    supports_response_schema: model.supports_response_schema,
+    supports_tool_choice: model.supports_tool_choice,
+    enabled: model.enabled,
+    cache_enabled: model.cache_enabled,
+    cache_ttl_secs: model.cache_ttl_secs,
+    tags: model.tags,
+  };
+}
+
+function ImportPreview({
+  plan,
+  pending,
+  onConfirm,
+  onCancel,
+}: {
+  plan: ImportPlanItem[];
+  pending: boolean;
+  onConfirm: () => void;
+  onCancel: () => void;
+}) {
+  const createCount = plan.filter((item) => item.action === "create").length;
+  const updateCount = plan.length - createCount;
+  return (
+    <div className="rounded-md border border-border bg-card/40">
+      <div className="flex flex-col gap-3 border-b border-border/60 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <p className="text-sm font-medium">Review import</p>
+          <p className="text-xs text-muted-foreground">
+            {plan.length} models in file / {createCount} new / {updateCount} to update
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <Button type="button" size="sm" variant="ghost" disabled={pending} onClick={onCancel}>
+            Cancel
+          </Button>
+          <Button type="button" size="sm" disabled={pending} onClick={onConfirm}>
+            {pending ? "Importing..." : `Confirm import (${plan.length})`}
+          </Button>
+        </div>
+      </div>
+      <div className="max-h-72 overflow-auto">
+        <table className="w-full text-xs">
+          <thead>
+            <tr className="border-b border-border text-left text-muted-foreground">
+              <th className="px-4 py-2 font-medium">Model</th>
+              <th className="px-3 py-2 font-medium">Action</th>
+              <th className="hidden px-3 py-2 font-medium md:table-cell">Upstream</th>
+              <th className="px-3 py-2 font-medium">State</th>
+            </tr>
+          </thead>
+          <tbody>
+            {plan.map((item) => (
+              <tr key={item.model_name} className="border-b border-border/50">
+                <td className="px-4 py-2 font-medium">{item.model_name}</td>
+                <td className="px-3 py-2">
+                  <Badge
+                    className={cn(
+                      "text-[10px]",
+                      item.action === "create"
+                        ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-300"
+                        : "border-sky-500/35 bg-sky-500/10 text-sky-300",
+                    )}
+                  >
+                    {item.action === "create" ? "new" : "update"}
+                  </Badge>
+                </td>
+                <td className="hidden px-3 py-2 font-mono text-[11px] text-muted-foreground md:table-cell">{item.upstream_model}</td>
+                <td className="px-3 py-2 text-muted-foreground">{item.enabled ? "enabled" : "disabled"}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function ImportResultBanner({
+  result,
+  onDismiss,
+}: {
+  result: ImportModelsResult;
+  onDismiss: () => void;
+}) {
+  if (!result.ok) {
+    return (
+      <div className="flex items-start justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+        <span>Import failed: {result.error}</span>
+        <button type="button" onClick={onDismiss} className="shrink-0 text-xs underline opacity-80 hover:opacity-100">
+          Dismiss
+        </button>
+      </div>
+    );
+  }
+  const ok = result.failed === 0;
+  return (
+    <div
+      className={cn(
+        "rounded-md border px-3 py-2 text-sm",
+        ok
+          ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-300"
+          : "border-amber-500/35 bg-amber-500/10 text-amber-200",
+      )}
+    >
+      <div className="flex items-start justify-between gap-3">
+        <span>
+          Imported {result.created} new, updated {result.updated}
+          {result.failed > 0 ? `, ${result.failed} failed` : ""}.
+        </span>
+        <button type="button" onClick={onDismiss} className="shrink-0 text-xs underline opacity-80 hover:opacity-100">
+          Dismiss
+        </button>
+      </div>
+      {result.errors.length > 0 && (
+        <ul className="mt-2 list-disc space-y-0.5 pl-5 text-xs">
+          {result.errors.map((error, index) => (
+            <li key={index}>{error}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
 function formatModelCost(model: ModelRoute) {
   const input = model.input_cost_per_token * 1_000_000;
   const output = model.output_cost_per_token * 1_000_000;
@@ -732,6 +1115,35 @@ function formatCostNumber(value: number) {
   if (value >= 1) return value.toFixed(2);
   if (value >= 0.01) return value.toFixed(3);
   return value.toPrecision(2);
+}
+
+// Renders a number as a plain decimal string, never scientific notation, so
+// per-token costs like 0.00000008 stay editable in the form instead of showing
+// as "8e-8". Expands the shortest round-trip representation by hand to avoid the
+// float artifacts that `toFixed` introduces for tiny values.
+function toPlainDecimal(value: number): string {
+  if (!Number.isFinite(value)) return "";
+  const str = String(value);
+  if (!/e/i.test(str)) return str;
+
+  const [coeff, expPart] = str.toLowerCase().split("e");
+  const exp = Number(expPart);
+  const negative = coeff.startsWith("-");
+  const unsigned = coeff.replace("-", "");
+  const digits = unsigned.replace(".", "");
+  const dotIndex = unsigned.indexOf(".");
+  const intLength = dotIndex === -1 ? unsigned.length : dotIndex;
+  const pointPos = intLength + exp;
+
+  let body: string;
+  if (pointPos <= 0) {
+    body = `0.${"0".repeat(-pointPos)}${digits}`;
+  } else if (pointPos >= digits.length) {
+    body = digits + "0".repeat(pointPos - digits.length);
+  } else {
+    body = `${digits.slice(0, pointPos)}.${digits.slice(pointPos)}`;
+  }
+  return (negative ? "-" : "") + body;
 }
 
 function formatCapabilities(model: ModelRoute) {

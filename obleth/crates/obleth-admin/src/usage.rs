@@ -62,9 +62,14 @@ pub struct UsageModelAgg {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
-    /// Generation throughput in output tokens/sec, measured over decode time
-    /// (total latency minus time-to-first-token) for completed streamed responses.
+    /// Median per-request generation throughput (output tokens/sec). Measured
+    /// over service time \u2014 decode window (total - ttft) for streamed responses,
+    /// or upstream time (total - queue_wait) for non-streamed ones \u2014 so queue
+    /// delay under saturation doesn't deflate the rate a user actually sees.
     pub gen_tokens_per_sec: f64,
+    /// Aggregate generation throughput: sum of per-request rates across the
+    /// window (combined model output rate across all connections).
+    pub agg_tokens_per_sec: f64,
     /// Average time-to-first-token in milliseconds.
     pub avg_ttft_ms: f64,
     /// Average end-to-end latency in milliseconds.
@@ -188,9 +193,11 @@ pub async fn query_usage_by_model(
         "select model, count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
          sum(input_tokens) + sum(output_tokens) as total_tok, \
-         round(if(sumIf(total_ms - ttft_ms, total_ms > ttft_ms and output_tokens > 0) > 0, \
-         sumIf(output_tokens, total_ms > ttft_ms and output_tokens > 0) / \
-         (sumIf(total_ms - ttft_ms, total_ms > ttft_ms and output_tokens > 0) / 1000), 0), 2) as gen_tps, \
+         round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
+         quantileIf(0.5)(output_tokens / (greatest(if(total_ms - ttft_ms >= 20, total_ms - ttft_ms, total_ms - queue_wait_ms), 1) / 1000.), \
+         total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps, \
+         round(sumIf(output_tokens / (greatest(if(total_ms - ttft_ms >= 20, total_ms - ttft_ms, total_ms - queue_wait_ms), 1) / 1000.), \
+         total_ms >= 20 and output_tokens >= 1), 1) as agg_tps, \
          round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft, \
          round(if(countIf(total_ms > 0) > 0, avgIf(total_ms, total_ms > 0), 0), 1) as avg_total, \
          round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft, \

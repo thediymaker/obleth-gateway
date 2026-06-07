@@ -216,8 +216,22 @@ pub struct ModelRoute {
     pub api_base: String,
     /// Optional bearer/api key for the upstream (stored encrypted-at-rest in prod).
     pub api_key: Option<String>,
+    /// Modality from the fixed [`MODEL_TYPES`] vocabulary. Determines which
+    /// OpenAI endpoint this model serves (`chat`, `embedding`,
+    /// `audio_transcription`, `audio_speech`, `image`). Defaults to `chat`.
+    #[serde(default = "default_model_type")]
+    pub model_type: String,
     pub input_cost_per_token: f64,
     pub output_cost_per_token: f64,
+    /// Per-generated-image cost in USD (`image` models).
+    #[serde(default)]
+    pub cost_per_image: f64,
+    /// Per-second-of-audio cost in USD (`audio_transcription` models).
+    #[serde(default)]
+    pub cost_per_audio_second: f64,
+    /// Per-input-character cost in USD (`audio_speech` models).
+    #[serde(default)]
+    pub cost_per_character: f64,
     pub context_window: i64,
     /// Multiplier applied to tenant weight at admission when this model is used.
     pub admission_weight: i64,
@@ -293,6 +307,11 @@ pub struct ResolvedModel {
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
+    /// Modality from the fixed [`MODEL_TYPES`] vocabulary. `#[serde(default)]`
+    /// keeps older cached payloads (without this field) deserializable as
+    /// `chat`.
+    #[serde(default = "default_model_type")]
+    pub model_type: String,
     pub admission_weight: i64,
     pub max_in_flight: Option<usize>,
     pub enabled: bool,
@@ -303,6 +322,13 @@ pub struct ResolvedModel {
     pub input_cost_per_token: f64,
     #[serde(default)]
     pub output_cost_per_token: f64,
+    /// Per-unit costs for non-chat modalities (USD).
+    #[serde(default)]
+    pub cost_per_image: f64,
+    #[serde(default)]
+    pub cost_per_audio_second: f64,
+    #[serde(default)]
+    pub cost_per_character: f64,
     /// Maximum context window in tokens. Used by the `auto` router to filter
     /// out models that cannot fit the request. `#[serde(default)]` keeps older
     /// cached payloads (without this field) deserializable.
@@ -479,6 +505,41 @@ pub const MODEL_TAGS: &[&str] = &[
 /// True when `tag` is part of the fixed [`MODEL_TAGS`] vocabulary.
 pub fn is_valid_tag(tag: &str) -> bool {
     MODEL_TAGS.contains(&tag)
+}
+
+/// Fixed vocabulary of model modalities. Each value maps to a family of
+/// OpenAI-compatible endpoints the model serves (see
+/// `endpoint_matches_model_type` in the proxy). `chat` is the default.
+pub const MODEL_TYPES: &[&str] = &[
+    "chat",
+    "embedding",
+    "audio_transcription",
+    "audio_speech",
+    "image",
+];
+
+/// The default modality assigned to a model when none is specified.
+pub const DEFAULT_MODEL_TYPE: &str = "chat";
+
+fn default_model_type() -> String {
+    DEFAULT_MODEL_TYPE.to_string()
+}
+
+/// True when `model_type` is part of the fixed [`MODEL_TYPES`] vocabulary.
+pub fn is_valid_model_type(model_type: &str) -> bool {
+    MODEL_TYPES.contains(&model_type)
+}
+
+/// Normalize an arbitrary model-type string to the canonical form used in
+/// storage: trimmed and lowercased, falling back to [`DEFAULT_MODEL_TYPE`]
+/// when empty or outside the known vocabulary.
+pub fn normalize_model_type(model_type: &str) -> String {
+    let t = model_type.trim().to_ascii_lowercase();
+    if is_valid_model_type(&t) {
+        t
+    } else {
+        DEFAULT_MODEL_TYPE.to_string()
+    }
 }
 
 /// Normalize an arbitrary list of tag strings to the canonical form used in

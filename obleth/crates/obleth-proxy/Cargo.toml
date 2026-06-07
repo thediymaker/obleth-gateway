@@ -14,6 +14,7 @@ tower.workspace = true
 tower-http.workspace = true
 reqwest.workspace = true
 http.workspace = true
+multer.workspace = true
 bytes.workspace = true
 futures.workspace = true
 futures-util.workspace = true

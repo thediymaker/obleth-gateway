@@ -531,8 +531,12 @@ impl Store {
         upstream_model: &str,
         api_base: &str,
         api_key: Option<&str>,
+        model_type: &str,
         input_cost_per_token: f64,
         output_cost_per_token: f64,
+        cost_per_image: f64,
+        cost_per_audio_second: f64,
+        cost_per_character: f64,
         context_window: i64,
         admission_weight: i64,
         max_in_flight: Option<i64>,
@@ -545,13 +549,15 @@ impl Store {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
             "insert into models (
-                id, model_name, description, upstream_model, api_base, api_key,
-                input_cost_per_token, output_cost_per_token, context_window,
+                id, model_name, description, upstream_model, api_base, api_key, model_type,
+                input_cost_per_token, output_cost_per_token,
+                cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                 admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                 supports_response_schema, supports_tool_choice, tags
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-             returning id, model_name, description, upstream_model, api_base, api_key,
-                       input_cost_per_token, output_cost_per_token, context_window,
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+                       input_cost_per_token, output_cost_per_token,
+                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
                        cache_enabled, cache_ttl_secs, tags,
@@ -563,8 +569,12 @@ impl Store {
         .bind(upstream_model)
         .bind(api_base)
         .bind(api_key)
+        .bind(obleth_config::normalize_model_type(model_type))
         .bind(input_cost_per_token)
         .bind(output_cost_per_token)
+        .bind(cost_per_image.max(0.0))
+        .bind(cost_per_audio_second.max(0.0))
+        .bind(cost_per_character.max(0.0))
         .bind(context_window.max(0))
         .bind(admission_weight.max(1))
         .bind(max_in_flight.map(|n| n.max(1)))
@@ -580,8 +590,9 @@ impl Store {
 
     pub async fn list_models(&self) -> Result<Vec<ModelRoute>> {
         let rows = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key,
-                    input_cost_per_token, output_cost_per_token, context_window,
+            "select id, model_name, description, upstream_model, api_base, api_key, model_type,
+                    input_cost_per_token, output_cost_per_token,
+                    cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, enabled,
                     cache_enabled, cache_ttl_secs, tags,
@@ -595,8 +606,9 @@ impl Store {
 
     pub async fn get_model(&self, id: Uuid) -> Result<ModelRoute> {
         let row = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key,
-                    input_cost_per_token, output_cost_per_token, context_window,
+            "select id, model_name, description, upstream_model, api_base, api_key, model_type,
+                    input_cost_per_token, output_cost_per_token,
+                    cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, enabled,
                     cache_enabled, cache_ttl_secs, tags,
@@ -612,8 +624,9 @@ impl Store {
 
     pub async fn get_model_by_name(&self, model_name: &str) -> Result<ModelRoute> {
         let row = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key,
-                    input_cost_per_token, output_cost_per_token, context_window,
+            "select id, model_name, description, upstream_model, api_base, api_key, model_type,
+                    input_cost_per_token, output_cost_per_token,
+                    cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, enabled,
                     cache_enabled, cache_ttl_secs, tags,
@@ -635,8 +648,12 @@ impl Store {
         upstream_model: &str,
         api_base: &str,
         api_key: Option<&str>,
+        model_type: &str,
         input_cost_per_token: f64,
         output_cost_per_token: f64,
+        cost_per_image: f64,
+        cost_per_audio_second: f64,
+        cost_per_character: f64,
         context_window: i64,
         admission_weight: i64,
         max_in_flight: Option<i64>,
@@ -656,10 +673,13 @@ impl Store {
                 max_in_flight = $10,
                 supports_function_calling = $11, supports_system_messages = $12,
                 supports_response_schema = $13, supports_tool_choice = $14,
-                enabled = $15, tags = $16, updated_at = now()
+                enabled = $15, tags = $16, model_type = $17,
+                cost_per_image = $18, cost_per_audio_second = $19, cost_per_character = $20,
+                updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key,
-                       input_cost_per_token, output_cost_per_token, context_window,
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+                       input_cost_per_token, output_cost_per_token,
+                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
                        cache_enabled, cache_ttl_secs, tags,
@@ -681,6 +701,10 @@ impl Store {
         .bind(supports_tool_choice)
         .bind(enabled)
         .bind(sqlx::types::Json(obleth_config::normalize_tags(tags)))
+        .bind(obleth_config::normalize_model_type(model_type))
+        .bind(cost_per_image.max(0.0))
+        .bind(cost_per_audio_second.max(0.0))
+        .bind(cost_per_character.max(0.0))
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -706,8 +730,9 @@ impl Store {
         let row = sqlx::query(
             "update models set max_in_flight = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key,
-                       input_cost_per_token, output_cost_per_token, context_window,
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+                       input_cost_per_token, output_cost_per_token,
+                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
                        cache_enabled, cache_ttl_secs, tags,
@@ -729,8 +754,9 @@ impl Store {
         let row = sqlx::query(
             "update models set admission_weight = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key,
-                       input_cost_per_token, output_cost_per_token, context_window,
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+                       input_cost_per_token, output_cost_per_token,
+                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
                        cache_enabled, cache_ttl_secs, tags,
@@ -746,8 +772,9 @@ impl Store {
 
     pub async fn all_resolved_models(&self) -> Result<Vec<(String, ResolvedModel)>> {
         let rows = sqlx::query(
-            "select model_name, upstream_model, api_base, api_key, admission_weight, max_in_flight, enabled,
+            "select model_name, upstream_model, api_base, api_key, model_type, admission_weight, max_in_flight, enabled,
                     cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token,
+                    cost_per_image, cost_per_audio_second, cost_per_character,
                     context_window, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, tags
              from models where enabled = true",
@@ -764,6 +791,7 @@ impl Store {
                         upstream_model: row.try_get("upstream_model")?,
                         api_base: row.try_get("api_base")?,
                         api_key: cipher().decrypt_opt(row.try_get("api_key")?)?,
+                        model_type: row.try_get("model_type")?,
                         admission_weight: row.try_get("admission_weight")?,
                         max_in_flight: row
                             .try_get::<Option<i64>, _>("max_in_flight")?
@@ -773,6 +801,9 @@ impl Store {
                         cache_ttl_secs: row.try_get("cache_ttl_secs")?,
                         input_cost_per_token: row.try_get("input_cost_per_token")?,
                         output_cost_per_token: row.try_get("output_cost_per_token")?,
+                        cost_per_image: row.try_get("cost_per_image")?,
+                        cost_per_audio_second: row.try_get("cost_per_audio_second")?,
+                        cost_per_character: row.try_get("cost_per_character")?,
                         context_window: row.try_get("context_window")?,
                         supports_function_calling: row.try_get("supports_function_calling")?,
                         supports_system_messages: row.try_get("supports_system_messages")?,
@@ -798,8 +829,9 @@ impl Store {
         let row = sqlx::query(
             "update models set cache_enabled = $2, cache_ttl_secs = $3, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key,
-                       input_cost_per_token, output_cost_per_token, context_window,
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+                       input_cost_per_token, output_cost_per_token,
+                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
                        cache_enabled, cache_ttl_secs, tags,
@@ -1407,8 +1439,18 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         upstream_model: row.try_get("upstream_model")?,
         api_base: row.try_get("api_base")?,
         api_key: cipher().decrypt_opt(row.try_get("api_key")?)?,
+        // Tolerant reads: SQL statements that don't select these newer columns
+        // (e.g. capacity/weight toggles) degrade to defaults rather than
+        // erroring. The full SELECT/RETURNING clauses do include them so the
+        // resolved-cache refresh in `sync_model` sees the real values.
+        model_type: row
+            .try_get::<String, _>("model_type")
+            .unwrap_or_else(|_| obleth_config::DEFAULT_MODEL_TYPE.to_string()),
         input_cost_per_token: row.try_get("input_cost_per_token")?,
         output_cost_per_token: row.try_get("output_cost_per_token")?,
+        cost_per_image: row.try_get("cost_per_image").unwrap_or(0.0),
+        cost_per_audio_second: row.try_get("cost_per_audio_second").unwrap_or(0.0),
+        cost_per_character: row.try_get("cost_per_character").unwrap_or(0.0),
         context_window: row.try_get("context_window")?,
         admission_weight: row.try_get("admission_weight")?,
         max_in_flight: row.try_get("max_in_flight")?,

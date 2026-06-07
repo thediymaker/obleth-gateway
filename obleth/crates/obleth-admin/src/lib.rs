@@ -344,8 +344,16 @@ pub struct CreateModel {
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub model_type: Option<String>,
     pub input_cost_per_token: Option<f64>,
     pub output_cost_per_token: Option<f64>,
+    #[serde(default)]
+    pub cost_per_image: Option<f64>,
+    #[serde(default)]
+    pub cost_per_audio_second: Option<f64>,
+    #[serde(default)]
+    pub cost_per_character: Option<f64>,
     pub context_window: Option<i64>,
     pub admission_weight: Option<i64>,
     pub max_in_flight: Option<i64>,
@@ -363,8 +371,16 @@ pub struct UpdateModel {
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub model_type: Option<String>,
     pub input_cost_per_token: Option<f64>,
     pub output_cost_per_token: Option<f64>,
+    #[serde(default)]
+    pub cost_per_image: Option<f64>,
+    #[serde(default)]
+    pub cost_per_audio_second: Option<f64>,
+    #[serde(default)]
+    pub cost_per_character: Option<f64>,
     pub context_window: Option<i64>,
     pub admission_weight: Option<i64>,
     pub max_in_flight: Option<i64>,
@@ -1386,8 +1402,12 @@ async fn create_model(
             &body.upstream_model,
             &body.api_base,
             body.api_key.as_deref(),
+            body.model_type.as_deref().unwrap_or("chat"),
             body.input_cost_per_token.unwrap_or(0.0),
             body.output_cost_per_token.unwrap_or(0.0),
+            body.cost_per_image.unwrap_or(0.0),
+            body.cost_per_audio_second.unwrap_or(0.0),
+            body.cost_per_character.unwrap_or(0.0),
             body.context_window.unwrap_or(8192),
             body.admission_weight.unwrap_or(100),
             body.max_in_flight,
@@ -1455,10 +1475,16 @@ async fn update_model(
             &body.upstream_model,
             &body.api_base,
             api_key,
+            body.model_type.as_deref().unwrap_or(&existing.model_type),
             body.input_cost_per_token
                 .unwrap_or(existing.input_cost_per_token),
             body.output_cost_per_token
                 .unwrap_or(existing.output_cost_per_token),
+            body.cost_per_image.unwrap_or(existing.cost_per_image),
+            body.cost_per_audio_second
+                .unwrap_or(existing.cost_per_audio_second),
+            body.cost_per_character
+                .unwrap_or(existing.cost_per_character),
             body.context_window.unwrap_or(existing.context_window),
             body.admission_weight.unwrap_or(existing.admission_weight),
             body.max_in_flight.or(existing.max_in_flight),
@@ -1728,6 +1754,7 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         upstream_model: model.upstream_model.clone(),
         api_base: model.api_base.clone(),
         api_key: model.api_key.clone(),
+        model_type: model.model_type.clone(),
         admission_weight: model.admission_weight,
         max_in_flight: model.max_in_flight.and_then(|n| usize::try_from(n).ok()),
         enabled: model.enabled,
@@ -1735,6 +1762,9 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         cache_ttl_secs: model.cache_ttl_secs,
         input_cost_per_token: model.input_cost_per_token,
         output_cost_per_token: model.output_cost_per_token,
+        cost_per_image: model.cost_per_image,
+        cost_per_audio_second: model.cost_per_audio_second,
+        cost_per_character: model.cost_per_character,
         context_window: model.context_window,
         supports_function_calling: model.supports_function_calling,
         supports_system_messages: model.supports_system_messages,

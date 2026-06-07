@@ -66,8 +66,12 @@ export interface ModelRoute {
   upstream_model: string;
   api_base: string;
   api_key: string | null;
+  model_type: string;
   input_cost_per_token: number;
   output_cost_per_token: number;
+  cost_per_image: number;
+  cost_per_audio_second: number;
+  cost_per_character: number;
   context_window: number;
   admission_weight: number;
   max_in_flight: number | null;
@@ -174,6 +178,7 @@ export interface UsageModelAgg {
   output_tokens: number;
   total_tokens: number;
   gen_tokens_per_sec: number;
+  agg_tokens_per_sec: number;
   avg_ttft_ms: number;
   avg_total_ms: number;
   p50_ttft_ms: number;

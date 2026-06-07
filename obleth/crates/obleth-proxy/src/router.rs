@@ -148,6 +148,10 @@ pub fn select_model(
     let eligible: Vec<&Candidate> = candidates
         .iter()
         .filter(|c| c.model.enabled && c.healthy)
+        // `auto` is a chat-completions convenience; only chat models are
+        // eligible. Non-chat modalities (embedding, image, audio) are addressed
+        // by name on their dedicated endpoints.
+        .filter(|c| c.model.model_type == obleth_config::DEFAULT_MODEL_TYPE)
         .filter(|c| {
             // A non-positive context window means "unknown" (misconfigured or
             // legacy row); don't exclude on a signal we don't trust.
@@ -339,6 +343,7 @@ mod tests {
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
             api_key: None,
+            model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
             admission_weight: 100,
             max_in_flight: None,
             enabled: true,
@@ -346,6 +351,9 @@ mod tests {
             cache_ttl_secs: 0,
             input_cost_per_token: 0.0,
             output_cost_per_token: 0.0,
+            cost_per_image: 0.0,
+            cost_per_audio_second: 0.0,
+            cost_per_character: 0.0,
             context_window: 128_000,
             supports_function_calling: true,
             supports_system_messages: true,
