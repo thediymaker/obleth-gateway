@@ -507,6 +507,36 @@ export async function setAutoRouterSettingsAction(
   return { ok: true };
 }
 
+export async function setUsageRetentionAction(days: number): Promise<ActionResult> {
+  await requireSession();
+  if (!Number.isFinite(days) || days < 1) {
+    return { ok: false, error: "Retention must be at least 1 day" };
+  }
+  try {
+    await obleth.setUsageRetention(Math.floor(days));
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/settings");
+  return { ok: true };
+}
+
+export async function compactUsageAction(): Promise<
+  ActionResult & { partitionsDropped?: number; retentionDays?: number }
+> {
+  await requireSession();
+  try {
+    const res = await obleth.compactUsage();
+    return {
+      ok: true,
+      partitionsDropped: res.partitions_dropped,
+      retentionDays: res.retention_days,
+    };
+  } catch (e) {
+    return actionError(e);
+  }
+}
+
 export async function testAlertAction(): Promise<
   ActionResult & { results?: { channel: string; ok: boolean; detail: string }[] }
 > {

@@ -1,19 +1,29 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { Send } from "lucide-react";
-import { setAlertSettingsAction, setAutoRouterSettingsAction, testAlertAction } from "@/app/actions";
+import { Send, Database, Trash2 } from "lucide-react";
+import {
+  setAlertSettingsAction,
+  setAutoRouterSettingsAction,
+  testAlertAction,
+  setUsageRetentionAction,
+  compactUsageAction,
+} from "@/app/actions";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { DestructiveConfirm } from "@/components/ui/destructive-confirm";
 import type {
   AlertSettingsView,
   AutoRouterSettingsView,
   ModelRoute,
   UpdateAlertSettings,
   UpdateAutoRouterSettings,
+  UsageRetentionView,
 } from "@/lib/obleth";
+
+const RETENTION_PRESETS = [7, 30, 90, 180, 365] as const;
 
 type ChannelResult = { channel: string; ok: boolean; detail: string };
 
@@ -418,6 +428,158 @@ export function AutoRouterSettingsForm({
           </p>
         )}
       </CardContent>
+    </Card>
+  );
+}
+
+export function UsageRetentionForm({ retention }: { retention: UsageRetentionView | null }) {
+  const currentDays = retention?.days ?? 180;
+  const [pending, start] = useTransition();
+  const [compacting, startCompact] = useTransition();
+  const [selected, setSelected] = useState<number>(currentDays);
+  const [status, setStatus] = useState<{ ok: boolean; message: string } | null>(null);
+  const [confirmLower, setConfirmLower] = useState(false);
+  const [confirmCompact, setConfirmCompact] = useState(false);
+
+  // Offer the saved value even if it isn't one of the presets.
+  const options = Array.from(new Set([...RETENTION_PRESETS, currentDays])).sort((a, b) => a - b);
+  const lowering = selected < currentDays;
+
+  function persist(days: number) {
+    setStatus(null);
+    start(async () => {
+      const result = await setUsageRetentionAction(days);
+      setStatus(
+        result.ok
+          ? { ok: true, message: `Retention set to ${days} days.` }
+          : { ok: false, message: result.error },
+      );
+      setConfirmLower(false);
+    });
+  }
+
+  function onSave() {
+    if (lowering) {
+      setConfirmLower(true);
+    } else {
+      persist(selected);
+    }
+  }
+
+  function onCompact() {
+    setStatus(null);
+    startCompact(async () => {
+      const result = await compactUsageAction();
+      if (result.ok) {
+        setStatus({
+          ok: true,
+          message: `Compacted: dropped ${result.partitionsDropped ?? 0} day-partition(s) older than ${result.retentionDays ?? currentDays} days.`,
+        });
+      } else {
+        setStatus({ ok: false, message: result.error });
+      }
+      setConfirmCompact(false);
+    });
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Database className="h-4 w-4" />
+          Usage data retention
+        </CardTitle>
+        <CardDescription>
+          Raw per-request usage rows are kept for this many days, then pruned to bound storage. The
+          permanent daily rollup powering the Reports page is <strong>kept forever</strong> and is
+          never affected by this setting.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-1">
+            <Label htmlFor="retention_days">Retention window</Label>
+            <select
+              id="retention_days"
+              value={selected}
+              onChange={(e) => setSelected(Number(e.target.value))}
+              className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
+            >
+              {options.map((d) => (
+                <option key={d} value={d}>
+                  {d} days{d === currentDays ? " (current)" : ""}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap gap-2">
+          <Button onClick={onSave} disabled={pending || selected === currentDays}>
+            {pending ? "Saving..." : "Save retention"}
+          </Button>
+          <Button variant="destructive" onClick={() => setConfirmCompact(true)} disabled={compacting}>
+            <Trash2 className="h-4 w-4" />
+            {compacting ? "Compacting..." : "Compact now"}
+          </Button>
+        </div>
+
+        {status && (
+          <p
+            className={
+              status.ok
+                ? "rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
+                : "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            }
+          >
+            {status.message}
+          </p>
+        )}
+      </CardContent>
+
+      <DestructiveConfirm
+        open={confirmLower}
+        onOpenChange={setConfirmLower}
+        title="Lower usage retention"
+        checkboxLabel="I understand raw per-request data older than the new window will be permanently deleted."
+        confirmLabel={`Lower to ${selected} days`}
+        pending={pending}
+        onConfirm={() => persist(selected)}
+        description={
+          <>
+            <p>
+              Lowering retention from <strong>{currentDays}</strong> to{" "}
+              <strong>{selected}</strong> days will, on the next compaction, permanently delete raw
+              per-request rows older than {selected} days.
+            </p>
+            <p>
+              Daily totals on the Reports page are <strong>not</strong> affected. This cannot be
+              undone.
+            </p>
+          </>
+        }
+      />
+
+      <DestructiveConfirm
+        open={confirmCompact}
+        onOpenChange={setConfirmCompact}
+        title="Compact usage data now"
+        checkboxLabel="I understand this immediately deletes raw per-request data outside the retention window."
+        confirmLabel="Compact now"
+        pending={compacting}
+        onConfirm={onCompact}
+        description={
+          <>
+            <p>
+              This immediately drops every raw <code>usage</code> day-partition older than the
+              current retention window ({currentDays} days), reclaiming storage.
+            </p>
+            <p>
+              The permanent daily rollup is <strong>not</strong> touched. This cannot be undone.
+            </p>
+          </>
+        }
+      />
     </Card>
   );
 }

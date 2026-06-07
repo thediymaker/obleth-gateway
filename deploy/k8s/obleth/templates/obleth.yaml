@@ -54,7 +54,7 @@ spec:
             - { name: OBLETH_MODEL_HEALTH_INTERVAL_SECS, value: {{ .Values.obleth.modelHealthIntervalSecs | quote }} }
             - { name: OBLETH_MODEL_HEALTH_TIMEOUT_SECS, value: {{ .Values.obleth.modelHealthTimeoutSecs | quote }} }
             - { name: OBLETH_MODEL_HEALTH_RETENTION_DAYS, value: {{ .Values.obleth.modelHealthRetentionDays | quote }} }
-            - { name: OBLETH_INTERNAL_PROXY_BASE_URL, value: {{ .Values.obleth.internalProxyBaseUrl | quote }} }
+            - { name: OBLETH_USAGE_RETENTION_DAYS, value: {{ .Values.obleth.usageRetentionDays | quote }} }
             - { name: OBLETH_OTEL_ENDPOINT, value: {{ .Values.obleth.otelEndpoint | quote }} }
             - { name: OBLETH_SLACK_ALERT_MIN_INTERVAL_SECS, value: {{ .Values.obleth.slackAlertMinIntervalSecs | quote }} }
             - { name: RUST_LOG, value: "info,obleth=info" }

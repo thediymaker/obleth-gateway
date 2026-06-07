@@ -442,6 +442,11 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         }
         req_builder = req_builder.headers(fwd_headers).body(send_bytes);
     }
+    // TTFT is measured from the moment we dispatch the upstream request, *after*
+    // fairshare admission. Time spent waiting in the queue is reported separately
+    // as `queue_wait_ms`; folding it into TTFT would double-count the wait and
+    // make a fast model look slow under contention.
+    let upstream_start = Instant::now();
     let upstream = req_builder
         .send()
         .instrument(tracing::info_span!("upstream_request"))
@@ -518,7 +523,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             match item {
                 Ok(chunk) => {
                     if first {
-                        ttft_ms = request_start.elapsed().as_millis() as u32;
+                        ttft_ms = upstream_start.elapsed().as_millis() as u32;
                         first = false;
                     }
                     append_tail(&mut tail, &chunk);

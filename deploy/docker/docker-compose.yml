@@ -107,7 +107,9 @@ services:
       OBLETH_MODEL_HEALTH_INTERVAL_SECS: ${OBLETH_MODEL_HEALTH_INTERVAL_SECS:-900}
       OBLETH_MODEL_HEALTH_TIMEOUT_SECS: ${OBLETH_MODEL_HEALTH_TIMEOUT_SECS:-30}
       OBLETH_MODEL_HEALTH_RETENTION_DAYS: ${OBLETH_MODEL_HEALTH_RETENTION_DAYS:-30}
-      OBLETH_INTERNAL_PROXY_BASE_URL: ${OBLETH_INTERNAL_PROXY_BASE_URL:-http://127.0.0.1:8080}
+      # Days of raw per-request usage history kept before pruning (whole
+      # day-partitions are dropped). The permanent daily rollup is never pruned.
+      OBLETH_USAGE_RETENTION_DAYS: ${OBLETH_USAGE_RETENTION_DAYS:-180}
       # OTLP/HTTP trace export (base URL). Empty disables tracing; the
       # observability profile ships a Jaeger collector on :4318.
       OBLETH_OTEL_ENDPOINT: ${OBLETH_OTEL_ENDPOINT:-}

@@ -1,10 +1,15 @@
 //! Model health checks for registered model routes.
 //!
-//! A health check is a tiny probe sent through obleth's own proxy path with a
-//! temporary Redis-only key. The probe targets the endpoint matching the
-//! model's modality (chat, embeddings, audio speech/transcription, image), so
-//! it validates the same auth, route resolution, scheduler, model rewrite, and
-//! upstream call path that real clients use.
+//! Checks are deliberately cheap and non-billable. For each model we first look
+//! for a passive signal — recent real client traffic in the ClickHouse usage
+//! ledger — and only fall back to an active probe when a model has seen no
+//! traffic. The active probe is a token-free `GET {api_base}/models` liveness
+//! call (optionally checking that the upstream actually lists the model), not a
+//! real inference request, so probing never consumes a provider budget.
+//!
+//! Transient conditions (overloaded upstream, an unsupported probe endpoint, a
+//! single network blip) are classified as `degraded` rather than `unhealthy`
+//! so a model doesn't flap to "down" and fire false alerts.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,9 +17,8 @@ use std::time::{Duration, Instant};
 use axum::extract::{Path, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
-use obleth_config::{
-    generate_api_key, ModelHealthDetail, ModelHealthSummary, ModelRoute, ResolvedKey,
-};
+use clickhouse::Row;
+use obleth_config::{ModelHealthDetail, ModelHealthSummary, ModelRoute};
 use obleth_store::{
     ModelHealthAlertEvent, ModelHealthClaim, ModelHealthConfigUpdate, ModelHealthRecordOutcome,
 };
@@ -25,11 +29,15 @@ use uuid::Uuid;
 
 use crate::{AdminError, AdminState, Result};
 
-const HEALTH_TENANT_NAME: &str = "__obleth_model_health";
 pub const HEALTH_GROUP: &str = "model-health";
 const CHECK_LIMIT: i64 = 50;
 const WORKER_CLAIM_LIMIT: i64 = 4;
 const WORKER_SLEEP_SECS: u64 = 30;
+/// Window of real traffic that counts as a passive health signal.
+const PASSIVE_WINDOW_SECS: i64 = 300;
+/// Total liveness-probe attempts (one initial try plus one retry) before a
+/// transient network failure is recorded.
+const LIVENESS_MAX_ATTEMPTS: u32 = 2;
 
 pub trait AlertSink: Send + Sync + 'static {
     fn issue(&self, key: String, title: String, detail: String);
@@ -45,7 +53,6 @@ pub struct ModelHealthRuntime {
     pub default_interval_secs: i64,
     pub timeout_secs: u64,
     pub retention_days: i64,
-    pub internal_proxy_base_url: String,
     pub http: reqwest::Client,
     pub alerts: Option<Arc<dyn AlertSink>>,
 }
@@ -251,9 +258,7 @@ async fn run_model_health_check(
     model: ModelRoute,
     trigger: &str,
 ) -> Result<ModelHealthRecordOutcome> {
-    let status = if model.enabled {
-        gateway_health_probe(state, &model).await
-    } else {
+    let status = if !model.enabled {
         ProbeResult {
             status: "disabled".to_string(),
             latency_ms: None,
@@ -261,6 +266,10 @@ async fn run_model_health_check(
             message: Some("model route is disabled".to_string()),
             response_excerpt: None,
         }
+    } else if let Some(passive) = passive_signal(state, &model).await {
+        passive
+    } else {
+        liveness_probe(state, &model).await
     };
     let summary = state.store.get_model_health_summary(model.id).await?;
     let next_check_at = jittered_next_check_at(summary.check_interval_secs);
@@ -280,170 +289,203 @@ async fn run_model_health_check(
         .map_err(AdminError::from)
 }
 
-async fn gateway_health_probe(state: &AdminState, model: &ModelRoute) -> ProbeResult {
-    let generated = generate_api_key();
-    let resolved = ResolvedKey {
-        key_id: Uuid::new_v4(),
-        tenant_id: health_tenant_id(),
-        tenant_name: HEALTH_TENANT_NAME.to_string(),
-        fairshare_group: HEALTH_GROUP.to_string(),
-        group_weight: 1,
-        weight: 1,
-        tokens_per_minute: 1_000_000,
-        max_in_flight: Some(1),
-        disabled: false,
-        status: "active".to_string(),
-        timezone: "UTC".to_string(),
-        active_from: None,
-        active_until: None,
-        weekly_windows: None,
-        budget_tokens: None,
-        budget_cost_usd: None,
-        budget_period: None,
-        budget_started_at: None,
-        allowed_models: None,
-        internal: true,
-    };
-
-    let write_key = state
-        .redis
-        .put_resolved_key(&generated.hash, &resolved)
-        .await;
-    if let Err(error) = write_key {
-        return ProbeResult::unhealthy(None, None, format!("temporary key write failed: {error}"));
+async fn passive_signal(state: &AdminState, model: &ModelRoute) -> Option<ProbeResult> {
+    let row = recent_traffic(state, &model.model_name, PASSIVE_WINDOW_SECS).await?;
+    if row.requests == 0 {
+        // No recent traffic to judge by; fall back to an active probe.
+        return None;
     }
-    let _ = state.redis.publish_invalidation(&generated.hash).await;
-
-    let result = send_health_probe_request(state, model, &generated.secret).await;
-    let _ = state.redis.delete_resolved_key(&generated.hash).await;
-    let _ = state.redis.publish_invalidation(&generated.hash).await;
-    result
+    if row.successes > 0 {
+        return Some(ProbeResult::healthy(
+            None,
+            None,
+            format!(
+                "passive: {} successful request(s) in the last {PASSIVE_WINDOW_SECS}s",
+                row.successes
+            ),
+        ));
+    }
+    if row.server_errors > 0 {
+        return Some(ProbeResult::unhealthy(
+            None,
+            None,
+            format!(
+                "passive: {} upstream server error(s) and no successes in the last {PASSIVE_WINDOW_SECS}s",
+                row.server_errors
+            ),
+        ));
+    }
+    // Only client-side (4xx) errors in the window reflect caller mistakes, not
+    // model health, so the signal is inconclusive — probe actively.
+    None
 }
 
-async fn send_health_probe_request(
+async fn recent_traffic(
     state: &AdminState,
-    model: &ModelRoute,
-    secret: &str,
-) -> ProbeResult {
-    let base = state.health.internal_proxy_base_url.trim_end_matches('/');
+    model_name: &str,
+    window_secs: i64,
+) -> Option<RecentTraffic> {
+    let since = Utc::now().timestamp_millis() - window_secs.max(1) * 1000;
+    let sql = "select count() as requests, \
+               countIf(status_code >= 200 and status_code < 300) as successes, \
+               countIf(status_code >= 500) as server_errors \
+               from usage where model = ? and ts_ms >= ?";
+    match state
+        .clickhouse
+        .query(sql)
+        .bind(model_name)
+        .bind(since)
+        .fetch_one::<RecentTraffic>()
+        .await
+    {
+        Ok(row) => Some(row),
+        Err(error) => {
+            tracing::warn!(%error, model = model_name, "passive health lookup failed; using active probe");
+            None
+        }
+    }
+}
+
+/// Token-free liveness probe: `GET {api_base}/models`. A 2xx proves the upstream
+/// is serving; when the response lists models we also confirm the route's
+/// `upstream_model` is actually loaded.
+async fn liveness_probe(state: &AdminState, model: &ModelRoute) -> ProbeResult {
+    let url = models_list_url(&model.api_base);
     let timeout = Duration::from_secs(state.health.timeout_secs.max(1));
     let client = &state.health.http;
 
-    // The probe targets the endpoint that matches the model's modality and
-    // sends the smallest valid request for it, so non-chat routes (embeddings,
-    // TTS, image, STT) get a real health signal instead of always failing a
-    // chat-completion probe.
-    let request = match model.model_type.as_str() {
-        "embedding" => client
-            .post(format!("{base}/v1/embeddings"))
-            .bearer_auth(secret)
-            .timeout(timeout)
-            .json(&serde_json::json!({ "model": model.model_name, "input": "ok" })),
-        "audio_speech" => client
-            .post(format!("{base}/v1/audio/speech"))
-            .bearer_auth(secret)
-            .timeout(timeout)
-            .json(&serde_json::json!({
-                "model": model.model_name,
-                "input": "ok",
-                "voice": "alloy"
-            })),
-        "image" => client
-            .post(format!("{base}/v1/images/generations"))
-            .bearer_auth(secret)
-            .timeout(timeout)
-            .json(&serde_json::json!({
-                "model": model.model_name,
-                "prompt": "ok",
-                "n": 1,
-                "size": "256x256"
-            })),
-        "audio_transcription" => {
-            let part = reqwest::multipart::Part::bytes(silent_wav())
-                .file_name("probe.wav")
-                .mime_str("audio/wav")
-                .expect("static audio/wav mime is valid");
-            let form = reqwest::multipart::Form::new()
-                .text("model", model.model_name.clone())
-                .part("file", part);
-            client
-                .post(format!("{base}/v1/audio/transcriptions"))
-                .bearer_auth(secret)
-                .timeout(timeout)
-                .multipart(form)
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let mut request = client.get(&url).timeout(timeout);
+        if let Some(key) = &model.api_key {
+            request = request.bearer_auth(key);
         }
-        _ => client
-            .post(format!("{base}/v1/chat/completions"))
-            .bearer_auth(secret)
-            .timeout(timeout)
-            .json(&serde_json::json!({
-                "model": model.model_name,
-                "messages": [
-                    { "role": "system", "content": "obleth model health check. Reply with ok." },
-                    { "role": "user", "content": "ok" }
-                ],
-                "max_tokens": 4,
-                "temperature": 0,
-                "stream": false
-            })),
-    };
+        let started = Instant::now();
+        let response = request.send().await;
+        let latency_ms = started.elapsed().as_millis().try_into().ok();
 
-    let started = Instant::now();
-    let response = request.send().await;
-    let latency_ms = started.elapsed().as_millis().try_into().ok();
-
-    match response {
-        Ok(res) => {
-            let status = res.status();
-            let http_status = Some(status.as_u16() as i64);
-            let body = res.text().await.unwrap_or_default();
-            if status.is_success() {
-                ProbeResult {
-                    status: "healthy".to_string(),
-                    latency_ms,
-                    http_status,
-                    message: Some("gateway health probe completed".to_string()),
-                    response_excerpt: None,
+        match response {
+            Ok(res) => {
+                let status = res.status();
+                let code = status.as_u16();
+                let http_status = Some(code as i64);
+                // Overload/throttle states are worth one quiet retry before we
+                // record anything.
+                let retryable = code == 408 || code == 429 || status.is_server_error();
+                if retryable && attempt < LIVENESS_MAX_ATTEMPTS {
+                    continue;
                 }
-            } else {
-                ProbeResult::unhealthy(
+                if status.is_success() {
+                    let body = res.text().await.unwrap_or_default();
+                    return match model_in_list(&body, &model.upstream_model) {
+                        ModelPresence::Present => ProbeResult::healthy(
+                            latency_ms,
+                            http_status,
+                            format!("upstream is serving and lists `{}`", model.upstream_model),
+                        ),
+                        // The upstream is up and answered, but doesn't advertise
+                        // this model in `/v1/models`. Many shared gateways omit
+                        // models from that list (or list slightly different ids),
+                        // so absence is a soft "can't confirm" signal, not an
+                        // outage \u2014 report `degraded` (no alert, no failure count)
+                        // rather than flapping a working model to "down".
+                        ModelPresence::Absent => ProbeResult::degraded(
+                            latency_ms,
+                            http_status,
+                            format!(
+                                "upstream is reachable but does not advertise `{}` in /v1/models",
+                                model.upstream_model
+                            ),
+                        ),
+                        ModelPresence::Unknown => ProbeResult::healthy(
+                            latency_ms,
+                            http_status,
+                            "upstream model-list endpoint responded".to_string(),
+                        ),
+                    };
+                }
+                // Rejected credentials are real and actionable. Everything else
+                // (unsupported endpoint, a lingering 5xx) is inconclusive and
+                // must not flap the model to "down".
+                if code == 401 || code == 403 {
+                    return ProbeResult::unhealthy(
+                        latency_ms,
+                        http_status,
+                        format!("upstream rejected the probe credentials (HTTP {code})"),
+                    );
+                }
+                return ProbeResult::degraded(
                     latency_ms,
                     http_status,
-                    format!("gateway health probe returned {status}"),
-                )
-                .with_excerpt(body)
+                    format!("model-list probe was inconclusive (HTTP {code})"),
+                );
+            }
+            Err(error) => {
+                let retryable =
+                    error.is_timeout() || error.is_connect() || error.is_request();
+                if retryable && attempt < LIVENESS_MAX_ATTEMPTS {
+                    continue;
+                }
+                return ProbeResult::unhealthy(
+                    latency_ms,
+                    None,
+                    format!("upstream is unreachable: {error}"),
+                );
             }
         }
-        Err(error) => ProbeResult::unhealthy(
-            latency_ms,
-            None,
-            format!("gateway health probe request failed: {error}"),
-        ),
     }
 }
 
-/// Minimal valid WAV (mono, 8 kHz, 16-bit PCM, ~0.1s of silence) used as the
-/// audio fixture for transcription health probes.
-fn silent_wav() -> Vec<u8> {
-    const SAMPLE_RATE: u32 = 8000;
-    const SAMPLES: u32 = 800; // ~0.1s
-    let data_len: u32 = SAMPLES * 2; // 16-bit mono
-    let mut buf = Vec::with_capacity(44 + data_len as usize);
-    buf.extend_from_slice(b"RIFF");
-    buf.extend_from_slice(&(36 + data_len).to_le_bytes());
-    buf.extend_from_slice(b"WAVE");
-    buf.extend_from_slice(b"fmt ");
-    buf.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
-    buf.extend_from_slice(&1u16.to_le_bytes()); // audio format = PCM
-    buf.extend_from_slice(&1u16.to_le_bytes()); // channels = mono
-    buf.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
-    buf.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
-    buf.extend_from_slice(&2u16.to_le_bytes()); // block align
-    buf.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
-    buf.extend_from_slice(b"data");
-    buf.extend_from_slice(&data_len.to_le_bytes());
-    buf.resize(44 + data_len as usize, 0); // silence
-    buf
+fn models_list_url(api_base: &str) -> String {
+    let base = api_base.trim_end_matches('/');
+    if base.ends_with("/models") {
+        base.to_string()
+    } else {
+        format!("{base}/models")
+    }
+}
+
+enum ModelPresence {
+    Present,
+    Absent,
+    Unknown,
+}
+
+/// Look for `upstream_model` in an OpenAI-style `{ "data": [{ "id": ... }] }`
+/// model list. `Unknown` means the body wasn't a recognizable, non-empty list,
+/// so membership can't be judged (treated as a soft pass).
+///
+/// A `"*"` id is a wildcard (e.g. LiteLLM advertises every route as a single
+/// `"*"` entry rather than enumerating them), so it matches any model.
+fn model_in_list(body: &str, upstream_model: &str) -> ModelPresence {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return ModelPresence::Unknown;
+    };
+    let Some(data) = json.get("data").and_then(|d| d.as_array()) else {
+        return ModelPresence::Unknown;
+    };
+    if data.is_empty() {
+        return ModelPresence::Unknown;
+    }
+    let present = data.iter().any(|item| {
+        matches!(
+            item.get("id").and_then(|v| v.as_str()),
+            Some(id) if id == "*" || id == upstream_model
+        )
+    });
+    if present {
+        ModelPresence::Present
+    } else {
+        ModelPresence::Absent
+    }
+}
+
+#[derive(Debug, Clone, Row, Deserialize)]
+struct RecentTraffic {
+    requests: u64,
+    successes: u64,
+    server_errors: u64,
 }
 
 fn maybe_alert(state: &AdminState, outcome: &ModelHealthRecordOutcome) {
@@ -511,6 +553,26 @@ struct ProbeResult {
 }
 
 impl ProbeResult {
+    fn healthy(latency_ms: Option<i64>, http_status: Option<i64>, message: String) -> Self {
+        Self {
+            status: "healthy".to_string(),
+            latency_ms,
+            http_status,
+            message: Some(normalize_excerpt(&message, 240)),
+            response_excerpt: None,
+        }
+    }
+
+    fn degraded(latency_ms: Option<i64>, http_status: Option<i64>, message: String) -> Self {
+        Self {
+            status: "degraded".to_string(),
+            latency_ms,
+            http_status,
+            message: Some(normalize_excerpt(&message, 240)),
+            response_excerpt: None,
+        }
+    }
+
     fn unhealthy(latency_ms: Option<i64>, http_status: Option<i64>, message: String) -> Self {
         Self {
             status: "unhealthy".to_string(),
@@ -519,14 +581,6 @@ impl ProbeResult {
             message: Some(normalize_excerpt(&message, 240)),
             response_excerpt: None,
         }
-    }
-
-    fn with_excerpt(mut self, body: String) -> Self {
-        let excerpt = normalize_excerpt(&body, 500);
-        if !excerpt.is_empty() {
-            self.response_excerpt = Some(excerpt);
-        }
-        self
     }
 }
 
@@ -550,5 +604,41 @@ mod tests {
     fn excerpt_collapses_and_truncates() {
         let value = normalize_excerpt(" a\n b\t ccccc ", 7);
         assert_eq!(value, "a b cc...");
+    }
+
+    #[test]
+    fn wildcard_model_list_matches_any_model() {
+        let body = r#"{"data":[{"id":"*","object":"model"}],"object":"list"}"#;
+        assert!(matches!(
+            model_in_list(body, "qwen3-vl-32b-instruct"),
+            ModelPresence::Present
+        ));
+    }
+
+    #[test]
+    fn exact_model_id_matches() {
+        let body = r#"{"data":[{"id":"qwen35-27b-fp8"},{"id":"other"}]}"#;
+        assert!(matches!(
+            model_in_list(body, "qwen35-27b-fp8"),
+            ModelPresence::Present
+        ));
+    }
+
+    #[test]
+    fn missing_model_id_is_absent() {
+        let body = r#"{"data":[{"id":"other-model"}]}"#;
+        assert!(matches!(
+            model_in_list(body, "qwen35-27b-fp8"),
+            ModelPresence::Absent
+        ));
+    }
+
+    #[test]
+    fn unrecognized_body_is_unknown() {
+        assert!(matches!(model_in_list("not json", "m"), ModelPresence::Unknown));
+        assert!(matches!(
+            model_in_list(r#"{"data":[]}"#, "m"),
+            ModelPresence::Unknown
+        ));
     }
 }

@@ -27,6 +27,49 @@ pub struct UsageSeriesQuery {
     pub bucket_ms: Option<i64>,
 }
 
+/// Date-range read against the permanent daily rollup (`usage_daily`).
+#[derive(Debug, Deserialize)]
+pub struct UsageDailyQuery {
+    /// Inclusive lower bound, `YYYY-MM-DD`. Defaults to 7 days ago.
+    pub start_day: Option<String>,
+    /// Inclusive upper bound, `YYYY-MM-DD`. Defaults to today.
+    pub end_day: Option<String>,
+    pub tenant_id: Option<Uuid>,
+    pub key_id: Option<Uuid>,
+    pub model: Option<String>,
+    /// Aggregate dimension: `day` (default), `tenant`, `key`, `model`,
+    /// or `key_model` (one row per key+model across the whole range).
+    pub group_by: Option<String>,
+}
+
+/// One row of the daily rollup, shaped by the requested `group_by`. Identity
+/// columns that aren't part of the grouping come back empty/zero.
+#[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
+pub struct UsageDailyRow {
+    /// `YYYY-MM-DD` for day-grouped reads; empty otherwise.
+    pub day: String,
+    #[serde(with = "clickhouse::serde::uuid")]
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
+    #[schema(value_type = String)]
+    pub key_id: Uuid,
+    pub model: String,
+    pub requests: u64,
+    pub success_requests: u64,
+    pub error_requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub estimated_tokens: u64,
+    pub cache_hits: u64,
+    pub cache_misses: u64,
+    /// Average time-to-first-token in ms across the grouped rows.
+    pub avg_ttft_ms: f64,
+    /// Average end-to-end latency in ms across the grouped rows.
+    pub avg_total_ms: f64,
+}
+
 /// Per-tenant usage aggregate.
 #[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
 pub struct UsageAgg {
@@ -333,6 +376,147 @@ pub async fn query_costs(
             }
         })
         .collect())
+}
+
+/// Read the permanent daily rollup over an inclusive `[start_day, end_day]`
+/// range. Averages are reconstructed from the stored latency sums and request
+/// counts (the rollup keeps sums, not per-request rows).
+pub async fn query_usage_daily(
+    client: &clickhouse::Client,
+    q: UsageDailyQuery,
+) -> Result<Vec<UsageDailyRow>, clickhouse::error::Error> {
+    let group = q.group_by.as_deref().unwrap_or("day");
+    // Identity columns selected per grouping; the rest are zeroed so the row
+    // shape stays uniform for the typed `Row` decode.
+    let (day_col, tenant_col, key_col, model_col, group_clause) = match group {
+        "tenant" => (
+            "'' as day",
+            "tenant_id",
+            "toUUID('00000000-0000-0000-0000-000000000000') as key_id",
+            "'' as model",
+            "group by tenant_id order by total_tokens desc",
+        ),
+        "key" => (
+            "'' as day",
+            "tenant_id",
+            "key_id",
+            "'' as model",
+            "group by tenant_id, key_id order by total_tokens desc",
+        ),
+        "model" => (
+            "'' as day",
+            "toUUID('00000000-0000-0000-0000-000000000000') as tenant_id",
+            "toUUID('00000000-0000-0000-0000-000000000000') as key_id",
+            "model",
+            "group by model order by total_tokens desc",
+        ),
+        "key_model" => (
+            "'' as day",
+            "tenant_id",
+            "key_id",
+            "model",
+            "group by tenant_id, key_id, model order by total_tokens desc",
+        ),
+        _ => (
+            "toString(day)",
+            "toUUID('00000000-0000-0000-0000-000000000000') as tenant_id",
+            "toUUID('00000000-0000-0000-0000-000000000000') as key_id",
+            "'' as model",
+            "group by day order by day",
+        ),
+    };
+
+    // Filters run against the physical table inside a subquery. This keeps the
+    // real `day`/`tenant_id`/`model` columns unambiguous: the outer SELECT
+    // replaces some of them with literal placeholders (e.g. `'' as day`), and
+    // ClickHouse's analyzer makes SELECT aliases visible in WHERE — so applying
+    // the predicates here would otherwise try to parse `''` as a Date.
+    let mut inner_where = String::from("where day >= toDate(?) and day <= toDate(?)");
+    if q.tenant_id.is_some() {
+        inner_where.push_str(" and tenant_id = toUUID(?)");
+    }
+    if q.key_id.is_some() {
+        inner_where.push_str(" and key_id = toUUID(?)");
+    }
+    if q.model.is_some() {
+        inner_where.push_str(" and model = ?");
+    }
+
+    let mut sql = format!(
+        "select {day_col}, {tenant_col}, {key_col}, {model_col}, \
+         sum(requests), \
+         sum(success_requests), \
+         sum(error_requests), \
+         sum(input_tokens), \
+         sum(output_tokens), \
+         sum(input_tokens) + sum(output_tokens) as total_tokens, \
+         sum(estimated_tokens), \
+         sum(cache_hits), \
+         sum(cache_misses), \
+         round(sum(ttft_ms_sum) / greatest(sum(success_requests), 1), 1) as avg_ttft_ms, \
+         round(sum(total_ms_sum) / greatest(sum(success_requests), 1), 1) as avg_total_ms \
+         from (select * from usage_daily {inner_where}) "
+    );
+    sql.push_str(group_clause);
+
+    let start = q.start_day.clone().unwrap_or_else(default_start_day);
+    let end = q.end_day.clone().unwrap_or_else(today_day);
+    let mut query = client.query(&sql).bind(start).bind(end);
+    if let Some(tid) = q.tenant_id {
+        query = query.bind(tid.to_string());
+    }
+    if let Some(kid) = q.key_id {
+        query = query.bind(kid.to_string());
+    }
+    if let Some(model) = &q.model {
+        query = query.bind(model.clone());
+    }
+    query.fetch_all::<UsageDailyRow>().await
+}
+
+/// `usage` day-partition ids (`YYYYMMDD`) strictly older than
+/// `cutoff_yyyymmdd`. Used by the retention worker and manual compact to drop
+/// whole day-partitions (an O(1) metadata op). Never touches `usage_daily`,
+/// which is permanent.
+pub async fn usage_partitions_before(
+    client: &clickhouse::Client,
+    cutoff_yyyymmdd: u32,
+) -> Result<Vec<String>, clickhouse::error::Error> {
+    let sql = "select distinct partition from system.parts \
+               where database = currentDatabase() and table = 'usage' and active \
+               and toUInt32(partition) < ? order by partition";
+    client
+        .query(sql)
+        .bind(cutoff_yyyymmdd)
+        .fetch_all::<String>()
+        .await
+}
+
+/// Drop a single `usage` day-partition. `partition` is a `YYYYMMDD` id as
+/// returned by [`usage_partitions_before`].
+pub async fn drop_usage_partition(
+    client: &clickhouse::Client,
+    partition: &str,
+) -> Result<(), clickhouse::error::Error> {
+    // Partition ids come straight from ClickHouse's own `system.parts` (numeric
+    // YYYYMMDD), never user input, and DDL cannot take bound parameters \u2014 hence
+    // the format. Guard anyway so a non-numeric value can never be interpolated.
+    if !partition.bytes().all(|b| b.is_ascii_digit()) {
+        return Ok(());
+    }
+    let sql = format!("alter table usage drop partition id '{partition}'");
+    client.query(&sql).execute().await
+}
+
+fn default_start_day() -> String {
+    use chrono::{Duration, Utc};
+    (Utc::now() - Duration::days(7))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+fn today_day() -> String {
+    chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
 fn bind_usage_filters(

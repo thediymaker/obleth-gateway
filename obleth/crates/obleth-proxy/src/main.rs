@@ -198,7 +198,6 @@ async fn main() -> anyhow::Result<()> {
         default_interval_secs: cfg.model_health_interval_secs as i64,
         timeout_secs: cfg.model_health_timeout_secs,
         retention_days: cfg.model_health_retention_days,
-        internal_proxy_base_url: cfg.internal_proxy_base_url.clone(),
         http: http.clone(),
         alerts: Some(Arc::new(alerts.clone()) as Arc<dyn obleth_admin::AlertSink>),
     };
@@ -211,10 +210,12 @@ async fn main() -> anyhow::Result<()> {
         clickhouse: clickhouse_read,
         admin_token: cfg.admin_token.clone(),
         health: health_runtime,
+        usage_retention_default_days: cfg.usage_retention_days,
         ssrf: obleth_admin::ssrf::SsrfPolicy::from_env(),
         alerts: alerts.clone(),
     };
     obleth_admin::model_health::spawn_worker(admin_state.clone());
+    obleth_admin::usage_retention::spawn_worker(admin_state.clone());
     let admin_app = obleth_admin::router(admin_state);
 
     // ---- routers ----

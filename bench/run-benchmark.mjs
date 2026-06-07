@@ -35,6 +35,7 @@ const BENCH_REUSE_KEYS = process.env.BENCH_REUSE_KEYS !== "0";
 const BENCH_PRUNE_KEYS = process.env.BENCH_PRUNE_KEYS !== "0";
 const CONC = Number(process.env.CONC ?? 32);
 const OUTPUT_TOKENS = Number(process.env.OUTPUT_TOKENS ?? 150);
+const STREAM = process.env.STREAM !== "0";
 const SAMPLE_MS = Number(process.env.SAMPLE_MS ?? 500);
 const VERIFY_DELAY_MS = Number(process.env.VERIFY_DELAY_MS ?? 3000);
 const MIN_COMPLETION_RATIO = Number(process.env.MIN_COMPLETION_RATIO ?? 2);
@@ -306,7 +307,7 @@ async function oneRequest(tenant, overlapStart, stats) {
           { role: "user", content: randomPrompt(nonce) },
         ],
         max_tokens: OUTPUT_TOKENS,
-        stream: false,
+        stream: STREAM,
       }),
     });
     const body = await res.text();
@@ -482,7 +483,7 @@ function evaluate(rows, sampleSummary, ledgerCounts) {
 
 async function main() {
   console.log("obleth benchmark");
-  console.log(`  model=${MODEL} capacity=${CAPACITY} output_tokens=${OUTPUT_TOKENS}`);
+  console.log(`  model=${MODEL} capacity=${CAPACITY} output_tokens=${OUTPUT_TOKENS} stream=${STREAM}`);
   console.log(`  duration=${DURATION_S}s after last tenant joins; conc=${CONC}/tenant`);
   console.log(`  proxy=${PROXY_BASE} admin=${ADMIN_BASE}`);
   console.log(`  output=${BENCH_OUT_DIR}`);

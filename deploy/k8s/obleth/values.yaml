@@ -34,7 +34,7 @@ obleth:
   modelHealthIntervalSecs: 900
   modelHealthTimeoutSecs: 30
   modelHealthRetentionDays: 30
-  internalProxyBaseUrl: "http://127.0.0.1:8080"
+  usageRetentionDays: 180
   resources:
     requests: { cpu: "250m", memory: "256Mi" }
     limits: { cpu: "2", memory: "1Gi" }

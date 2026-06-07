@@ -407,6 +407,17 @@ pub struct UsageRecord {
     pub ts_ms: i64,
 }
 
+/// Runtime-configurable retention for the raw per-request `usage` ledger.
+/// Rows older than `days` are pruned (whole day-partitions dropped) by a
+/// background worker; the permanent `usage_daily` rollup is never affected.
+/// Persisted in Postgres so changes survive restarts and override the env
+/// default.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct UsageRetentionSettings {
+    /// Days of raw per-request history to keep. Clamped to a sane floor on use.
+    pub days: i64,
+}
+
 /// Runtime-configurable alerting settings, editable from the control plane and
 /// persisted in Postgres so they survive restarts. The gateway loads these at
 /// boot (falling back to environment defaults) and applies live updates without

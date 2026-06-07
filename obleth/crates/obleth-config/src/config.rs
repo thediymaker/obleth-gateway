@@ -53,7 +53,10 @@ pub struct Config {
     pub model_health_interval_secs: u64,
     pub model_health_timeout_secs: u64,
     pub model_health_retention_days: i64,
-    pub internal_proxy_base_url: String,
+
+    /// Default days of raw per-request `usage` history to keep before pruning.
+    /// A runtime setting saved from the control plane overrides this.
+    pub usage_retention_days: i64,
 
     /// OTLP/HTTP trace collector base URL (e.g. `http://jaeger:4318`). `None`
     /// disables distributed tracing entirely.
@@ -119,10 +122,7 @@ impl Config {
             model_health_interval_secs: parse_or("OBLETH_MODEL_HEALTH_INTERVAL_SECS", 900),
             model_health_timeout_secs: parse_or("OBLETH_MODEL_HEALTH_TIMEOUT_SECS", 30),
             model_health_retention_days: parse_or("OBLETH_MODEL_HEALTH_RETENTION_DAYS", 30),
-            internal_proxy_base_url: env_or(
-                "OBLETH_INTERNAL_PROXY_BASE_URL",
-                "http://127.0.0.1:8080",
-            ),
+            usage_retention_days: parse_or("OBLETH_USAGE_RETENTION_DAYS", 180),
             otel_endpoint: env::var("OBLETH_OTEL_ENDPOINT")
                 .ok()
                 .filter(|s| !s.is_empty()),

@@ -196,6 +196,46 @@ export interface UsageTimePoint {
   total_tokens: number;
 }
 
+/// One row of the permanent daily rollup (`usage_daily`).
+export interface UsageDailyRow {
+  day: string;
+  tenant_id: string;
+  key_id: string;
+  model: string;
+  requests: number;
+  success_requests: number;
+  error_requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  estimated_tokens: number;
+  cache_hits: number;
+  cache_misses: number;
+  avg_ttft_ms: number;
+  avg_total_ms: number;
+}
+
+export interface UsageRetentionView {
+  days: number;
+  configured: boolean;
+}
+
+export interface CompactUsageResult {
+  retention_days: number;
+  partitions_dropped: number;
+}
+
+export type UsageDailyGroupBy = "day" | "tenant" | "key" | "model" | "key_model";
+
+export interface UsageDailyParams {
+  startDay: string;
+  endDay: string;
+  groupBy?: UsageDailyGroupBy;
+  tenantId?: string;
+  keyId?: string;
+  model?: string;
+}
+
 export interface CostAgg {
   model: string;
   requests: number;
@@ -488,6 +528,24 @@ export const obleth = {
   usageSeriesByTenant: (bucketMs = 10_000, sinceMs?: number) =>
     api<TenantUsageTimePoint[]>(`/usage/series/tenants${qs({ bucket_ms: bucketMs, since_ms: sinceMs })}`),
   costs: (sinceMs?: number) => api<CostAgg[]>(`/costs${qs({ since_ms: sinceMs })}`),
+  usageDaily: (params: UsageDailyParams) =>
+    api<UsageDailyRow[]>(
+      `/usage/daily${qs({
+        start_day: params.startDay,
+        end_day: params.endDay,
+        group_by: params.groupBy,
+        tenant_id: params.tenantId,
+        key_id: params.keyId,
+        model: params.model,
+      })}`,
+    ),
+  getUsageRetention: () => api<UsageRetentionView>("/settings/usage-retention"),
+  setUsageRetention: (days: number) =>
+    api<UsageRetentionView>("/settings/usage-retention", {
+      method: "PUT",
+      body: JSON.stringify({ days }),
+    }),
+  compactUsage: () => api<CompactUsageResult>("/usage/compact", { method: "POST" }),
   stats: () => api<LiveStats>("/stats"),
   fairshareLive: () => api<FairshareLiveView>("/fairshare/live"),
   audit: (limit = 100) => api<AuditEntry[]>(`/audit?limit=${limit}`),

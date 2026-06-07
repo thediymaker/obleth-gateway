@@ -1,4 +1,8 @@
-import { AlertSettingsForm, AutoRouterSettingsForm } from "@/components/settings-form";
+import {
+  AlertSettingsForm,
+  AutoRouterSettingsForm,
+  UsageRetentionForm,
+} from "@/components/settings-form";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
@@ -8,6 +12,7 @@ export default async function SettingsPage() {
   const settings = await safe(obleth.getAlertSettings(), null);
   const autoRouter = await safe(obleth.getAutoRouterSettings(), null);
   const models = await safe(obleth.listModels(), []);
+  const retention = await safe(obleth.getUsageRetention(), null);
 
   return (
     <div className="space-y-6">
@@ -20,6 +25,7 @@ export default async function SettingsPage() {
       </div>
       <AlertSettingsForm settings={settings} />
       <AutoRouterSettingsForm settings={autoRouter} models={models} />
+      <UsageRetentionForm retention={retention} />
     </div>
   );
 }

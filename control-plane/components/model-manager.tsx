@@ -749,6 +749,7 @@ function StatusPill({ status }: { status: string }) {
 function healthClass(status: string) {
   if (status === "healthy") return "border-emerald-500/35 bg-emerald-500/10 text-emerald-300";
   if (status === "unhealthy") return "border-red-500/35 bg-red-500/10 text-red-300";
+  if (status === "degraded") return "border-amber-500/35 bg-amber-500/10 text-amber-300";
   if (status === "maintenance") return "border-amber-500/35 bg-amber-500/10 text-amber-300";
   if (status === "disabled") return "border-border bg-muted/30 text-muted-foreground";
   return "border-border bg-background text-muted-foreground";

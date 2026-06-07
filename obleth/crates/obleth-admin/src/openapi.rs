@@ -3,14 +3,14 @@
 use utoipa::OpenApi;
 
 use crate::model_health::{BulkModelHealthResult, UpdateModelHealthConfig};
-use crate::usage::UsageAgg;
+use crate::usage::{UsageAgg, UsageDailyRow};
 use crate::{
     AlertSettingsView, EmailSettingsView, TestAlertResult, UpdateAlertSettings, UpdateEmailSettings,
 };
 use crate::{
-    CapacityView, CreateKey, CreateTenant, CreatedKey, SetCapacity, SetDisabled,
-    SetTenantAllowlist, SetTenantBudget, SetTenantSchedule, SetTenantStatus, UpdateQuota,
-    UpdateTenant, UpdateWeight,
+    CapacityView, CompactUsageResult, CreateKey, CreateTenant, CreatedKey, SetCapacity,
+    SetDisabled, SetTenantAllowlist, SetTenantBudget, SetTenantSchedule, SetTenantStatus,
+    UpdateQuota, UpdateTenant, UpdateUsageRetention, UpdateWeight, UsageRetentionView,
 };
 use obleth_config::{
     ApiKey, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, Tenant, WeeklyWindow,
@@ -35,9 +35,13 @@ use obleth_config::{
         crate::patch_weight,
         crate::create_key,
         crate::get_usage,
+        crate::get_usage_daily,
+        crate::compact_usage,
         crate::get_alert_settings,
         crate::put_alert_settings,
         crate::test_alert_settings,
+        crate::get_usage_retention,
+        crate::put_usage_retention,
         crate::model_health::list_health,
         crate::model_health::get_health,
         crate::model_health::check_one,
@@ -67,6 +71,10 @@ use obleth_config::{
         SetCapacity,
         CapacityView,
         UsageAgg,
+        UsageDailyRow,
+        UsageRetentionView,
+        UpdateUsageRetention,
+        CompactUsageResult,
         AlertSettingsView,
         EmailSettingsView,
         UpdateAlertSettings,

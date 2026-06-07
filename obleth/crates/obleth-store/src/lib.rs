@@ -1045,20 +1045,34 @@ impl Store {
         let previous_alert_state: String = current.try_get("health_alert_state")?;
         let healthy = status == "healthy";
         let disabled = status == "disabled";
+        // Transient/inconclusive outcomes (overloaded upstream, an unsupported
+        // probe endpoint, a single network blip) must not flap a model to
+        // "down": they neither count toward the failure threshold nor reset a
+        // streak that is already in progress, and they never fire an alert.
+        let transient = status == "degraded" || status == "skipped";
         let in_maintenance = maintenance_until
             .map(|until| until > checked_at)
             .unwrap_or(false);
         let new_failures = if healthy || disabled {
             0
+        } else if transient {
+            previous_failures
         } else {
             previous_failures.saturating_add(1)
         };
         let should_fire = !healthy
             && !disabled
+            && !transient
             && alerts_enabled
             && !in_maintenance
             && new_failures >= failure_threshold.max(1);
-        let new_alert_state = if should_fire { "firing" } else { "ok" };
+        let new_alert_state = if transient {
+            previous_alert_state.as_str()
+        } else if should_fire {
+            "firing"
+        } else {
+            "ok"
+        };
         let alert_event = if healthy && previous_alert_state == "firing" && alerts_enabled {
             Some(ModelHealthAlertEvent::Recovery)
         } else if should_fire && previous_alert_state != "firing" {
@@ -1272,6 +1286,39 @@ impl Store {
         sqlx::query(
             "insert into app_settings (key, value, updated_at)
              values ('auto_router', $1, now())
+             on conflict (key) do update set value = excluded.value, updated_at = now()",
+        )
+        .bind(sqlx::types::Json(settings))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Load the persisted raw-usage retention setting, or `None` if unset.
+    pub async fn get_usage_retention_settings(
+        &self,
+    ) -> Result<Option<obleth_config::UsageRetentionSettings>> {
+        let row = sqlx::query("select value from app_settings where key = 'usage_retention'")
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => {
+                let value: sqlx::types::Json<obleth_config::UsageRetentionSettings> =
+                    row.try_get("value")?;
+                Ok(Some(value.0))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the raw-usage retention setting (upsert on `usage_retention`).
+    pub async fn put_usage_retention_settings(
+        &self,
+        settings: &obleth_config::UsageRetentionSettings,
+    ) -> Result<()> {
+        sqlx::query(
+            "insert into app_settings (key, value, updated_at)
+             values ('usage_retention', $1, now())
              on conflict (key) do update set value = excluded.value, updated_at = now()",
         )
         .bind(sqlx::types::Json(settings))
@@ -1580,6 +1627,10 @@ mod tests {
                 "upstream-model",
                 "http://127.0.0.1:8081",
                 None,
+                "chat",
+                0.0,
+                0.0,
+                0.0,
                 0.0,
                 0.0,
                 8192,

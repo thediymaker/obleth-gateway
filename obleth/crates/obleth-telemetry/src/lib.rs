@@ -277,5 +277,99 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
         ))
         .execute()
         .await?;
+    ensure_daily_rollup(client, database).await?;
+    Ok(())
+}
+
+/// Permanent daily rollup of the per-request `usage` ledger.
+///
+/// `usage` rows are pruned on a retention window (default 180 days) to bound
+/// storage, but the aggregates here are kept forever: one row per
+/// `day x tenant x key x model`. A ClickHouse materialized view keeps the
+/// rollup current as new requests land, and a one-time guarded backfill seeds
+/// it from any history that predates the view. `SummingMergeTree` collapses
+/// rows sharing the sort key on merge, so summed columns stay correct.
+async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), TelemetryError> {
+    let table_ddl = format!(
+        "CREATE TABLE IF NOT EXISTS {database}.usage_daily (
+            day Date,
+            tenant_id UUID,
+            key_id UUID,
+            model String,
+            requests UInt64,
+            success_requests UInt64,
+            error_requests UInt64,
+            input_tokens UInt64,
+            output_tokens UInt64,
+            estimated_tokens UInt64,
+            cache_hits UInt64,
+            cache_misses UInt64,
+            ttft_ms_sum UInt64,
+            total_ms_sum UInt64
+        ) ENGINE = SummingMergeTree()
+        PARTITION BY toYYYYMM(day)
+        ORDER BY (day, tenant_id, key_id, model)"
+    );
+    client.query(&table_ddl).execute().await?;
+
+    // The aggregation projection shared by the materialized view and the
+    // backfill, so both compute identical columns from the raw ledger.
+    // Latency sums (`ttft_ms_sum`/`total_ms_sum`) are accumulated over
+    // successful (2xx/3xx) requests only, so timeouts and upstream errors don't
+    // distort the average TTFT / total-time reported per day. The read side
+    // divides these by `success_requests` to match.
+    let rollup_select = "
+        toDate(ts) AS day,
+        tenant_id,
+        key_id,
+        model,
+        count() AS requests,
+        countIf(status_code >= 200 AND status_code < 400) AS success_requests,
+        countIf(status_code >= 400) AS error_requests,
+        sum(input_tokens) AS input_tokens,
+        sum(output_tokens) AS output_tokens,
+        sum(estimated_tokens) AS estimated_tokens,
+        countIf(cache_status = 'hit') AS cache_hits,
+        countIf(cache_status = 'miss') AS cache_misses,
+        sumIf(ttft_ms, status_code >= 200 AND status_code < 400) AS ttft_ms_sum,
+        sumIf(total_ms, status_code >= 200 AND status_code < 400) AS total_ms_sum";
+
+    // One-time backfill BEFORE the view exists, and only when the rollup is
+    // empty, so restarts never double-count (SummingMergeTree would otherwise
+    // re-add existing history) and the view below cannot also capture the same
+    // historical rows.
+    let existing = client
+        .query(&format!("SELECT count() FROM {database}.usage_daily"))
+        .fetch_one::<u64>()
+        .await
+        .unwrap_or(0);
+    if existing == 0 {
+        let backfill = format!(
+            "INSERT INTO {database}.usage_daily
+             SELECT {rollup_select}
+             FROM {database}.usage
+             GROUP BY day, tenant_id, key_id, model"
+        );
+        if let Err(e) = client.query(&backfill).execute().await {
+            tracing::warn!(error = %e, "usage_daily backfill failed; rollup will fill going forward");
+        }
+    }
+
+    let mv_ddl = format!(
+        "CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.usage_daily_mv
+         TO {database}.usage_daily AS
+         SELECT {rollup_select}
+         FROM {database}.usage
+         GROUP BY day, tenant_id, key_id, model"
+    );
+    // Drop-and-recreate so latency-sum semantics (success-only) take effect on
+    // deployments whose view predates this change. Dropping the view leaves the
+    // target `usage_daily` rows untouched — historical aggregates are kept as-is
+    // and only new inserts use the updated projection.
+    client
+        .query(&format!("DROP VIEW IF EXISTS {database}.usage_daily_mv"))
+        .execute()
+        .await?;
+    client.query(&mv_ddl).execute().await?;
     Ok(())
 }

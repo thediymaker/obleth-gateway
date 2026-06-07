@@ -12,6 +12,7 @@ pub mod model_health;
 mod openapi;
 pub mod ssrf;
 mod usage;
+pub mod usage_retention;
 
 use std::sync::Arc;
 
@@ -52,6 +53,9 @@ pub struct AdminState {
     pub clickhouse: clickhouse::Client,
     pub admin_token: String,
     pub health: ModelHealthRuntime,
+    /// Default raw-usage retention in days, used when no runtime setting is
+    /// persisted. Sourced from `OBLETH_USAGE_RETENTION_DAYS`.
+    pub usage_retention_default_days: i64,
     /// SSRF allowlist policy applied to admin-supplied upstream URLs.
     pub ssrf: ssrf::SsrfPolicy,
     /// Runtime-reloadable alert dispatcher shared with the data plane.
@@ -93,6 +97,8 @@ pub fn router(state: AdminState) -> Router {
             get(get_usage_series_tenants),
         )
         .route("/api/v1/usage/cache", get(get_cache_stats))
+        .route("/api/v1/usage/daily", get(get_usage_daily))
+        .route("/api/v1/usage/compact", post(compact_usage))
         .route("/api/v1/costs", get(get_costs))
         .route("/api/v1/stats", get(get_stats))
         .route("/api/v1/fairshare/live", get(get_fairshare_live))
@@ -146,6 +152,10 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/api/v1/settings/auto-router",
             get(get_auto_router_settings).put(put_auto_router_settings),
+        )
+        .route(
+            "/api/v1/settings/usage-retention",
+            get(get_usage_retention).put(put_usage_retention),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -1233,6 +1243,113 @@ async fn get_costs(
     Ok(Json(
         usage::query_costs(&state.clickhouse, q.since_ms, &costs).await?,
     ))
+}
+
+#[utoipa::path(get, path = "/api/v1/usage/daily", tag = "usage", responses((status = 200, body = [usage::UsageDailyRow])))]
+async fn get_usage_daily(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::UsageDailyQuery>,
+) -> Result<Json<Vec<usage::UsageDailyRow>>> {
+    Ok(Json(usage::query_usage_daily(&state.clickhouse, q).await?))
+}
+
+/// View of the persisted raw-usage retention window.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct UsageRetentionView {
+    /// Days of raw per-request history retained before pruning.
+    pub days: i64,
+    /// True when this reflects a saved setting rather than the env default.
+    pub configured: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateUsageRetention {
+    pub days: i64,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/settings/usage-retention", tag = "settings",
+    responses((status = 200, body = UsageRetentionView))
+)]
+async fn get_usage_retention(
+    State(state): State<AdminState>,
+) -> Result<Json<UsageRetentionView>> {
+    let saved = state.store.get_usage_retention_settings().await?;
+    let view = match saved {
+        Some(s) => UsageRetentionView {
+            days: s.days,
+            configured: true,
+        },
+        None => UsageRetentionView {
+            days: state.usage_retention_default_days,
+            configured: false,
+        },
+    };
+    Ok(Json(view))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/settings/usage-retention", tag = "settings",
+    request_body = UpdateUsageRetention,
+    responses((status = 200, body = UsageRetentionView))
+)]
+async fn put_usage_retention(
+    State(state): State<AdminState>,
+    Json(body): Json<UpdateUsageRetention>,
+) -> Result<Json<UsageRetentionView>> {
+    if body.days < 1 {
+        return Err(AdminError::BadRequest(
+            "retention days must be at least 1".into(),
+        ));
+    }
+    let settings = obleth_config::UsageRetentionSettings { days: body.days };
+    state.store.put_usage_retention_settings(&settings).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "set_usage_retention",
+            "settings",
+            "usage_retention",
+            serde_json::json!({ "days": settings.days }),
+        )
+        .await?;
+    Ok(Json(UsageRetentionView {
+        days: settings.days,
+        configured: true,
+    }))
+}
+
+/// Result of a manual compaction run.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct CompactUsageResult {
+    pub retention_days: i64,
+    pub partitions_dropped: usize,
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/usage/compact", tag = "usage",
+    responses((status = 200, body = CompactUsageResult))
+)]
+async fn compact_usage(State(state): State<AdminState>) -> Result<Json<CompactUsageResult>> {
+    let result = usage_retention::compact_usage_now(&state).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "compact_usage",
+            "usage",
+            "usage",
+            serde_json::json!({
+                "retention_days": result.retention_days,
+                "partitions_dropped": result.partitions_dropped,
+            }),
+        )
+        .await?;
+    Ok(Json(CompactUsageResult {
+        retention_days: result.retention_days,
+        partitions_dropped: result.partitions_dropped,
+    }))
 }
 
 async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {

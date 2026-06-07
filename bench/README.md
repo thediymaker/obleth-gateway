@@ -101,6 +101,7 @@ CONTAINER_CLI=podman CHAOS=1 node bench/run-benchmark.mjs
 | `STAGGER_CHATBOT_S` | `10` | Seconds `api-batch` gets to flood before `chatbot` joins |
 | `CONC` | `32` | Worker count per active tenant |
 | `OUTPUT_TOKENS` | `150` | `max_tokens` per request |
+| `STREAM` | `1` | Request SSE streaming (`stream:true`). Set `0` for buffered responses; streaming yields realistic TTFT (first-token) instead of full-generation TTFT |
 | `INCLUDE_CHATBOT2` | unset | Set `1` to add a second tenant in the `chatbot` group |
 | `INCLUDE_ANALYTICS` | unset | Set `1` to add an `analytics` group tenant |
 | `BENCH_KEY_NAME` | `bench` | Name assigned to generated benchmark keys |

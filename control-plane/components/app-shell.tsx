@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import {
   Boxes,
+  BarChart3,
   ChevronDown,
   Gauge,
   KeyRound,
@@ -41,6 +42,7 @@ const nav = [
   { href: "/mcp", label: "MCP Servers", icon: Plug },
   { href: "/tenants", label: "Tenants", icon: Users },
   { href: "/keys", label: "API Keys", icon: KeyRound },
+  { href: "/reports", label: "Reports", icon: BarChart3 },
   { href: "/audit", label: "Audit", icon: ScrollText },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
