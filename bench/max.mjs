@@ -11,8 +11,13 @@
 //   DURATION_S=60 node bench/max.mjs          # longer measured window
 //
 // Like throughput.mjs it targets the fast `bench-turbo` profile with tiny
-// outputs and a huge backend slot count, and decouples gateway CAPACITY from
-// CONC so admission never gates - the point is to find obleth's req/s ceiling.
+// outputs and a huge backend slot count. Admission CAPACITY defaults to CONC,
+// not an arbitrary huge number: in a closed loop each lane holds at most one
+// request, so in-flight can never exceed CONC. Setting CAPACITY = CONC is the
+// exact "never gate" value - it guarantees admission never throttles the run
+// while still being a real, explainable limit. (At CONC=512, ~8k req/s only
+// fills ~120 slots, because each request holds its slot for just the few-ms
+// upstream round-trip - in_flight = throughput x hold_time, Little's Law.)
 //
 // To go beyond one host's cores, run this on several machines against the same
 // PROXY_BASE and sum the reported req/s.
@@ -57,7 +62,9 @@ const DURATION_S = Number(process.env.DURATION_S ?? 30);
 const WARMUP_S = Number(process.env.WARMUP_S ?? 3);
 const OUTPUT_TOKENS = Number(process.env.OUTPUT_TOKENS ?? 4);
 const STREAM = process.env.STREAM === "1"; // default off: pure req/s, not TTFT
-const CAPACITY = Number(process.env.CAPACITY ?? 100_000);
+// In a closed loop in-flight <= CONC, so CONC is the exact "never gate" value -
+// no magic number. Override only to deliberately study admission/429 behavior.
+const CAPACITY = Number(process.env.CAPACITY ?? CONC);
 const TENANT_NAME = process.env.TENANT_NAME ?? "maxpush";
 const KEY_NAME = process.env.BENCH_KEY_NAME ?? "maxpush";
 const MAX_ERROR_RATE = Number(process.env.MAX_ERROR_RATE ?? 0.01);

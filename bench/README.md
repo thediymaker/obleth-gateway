@@ -235,24 +235,113 @@ Reading the result:
 and tops out at a few thousand req/s before the *generator* - not obleth -
 becomes the bottleneck. `max.mjs` fans the same fast-path load out across
 `WORKERS` worker threads so the load generator scales with cores and the gateway
-is what saturates. It targets the fast `bench-turbo` profile with tiny outputs
-and decouples gateway `CAPACITY` from `CONC` so admission never gates - the goal
-is to find obleth's req/s ceiling.
+is what saturates. It targets the fast `bench-turbo` profile with tiny outputs,
+so the *backend* stays off the critical path and the number reflects how fast
+obleth can admit, route, account, and proxy.
 
 ```bash
-# auto workers (CPU-1), push for the ceiling
+# auto workers (CPU-1), default lanes
 node bench/max.mjs
 
-# explicit fan-out
-WORKERS=8 CONC=4096 DURATION_S=60 node bench/max.mjs
+# explicit fan-out: pick workers/lanes for your box, longer window
+WORKERS=8 CONC=1024 DURATION_S=60 node bench/max.mjs
 ```
 
 The combined req/s is printed live and percentiles are computed over the merged
 population of all workers (not an average of averages). Output goes to
 `$BENCH_OUT_DIR/max-meta.json`.
 
-To go past one host's cores, run `max.mjs` on several machines against the same
-`PROXY_BASE` and sum the reported req/s.
+### Reading the result
+
+The end-of-run summary looks like this. The *absolute* numbers depend entirely
+on your hardware, Docker setup, and how the fixture backend is sized - treat
+them as a shape to recognize, not a target to hit:
+
+```
+max-push result (through obleth):
+  workers:    8  lanes:  1024
+  requests:   800827 ok / 800827 attempted  (13347 req/s)
+  errors:     0 (0.00%)   429: 0
+  ttfb ms:    p50=32  p90=35  p99=38
+  total ms:   p50=76  p90=81  p99=85
+```
+
+- **req/s** is steady-state completions / `DURATION_S` - the headline number.
+- **errors / 429** should be `0`. Non-zero means you pushed past what the gateway
+  *or the fixture backend* can take (see "finding the knee" below).
+- **ttfb** is the gateway+backend first-byte latency; **total** includes time the
+  request spent queued behind its lane in the generator, so total > ttfb is
+  expected and is mostly client-side, not gateway cost. A *flat* p50-to-p99
+  spread (76 -> 85 ms above) means the gateway is keeping up, not buffering.
+
+### Finding the knee (tuning for your box)
+
+There is no single "right" `CONC`. The sustainable ceiling is wherever req/s
+stops climbing *and stays clean* (0 errors), and that point differs per machine.
+Sweep up and stop at the last value that holds steady:
+
+```bash
+WORKERS=8 CONC=256  DURATION_S=30 node bench/max.mjs
+WORKERS=8 CONC=512  DURATION_S=30 node bench/max.mjs
+WORKERS=8 CONC=1024 DURATION_S=30 node bench/max.mjs   # e.g. req/s still rising
+WORKERS=8 CONC=2048 DURATION_S=30 node bench/max.mjs   # e.g. req/s flattens
+```
+
+Go *too* far and throughput gets worse, not better: with enough lanes you stop
+measuring the gateway and start overwhelming the single-process fixture backend.
+When that happens you will see req/s climb, then collapse toward 0 with the
+obleth logs showing `upstream request failed`. That is the *backend* tapping out
+(and obleth's retries amplifying it), not an obleth limit - back the lane count
+off to the last clean value.
+
+To confirm *who* is the bottleneck at any setting, watch CPU during a run:
+`docker stats obleth-obleth-1` next to the host's `node` process. If `node` is
+pinned and obleth is not, you are generator-bound - add workers/hosts. If obleth
+is pinned, you have found its real ceiling on this hardware.
+
+### Why `CAPACITY` defaults to `CONC` (and not some huge number)
+
+`CAPACITY` is the gateway's global **in-flight** limit (max requests being
+proxied *at the same instant*) - it is a concurrency cap, not a rate limit. In a
+closed-loop driver each lane holds at most one request, so in-flight can never
+exceed `CONC`. That makes `CAPACITY = CONC` the *exact* "admission never gates"
+value: it is provably high enough to never throttle the run, while still being a
+real, explainable limit instead of an arbitrary `100000`.
+
+You will notice in-flight sits far below `CAPACITY` during a run - e.g. ~120 at
+8k req/s with `CONC=512`. That is correct, not under-load. By Little's Law:
+
+```
+in_flight = throughput x hold_time
+          = 8311 req/s x ~0.015 s  (the few-ms upstream round-trip)
+          ~= 125
+```
+
+Each request occupies an admission slot only for the upstream round-trip (a few
+ms with the `turbo` profile), so even at thousands of req/s only a small number
+are ever in flight at once. To deliberately fill capacity and watch admission /
+`429` behavior, raise `CONC` *and* lower `CAPACITY` below it (or use a slow
+model / large `OUTPUT_TOKENS` so each slot is held longer) - or use the soak
+scenario, which is built for that.
+
+### Pushing it further
+
+Once you have found the knee on one box, these are the levers to go higher -
+roughly in order of effort:
+
+1. **More cores / hosts.** A single machine is ultimately bound by cores and NIC.
+   The generator scales with `WORKERS`, so a bigger box goes further; past that,
+   run `max.mjs` on 2-3 machines against the same `PROXY_BASE` and sum the
+   reported req/s.
+2. **Bypass extra hops.** `PROXY_BASE=http://localhost` goes through HAProxy.
+   Point `PROXY_BASE` straight at the obleth container's published proxy port to
+   measure the gateway without the edge proxy in the path.
+3. **Scale the fixture backend.** If runs collapse with `upstream request failed`
+   before obleth's CPU saturates, the single fixture process is the cap. Give it
+   more room (`BENCHMARK_BACKEND_CONCURRENCY`) or run multiple backend replicas
+   so connections fan out across them.
+4. **Watch OS limits.** Each worker uses `lanes x 2` keep-alive sockets; at high
+   `CONC` make sure ephemeral-port / file-descriptor limits are not the real cap.
 
 | Env | Default | Purpose |
 | --- | --- | --- |
@@ -262,7 +351,7 @@ To go past one host's cores, run `max.mjs` on several machines against the same
 | `WARMUP_S` | `3` | Discarded ramp-up seconds |
 | `OUTPUT_TOKENS` | `4` | `max_tokens` per request (keep small) |
 | `STREAM` | `0` | Set `1` for SSE; default buffered for pure req/s |
-| `CAPACITY` | `100000` | Gateway global in-flight (set high to not gate) |
+| `CAPACITY` | `CONC` | Gateway global in-flight; `= CONC` never gates a closed loop |
 | `MODEL` | `bench-turbo` | Registered model; `turbo` = fast backend profile |
 | `MAX_ERROR_RATE` | `0.01` | Fail above this client error rate |
 

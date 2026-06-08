@@ -19,7 +19,9 @@ obleth:
   # changing it invalidates issued keys. Supply via an external Secret.
   apiKeyPepper: ""
   # SSRF allowlist for admin-registered upstream URLs (comma-separated CIDRs).
-  # Empty = only public addresses allowed. Set to reach internal cluster targets,
+  # Default SSRF policy permits private/LAN targets (RFC1918, loopback, etc.) so
+  # in-cluster api_base values work without this field. Only required when
+  # OBLETH_BLOCK_PRIVATE_NETWORKS=1 (strict mode) — then list trusted ranges,
   # e.g. "10.0.0.0/8".
   allowedPrivateCidrs: ""
   upstreamBaseUrl: ""   # empty -> defaults to the in-chart benchmark fixture backend

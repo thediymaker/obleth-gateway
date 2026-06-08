@@ -153,12 +153,28 @@ Full API spec: `GET http://localhost:9090/api/v1/openapi.json`.
 ### Kubernetes
 
 ```bash
-helm install obleth deploy/k8s/obleth
+helm install obleth deploy/k8s/obleth -f my-values.yaml
 ```
 
 Ships the obleth Deployment + HPA + Services, an optional ServiceMonitor, and
 bundled demo dependencies. For production, point at CloudNativePG, an operator-
-managed ClickHouse, and HA Redis (`postgres.enabled=false`, etc.).
+managed ClickHouse, and HA Redis (`postgres.enabled=false`, etc.). See
+`deploy/k8s/README.md` for post-install steps.
+
+A fresh `helm install` starts with **no models and no tenant keys**. After pods
+are Running:
+
+1. Port-forward the Management API: `kubectl port-forward svc/obleth 9090:9090`
+2. Create a tenant and mint a key (`POST /api/v1/tenants`, then
+   `POST /api/v1/tenants/{id}/keys`) — there is no shared "open" proxy key.
+3. Register models via `POST /api/v1/models`. Set `api_base` to the provider base
+   ending in `/v1`; set `upstream_model` to the bare name the backend expects.
+
+By default, private cluster addresses (e.g. `*.svc.cluster.local` → `10.x`) are
+allowed for `api_base` without extra configuration. If you enable strict SSRF
+(`OBLETH_BLOCK_PRIVATE_NETWORKS=1`), set `obleth.allowedPrivateCidrs` to your
+pod CIDR (e.g. `10.0.0.0/8`). Do not commit real secrets in values files — use
+`--set` or inject a Kubernetes Secret instead.
 
 ## Configuration
 

@@ -136,6 +136,12 @@ services:
       context: ../../control-plane
       dockerfile: ../deploy/docker/control-plane.Dockerfile
     environment:
+      # Next.js standalone (`node server.js`) binds to $HOSTNAME, which Docker
+      # sets to the container ID -> it would listen only on the container's eth0
+      # IP and the published host port (3002) could not reach it. Force all
+      # interfaces so the host->container port publish works.
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
       OBLETH_ADMIN_BASE_URL: http://obleth:9090
       OBLETH_ADMIN_TOKEN: ${OBLETH_ADMIN_TOKEN:?set OBLETH_ADMIN_TOKEN in deploy/docker/.env (copy from .env.example)}
       DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:?set DASHBOARD_USERNAME in deploy/docker/.env}
