@@ -184,8 +184,6 @@ pub enum Admission {
     Fast,
     /// Admitted after waiting in the weighted queue.
     Queued,
-    /// Admitted but degraded (capped max_tokens / downgraded) under saturation.
-    Brownout,
     /// Rejected (budget exhausted or fail-closed).
     Rejected,
 }
@@ -195,7 +193,6 @@ impl Admission {
         match self {
             Admission::Fast => "fast",
             Admission::Queued => "queued",
-            Admission::Brownout => "brownout",
             Admission::Rejected => "rejected",
         }
     }
@@ -261,10 +258,24 @@ pub struct ModelRoute {
     /// prefers models whose tags match the request's classified intent.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Per-request upstream timeout in seconds. `None` falls back to the global
+    /// `OBLETH_UPSTREAM_TIMEOUT_SECS` default.
+    #[serde(default)]
+    pub request_timeout_secs: Option<i64>,
+    /// Extra attempts against the same endpoint on retryable failures (network
+    /// errors, timeouts, 408/429/5xx). `0` disables retries.
+    #[serde(default)]
+    pub max_retries: i64,
+    /// Base delay in milliseconds for exponential backoff between retries.
+    #[serde(default = "default_retry_backoff_ms")]
+    pub retry_backoff_ms: i64,
+    /// How obleth chooses among this model's registered endpoints: `failover`
+    /// (priority order) or `load_balance` (weighted).
+    #[serde(default = "default_endpoint_selection_mode")]
+    pub endpoint_selection_mode: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
-
 /// Persisted model-health status. Stored as snake_case text in Postgres so new
 /// UI/API readers can remain forward-compatible with older rows.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -354,6 +365,77 @@ pub struct ResolvedModel {
     /// Routing tags from the fixed [`MODEL_TAGS`] vocabulary.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Per-request upstream timeout in seconds. `None` falls back to the global
+    /// default. `#[serde(default)]` keeps older cached payloads readable.
+    #[serde(default)]
+    pub request_timeout_secs: Option<i64>,
+    /// Extra attempts against the same endpoint on retryable failures.
+    #[serde(default)]
+    pub max_retries: i64,
+    /// Base delay (ms) for exponential backoff between retries.
+    #[serde(default = "default_retry_backoff_ms")]
+    pub retry_backoff_ms: i64,
+    /// How to choose among `endpoints`: `failover` or `load_balance`.
+    #[serde(default = "default_endpoint_selection_mode")]
+    pub endpoint_selection_mode: String,
+    /// Upstream endpoints for this model. When empty, the data plane falls back
+    /// to the legacy single `api_base`/`api_key` pair above (older cached
+    /// payloads and un-migrated rows).
+    #[serde(default)]
+    pub endpoints: Vec<ResolvedEndpoint>,
+}
+
+/// Hot-path view of one upstream endpoint of a model. Several endpoints of the
+/// same model are interchangeable (identical pricing and capabilities); only
+/// the wire target (`api_base`/`api_key`) differs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ResolvedEndpoint {
+    #[serde(default)]
+    pub id: String,
+    pub api_base: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Lower wins in `failover` mode.
+    #[serde(default)]
+    pub priority: i64,
+    /// Relative share in `load_balance` mode.
+    #[serde(default)]
+    pub weight: i64,
+    /// Whether this endpoint is eligible for traffic at all.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Last observed health. Unhealthy endpoints are skipped during selection.
+    #[serde(default)]
+    pub healthy: bool,
+}
+
+/// Persisted upstream endpoint of a model (control-plane/API view). Several
+/// endpoints of the same model are interchangeable; obleth fails over or
+/// load-balances across them and tracks health per endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelEndpoint {
+    pub id: Uuid,
+    #[schema(value_type = String)]
+    pub model_id: Uuid,
+    /// Operator-facing label, unique within the model.
+    pub name: String,
+    pub api_base: String,
+    /// Optional bearer/api key for this endpoint (stored encrypted-at-rest).
+    pub api_key: Option<String>,
+    /// Lower wins in `failover` mode.
+    pub priority: i64,
+    /// Relative share in `load_balance` mode.
+    pub weight: i64,
+    pub enabled: bool,
+    pub health_status: String,
+    pub consecutive_failures: i64,
+    pub alert_state: String,
+    pub last_checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_latency_ms: Option<i64>,
+    pub last_http_status: Option<i64>,
+    pub last_message: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// A registered MCP (Model Context Protocol) server. obleth fronts it with the
@@ -569,6 +651,42 @@ pub fn normalize_capacity_mode(mode: &str) -> String {
         m
     } else {
         DEFAULT_CAPACITY_MODE.to_string()
+    }
+}
+
+/// Fixed vocabulary of endpoint-selection modes. `failover` tries a model's
+/// endpoints in priority order; `load_balance` spreads requests across them by
+/// weight. Skipping unhealthy/disabled endpoints applies in both modes.
+pub const ENDPOINT_SELECTION_MODES: &[&str] = &["failover", "load_balance"];
+
+/// The default endpoint-selection mode assigned to a model when none is set.
+pub const DEFAULT_ENDPOINT_SELECTION_MODE: &str = "failover";
+
+fn default_endpoint_selection_mode() -> String {
+    DEFAULT_ENDPOINT_SELECTION_MODE.to_string()
+}
+
+/// Default base delay (ms) for retry exponential backoff.
+pub const DEFAULT_RETRY_BACKOFF_MS: i64 = 200;
+
+fn default_retry_backoff_ms() -> i64 {
+    DEFAULT_RETRY_BACKOFF_MS
+}
+
+/// True when `mode` is part of the fixed [`ENDPOINT_SELECTION_MODES`] vocabulary.
+pub fn is_valid_endpoint_selection_mode(mode: &str) -> bool {
+    ENDPOINT_SELECTION_MODES.contains(&mode)
+}
+
+/// Normalize an endpoint-selection-mode string to canonical storage form:
+/// trimmed and lowercased, falling back to [`DEFAULT_ENDPOINT_SELECTION_MODE`]
+/// when empty or unknown.
+pub fn normalize_endpoint_selection_mode(mode: &str) -> String {
+    let m = mode.trim().to_ascii_lowercase();
+    if is_valid_endpoint_selection_mode(&m) {
+        m
+    } else {
+        DEFAULT_ENDPOINT_SELECTION_MODE.to_string()
     }
 }
 

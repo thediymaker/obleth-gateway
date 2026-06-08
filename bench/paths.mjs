@@ -13,4 +13,5 @@ export const benchPaths = {
   throughputMeta: join(BENCH_OUT_DIR, "throughput-meta.json"),
   soakMeta: join(BENCH_OUT_DIR, "soak-meta.json"),
   soakTimeline: join(BENCH_OUT_DIR, "soak-timeline.jsonl"),
+  maxMeta: join(BENCH_OUT_DIR, "max-meta.json"),
 };

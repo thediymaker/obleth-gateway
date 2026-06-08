@@ -38,8 +38,6 @@ pub struct Config {
     pub global_max_in_flight: usize,
     /// Fairshare scheduling algorithm (`weighted` or `hierarchical`).
     pub fairshare_algorithm: FairshareAlgorithm,
-    /// Queue-wait threshold (ms) past which brownout degradation kicks in.
-    pub brownout_wait_ms: u64,
 
     /// Fail-open: keep serving from cache + buffer telemetry to WAL when
     /// Redis/ClickHouse are unavailable. Fail-closed rejects instead.
@@ -115,7 +113,6 @@ impl Config {
                 "OBLETH_FAIRSHARE_ALGORITHM",
                 "hierarchical",
             )),
-            brownout_wait_ms: parse_or("OBLETH_BROWNOUT_WAIT_MS", 750),
             fail_open: parse_or("OBLETH_FAIL_OPEN", true),
             wal_path: env_or("OBLETH_WAL_PATH", "./obleth-telemetry.wal"),
             model_health_enabled: parse_or("OBLETH_MODEL_HEALTH_ENABLED", true),

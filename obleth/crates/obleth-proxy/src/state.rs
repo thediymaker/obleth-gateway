@@ -24,6 +24,9 @@ pub struct AppState {
     pub telemetry: TelemetrySink,
     pub http: reqwest::Client,
     pub upstream_base: String,
+    /// Default per-request upstream timeout, used when a model does not set its
+    /// own `request_timeout_secs`. From `OBLETH_UPSTREAM_TIMEOUT_SECS`.
+    pub upstream_timeout: std::time::Duration,
     /// hash -> resolved key, with a short TTL as a backstop to pub/sub invalidation.
     pub key_cache: Cache<String, ResolvedKey>,
     pub model_cache: Cache<String, ResolvedModel>,

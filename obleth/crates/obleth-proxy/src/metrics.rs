@@ -21,6 +21,7 @@ pub struct Metrics {
     cache_lookups: IntCounterVec,
     tokens_saved: IntCounter,
     mcp_requests: IntCounterVec,
+    upstream_attempts: IntCounterVec,
 }
 
 impl Metrics {
@@ -91,6 +92,14 @@ impl Metrics {
             &["server", "status"],
         )
         .unwrap();
+        let upstream_attempts = IntCounterVec::new(
+            Opts::new(
+                "obleth_upstream_attempts_total",
+                "Upstream dispatch attempts by outcome (success/retry/timeout/failover/exhausted)",
+            ),
+            &["outcome"],
+        )
+        .unwrap();
 
         registry.register(Box::new(requests.clone())).unwrap();
         registry.register(Box::new(tokens_in.clone())).unwrap();
@@ -105,6 +114,9 @@ impl Metrics {
         registry.register(Box::new(cache_lookups.clone())).unwrap();
         registry.register(Box::new(tokens_saved.clone())).unwrap();
         registry.register(Box::new(mcp_requests.clone())).unwrap();
+        registry
+            .register(Box::new(upstream_attempts.clone()))
+            .unwrap();
 
         Metrics {
             registry,
@@ -119,7 +131,14 @@ impl Metrics {
             cache_lookups,
             tokens_saved,
             mcp_requests,
+            upstream_attempts,
         }
+    }
+
+    /// Record one upstream dispatch attempt outcome. `outcome` is one of
+    /// `success`, `retry`, `timeout`, `failover`, or `exhausted`.
+    pub fn record_upstream_attempt(&self, outcome: &str) {
+        self.upstream_attempts.with_label_values(&[outcome]).inc();
     }
 
     /// Record an MCP gateway request by server name and HTTP status class.

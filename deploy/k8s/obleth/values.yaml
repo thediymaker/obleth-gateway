@@ -7,7 +7,6 @@ image:
 obleth:
   replicas: 3
   globalMaxInFlight: 256
-  brownoutWaitMs: 500
   failOpen: true
   # REQUIRED. No default is shipped — supply via `--set obleth.adminToken=...`,
   # a values override, or (preferred) an external Secret. `openssl rand -hex 32`.

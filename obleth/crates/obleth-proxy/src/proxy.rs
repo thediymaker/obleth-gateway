@@ -1,28 +1,28 @@
 //! The data-plane request pipeline.
 //!
-//! resolve key -> estimate cost -> fairshare admit -> (brownout) -> reserve
+//! resolve key -> estimate cost -> fairshare admit -> reserve
 //! budget -> stream to upstream -> reconcile actual cost -> emit telemetry.
 //!
 //! The fairshare permit is held inside the response stream and released only
 //! when the stream finishes, so concurrency accounting matches real upstream
 //! occupancy including streaming time.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use futures_util::StreamExt;
-use obleth_config::{hash_api_key, Admission, ResolvedKey, ResolvedModel, UsageRecord};
+use obleth_config::{hash_api_key, Admission, ResolvedEndpoint, ResolvedKey, ResolvedModel, UsageRecord};
 use obleth_tokenizer::{CostEstimate, Tokenizer};
+use tokio::time::timeout;
 use tracing::Instrument;
 use uuid::Uuid;
 
 use crate::state::AppState;
 
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
-const BROWNOUT_MAX_TOKENS: u64 = 256;
 const TAIL_CAP: usize = 16 * 1024;
 /// Upper bound on a response we are willing to cache. Larger responses stream
 /// through uncached so the cache can't be used to balloon Redis memory.
@@ -86,9 +86,8 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         Ok(b) => b,
         Err(_) => return error_json(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
-    let mut json: serde_json::Value =
+    let json: serde_json::Value =
         serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
-
     // Audio transcription/translation send the model as a `multipart/form-data`
     // field alongside the uploaded file, not as JSON. Parse the fields once so
     // we can resolve the model and later rebuild the upstream form with the
@@ -98,7 +97,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let multipart_fields = if is_multipart_endpoint(&path)
+    let mut multipart_fields = if is_multipart_endpoint(&path)
         && content_type_in.starts_with("multipart/form-data")
     {
         match multer::parse_boundary(&content_type_in) {
@@ -279,14 +278,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let permit = admitted.permit;
     let queue_wait_ms = admitted.waited.as_millis() as u32;
 
-    // ---- brownout: degrade low-priority requests instead of rejecting ----
-    let mut send_bytes = body_bytes;
-    if matches!(admission, Admission::Brownout) {
-        if let Some(degraded) = apply_brownout(&mut json) {
-            send_bytes = Bytes::from(degraded);
-            est = state.tokenizer.estimate_request(&json);
-        }
-    }
+    let send_bytes = body_bytes;
 
     // ---- token budget reserve (atomic, cross-pod) ----
     let capacity = resolved.tokens_per_minute.max(1);
@@ -406,64 +398,169 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let modality_cost = compute_modality_cost(route.as_ref(), &json);
 
     // ---- proxy upstream ----
-    let upstream_base = route
+    // Resolve the per-request timeout and retry policy. Both default to the
+    // model-level config, falling back to the global gateway settings.
+    let req_timeout = route
         .as_ref()
-        .map(|r| r.api_base.clone())
-        .unwrap_or_else(|| state.upstream_base.clone());
-    let url = build_upstream_url(&upstream_base, &path, &query);
-    let mut fwd_headers = forward_headers(&headers);
-    if let Some(route) = &route {
-        if let Some(key) = &route.api_key {
-            if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {key}")) {
-                fwd_headers.insert(header::AUTHORIZATION, v);
-            }
-        }
-    }
-    let mut req_builder = state.http.request(method, &url);
-    if let Some(fields) = multipart_fields {
-        // Rebuild the multipart form, swapping the client model name for the
-        // upstream one. reqwest regenerates the Content-Type (with boundary), so
-        // the inbound multipart content-type header must be dropped.
-        fwd_headers.remove(header::CONTENT_TYPE);
-        let upstream_model = route
+        .and_then(|r| r.request_timeout_secs)
+        .filter(|s| *s >= 1)
+        .map(|s| Duration::from_secs(s as u64))
+        .unwrap_or(state.upstream_timeout);
+    let max_retries = route.as_ref().map(|r| r.max_retries.max(0)).unwrap_or(0);
+    let backoff = Duration::from_millis(
+        route
             .as_ref()
-            .map(|r| r.upstream_model.clone())
-            .unwrap_or_else(|| model.clone());
-        let form = build_multipart_form(fields, &upstream_model);
-        req_builder = req_builder.headers(fwd_headers).multipart(form);
-    } else {
-        let (_, mut send_bytes, upstream_model) =
+            .map(|r| r.retry_backoff_ms.max(0) as u64)
+            .unwrap_or(0),
+    );
+    let selection_mode = route
+        .as_ref()
+        .map(|r| r.endpoint_selection_mode.as_str())
+        .unwrap_or(obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE);
+
+    // Build the ordered list of upstream targets. When a model defines explicit
+    // endpoints we route across the healthy/enabled ones (priority order for
+    // failover, weighted order for load_balance); otherwise we fall back to the
+    // legacy single api_base/api_key on the model (or the global default).
+    let targets = build_targets(route.as_ref(), &state.upstream_base, selection_mode);
+
+    // The JSON body is rebuilt once and replayed on each attempt/endpoint.
+    // Multipart bodies cannot be replayed, so they get a single attempt against
+    // the first target only.
+    let replayable = multipart_fields.is_none();
+    let prepared_body: Option<Bytes> = if replayable {
+        let (_, mut sb, upstream_model) =
             prepare_upstream(&route, &state.upstream_base, &model, &json, send_bytes);
         if let Some(upstream_model) = upstream_model {
             if let Ok(bytes) = serde_json::to_vec(&upstream_model) {
-                send_bytes = Bytes::from(bytes);
+                sb = Bytes::from(bytes);
                 est = state.tokenizer.estimate_request(&upstream_model);
             }
         }
-        req_builder = req_builder.headers(fwd_headers).body(send_bytes);
+        Some(sb)
+    } else {
+        None
+    };
+
+    // TTFT is measured from the moment we dispatch the *successful* upstream
+    // request, *after* fairshare admission. Time spent waiting in the queue is
+    // reported separately as `queue_wait_ms`; folding it into TTFT would
+    // double-count the wait and make a fast model look slow under contention.
+    let mut upstream_start = Instant::now();
+    let mut upstream_resp: Option<reqwest::Response> = None;
+    let mut last_url = String::new();
+    let mut last_err: Option<String> = None;
+    let mut timed_out = false;
+    let total_targets = targets.len();
+
+    'targets: for (ti, target) in targets.iter().enumerate() {
+        let url = build_upstream_url(&target.base, &path, &query);
+        last_url = url.clone();
+        let attempts: u32 = if replayable { max_retries as u32 + 1 } else { 1 };
+        for attempt in 0..attempts {
+            let more_attempts = attempt + 1 < attempts;
+            let more_targets = replayable && ti + 1 < total_targets;
+
+            let mut fwd_headers = forward_headers(&headers);
+            if let Some(key) = &target.api_key {
+                if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {key}")) {
+                    fwd_headers.insert(header::AUTHORIZATION, v);
+                }
+            }
+            let req_builder = if let Some(body) = &prepared_body {
+                state
+                    .http
+                    .request(method.clone(), &url)
+                    .headers(fwd_headers)
+                    .body(body.clone())
+            } else {
+                // Rebuild the multipart form, swapping the client model name for
+                // the upstream one. reqwest regenerates the Content-Type (with
+                // boundary), so the inbound multipart content-type must be dropped.
+                fwd_headers.remove(header::CONTENT_TYPE);
+                let upstream_model = route
+                    .as_ref()
+                    .map(|r| r.upstream_model.clone())
+                    .unwrap_or_else(|| model.clone());
+                let fields = multipart_fields.take().expect("multipart fields present");
+                let form = build_multipart_form(fields, &upstream_model);
+                state
+                    .http
+                    .request(method.clone(), &url)
+                    .headers(fwd_headers)
+                    .multipart(form)
+            };
+
+            upstream_start = Instant::now();
+            let send_fut = req_builder
+                .send()
+                .instrument(tracing::info_span!("upstream_request"));
+            match timeout(req_timeout, send_fut).await {
+                Ok(Ok(resp)) => {
+                    let status = resp.status().as_u16();
+                    if is_retryable_status(status) && (more_attempts || more_targets) {
+                        last_err = Some(format!("upstream status {status}"));
+                        if more_attempts {
+                            state.metrics.record_upstream_attempt("retry");
+                            tokio::time::sleep(backoff_for(backoff, attempt)).await;
+                            continue;
+                        }
+                        state.metrics.record_upstream_attempt("failover");
+                        continue 'targets;
+                    }
+                    state.metrics.record_upstream_attempt("success");
+                    upstream_resp = Some(resp);
+                    break 'targets;
+                }
+                Ok(Err(e)) => {
+                    last_err = Some(e.to_string());
+                    if more_attempts {
+                        state.metrics.record_upstream_attempt("retry");
+                        tokio::time::sleep(backoff_for(backoff, attempt)).await;
+                        continue;
+                    }
+                }
+                Err(_) => {
+                    timed_out = true;
+                    last_err = Some(format!("timed out after {req_timeout:?}"));
+                    if more_attempts {
+                        state.metrics.record_upstream_attempt("timeout");
+                        tokio::time::sleep(backoff_for(backoff, attempt)).await;
+                        continue;
+                    }
+                }
+            }
+        }
+        // Attempts on this target are exhausted. Fail over to the next target
+        // when one is available and the request is replayable.
+        if replayable && ti + 1 < total_targets {
+            state.metrics.record_upstream_attempt("failover");
+            continue 'targets;
+        }
+        break;
     }
-    // TTFT is measured from the moment we dispatch the upstream request, *after*
-    // fairshare admission. Time spent waiting in the queue is reported separately
-    // as `queue_wait_ms`; folding it into TTFT would double-count the wait and
-    // make a fast model look slow under contention.
-    let upstream_start = Instant::now();
-    let upstream = req_builder
-        .send()
-        .instrument(tracing::info_span!("upstream_request"))
-        .await;
-    let upstream = match upstream {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(error = %e, "upstream request failed");
+
+    let url = last_url;
+    let upstream = match upstream_resp {
+        Some(r) => r,
+        None => {
+            state.metrics.record_upstream_attempt("exhausted");
+            let msg = last_err.unwrap_or_else(|| "upstream request failed".to_string());
+            tracing::warn!(error = %msg, "upstream request failed after all attempts");
             state.alerts.issue(
                 "upstream_request_failed",
                 "Upstream request failed",
                 format!(
-                    "tenant `{}` model `{model}` path `{path}` upstream `{url}`: {e}",
+                    "tenant `{}` model `{model}` path `{path}` upstream `{url}`: {msg}",
                     resolved.tenant_name
                 ),
             );
             drop(permit);
+            let (code, http_status) = if timed_out {
+                (504u16, StatusCode::GATEWAY_TIMEOUT)
+            } else {
+                (502u16, StatusCode::BAD_GATEWAY)
+            };
             finalize(
                 &state,
                 &resolved,
@@ -475,10 +572,15 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 queue_wait_ms,
                 0,
                 0,
-                502,
+                code,
                 cache_status_label,
             );
-            return error_json(StatusCode::BAD_GATEWAY, "upstream request failed");
+            let detail = if timed_out {
+                "upstream request timed out"
+            } else {
+                "upstream request failed"
+            };
+            return error_json(http_status, detail);
         }
     };
     let status_code = upstream.status().as_u16();
@@ -502,11 +604,8 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         .unwrap_or("application/json")
         .to_string();
 
-    // Cache only successful, non-degraded responses. Brownout output is capped,
-    // so storing it would poison later (unsaturated) reads.
-    let store_in_cache = cache_key
-        .clone()
-        .filter(|_| !matches!(admission, Admission::Brownout));
+    // Cache only successful responses.
+    let store_in_cache = cache_key.clone();
 
     // ---- stream back, inspecting for actual usage, then reconcile ----
     let stream_state = state.clone();
@@ -1074,6 +1173,100 @@ fn prepare_upstream(
     (route.api_base.clone(), body, Some(upstream_json))
 }
 
+/// One resolved upstream target: a base URL plus an optional bearer key.
+struct Target {
+    base: String,
+    api_key: Option<String>,
+}
+
+/// Build the ordered list of upstream targets for a request.
+///
+/// When the model defines explicit endpoints we route across the ones that are
+/// both `enabled` and `healthy`. `failover` orders them by ascending priority
+/// (lowest first); `load_balance` orders them by a weighted random shuffle so
+/// traffic spreads across clusters in proportion to their weights. When no
+/// usable endpoints exist we fall back to the model's own `api_base`/`api_key`
+/// (or the global default base), preserving the legacy single-upstream path.
+fn build_targets(
+    route: Option<&ResolvedModel>,
+    default_base: &str,
+    selection_mode: &str,
+) -> Vec<Target> {
+    let mut targets: Vec<Target> = Vec::new();
+    if let Some(r) = route {
+        let mut eligible: Vec<&ResolvedEndpoint> = r
+            .endpoints
+            .iter()
+            .filter(|e| e.enabled && e.healthy)
+            .collect();
+        if !eligible.is_empty() {
+            if selection_mode == "load_balance" {
+                eligible = weighted_order(eligible);
+            } else {
+                eligible.sort_by_key(|e| e.priority);
+            }
+            for e in eligible {
+                targets.push(Target {
+                    base: e.api_base.clone(),
+                    api_key: e.api_key.clone().or_else(|| r.api_key.clone()),
+                });
+            }
+            return targets;
+        }
+    }
+    targets.push(Target {
+        base: route
+            .map(|r| r.api_base.clone())
+            .unwrap_or_else(|| default_base.to_string()),
+        api_key: route.and_then(|r| r.api_key.clone()),
+    });
+    targets
+}
+
+/// Order endpoints by weighted random sampling (A-Res): each endpoint gets a
+/// key `u^(1/weight)` for a uniform random `u`, and we sort by descending key.
+/// Higher-weight endpoints land earlier more often, so the first eligible
+/// target is chosen in proportion to weight while the rest stay available for
+/// failover.
+fn weighted_order(items: Vec<&ResolvedEndpoint>) -> Vec<&ResolvedEndpoint> {
+    let mut seed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15);
+    let mut next = move || {
+        seed = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = seed;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^ (z >> 31)
+    };
+    let mut keyed: Vec<(f64, &ResolvedEndpoint)> = items
+        .into_iter()
+        .map(|e| {
+            let w = e.weight.max(1) as f64;
+            let u = (next() as f64 / u64::MAX as f64).max(1e-12);
+            (u.powf(1.0 / w), e)
+        })
+        .collect();
+    keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    keyed.into_iter().map(|(_, e)| e).collect()
+}
+
+/// Whether an upstream HTTP status is worth retrying or failing over for.
+/// Transient transport/overload conditions only — never 4xx client errors
+/// (except 408 request-timeout and 429 too-many-requests).
+fn is_retryable_status(status: u16) -> bool {
+    matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Exponential backoff for retry `attempt` (0-based), capped to avoid overflow.
+fn backoff_for(base: Duration, attempt: u32) -> Duration {
+    if base.is_zero() {
+        return base;
+    }
+    base.saturating_mul(1u32 << attempt.min(6))
+}
+
 fn build_upstream_url(base: &str, path: &str, query: &str) -> String {
     let base = base.trim_end_matches('/');
     let rel_raw = path.trim_start_matches('/');
@@ -1124,18 +1317,6 @@ pub(crate) fn forward_headers(headers: &HeaderMap) -> HeaderMap {
         }
     }
     out
-}
-
-/// Cap output under saturation. Returns the re-serialized body if it changed.
-fn apply_brownout(json: &mut serde_json::Value) -> Option<Vec<u8>> {
-    let obj = json.as_object_mut()?;
-    let current = obj
-        .get("max_tokens")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(u64::MAX);
-    let capped = current.min(BROWNOUT_MAX_TOKENS);
-    obj.insert("max_tokens".to_string(), serde_json::json!(capped));
-    serde_json::to_vec(json).ok()
 }
 
 fn append_tail(tail: &mut String, chunk: &[u8]) {
@@ -1254,10 +1435,26 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_upstream_url, tenant_active_now};
+    use super::{
+        backoff_for, build_targets, build_upstream_url, is_retryable_status, tenant_active_now,
+        weighted_order,
+    };
     use chrono::{DateTime, TimeZone, Utc};
-    use obleth_config::{ResolvedKey, WeeklyWindow};
+    use obleth_config::{ResolvedEndpoint, ResolvedKey, WeeklyWindow};
+    use std::time::Duration;
     use uuid::Uuid;
+
+    fn endpoint(id: &str, base: &str, priority: i64, weight: i64, enabled: bool, healthy: bool) -> ResolvedEndpoint {
+        ResolvedEndpoint {
+            id: id.into(),
+            api_base: base.into(),
+            api_key: None,
+            priority,
+            weight,
+            enabled,
+            healthy,
+        }
+    }
 
     fn key_with_schedule(
         timezone: &str,
@@ -1393,5 +1590,113 @@ mod tests {
             }]),
         );
         assert!(tenant_active_now(&key, now).is_ok());
+    }
+
+    fn model_with(endpoints: Vec<ResolvedEndpoint>) -> obleth_config::ResolvedModel {
+        obleth_config::ResolvedModel {
+            model_name: "m".into(),
+            upstream_model: "m".into(),
+            api_base: "http://primary/v1".into(),
+            api_key: Some("model-key".into()),
+            model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
+            admission_weight: 100,
+            max_in_flight: None,
+            enabled: true,
+            cache_enabled: false,
+            cache_ttl_secs: 0,
+            input_cost_per_token: 0.0,
+            output_cost_per_token: 0.0,
+            cost_per_image: 0.0,
+            cost_per_audio_second: 0.0,
+            cost_per_character: 0.0,
+            context_window: 128_000,
+            supports_function_calling: true,
+            supports_system_messages: true,
+            supports_response_schema: true,
+            supports_tool_choice: true,
+            tags: Vec::new(),
+            request_timeout_secs: None,
+            max_retries: 0,
+            retry_backoff_ms: obleth_config::DEFAULT_RETRY_BACKOFF_MS,
+            endpoint_selection_mode: obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
+            endpoints,
+        }
+    }
+
+    #[test]
+    fn retryable_status_classification() {
+        for s in [408, 429, 500, 502, 503, 504] {
+            assert!(is_retryable_status(s), "{s} should be retryable");
+        }
+        for s in [200, 201, 400, 401, 403, 404, 422] {
+            assert!(!is_retryable_status(s), "{s} should be fatal");
+        }
+    }
+
+    #[test]
+    fn backoff_grows_exponentially_and_caps() {
+        let base = Duration::from_millis(100);
+        assert_eq!(backoff_for(base, 0), Duration::from_millis(100));
+        assert_eq!(backoff_for(base, 1), Duration::from_millis(200));
+        assert_eq!(backoff_for(base, 2), Duration::from_millis(400));
+        // Cap kicks in at attempt 6 (×64); higher attempts stay flat.
+        assert_eq!(backoff_for(base, 10), backoff_for(base, 6));
+        // Zero base stays zero (no backoff configured).
+        assert_eq!(backoff_for(Duration::ZERO, 3), Duration::ZERO);
+    }
+
+    #[test]
+    fn no_endpoints_falls_back_to_model_base() {
+        let model = model_with(Vec::new());
+        let targets = build_targets(Some(&model), "http://global/v1", "failover");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].base, "http://primary/v1");
+        assert_eq!(targets[0].api_key.as_deref(), Some("model-key"));
+    }
+
+    #[test]
+    fn none_route_uses_global_default() {
+        let targets = build_targets(None, "http://global/v1", "failover");
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].base, "http://global/v1");
+        assert!(targets[0].api_key.is_none());
+    }
+
+    #[test]
+    fn failover_orders_by_priority_and_skips_unusable() {
+        let model = model_with(vec![
+            endpoint("c", "http://c", 30, 100, true, true),
+            endpoint("a", "http://a", 10, 100, true, true),
+            endpoint("disabled", "http://x", 5, 100, false, true),
+            endpoint("unhealthy", "http://y", 1, 100, true, false),
+            endpoint("b", "http://b", 20, 100, true, true),
+        ]);
+        let targets = build_targets(Some(&model), "http://global/v1", "failover");
+        let bases: Vec<&str> = targets.iter().map(|t| t.base.as_str()).collect();
+        assert_eq!(bases, vec!["http://a", "http://b", "http://c"]);
+    }
+
+    #[test]
+    fn endpoint_key_falls_back_to_model_key() {
+        let mut ep = endpoint("a", "http://a", 10, 100, true, true);
+        ep.api_key = None;
+        let model = model_with(vec![ep]);
+        let targets = build_targets(Some(&model), "http://global/v1", "failover");
+        assert_eq!(targets[0].api_key.as_deref(), Some("model-key"));
+    }
+
+    #[test]
+    fn weighted_order_preserves_membership() {
+        let eps = vec![
+            endpoint("a", "http://a", 10, 100, true, true),
+            endpoint("b", "http://b", 20, 50, true, true),
+            endpoint("c", "http://c", 30, 1, true, true),
+        ];
+        let refs: Vec<&ResolvedEndpoint> = eps.iter().collect();
+        let ordered = weighted_order(refs);
+        assert_eq!(ordered.len(), 3);
+        let mut ids: Vec<&str> = ordered.iter().map(|e| e.id.as_str()).collect();
+        ids.sort();
+        assert_eq!(ids, vec!["a", "b", "c"]);
     }
 }

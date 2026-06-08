@@ -177,6 +177,32 @@ do $$ begin
     end if;
 end $$;
 
+-- Per-model reliability controls (added via if-not-exists for upgrades).
+-- request_timeout_secs: per-request upstream timeout; null = use the global
+-- OBLETH_UPSTREAM_TIMEOUT_SECS default. max_retries: extra attempts against the
+-- same endpoint on retryable failures (0 = no retry). retry_backoff_ms: base
+-- delay for exponential backoff between those retries.
+alter table models add column if not exists request_timeout_secs bigint
+    check (request_timeout_secs is null or request_timeout_secs >= 1);
+alter table models add column if not exists max_retries bigint not null default 0
+    check (max_retries >= 0);
+alter table models add column if not exists retry_backoff_ms bigint not null default 200
+    check (retry_backoff_ms >= 0);
+
+-- How obleth chooses among a model's endpoints when more than one is
+-- registered: 'failover' tries them in priority order; 'load_balance' spreads
+-- requests by weight. Endpoints themselves live in the model_endpoints table.
+alter table models add column if not exists endpoint_selection_mode text not null default 'failover';
+do $$ begin
+    if not exists (
+        select 1 from information_schema.constraint_column_usage
+        where table_name = 'models' and constraint_name = 'models_endpoint_selection_mode_check'
+    ) then
+        alter table models add constraint models_endpoint_selection_mode_check
+            check (endpoint_selection_mode in ('failover', 'load_balance'));
+    end if;
+end $$;
+
 create index if not exists models_health_due_idx
     on models (health_next_check_at)
     where enabled = true and health_checks_enabled = true;
@@ -198,6 +224,37 @@ create index if not exists model_health_checks_model_ts_idx
 
 create index if not exists model_health_checks_ts_idx
     on model_health_checks (checked_at desc);
+
+-- Per-model upstream endpoints. A model can target several interchangeable
+-- clusters (same model, different api_base/api_key). obleth fails over between
+-- them (priority order) or load-balances (by weight), and tracks health per
+-- endpoint so a dead cluster is pulled from rotation while the model stays up.
+create table if not exists model_endpoints (
+    id                   uuid primary key,
+    model_id             uuid not null references models(id) on delete cascade,
+    -- operator-facing label, unique within a model
+    name                 text not null,
+    api_base             text not null,
+    api_key              text,
+    -- lower priority wins in failover mode; ties broken by created_at
+    priority             bigint not null default 100 check (priority >= 0),
+    -- relative share in load_balance mode
+    weight               bigint not null default 100 check (weight >= 1),
+    enabled              boolean not null default true,
+    -- per-endpoint health, mirroring the model-level health columns
+    health_status        text not null default 'unknown',
+    consecutive_failures bigint not null default 0 check (consecutive_failures >= 0),
+    alert_state          text not null default 'ok',
+    last_checked_at      timestamptz,
+    last_latency_ms      bigint,
+    last_http_status     bigint,
+    last_message         text,
+    created_at           timestamptz not null default now(),
+    updated_at           timestamptz not null default now(),
+    unique (model_id, name)
+);
+
+create index if not exists model_endpoints_model_idx on model_endpoints (model_id);
 
 -- MCP (Model Context Protocol) server registry. obleth reverse-proxies these
 -- through its auth + audit layer so clients reach many MCP servers via one

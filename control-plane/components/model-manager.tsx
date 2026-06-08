@@ -32,15 +32,19 @@ import {
   autotuneModelAction,
   checkModelHealthAction,
   createModelAction,
+  createModelEndpointAction,
   deleteModelAction,
+  deleteModelEndpointAction,
   importModelsAction,
   planModelImportAction,
   setModelCacheAction,
   setModelCapacityAction,
   setModelCapacityModeAction,
   setModelHealthConfigAction,
+  setModelReliabilityAction,
   setModelWeightAction,
   updateModelAction,
+  updateModelEndpointAction,
   type ImportModelsResult,
   type ImportPlanItem,
 } from "@/app/actions";
@@ -66,7 +70,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { AutotuneReport, AutotuneWorkload, CacheStats, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
+import type { AutotuneReport, AutotuneWorkload, CacheStats, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import { cn, formatNumber } from "@/lib/utils";
 
 // Fixed routing-tag vocabulary; mirrors obleth-config `MODEL_TAGS`. Used by the
@@ -101,11 +105,13 @@ export function ModelManager({
   cacheStats,
   health,
   healthDetails,
+  endpoints,
 }: {
   models: ModelRoute[];
   cacheStats?: CacheStats;
   health: ModelHealthSummary[];
   healthDetails: Record<string, ModelHealthDetail | undefined>;
+  endpoints: Record<string, ModelEndpoint[]>;
 }) {
   const [pending, start] = useTransition();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -420,6 +426,7 @@ export function ModelManager({
                             model={model}
                             summary={summary}
                             detail={healthDetails[model.id]}
+                            endpoints={endpoints[model.id] ?? []}
                             pending={pending}
                             onCacheToggle={() => start(() => setModelCacheAction(model.id, !model.cache_enabled, model.cache_ttl_secs || 300))}
                           />
@@ -448,12 +455,14 @@ function ModelDetailPanel({
   model,
   summary,
   detail,
+  endpoints,
   pending,
   onCacheToggle,
 }: {
   model: ModelRoute;
   summary: ModelHealthSummary;
   detail?: ModelHealthDetail;
+  endpoints: ModelEndpoint[];
   pending: boolean;
   onCacheToggle: () => void;
 }) {
@@ -517,6 +526,8 @@ function ModelDetailPanel({
           </div>
           <AutotunePanel model={model} />
         </div>
+
+        <ReliabilityPanel model={model} endpoints={endpoints} pending={pending} />
 
         <div className="rounded-md border border-border bg-card/40 p-4">
           <div className="mb-4 flex items-center justify-between gap-3">
@@ -1098,6 +1109,164 @@ function healthClass(status: string) {
   if (status === "maintenance") return "border-amber-500/35 bg-amber-500/10 text-amber-300";
   if (status === "disabled") return "border-border bg-muted/30 text-muted-foreground";
   return "border-border bg-background text-muted-foreground";
+}
+
+function ReliabilityPanel({
+  model,
+  endpoints,
+  pending,
+}: {
+  model: ModelRoute;
+  endpoints: ModelEndpoint[];
+  pending: boolean;
+}) {
+  const [busy, start] = useTransition();
+  const disabled = pending || busy;
+  const addFormRef = useRef<HTMLFormElement>(null);
+
+  function saveReliability(formData: FormData) {
+    const rawTimeout = String(formData.get("request_timeout_secs") ?? "").trim();
+    const body = {
+      request_timeout_secs: rawTimeout === "" ? null : Number(rawTimeout),
+      max_retries: Number(formData.get("max_retries") ?? 0),
+      retry_backoff_ms: Number(formData.get("retry_backoff_ms") ?? 200),
+      endpoint_selection_mode: String(formData.get("endpoint_selection_mode") ?? "failover"),
+    };
+    start(() => setModelReliabilityAction(model.id, body));
+  }
+
+  function addEndpoint(formData: FormData) {
+    start(async () => {
+      await createModelEndpointAction(model.id, formData);
+      addFormRef.current?.reset();
+    });
+  }
+
+  return (
+    <div className="rounded-md border border-border bg-card/40 p-4">
+      <p className="text-sm font-medium">Reliability &amp; endpoints</p>
+      <p className="text-xs text-muted-foreground">
+        Per-request timeout, automatic retries, and multiple upstream clusters for the same model.
+      </p>
+
+      <form action={saveReliability} className="mt-4 grid gap-3 md:grid-cols-2">
+        <Field
+          label="Request timeout (s)"
+          name="request_timeout_secs"
+          type="number"
+          placeholder="default"
+          defaultValue={model.request_timeout_secs == null ? "" : String(model.request_timeout_secs)}
+        />
+        <Field label="Max retries" name="max_retries" type="number" defaultValue={String(model.max_retries)} />
+        <Field label="Retry backoff (ms)" name="retry_backoff_ms" type="number" defaultValue={String(model.retry_backoff_ms)} />
+        <div className="space-y-1.5">
+          <Label htmlFor={`selection-${model.id}`}>Endpoint selection</Label>
+          <select
+            id={`selection-${model.id}`}
+            name="endpoint_selection_mode"
+            defaultValue={model.endpoint_selection_mode}
+            className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+          >
+            <option value="failover">failover (priority order)</option>
+            <option value="load_balance">load_balance (weighted)</option>
+          </select>
+        </div>
+        <div className="md:col-span-2">
+          <Button type="submit" size="sm" disabled={disabled}>
+            <Save className="h-3.5 w-3.5" />
+            Save reliability
+          </Button>
+        </div>
+      </form>
+
+      <div className="mt-5">
+        <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Endpoints</p>
+        {endpoints.length === 0 ? (
+          <p className="mt-2 text-xs text-muted-foreground">
+            No explicit endpoints. Requests use the model&apos;s primary API base above.
+          </p>
+        ) : (
+          <div className="mt-2 overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                <tr>
+                  <th className="py-1 pr-3">Name</th>
+                  <th className="py-1 pr-3">API base</th>
+                  <th className="py-1 pr-3">Priority</th>
+                  <th className="py-1 pr-3">Weight</th>
+                  <th className="py-1 pr-3">Health</th>
+                  <th className="py-1 pr-3" />
+                </tr>
+              </thead>
+              <tbody>
+                {endpoints.map((ep) => (
+                  <tr key={ep.id} className="border-t border-border/60">
+                    <td className="py-1.5 pr-3 font-medium">{ep.name}</td>
+                    <td className="py-1.5 pr-3 font-mono text-[11px] text-muted-foreground">{ep.api_base}</td>
+                    <td className="py-1.5 pr-3 tabular-nums">{ep.priority}</td>
+                    <td className="py-1.5 pr-3 tabular-nums">{ep.weight}</td>
+                    <td className="py-1.5 pr-3">
+                      <StatusPill status={ep.enabled ? ep.health_status : "disabled"} />
+                    </td>
+                    <td className="py-1.5 pr-3">
+                      <div className="flex items-center gap-1.5">
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          disabled={disabled}
+                          onClick={() =>
+                            start(() =>
+                              updateModelEndpointAction(model.id, ep.id, {
+                                name: ep.name,
+                                api_base: ep.api_base,
+                                priority: ep.priority,
+                                weight: ep.weight,
+                                enabled: !ep.enabled,
+                              }),
+                            )
+                          }
+                        >
+                          {ep.enabled ? "Disable" : "Enable"}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          variant="ghost"
+                          disabled={disabled}
+                          onClick={() => {
+                            if (!window.confirm(`Remove endpoint "${ep.name}"?`)) return;
+                            start(() => deleteModelEndpointAction(model.id, ep.id));
+                          }}
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </Button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+
+        <form ref={addFormRef} action={addEndpoint} className="mt-3 grid gap-3 md:grid-cols-2">
+          <Field label="Name" name="name" placeholder="cluster-b" required />
+          <Field label="API base URL" name="api_base" placeholder="http://cluster-b/v1" required />
+          <Field label="API key" name="api_key" placeholder="Leave blank to inherit" />
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Priority" name="priority" type="number" defaultValue="100" />
+            <Field label="Weight" name="weight" type="number" defaultValue="100" />
+          </div>
+          <div className="md:col-span-2">
+            <Button type="submit" size="sm" variant="secondary" disabled={disabled}>
+              Add endpoint
+            </Button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
 }
 
 function ControlBlock({ label, children }: { label: string; children: ReactNode }) {

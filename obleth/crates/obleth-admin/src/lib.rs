@@ -24,8 +24,8 @@ use axum::response::Response;
 use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use obleth_config::{
-    hash_api_key, ApiKey, FairshareGroup, McpServer, ModelRoute, ResolvedKey, ResolvedMcpServer,
-    ResolvedModel, Tenant,
+    hash_api_key, ApiKey, FairshareGroup, McpServer, ModelEndpoint, ModelRoute, ResolvedKey,
+    ResolvedMcpServer, ResolvedModel, Tenant,
 };
 use obleth_config::{AlertSettings, AutoRouterSettings, EmailSettings};
 use obleth_fairshare::{FairShare, StaticCapacity, Stats};
@@ -142,6 +142,15 @@ pub fn router(state: AdminState) -> Router {
             post(apply_autotune_capacity),
         )
         .route("/api/v1/models/:id/cache", put(set_model_cache))
+        .route("/api/v1/models/:id/reliability", put(set_model_reliability))
+        .route(
+            "/api/v1/models/:id/endpoints",
+            get(list_model_endpoints).post(create_model_endpoint),
+        )
+        .route(
+            "/api/v1/models/:id/endpoints/:endpoint_id",
+            put(update_model_endpoint).delete(delete_model_endpoint),
+        )
         .route(
             "/api/v1/mcp-servers",
             post(create_mcp_server).get(list_mcp_servers),
@@ -417,6 +426,69 @@ pub struct UpdateModel {
 pub struct SetModelCache {
     pub cache_enabled: bool,
     pub cache_ttl_secs: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetModelReliability {
+    /// Per-request upstream timeout in seconds. `null` defers to the global
+    /// default.
+    #[serde(default)]
+    pub request_timeout_secs: Option<i64>,
+    #[serde(default)]
+    pub max_retries: i64,
+    #[serde(default = "default_retry_backoff_ms_dto")]
+    pub retry_backoff_ms: i64,
+    #[serde(default = "default_selection_mode_dto")]
+    pub endpoint_selection_mode: String,
+}
+
+fn default_retry_backoff_ms_dto() -> i64 {
+    obleth_config::DEFAULT_RETRY_BACKOFF_MS
+}
+
+fn default_selection_mode_dto() -> String {
+    obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string()
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateModelEndpoint {
+    pub name: String,
+    pub api_base: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_endpoint_priority")]
+    pub priority: i64,
+    #[serde(default = "default_endpoint_weight")]
+    pub weight: i64,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateModelEndpoint {
+    pub name: String,
+    pub api_base: String,
+    /// Omit to keep the stored key; empty string clears it.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default = "default_endpoint_priority")]
+    pub priority: i64,
+    #[serde(default = "default_endpoint_weight")]
+    pub weight: i64,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_endpoint_priority() -> i64 {
+    100
+}
+
+fn default_endpoint_weight() -> i64 {
+    100
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1839,6 +1911,147 @@ async fn set_model_cache(
     Ok(Json(model))
 }
 
+async fn set_model_reliability(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetModelReliability>,
+) -> Result<Json<ModelRoute>> {
+    let model = state
+        .store
+        .update_model_reliability(
+            id,
+            body.request_timeout_secs,
+            body.max_retries,
+            body.retry_backoff_ms,
+            &body.endpoint_selection_mode,
+        )
+        .await?;
+    sync_model(&state, &model).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "set_model_reliability",
+            "model",
+            &id.to_string(),
+            serde_json::json!({
+                "request_timeout_secs": model.request_timeout_secs,
+                "max_retries": model.max_retries,
+                "retry_backoff_ms": model.retry_backoff_ms,
+                "endpoint_selection_mode": model.endpoint_selection_mode,
+            }),
+        )
+        .await?;
+    Ok(Json(model))
+}
+
+// ---- model endpoints -----------------------------------------------------
+
+async fn list_model_endpoints(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<ModelEndpoint>>> {
+    // Confirm the model exists so callers get 404 (not an empty list) for a
+    // bad id.
+    state.store.get_model(id).await?;
+    Ok(Json(state.store.list_model_endpoints(id).await?))
+}
+
+async fn create_model_endpoint(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreateModelEndpoint>,
+) -> Result<Json<ModelEndpoint>> {
+    state.ssrf.validate(&body.api_base)?;
+    let model = state.store.get_model(id).await?;
+    let endpoint = state
+        .store
+        .create_model_endpoint(
+            id,
+            &body.name,
+            &body.api_base,
+            body.api_key.as_deref(),
+            body.priority,
+            body.weight,
+            body.enabled,
+        )
+        .await?;
+    sync_model(&state, &model).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "create_model_endpoint",
+            "model_endpoint",
+            &endpoint.id.to_string(),
+            serde_json::json!({
+                "model": model.model_name,
+                "name": endpoint.name,
+                "api_base": endpoint.api_base,
+            }),
+        )
+        .await?;
+    Ok(Json(endpoint))
+}
+
+async fn update_model_endpoint(
+    State(state): State<AdminState>,
+    Path((id, endpoint_id)): Path<(Uuid, Uuid)>,
+    Json(body): Json<UpdateModelEndpoint>,
+) -> Result<Json<ModelEndpoint>> {
+    state.ssrf.validate(&body.api_base)?;
+    let model = state.store.get_model(id).await?;
+    let endpoint = state
+        .store
+        .update_model_endpoint(
+            endpoint_id,
+            &body.name,
+            &body.api_base,
+            body.api_key.as_deref(),
+            body.priority,
+            body.weight,
+            body.enabled,
+        )
+        .await?;
+    sync_model(&state, &model).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "update_model_endpoint",
+            "model_endpoint",
+            &endpoint.id.to_string(),
+            serde_json::json!({
+                "model": model.model_name,
+                "name": endpoint.name,
+                "api_base": endpoint.api_base,
+                "enabled": endpoint.enabled,
+            }),
+        )
+        .await?;
+    Ok(Json(endpoint))
+}
+
+async fn delete_model_endpoint(
+    State(state): State<AdminState>,
+    Path((id, endpoint_id)): Path<(Uuid, Uuid)>,
+) -> Result<StatusCode> {
+    let model = state.store.get_model(id).await?;
+    state.store.delete_model_endpoint(endpoint_id).await?;
+    sync_model(&state, &model).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "delete_model_endpoint",
+            "model_endpoint",
+            &endpoint_id.to_string(),
+            serde_json::json!({ "model": model.model_name }),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn delete_model(State(state): State<AdminState>, Path(id): Path<Uuid>) -> Result<StatusCode> {
     let model = state.store.get_model(id).await?;
     state.store.delete_model(id).await?;
@@ -2002,6 +2215,13 @@ async fn push_key(state: &AdminState, hash: &str, resolved: &ResolvedKey) -> Res
 }
 
 async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
+    // Endpoints carry the per-cluster wire targets and health; the data plane
+    // prefers them over the legacy single api_base/api_key when present.
+    let endpoints = state
+        .store
+        .resolved_endpoints_for(model.id)
+        .await
+        .unwrap_or_default();
     let resolved = ResolvedModel {
         model_name: model.model_name.clone(),
         upstream_model: model.upstream_model.clone(),
@@ -2024,6 +2244,11 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         supports_response_schema: model.supports_response_schema,
         supports_tool_choice: model.supports_tool_choice,
         tags: model.tags.clone(),
+        request_timeout_secs: model.request_timeout_secs,
+        max_retries: model.max_retries,
+        retry_backoff_ms: model.retry_backoff_ms,
+        endpoint_selection_mode: model.endpoint_selection_mode.clone(),
+        endpoints,
     };
     if model.enabled {
         state

@@ -291,6 +291,56 @@ export async function setModelCacheAction(id: string, enabled: boolean, ttlSecs?
   revalidatePath("/models");
 }
 
+export async function setModelReliabilityAction(
+  id: string,
+  body: {
+    request_timeout_secs: number | null;
+    max_retries: number;
+    retry_backoff_ms: number;
+    endpoint_selection_mode: string;
+  },
+) {
+  await requireSession();
+  await obleth.setModelReliability(id, body);
+  revalidatePath("/models");
+}
+
+export async function createModelEndpointAction(id: string, formData: FormData) {
+  await requireSession();
+  await obleth.createModelEndpoint(id, {
+    name: String(formData.get("name") ?? "").trim(),
+    api_base: String(formData.get("api_base") ?? "").trim(),
+    api_key: strOrNull(formData.get("api_key")),
+    priority: numOr(formData.get("priority"), 100),
+    weight: numOr(formData.get("weight"), 100),
+    enabled: formData.get("enabled") !== "off",
+  });
+  revalidatePath("/models");
+}
+
+export async function updateModelEndpointAction(
+  id: string,
+  endpointId: string,
+  body: {
+    name: string;
+    api_base: string;
+    api_key?: string | null;
+    priority?: number;
+    weight?: number;
+    enabled?: boolean;
+  },
+) {
+  await requireSession();
+  await obleth.updateModelEndpoint(id, endpointId, body);
+  revalidatePath("/models");
+}
+
+export async function deleteModelEndpointAction(id: string, endpointId: string) {
+  await requireSession();
+  await obleth.deleteModelEndpoint(id, endpointId);
+  revalidatePath("/models");
+}
+
 export async function updateModelAction(formData: FormData) {
   await requireSession();
   const id = String(formData.get("id") ?? "");

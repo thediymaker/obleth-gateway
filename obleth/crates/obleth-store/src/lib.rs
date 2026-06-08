@@ -6,9 +6,9 @@
 
 use chrono::{DateTime, Utc};
 use obleth_config::{
-    generate_api_key, ApiKey, FairshareGroup, McpServer, ModelHealthCheck, ModelHealthDetail,
-    ModelHealthSummary, ModelRoute, ResolvedKey, ResolvedMcpServer, ResolvedModel, Tenant,
-    WeeklyWindow,
+    generate_api_key, ApiKey, FairshareGroup, McpServer, ModelEndpoint, ModelHealthCheck,
+    ModelHealthDetail, ModelHealthSummary, ModelRoute, ResolvedEndpoint, ResolvedKey,
+    ResolvedMcpServer, ResolvedModel, Tenant, WeeklyWindow,
 };
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
@@ -836,51 +836,59 @@ impl Store {
 
     pub async fn all_resolved_models(&self) -> Result<Vec<(String, ResolvedModel)>> {
         let rows = sqlx::query(
-            "select model_name, upstream_model, api_base, api_key, model_type, admission_weight, max_in_flight, enabled,
+            "select id, model_name, upstream_model, api_base, api_key, model_type, admission_weight, max_in_flight, enabled,
                     cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character,
                     context_window, supports_function_calling, supports_system_messages,
-                    supports_response_schema, supports_tool_choice, tags
+                    supports_response_schema, supports_tool_choice, tags,
+                    request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode
              from models where enabled = true",
         )
         .fetch_all(&self.pool)
         .await?;
-        rows.iter()
-            .map(|row| {
-                let name: String = row.try_get("model_name")?;
-                Ok((
-                    name.clone(),
-                    ResolvedModel {
-                        model_name: name,
-                        upstream_model: row.try_get("upstream_model")?,
-                        api_base: row.try_get("api_base")?,
-                        api_key: cipher().decrypt_opt(row.try_get("api_key")?)?,
-                        model_type: row.try_get("model_type")?,
-                        admission_weight: row.try_get("admission_weight")?,
-                        max_in_flight: row
-                            .try_get::<Option<i64>, _>("max_in_flight")?
-                            .and_then(|n| usize::try_from(n).ok()),
-                        enabled: row.try_get("enabled")?,
-                        cache_enabled: row.try_get("cache_enabled")?,
-                        cache_ttl_secs: row.try_get("cache_ttl_secs")?,
-                        input_cost_per_token: row.try_get("input_cost_per_token")?,
-                        output_cost_per_token: row.try_get("output_cost_per_token")?,
-                        cost_per_image: row.try_get("cost_per_image")?,
-                        cost_per_audio_second: row.try_get("cost_per_audio_second")?,
-                        cost_per_character: row.try_get("cost_per_character")?,
-                        context_window: row.try_get("context_window")?,
-                        supports_function_calling: row.try_get("supports_function_calling")?,
-                        supports_system_messages: row.try_get("supports_system_messages")?,
-                        supports_response_schema: row.try_get("supports_response_schema")?,
-                        supports_tool_choice: row.try_get("supports_tool_choice")?,
-                        tags: row
-                            .try_get::<sqlx::types::Json<Vec<String>>, _>("tags")
-                            .map(|j| j.0)
-                            .unwrap_or_default(),
-                    },
-                ))
-            })
-            .collect()
+        let mut out = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let name: String = row.try_get("model_name")?;
+            let model_id: Uuid = row.try_get("id")?;
+            let endpoints = self.resolved_endpoints_for(model_id).await?;
+            out.push((
+                name.clone(),
+                ResolvedModel {
+                    model_name: name,
+                    upstream_model: row.try_get("upstream_model")?,
+                    api_base: row.try_get("api_base")?,
+                    api_key: cipher().decrypt_opt(row.try_get("api_key")?)?,
+                    model_type: row.try_get("model_type")?,
+                    admission_weight: row.try_get("admission_weight")?,
+                    max_in_flight: row
+                        .try_get::<Option<i64>, _>("max_in_flight")?
+                        .and_then(|n| usize::try_from(n).ok()),
+                    enabled: row.try_get("enabled")?,
+                    cache_enabled: row.try_get("cache_enabled")?,
+                    cache_ttl_secs: row.try_get("cache_ttl_secs")?,
+                    input_cost_per_token: row.try_get("input_cost_per_token")?,
+                    output_cost_per_token: row.try_get("output_cost_per_token")?,
+                    cost_per_image: row.try_get("cost_per_image")?,
+                    cost_per_audio_second: row.try_get("cost_per_audio_second")?,
+                    cost_per_character: row.try_get("cost_per_character")?,
+                    context_window: row.try_get("context_window")?,
+                    supports_function_calling: row.try_get("supports_function_calling")?,
+                    supports_system_messages: row.try_get("supports_system_messages")?,
+                    supports_response_schema: row.try_get("supports_response_schema")?,
+                    supports_tool_choice: row.try_get("supports_tool_choice")?,
+                    tags: row
+                        .try_get::<sqlx::types::Json<Vec<String>>, _>("tags")
+                        .map(|j| j.0)
+                        .unwrap_or_default(),
+                    request_timeout_secs: row.try_get("request_timeout_secs")?,
+                    max_retries: row.try_get("max_retries")?,
+                    retry_backoff_ms: row.try_get("retry_backoff_ms")?,
+                    endpoint_selection_mode: row.try_get("endpoint_selection_mode")?,
+                    endpoints,
+                },
+            ));
+        }
+        Ok(out)
     }
 
     /// Toggle (and set the TTL of) the response cache for a model.
@@ -909,6 +917,273 @@ impl Store {
         .await?
         .ok_or(StoreError::NotFound)?;
         model_from_row(&row)
+    }
+
+    /// Set the per-model reliability controls (upstream timeout, retries,
+    /// retry backoff, endpoint-selection mode). A `None` timeout means the
+    /// model defers to the global default.
+    pub async fn update_model_reliability(
+        &self,
+        id: Uuid,
+        request_timeout_secs: Option<i64>,
+        max_retries: i64,
+        retry_backoff_ms: i64,
+        endpoint_selection_mode: &str,
+    ) -> Result<ModelRoute> {
+        let row = sqlx::query(
+            "update models set request_timeout_secs = $2, max_retries = $3,
+                    retry_backoff_ms = $4, endpoint_selection_mode = $5, updated_at = now()
+             where id = $1
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+                       input_cost_per_token, output_cost_per_token,
+                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
+                       supports_response_schema, supports_tool_choice, enabled,
+                       cache_enabled, cache_ttl_secs, tags,
+                       capacity_mode, capacity_tuned_at,
+                       request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
+                       created_at, updated_at",
+        )
+        .bind(id)
+        .bind(request_timeout_secs.filter(|n| *n >= 1))
+        .bind(max_retries.max(0))
+        .bind(retry_backoff_ms.max(0))
+        .bind(obleth_config::normalize_endpoint_selection_mode(
+            endpoint_selection_mode,
+        ))
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        model_from_row(&row)
+    }
+
+    // ---- model endpoints -------------------------------------------------
+
+    /// Hot-path endpoint views for one model: enabled endpoints with their
+    /// decrypted upstream keys and current health, ordered by priority.
+    pub async fn resolved_endpoints_for(
+        &self,
+        model_id: Uuid,
+    ) -> Result<Vec<ResolvedEndpoint>> {
+        let rows = sqlx::query(
+            "select id, api_base, api_key, priority, weight, enabled, health_status
+             from model_endpoints
+             where model_id = $1
+             order by priority asc, created_at asc",
+        )
+        .bind(model_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter()
+            .map(|r| {
+                let status: String = r.try_get("health_status")?;
+                Ok(ResolvedEndpoint {
+                    id: r.try_get::<Uuid, _>("id")?.to_string(),
+                    api_base: r.try_get("api_base")?,
+                    api_key: cipher().decrypt_opt(r.try_get("api_key")?)?,
+                    priority: r.try_get("priority")?,
+                    weight: r.try_get("weight")?,
+                    enabled: r.try_get("enabled")?,
+                    // Treat unknown/degraded as eligible (soft-pass); only an
+                    // explicit unhealthy/disabled state removes an endpoint.
+                    healthy: !matches!(status.as_str(), "unhealthy" | "disabled"),
+                })
+            })
+            .collect()
+    }
+
+    pub async fn list_model_endpoints(&self, model_id: Uuid) -> Result<Vec<ModelEndpoint>> {
+        let rows = sqlx::query(
+            "select id, model_id, name, api_base, api_key, priority, weight, enabled,
+                    health_status, consecutive_failures, alert_state,
+                    last_checked_at, last_latency_ms, last_http_status, last_message,
+                    created_at, updated_at
+             from model_endpoints where model_id = $1
+             order by priority asc, created_at asc",
+        )
+        .bind(model_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(endpoint_from_row).collect()
+    }
+
+    /// List every endpoint across all models (used for cache warming and the
+    /// per-endpoint health scheduler).
+    pub async fn all_model_endpoints(&self) -> Result<Vec<ModelEndpoint>> {
+        let rows = sqlx::query(
+            "select id, model_id, name, api_base, api_key, priority, weight, enabled,
+                    health_status, consecutive_failures, alert_state,
+                    last_checked_at, last_latency_ms, last_http_status, last_message,
+                    created_at, updated_at
+             from model_endpoints order by model_id, priority asc",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(endpoint_from_row).collect()
+    }
+
+    pub async fn get_model_endpoint(&self, id: Uuid) -> Result<ModelEndpoint> {
+        let row = sqlx::query(
+            "select id, model_id, name, api_base, api_key, priority, weight, enabled,
+                    health_status, consecutive_failures, alert_state,
+                    last_checked_at, last_latency_ms, last_http_status, last_message,
+                    created_at, updated_at
+             from model_endpoints where id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        endpoint_from_row(&row)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_model_endpoint(
+        &self,
+        model_id: Uuid,
+        name: &str,
+        api_base: &str,
+        api_key: Option<&str>,
+        priority: i64,
+        weight: i64,
+        enabled: bool,
+    ) -> Result<ModelEndpoint> {
+        let api_key = cipher().encrypt_opt(api_key);
+        let row = sqlx::query(
+            "insert into model_endpoints (id, model_id, name, api_base, api_key, priority, weight, enabled)
+             values ($1, $2, $3, $4, $5, $6, $7, $8)
+             returning id, model_id, name, api_base, api_key, priority, weight, enabled,
+                       health_status, consecutive_failures, alert_state,
+                       last_checked_at, last_latency_ms, last_http_status, last_message,
+                       created_at, updated_at",
+        )
+        .bind(Uuid::new_v4())
+        .bind(model_id)
+        .bind(name)
+        .bind(api_base)
+        .bind(api_key)
+        .bind(priority.max(0))
+        .bind(weight.max(1))
+        .bind(enabled)
+        .fetch_one(&self.pool)
+        .await?;
+        endpoint_from_row(&row)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn update_model_endpoint(
+        &self,
+        id: Uuid,
+        name: &str,
+        api_base: &str,
+        api_key: Option<&str>,
+        priority: i64,
+        weight: i64,
+        enabled: bool,
+    ) -> Result<ModelEndpoint> {
+        // A `None` api_key leaves the stored secret untouched (so the UI can
+        // edit other fields without re-entering the key); an empty string
+        // clears it.
+        let row = match api_key {
+            Some(secret) => {
+                let enc = cipher().encrypt_opt(Some(secret));
+                sqlx::query(
+                    "update model_endpoints set name = $2, api_base = $3, api_key = $4,
+                            priority = $5, weight = $6, enabled = $7, updated_at = now()
+                     where id = $1
+                     returning id, model_id, name, api_base, api_key, priority, weight, enabled,
+                               health_status, consecutive_failures, alert_state,
+                               last_checked_at, last_latency_ms, last_http_status, last_message,
+                               created_at, updated_at",
+                )
+                .bind(id)
+                .bind(name)
+                .bind(api_base)
+                .bind(enc)
+                .bind(priority.max(0))
+                .bind(weight.max(1))
+                .bind(enabled)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "update model_endpoints set name = $2, api_base = $3,
+                            priority = $4, weight = $5, enabled = $6, updated_at = now()
+                     where id = $1
+                     returning id, model_id, name, api_base, api_key, priority, weight, enabled,
+                               health_status, consecutive_failures, alert_state,
+                               last_checked_at, last_latency_ms, last_http_status, last_message,
+                               created_at, updated_at",
+                )
+                .bind(id)
+                .bind(name)
+                .bind(api_base)
+                .bind(priority.max(0))
+                .bind(weight.max(1))
+                .bind(enabled)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+        }
+        .ok_or(StoreError::NotFound)?;
+        endpoint_from_row(&row)
+    }
+
+    pub async fn delete_model_endpoint(&self, id: Uuid) -> Result<Uuid> {
+        let row = sqlx::query("delete from model_endpoints where id = $1 returning model_id")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        Ok(row.try_get("model_id")?)
+    }
+
+    /// Record the outcome of a per-endpoint health check. Mirrors
+    /// `record_model_health_check`: `healthy`/`disabled` reset the failure
+    /// counter; `degraded`/`skipped` are transient (left untouched); anything
+    /// else increments `consecutive_failures`.
+    pub async fn record_endpoint_health(
+        &self,
+        id: Uuid,
+        status: &str,
+        latency_ms: Option<i64>,
+        http_status: Option<i64>,
+        message: Option<&str>,
+    ) -> Result<ModelEndpoint> {
+        let failure_delta: i64 = match status {
+            "healthy" | "disabled" => 0,
+            "degraded" | "skipped" => -1, // sentinel: leave counter as-is
+            _ => 1,
+        };
+        let row = sqlx::query(
+            "update model_endpoints set
+                health_status = case when $2 in ('degraded','skipped') then health_status else $2 end,
+                consecutive_failures = case
+                    when $3 = 0 then 0
+                    when $3 < 0 then consecutive_failures
+                    else consecutive_failures + 1 end,
+                last_checked_at = now(),
+                last_latency_ms = $4,
+                last_http_status = $5,
+                last_message = $6,
+                updated_at = now()
+             where id = $1
+             returning id, model_id, name, api_base, api_key, priority, weight, enabled,
+                       health_status, consecutive_failures, alert_state,
+                       last_checked_at, last_latency_ms, last_http_status, last_message,
+                       created_at, updated_at",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(failure_delta)
+        .bind(latency_ms)
+        .bind(http_status)
+        .bind(message)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        endpoint_from_row(&row)
     }
 
     // ---- model health ----------------------------------------------------
@@ -1585,6 +1860,38 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
             .try_get::<sqlx::types::Json<Vec<String>>, _>("tags")
             .map(|j| j.0)
             .unwrap_or_default(),
+        // Tolerant reads for the reliability columns: statements that don't
+        // select them degrade to defaults rather than erroring.
+        request_timeout_secs: row.try_get("request_timeout_secs").unwrap_or(None),
+        max_retries: row.try_get("max_retries").unwrap_or(0),
+        retry_backoff_ms: row
+            .try_get("retry_backoff_ms")
+            .unwrap_or(obleth_config::DEFAULT_RETRY_BACKOFF_MS),
+        endpoint_selection_mode: row
+            .try_get::<String, _>("endpoint_selection_mode")
+            .unwrap_or_else(|_| obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string()),
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn endpoint_from_row(row: &PgRow) -> Result<ModelEndpoint> {
+    Ok(ModelEndpoint {
+        id: row.try_get("id")?,
+        model_id: row.try_get("model_id")?,
+        name: row.try_get("name")?,
+        api_base: row.try_get("api_base")?,
+        api_key: cipher().decrypt_opt(row.try_get("api_key")?)?,
+        priority: row.try_get("priority")?,
+        weight: row.try_get("weight")?,
+        enabled: row.try_get("enabled")?,
+        health_status: row.try_get("health_status")?,
+        consecutive_failures: row.try_get("consecutive_failures")?,
+        alert_state: row.try_get("alert_state")?,
+        last_checked_at: row.try_get("last_checked_at")?,
+        last_latency_ms: row.try_get("last_latency_ms")?,
+        last_http_status: row.try_get("last_http_status")?,
+        last_message: row.try_get("last_message")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

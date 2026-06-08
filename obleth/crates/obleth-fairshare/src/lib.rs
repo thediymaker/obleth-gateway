@@ -148,7 +148,6 @@ pub struct FairShare {
 impl FairShare {
     pub fn start(
         capacity: Arc<dyn CapacityProvider>,
-        brownout_wait: Duration,
         algorithm: FairshareAlgorithm,
     ) -> Self {
         let (ctl, rx) = mpsc::unbounded_channel();
@@ -156,7 +155,6 @@ impl FairShare {
         let scheduler = Scheduler {
             algorithm,
             capacity,
-            brownout_wait,
             in_flight: 0,
             tenant_in_flight: HashMap::new(),
             model_in_flight: HashMap::new(),
@@ -211,7 +209,6 @@ struct Waiter {
 struct Scheduler {
     algorithm: FairshareAlgorithm,
     capacity: Arc<dyn CapacityProvider>,
-    brownout_wait: Duration,
     in_flight: usize,
     tenant_in_flight: HashMap<Uuid, usize>,
     model_in_flight: HashMap<String, usize>,
@@ -653,14 +650,9 @@ impl Scheduler {
             self.tenant_weight.insert(tenant, waiter.weight.max(1));
 
             let waited = waiter.enqueued.elapsed();
-            let admission = if waited >= self.brownout_wait {
-                Admission::Brownout
-            } else {
-                Admission::Queued
-            };
             if waiter
                 .respond
-                .send(self.make_admitted(tenant, waiter.model.clone(), admission, waited))
+                .send(self.make_admitted(tenant, waiter.model.clone(), Admission::Queued, waited))
                 .is_err()
             {
                 let _ = self.ctl_tx.send(Ctl::Release {

@@ -10,7 +10,7 @@ use uuid::Uuid;
 #[tokio::test]
 async fn fast_path_when_idle() {
     let cap = Arc::new(StaticCapacity::new(8));
-    let fs = FairShare::start(cap, Duration::from_secs(3600), FairshareAlgorithm::Weighted);
+    let fs = FairShare::start(cap, FairshareAlgorithm::Weighted);
     let admitted = fs
         .admit(AdmitRequest::weighted(Uuid::new_v4(), 1, 10))
         .await
@@ -21,7 +21,7 @@ async fn fast_path_when_idle() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn saturated_model_does_not_block_other_models() {
     let cap = Arc::new(StaticCapacity::new(4));
-    let fs = FairShare::start(cap, Duration::from_secs(3600), FairshareAlgorithm::Weighted);
+    let fs = FairShare::start(cap, FairshareAlgorithm::Weighted);
     let slow_tenant = Uuid::new_v4();
     let fast_tenant = Uuid::new_v4();
 
@@ -80,7 +80,7 @@ async fn saturated_model_does_not_block_other_models() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn weighted_share_under_contention() {
     let cap = Arc::new(StaticCapacity::new(1));
-    let fs = FairShare::start(cap, Duration::from_secs(3600), FairshareAlgorithm::Weighted);
+    let fs = FairShare::start(cap, FairshareAlgorithm::Weighted);
 
     let low = Uuid::new_v4();
     let high = Uuid::new_v4();
@@ -122,11 +122,7 @@ async fn weighted_share_under_contention() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hierarchical_higher_weight_tenant_wins_within_group() {
     let cap = Arc::new(StaticCapacity::new(8));
-    let fs = FairShare::start(
-        cap,
-        Duration::from_secs(3600),
-        FairshareAlgorithm::Hierarchical,
-    );
+    let fs = FairShare::start(cap, FairshareAlgorithm::Hierarchical);
 
     let low = Uuid::new_v4();
     let high = Uuid::new_v4();
@@ -176,11 +172,7 @@ async fn hierarchical_higher_weight_tenant_wins_within_group() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hierarchical_group_gets_reserved_slot() {
     let cap = Arc::new(StaticCapacity::new(8));
-    let fs = FairShare::start(
-        cap,
-        Duration::from_secs(3600),
-        FairshareAlgorithm::Hierarchical,
-    );
+    let fs = FairShare::start(cap, FairshareAlgorithm::Hierarchical);
 
     let chatbot = Uuid::new_v4();
     let api = Uuid::new_v4();
@@ -238,11 +230,7 @@ async fn hierarchical_group_gets_reserved_slot() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn hierarchical_group_slots_split_across_tenants() {
     let cap = Arc::new(StaticCapacity::new(8));
-    let fs = FairShare::start(
-        cap,
-        Duration::from_secs(3600),
-        FairshareAlgorithm::Hierarchical,
-    );
+    let fs = FairShare::start(cap, FairshareAlgorithm::Hierarchical);
 
     let chatbot = Uuid::new_v4();
     let chatbot2 = Uuid::new_v4();

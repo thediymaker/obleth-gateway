@@ -84,7 +84,31 @@ export interface ModelRoute {
   enabled: boolean;
   cache_enabled: boolean;
   cache_ttl_secs: number;
+  request_timeout_secs: number | null;
+  max_retries: number;
+  retry_backoff_ms: number;
+  endpoint_selection_mode: string;
   tags: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ModelEndpoint {
+  id: string;
+  model_id: string;
+  name: string;
+  api_base: string;
+  api_key: string | null;
+  priority: number;
+  weight: number;
+  enabled: boolean;
+  health_status: string;
+  consecutive_failures: number;
+  alert_state: string;
+  last_checked_at: string | null;
+  last_latency_ms: number | null;
+  last_http_status: number | null;
+  last_message: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -563,6 +587,54 @@ export const obleth = {
       method: "PUT",
       body: JSON.stringify({ cache_enabled, cache_ttl_secs }),
     }),
+  setModelReliability: (
+    id: string,
+    body: {
+      request_timeout_secs: number | null;
+      max_retries: number;
+      retry_backoff_ms: number;
+      endpoint_selection_mode: string;
+    },
+  ) =>
+    api<ModelRoute>(`/models/${id}/reliability`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  listModelEndpoints: (id: string) =>
+    api<ModelEndpoint[]>(`/models/${id}/endpoints`),
+  createModelEndpoint: (
+    id: string,
+    body: {
+      name: string;
+      api_base: string;
+      api_key?: string | null;
+      priority?: number;
+      weight?: number;
+      enabled?: boolean;
+    },
+  ) =>
+    api<ModelEndpoint>(`/models/${id}/endpoints`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  updateModelEndpoint: (
+    id: string,
+    endpointId: string,
+    body: {
+      name: string;
+      api_base: string;
+      api_key?: string | null;
+      priority?: number;
+      weight?: number;
+      enabled?: boolean;
+    },
+  ) =>
+    api<ModelEndpoint>(`/models/${id}/endpoints/${endpointId}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  deleteModelEndpoint: (id: string, endpointId: string) =>
+    api<void>(`/models/${id}/endpoints/${endpointId}`, { method: "DELETE" }),
   cacheStats: (sinceMs?: number) => api<CacheStats>(`/usage/cache${qs({ since_ms: sinceMs })}`),
   listMcpServers: () => api<McpServer[]>("/mcp-servers"),
   createMcpServer: (body: { name: string; upstream_url: string; auth_header?: string }) =>

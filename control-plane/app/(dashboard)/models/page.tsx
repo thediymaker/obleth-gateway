@@ -1,5 +1,11 @@
 import { ModelManager } from "@/components/model-manager";
-import { obleth, type CacheStats, type ModelHealthDetail, type ModelHealthSummary } from "@/lib/obleth";
+import {
+  obleth,
+  type CacheStats,
+  type ModelEndpoint,
+  type ModelHealthDetail,
+  type ModelHealthSummary,
+} from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
@@ -18,6 +24,14 @@ export default async function ModelsPage() {
       }),
     ),
   );
+  const endpoints = Object.fromEntries(
+    await Promise.all(
+      models.map(async (model) => {
+        const list = await safe<ModelEndpoint[]>(obleth.listModelEndpoints(model.id), []);
+        return [model.id, list] as const;
+      }),
+    ),
+  );
 
   return (
     <div className="space-y-6">
@@ -27,7 +41,13 @@ export default async function ModelsPage() {
           Route client model names to upstream inference endpoints. Pod selection remains with Aibrix.
         </p>
       </div>
-      <ModelManager models={models} cacheStats={cacheStats} health={health} healthDetails={healthDetails} />
+      <ModelManager
+        models={models}
+        cacheStats={cacheStats}
+        health={health}
+        healthDetails={healthDetails}
+        endpoints={endpoints}
+      />
     </div>
   );
 }

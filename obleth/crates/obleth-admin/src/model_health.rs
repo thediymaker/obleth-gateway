@@ -271,6 +271,11 @@ async fn run_model_health_check(
     } else {
         liveness_probe(state, &model).await
     };
+    // Probe each configured endpoint so the data plane can route around dead
+    // clusters independently of the model-level signal.
+    if model.enabled {
+        probe_endpoints(state, &model).await;
+    }
     let summary = state.store.get_model_health_summary(model.id).await?;
     let next_check_at = jittered_next_check_at(summary.check_interval_secs);
     state
@@ -350,7 +355,24 @@ async fn recent_traffic(
 /// is serving; when the response lists models we also confirm the route's
 /// `upstream_model` is actually loaded.
 async fn liveness_probe(state: &AdminState, model: &ModelRoute) -> ProbeResult {
-    let url = models_list_url(&model.api_base);
+    probe_target(
+        state,
+        &model.api_base,
+        model.api_key.as_deref(),
+        &model.upstream_model,
+    )
+    .await
+}
+
+/// Reusable liveness probe against an arbitrary `api_base`/`api_key`. Used both
+/// for the model-level probe and for per-endpoint probes.
+async fn probe_target(
+    state: &AdminState,
+    api_base: &str,
+    api_key: Option<&str>,
+    upstream_model: &str,
+) -> ProbeResult {
+    let url = models_list_url(api_base);
     let timeout = Duration::from_secs(state.health.timeout_secs.max(1));
     let client = &state.health.http;
 
@@ -358,7 +380,7 @@ async fn liveness_probe(state: &AdminState, model: &ModelRoute) -> ProbeResult {
     loop {
         attempt += 1;
         let mut request = client.get(&url).timeout(timeout);
-        if let Some(key) = &model.api_key {
+        if let Some(key) = api_key {
             request = request.bearer_auth(key);
         }
         let started = Instant::now();
@@ -378,11 +400,11 @@ async fn liveness_probe(state: &AdminState, model: &ModelRoute) -> ProbeResult {
                 }
                 if status.is_success() {
                     let body = res.text().await.unwrap_or_default();
-                    return match model_in_list(&body, &model.upstream_model) {
+                    return match model_in_list(&body, upstream_model) {
                         ModelPresence::Present => ProbeResult::healthy(
                             latency_ms,
                             http_status,
-                            format!("upstream is serving and lists `{}`", model.upstream_model),
+                            format!("upstream is serving and lists `{upstream_model}`"),
                         ),
                         // The upstream is up and answered, but doesn't advertise
                         // this model in `/v1/models`. Many shared gateways omit
@@ -394,8 +416,7 @@ async fn liveness_probe(state: &AdminState, model: &ModelRoute) -> ProbeResult {
                             latency_ms,
                             http_status,
                             format!(
-                                "upstream is reachable but does not advertise `{}` in /v1/models",
-                                model.upstream_model
+                                "upstream is reachable but does not advertise `{upstream_model}` in /v1/models"
                             ),
                         ),
                         ModelPresence::Unknown => ProbeResult::healthy(
@@ -433,6 +454,63 @@ async fn liveness_probe(state: &AdminState, model: &ModelRoute) -> ProbeResult {
                     format!("upstream is unreachable: {error}"),
                 );
             }
+        }
+    }
+}
+
+/// Actively probe each enabled endpoint of a model and record its health so the
+/// data plane can route around dead clusters. Disabled endpoints are recorded
+/// as `disabled` (which resets their failure count) without a network call.
+async fn probe_endpoints(state: &AdminState, model: &ModelRoute) {
+    let endpoints = match state.store.list_model_endpoints(model.id).await {
+        Ok(e) => e,
+        Err(error) => {
+            tracing::warn!(%error, model = %model.model_name, "failed to list endpoints for health probe");
+            return;
+        }
+    };
+    if endpoints.is_empty() {
+        return;
+    }
+    // Decrypted keys for the actual probe call.
+    let resolved = state
+        .store
+        .resolved_endpoints_for(model.id)
+        .await
+        .unwrap_or_default();
+    let key_by_id: std::collections::HashMap<&str, Option<&str>> = resolved
+        .iter()
+        .map(|e| (e.id.as_str(), e.api_key.as_deref()))
+        .collect();
+
+    for endpoint in &endpoints {
+        let result = if !endpoint.enabled {
+            ProbeResult {
+                status: "disabled".to_string(),
+                latency_ms: None,
+                http_status: None,
+                message: Some("endpoint is disabled".to_string()),
+                response_excerpt: None,
+            }
+        } else {
+            let api_key = key_by_id
+                .get(endpoint.id.to_string().as_str())
+                .copied()
+                .flatten();
+            probe_target(state, &endpoint.api_base, api_key, &model.upstream_model).await
+        };
+        if let Err(error) = state
+            .store
+            .record_endpoint_health(
+                endpoint.id,
+                &result.status,
+                result.latency_ms,
+                result.http_status,
+                result.message.as_deref(),
+            )
+            .await
+        {
+            tracing::warn!(%error, endpoint = %endpoint.name, "failed to record endpoint health");
         }
     }
 }

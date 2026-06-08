@@ -1,6 +1,6 @@
 # obleth benchmark harness
 
-Three scenarios, one GPU-free fixture backend. Together they let you stress the
+Four scenarios, one GPU-free fixture backend. Together they let you stress the
 gateway and the example backend, and put real numbers behind claims like
 "N req/s" or "Mx faster than <other gateway>".
 
@@ -8,6 +8,7 @@ gateway and the example backend, and put real numbers behind claims like
 | --- | --- | --- |
 | Fairshare | `run-benchmark.mjs` | Does weighted fair queuing keep a boosted tenant moving without starving a baseline tenant under staggered contention? |
 | Max throughput | `throughput.mjs` | How many req/s can obleth sustain, and how much latency does it add over hitting the backend directly? |
+| Max push | `max.mjs` | How high can req/s go when the load generator is fanned out across cores so the gateway - not one Node event loop - is the bottleneck? |
 | Soak (mixed) | `soak.mjs` | Does the gateway + backend stay healthy for a long window under many models, tenants, and usage types, with the ledger reconciling? |
 
 Generated keys, run metadata, and samples are written to `BENCH_OUT_DIR`
@@ -228,7 +229,48 @@ Reading the result:
 
 ---
 
-## Scenario 3: soak / mixed traffic (`soak.mjs`)
+## Scenario 3: max push (`max.mjs`)
+
+`throughput.mjs` runs a single closed-loop driver, which is one Node event loop
+and tops out at a few thousand req/s before the *generator* - not obleth -
+becomes the bottleneck. `max.mjs` fans the same fast-path load out across
+`WORKERS` worker threads so the load generator scales with cores and the gateway
+is what saturates. It targets the fast `bench-turbo` profile with tiny outputs
+and decouples gateway `CAPACITY` from `CONC` so admission never gates - the goal
+is to find obleth's req/s ceiling.
+
+```bash
+# auto workers (CPU-1), push for the ceiling
+node bench/max.mjs
+
+# explicit fan-out
+WORKERS=8 CONC=4096 DURATION_S=60 node bench/max.mjs
+```
+
+The combined req/s is printed live and percentiles are computed over the merged
+population of all workers (not an average of averages). Output goes to
+`$BENCH_OUT_DIR/max-meta.json`.
+
+To go past one host's cores, run `max.mjs` on several machines against the same
+`PROXY_BASE` and sum the reported req/s.
+
+| Env | Default | Purpose |
+| --- | --- | --- |
+| `WORKERS` | `CPU count - 1` | Worker threads to fan the load across |
+| `CONC` | `2048` | Total concurrent lanes, split evenly across workers |
+| `DURATION_S` | `30` | Measured window (after warmup) |
+| `WARMUP_S` | `3` | Discarded ramp-up seconds |
+| `OUTPUT_TOKENS` | `4` | `max_tokens` per request (keep small) |
+| `STREAM` | `0` | Set `1` for SSE; default buffered for pure req/s |
+| `CAPACITY` | `100000` | Gateway global in-flight (set high to not gate) |
+| `MODEL` | `bench-turbo` | Registered model; `turbo` = fast backend profile |
+| `MAX_ERROR_RATE` | `0.01` | Fail above this client error rate |
+
+`PASS` when the measured error rate stays under `MAX_ERROR_RATE`.
+
+---
+
+## Scenario 4: soak / mixed traffic (`soak.mjs`)
 
 A long, configurable run that stresses both the gateway and the example backend
 the way a busy fleet would: 5 models with different latency profiles, 5 tenants

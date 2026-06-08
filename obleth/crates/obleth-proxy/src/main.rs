@@ -71,11 +71,7 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- fairshare scheduler + capacity ----
     let capacity = Arc::new(StaticCapacity::new(cfg.global_max_in_flight));
-    let fairshare = FairShare::start(
-        capacity.clone(),
-        Duration::from_millis(cfg.brownout_wait_ms),
-        cfg.fairshare_algorithm,
-    );
+    let fairshare = FairShare::start(capacity.clone(), cfg.fairshare_algorithm);
 
     let metrics = Arc::new(Metrics::new());
     let key_cache: Cache<String, obleth_config::ResolvedKey> = Cache::builder()
@@ -142,6 +138,7 @@ async fn main() -> anyhow::Result<()> {
         telemetry: telemetry.clone(),
         http: http.clone(),
         upstream_base: cfg.upstream_base_url.clone(),
+        upstream_timeout: cfg.upstream_timeout,
         key_cache: key_cache.clone(),
         model_cache: model_cache.clone(),
         mcp_cache: mcp_cache.clone(),

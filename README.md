@@ -53,10 +53,12 @@ behind one provider key does not need it.
 - **Token-accurate cost accounting.** obleth estimates tokens at admission, reserves
   them atomically, and reconciles the true cost against per-model input/output
   pricing after the stream completes.
-- **Model health and uptime tracking.** obleth probes each model through its own
-  proxy path on a schedule, tracks health status and consecutive failures, and trips
-  a model out of rotation after a failure threshold. Operators can set maintenance
-  windows to suppress alerts during planned downtime.
+- **Model health and uptime tracking.** For each model, obleth first checks recent
+  client traffic in the ClickHouse usage ledger (passive signal); when there is no
+  recent traffic it runs a token-free liveness probe (`GET {api_base}/models`)
+  directly at the upstream. Health status and consecutive failures are tracked;
+  unhealthy models drop out of `auto` routing rotation. Operators can set
+  maintenance windows to suppress alerts during planned downtime.
 - **Per-model capacity and auto-tune.** Each model can carry its own `max_in_flight`
   slot cap (inside the global scheduler limit). A bounded ramp probe drives real load
   directly at the upstream — bypassing gateway admission — to find the throughput/latency
@@ -71,8 +73,11 @@ behind one provider key does not need it.
   obleth's single authenticated endpoint.
 - **Audit log.** Every management action records the actor, entity, and a JSON
   detail payload.
-- **Defined behavior under load.** When saturated, low-priority traffic is browned
-  out (capped `max_tokens`) rather than rejected. If Redis or ClickHouse become
+- **Defined behavior under load.** When saturated, requests queue in the weighted
+  fairshare scheduler until a slot opens — they are not dropped or degraded.
+  Hard stops are explicit: `429` when the per-minute token budget is empty, `403`
+  when a term budget is exhausted or the tenant is outside its access window, and
+  `503` when the scheduler is unavailable. If Redis or ClickHouse become
   unavailable, the data plane fails open from its in-process cache and replays
   telemetry on recovery.
 - **Observability.** Per-model throughput (tok/s), TTFT and end-to-end latency
@@ -80,7 +85,10 @@ behind one provider key does not need it.
   computed from obleth's own usage ledger — plus a live fairshare view in the
   dashboard.
 - **SSRF protection.** Admin-registered upstreams (model `api_base`, MCP URLs) are
-  validated against a policy that blocks cloud-metadata and link-local addresses.
+  validated on create/update. By default (local-first), private/LAN/loopback targets
+  are allowed; link-local and cloud-metadata addresses are always blocked. Set
+  `OBLETH_BLOCK_PRIVATE_NETWORKS=1` for strict mode, then allow specific internal
+  CIDRs via `OBLETH_ALLOWED_PRIVATE_CIDRS`.
 
 The data plane is a thin Rust service on the request path. The control plane
 (dashboard and Management API) configures everything out of band and never touches
@@ -94,11 +102,12 @@ cost ledger).
 docker compose -f deploy/docker/docker-compose.yml --profile benchmark --profile edge --profile observability up --build -d
 ```
 
-Services: HAProxy (`:80`), obleth proxy (`:8080`), Management API (`:9090`),
-metrics (`:9091`), dashboard (`:3000`), Postgres, Redis, ClickHouse,
-benchmark fixture backend (`:8081`), Prometheus (`:9095`), Grafana (`:3001`).
+Services: HAProxy (`:80`), obleth data plane (`:8088` on the host, `:8080` inside
+the network), Management API (`:9090`), metrics (`:9091`), dashboard (`:3002` on
+the host), Postgres, Redis, ClickHouse, benchmark fixture backend (`:8081`),
+Prometheus (`:9095`), Grafana (`:3001`).
 
-Open the dashboard at <http://localhost:3000>.
+Open the dashboard at <http://localhost:3002>.
 
 ### Grafana dashboards
 
@@ -133,8 +142,8 @@ SECRET=$(curl -s -XPOST localhost:9090/api/v1/tenants/$TID/keys \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"name":"prod"}' | jq -r .secret)
 
-# call the gateway (use "auto" as the model to let obleth pick one)
-curl -s localhost:8080/v1/chat/completions \
+# call through HAProxy (edge profile) or use localhost:8088 for direct data-plane access
+curl -s localhost/v1/chat/completions \
   -H "Authorization: Bearer $SECRET" -H 'Content-Type: application/json' \
   -d '{"model":"benchmark-endpoint","messages":[{"role":"user","content":"hi"}],"max_tokens":32}'
 ```
@@ -169,9 +178,8 @@ deploying anywhere real.
 ## Documentation
 
 Architecture, the fairshare engine internals, auto routing and the classifier,
-scheduling, budgets, brownout tuning, secrets, SSRF allow-lists, alerting,
-dashboard auth, and the full configuration reference live at
-**[obleth.com](https://obleth.com)**.
+scheduling, budgets, secrets, SSRF policy, alerting, dashboard auth, and the
+full configuration reference live at **[docs.obleth.dev](https://docs.obleth.dev)**.
 
 ## License
 

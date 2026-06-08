@@ -360,6 +360,11 @@ mod tests {
             supports_response_schema: true,
             supports_tool_choice: true,
             tags: Vec::new(),
+            request_timeout_secs: None,
+            max_retries: 0,
+            retry_backoff_ms: obleth_config::DEFAULT_RETRY_BACKOFF_MS,
+            endpoint_selection_mode: obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
+            endpoints: Vec::new(),
         }
     }
 
