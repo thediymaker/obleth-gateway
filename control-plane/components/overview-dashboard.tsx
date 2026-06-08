@@ -633,7 +633,7 @@ function TenantPanel({ rows }: { rows: TenantDisplayRow[] }) {
         <Button type="button" variant="outline" size="sm" asChild>
           <Link href="/fairshare">
             <Gauge className="h-3.5 w-3.5" />
-            Scheduler
+            Fairshare
           </Link>
         </Button>
       </CardHeader>
@@ -704,7 +704,7 @@ function ModelPanel({ rows }: { rows: ModelDisplayRow[] }) {
         <Button type="button" variant="outline" size="sm" asChild>
           <Link href="/models">
             <Boxes className="h-3.5 w-3.5" />
-            Routes
+            Models
           </Link>
         </Button>
       </CardHeader>

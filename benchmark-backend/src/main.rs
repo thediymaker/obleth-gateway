@@ -10,6 +10,15 @@
 //! measure exactly how many requests reached the backend (e.g. to quantify
 //! gateway cache offload) rather than inferring it from container metrics.
 //!
+//! Per-model latency profiles: the upstream model name (the value obleth sends
+//! after route transformation) selects a latency profile so a single fixture can
+//! emulate a fleet of fast/slow/embedding models. Names containing `turbo`,
+//! `flash`, `mini`, `fast`, or `small` are quicker; `large`, `70b`, `xl`,
+//! `opus`, or `heavy` are slower; `embed` returns vectors with no per-token
+//! delay. Everything else uses the configured defaults.
+//!
+//! Endpoints: `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`.
+//!
 //! Env knobs:
 //!   BENCHMARK_BACKEND_LISTEN          (default 0.0.0.0:8081)
 //!   BENCHMARK_BACKEND_TTFT_MS         time to first token (default 20)
@@ -40,8 +49,52 @@ struct Counters {
     requests: AtomicU64,
     streaming: AtomicU64,
     non_streaming: AtomicU64,
+    embeddings: AtomicU64,
     prompt_tokens: AtomicU64,
     completion_tokens: AtomicU64,
+}
+
+/// Latency characteristics for one simulated model. Derived from the upstream
+/// model name so one fixture can stand in for a heterogeneous fleet.
+#[derive(Clone, Copy)]
+struct Profile {
+    ttft_ms: u64,
+    token_ms: u64,
+}
+
+fn profile_for(model: &str, cfg: &Cfg) -> Profile {
+    let m = model.to_ascii_lowercase();
+    if m.contains("turbo")
+        || m.contains("flash")
+        || m.contains("mini")
+        || m.contains("fast")
+        || m.contains("small")
+    {
+        Profile {
+            ttft_ms: (cfg.ttft_ms / 2).max(1),
+            token_ms: (cfg.token_ms / 2).max(1),
+        }
+    } else if m.contains("large")
+        || m.contains("70b")
+        || m.contains("xl")
+        || m.contains("opus")
+        || m.contains("heavy")
+    {
+        Profile {
+            ttft_ms: cfg.ttft_ms * 4,
+            token_ms: cfg.token_ms * 3,
+        }
+    } else if m.contains("embed") {
+        Profile {
+            ttft_ms: cfg.ttft_ms,
+            token_ms: 0,
+        }
+    } else {
+        Profile {
+            ttft_ms: cfg.ttft_ms,
+            token_ms: cfg.token_ms,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -82,6 +135,7 @@ async fn main() {
         .route("/stats", get(stats))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(chat))
+        .route("/v1/embeddings", post(embeddings))
         .with_state(cfg);
 
     let listen = env_string("BENCHMARK_BACKEND_LISTEN", "MOCK_LISTEN", "0.0.0.0:8081");
@@ -99,6 +153,7 @@ async fn stats(State(cfg): State<Cfg>) -> Json<Value> {
         "requests": c.requests.load(Ordering::Relaxed),
         "streaming": c.streaming.load(Ordering::Relaxed),
         "non_streaming": c.non_streaming.load(Ordering::Relaxed),
+        "embeddings": c.embeddings.load(Ordering::Relaxed),
         "prompt_tokens": c.prompt_tokens.load(Ordering::Relaxed),
         "completion_tokens": c.completion_tokens.load(Ordering::Relaxed),
     }))
@@ -138,22 +193,74 @@ async fn chat(State(cfg): State<Cfg>, Json(body): Json<Value>) -> Response {
     // Acquire a simulated GPU slot; when none free, this awaits -> models saturation.
     let permit = cfg.slots.clone().acquire_owned().await.ok();
 
+    let profile = profile_for(&model, &cfg);
     if stream {
-        stream_response(cfg, model, prompt_tokens, output_tokens, permit).await
+        stream_response(profile, model, prompt_tokens, output_tokens, permit).await
     } else {
-        json_response(cfg, model, prompt_tokens, output_tokens, permit).await
+        json_response(profile, model, prompt_tokens, output_tokens, permit).await
+    }
+}
+
+async fn embeddings(State(cfg): State<Cfg>, Json(body): Json<Value>) -> Response {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("benchmark-embed")
+        .to_string();
+    let (count, prompt_tokens) = estimate_embedding_inputs(&body);
+
+    cfg.counters.requests.fetch_add(1, Ordering::Relaxed);
+    cfg.counters.non_streaming.fetch_add(1, Ordering::Relaxed);
+    cfg.counters.embeddings.fetch_add(1, Ordering::Relaxed);
+    cfg.counters
+        .prompt_tokens
+        .fetch_add(prompt_tokens as u64, Ordering::Relaxed);
+
+    let permit = cfg.slots.clone().acquire_owned().await.ok();
+    let profile = profile_for(&model, &cfg);
+    tokio::time::sleep(Duration::from_millis(profile.ttft_ms)).await;
+    drop(permit);
+
+    let data: Vec<Value> = (0..count)
+        .map(|i| {
+            let embedding: Vec<f32> = (0..16).map(|d| (((i + d) % 7) as f32) / 7.0).collect();
+            json!({ "object": "embedding", "index": i, "embedding": embedding })
+        })
+        .collect();
+    let payload = json!({
+        "object": "list",
+        "data": data,
+        "model": model,
+        "usage": { "prompt_tokens": prompt_tokens, "total_tokens": prompt_tokens }
+    });
+    (StatusCode::OK, Json(payload)).into_response()
+}
+
+fn estimate_embedding_inputs(body: &Value) -> (usize, u32) {
+    match body.get("input") {
+        Some(Value::String(s)) => (1, ((s.chars().count() / 4) as u32).max(1)),
+        Some(Value::Array(arr)) => {
+            let mut tokens = 0u32;
+            for v in arr {
+                if let Some(s) = v.as_str() {
+                    tokens += ((s.chars().count() / 4) as u32).max(1);
+                }
+            }
+            (arr.len().max(1), tokens.max(1))
+        }
+        _ => (1, 1),
     }
 }
 
 async fn json_response(
-    cfg: Cfg,
+    profile: Profile,
     model: String,
     prompt_tokens: u32,
     output_tokens: u32,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
 ) -> Response {
     tokio::time::sleep(Duration::from_millis(
-        cfg.ttft_ms + cfg.token_ms * output_tokens as u64,
+        profile.ttft_ms + profile.token_ms * output_tokens as u64,
     ))
     .await;
     drop(permit);
@@ -177,7 +284,7 @@ async fn json_response(
 }
 
 async fn stream_response(
-    cfg: Cfg,
+    profile: Profile,
     model: String,
     prompt_tokens: u32,
     output_tokens: u32,
@@ -186,7 +293,7 @@ async fn stream_response(
     let body = async_stream::stream! {
         // hold the slot for the whole stream
         let _permit = permit;
-        tokio::time::sleep(Duration::from_millis(cfg.ttft_ms)).await;
+        tokio::time::sleep(Duration::from_millis(profile.ttft_ms)).await;
 
         let role = json!({
             "id": "chatcmpl-bench", "object": "chat.completion.chunk", "model": model,
@@ -195,7 +302,7 @@ async fn stream_response(
         yield sse(&role);
 
         for _ in 0..output_tokens {
-            tokio::time::sleep(Duration::from_millis(cfg.token_ms)).await;
+            tokio::time::sleep(Duration::from_millis(profile.token_ms)).await;
             let chunk = json!({
                 "id": "chatcmpl-bench", "object": "chat.completion.chunk", "model": model,
                 "choices": [{"index": 0, "delta": {"content": "lorem "}, "finish_reason": null}]

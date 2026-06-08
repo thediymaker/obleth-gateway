@@ -1,0 +1,136 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "tags": ["postgres"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "browser",
+  "title": "PostgreSQL",
+  "uid": "obleth-postgres",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Up",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "options": { "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "mappings": [{ "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }], "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } } },
+      "targets": [{ "refId": "A", "expr": "pg_up" }]
+    },
+    {
+      "type": "stat",
+      "title": "Active connections",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 80 }, { "color": "red", "value": 100 }] } } },
+      "targets": [{ "refId": "A", "expr": "sum(pg_stat_database_numbackends)" }]
+    },
+    {
+      "type": "stat",
+      "title": "Cache hit ratio",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.9 }, { "color": "green", "value": 0.99 }] } } },
+      "targets": [{ "refId": "A", "expr": "sum(rate(pg_stat_database_blks_hit[5m])) / clamp_min(sum(rate(pg_stat_database_blks_hit[5m])) + sum(rate(pg_stat_database_blks_read[5m])), 1)" }]
+    },
+    {
+      "type": "stat",
+      "title": "Commits / s",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } } },
+      "targets": [{ "refId": "A", "expr": "sum(rate(pg_stat_database_xact_commit[5m]))" }]
+    },
+    {
+      "type": "stat",
+      "title": "Rollbacks / s",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }] } } },
+      "targets": [{ "refId": "A", "expr": "sum(rate(pg_stat_database_xact_rollback[5m]))" }]
+    },
+    {
+      "type": "stat",
+      "title": "Deadlocks / s",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.001 }] } } },
+      "targets": [{ "refId": "A", "expr": "sum(rate(pg_stat_database_deadlocks[5m]))" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Transactions / s (commit vs rollback)",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(pg_stat_database_xact_commit[5m]))", "legendFormat": "commit" },
+        { "refId": "B", "expr": "sum(rate(pg_stat_database_xact_rollback[5m]))", "legendFormat": "rollback" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Connections by database",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } } } },
+      "targets": [{ "refId": "A", "expr": "pg_stat_database_numbackends{datname!=\"\"}", "legendFormat": "{{datname}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Tuple operations / s",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(pg_stat_database_tup_inserted[5m]))", "legendFormat": "inserted" },
+        { "refId": "B", "expr": "sum(rate(pg_stat_database_tup_updated[5m]))", "legendFormat": "updated" },
+        { "refId": "C", "expr": "sum(rate(pg_stat_database_tup_deleted[5m]))", "legendFormat": "deleted" },
+        { "refId": "D", "expr": "sum(rate(pg_stat_database_tup_returned[5m]))", "legendFormat": "returned" },
+        { "refId": "E", "expr": "sum(rate(pg_stat_database_tup_fetched[5m]))", "legendFormat": "fetched" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Block I/O (hit vs read) / s",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(pg_stat_database_blks_hit[5m]))", "legendFormat": "cache hit" },
+        { "refId": "B", "expr": "sum(rate(pg_stat_database_blks_read[5m]))", "legendFormat": "disk read" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Database size",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [{ "refId": "A", "expr": "pg_database_size_bytes{datname!=\"\"}", "legendFormat": "{{datname}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Temp files / s",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [{ "refId": "A", "expr": "sum(rate(pg_stat_database_temp_files[5m]))", "legendFormat": "temp files" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Conflicts & deadlocks / s",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(pg_stat_database_conflicts[5m]))", "legendFormat": "conflicts" },
+        { "refId": "B", "expr": "sum(rate(pg_stat_database_deadlocks[5m]))", "legendFormat": "deadlocks" }
+      ]
+    }
+  ]
+}

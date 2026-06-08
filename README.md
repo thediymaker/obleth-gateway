@@ -57,6 +57,12 @@ behind one provider key does not need it.
   proxy path on a schedule, tracks health status and consecutive failures, and trips
   a model out of rotation after a failure threshold. Operators can set maintenance
   windows to suppress alerts during planned downtime.
+- **Per-model capacity and auto-tune.** Each model can carry its own `max_in_flight`
+  slot cap (inside the global scheduler limit). A bounded ramp probe drives real load
+  directly at the upstream — bypassing gateway admission — to find the throughput/latency
+  knee for chat and embedding models. The probe is recommend-only; operators apply the
+  suggested slots from the dashboard or Management API and can mark a model `static`
+  (operator-set) or `tuned` (probe-derived).
 - **Alerting.** Health failures, budget exhaustion, and other operational events are
   dispatched to Slack webhooks and email (SMTP).
 - **Response caching.** Optional per-model exact-match response caching in Redis,
@@ -93,6 +99,25 @@ metrics (`:9091`), dashboard (`:3000`), Postgres, Redis, ClickHouse,
 benchmark fixture backend (`:8081`), Prometheus (`:9095`), Grafana (`:3001`).
 
 Open the dashboard at <http://localhost:3000>.
+
+### Grafana dashboards
+
+The `observability` profile auto-provisions Grafana (<http://localhost:3001>,
+anonymous admin) with a Prometheus datasource and a pre-built **Obleth** folder
+of dashboards: the gateway data plane (`obleth_*` metrics), plus full
+PostgreSQL, Redis, ClickHouse, and HAProxy dashboards. Metrics are sourced from:
+
+| Source | Exporter / endpoint | Scrape target |
+| --- | --- | --- |
+| obleth | built-in `:9091/metrics` | `obleth:9091` |
+| Postgres | `prometheuscommunity/postgres-exporter` | `postgres-exporter:9187` |
+| Redis | `oliver006/redis_exporter` | `redis-exporter:9121` |
+| ClickHouse | built-in Prometheus endpoint | `clickhouse:9363` |
+| HAProxy | built-in Prometheus exporter (`edge` profile) | `haproxy:8404` |
+
+Dashboard JSON and provisioning live in `deploy/docker/grafana/`; edit the JSON
+files and Grafana hot-reloads them. The HAProxy dashboard only has data when the
+`edge` profile is also enabled.
 
 ### Create a tenant + key, then call the gateway
 

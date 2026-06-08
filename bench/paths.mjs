@@ -10,4 +10,7 @@ export const benchPaths = {
   keys: join(BENCH_OUT_DIR, "keys.json"),
   runMeta: join(BENCH_OUT_DIR, "run-meta.json"),
   fairshareSamples: join(BENCH_OUT_DIR, "fairshare-samples.jsonl"),
+  throughputMeta: join(BENCH_OUT_DIR, "throughput-meta.json"),
+  soakMeta: join(BENCH_OUT_DIR, "soak-meta.json"),
+  soakTimeline: join(BENCH_OUT_DIR, "soak-timeline.jsonl"),
 };

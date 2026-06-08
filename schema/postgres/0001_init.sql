@@ -122,6 +122,12 @@ create table if not exists models (
     -- optional per-model in-flight cap; null = no model-specific cap, the
     -- global fairshare scheduler capacity remains the outer limit
     max_in_flight               bigint check (max_in_flight is null or max_in_flight >= 1),
+    -- how max_in_flight is decided: 'static' = operator-set (default; cloud
+    -- models pair this with a cap to bound spend); 'tuned' = found by the
+    -- auto-tune ramp probe against the upstream (local/self-hosted models).
+    capacity_mode               text not null default 'static' check (capacity_mode in ('static', 'tuned')),
+    -- when the tuned value was last written by auto-tune (null until tuned).
+    capacity_tuned_at           timestamptz,
     supports_function_calling   boolean not null default false,
     supports_system_messages    boolean not null default true,
     supports_response_schema    boolean not null default false,
@@ -155,6 +161,21 @@ create index if not exists models_enabled_idx on models (enabled) where enabled 
 -- Routing tags for the `auto` router (fixed vocabulary, stored as a JSON array
 -- so adding tags needs no migration). Added via if-not-exists for upgrades.
 alter table models add column if not exists tags jsonb not null default '[]'::jsonb;
+
+-- Capacity tuning mode (added via if-not-exists for upgrades). 'static' keeps
+-- the operator-set max_in_flight; 'tuned' lets auto-tune set it from a ramp
+-- probe against the upstream.
+alter table models add column if not exists capacity_mode text not null default 'static';
+alter table models add column if not exists capacity_tuned_at timestamptz;
+do $$ begin
+    if not exists (
+        select 1 from information_schema.constraint_column_usage
+        where table_name = 'models' and constraint_name = 'models_capacity_mode_check'
+    ) then
+        alter table models add constraint models_capacity_mode_check
+            check (capacity_mode in ('static', 'tuned'));
+    end if;
+end $$;
 
 create index if not exists models_health_due_idx
     on models (health_next_check_at)

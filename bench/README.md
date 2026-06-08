@@ -1,22 +1,68 @@
 # obleth benchmark harness
 
-One command proves the behavior we care about: a lower-weight workload can flood
-the gateway first, a boosted workload can join later, and fairshare still keeps
-the boosted tenant moving without starving the baseline tenant.
+Three scenarios, one GPU-free fixture backend. Together they let you stress the
+gateway and the example backend, and put real numbers behind claims like
+"N req/s" or "Mx faster than <other gateway>".
 
-Generated keys, run metadata, and fairshare samples are written to
-`BENCH_OUT_DIR` (default `/tmp/obleth-bench`). Nothing generated should land in
-this source directory.
+| Scenario | Script | Question it answers |
+| --- | --- | --- |
+| Fairshare | `run-benchmark.mjs` | Does weighted fair queuing keep a boosted tenant moving without starving a baseline tenant under staggered contention? |
+| Max throughput | `throughput.mjs` | How many req/s can obleth sustain, and how much latency does it add over hitting the backend directly? |
+| Soak (mixed) | `soak.mjs` | Does the gateway + backend stay healthy for a long window under many models, tenants, and usage types, with the ledger reconciling? |
 
-## Run it
+Generated keys, run metadata, and samples are written to `BENCH_OUT_DIR`
+(default `/tmp/obleth-bench`). Nothing generated should land in this source
+directory.
 
-Start the stack first:
+Start the stack first (all scenarios need it):
 
 ```bash
 docker compose -f deploy/docker/docker-compose.yml --profile benchmark --profile edge up --build -d
 ```
 
-Then run the benchmark:
+## How we substantiate the claims
+
+Marketing numbers like "50x faster than <gateway>" or "5,000 req/s" only mean
+something if they are reproducible and apples-to-apples. The harness is built to
+be honest about that:
+
+- **req/s** comes from `throughput.mjs`: a closed-loop driver with a tuned
+  keep-alive connection pool, a warmup window that is discarded, and small
+  outputs against the fast `bench-turbo` profile so the *backend is not the
+  bottleneck*. The reported number is steady-state completions / measured
+  seconds.
+- **"faster than X"** is the *gateway-added latency*: run `MODE=both` to measure
+  the backend directly, then through obleth, on identical hardware and backend.
+  The honest figure is `gateway_p50 - direct_p50` (overhead), and the throughput
+  retained vs direct. To compare against another gateway, point its upstream at
+  this same fixture and run the same probe.
+- **fleet realism** comes from per-model latency profiles in the fixture
+  backend: model names containing `turbo/flash/mini/fast/small` are quicker,
+  `large/70b/xl/opus/heavy` are slower, `embed` returns vectors with no
+  per-token delay. One container emulates a heterogeneous fleet.
+
+## The fixture backend
+
+`benchmark-backend` is an OpenAI-compatible server with no GPU. It streams SSE
+chat completions with configurable TTFT/per-token latency, serves buffered chat
+and `/v1/embeddings`, and exposes `GET /stats` with process-wide request/token
+counters so you can measure exactly how many requests reached the upstream
+(e.g. to quantify gateway cache offload). A global slot semaphore simulates a
+saturated cluster so fairshare is observable.
+
+Env knobs (legacy `MOCK_*` names still accepted): `BENCHMARK_BACKEND_TTFT_MS`,
+`BENCHMARK_BACKEND_TOKEN_MS`, `BENCHMARK_BACKEND_DEFAULT_OUTPUT`,
+`BENCHMARK_BACKEND_CONCURRENCY`, `BENCHMARK_BACKEND_LISTEN`.
+
+---
+
+## Scenario 1: fairshare (`run-benchmark.mjs`)
+
+One command proves the behavior we care about: a lower-weight workload can flood
+the gateway first, a boosted workload can join later, and fairshare still keeps
+the boosted tenant moving without starving the baseline tenant.
+
+### Run it
 
 ```bash
 node bench/run-benchmark.mjs
@@ -131,3 +177,89 @@ The old split scripts were easy to misuse: the global target mode could let the
 faster tenant consume the shared request budget, and the chaos script had to be
 coordinated by hand. `run-benchmark.mjs` keeps the setup, load, live sampling,
 ledger check, and optional chaos in one reproducible path.
+
+---
+
+## Scenario 2: max throughput (`throughput.mjs`)
+
+Finds the sustained req/s ceiling and the latency obleth adds over hitting the
+backend directly. A closed-loop driver fires `CONC` workers back-to-back; a
+warmup window is discarded so the number reflects steady state.
+
+```bash
+# gateway only
+node bench/throughput.mjs
+
+# baseline (direct) + gateway + overhead delta
+MODE=both node bench/throughput.mjs
+
+# push for the ceiling
+MODE=both CONC=512 DURATION_S=60 node bench/throughput.mjs
+```
+
+Defaults target the fast `bench-turbo` profile with tiny outputs and a huge
+backend slot count so the *gateway* is what you are measuring, not generation
+time. Output goes to `$BENCH_OUT_DIR/throughput-meta.json`.
+
+Reading the result:
+
+- `req/s` — steady-state completions / `DURATION_S`.
+- `ttfb p50/p99` — time to first byte (the latency a streaming client feels).
+- `MODE=both` adds **overhead**: `added p50 ttfb` (gateway minus direct) and
+  `throughput retained` (gateway req/s as a fraction of direct). These are the
+  honest, apples-to-apples figures for a "faster than X" comparison — point the
+  other gateway at the same fixture and run the same probe.
+
+| Env | Default | Purpose |
+| --- | --- | --- |
+| `MODE` | `gateway` | `gateway`, `direct`, or `both` |
+| `CONC` | `256` | Concurrent closed-loop workers |
+| `DURATION_S` | `30` | Measured window (after warmup) |
+| `WARMUP_S` | `3` | Discarded ramp-up seconds |
+| `OUTPUT_TOKENS` | `4` | `max_tokens` per request (keep small) |
+| `STREAM` | `0` | Set `1` for SSE; default buffered for pure overhead |
+| `CAPACITY` | `100000` | Gateway global in-flight (set high to not gate) |
+| `MODEL` | `bench-turbo` | Registered model; `turbo` = fast backend profile |
+| `BACKEND_BASE` | `http://localhost:8081` | Direct backend URL for the baseline |
+| `MAX_SOCKETS` | `CONC*2` | Keep-alive pool size |
+| `MAX_ERROR_RATE` | `0.01` | Fail above this client error rate |
+
+`PASS` when the measured error rate stays under `MAX_ERROR_RATE`.
+
+---
+
+## Scenario 3: soak / mixed traffic (`soak.mjs`)
+
+A long, configurable run that stresses both the gateway and the example backend
+the way a busy fleet would: 5 models with different latency profiles, 5 tenants
+across 3 fairshare groups, and 6 usage types (streaming chat, buffered chat,
+large generations, code, and embeddings). It samples fairshare and throughput
+over time, then reconciles client counts against the ClickHouse ledger.
+
+```bash
+# ~10 min default
+node bench/soak.mjs
+
+# 1 hour soak
+DURATION_S=3600 node bench/soak.mjs
+```
+
+Output: `$BENCH_OUT_DIR/soak-meta.json` (full breakdown) and
+`$BENCH_OUT_DIR/soak-timeline.jsonl` (per-interval req/s, in-flight, queued — so
+a slow throughput or latency drift over time is visible).
+
+The single fixture backend emulates the fleet via per-model latency profiles
+(model names carry the keyword: `bench-turbo`, `bench-base`, `bench-code`,
+`bench-large`, `bench-embed`).
+
+| Env | Default | Purpose |
+| --- | --- | --- |
+| `DURATION_S` | `600` | Soak length in seconds |
+| `CONC` | `64` | Concurrent workers across all tenants/models |
+| `CAPACITY` | `64` | Gateway global in-flight limit |
+| `PROGRESS_S` | `10` | Sampling + progress-log interval |
+| `MAX_ERROR_RATE` | `0.02` | Fail above this overall error rate |
+| `LEDGER_TOLERANCE` | `0.2` | Allowed ClickHouse/client request delta |
+
+`PASS` when error rate stays under threshold, fairshare samples were captured,
+and the ClickHouse ledger reconciles with client attempts.

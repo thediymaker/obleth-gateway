@@ -1,0 +1,130 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "tags": ["haproxy"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "browser",
+  "title": "HAProxy",
+  "uid": "obleth-haproxy",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Up",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "options": { "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "mappings": [{ "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }], "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } } },
+      "targets": [{ "refId": "A", "expr": "up{job=\"haproxy\"}" }]
+    },
+    {
+      "type": "stat",
+      "title": "Requests / s",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "reqps", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } } },
+      "targets": [{ "refId": "A", "expr": "sum(rate(haproxy_frontend_http_requests_total[5m]))" }]
+    },
+    {
+      "type": "stat",
+      "title": "Active sessions (frontend)",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } } },
+      "targets": [{ "refId": "A", "expr": "sum(haproxy_frontend_current_sessions)" }]
+    },
+    {
+      "type": "stat",
+      "title": "Servers up",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } } },
+      "targets": [{ "refId": "A", "expr": "sum(haproxy_server_status)" }]
+    },
+    {
+      "type": "stat",
+      "title": "5xx / s",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 0.001 }] } } },
+      "targets": [{ "refId": "A", "expr": "sum(rate(haproxy_frontend_http_responses_total{code=\"5xx\"}[5m]))" }]
+    },
+    {
+      "type": "stat",
+      "title": "Backend response time (avg)",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }, { "color": "red", "value": 5 }] } } },
+      "targets": [{ "refId": "A", "expr": "max(haproxy_backend_response_time_average_seconds)" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Responses by code / s (frontend)",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } } } },
+      "targets": [{ "refId": "A", "expr": "sum by (code) (rate(haproxy_frontend_http_responses_total[5m]))", "legendFormat": "{{code}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Sessions (frontend vs backend)",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(haproxy_frontend_current_sessions)", "legendFormat": "frontend" },
+        { "refId": "B", "expr": "sum(haproxy_backend_current_sessions)", "legendFormat": "backend" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Network throughput",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(haproxy_frontend_bytes_in_total[5m]))", "legendFormat": "in" },
+        { "refId": "B", "expr": "sum(rate(haproxy_frontend_bytes_out_total[5m]))", "legendFormat": "out" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Backend response time (avg)",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "s", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [{ "refId": "A", "expr": "haproxy_backend_response_time_average_seconds", "legendFormat": "{{proxy}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Backend queue length",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [{ "refId": "A", "expr": "haproxy_backend_current_queue", "legendFormat": "{{proxy}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Connection & response errors / s",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(haproxy_backend_connection_errors_total[5m]))", "legendFormat": "connection" },
+        { "refId": "B", "expr": "sum(rate(haproxy_backend_response_errors_total[5m]))", "legendFormat": "response" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Server status (1 = UP)",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "short", "min": 0, "max": 1, "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [{ "refId": "A", "expr": "haproxy_server_status", "legendFormat": "{{proxy}}/{{server}}" }]
+    }
+  ]
+}

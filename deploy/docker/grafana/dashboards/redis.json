@@ -1,0 +1,136 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "tags": ["redis"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "browser",
+  "title": "Redis",
+  "uid": "obleth-redis",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "10s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Up",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "options": { "colorMode": "background" },
+      "fieldConfig": { "defaults": { "unit": "short", "mappings": [{ "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "UP", "color": "green" } } }], "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] } } },
+      "targets": [{ "refId": "A", "expr": "redis_up" }]
+    },
+    {
+      "type": "stat",
+      "title": "Connected clients",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } } },
+      "targets": [{ "refId": "A", "expr": "redis_connected_clients" }]
+    },
+    {
+      "type": "stat",
+      "title": "Memory used",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "bytes", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } } },
+      "targets": [{ "refId": "A", "expr": "redis_memory_used_bytes" }]
+    },
+    {
+      "type": "stat",
+      "title": "Ops / s",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "ops", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } } },
+      "targets": [{ "refId": "A", "expr": "sum(rate(redis_commands_processed_total[5m]))" }]
+    },
+    {
+      "type": "stat",
+      "title": "Keyspace hit ratio",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "green", "value": 0.8 }] } } },
+      "targets": [{ "refId": "A", "expr": "sum(rate(redis_keyspace_hits_total[5m])) / clamp_min(sum(rate(redis_keyspace_hits_total[5m])) + sum(rate(redis_keyspace_misses_total[5m])), 1)" }]
+    },
+    {
+      "type": "stat",
+      "title": "Uptime",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "s", "color": { "mode": "thresholds" }, "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] } } },
+      "targets": [{ "refId": "A", "expr": "redis_uptime_in_seconds" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Commands / s by type",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } } } },
+      "targets": [{ "refId": "A", "expr": "topk(10, sum by (cmd) (rate(redis_commands_total[5m])))", "legendFormat": "{{cmd}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Memory used vs max",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "fieldConfig": { "defaults": { "unit": "bytes", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "redis_memory_used_bytes", "legendFormat": "used" },
+        { "refId": "B", "expr": "redis_memory_max_bytes", "legendFormat": "max" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Keyspace hits vs misses / s",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(redis_keyspace_hits_total[5m]))", "legendFormat": "hits" },
+        { "refId": "B", "expr": "sum(rate(redis_keyspace_misses_total[5m]))", "legendFormat": "misses" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Network I/O",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "fieldConfig": { "defaults": { "unit": "Bps", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "rate(redis_net_input_bytes_total[5m])", "legendFormat": "in" },
+        { "refId": "B", "expr": "rate(redis_net_output_bytes_total[5m])", "legendFormat": "out" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Keys per database",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 20, "stacking": { "mode": "normal" } } } },
+      "targets": [{ "refId": "A", "expr": "redis_db_keys", "legendFormat": "{{db}}" }]
+    },
+    {
+      "type": "timeseries",
+      "title": "Evicted & expired keys / s",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "ops", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "rate(redis_evicted_keys_total[5m])", "legendFormat": "evicted" },
+        { "refId": "B", "expr": "rate(redis_expired_keys_total[5m])", "legendFormat": "expired" }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Clients (connected vs blocked)",
+      "datasource": { "type": "prometheus", "uid": "obleth-prometheus" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 20 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        { "refId": "A", "expr": "redis_connected_clients", "legendFormat": "connected" },
+        { "refId": "B", "expr": "redis_blocked_clients", "legendFormat": "blocked" }
+      ]
+    }
+  ]
+}

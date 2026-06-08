@@ -7,13 +7,16 @@ import {
   ChevronDown,
   Database,
   Download,
+  Gauge,
   HeartPulse,
+  Info,
   PauseCircle,
   RefreshCw,
   Save,
   Trash2,
   Upload,
   XCircle,
+  Zap,
 } from "lucide-react";
 import {
   CartesianGrid,
@@ -25,6 +28,8 @@ import {
   YAxis,
 } from "recharts";
 import {
+  applyAutotuneCapacityAction,
+  autotuneModelAction,
   checkModelHealthAction,
   createModelAction,
   deleteModelAction,
@@ -32,6 +37,7 @@ import {
   planModelImportAction,
   setModelCacheAction,
   setModelCapacityAction,
+  setModelCapacityModeAction,
   setModelHealthConfigAction,
   setModelWeightAction,
   updateModelAction,
@@ -42,9 +48,25 @@ import { ChartShell, axisTick, chartGrid, compactAxis, tip, timeCursor } from "@
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import type { CacheStats, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
+import { Select } from "@/components/ui/select";
+import {
+  Tooltip as UiTooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
+import type { AutotuneReport, AutotuneWorkload, CacheStats, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import { cn, formatNumber } from "@/lib/utils";
 
 // Fixed routing-tag vocabulary; mirrors obleth-config `MODEL_TAGS`. Used by the
@@ -486,10 +508,14 @@ function ModelDetailPanel({
             <ControlBlock label="Admission weight">
               <ModelWeightControl id={model.id} initial={model.admission_weight} />
             </ControlBlock>
+            <ControlBlock label="Capacity mode">
+              <CapacityModeToggle id={model.id} mode={model.capacity_mode} />
+            </ControlBlock>
             <ControlBlock label="Max slots">
               <ModelCapacityControl id={model.id} initial={model.max_in_flight} />
             </ControlBlock>
           </div>
+          <AutotunePanel model={model} />
         </div>
 
         <div className="rounded-md border border-border bg-card/40 p-4">
@@ -681,6 +707,325 @@ export function ModelCapacityControl({ id, initial }: { id: string; initial: num
       <Button type="button" size="sm" variant="secondary" disabled={pending || !changed} onClick={() => start(() => setModelCapacityAction(id, next))}>
         {pending ? "Saving" : "Apply"}
       </Button>
+    </div>
+  );
+}
+
+export function CapacityModeToggle({ id, mode }: { id: string; mode: string }) {
+  const [pending, start] = useTransition();
+  const current = mode === "tuned" ? "tuned" : "static";
+  const set = (next: "static" | "tuned") => {
+    if (next === current) return;
+    start(() => setModelCapacityModeAction(id, next));
+  };
+  return (
+    <div className="inline-flex w-full overflow-hidden rounded-md border border-border" role="group" aria-label="Capacity mode">
+      {(["static", "tuned"] as const).map((opt) => (
+        <button
+          key={opt}
+          type="button"
+          disabled={pending}
+          onClick={() => set(opt)}
+          className={cn(
+            "flex-1 px-2 py-1 text-xs capitalize transition-colors disabled:opacity-60",
+            current === opt ? "bg-primary text-primary-foreground" : "bg-transparent text-muted-foreground hover:bg-muted/50",
+          )}
+        >
+          {opt}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+const AUTOTUNE_KNEE_LABEL: Record<AutotuneReport["knee_reason"], string> = {
+  latency_degraded: "Latency degraded past your tolerance",
+  plateau: "Throughput plateaued",
+  max_concurrency: "Reached the concurrency ceiling (real knee may be higher)",
+  no_data: "No usable samples — upstream unreachable",
+};
+
+const AUTOTUNE_HEADROOM_OPTIONS = [
+  { value: "2", label: "Tight — 2× a single request" },
+  { value: "4", label: "Balanced — 4× a single request" },
+  { value: "8", label: "Relaxed — 8× a single request" },
+] as const;
+
+function AutotuneField({
+  label,
+  info,
+  children,
+}: {
+  label: string;
+  info: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex items-center gap-3 p-3">
+      <div className="flex w-40 shrink-0 items-center gap-1.5">
+        <Label className="text-xs">{label}</Label>
+        <UiTooltip>
+          <TooltipTrigger asChild>
+            <button
+              type="button"
+              aria-label={`About ${label}`}
+              className="text-muted-foreground/70 transition-colors hover:text-foreground"
+            >
+              <Info className="h-3.5 w-3.5" />
+            </button>
+          </TooltipTrigger>
+          <TooltipContent side="left" align="center" className="max-w-xs leading-relaxed">
+            {info}
+          </TooltipContent>
+        </UiTooltip>
+      </div>
+      <div className="min-w-0 flex-1">{children}</div>
+    </div>
+  );
+}
+
+export function AutotunePanel({ model }: { model: ModelRoute }) {
+  const probeable = model.model_type === "chat" || model.model_type === "embedding";
+  const [open, setOpen] = useState(false);
+  const [headroom, setHeadroom] = useState("4");
+  const [replicas, setReplicas] = useState("1");
+  const [workload, setWorkload] = useState<AutotuneWorkload>("chat");
+  const [running, setRunning] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [report, setReport] = useState<AutotuneReport | null>(null);
+  const [pending, start] = useTransition();
+
+  if (!probeable) return null;
+
+  const reset = () => {
+    setReport(null);
+    setError(null);
+  };
+
+  const runProbe = async () => {
+    setRunning(true);
+    setError(null);
+    setReport(null);
+    try {
+      const result = await autotuneModelAction(model.id, {
+        latency_headroom: Math.max(1.5, Number(headroom) || 4),
+        replicas: Math.max(1, Math.round(Number(replicas) || 1)),
+        workload,
+      });
+      setReport(result);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Auto-tune failed");
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const apply = () => {
+    if (!report) return;
+    start(async () => {
+      await applyAutotuneCapacityAction(model.id, report.recommended_max_in_flight);
+      setOpen(false);
+      reset();
+    });
+  };
+
+  return (
+    <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-dashed border-border/70 bg-background/40 p-3">
+      <div className="flex items-start gap-2">
+        <Gauge className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
+        <div>
+          <p className="text-xs font-medium">Auto-tune capacity</p>
+          <p className="text-xs text-muted-foreground">
+            Ramp live load against the upstream to find the in-flight knee. Best for self-hosted models.
+          </p>
+        </div>
+      </div>
+      <Dialog
+        open={open}
+        onOpenChange={(next) => {
+          setOpen(next);
+          if (!next) reset();
+        }}
+      >
+        <DialogTrigger asChild>
+          <Button type="button" size="sm" variant="secondary">
+            <Zap className="h-3.5 w-3.5" />
+            Auto-tune
+          </Button>
+        </DialogTrigger>
+        <DialogContent className="max-w-3xl">
+          <DialogHeader>
+            <div className="flex items-center gap-2">
+              <DialogTitle>Auto-tune {model.model_name}</DialogTitle>
+              <TooltipProvider delayDuration={150}>
+                <UiTooltip>
+                  <TooltipTrigger asChild>
+                    <button
+                      type="button"
+                      aria-label="How auto-tune works"
+                      className="text-muted-foreground transition-colors hover:text-foreground"
+                    >
+                      <Info className="h-4 w-4" />
+                    </button>
+                  </TooltipTrigger>
+                  <TooltipContent side="bottom" align="start" className="max-w-xs leading-relaxed">
+                    Sends real requests straight to the upstream and ramps concurrency to find its
+                    true capacity. Hover each field below for what it controls.
+                  </TooltipContent>
+                </UiTooltip>
+              </TooltipProvider>
+            </div>
+            <DialogDescription>
+              Finds the in-flight knee by ramping live load.{" "}
+              <span className="font-medium text-foreground">Consumes upstream tokens</span> &mdash;
+              avoid running against a busy production model.
+            </DialogDescription>
+          </DialogHeader>
+
+          <TooltipProvider delayDuration={150}>
+            <div className="divide-y divide-border rounded-md border border-border">
+              <AutotuneField
+                label="Replicas running"
+                info="How many copies of the model are serving traffic. The probe scales its concurrency ceiling (up to ~32× this) so the ramp covers a realistic load for your fleet."
+              >
+                <Input
+                  type="number"
+                  min={1}
+                  step={1}
+                  value={replicas}
+                  onChange={(e) => setReplicas(e.target.value)}
+                  className="h-9 w-full text-xs"
+                />
+              </AutotuneField>
+
+              <AutotuneField
+                label="Latency tolerance"
+                info="How much slower than a single idle request you'll accept at peak load. The ramp stops once p99 crosses this multiple of the baseline — tighter tolerance means fewer slots but snappier responses."
+              >
+                <Select
+                  value={headroom}
+                  onChange={(e) => setHeadroom(e.target.value)}
+                  className="h-9 w-full text-xs"
+                >
+                  {AUTOTUNE_HEADROOM_OPTIONS.map((o) => (
+                    <option key={o.value} value={o.value}>
+                      {o.label}
+                    </option>
+                  ))}
+                </Select>
+              </AutotuneField>
+
+              <AutotuneField
+                label="Workload"
+                info="The shape of the probe requests. Pick whichever matches real traffic — coding sends large prompts and longer replies, which costs more capacity than short chat turns, so it tunes to a lower slot count."
+              >
+                <Select
+                  value={workload}
+                  onChange={(e) => setWorkload(e.target.value as AutotuneWorkload)}
+                  className="h-9 w-full text-xs"
+                >
+                  <option value="chat">Chat — short prompt, short reply</option>
+                  <option value="coding">Coding — large context, longer reply</option>
+                </Select>
+              </AutotuneField>
+            </div>
+          </TooltipProvider>
+
+          {error && (
+            <p className="rounded-sm border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">{error}</p>
+          )}
+
+          {report && (
+            <div className="space-y-3">
+              <div className="flex flex-wrap items-center gap-x-6 gap-y-1 rounded-md border border-border bg-card/40 p-3 text-xs">
+                <div>
+                  <span className="text-muted-foreground">Recommended slots</span>
+                  <p className="text-lg font-semibold tabular-nums">{report.recommended_max_in_flight}</p>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">Throughput at knee</span>
+                  <p className="text-lg font-semibold tabular-nums">{report.recommended_throughput_rps.toFixed(1)} rps</p>
+                </div>
+                <div>
+                  <span className="text-muted-foreground">Latency budget</span>
+                  <p className="font-medium tabular-nums">
+                    {report.baseline_p99_ms > 0
+                      ? `${report.baseline_p99_ms} ms → ${report.latency_ceiling_ms} ms (${report.latency_headroom.toFixed(0)}×)`
+                      : "no baseline"}
+                  </p>
+                </div>
+                <div className="min-w-[12rem] flex-1">
+                  <span className="text-muted-foreground">Why it stopped</span>
+                  <p className="font-medium">{AUTOTUNE_KNEE_LABEL[report.knee_reason]}</p>
+                </div>
+              </div>
+
+              <div className="max-h-56 overflow-auto rounded-md border border-border">
+                <table className="w-full text-xs">
+                  <thead className="sticky top-0 bg-card">
+                    <tr className="border-b border-border text-left text-muted-foreground">
+                      <th className="py-2 pl-3 pr-3 font-medium">Concurrency</th>
+                      <th className="py-2 pr-3 font-medium">Throughput</th>
+                      <th className="py-2 pr-3 font-medium">p50</th>
+                      <th className="py-2 pr-3 font-medium">p99</th>
+                      <th className="py-2 pr-3 font-medium">Errors</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {report.steps.map((step) => {
+                      const isRec = step.concurrency === report.recommended_max_in_flight;
+                      return (
+                        <tr key={step.concurrency} className={cn("border-b border-border/50", isRec && "bg-primary/10")}>
+                          <td className="py-1.5 pl-3 pr-3 tabular-nums">
+                            {step.concurrency}
+                            {isRec && <span className="ml-1 text-primary">★</span>}
+                          </td>
+                          <td className="py-1.5 pr-3 tabular-nums">{step.throughput_rps.toFixed(1)} rps</td>
+                          <td className="py-1.5 pr-3 tabular-nums text-muted-foreground">{step.p50_ms} ms</td>
+                          <td className="py-1.5 pr-3 tabular-nums text-muted-foreground">{step.p99_ms} ms</td>
+                          <td className="py-1.5 pr-3 tabular-nums text-muted-foreground">{step.errors}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          <DialogFooter>
+            {!report ? (
+              <Button type="button" size="sm" onClick={runProbe} disabled={running}>
+                {running ? (
+                  <>
+                    <RefreshCw className="h-3.5 w-3.5 animate-spin" />
+                    Probing…
+                  </>
+                ) : (
+                  <>
+                    <Zap className="h-3.5 w-3.5" />
+                    Run probe
+                  </>
+                )}
+              </Button>
+            ) : (
+              <div className="flex w-full items-center justify-end gap-2">
+                <Button type="button" size="sm" variant="secondary" onClick={runProbe} disabled={running || pending}>
+                  Re-run
+                </Button>
+                <Button
+                  type="button"
+                  size="sm"
+                  onClick={apply}
+                  disabled={pending || report.knee_reason === "no_data"}
+                >
+                  {pending ? "Applying…" : `Apply ${report.recommended_max_in_flight} slots`}
+                </Button>
+              </div>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

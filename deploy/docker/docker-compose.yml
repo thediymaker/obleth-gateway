@@ -46,9 +46,14 @@ services:
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-obleth}
       CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
     ports: ["127.0.0.1:8123:8123", "127.0.0.1:9000:9000"]
+    # :9363 Prometheus metrics is scraped in-network by Prometheus (no host bind).
+    expose: ["9363"]
     ulimits:
       nofile: { soft: 262144, hard: 262144 }
-    volumes: ["chdata:/var/lib/clickhouse"]
+    volumes:
+      - "chdata:/var/lib/clickhouse"
+      # Built-in Prometheus exposition on :9363/metrics (scraped by Prometheus).
+      - "./clickhouse/prometheus.xml:/etc/clickhouse-server/config.d/prometheus.xml:ro"
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
       interval: 3s
@@ -147,6 +152,8 @@ services:
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     ports: ["80:80"]
+    # :8404 (Prometheus metrics + /stats UI) is scraped in-network by Prometheus.
+    expose: ["8404"]
     depends_on:
       obleth: { condition: service_started }
 
@@ -163,9 +170,36 @@ services:
     environment:
       GF_AUTH_ANONYMOUS_ENABLED: "true"
       GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+    volumes:
+      # Auto-provisioned Prometheus datasource + the bundled dashboards.
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
     ports: ["3001:3000"]
     depends_on:
       prometheus: { condition: service_started }
+
+  # Postgres -> Prometheus exporter. Reuses the same credentials as the bundled
+  # postgres container so it needs no extra setup.
+  postgres-exporter:
+    profiles: ["observability"]
+    image: quay.io/prometheuscommunity/postgres-exporter:latest
+    environment:
+      DATA_SOURCE_NAME: postgresql://${POSTGRES_USER:-obleth}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/docker/.env}@postgres:5432/${POSTGRES_DB:-obleth}?sslmode=disable
+    # Scraped in-network by Prometheus on :9187; no host port needed.
+    expose: ["9187"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # Redis -> Prometheus exporter.
+  redis-exporter:
+    profiles: ["observability"]
+    image: oliver006/redis_exporter:latest
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    # Scraped in-network by Prometheus on :9121; no host port needed.
+    expose: ["9121"]
+    depends_on:
+      redis: { condition: service_healthy }
 
   # OTLP trace collector + UI. Set OBLETH_OTEL_ENDPOINT=http://jaeger:4317 (see
   # .env.example) so obleth exports spans here. UI on http://localhost:16686.

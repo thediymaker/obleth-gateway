@@ -7,6 +7,7 @@
 //! endpoints.
 
 pub mod alerts;
+pub mod autotune;
 mod error;
 pub mod model_health;
 mod openapi;
@@ -131,6 +132,15 @@ pub fn router(state: AdminState) -> Router {
         )
         .route("/api/v1/models/:id/weight", put(set_model_weight))
         .route("/api/v1/models/:id/capacity", put(set_model_capacity))
+        .route(
+            "/api/v1/models/:id/capacity-mode",
+            put(set_model_capacity_mode),
+        )
+        .route("/api/v1/models/:id/autotune", post(autotune_model))
+        .route(
+            "/api/v1/models/:id/autotune/apply",
+            post(apply_autotune_capacity),
+        )
         .route("/api/v1/models/:id/cache", put(set_model_cache))
         .route(
             "/api/v1/mcp-servers",
@@ -412,6 +422,16 @@ pub struct SetModelCache {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetModelCapacity {
     pub max_in_flight: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetModelCapacityMode {
+    pub capacity_mode: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ApplyAutotuneCapacity {
+    pub max_in_flight: i64,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1649,6 +1669,122 @@ async fn set_model_capacity(
             "model",
             &id.to_string(),
             serde_json::json!({ "max_in_flight": model.max_in_flight }),
+        )
+        .await?;
+    Ok(Json(model))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/models/{id}/capacity-mode",
+    tag = "models",
+    request_body = SetModelCapacityMode,
+    responses((status = 200, body = ModelRoute))
+)]
+async fn set_model_capacity_mode(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetModelCapacityMode>,
+) -> Result<Json<ModelRoute>> {
+    if !obleth_config::is_valid_capacity_mode(body.capacity_mode.trim()) {
+        return Err(AdminError::BadRequest(format!(
+            "invalid capacity_mode `{}` (expected `static` or `tuned`)",
+            body.capacity_mode
+        )));
+    }
+    let model = state
+        .store
+        .update_model_capacity_mode(id, &body.capacity_mode)
+        .await?;
+    sync_model(&state, &model).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "set_model_capacity_mode",
+            "model",
+            &id.to_string(),
+            serde_json::json!({ "capacity_mode": model.capacity_mode }),
+        )
+        .await?;
+    Ok(Json(model))
+}
+
+/// Run an auto-tune ramp probe against the model's upstream and return a
+/// recommendation. Recommend-only: this writes no config. The probe drives
+/// real load directly at the upstream, so it costs upstream tokens.
+#[utoipa::path(
+    post,
+    path = "/api/v1/models/{id}/autotune",
+    tag = "models",
+    request_body = autotune::AutotuneRequest,
+    responses((status = 200, body = autotune::AutotuneReport))
+)]
+async fn autotune_model(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<autotune::AutotuneRequest>,
+) -> Result<Json<autotune::AutotuneReport>> {
+    let model = state.store.get_model(id).await?;
+    let report = autotune::run_probe(&state.health.http, &model, &body)
+        .await
+        .map_err(|e| AdminError::BadRequest(e.to_string()))?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "autotune_model",
+            "model",
+            &id.to_string(),
+            serde_json::json!({
+                "recommended_max_in_flight": report.recommended_max_in_flight,
+                "knee_reason": report.knee_reason,
+                "baseline_p99_ms": report.baseline_p99_ms,
+                "latency_ceiling_ms": report.latency_ceiling_ms,
+                "latency_headroom": report.latency_headroom,
+                "workload": report.workload,
+                "max_concurrency": report.max_concurrency,
+            }),
+        )
+        .await?;
+    Ok(Json(report))
+}
+
+/// Apply an auto-tune recommendation: set `max_in_flight`, flip the model to
+/// `tuned` mode, and stamp the tuned timestamp.
+#[utoipa::path(
+    post,
+    path = "/api/v1/models/{id}/autotune/apply",
+    tag = "models",
+    request_body = ApplyAutotuneCapacity,
+    responses((status = 200, body = ModelRoute))
+)]
+async fn apply_autotune_capacity(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<ApplyAutotuneCapacity>,
+) -> Result<Json<ModelRoute>> {
+    if body.max_in_flight < 1 {
+        return Err(AdminError::BadRequest(
+            "max_in_flight must be >= 1".to_string(),
+        ));
+    }
+    let model = state
+        .store
+        .apply_tuned_model_capacity(id, body.max_in_flight)
+        .await?;
+    sync_model(&state, &model).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "apply_autotune_capacity",
+            "model",
+            &id.to_string(),
+            serde_json::json!({
+                "max_in_flight": model.max_in_flight,
+                "capacity_mode": model.capacity_mode,
+            }),
         )
         .await?;
     Ok(Json(model))

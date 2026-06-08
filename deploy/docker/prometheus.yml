@@ -2,6 +2,29 @@ global:
   scrape_interval: 5s
 
 scrape_configs:
+  # obleth data-plane metrics (always on)
   - job_name: obleth
     static_configs:
       - targets: ["obleth:9091"]
+
+  # Postgres via prometheuscommunity/postgres-exporter (observability profile)
+  - job_name: postgres
+    static_configs:
+      - targets: ["postgres-exporter:9187"]
+
+  # Redis via oliver006/redis_exporter (observability profile)
+  - job_name: redis
+    static_configs:
+      - targets: ["redis-exporter:9121"]
+
+  # ClickHouse built-in Prometheus endpoint (see clickhouse/prometheus.xml)
+  - job_name: clickhouse
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["clickhouse:9363"]
+
+  # HAProxy built-in Prometheus exporter (edge profile; see haproxy.cfg)
+  - job_name: haproxy
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["haproxy:8404"]

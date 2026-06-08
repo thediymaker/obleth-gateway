@@ -238,6 +238,15 @@ pub struct ModelRoute {
     /// Optional per-model in-flight cap. `None` means only the global scheduler
     /// cap and tenant/group fairshare limits apply.
     pub max_in_flight: Option<i64>,
+    /// How `max_in_flight` is decided. `static` (default) keeps the
+    /// operator-set value; `tuned` means it was found by the auto-tune ramp
+    /// probe against the upstream. Stored as text for forward compatibility.
+    #[serde(default = "default_capacity_mode")]
+    pub capacity_mode: String,
+    /// When the tuned `max_in_flight` was last written by auto-tune. `None`
+    /// until the model has been tuned.
+    #[serde(default)]
+    pub capacity_tuned_at: Option<chrono::DateTime<chrono::Utc>>,
     pub supports_function_calling: bool,
     pub supports_system_messages: bool,
     pub supports_response_schema: bool,
@@ -534,6 +543,33 @@ pub const DEFAULT_MODEL_TYPE: &str = "chat";
 
 fn default_model_type() -> String {
     DEFAULT_MODEL_TYPE.to_string()
+}
+
+/// Fixed vocabulary of capacity-tuning modes. `static` keeps the operator-set
+/// `max_in_flight`; `tuned` lets auto-tune set it from a ramp probe.
+pub const CAPACITY_MODES: &[&str] = &["static", "tuned"];
+
+/// The default capacity mode assigned to a model when none is specified.
+pub const DEFAULT_CAPACITY_MODE: &str = "static";
+
+fn default_capacity_mode() -> String {
+    DEFAULT_CAPACITY_MODE.to_string()
+}
+
+/// True when `mode` is part of the fixed [`CAPACITY_MODES`] vocabulary.
+pub fn is_valid_capacity_mode(mode: &str) -> bool {
+    CAPACITY_MODES.contains(&mode)
+}
+
+/// Normalize a capacity-mode string to canonical storage form: trimmed and
+/// lowercased, falling back to [`DEFAULT_CAPACITY_MODE`] when empty or unknown.
+pub fn normalize_capacity_mode(mode: &str) -> String {
+    let m = mode.trim().to_ascii_lowercase();
+    if is_valid_capacity_mode(&m) {
+        m
+    } else {
+        DEFAULT_CAPACITY_MODE.to_string()
+    }
 }
 
 /// True when `model_type` is part of the fixed [`MODEL_TYPES`] vocabulary.

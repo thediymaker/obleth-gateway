@@ -12,8 +12,11 @@ use crate::{
     SetDisabled, SetTenantAllowlist, SetTenantBudget, SetTenantSchedule, SetTenantStatus,
     UpdateQuota, UpdateTenant, UpdateUsageRetention, UpdateWeight, UsageRetentionView,
 };
+use crate::autotune::{AutotuneReport, AutotuneRequest, AutotuneStep, KneeReason, WorkloadProfile};
+use crate::{ApplyAutotuneCapacity, SetModelCapacityMode};
 use obleth_config::{
-    ApiKey, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, Tenant, WeeklyWindow,
+    ApiKey, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelRoute, Tenant,
+    WeeklyWindow,
 };
 
 #[derive(OpenApi)]
@@ -47,6 +50,9 @@ use obleth_config::{
         crate::model_health::check_one,
         crate::model_health::check_all,
         crate::model_health::update_config,
+        crate::set_model_capacity_mode,
+        crate::autotune_model,
+        crate::apply_autotune_capacity,
     ),
     components(schemas(
         Tenant,
@@ -81,10 +87,19 @@ use obleth_config::{
         UpdateEmailSettings,
         TestAlertResult,
         crate::alerts::ChannelResult,
+        ModelRoute,
+        SetModelCapacityMode,
+        ApplyAutotuneCapacity,
+        AutotuneRequest,
+        AutotuneReport,
+        AutotuneStep,
+        KneeReason,
+        WorkloadProfile,
     )),
     tags(
         (name = "tenants", description = "Tenant + fairshare weight management"),
         (name = "keys", description = "API key lifecycle"),
+        (name = "models", description = "Model registry, capacity, and auto-tune"),
         (name = "usage", description = "Usage and cost analytics"),
         (name = "settings", description = "Runtime alerting configuration")
     )

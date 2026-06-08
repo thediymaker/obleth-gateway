@@ -3,7 +3,7 @@
 import { revalidatePath } from "next/cache";
 import { parse as parseYaml } from "yaml";
 import { obleth, OblethApiError } from "@/lib/obleth";
-import type { ModelRoute, UpdateAlertSettings, UpdateAutoRouterSettings } from "@/lib/obleth";
+import type { AutotuneReport, AutotuneWorkload, ModelRoute, UpdateAlertSettings, UpdateAutoRouterSettings } from "@/lib/obleth";
 import { requireSession } from "@/lib/auth/session";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
@@ -244,6 +244,30 @@ export async function createModelAction(formData: FormData): Promise<ActionResul
 export async function setModelCapacityAction(id: string, max_in_flight: number | null) {
   await requireSession();
   await obleth.setModelCapacity(id, max_in_flight);
+  revalidatePath("/models");
+  revalidatePath("/fairshare");
+}
+
+export async function setModelCapacityModeAction(id: string, capacityMode: string) {
+  await requireSession();
+  await obleth.setModelCapacityMode(id, capacityMode);
+  revalidatePath("/models");
+  revalidatePath("/fairshare");
+}
+
+export async function autotuneModelAction(
+  id: string,
+  opts?: { workload?: AutotuneWorkload; latency_headroom?: number; replicas?: number }
+): Promise<AutotuneReport> {
+  await requireSession();
+  // Recommend-only: drives a live probe against the upstream and returns the
+  // suggested capacity. Nothing is persisted here.
+  return obleth.autotuneModel(id, opts);
+}
+
+export async function applyAutotuneCapacityAction(id: string, max_in_flight: number) {
+  await requireSession();
+  await obleth.applyAutotuneCapacity(id, max_in_flight);
   revalidatePath("/models");
   revalidatePath("/fairshare");
 }

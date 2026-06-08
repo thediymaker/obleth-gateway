@@ -561,6 +561,7 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
                        cache_enabled, cache_ttl_secs, tags,
+                       capacity_mode, capacity_tuned_at,
                        created_at, updated_at",
         )
         .bind(Uuid::new_v4())
@@ -596,6 +597,7 @@ impl Store {
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, enabled,
                     cache_enabled, cache_ttl_secs, tags,
+                    capacity_mode, capacity_tuned_at,
                     created_at, updated_at
              from models order by model_name",
         )
@@ -612,6 +614,7 @@ impl Store {
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, enabled,
                     cache_enabled, cache_ttl_secs, tags,
+                    capacity_mode, capacity_tuned_at,
                     created_at, updated_at
              from models where id = $1",
         )
@@ -630,6 +633,7 @@ impl Store {
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, enabled,
                     cache_enabled, cache_ttl_secs, tags,
+                    capacity_mode, capacity_tuned_at,
                     created_at, updated_at
              from models where model_name = $1",
         )
@@ -683,6 +687,7 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
                        cache_enabled, cache_ttl_secs, tags,
+                       capacity_mode, capacity_tuned_at,
                        created_at, updated_at",
         )
         .bind(id)
@@ -736,10 +741,68 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
                        cache_enabled, cache_ttl_secs, tags,
+                       capacity_mode, capacity_tuned_at,
                        created_at, updated_at",
         )
         .bind(id)
         .bind(max_in_flight.map(|n| n.max(1)))
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        model_from_row(&row)
+    }
+
+    /// Set the capacity-tuning mode (`static` or `tuned`) for a model. Switching
+    /// to `static` leaves `max_in_flight` and `capacity_tuned_at` untouched so
+    /// operators can keep or edit the value the tuner found.
+    pub async fn update_model_capacity_mode(
+        &self,
+        id: Uuid,
+        capacity_mode: &str,
+    ) -> Result<ModelRoute> {
+        let row = sqlx::query(
+            "update models set capacity_mode = $2, updated_at = now()
+             where id = $1
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+                       input_cost_per_token, output_cost_per_token,
+                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
+                       supports_response_schema, supports_tool_choice, enabled,
+                       cache_enabled, cache_ttl_secs, tags,
+                       capacity_mode, capacity_tuned_at,
+                       created_at, updated_at",
+        )
+        .bind(id)
+        .bind(obleth_config::normalize_capacity_mode(capacity_mode))
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        model_from_row(&row)
+    }
+
+    /// Apply a value found by auto-tune: set `max_in_flight`, flip the model to
+    /// `tuned` mode, and stamp `capacity_tuned_at` so the dashboard can show
+    /// when the recommendation was last applied.
+    pub async fn apply_tuned_model_capacity(
+        &self,
+        id: Uuid,
+        max_in_flight: i64,
+    ) -> Result<ModelRoute> {
+        let row = sqlx::query(
+            "update models set max_in_flight = $2, capacity_mode = 'tuned',
+                    capacity_tuned_at = now(), updated_at = now()
+             where id = $1
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+                       input_cost_per_token, output_cost_per_token,
+                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
+                       supports_response_schema, supports_tool_choice, enabled,
+                       cache_enabled, cache_ttl_secs, tags,
+                       capacity_mode, capacity_tuned_at,
+                       created_at, updated_at",
+        )
+        .bind(id)
+        .bind(max_in_flight.max(1))
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -760,6 +823,7 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
                        cache_enabled, cache_ttl_secs, tags,
+                       capacity_mode, capacity_tuned_at,
                        created_at, updated_at",
         )
         .bind(id)
@@ -835,6 +899,7 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, enabled,
                        cache_enabled, cache_ttl_secs, tags,
+                       capacity_mode, capacity_tuned_at,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1501,6 +1566,12 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         context_window: row.try_get("context_window")?,
         admission_weight: row.try_get("admission_weight")?,
         max_in_flight: row.try_get("max_in_flight")?,
+        // Tolerant reads for the capacity-mode columns: statements that don't
+        // select them degrade to the static default rather than erroring.
+        capacity_mode: row
+            .try_get::<String, _>("capacity_mode")
+            .unwrap_or_else(|_| obleth_config::DEFAULT_CAPACITY_MODE.to_string()),
+        capacity_tuned_at: row.try_get("capacity_tuned_at").unwrap_or(None),
         supports_function_calling: row.try_get("supports_function_calling")?,
         supports_system_messages: row.try_get("supports_system_messages")?,
         supports_response_schema: row.try_get("supports_response_schema")?,

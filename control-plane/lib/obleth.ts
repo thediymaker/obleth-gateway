@@ -75,6 +75,8 @@ export interface ModelRoute {
   context_window: number;
   admission_weight: number;
   max_in_flight: number | null;
+  capacity_mode: string;
+  capacity_tuned_at: string | null;
   supports_function_calling: boolean;
   supports_system_messages: boolean;
   supports_response_schema: boolean;
@@ -85,6 +87,39 @@ export interface ModelRoute {
   tags: string[];
   created_at: string;
   updated_at: string;
+}
+
+export type AutotuneKneeReason =
+  | "latency_degraded"
+  | "plateau"
+  | "max_concurrency"
+  | "no_data";
+
+export type AutotuneWorkload = "chat" | "coding";
+
+export interface AutotuneStep {
+  concurrency: number;
+  throughput_rps: number;
+  p99_ms: number;
+  p50_ms: number;
+  requests: number;
+  errors: number;
+}
+
+export interface AutotuneReport {
+  model_id: string;
+  model_name: string;
+  modality: string;
+  workload: AutotuneWorkload;
+  recommended_max_in_flight: number;
+  knee_reason: AutotuneKneeReason;
+  baseline_p99_ms: number;
+  latency_ceiling_ms: number;
+  latency_headroom: number;
+  max_concurrency: number;
+  recommended_throughput_rps: number;
+  steps: AutotuneStep[];
+  duration_ms: number;
 }
 
 export interface ModelHealthSummary {
@@ -503,6 +538,24 @@ export const obleth = {
   setModelCapacity: (id: string, max_in_flight: number | null) =>
     api<ModelRoute>(`/models/${id}/capacity`, {
       method: "PUT",
+      body: JSON.stringify({ max_in_flight }),
+    }),
+  setModelCapacityMode: (id: string, capacity_mode: string) =>
+    api<ModelRoute>(`/models/${id}/capacity-mode`, {
+      method: "PUT",
+      body: JSON.stringify({ capacity_mode }),
+    }),
+  autotuneModel: (
+    id: string,
+    opts?: { workload?: AutotuneWorkload; latency_headroom?: number; replicas?: number }
+  ) =>
+    api<AutotuneReport>(`/models/${id}/autotune`, {
+      method: "POST",
+      body: JSON.stringify(opts ?? {}),
+    }),
+  applyAutotuneCapacity: (id: string, max_in_flight: number) =>
+    api<ModelRoute>(`/models/${id}/autotune/apply`, {
+      method: "POST",
       body: JSON.stringify({ max_in_flight }),
     }),
   setModelCache: (id: string, cache_enabled: boolean, cache_ttl_secs?: number) =>
