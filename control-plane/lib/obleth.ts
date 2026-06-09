@@ -230,6 +230,21 @@ export interface UsageKeyAgg {
   total_tokens: number;
 }
 
+/// Per-key activity summary: last-used metadata plus rolling usage totals.
+/// `last_used_ms` is `0` when the key has no requests in the queried range.
+export interface KeyUsageSummary {
+  key_id: string;
+  tenant_id: string;
+  last_used_ms: number;
+  last_model: string;
+  last_status_code: number;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+}
+
 export interface UsageModelAgg {
   model: string;
   requests: number;
@@ -274,6 +289,48 @@ export interface UsageDailyRow {
   avg_total_ms: number;
   /** Total USD spend, summed from each request's frozen completion-time cost. */
   cost_usd: number;
+}
+
+/// One row of the live request log (`usage/logs`), enriched with tenant/key names.
+export interface UsageLogEntry {
+  request_id: string;
+  ts_ms: number;
+  tenant_id: string;
+  key_id: string;
+  model: string;
+  request_type: string;
+  session_id: string;
+  admission: string;
+  status_code: number;
+  input_tokens: number;
+  output_tokens: number;
+  total_tokens: number;
+  queue_wait_ms: number;
+  ttft_ms: number;
+  total_ms: number;
+  cache_status: string;
+  cost_usd: number;
+  tenant_name: string;
+  key_name: string;
+  key_prefix: string;
+}
+
+export type UsageLogStatus = "success" | "error";
+
+export interface UsageLogParams {
+  tenantId?: string;
+  keyId?: string;
+  model?: string;
+  requestType?: string;
+  sessionId?: string;
+  status?: UsageLogStatus;
+  requestId?: string;
+  sinceMs?: number;
+  untilMs?: number;
+  /** Keyset cursor for older pages: rows strictly before this (ts, request id). */
+  beforeMs?: number;
+  beforeRequestId?: string;
+  limit?: number;
 }
 
 export interface UsageRetentionView {
@@ -649,6 +706,16 @@ export const obleth = {
   usage: (sinceMs?: number) => api<UsageAgg[]>(`/usage${qs({ since_ms: sinceMs })}`),
   usageByKey: (sinceMs?: number, limit?: number) =>
     api<UsageKeyAgg[]>(`/usage/keys${qs({ since_ms: sinceMs, limit })}`),
+  keyUsage: (id: string, sinceMs?: number) =>
+    api<KeyUsageSummary>(`/keys/${id}/usage${qs({ since_ms: sinceMs })}`),
+  usageKeysSummary: (params: { tenantId?: string; sinceMs?: number; limit?: number } = {}) =>
+    api<KeyUsageSummary[]>(
+      `/usage/keys/summary${qs({
+        tenant_id: params.tenantId,
+        since_ms: params.sinceMs,
+        limit: params.limit,
+      })}`,
+    ),
   usageByModel: (sinceMs?: number) => api<UsageModelAgg[]>(`/usage/models${qs({ since_ms: sinceMs })}`),
   usageSeries: (bucketMs = 300_000, sinceMs?: number) =>
     api<UsageTimePoint[]>(`/usage/series${qs({ bucket_ms: bucketMs, since_ms: sinceMs })}`),
@@ -664,6 +731,23 @@ export const obleth = {
         tenant_id: params.tenantId,
         key_id: params.keyId,
         model: params.model,
+      })}`,
+    ),
+  usageLogs: (params: UsageLogParams = {}) =>
+    api<UsageLogEntry[]>(
+      `/usage/logs${qs({
+        tenant_id: params.tenantId,
+        key_id: params.keyId,
+        model: params.model,
+        request_type: params.requestType,
+        session_id: params.sessionId,
+        status: params.status,
+        request_id: params.requestId,
+        since_ms: params.sinceMs,
+        until_ms: params.untilMs,
+        before_ms: params.beforeMs,
+        before_request_id: params.beforeRequestId,
+        limit: params.limit,
       })}`,
     ),
   getUsageRetention: () => api<UsageRetentionView>("/settings/usage-retention"),

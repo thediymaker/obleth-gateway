@@ -89,8 +89,10 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/keys", get(list_keys))
         .route("/api/v1/keys/:id", delete(delete_key))
         .route("/api/v1/keys/:id/disabled", put(set_key_disabled))
+        .route("/api/v1/keys/:id/usage", get(get_key_usage))
         .route("/api/v1/usage", get(get_usage))
         .route("/api/v1/usage/keys", get(get_usage_keys))
+        .route("/api/v1/usage/keys/summary", get(get_usage_keys_summary))
         .route("/api/v1/usage/models", get(get_usage_models))
         .route("/api/v1/usage/series", get(get_usage_series))
         .route(
@@ -98,6 +100,7 @@ pub fn router(state: AdminState) -> Router {
             get(get_usage_series_tenants),
         )
         .route("/api/v1/usage/cache", get(get_cache_stats))
+        .route("/api/v1/usage/logs", get(get_usage_logs))
         .route("/api/v1/usage/daily", get(get_usage_daily))
         .route("/api/v1/usage/compact", post(compact_usage))
         .route("/api/v1/costs", get(get_costs))
@@ -1285,6 +1288,54 @@ async fn get_usage_keys(
     Ok(Json(usage::query_usage_by_key(&state.clickhouse, q).await?))
 }
 
+/// Activity summary for a single API key: last-used timestamp, last model and
+/// status, and rolling request/token/cost totals. 404s when the key id is
+/// unknown; a known key with no traffic yet returns a zeroed summary
+/// (`last_used_ms = 0`) rather than 404.
+async fn get_key_usage(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<usage::KeyUsageSummaryQuery>,
+) -> Result<Json<usage::KeyUsageSummary>> {
+    // Validate the key exists (and recover its tenant for the never-used case)
+    // before touching ClickHouse, so unknown ids are a clean 404.
+    let key = state
+        .store
+        .keys_by_ids(&[id])
+        .await?
+        .into_iter()
+        .next()
+        .ok_or(AdminError::NotFound)?;
+
+    let summary = usage::query_key_usage_summary(&state.clickhouse, id, q.since_ms)
+        .await?
+        .unwrap_or(usage::KeyUsageSummary {
+            key_id: id,
+            tenant_id: key.tenant_id,
+            last_used_ms: 0,
+            last_model: String::new(),
+            last_status_code: 0,
+            requests: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            total_tokens: 0,
+            cost_usd: 0.0,
+        });
+    Ok(Json(summary))
+}
+
+/// Bulk per-key activity summary for the dashboard Keys table. Returns the
+/// busiest keys (by token volume) that saw traffic in the window, each with
+/// last-used metadata so the UI can show "last used" without N+1 log fetches.
+async fn get_usage_keys_summary(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::KeyUsageSummaryQuery>,
+) -> Result<Json<Vec<usage::KeyUsageSummary>>> {
+    Ok(Json(
+        usage::query_keys_usage_summary(&state.clickhouse, q).await?,
+    ))
+}
+
 async fn get_usage_models(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageQuery>,
@@ -1335,6 +1386,70 @@ async fn get_costs(
     Ok(Json(
         usage::query_costs(&state.clickhouse, q.since_ms, &costs).await?,
     ))
+}
+
+/// A request-log row enriched with the human-readable tenant and key names
+/// resolved from Postgres, so the live log view does not have to display bare
+/// UUIDs.
+#[derive(Debug, Serialize)]
+pub struct UsageLogEntry {
+    #[serde(flatten)]
+    pub row: usage::UsageLogRow,
+    pub tenant_name: String,
+    pub key_name: String,
+    pub key_prefix: String,
+}
+
+/// Newest-first feed of individual requests for the live log view. ClickHouse
+/// stores only UUIDs, so the page's tenant/key ids are resolved to names in a
+/// pair of bounded Postgres lookups (tenants are few; keys are fetched by the
+/// exact ids on the page rather than the full fleet).
+async fn get_usage_logs(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::UsageLogQuery>,
+) -> Result<Json<Vec<UsageLogEntry>>> {
+    let rows = usage::query_usage_logs(&state.clickhouse, q).await?;
+
+    let tenant_names: std::collections::HashMap<Uuid, String> = state
+        .store
+        .list_tenants()
+        .await?
+        .into_iter()
+        .map(|t| (t.id, t.name))
+        .collect();
+
+    let key_ids: Vec<Uuid> = {
+        let mut ids: Vec<Uuid> = rows.iter().map(|r| r.key_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    let key_meta: std::collections::HashMap<Uuid, (String, String)> = state
+        .store
+        .keys_by_ids(&key_ids)
+        .await?
+        .into_iter()
+        .map(|k| (k.id, (k.name, k.key_prefix)))
+        .collect();
+
+    let entries = rows
+        .into_iter()
+        .map(|row| {
+            let tenant_name = tenant_names
+                .get(&row.tenant_id)
+                .cloned()
+                .unwrap_or_default();
+            let (key_name, key_prefix) = key_meta.get(&row.key_id).cloned().unwrap_or_default();
+            UsageLogEntry {
+                row,
+                tenant_name,
+                key_name,
+                key_prefix,
+            }
+        })
+        .collect();
+
+    Ok(Json(entries))
 }
 
 #[utoipa::path(get, path = "/api/v1/usage/daily", tag = "usage", responses((status = 200, body = [usage::UsageDailyRow])))]

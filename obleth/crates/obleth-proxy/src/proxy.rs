@@ -126,6 +126,14 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             .to_string()
     };
 
+    // Request-log metadata, captured once so every `finalize` path (cache hit,
+    // rejection, upstream error, streamed success) records the same session and
+    // request class.
+    let req_meta = RequestMeta {
+        session_id: extract_session_id(&headers, &json),
+        request_type: request_type_for_path(&path),
+    };
+
     // ---- auto model selection ----
     // `model: "auto"` is resolved to a concrete registered model from request
     // shape (estimated context size, required capabilities) and live load. From
@@ -230,6 +238,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 finalize(
                     &state,
                     &resolved,
+                    &req_meta,
                     &model,
                     Admission::Fast,
                     est,
@@ -312,6 +321,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             finalize(
                 &state,
                 &resolved,
+                &req_meta,
                 &model,
                 Admission::Rejected,
                 est,
@@ -377,6 +387,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                     finalize(
                         &state,
                         &resolved,
+                        &req_meta,
                         &model,
                         Admission::Rejected,
                         est,
@@ -570,6 +581,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             finalize(
                 &state,
                 &resolved,
+                &req_meta,
                 &model,
                 admission,
                 est,
@@ -617,6 +629,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // ---- stream back, inspecting for actual usage, then reconcile ----
     let stream_state = state.clone();
     let resolved_for_stream = resolved.clone();
+    let meta_for_stream = req_meta.clone();
     let body_stream = async_stream::stream! {
         let mut byte_stream = upstream.bytes_stream();
         let mut first = true;
@@ -751,6 +764,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         finalize(
             &stream_state,
             &resolved_for_stream,
+            &meta_for_stream,
             &model,
             admission,
             est,
@@ -1369,10 +1383,82 @@ fn find_int_after(haystack: &str, key: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// Per-request metadata captured once at the top of the handler and shared by
+/// every `finalize` path, so the request-log columns are identical regardless
+/// of where the request terminates (cache hit, rejection, upstream error, or
+/// streamed success). Cheap to clone for the response-stream closure.
+#[derive(Clone)]
+struct RequestMeta {
+    /// Client-supplied session id grouping related requests, or empty.
+    session_id: String,
+    /// Coarse request class derived from the request path.
+    request_type: &'static str,
+}
+
+/// Classify a request by its OpenAI-style path suffix. Matching the suffix (not
+/// the full path) keeps this robust to version prefixes (`/v1/...`) or any
+/// future routing prefix.
+fn request_type_for_path(path: &str) -> &'static str {
+    if path.ends_with("/chat/completions") {
+        "chat"
+    } else if path.ends_with("/responses") {
+        "responses"
+    } else if path.ends_with("/completions") {
+        "completion"
+    } else if path.ends_with("/embeddings") {
+        "embedding"
+    } else if path.contains("/audio/") {
+        "audio"
+    } else if path.contains("/images/") {
+        "image"
+    } else if path.ends_with("/rerank") || path.ends_with("/reranking") {
+        "rerank"
+    } else if path.ends_with("/moderations") {
+        "moderation"
+    } else {
+        "other"
+    }
+}
+
+/// Resolve a session id for request-log grouping. An explicit header wins, then
+/// common request-body conventions. The value is trimmed and length-capped so a
+/// hostile client cannot bloat the ledger row.
+fn extract_session_id(headers: &HeaderMap, json: &serde_json::Value) -> String {
+    const MAX: usize = 200;
+    let capped = |s: &str| -> String { s.trim().chars().take(MAX).collect() };
+
+    if let Some(s) = headers
+        .get("x-obleth-session-id")
+        .or_else(|| headers.get("x-session-id"))
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return capped(s);
+    }
+
+    // Body conventions: litellm uses `metadata.session_id`; some clients send a
+    // top-level `session_id`, and the OpenAI `user` field is a useful fallback.
+    let candidates = [
+        json.get("session_id").and_then(|v| v.as_str()),
+        json.get("metadata")
+            .and_then(|m| m.get("session_id"))
+            .and_then(|v| v.as_str()),
+        json.get("user").and_then(|v| v.as_str()),
+    ];
+    for c in candidates.into_iter().flatten() {
+        if !c.trim().is_empty() {
+            return capped(c);
+        }
+    }
+    String::new()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finalize(
     state: &AppState,
     resolved: &ResolvedKey,
+    meta: &RequestMeta,
     model: &str,
     admission: Admission,
     est: CostEstimate,
@@ -1411,6 +1497,8 @@ fn finalize(
         cache_status: cache_status.to_string(),
         cost_usd,
         ts_ms: now_ms(),
+        session_id: meta.session_id.clone(),
+        request_type: meta.request_type.to_string(),
     });
 }
 

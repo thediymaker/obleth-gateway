@@ -48,6 +48,8 @@ struct UsageRow {
     cache_status: String,
     cost_usd: f64,
     ts_ms: i64,
+    session_id: String,
+    request_type: String,
 }
 
 impl From<UsageRecord> for UsageRow {
@@ -69,6 +71,8 @@ impl From<UsageRecord> for UsageRow {
             cache_status: r.cache_status,
             cost_usd: r.cost_usd,
             ts_ms: r.ts_ms,
+            session_id: r.session_id,
+            request_type: r.request_type,
         }
     }
 }
@@ -267,6 +271,8 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             cache_status LowCardinality(String) DEFAULT 'off',
             cost_usd Float64 DEFAULT 0,
             ts_ms Int64,
+            session_id String DEFAULT '',
+            request_type LowCardinality(String) DEFAULT '',
             ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms)
         ) ENGINE = MergeTree()
         PARTITION BY toYYYYMMDD(ts)
@@ -284,6 +290,20 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
     client
         .query(&format!(
             "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS cost_usd Float64 DEFAULT 0"
+        ))
+        .execute()
+        .await?;
+    // Idempotent adds for databases created before the per-request log surfaced
+    // session grouping and request class.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS session_id String DEFAULT ''"
+        ))
+        .execute()
+        .await?;
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS request_type LowCardinality(String) DEFAULT ''"
         ))
         .execute()
         .await?;

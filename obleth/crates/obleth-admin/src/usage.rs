@@ -61,6 +61,151 @@ pub fn parse_key_ids(raw: Option<&str>) -> Result<Vec<Uuid>, uuid::Error> {
     }
 }
 
+/// Filters for the raw per-request log feed (`GET /api/v1/usage/logs`). This is
+/// the only read that returns individual `usage` rows rather than an aggregate,
+/// and it powers the live request-log view in the control plane.
+#[derive(Debug, Deserialize)]
+pub struct UsageLogQuery {
+    pub tenant_id: Option<Uuid>,
+    pub key_id: Option<Uuid>,
+    pub model: Option<String>,
+    /// Coarse request class (`chat`, `embedding`, `audio`, ...).
+    pub request_type: Option<String>,
+    pub session_id: Option<String>,
+    /// Status filter: `success` (2xx/3xx), `error` (>=400), or all (default).
+    pub status: Option<String>,
+    /// Case-insensitive prefix match on the request id, for the search box.
+    pub request_id: Option<String>,
+    /// Inclusive lower bound, unix epoch millis. Defaults to the last 24h.
+    pub since_ms: Option<i64>,
+    /// Inclusive upper bound, unix epoch millis. Open-ended by default.
+    pub until_ms: Option<i64>,
+    /// Keyset cursor for "older" pages: return rows strictly before this
+    /// timestamp. Paired with `before_request_id` to break ties at the same ms.
+    pub before_ms: Option<i64>,
+    pub before_request_id: Option<Uuid>,
+    /// Page size (highest `ts_ms` first). Clamped to a sane ceiling.
+    pub limit: Option<u64>,
+}
+
+/// A single request as stored in the `usage` ledger, returned newest-first for
+/// the live log view. UUIDs are resolved to tenant/key names by the handler.
+#[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
+pub struct UsageLogRow {
+    #[serde(with = "clickhouse::serde::uuid")]
+    #[schema(value_type = String)]
+    pub request_id: Uuid,
+    /// Unix epoch milliseconds at request completion.
+    pub ts_ms: i64,
+    #[serde(with = "clickhouse::serde::uuid")]
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
+    #[schema(value_type = String)]
+    pub key_id: Uuid,
+    pub model: String,
+    pub request_type: String,
+    pub session_id: String,
+    pub admission: String,
+    pub status_code: u16,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub total_tokens: u64,
+    pub queue_wait_ms: u32,
+    pub ttft_ms: u32,
+    pub total_ms: u32,
+    pub cache_status: String,
+    pub cost_usd: f64,
+}
+
+/// Read individual `usage` rows newest-first, honoring the supplied filters and
+/// keyset cursor. Bind order below must track the `?` placeholders exactly,
+/// since the ClickHouse client binds positionally.
+pub async fn query_usage_logs(
+    client: &clickhouse::Client,
+    q: UsageLogQuery,
+) -> Result<Vec<UsageLogRow>, clickhouse::error::Error> {
+    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+
+    let mut sql = String::from(
+        "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, \
+         admission, status_code, input_tokens, output_tokens, \
+         toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
+         queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd \
+         from usage where ts_ms >= ?",
+    );
+    if q.until_ms.is_some() {
+        sql.push_str(" and ts_ms <= ?");
+    }
+    if q.tenant_id.is_some() {
+        sql.push_str(" and tenant_id = toUUID(?)");
+    }
+    if q.key_id.is_some() {
+        sql.push_str(" and key_id = toUUID(?)");
+    }
+    if q.model.is_some() {
+        sql.push_str(" and model = ?");
+    }
+    if q.request_type.is_some() {
+        sql.push_str(" and request_type = ?");
+    }
+    if q.session_id.is_some() {
+        sql.push_str(" and session_id = ?");
+    }
+    match q.status.as_deref() {
+        Some("success") => sql.push_str(" and status_code >= 200 and status_code < 400"),
+        Some("error") => sql.push_str(" and status_code >= 400"),
+        _ => {}
+    }
+    if q.request_id.is_some() {
+        sql.push_str(" and startsWith(lower(toString(request_id)), lower(?))");
+    }
+    // Keyset cursor: (ts_ms, request_id) tuple strictly less than the cursor.
+    // Tuple comparison matches the `order by` below for stable paging.
+    if q.before_ms.is_some() && q.before_request_id.is_some() {
+        sql.push_str(" and (ts_ms, toString(request_id)) < (?, ?)");
+    } else if q.before_ms.is_some() {
+        sql.push_str(" and ts_ms < ?");
+    }
+    // Order by the same expression the keyset cursor compares against
+    // (`toString(request_id)`), so paging is stable across millisecond ties:
+    // ClickHouse's native UUID ordering differs from its string ordering.
+    sql.push_str(&format!(
+        " order by ts_ms desc, toString(request_id) desc limit {limit}"
+    ));
+
+    let mut query = client.query(&sql).bind(since);
+    if let Some(until) = q.until_ms {
+        query = query.bind(until);
+    }
+    if let Some(tid) = q.tenant_id {
+        query = query.bind(tid.to_string());
+    }
+    if let Some(kid) = q.key_id {
+        query = query.bind(kid.to_string());
+    }
+    if let Some(model) = &q.model {
+        query = query.bind(model.clone());
+    }
+    if let Some(rt) = &q.request_type {
+        query = query.bind(rt.clone());
+    }
+    if let Some(sid) = &q.session_id {
+        query = query.bind(sid.clone());
+    }
+    if let Some(rid) = &q.request_id {
+        query = query.bind(rid.clone());
+    }
+    if let (Some(before_ms), Some(before_id)) = (q.before_ms, q.before_request_id) {
+        query = query.bind(before_ms).bind(before_id.to_string());
+    } else if let Some(before_ms) = q.before_ms {
+        query = query.bind(before_ms);
+    }
+
+    query.fetch_all::<UsageLogRow>().await
+}
+
 /// One row of the daily rollup, shaped by the requested `group_by`. Identity
 /// columns that aren't part of the grouping come back empty/zero.
 #[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
@@ -247,6 +392,119 @@ pub async fn query_usage_by_key(
     bind_usage_filters(client.query(&sql).bind(since), &q)
         .fetch_all::<UsageKeyAgg>()
         .await
+}
+
+/// Filters for the per-key usage summary feeds (`/keys/{id}/usage` and
+/// `/usage/keys/summary`).
+#[derive(Debug, Deserialize)]
+pub struct KeyUsageSummaryQuery {
+    /// Restrict the bulk feed to one tenant (UUID). Ignored by the single-key
+    /// endpoint, which is already scoped to one key.
+    pub tenant_id: Option<Uuid>,
+    /// Rolling window for the request/token/cost aggregates, unix epoch millis.
+    /// Defaults to the last 24h. Note this does **not** bound `last_used_ms` for
+    /// the single-key endpoint (which reports the true last use within the
+    /// ledger retention window); it does for the bulk endpoint.
+    pub since_ms: Option<i64>,
+    /// Cap on rows returned by the bulk feed (busiest keys first).
+    pub limit: Option<u64>,
+}
+
+/// Activity summary for a single API key: when it was last seen, what it last
+/// called, and rolling usage totals. `last_used_ms` is `0` when the key has no
+/// requests in the queried range (i.e. never used, within ledger retention).
+#[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
+pub struct KeyUsageSummary {
+    #[serde(with = "clickhouse::serde::uuid")]
+    #[schema(value_type = String)]
+    pub key_id: Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    /// Unix epoch millis of the most recent request, or `0` if never used.
+    pub last_used_ms: i64,
+    /// Model named on the most recent request (empty if never used).
+    pub last_model: String,
+    /// HTTP status of the most recent request (`0` if never used).
+    pub last_status_code: u16,
+    /// Requests in the rolling window.
+    pub requests: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    /// USD spend in the window, summed from each request's frozen cost.
+    pub cost_usd: f64,
+}
+
+/// Summary for one key. `last_used_ms` / `last_model` / `last_status_code` are
+/// computed over the full retained ledger for that key (cheap — one key is a
+/// narrow scan), while the request/token/cost columns are limited to the
+/// rolling window. Returns `None` when the key has never appeared in the ledger.
+pub async fn query_key_usage_summary(
+    client: &clickhouse::Client,
+    key_id: Uuid,
+    since_ms: Option<i64>,
+) -> Result<Option<KeyUsageSummary>, clickhouse::error::Error> {
+    let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let sql = "select \
+         key_id, \
+         any(tenant_id) as tenant_id, \
+         max(ts_ms) as last_used_ms, \
+         argMax(model, ts_ms) as last_model, \
+         argMax(status_code, ts_ms) as last_status_code, \
+         countIf(ts_ms >= ?) as requests, \
+         sumIf(input_tokens, ts_ms >= ?) as input_tokens, \
+         sumIf(output_tokens, ts_ms >= ?) as output_tokens, \
+         sumIf(toUInt64(input_tokens) + toUInt64(output_tokens), ts_ms >= ?) as total_tokens, \
+         sumIf(cost_usd, ts_ms >= ?) as cost_usd \
+         from usage where key_id = toUUID(?) group by key_id";
+    let rows = client
+        .query(sql)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(key_id.to_string())
+        .fetch_all::<KeyUsageSummary>()
+        .await?;
+    Ok(rows.into_iter().next())
+}
+
+/// Bulk per-key summary for the dashboard. The window (`since_ms`) bounds the
+/// whole scan, so `last_used_ms` here is the last use *within the window* and
+/// only keys with activity in the window are returned. Ordered by token volume.
+pub async fn query_keys_usage_summary(
+    client: &clickhouse::Client,
+    q: KeyUsageSummaryQuery,
+) -> Result<Vec<KeyUsageSummary>, clickhouse::error::Error> {
+    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let limit = q.limit.unwrap_or(1000).min(10_000);
+    let mut sql = String::from(
+        "select \
+         key_id, \
+         any(tenant_id) as tenant_id, \
+         max(ts_ms) as last_used_ms, \
+         argMax(model, ts_ms) as last_model, \
+         argMax(status_code, ts_ms) as last_status_code, \
+         count() as requests, \
+         sum(input_tokens) as input_tokens, \
+         sum(output_tokens) as output_tokens, \
+         sum(toUInt64(input_tokens) + toUInt64(output_tokens)) as total_tokens, \
+         sum(cost_usd) as cost_usd \
+         from usage where ts_ms >= ?",
+    );
+    if q.tenant_id.is_some() {
+        sql.push_str(" and tenant_id = toUUID(?)");
+    }
+    sql.push_str(&format!(
+        " group by key_id order by total_tokens desc limit {limit}"
+    ));
+    let mut query = client.query(&sql).bind(since);
+    if let Some(tid) = q.tenant_id {
+        query = query.bind(tid.to_string());
+    }
+    query.fetch_all::<KeyUsageSummary>().await
 }
 
 pub async fn query_usage_by_model(

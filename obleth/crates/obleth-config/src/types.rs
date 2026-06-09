@@ -504,6 +504,18 @@ pub struct UsageRecord {
     pub cost_usd: f64,
     /// Unix epoch milliseconds at request completion.
     pub ts_ms: i64,
+    /// Client-supplied session/conversation id used to group related requests
+    /// in the live request log (e.g. a multi-turn chat). Empty when the caller
+    /// did not provide one. `#[serde(default)]` keeps older WAL records
+    /// replayable.
+    #[serde(default)]
+    pub session_id: String,
+    /// Coarse request class derived from the request path (e.g. `chat`,
+    /// `embedding`, `audio`, `image`, `completion`, `responses`, `rerank`,
+    /// `other`). Surfaced as the "Type" column in the request log.
+    /// `#[serde(default)]` keeps older WAL records replayable.
+    #[serde(default)]
+    pub request_type: String,
 }
 
 /// Runtime-configurable retention for the raw per-request `usage` ledger.

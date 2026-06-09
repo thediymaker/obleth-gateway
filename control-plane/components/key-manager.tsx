@@ -15,7 +15,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
-import type { ApiKey, Tenant, UsageKeyAgg } from "@/lib/obleth";
+import type { ApiKey, KeyUsageSummary, Tenant } from "@/lib/obleth";
 import { KeyUsageChart } from "@/components/fairshare-dashboard";
 import { formatNumber } from "@/lib/utils";
 
@@ -26,11 +26,11 @@ type StatusFilter = "all" | "active" | "disabled";
 export function KeyManager({
   tenants,
   keys,
-  usageByKey,
+  keyUsage,
 }: {
   tenants: Tenant[];
   keys: ApiKey[];
-  usageByKey: UsageKeyAgg[];
+  keyUsage: KeyUsageSummary[];
 }) {
   const [secret, setSecret] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -44,7 +44,7 @@ export function KeyManager({
 
   const tenantNameMap = useMemo(() => Object.fromEntries(tenants.map((t) => [t.id, t.name])), [tenants]);
   const tenantName = (id: string) => tenantNameMap[id] ?? id.slice(0, 8);
-  const usageMap = useMemo(() => new Map(usageByKey.map((u) => [u.key_id, u])), [usageByKey]);
+  const usageMap = useMemo(() => new Map(keyUsage.map((u) => [u.key_id, u])), [keyUsage]);
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -207,7 +207,7 @@ export function KeyManager({
         </CardContent>
       </Card>
 
-      <KeyUsageChart keys={keys} usageByKey={usageByKey} tenantNames={tenantNameMap} />
+      <KeyUsageChart keys={keys} usageByKey={keyUsage} tenantNames={tenantNameMap} />
 
       <Card>
         <CardHeader className="gap-3">
@@ -291,6 +291,7 @@ export function KeyManager({
                   <th className="px-3 py-3 font-medium">Prefix</th>
                   <th className="px-3 py-3 font-medium">Tenant</th>
                   <th className="px-3 py-3 font-medium">Name</th>
+                  <th className="px-3 py-3 font-medium">Last used</th>
                   <th className="px-3 py-3 text-right font-medium">Requests</th>
                   <th className="px-3 py-3 text-right font-medium">Tokens</th>
                   <th className="px-3 py-3 font-medium">Status</th>
@@ -315,6 +316,9 @@ export function KeyManager({
                       <td className="px-3 py-3 font-mono text-xs">{k.key_prefix}...</td>
                       <td className="px-3 py-3">{tenantName(k.tenant_id)}</td>
                       <td className="px-3 py-3">{k.name}</td>
+                      <td className="px-3 py-3 text-xs text-muted-foreground" title={u?.last_model ? `Last model: ${u.last_model}` : undefined}>
+                        {formatLastUsed(u?.last_used_ms)}
+                      </td>
                       <td className="px-3 py-3 text-right tabular-nums">{formatNumber(Number(u?.requests ?? 0))}</td>
                       <td className="px-3 py-3 text-right tabular-nums">{formatNumber(Number(u?.total_tokens ?? 0))}</td>
                       <td className="px-3 py-3">
@@ -347,7 +351,7 @@ export function KeyManager({
                 })}
                 {filtered.length === 0 && (
                   <tr>
-                    <td colSpan={8} className="px-6 py-10 text-center text-muted-foreground">
+                    <td colSpan={9} className="px-6 py-10 text-center text-muted-foreground">
                       {keys.length === 0 ? "No keys yet." : "No keys match your filters."}
                     </td>
                   </tr>
@@ -375,6 +379,22 @@ export function KeyManager({
       </Card>
     </div>
   );
+}
+
+// Compact relative "last used" label. Falls back to an absolute date past a
+// week. `0` / undefined means the key had no traffic in the queried window.
+function formatLastUsed(ms?: number): string {
+  if (!ms || ms <= 0) return "Never";
+  const diff = Date.now() - ms;
+  if (diff < 0) return "Just now";
+  const min = Math.floor(diff / 60_000);
+  if (min < 1) return "Just now";
+  if (min < 60) return `${min}m ago`;
+  const hours = Math.floor(min / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 7) return `${days}d ago`;
+  return new Date(ms).toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
 }
 
 function Stat({ label, value }: { label: string; value: string }) {

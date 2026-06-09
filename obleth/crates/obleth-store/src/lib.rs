@@ -395,6 +395,23 @@ impl Store {
         rows.iter().map(api_key_from_row).collect()
     }
 
+    /// Fetch a bounded set of keys by id in one query. Used to resolve the
+    /// key ids on a page of request-log rows to display names without loading
+    /// the full key fleet (which can be 100k+).
+    pub async fn keys_by_ids(&self, ids: &[Uuid]) -> Result<Vec<ApiKey>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query(
+            "select id, tenant_id, name, key_prefix, disabled, created_at
+             from api_keys where id = any($1)",
+        )
+        .bind(ids)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(api_key_from_row).collect()
+    }
+
     pub async fn set_key_disabled(
         &self,
         id: Uuid,
