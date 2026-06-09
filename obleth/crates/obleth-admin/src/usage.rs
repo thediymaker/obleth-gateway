@@ -418,10 +418,46 @@ pub struct KeyUsageSummaryQuery {
     pub limit: Option<u64>,
 }
 
+/// ClickHouse row for per-key summary queries. Aggregate aliases intentionally
+/// avoid colliding with source column names (`in_tok` not `input_tokens`) so
+/// ClickHouse does not resolve inner `sumIf(input_tokens, …)` to the alias.
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+struct KeyUsageSummaryRow {
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub key_id: Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub tenant_id: Uuid,
+    pub last_used_ms: i64,
+    pub last_model: String,
+    pub last_status_code: u16,
+    pub requests: u64,
+    pub in_tok: u64,
+    pub out_tok: u64,
+    pub total_tok: u64,
+    pub cost_sum: f64,
+}
+
+impl From<KeyUsageSummaryRow> for KeyUsageSummary {
+    fn from(r: KeyUsageSummaryRow) -> Self {
+        KeyUsageSummary {
+            key_id: r.key_id,
+            tenant_id: r.tenant_id,
+            last_used_ms: r.last_used_ms,
+            last_model: r.last_model,
+            last_status_code: r.last_status_code,
+            requests: r.requests,
+            input_tokens: r.in_tok,
+            output_tokens: r.out_tok,
+            total_tokens: r.total_tok,
+            cost_usd: r.cost_sum,
+        }
+    }
+}
+
 /// Activity summary for a single API key: when it was last seen, what it last
 /// called, and rolling usage totals. `last_used_ms` is `0` when the key has no
 /// requests in the queried range (i.e. never used, within ledger retention).
-#[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct KeyUsageSummary {
     #[serde(with = "clickhouse::serde::uuid")]
     #[schema(value_type = String)]
@@ -461,10 +497,10 @@ pub async fn query_key_usage_summary(
          argMax(model, ts_ms) as last_model, \
          argMax(status_code, ts_ms) as last_status_code, \
          countIf(ts_ms >= ?) as requests, \
-         sumIf(input_tokens, ts_ms >= ?) as input_tokens, \
-         sumIf(output_tokens, ts_ms >= ?) as output_tokens, \
-         sumIf(toUInt64(input_tokens) + toUInt64(output_tokens), ts_ms >= ?) as total_tokens, \
-         sumIf(cost_usd, ts_ms >= ?) as cost_usd \
+         sumIf(input_tokens, ts_ms >= ?) as in_tok, \
+         sumIf(output_tokens, ts_ms >= ?) as out_tok, \
+         sumIf(toUInt64(input_tokens) + toUInt64(output_tokens), ts_ms >= ?) as total_tok, \
+         sumIf(cost_usd, ts_ms >= ?) as cost_sum \
          from usage where key_id = toUUID(?) group by key_id";
     let rows = client
         .query(sql)
@@ -474,9 +510,9 @@ pub async fn query_key_usage_summary(
         .bind(since)
         .bind(since)
         .bind(key_id.to_string())
-        .fetch_all::<KeyUsageSummary>()
+        .fetch_all::<KeyUsageSummaryRow>()
         .await?;
-    Ok(rows.into_iter().next())
+    Ok(rows.into_iter().next().map(KeyUsageSummary::from))
 }
 
 /// Bulk per-key summary for the dashboard. The window (`since_ms`) bounds the
@@ -496,23 +532,25 @@ pub async fn query_keys_usage_summary(
          argMax(model, ts_ms) as last_model, \
          argMax(status_code, ts_ms) as last_status_code, \
          count() as requests, \
-         sum(input_tokens) as input_tokens, \
-         sum(output_tokens) as output_tokens, \
-         sum(toUInt64(input_tokens) + toUInt64(output_tokens)) as total_tokens, \
-         sum(cost_usd) as cost_usd \
+         sum(input_tokens) as in_tok, \
+         sum(output_tokens) as out_tok, \
+         sum(toUInt64(input_tokens) + toUInt64(output_tokens)) as total_tok, \
+         sum(cost_usd) as cost_sum \
          from usage where ts_ms >= ?",
     );
     if q.tenant_id.is_some() {
-        sql.push_str(" and tenant_id = toUUID(?)");
+        // Qualify the raw column so the SELECT alias `tenant_id` cannot shadow it.
+        sql.push_str(" and usage.tenant_id = toUUID(?)");
     }
     sql.push_str(&format!(
-        " group by key_id order by total_tokens desc limit {limit}"
+        " group by key_id order by total_tok desc limit {limit}"
     ));
     let mut query = client.query(&sql).bind(since);
     if let Some(tid) = q.tenant_id {
         query = query.bind(tid.to_string());
     }
-    query.fetch_all::<KeyUsageSummary>().await
+    let rows = query.fetch_all::<KeyUsageSummaryRow>().await?;
+    Ok(rows.into_iter().map(KeyUsageSummary::from).collect())
 }
 
 pub async fn query_usage_by_model(

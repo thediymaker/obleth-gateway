@@ -13,7 +13,7 @@ export default async function KeysPage() {
   const [tenants, keys, keyUsage] = await Promise.all([
     safe(obleth.listTenants(), []),
     safe(obleth.listKeys(), []),
-    safe(obleth.usageKeysSummary({ sinceMs: Date.now() - KEY_USAGE_WINDOW_MS, limit: 5000 }), []),
+    obleth.keyUsageForDashboard({ sinceMs: Date.now() - KEY_USAGE_WINDOW_MS, limit: 5000 }),
   ]);
 
   return (

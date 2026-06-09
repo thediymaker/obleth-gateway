@@ -716,6 +716,30 @@ export const obleth = {
         limit: params.limit,
       })}`,
     ),
+  /** Bulk per-key summary with automatic fallback to `/usage/keys` while summary is rolling out. */
+  keyUsageForDashboard: async (params: { sinceMs?: number; limit?: number } = {}) => {
+    try {
+      return await api<KeyUsageSummary[]>(
+        `/usage/keys/summary${qs({ since_ms: params.sinceMs, limit: params.limit })}`,
+      );
+    } catch {
+      const legacy = await api<UsageKeyAgg[]>(
+        `/usage/keys${qs({ since_ms: params.sinceMs, limit: params.limit })}`,
+      ).catch(() => [] as UsageKeyAgg[]);
+      return legacy.map((u) => ({
+        key_id: u.key_id,
+        tenant_id: u.tenant_id,
+        last_used_ms: 0,
+        last_model: "",
+        last_status_code: 0,
+        requests: u.requests,
+        input_tokens: u.input_tokens,
+        output_tokens: u.output_tokens,
+        total_tokens: u.total_tokens,
+        cost_usd: 0,
+      }));
+    }
+  },
   usageByModel: (sinceMs?: number) => api<UsageModelAgg[]>(`/usage/models${qs({ since_ms: sinceMs })}`),
   usageSeries: (bucketMs = 300_000, sinceMs?: number) =>
     api<UsageTimePoint[]>(`/usage/series${qs({ bucket_ms: bucketMs, since_ms: sinceMs })}`),
