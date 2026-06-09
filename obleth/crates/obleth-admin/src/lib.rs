@@ -528,9 +528,28 @@ pub struct UpdateMcpServer {
     pub enabled: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
 pub struct ListKeysQuery {
+    #[schema(value_type = Option<String>)]
     pub tenant_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
+pub struct AuditQuery {
+    pub limit: Option<i64>,
+}
+
+/// OpenAPI shape for audit-log rows (`GET /api/v1/audit`).
+#[derive(Debug, Serialize, ToSchema)]
+pub struct AuditEntryView {
+    pub id: i64,
+    #[schema(value_type = String)]
+    pub ts: chrono::DateTime<chrono::Utc>,
+    pub actor: String,
+    pub action: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub detail: serde_json::Value,
 }
 
 // ---- handlers ------------------------------------------------------------
@@ -581,6 +600,11 @@ async fn list_tenants(State(state): State<AdminState>) -> Result<Json<Vec<Tenant
     Ok(Json(state.store.list_tenants().await?))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/tenants/{id}", tag = "tenants",
+    params(("id" = Uuid, Path, description = "Tenant id")),
+    responses((status = 200, body = Tenant), (status = 404))
+)]
 async fn get_tenant(State(state): State<AdminState>, Path(id): Path<Uuid>) -> Result<Json<Tenant>> {
     Ok(Json(state.store.get_tenant(id).await?))
 }
@@ -1171,6 +1195,12 @@ async fn patch_weight(
     Ok(Json(tenant))
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/tenants/{id}/quota", tag = "tenants",
+    params(("id" = Uuid, Path, description = "Tenant id")),
+    request_body = UpdateQuota,
+    responses((status = 200, body = Tenant))
+)]
 async fn put_quota(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -1225,6 +1255,11 @@ async fn create_key(
     Ok(Json(CreatedKey { key, secret }))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/keys", tag = "keys",
+    params(ListKeysQuery),
+    responses((status = 200, body = [ApiKey]))
+)]
 async fn list_keys(
     State(state): State<AdminState>,
     Query(q): Query<ListKeysQuery>,
@@ -1232,6 +1267,11 @@ async fn list_keys(
     Ok(Json(state.store.list_keys(q.tenant_id).await?))
 }
 
+#[utoipa::path(
+    delete, path = "/api/v1/keys/{id}", tag = "keys",
+    params(("id" = Uuid, Path, description = "API key id")),
+    responses((status = 204), (status = 404))
+)]
 async fn delete_key(State(state): State<AdminState>, Path(id): Path<Uuid>) -> Result<StatusCode> {
     let hash = state.store.delete_key(id).await?;
     let _ = state.redis.delete_resolved_key(&hash).await;
@@ -1249,6 +1289,12 @@ async fn delete_key(State(state): State<AdminState>, Path(id): Path<Uuid>) -> Re
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/keys/{id}/disabled", tag = "keys",
+    params(("id" = Uuid, Path, description = "API key id")),
+    request_body = SetDisabled,
+    responses((status = 204), (status = 404))
+)]
 async fn set_key_disabled(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -1273,7 +1319,11 @@ async fn set_key_disabled(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[utoipa::path(get, path = "/api/v1/usage", tag = "usage", responses((status = 200, body = [usage::UsageAgg])))]
+#[utoipa::path(
+    get, path = "/api/v1/usage", tag = "usage",
+    params(usage::UsageQuery),
+    responses((status = 200, body = [usage::UsageAgg]))
+)]
 async fn get_usage(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageQuery>,
@@ -1281,6 +1331,11 @@ async fn get_usage(
     Ok(Json(usage::query_usage(&state.clickhouse, q).await?))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/usage/keys", tag = "usage",
+    params(usage::UsageQuery),
+    responses((status = 200, body = [usage::UsageKeyAgg]))
+)]
 async fn get_usage_keys(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageQuery>,
@@ -1292,6 +1347,14 @@ async fn get_usage_keys(
 /// status, and rolling request/token/cost totals. 404s when the key id is
 /// unknown; a known key with no traffic yet returns a zeroed summary
 /// (`last_used_ms = 0`) rather than 404.
+#[utoipa::path(
+    get, path = "/api/v1/keys/{id}/usage", tag = "keys",
+    params(
+        ("id" = Uuid, Path, description = "API key id"),
+        usage::KeyUsageSummaryQuery
+    ),
+    responses((status = 200, body = usage::KeyUsageSummary), (status = 404))
+)]
 async fn get_key_usage(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -1327,6 +1390,11 @@ async fn get_key_usage(
 /// Bulk per-key activity summary for the dashboard Keys table. Returns the
 /// busiest keys (by token volume) that saw traffic in the window, each with
 /// last-used metadata so the UI can show "last used" without N+1 log fetches.
+#[utoipa::path(
+    get, path = "/api/v1/usage/keys/summary", tag = "usage",
+    params(usage::KeyUsageSummaryQuery),
+    responses((status = 200, body = [usage::KeyUsageSummary]))
+)]
 async fn get_usage_keys_summary(
     State(state): State<AdminState>,
     Query(q): Query<usage::KeyUsageSummaryQuery>,
@@ -1336,6 +1404,11 @@ async fn get_usage_keys_summary(
     ))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/usage/models", tag = "usage",
+    params(usage::UsageQuery),
+    responses((status = 200, body = [usage::UsageModelAgg]))
+)]
 async fn get_usage_models(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageQuery>,
@@ -1345,6 +1418,11 @@ async fn get_usage_models(
     ))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/usage/series", tag = "usage",
+    params(usage::UsageSeriesQuery),
+    responses((status = 200, body = [usage::UsageTimePoint]))
+)]
 async fn get_usage_series(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageSeriesQuery>,
@@ -1352,6 +1430,11 @@ async fn get_usage_series(
     Ok(Json(usage::query_usage_series(&state.clickhouse, q).await?))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/usage/series/tenants", tag = "usage",
+    params(usage::UsageSeriesQuery),
+    responses((status = 200, body = [usage::TenantUsageTimePoint]))
+)]
 async fn get_usage_series_tenants(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageSeriesQuery>,
@@ -1361,6 +1444,11 @@ async fn get_usage_series_tenants(
     ))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/usage/cache", tag = "usage",
+    params(usage::UsageQuery),
+    responses((status = 200, body = usage::CacheStats))
+)]
 async fn get_cache_stats(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageQuery>,
@@ -1368,6 +1456,11 @@ async fn get_cache_stats(
     Ok(Json(usage::query_cache_stats(&state.clickhouse, q).await?))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/costs", tag = "usage",
+    params(usage::UsageQuery),
+    responses((status = 200, body = [usage::CostAgg]))
+)]
 async fn get_costs(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageQuery>,
@@ -1404,6 +1497,12 @@ pub struct UsageLogEntry {
 /// stores only UUIDs, so the page's tenant/key ids are resolved to names in a
 /// pair of bounded Postgres lookups (tenants are few; keys are fetched by the
 /// exact ids on the page rather than the full fleet).
+#[utoipa::path(
+    get, path = "/api/v1/usage/logs", tag = "usage",
+    params(usage::UsageLogQuery),
+    responses((status = 200, body = [usage::UsageLogRow],
+        description = "Each row also includes tenant_name, key_name, and key_prefix resolved from Postgres"))
+)]
 async fn get_usage_logs(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageLogQuery>,
@@ -1452,7 +1551,11 @@ async fn get_usage_logs(
     Ok(Json(entries))
 }
 
-#[utoipa::path(get, path = "/api/v1/usage/daily", tag = "usage", responses((status = 200, body = [usage::UsageDailyRow])))]
+#[utoipa::path(
+    get, path = "/api/v1/usage/daily", tag = "usage",
+    params(usage::UsageDailyQuery),
+    responses((status = 200, body = [usage::UsageDailyRow]))
+)]
 async fn get_usage_daily(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageDailyQuery>,
@@ -1563,6 +1666,10 @@ async fn compact_usage(State(state): State<AdminState>) -> Result<Json<CompactUs
     }))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/stats", tag = "usage",
+    responses((status = 200, body = LiveStats))
+)]
 async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
     use obleth_fairshare::CapacityProvider;
     use std::sync::atomic::Ordering;
@@ -1573,6 +1680,10 @@ async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
     })
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/fairshare/live", tag = "fairshare",
+    responses((status = 200, body = FairshareLiveView))
+)]
 async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<FairshareLiveView>> {
     let snap = state
         .fairshare
@@ -1636,12 +1747,21 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
     }))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/fairshare/groups", tag = "fairshare",
+    responses((status = 200, body = [FairshareGroup]))
+)]
 async fn list_fairshare_groups(
     State(state): State<AdminState>,
 ) -> Result<Json<Vec<FairshareGroup>>> {
     Ok(Json(state.store.list_fairshare_groups().await?))
 }
 
+#[utoipa::path(
+    post, path = "/api/v1/fairshare/groups", tag = "fairshare",
+    request_body = CreateFairshareGroup,
+    responses((status = 200, body = FairshareGroup))
+)]
 async fn create_fairshare_group(
     State(state): State<AdminState>,
     Json(body): Json<CreateFairshareGroup>,
@@ -1663,6 +1783,12 @@ async fn create_fairshare_group(
     Ok(Json(group))
 }
 
+#[utoipa::path(
+    patch, path = "/api/v1/fairshare/groups/{name}/weight", tag = "fairshare",
+    params(("name" = String, Path, description = "Fairshare group name")),
+    request_body = UpdateGroupWeight,
+    responses((status = 200, body = FairshareGroup))
+)]
 async fn patch_fairshare_group_weight(
     State(state): State<AdminState>,
     Path(name): Path<String>,
@@ -1686,6 +1812,12 @@ async fn patch_fairshare_group_weight(
     Ok(Json(group))
 }
 
+#[utoipa::path(
+    patch, path = "/api/v1/tenants/{id}/group", tag = "tenants",
+    params(("id" = Uuid, Path, description = "Tenant id")),
+    request_body = UpdateTenantGroup,
+    responses((status = 200, body = Tenant))
+)]
 async fn patch_tenant_group(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -1717,6 +1849,11 @@ async fn resync_all_keys(state: &AdminState) -> Result<()> {
     Ok(())
 }
 
+#[utoipa::path(
+    post, path = "/api/v1/models", tag = "models",
+    request_body = CreateModel,
+    responses((status = 200, body = ModelRoute))
+)]
 async fn create_model(
     State(state): State<AdminState>,
     Json(body): Json<CreateModel>,
@@ -1776,10 +1913,19 @@ async fn create_model(
     Ok(Json(model))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/models", tag = "models",
+    responses((status = 200, body = [ModelRoute]))
+)]
 async fn list_models(State(state): State<AdminState>) -> Result<Json<Vec<ModelRoute>>> {
     Ok(Json(state.store.list_models().await?))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/models/{id}", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    responses((status = 200, body = ModelRoute), (status = 404))
+)]
 async fn get_model(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -1787,6 +1933,12 @@ async fn get_model(
     Ok(Json(state.store.get_model(id).await?))
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/models/{id}", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = UpdateModel,
+    responses((status = 200, body = ModelRoute))
+)]
 async fn update_model(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -1842,6 +1994,12 @@ async fn update_model(
     Ok(Json(model))
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/models/{id}/capacity", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = SetModelCapacity,
+    responses((status = 200, body = ModelRoute))
+)]
 async fn set_model_capacity(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -1981,6 +2139,12 @@ async fn apply_autotune_capacity(
     Ok(Json(model))
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/models/{id}/weight", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = SetModelWeight,
+    responses((status = 200, body = ModelRoute))
+)]
 async fn set_model_weight(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -2004,6 +2168,12 @@ async fn set_model_weight(
     Ok(Json(model))
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/models/{id}/cache", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = SetModelCache,
+    responses((status = 200, body = ModelRoute))
+)]
 async fn set_model_cache(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -2030,6 +2200,12 @@ async fn set_model_cache(
     Ok(Json(model))
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/models/{id}/reliability", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = SetModelReliability,
+    responses((status = 200, body = ModelRoute))
+)]
 async fn set_model_reliability(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -2066,6 +2242,11 @@ async fn set_model_reliability(
 
 // ---- model endpoints -----------------------------------------------------
 
+#[utoipa::path(
+    get, path = "/api/v1/models/{id}/endpoints", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    responses((status = 200, body = [ModelEndpoint]))
+)]
 async fn list_model_endpoints(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -2076,6 +2257,12 @@ async fn list_model_endpoints(
     Ok(Json(state.store.list_model_endpoints(id).await?))
 }
 
+#[utoipa::path(
+    post, path = "/api/v1/models/{id}/endpoints", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    request_body = CreateModelEndpoint,
+    responses((status = 200, body = ModelEndpoint))
+)]
 async fn create_model_endpoint(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -2113,6 +2300,15 @@ async fn create_model_endpoint(
     Ok(Json(endpoint))
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/models/{id}/endpoints/{endpoint_id}", tag = "models",
+    params(
+        ("id" = Uuid, Path, description = "Model id"),
+        ("endpoint_id" = Uuid, Path, description = "Endpoint id")
+    ),
+    request_body = UpdateModelEndpoint,
+    responses((status = 200, body = ModelEndpoint))
+)]
 async fn update_model_endpoint(
     State(state): State<AdminState>,
     Path((id, endpoint_id)): Path<(Uuid, Uuid)>,
@@ -2151,6 +2347,14 @@ async fn update_model_endpoint(
     Ok(Json(endpoint))
 }
 
+#[utoipa::path(
+    delete, path = "/api/v1/models/{id}/endpoints/{endpoint_id}", tag = "models",
+    params(
+        ("id" = Uuid, Path, description = "Model id"),
+        ("endpoint_id" = Uuid, Path, description = "Endpoint id")
+    ),
+    responses((status = 204), (status = 404))
+)]
 async fn delete_model_endpoint(
     State(state): State<AdminState>,
     Path((id, endpoint_id)): Path<(Uuid, Uuid)>,
@@ -2171,6 +2375,11 @@ async fn delete_model_endpoint(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    delete, path = "/api/v1/models/{id}", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    responses((status = 204), (status = 404))
+)]
 async fn delete_model(State(state): State<AdminState>, Path(id): Path<Uuid>) -> Result<StatusCode> {
     let model = state.store.get_model(id).await?;
     state.store.delete_model(id).await?;
@@ -2194,6 +2403,11 @@ async fn delete_model(State(state): State<AdminState>, Path(id): Path<Uuid>) -> 
 
 // ---- mcp servers ---------------------------------------------------------
 
+#[utoipa::path(
+    post, path = "/api/v1/mcp-servers", tag = "mcp",
+    request_body = CreateMcpServer,
+    responses((status = 200, body = McpServer))
+)]
 async fn create_mcp_server(
     State(state): State<AdminState>,
     Json(body): Json<CreateMcpServer>,
@@ -2217,10 +2431,19 @@ async fn create_mcp_server(
     Ok(Json(server))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/mcp-servers", tag = "mcp",
+    responses((status = 200, body = [McpServer]))
+)]
 async fn list_mcp_servers(State(state): State<AdminState>) -> Result<Json<Vec<McpServer>>> {
     Ok(Json(state.store.list_mcp_servers().await?))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/mcp-servers/{id}", tag = "mcp",
+    params(("id" = Uuid, Path, description = "MCP server id")),
+    responses((status = 200, body = McpServer), (status = 404))
+)]
 async fn get_mcp_server(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -2228,6 +2451,12 @@ async fn get_mcp_server(
     Ok(Json(state.store.get_mcp_server(id).await?))
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/mcp-servers/{id}", tag = "mcp",
+    params(("id" = Uuid, Path, description = "MCP server id")),
+    request_body = UpdateMcpServer,
+    responses((status = 200, body = McpServer))
+)]
 async fn update_mcp_server(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -2262,6 +2491,11 @@ async fn update_mcp_server(
     Ok(Json(server))
 }
 
+#[utoipa::path(
+    delete, path = "/api/v1/mcp-servers/{id}", tag = "mcp",
+    params(("id" = Uuid, Path, description = "MCP server id")),
+    responses((status = 204), (status = 404))
+)]
 async fn delete_mcp_server(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -2286,6 +2520,11 @@ async fn delete_mcp_server(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/audit", tag = "audit",
+    params(AuditQuery),
+    responses((status = 200, body = [AuditEntryView]))
+)]
 async fn get_audit(
     State(state): State<AdminState>,
     Query(q): Query<AuditQuery>,
@@ -2293,11 +2532,10 @@ async fn get_audit(
     Ok(Json(state.store.list_audit(q.limit.unwrap_or(100)).await?))
 }
 
-#[derive(Debug, Deserialize)]
-pub struct AuditQuery {
-    pub limit: Option<i64>,
-}
-
+#[utoipa::path(
+    get, path = "/api/v1/capacity", tag = "capacity",
+    responses((status = 200, body = CapacityView))
+)]
 async fn get_capacity(State(state): State<AdminState>) -> Json<CapacityView> {
     use obleth_fairshare::CapacityProvider;
     Json(CapacityView {
@@ -2305,6 +2543,11 @@ async fn get_capacity(State(state): State<AdminState>) -> Json<CapacityView> {
     })
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/capacity", tag = "capacity",
+    request_body = SetCapacity,
+    responses((status = 200, body = CapacityView))
+)]
 async fn set_capacity(
     State(state): State<AdminState>,
     Json(body): Json<SetCapacity>,

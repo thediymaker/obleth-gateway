@@ -2,12 +2,14 @@
 
 use clickhouse::Row;
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct UsageQuery {
+    #[schema(value_type = Option<String>)]
     pub tenant_id: Option<Uuid>,
+    #[schema(value_type = Option<String>)]
     pub key_id: Option<Uuid>,
     pub model: Option<String>,
     /// Lower bound, unix epoch millis. Defaults to the last 24h.
@@ -19,8 +21,9 @@ pub struct UsageQuery {
     pub limit: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct UsageSeriesQuery {
+    #[schema(value_type = Option<String>)]
     pub tenant_id: Option<Uuid>,
     pub since_ms: Option<i64>,
     /// Bucket width in milliseconds. Default 300_000 (5 minutes).
@@ -28,12 +31,13 @@ pub struct UsageSeriesQuery {
 }
 
 /// Date-range read against the permanent daily rollup (`usage_daily`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct UsageDailyQuery {
     /// Inclusive lower bound, `YYYY-MM-DD`. Defaults to 7 days ago.
     pub start_day: Option<String>,
     /// Inclusive upper bound, `YYYY-MM-DD`. Defaults to today.
     pub end_day: Option<String>,
+    #[schema(value_type = Option<String>)]
     pub tenant_id: Option<Uuid>,
     /// One or more key ids. Accepts a single UUID or a comma-separated list
     /// (`key_id=a,b,c`) so a caller can fetch spend across all of a user's
@@ -64,9 +68,11 @@ pub fn parse_key_ids(raw: Option<&str>) -> Result<Vec<Uuid>, uuid::Error> {
 /// Filters for the raw per-request log feed (`GET /api/v1/usage/logs`). This is
 /// the only read that returns individual `usage` rows rather than an aggregate,
 /// and it powers the live request-log view in the control plane.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct UsageLogQuery {
+    #[schema(value_type = Option<String>)]
     pub tenant_id: Option<Uuid>,
+    #[schema(value_type = Option<String>)]
     pub key_id: Option<Uuid>,
     pub model: Option<String>,
     /// Coarse request class (`chat`, `embedding`, `audio`, ...).
@@ -83,6 +89,7 @@ pub struct UsageLogQuery {
     /// Keyset cursor for "older" pages: return rows strictly before this
     /// timestamp. Paired with `before_request_id` to break ties at the same ms.
     pub before_ms: Option<i64>,
+    #[schema(value_type = Option<String>)]
     pub before_request_id: Option<Uuid>,
     /// Page size (highest `ts_ms` first). Clamped to a sane ceiling.
     pub limit: Option<u64>,
@@ -396,10 +403,11 @@ pub async fn query_usage_by_key(
 
 /// Filters for the per-key usage summary feeds (`/keys/{id}/usage` and
 /// `/usage/keys/summary`).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct KeyUsageSummaryQuery {
     /// Restrict the bulk feed to one tenant (UUID). Ignored by the single-key
     /// endpoint, which is already scoped to one key.
+    #[schema(value_type = Option<String>)]
     pub tenant_id: Option<Uuid>,
     /// Rolling window for the request/token/cost aggregates, unix epoch millis.
     /// Defaults to the last 24h. Note this does **not** bound `last_used_ms` for
