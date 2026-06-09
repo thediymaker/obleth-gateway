@@ -46,6 +46,7 @@ struct UsageRow {
     total_ms: u32,
     status_code: u16,
     cache_status: String,
+    cost_usd: f64,
     ts_ms: i64,
 }
 
@@ -66,6 +67,7 @@ impl From<UsageRecord> for UsageRow {
             total_ms: r.total_ms,
             status_code: r.status_code,
             cache_status: r.cache_status,
+            cost_usd: r.cost_usd,
             ts_ms: r.ts_ms,
         }
     }
@@ -263,6 +265,7 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             total_ms UInt32,
             status_code UInt16,
             cache_status LowCardinality(String) DEFAULT 'off',
+            cost_usd Float64 DEFAULT 0,
             ts_ms Int64,
             ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms)
         ) ENGINE = MergeTree()
@@ -274,6 +277,13 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
     client
         .query(&format!(
             "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS cache_status LowCardinality(String) DEFAULT 'off'"
+        ))
+        .execute()
+        .await?;
+    // Idempotent add for databases created before per-request cost was frozen.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS cost_usd Float64 DEFAULT 0"
         ))
         .execute()
         .await?;
@@ -305,12 +315,20 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
             cache_hits UInt64,
             cache_misses UInt64,
             ttft_ms_sum UInt64,
-            total_ms_sum UInt64
+            total_ms_sum UInt64,
+            cost_usd_sum Float64
         ) ENGINE = SummingMergeTree()
         PARTITION BY toYYYYMM(day)
         ORDER BY (day, tenant_id, key_id, model)"
     );
     client.query(&table_ddl).execute().await?;
+    // Idempotent add for rollups created before per-request cost was frozen.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage_daily ADD COLUMN IF NOT EXISTS cost_usd_sum Float64 DEFAULT 0"
+        ))
+        .execute()
+        .await?;
 
     // The aggregation projection shared by the materialized view and the
     // backfill, so both compute identical columns from the raw ledger.
@@ -332,7 +350,8 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
         countIf(cache_status = 'hit') AS cache_hits,
         countIf(cache_status = 'miss') AS cache_misses,
         sumIf(ttft_ms, status_code >= 200 AND status_code < 400) AS ttft_ms_sum,
-        sumIf(total_ms, status_code >= 200 AND status_code < 400) AS total_ms_sum";
+        sumIf(total_ms, status_code >= 200 AND status_code < 400) AS total_ms_sum,
+        sum(cost_usd) AS cost_usd_sum";
 
     // One-time backfill BEFORE the view exists, and only when the rollup is
     // empty, so restarts never double-count (SummingMergeTree would otherwise

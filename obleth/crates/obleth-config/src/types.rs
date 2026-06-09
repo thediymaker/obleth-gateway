@@ -494,6 +494,14 @@ pub struct UsageRecord {
     pub status_code: u16,
     /// Response cache outcome: `hit`, `miss`, or `off` (caching not enabled).
     pub cache_status: String,
+    /// USD cost of this request, frozen at completion using the model's
+    /// per-token (and per-modality) rates in effect at that moment. Stored so
+    /// spend reporting never has to recompute from tokens × current price, and
+    /// so editing a model's price later can't rewrite historical spend.
+    /// `#[serde(default)]` keeps WAL records written before this field existed
+    /// replayable.
+    #[serde(default)]
+    pub cost_usd: f64,
     /// Unix epoch milliseconds at request completion.
     pub ts_ms: i64,
 }

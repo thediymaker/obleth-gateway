@@ -201,6 +201,16 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let effective_weight = effective_admission_weight(resolved.weight, route.as_ref());
     let mut est = state.tokenizer.estimate_request(&json);
 
+    // Cost rates and per-request modality surcharge captured up front so every
+    // `finalize` path (cache hit, rejection, upstream error, streamed success)
+    // can freeze an identical USD cost, and so the post-stream term-usage commit
+    // can reuse them after `route` is moved out of the request scope.
+    let (in_cost_rate, out_cost_rate) = route
+        .as_ref()
+        .map(|r| (r.input_cost_per_token, r.output_cost_per_token))
+        .unwrap_or((0.0, 0.0));
+    let modality_cost = compute_modality_cost(route.as_ref(), &json);
+
     // ---- response cache (exact-match, before admission so hits cost nothing) ----
     let cache_enabled = route.as_ref().map(|r| r.cache_enabled).unwrap_or(false);
     let cache_ttl = route.as_ref().map(|r| r.cache_ttl_secs).unwrap_or(0);
@@ -230,6 +240,9 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                     0,
                     cached.status,
                     "hit",
+                    (cached.input_tokens as f64) * in_cost_rate
+                        + (cached.output_tokens as f64) * out_cost_rate
+                        + modality_cost,
                 );
                 return cached_response(cached);
             }
@@ -309,6 +322,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 0,
                 429,
                 cache_status_label,
+                0.0,
             );
             return error_json(StatusCode::TOO_MANY_REQUESTS, "token budget exceeded");
         }
@@ -373,6 +387,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                         0,
                         403,
                         cache_status_label,
+                        0.0,
                     );
                     return error_json(StatusCode::FORBIDDEN, "tenant term budget exhausted");
                 }
@@ -387,15 +402,6 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             }
         }
     }
-    // Cost rates captured for the post-stream term-usage commit (route isn't
-    // moved into the streaming closure).
-    let (in_cost_rate, out_cost_rate) = route
-        .as_ref()
-        .map(|r| (r.input_cost_per_token, r.output_cost_per_token))
-        .unwrap_or((0.0, 0.0));
-    // Per-request modality surcharge (image generations, TTS) computed before
-    // the streaming closure takes ownership of the request state.
-    let modality_cost = compute_modality_cost(route.as_ref(), &json);
 
     // ---- proxy upstream ----
     // Resolve the per-request timeout and retry policy. Both default to the
@@ -574,6 +580,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 0,
                 code,
                 cache_status_label,
+                0.0,
             );
             let detail = if timed_out {
                 "upstream request timed out"
@@ -706,14 +713,17 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         }
 
         // ---- term-usage commit + budget alerts (Phase 3 + Phase 5) ----
+        // Frozen request cost: per-token rates (captured at admission) plus any
+        // per-request modality surcharge. Computed once and used for both the
+        // term-budget commit and the persisted usage ledger so they agree.
+        let cost_usd = (input_tokens as f64) * in_cost_rate
+            + (output_tokens as f64) * out_cost_rate
+            + modality_cost;
         if let Some(period) = &term_period {
-            let cost = (input_tokens as f64) * in_cost_rate
-                + (output_tokens as f64) * out_cost_rate
-                + modality_cost;
             let added = input_tokens.saturating_add(output_tokens) as i64;
             match stream_state
                 .redis
-                .term_usage_add(&resolved_for_stream.tenant_id, period, added, cost)
+                .term_usage_add(&resolved_for_stream.tenant_id, period, added, cost_usd)
                 .await
             {
                 Ok((total_tokens, total_cost)) => {
@@ -751,6 +761,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             total_ms,
             status_code,
             cache_status_label,
+            cost_usd,
         );
         stream_state.metrics.total_ms.observe(total_ms as f64);
 
@@ -1372,6 +1383,7 @@ fn finalize(
     total_ms: u32,
     status_code: u16,
     cache_status: &str,
+    cost_usd: f64,
 ) {
     state
         .metrics
@@ -1397,6 +1409,7 @@ fn finalize(
         total_ms,
         status_code,
         cache_status: cache_status.to_string(),
+        cost_usd,
         ts_ms: now_ms(),
     });
 }

@@ -272,6 +272,8 @@ export interface UsageDailyRow {
   cache_misses: number;
   avg_ttft_ms: number;
   avg_total_ms: number;
+  /** Total USD spend, summed from each request's frozen completion-time cost. */
+  cost_usd: number;
 }
 
 export interface UsageRetentionView {

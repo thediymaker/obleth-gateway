@@ -68,6 +68,9 @@ pub struct UsageDailyRow {
     pub avg_ttft_ms: f64,
     /// Average end-to-end latency in ms across the grouped rows.
     pub avg_total_ms: f64,
+    /// Total USD spend across the grouped rows, summed from the per-request
+    /// cost frozen at completion time (never recomputed from current prices).
+    pub cost_usd: f64,
 }
 
 /// Per-tenant usage aggregate.
@@ -343,23 +346,34 @@ pub async fn query_costs(
     since_ms: Option<i64>,
     model_costs: &[(String, f64, f64)],
 ) -> Result<Vec<CostAgg>, clickhouse::error::Error> {
-    let usage = query_usage_by_model(
-        client,
-        UsageQuery {
-            tenant_id: None,
-            key_id: None,
-            model: None,
-            since_ms,
-            group_by: Some("model".into()),
-            limit: None,
-        },
-    )
-    .await?;
+    // One row per model from the raw ledger, carrying the authoritative spend
+    // (`total_cost`) summed from each request's frozen cost — never recomputed
+    // from current prices. The per-token rates are only used to split that
+    // total into an informational input/output breakdown.
+    #[derive(Row, Deserialize)]
+    struct CostRawRow {
+        model: String,
+        requests: u64,
+        input_tokens: u64,
+        output_tokens: u64,
+        total_cost: f64,
+    }
+    let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let rows = client
+        .query(
+            "select model, count() as requests, \
+             sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens, \
+             sum(cost_usd) as total_cost \
+             from usage where ts_ms >= ? group by model order by total_cost desc",
+        )
+        .bind(since)
+        .fetch_all::<CostRawRow>()
+        .await?;
     let cost_map: std::collections::HashMap<String, (f64, f64)> = model_costs
         .iter()
         .map(|(m, i, o)| (m.clone(), (*i, *o)))
         .collect();
-    Ok(usage
+    Ok(rows
         .into_iter()
         .map(|u| {
             let (in_rate, out_rate) = cost_map.get(&u.model).copied().unwrap_or((0.0, 0.0));
@@ -372,7 +386,7 @@ pub async fn query_costs(
                 output_tokens: u.output_tokens,
                 input_cost,
                 output_cost,
-                total_cost: input_cost + output_cost,
+                total_cost: u.total_cost,
             }
         })
         .collect())
@@ -454,7 +468,8 @@ pub async fn query_usage_daily(
          sum(cache_hits), \
          sum(cache_misses), \
          round(sum(ttft_ms_sum) / greatest(sum(success_requests), 1), 1) as avg_ttft_ms, \
-         round(sum(total_ms_sum) / greatest(sum(success_requests), 1), 1) as avg_total_ms \
+         round(sum(total_ms_sum) / greatest(sum(success_requests), 1), 1) as avg_total_ms, \
+         round(sum(cost_usd_sum), 6) as cost_usd \
          from (select * from usage_daily {inner_where}) "
     );
     sql.push_str(group_clause);
