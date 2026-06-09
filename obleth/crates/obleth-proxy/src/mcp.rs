@@ -16,8 +16,9 @@ use axum::extract::{Path, State};
 use axum::http::{header, Request, Response, StatusCode};
 use futures_util::StreamExt;
 use obleth_config::ResolvedMcpServer;
+use std::sync::Arc;
 
-use crate::proxy::{bearer, error_json, forward_headers, resolve_key};
+use crate::proxy::{bearer, error_json, forward_headers, has_path_traversal, resolve_key};
 use crate::state::AppState;
 
 const MCP_BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -31,6 +32,13 @@ pub async fn mcp_handler(
 ) -> Response<Body> {
     let (parts, body) = req.into_parts();
     let headers = parts.headers;
+
+    // ---- reject path traversal in the `*rest` segment before any upstream work ----
+    if let Some(rest) = params.rest.as_deref() {
+        if has_path_traversal(rest) {
+            return error_json(StatusCode::BAD_REQUEST, "invalid request path");
+        }
+    }
 
     // ---- auth (same obleth API key as the data plane) ----
     let Some(secret) = bearer(&headers) else {
@@ -133,12 +141,13 @@ pub struct McpPath {
 }
 
 /// Resolve a registered MCP server via moka, falling back to Redis.
-async fn resolve_mcp(state: &AppState, name: &str) -> Option<ResolvedMcpServer> {
+async fn resolve_mcp(state: &AppState, name: &str) -> Option<Arc<ResolvedMcpServer>> {
     if let Some(s) = state.mcp_cache.get(name).await {
         return Some(s);
     }
     match state.redis.get_resolved_mcp_server(name).await {
         Ok(Some(s)) => {
+            let s = Arc::new(s);
             state.mcp_cache.insert(name.to_string(), s.clone()).await;
             Some(s)
         }

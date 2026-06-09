@@ -2,6 +2,7 @@
 
 import { revalidatePath } from "next/cache";
 import { parse as parseYaml } from "yaml";
+import { z } from "zod";
 import { obleth, OblethApiError } from "@/lib/obleth";
 import type { AutotuneReport, AutotuneWorkload, ModelRoute, UpdateAlertSettings, UpdateAutoRouterSettings } from "@/lib/obleth";
 import { requireSession } from "@/lib/auth/session";
@@ -13,30 +14,125 @@ function actionError(e: unknown): ActionResult {
   return { ok: false, error: e instanceof Error ? e.message : "Unexpected error" };
 }
 
+// ----------------------------------------------------------------------------
+// Input validation
+//
+// Server actions are an untrusted boundary even though the dashboard is the
+// only intended caller, so FormData is validated with zod before any request
+// is forwarded to the obleth admin API. The schemas mirror the previous manual
+// coercion (empty/blank fields fall back to defaults) and add the checks that
+// were previously missing: required non-empty names, valid email/URL shapes,
+// and non-negative numeric fields.
+// ----------------------------------------------------------------------------
+
+/** Trim a FormData value to a string ("" when absent). */
+const trimmed = (v: unknown) => (v == null ? "" : String(v)).trim();
+/** Map "" / null to undefined so zod `.default()` and `.optional()` apply. */
+const blankToUndef = (v: unknown) => {
+  const s = trimmed(v);
+  return s === "" ? undefined : s;
+};
+
+const requiredText = (message: string) =>
+  z.preprocess(trimmed, z.string().min(1, message));
+const optionalText = z.preprocess(trimmed, z.string());
+const checkbox = z.preprocess((v) => v === "on", z.boolean());
+
+/** Optional positive integer (absent when the field is blank). */
+const optionalPositiveInt = z
+  .preprocess(blankToUndef, z.coerce.number().int().positive().optional());
+/** Optional non-negative integer. */
+const optionalNonNegInt = z
+  .preprocess(blankToUndef, z.coerce.number().int().nonnegative().optional());
+/** Non-negative number with a default applied when the field is blank. */
+const nonNegNumber = (def: number) =>
+  z.preprocess(blankToUndef, z.coerce.number().nonnegative().default(def));
+/** Positive integer with a default applied when blank. */
+const positiveIntWithDefault = (def: number) =>
+  z.preprocess(blankToUndef, z.coerce.number().int().positive().default(def));
+
+const tenantCreateSchema = z.object({
+  name: requiredText("Tenant name is required"),
+  weight: optionalPositiveInt,
+  tokens_per_minute: optionalNonNegInt,
+  max_in_flight: optionalPositiveInt,
+});
+
+const tenantUpdateSchema = z.object({
+  id: requiredText("Missing tenant id"),
+  name: requiredText("Tenant name is required"),
+  description: optionalText,
+  organization: optionalText,
+  contact_email: z.preprocess(
+    blankToUndef,
+    z.string().email("Invalid contact email").optional(),
+  ),
+});
+
+const modelFieldsSchema = {
+  description: optionalText,
+  upstream_model: optionalText,
+  api_base: optionalText,
+  model_type: z.preprocess(blankToUndef, z.string().default("chat")),
+  input_cost_per_token: nonNegNumber(0),
+  output_cost_per_token: nonNegNumber(0),
+  cost_per_image: nonNegNumber(0),
+  cost_per_audio_second: nonNegNumber(0),
+  cost_per_character: nonNegNumber(0),
+  context_window: positiveIntWithDefault(8192),
+  admission_weight: positiveIntWithDefault(100),
+  supports_function_calling: checkbox,
+  supports_system_messages: checkbox,
+  supports_response_schema: checkbox,
+  supports_tool_choice: checkbox,
+};
+
+const modelCreateSchema = z.object({
+  model_name: requiredText("Model name is required"),
+  ...modelFieldsSchema,
+});
+
+const mcpCreateSchema = z.object({
+  name: requiredText("Name is required"),
+  upstream_url: z.preprocess(trimmed, z.string().url("A valid upstream URL is required")),
+});
+
+/** Return the first zod issue message for surfacing to the UI. */
+function firstIssue(error: z.ZodError): string {
+  return error.issues[0]?.message ?? "Invalid input";
+}
+
+
 export async function createTenantAction(formData: FormData) {
   await requireSession();
-  const name = String(formData.get("name") ?? "").trim();
-  if (!name) return;
-  await obleth.createTenant({
-    name,
-    weight: numOrUndef(formData.get("weight")),
-    tokens_per_minute: numOrUndef(formData.get("tokens_per_minute")),
-    max_in_flight: numOrUndef(formData.get("max_in_flight")),
+  const parsed = tenantCreateSchema.safeParse({
+    name: formData.get("name"),
+    weight: formData.get("weight"),
+    tokens_per_minute: formData.get("tokens_per_minute"),
+    max_in_flight: formData.get("max_in_flight"),
   });
+  if (!parsed.success) return;
+  await obleth.createTenant(parsed.data);
   revalidatePath("/tenants");
   revalidatePath("/");
 }
 
 export async function updateTenantAction(formData: FormData) {
   await requireSession();
-  const id = String(formData.get("id") ?? "").trim();
-  const name = String(formData.get("name") ?? "").trim();
-  if (!id || !name) return;
+  const parsed = tenantUpdateSchema.safeParse({
+    id: formData.get("id"),
+    name: formData.get("name"),
+    description: formData.get("description"),
+    organization: formData.get("organization"),
+    contact_email: formData.get("contact_email"),
+  });
+  if (!parsed.success) return;
+  const { id, ...rest } = parsed.data;
   await obleth.updateTenant(id, {
-    name,
-    description: String(formData.get("description") ?? "").trim(),
-    organization: String(formData.get("organization") ?? "").trim(),
-    contact_email: String(formData.get("contact_email") ?? "").trim(),
+    name: rest.name,
+    description: rest.description,
+    organization: rest.organization,
+    contact_email: rest.contact_email ?? "",
   });
   revalidatePath("/tenants");
   revalidatePath("/");
@@ -212,26 +308,30 @@ export async function setCapacityAction(max: number) {
 
 export async function createModelAction(formData: FormData): Promise<ActionResult> {
   await requireSession();
+  const parsed = modelCreateSchema.safeParse({
+    model_name: formData.get("model_name"),
+    description: formData.get("description"),
+    upstream_model: formData.get("upstream_model"),
+    api_base: formData.get("api_base"),
+    model_type: formData.get("model_type"),
+    input_cost_per_token: formData.get("input_cost_per_token"),
+    output_cost_per_token: formData.get("output_cost_per_token"),
+    cost_per_image: formData.get("cost_per_image"),
+    cost_per_audio_second: formData.get("cost_per_audio_second"),
+    cost_per_character: formData.get("cost_per_character"),
+    context_window: formData.get("context_window"),
+    admission_weight: formData.get("admission_weight"),
+    supports_function_calling: formData.get("supports_function_calling"),
+    supports_system_messages: formData.get("supports_system_messages"),
+    supports_response_schema: formData.get("supports_response_schema"),
+    supports_tool_choice: formData.get("supports_tool_choice"),
+  });
+  if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
   try {
     await obleth.createModel({
-      model_name: String(formData.get("model_name") ?? "").trim(),
-      description: String(formData.get("description") ?? "").trim(),
-      upstream_model: String(formData.get("upstream_model") ?? "").trim(),
-      api_base: String(formData.get("api_base") ?? "").trim(),
+      ...parsed.data,
       api_key: strOrNull(formData.get("api_key")),
-      model_type: String(formData.get("model_type") ?? "chat").trim() || "chat",
-      input_cost_per_token: numOr(formData.get("input_cost_per_token"), 0),
-      output_cost_per_token: numOr(formData.get("output_cost_per_token"), 0),
-      cost_per_image: numOr(formData.get("cost_per_image"), 0),
-      cost_per_audio_second: numOr(formData.get("cost_per_audio_second"), 0),
-      cost_per_character: numOr(formData.get("cost_per_character"), 0),
-      context_window: numOr(formData.get("context_window"), 8192),
-      admission_weight: numOr(formData.get("admission_weight"), 100),
       max_in_flight: numOrNull(formData.get("max_in_flight")),
-      supports_function_calling: formData.get("supports_function_calling") === "on",
-      supports_system_messages: formData.get("supports_system_messages") === "on",
-      supports_response_schema: formData.get("supports_response_schema") === "on",
-      supports_tool_choice: formData.get("supports_tool_choice") === "on",
       tags: tagsFromForm(formData),
     });
   } catch (e) {
@@ -345,24 +445,28 @@ export async function updateModelAction(formData: FormData) {
   await requireSession();
   const id = String(formData.get("id") ?? "");
   if (!id) return;
+  const parsed = modelCreateSchema.omit({ model_name: true }).safeParse({
+    description: formData.get("description"),
+    upstream_model: formData.get("upstream_model"),
+    api_base: formData.get("api_base"),
+    model_type: formData.get("model_type"),
+    input_cost_per_token: formData.get("input_cost_per_token"),
+    output_cost_per_token: formData.get("output_cost_per_token"),
+    cost_per_image: formData.get("cost_per_image"),
+    cost_per_audio_second: formData.get("cost_per_audio_second"),
+    cost_per_character: formData.get("cost_per_character"),
+    context_window: formData.get("context_window"),
+    admission_weight: formData.get("admission_weight"),
+    supports_function_calling: formData.get("supports_function_calling"),
+    supports_system_messages: formData.get("supports_system_messages"),
+    supports_response_schema: formData.get("supports_response_schema"),
+    supports_tool_choice: formData.get("supports_tool_choice"),
+  });
+  if (!parsed.success) return;
   await obleth.updateModel(id, {
-    description: String(formData.get("description") ?? "").trim(),
-    upstream_model: String(formData.get("upstream_model") ?? "").trim(),
-    api_base: String(formData.get("api_base") ?? "").trim(),
+    ...parsed.data,
     api_key: strOrNull(formData.get("api_key")),
-    model_type: String(formData.get("model_type") ?? "chat").trim() || "chat",
-    input_cost_per_token: numOr(formData.get("input_cost_per_token"), 0),
-    output_cost_per_token: numOr(formData.get("output_cost_per_token"), 0),
-    cost_per_image: numOr(formData.get("cost_per_image"), 0),
-    cost_per_audio_second: numOr(formData.get("cost_per_audio_second"), 0),
-    cost_per_character: numOr(formData.get("cost_per_character"), 0),
-    context_window: numOr(formData.get("context_window"), 8192),
-    admission_weight: numOr(formData.get("admission_weight"), 100),
     max_in_flight: numOrNull(formData.get("max_in_flight")),
-    supports_function_calling: formData.get("supports_function_calling") === "on",
-    supports_system_messages: formData.get("supports_system_messages") === "on",
-    supports_response_schema: formData.get("supports_response_schema") === "on",
-    supports_tool_choice: formData.get("supports_tool_choice") === "on",
     enabled: formData.get("enabled") === "on",
     tags: tagsFromForm(formData),
   });
@@ -525,15 +629,15 @@ export async function setModelHealthConfigAction(formData: FormData) {
 
 export async function createMcpServerAction(formData: FormData): Promise<ActionResult> {
   await requireSession();
-  const name = String(formData.get("name") ?? "").trim();
-  const upstream_url = String(formData.get("upstream_url") ?? "").trim();
-  if (!name || !upstream_url) {
-    return { ok: false, error: "Name and upstream URL are required." };
-  }
+  const parsed = mcpCreateSchema.safeParse({
+    name: formData.get("name"),
+    upstream_url: formData.get("upstream_url"),
+  });
+  if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
   try {
     await obleth.createMcpServer({
-      name,
-      upstream_url,
+      name: parsed.data.name,
+      upstream_url: parsed.data.upstream_url,
       auth_header: strOrNull(formData.get("auth_header")),
     });
   } catch (e) {

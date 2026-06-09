@@ -97,6 +97,9 @@ create table if not exists audit_log (
 );
 
 create index if not exists audit_log_ts_idx on audit_log (ts desc);
+-- Support filtering the audit trail by who acted and which entity was touched.
+create index if not exists audit_log_actor_idx on audit_log (actor, ts desc);
+create index if not exists audit_log_entity_idx on audit_log (entity_type, entity_id, ts desc);
 
 -- Model registry: client-facing names mapped to upstream OpenAI-compatible endpoints.
 -- obleth routes by model_name; Aibrix/vLLM or any compatible API handles inference.

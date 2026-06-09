@@ -491,16 +491,27 @@ export class OblethApiError extends Error {
   }
 }
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(`${BASE}/api/v1${path}`, {
-    ...init,
+/** Next.js fetch caching options accepted alongside a standard RequestInit. */
+type NextFetchOptions = { revalidate?: number | false; tags?: string[] };
+type ApiInit = RequestInit & { next?: NextFetchOptions };
+
+async function api<T>(path: string, init?: ApiInit): Promise<T> {
+  const { next, cache, headers, ...rest } = init ?? {};
+  const fetchInit: ApiInit = {
+    ...rest,
     headers: {
       Authorization: `Bearer ${adminToken()}`,
       "Content-Type": "application/json",
-      ...(init?.headers ?? {}),
+      ...(headers ?? {}),
     },
-    cache: "no-store",
-  });
+  };
+  // Default to `no-store` so reads are always fresh. Callers may opt specific
+  // GETs into Next's Data Cache by passing `next: { revalidate }`; those routes
+  // already call `revalidatePath` on mutation, so cached lists stay correct.
+  if (next) fetchInit.next = next;
+  else fetchInit.cache = cache ?? "no-store";
+
+  const res = await fetch(`${BASE}/api/v1${path}`, fetchInit);
   if (!res.ok) {
     const text = await res.text().catch(() => "");
     // The management API returns errors as `{"error": "..."}`. Surface that

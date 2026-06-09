@@ -24,6 +24,8 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(1000);
 pub enum TelemetryError {
     #[error("clickhouse: {0}")]
     Click(#[from] clickhouse::error::Error),
+    #[error("invalid clickhouse database name: {0:?}")]
+    InvalidDatabase(String),
 }
 
 /// ClickHouse row mirror of [`UsageRecord`].
@@ -248,7 +250,29 @@ impl Flusher {
     }
 }
 
+/// True when `name` is a safe bare SQL identifier (letters, digits, underscore,
+/// not starting with a digit). Used to guard identifiers that must be string-
+/// interpolated into ClickHouse DDL.
+fn is_valid_identifier(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryError> {
+    // The database name is interpolated directly into DDL (ClickHouse has no
+    // bind-parameter support for identifiers), so reject anything that isn't a
+    // plain SQL identifier as defense-in-depth even though it comes from trusted
+    // config rather than user input.
+    if !is_valid_identifier(database) {
+        return Err(TelemetryError::InvalidDatabase(database.to_string()));
+    }
     client
         .query(&format!("CREATE DATABASE IF NOT EXISTS {database}"))
         .execute()

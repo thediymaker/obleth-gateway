@@ -28,9 +28,11 @@ pub struct AppState {
     /// own `request_timeout_secs`. From `OBLETH_UPSTREAM_TIMEOUT_SECS`.
     pub upstream_timeout: std::time::Duration,
     /// hash -> resolved key, with a short TTL as a backstop to pub/sub invalidation.
-    pub key_cache: Cache<String, ResolvedKey>,
-    pub model_cache: Cache<String, ResolvedModel>,
-    pub mcp_cache: Cache<String, ResolvedMcpServer>,
+    /// Values are `Arc`-wrapped so a per-request lookup clones a pointer, not the
+    /// whole struct (these are read on every data-plane and MCP request).
+    pub key_cache: Cache<String, Arc<ResolvedKey>>,
+    pub model_cache: Cache<String, Arc<ResolvedModel>>,
+    pub mcp_cache: Cache<String, Arc<ResolvedMcpServer>>,
     /// Enumerable list of candidate models for `auto` selection. Kept fresh by
     /// a background refresh task; the `model_cache` above is not enumerable.
     pub model_registry: ModelRegistry,

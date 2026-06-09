@@ -7,6 +7,7 @@
 //! when the stream finishes, so concurrency accounting matches real upstream
 //! occupancy including streaming time.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
@@ -40,6 +41,11 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
     let headers = parts.headers;
+
+    // ---- reject path traversal before any upstream work ----
+    if has_path_traversal(&path) {
+        return error_json(StatusCode::BAD_REQUEST, "invalid request path");
+    }
 
     // ---- auth ----
     let Some(secret) = bearer(&headers) else {
@@ -171,7 +177,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             Some(chosen) => {
                 tracing::debug!(chosen = %chosen.model_name, "auto-routed request");
                 model = chosen.model_name.clone();
-                Some(chosen)
+                Some(Arc::new(chosen))
             }
             None => {
                 return error_json(
@@ -206,7 +212,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             }
         }
     }
-    let effective_weight = effective_admission_weight(resolved.weight, route.as_ref());
+    let effective_weight = effective_admission_weight(resolved.weight, route.as_deref());
     let mut est = state.tokenizer.estimate_request(&json);
 
     // Cost rates and per-request modality surcharge captured up front so every
@@ -217,7 +223,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         .as_ref()
         .map(|r| (r.input_cost_per_token, r.output_cost_per_token))
         .unwrap_or((0.0, 0.0));
-    let modality_cost = compute_modality_cost(route.as_ref(), &json);
+    let modality_cost = compute_modality_cost(route.as_deref(), &json);
 
     // ---- response cache (exact-match, before admission so hits cost nothing) ----
     let cache_enabled = route.as_ref().map(|r| r.cache_enabled).unwrap_or(false);
@@ -439,7 +445,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // endpoints we route across the healthy/enabled ones (priority order for
     // failover, weighted order for load_balance); otherwise we fall back to the
     // legacy single api_base/api_key on the model (or the global default).
-    let targets = build_targets(route.as_ref(), &state.upstream_base, selection_mode);
+    let targets = build_targets(route.as_deref(), &state.upstream_base, selection_mode);
 
     // The JSON body is rebuilt once and replayed on each attempt/endpoint.
     // Multipart bodies cannot be replayed, so they get a single attempt against
@@ -447,7 +453,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let replayable = multipart_fields.is_none();
     let prepared_body: Option<Bytes> = if replayable {
         let (_, mut sb, upstream_model) =
-            prepare_upstream(&route, &state.upstream_base, &model, &json, send_bytes);
+            prepare_upstream(route.as_deref(), &state.upstream_base, &model, &json, send_bytes);
         if let Some(upstream_model) = upstream_model {
             if let Ok(bytes) = serde_json::to_vec(&upstream_model) {
                 sb = Bytes::from(bytes);
@@ -499,7 +505,17 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                     .as_ref()
                     .map(|r| r.upstream_model.clone())
                     .unwrap_or_else(|| model.clone());
-                let fields = multipart_fields.take().expect("multipart fields present");
+                // Multipart bodies are not replayable, so this branch only runs on
+                // the single attempt against the first target (`replayable` is false
+                // ⇒ one attempt, no failover). The `take` therefore yields `Some`
+                // exactly once; we still handle `None` gracefully instead of
+                // panicking should that invariant ever change.
+                let Some(fields) = multipart_fields.take() else {
+                    return error_json(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "multipart request body was already consumed",
+                    );
+                };
                 let form = build_multipart_form(fields, &upstream_model);
                 state
                     .http
@@ -792,12 +808,13 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
 
 /// Resolve a key via moka, falling back to Redis and caching the result.
 #[tracing::instrument(skip_all, name = "auth_resolve")]
-pub(crate) async fn resolve_key(state: &AppState, hash: &str) -> Option<ResolvedKey> {
+pub(crate) async fn resolve_key(state: &AppState, hash: &str) -> Option<Arc<ResolvedKey>> {
     if let Some(r) = state.key_cache.get(hash).await {
         return Some(r);
     }
     match state.redis.get_resolved_key(hash).await {
         Ok(Some(r)) => {
+            let r = Arc::new(r);
             state.key_cache.insert(hash.to_string(), r.clone()).await;
             Some(r)
         }
@@ -908,12 +925,13 @@ fn message_text(content: Option<&serde_json::Value>) -> String {
     }
 }
 
-async fn resolve_model(state: &AppState, name: &str) -> Option<ResolvedModel> {
+async fn resolve_model(state: &AppState, name: &str) -> Option<Arc<ResolvedModel>> {
     if let Some(r) = state.model_cache.get(name).await {
         return Some(r);
     }
     match state.redis.get_resolved_model(name).await {
         Ok(Some(r)) => {
+            let r = Arc::new(r);
             state.model_cache.insert(name.to_string(), r.clone()).await;
             Some(r)
         }
@@ -1173,7 +1191,7 @@ fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value
 }
 
 fn prepare_upstream(
-    route: &Option<ResolvedModel>,
+    route: Option<&ResolvedModel>,
     default_base: &str,
     _client_model: &str,
     json: &serde_json::Value,
@@ -1290,6 +1308,24 @@ fn backoff_for(base: Duration, attempt: u32) -> Duration {
         return base;
     }
     base.saturating_mul(1u32 << attempt.min(6))
+}
+
+/// Reject client request paths that could escape the configured upstream base.
+///
+/// The upstream host is fixed by the operator-registered `api_base` (and is
+/// SSRF-screened at registration), but the client-supplied path is appended to
+/// it. A `..` segment — literal or percent-encoded — could walk above the
+/// intended API prefix and reach a different path on that host, so we refuse it
+/// outright. Legitimate OpenAI-compatible paths never contain `..`, encoded
+/// dots, or encoded separators.
+pub(crate) fn has_path_traversal(path: &str) -> bool {
+    let lowered = path.to_ascii_lowercase();
+    // Encoded dot (`%2e`) or separators (`%2f` `/`, `%5c` `\`) can reconstruct a
+    // traversal after the upstream decodes them; none are valid here.
+    if lowered.contains("%2e") || lowered.contains("%2f") || lowered.contains("%5c") {
+        return true;
+    }
+    path.split(['/', '\\']).any(|seg| seg == "..")
 }
 
 fn build_upstream_url(base: &str, path: &str, query: &str) -> String {
@@ -1537,8 +1573,8 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        backoff_for, build_targets, build_upstream_url, is_retryable_status, tenant_active_now,
-        weighted_order,
+        backoff_for, build_targets, build_upstream_url, has_path_traversal, is_retryable_status,
+        tenant_active_now, weighted_order,
     };
     use chrono::{DateTime, TimeZone, Utc};
     use obleth_config::{ResolvedEndpoint, ResolvedKey, WeeklyWindow};
@@ -1618,6 +1654,29 @@ mod tests {
             ),
             "https://openai.rc.asu.edu/v1/audio/speech"
         );
+    }
+
+    #[test]
+    fn path_traversal_is_detected() {
+        // Literal `..` segments anywhere in the path.
+        assert!(has_path_traversal("/v1/../admin"));
+        assert!(has_path_traversal("/v1/chat/../../secret"));
+        assert!(has_path_traversal("/.."));
+        // Percent-encoded dots and separators that could decode to a traversal.
+        assert!(has_path_traversal("/v1/%2e%2e/admin"));
+        assert!(has_path_traversal("/v1%2fadmin"));
+        assert!(has_path_traversal("/v1%5c..%5cadmin"));
+        // Backslash separators.
+        assert!(has_path_traversal("\\..\\admin"));
+    }
+
+    #[test]
+    fn legitimate_paths_are_allowed() {
+        assert!(!has_path_traversal("/v1/chat/completions"));
+        assert!(!has_path_traversal("/v1/audio/transcriptions"));
+        assert!(!has_path_traversal("/health"));
+        // A literal `..` only inside a longer segment is not a traversal segment.
+        assert!(!has_path_traversal("/v1/models/gpt..4"));
     }
 
     #[test]

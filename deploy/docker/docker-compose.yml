@@ -156,6 +156,11 @@ services:
     image: haproxy:2.9
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    environment:
+      # HAProxy expands ${VAR} in haproxy.cfg at parse time; these guard the
+      # /stats UI. Defaults keep `docker compose up` working out of the box.
+      HAPROXY_STATS_USER: ${HAPROXY_STATS_USER:-admin}
+      HAPROXY_STATS_PASSWORD: ${HAPROXY_STATS_PASSWORD:-admin}
     ports: ["80:80"]
     # :8404 (Prometheus metrics + /stats UI) is scraped in-network by Prometheus.
     expose: ["8404"]
@@ -173,8 +178,12 @@ services:
     profiles: ["observability"]
     image: grafana/grafana:latest
     environment:
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Admin
+      # Anonymous access is OFF: an open dashboard with Admin rights lets anyone
+      # on the network edit datasources/dashboards. Log in with the admin user
+      # below (password is required from .env, no insecure default).
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?set GRAFANA_ADMIN_PASSWORD in deploy/docker/.env}
     volumes:
       # Auto-provisioned Prometheus datasource + the bundled dashboards.
       - ./grafana/provisioning:/etc/grafana/provisioning:ro

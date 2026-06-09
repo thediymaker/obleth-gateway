@@ -74,15 +74,15 @@ async fn main() -> anyhow::Result<()> {
     let fairshare = FairShare::start(capacity.clone(), cfg.fairshare_algorithm);
 
     let metrics = Arc::new(Metrics::new());
-    let key_cache: Cache<String, obleth_config::ResolvedKey> = Cache::builder()
+    let key_cache: Cache<String, Arc<obleth_config::ResolvedKey>> = Cache::builder()
         .time_to_live(Duration::from_secs(300))
         .max_capacity(100_000)
         .build();
-    let model_cache: Cache<String, obleth_config::ResolvedModel> = Cache::builder()
+    let model_cache: Cache<String, Arc<obleth_config::ResolvedModel>> = Cache::builder()
         .time_to_live(Duration::from_secs(300))
         .max_capacity(10_000)
         .build();
-    let mcp_cache: Cache<String, obleth_config::ResolvedMcpServer> = Cache::builder()
+    let mcp_cache: Cache<String, Arc<obleth_config::ResolvedMcpServer>> = Cache::builder()
         .time_to_live(Duration::from_secs(300))
         .max_capacity(10_000)
         .build();
@@ -155,7 +155,7 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = redis.put_resolved_model(name, resolved).await {
                     tracing::warn!(error = %e, "failed to warm model into redis");
                 }
-                model_cache.insert(name.clone(), resolved.clone()).await;
+                model_cache.insert(name.clone(), Arc::new(resolved.clone())).await;
             }
             tracing::info!(count = models.len(), "warmed model cache");
             model_registry.store(build_candidates(&store, models).await);
@@ -173,7 +173,7 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = redis.put_resolved_mcp_server(name, resolved).await {
                     tracing::warn!(error = %e, "failed to warm mcp server into redis");
                 }
-                mcp_cache.insert(name.clone(), resolved.clone()).await;
+                mcp_cache.insert(name.clone(), Arc::new(resolved.clone())).await;
             }
             tracing::info!(count = servers.len(), "warmed mcp server cache");
         }
@@ -340,9 +340,9 @@ fn spawn_model_registry_refresh(
 
 fn spawn_invalidation_listener(
     redis: RedisStore,
-    key_cache: Cache<String, obleth_config::ResolvedKey>,
-    model_cache: Cache<String, obleth_config::ResolvedModel>,
-    mcp_cache: Cache<String, obleth_config::ResolvedMcpServer>,
+    key_cache: Cache<String, Arc<obleth_config::ResolvedKey>>,
+    model_cache: Cache<String, Arc<obleth_config::ResolvedModel>>,
+    mcp_cache: Cache<String, Arc<obleth_config::ResolvedMcpServer>>,
 ) {
     tokio::spawn(async move {
         loop {

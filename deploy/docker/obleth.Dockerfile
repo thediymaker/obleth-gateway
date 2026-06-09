@@ -9,11 +9,14 @@ WORKDIR /app/obleth
 RUN cargo build --release --bin obleth
 
 FROM debian:bookworm-slim AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 obleth \
     && useradd --system --uid 10001 --gid obleth --no-create-home obleth
 COPY --from=builder /app/obleth/target/release/obleth /usr/local/bin/obleth
 USER 10001:10001
 EXPOSE 8080 9180 9091
+# Probe the proxy's /health endpoint (default OBLETH_PROXY_LISTEN :8080).
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8080/health || exit 1
 ENTRYPOINT ["obleth"]
