@@ -35,11 +35,30 @@ pub struct UsageDailyQuery {
     /// Inclusive upper bound, `YYYY-MM-DD`. Defaults to today.
     pub end_day: Option<String>,
     pub tenant_id: Option<Uuid>,
-    pub key_id: Option<Uuid>,
+    /// One or more key ids. Accepts a single UUID or a comma-separated list
+    /// (`key_id=a,b,c`) so a caller can fetch spend across all of a user's
+    /// rotated keys in one request.
+    pub key_id: Option<String>,
     pub model: Option<String>,
     /// Aggregate dimension: `day` (default), `tenant`, `key`, `model`,
     /// or `key_model` (one row per key+model across the whole range).
     pub group_by: Option<String>,
+}
+
+/// Parse the `key_id` query value, which may be a single UUID or a
+/// comma-separated list (`a,b,c`). Empty entries are ignored so a trailing
+/// comma is harmless. Returns the first parse error so the handler can map it
+/// to a 400.
+pub fn parse_key_ids(raw: Option<&str>) -> Result<Vec<Uuid>, uuid::Error> {
+    match raw {
+        Some(s) => s
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(Uuid::parse_str)
+            .collect(),
+        None => Ok(Vec::new()),
+    }
 }
 
 /// One row of the daily rollup, shaped by the requested `group_by`. Identity
@@ -398,6 +417,7 @@ pub async fn query_costs(
 pub async fn query_usage_daily(
     client: &clickhouse::Client,
     q: UsageDailyQuery,
+    key_ids: &[Uuid],
 ) -> Result<Vec<UsageDailyRow>, clickhouse::error::Error> {
     let group = q.group_by.as_deref().unwrap_or("day");
     // Identity columns selected per grouping; the rest are zeroed so the row
@@ -449,8 +469,12 @@ pub async fn query_usage_daily(
     if q.tenant_id.is_some() {
         inner_where.push_str(" and tenant_id = toUUID(?)");
     }
-    if q.key_id.is_some() {
-        inner_where.push_str(" and key_id = toUUID(?)");
+    if !key_ids.is_empty() {
+        let placeholders = std::iter::repeat("toUUID(?)")
+            .take(key_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        inner_where.push_str(&format!(" and key_id in ({placeholders})"));
     }
     if q.model.is_some() {
         inner_where.push_str(" and model = ?");
@@ -480,7 +504,7 @@ pub async fn query_usage_daily(
     if let Some(tid) = q.tenant_id {
         query = query.bind(tid.to_string());
     }
-    if let Some(kid) = q.key_id {
+    for kid in key_ids {
         query = query.bind(kid.to_string());
     }
     if let Some(model) = &q.model {

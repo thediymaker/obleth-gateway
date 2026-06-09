@@ -1342,7 +1342,11 @@ async fn get_usage_daily(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageDailyQuery>,
 ) -> Result<Json<Vec<usage::UsageDailyRow>>> {
-    Ok(Json(usage::query_usage_daily(&state.clickhouse, q).await?))
+    let key_ids = usage::parse_key_ids(q.key_id.as_deref())
+        .map_err(|e| AdminError::BadRequest(format!("invalid key_id: {e}")))?;
+    Ok(Json(
+        usage::query_usage_daily(&state.clickhouse, q, &key_ids).await?,
+    ))
 }
 
 /// View of the persisted raw-usage retention window.
