@@ -26,7 +26,7 @@ spec:
           image: {{ .Values.image.controlPlane }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
-            - { name: OBLETH_ADMIN_BASE_URL, value: "http://{{ include "obleth.fullname" . }}:9090" }
+            - { name: OBLETH_ADMIN_BASE_URL, value: "http://{{ include "obleth.fullname" . }}:9180" }
             - name: OBLETH_ADMIN_TOKEN
               valueFrom:
                 secretKeyRef:

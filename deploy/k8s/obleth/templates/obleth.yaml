@@ -34,11 +34,11 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - { name: proxy, containerPort: 8080 }
-            - { name: admin, containerPort: 9090 }
+            - { name: admin, containerPort: 9180 }
             - { name: metrics, containerPort: 9091 }
           env:
             - { name: OBLETH_PROXY_LISTEN, value: "0.0.0.0:8080" }
-            - { name: OBLETH_ADMIN_LISTEN, value: "0.0.0.0:9090" }
+            - { name: OBLETH_ADMIN_LISTEN, value: "0.0.0.0:9180" }
             - { name: OBLETH_METRICS_LISTEN, value: "0.0.0.0:9091" }
             - { name: OBLETH_REDIS_URL, value: {{ include "obleth.redisUrl" . | quote }} }
             - { name: OBLETH_CLICKHOUSE_URL, value: {{ include "obleth.clickhouseUrl" . | quote }} }
@@ -81,7 +81,7 @@ spec:
     app.kubernetes.io/instance: {{ .Release.Name }}
   ports:
     - { name: proxy, port: 8080, targetPort: proxy }
-    - { name: admin, port: 9090, targetPort: admin }
+    - { name: admin, port: 9180, targetPort: admin }
     - { name: metrics, port: 9091, targetPort: metrics }
 {{- if .Values.hpa.enabled }}
 ---

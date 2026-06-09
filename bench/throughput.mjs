@@ -36,7 +36,7 @@ import {
   sleep,
 } from "./lib.mjs";
 
-const ADMIN_BASE = process.env.ADMIN_BASE ?? "http://localhost:9090";
+const ADMIN_BASE = process.env.ADMIN_BASE ?? "http://localhost:9180";
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN ?? "dev-admin-token";
 const PROXY_BASE = process.env.PROXY_BASE ?? "http://localhost";
 const BACKEND_BASE = process.env.BACKEND_BASE ?? "http://localhost:8081";

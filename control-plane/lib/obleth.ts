@@ -1,6 +1,6 @@
 // Server-side client for the obleth Management API.
 
-const BASE = process.env.OBLETH_ADMIN_BASE_URL ?? "http://localhost:9090";
+const BASE = process.env.OBLETH_ADMIN_BASE_URL ?? "http://localhost:9180";
 
 // Resolve the admin token lazily, at request time. Validating it at module
 // scope would throw while Next.js evaluates server modules during `next build`

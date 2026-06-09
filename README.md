@@ -103,9 +103,9 @@ docker compose -f deploy/docker/docker-compose.yml --profile benchmark --profile
 ```
 
 Services: HAProxy (`:80`), obleth data plane (`:8088` on the host, `:8080` inside
-the network), Management API (`:9090`), metrics (`:9091`), dashboard (`:3002` on
+the network), Management API (`:9180`), metrics (`:9091`), dashboard (`:3002` on
 the host), Postgres, Redis, ClickHouse, benchmark fixture backend (`:8081`),
-Prometheus (`:9095`), Grafana (`:3001`).
+Prometheus (`:9090`), Grafana (`:3001`).
 
 Open the dashboard at <http://localhost:3002>.
 
@@ -133,12 +133,12 @@ files and Grafana hot-reloads them. The HAProxy dashboard only has data when the
 ```bash
 TOKEN=dev-admin-token
 # create a boosted "chatbot" tenant
-TID=$(curl -s -XPOST localhost:9090/api/v1/tenants \
+TID=$(curl -s -XPOST localhost:9180/api/v1/tenants \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"name":"chatbot","weight":500,"tokens_per_minute":2000000}' | jq -r .id)
 
 # mint a key (secret shown once)
-SECRET=$(curl -s -XPOST localhost:9090/api/v1/tenants/$TID/keys \
+SECRET=$(curl -s -XPOST localhost:9180/api/v1/tenants/$TID/keys \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
   -d '{"name":"prod"}' | jq -r .secret)
 
@@ -148,7 +148,7 @@ curl -s localhost/v1/chat/completions \
   -d '{"model":"benchmark-endpoint","messages":[{"role":"user","content":"hi"}],"max_tokens":32}'
 ```
 
-Full API spec: `GET http://localhost:9090/api/v1/openapi.json`.
+Full API spec: `GET http://localhost:9180/api/v1/openapi.json`.
 
 ### Kubernetes
 
@@ -164,7 +164,7 @@ managed ClickHouse, and HA Redis (`postgres.enabled=false`, etc.). See
 A fresh `helm install` starts with **no models and no tenant keys**. After pods
 are Running:
 
-1. Port-forward the Management API: `kubectl port-forward svc/obleth 9090:9090`
+1. Port-forward the Management API: `kubectl port-forward svc/obleth 9180:9180`
 2. Create a tenant and mint a key (`POST /api/v1/tenants`, then
    `POST /api/v1/tenants/{id}/keys`) — there is no shared "open" proxy key.
 3. Register models via `POST /api/v1/models`. Set `api_base` to the provider base

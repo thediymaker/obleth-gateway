@@ -15,5 +15,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && useradd --system --uid 10001 --gid obleth --no-create-home obleth
 COPY --from=builder /app/obleth/target/release/obleth /usr/local/bin/obleth
 USER 10001:10001
-EXPOSE 8080 9090 9091
+EXPOSE 8080 9180 9091
 ENTRYPOINT ["obleth"]

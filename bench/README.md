@@ -78,7 +78,7 @@ DURATION_S=120
 CONC=64
 OUTPUT_TOKENS=150
 PROXY_BASE=http://localhost
-ADMIN_BASE=http://localhost:9090
+ADMIN_BASE=http://localhost:9180
 ```
 
 On Node 22 you do not need `--env-file`; the runner loads `bench/.env`
@@ -137,7 +137,7 @@ CONTAINER_CLI=podman CHAOS=1 node bench/run-benchmark.mjs
 
 | Env | Default | Purpose |
 | --- | --- | --- |
-| `ADMIN_BASE` | `http://localhost:9090` | Management API base URL |
+| `ADMIN_BASE` | `http://localhost:9180` | Management API base URL |
 | `ADMIN_TOKEN` | `dev-admin-token` | Management API bearer token |
 | `PROXY_BASE` | `http://localhost` | Data-plane base URL, usually HAProxy |
 | `MODEL` | `benchmark-endpoint` | Registered model name to request |

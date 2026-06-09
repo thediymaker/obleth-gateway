@@ -94,7 +94,7 @@ impl Config {
     pub fn from_env() -> Self {
         Config {
             proxy_listen: env_or("OBLETH_PROXY_LISTEN", "0.0.0.0:8080"),
-            admin_listen: env_or("OBLETH_ADMIN_LISTEN", "0.0.0.0:9090"),
+            admin_listen: env_or("OBLETH_ADMIN_LISTEN", "0.0.0.0:9180"),
             metrics_listen: env_or("OBLETH_METRICS_LISTEN", "0.0.0.0:9091"),
             upstream_base_url: env_or("OBLETH_UPSTREAM_BASE_URL", "http://127.0.0.1:8081"),
             upstream_timeout: Duration::from_secs(parse_or("OBLETH_UPSTREAM_TIMEOUT_SECS", 300)),

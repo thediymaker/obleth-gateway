@@ -36,11 +36,11 @@ an empty model registry until you configure it.
 ### 1. Reach the Management API
 
 ```bash
-kubectl port-forward -n obleth svc/obleth 9090:9090
+kubectl port-forward -n obleth svc/obleth 9180:9180
 ```
 
 Use your cluster Ingress or an internal Service URL instead if you already expose
-`:9090`.
+`:9180`.
 
 ### 2. Create a tenant and mint a key
 
@@ -49,13 +49,13 @@ There is no shared proxy key. Each client needs a tenant-scoped `sk_...` secret:
 ```bash
 TOKEN=<your-OBLETH_ADMIN_TOKEN>
 
-TID=$(curl -s -X POST http://localhost:9090/api/v1/tenants \
+TID=$(curl -s -X POST http://localhost:9180/api/v1/tenants \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"my-team","weight":200,"tokens_per_minute":500000}' \
   | jq -r .id)
 
-SECRET=$(curl -s -X POST "http://localhost:9090/api/v1/tenants/$TID/keys" \
+SECRET=$(curl -s -X POST "http://localhost:9180/api/v1/tenants/$TID/keys" \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"name":"prod"}' \
@@ -67,7 +67,7 @@ Store `SECRET` immediately — it is shown once.
 ### 3. Register models
 
 ```bash
-curl -s -X POST http://localhost:9090/api/v1/models \
+curl -s -X POST http://localhost:9180/api/v1/models \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
