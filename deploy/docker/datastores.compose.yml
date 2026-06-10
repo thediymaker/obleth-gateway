@@ -1,0 +1,94 @@
+# Standalone external datastores for self-hosting obleth
+# =============================================================================
+# Use this when you run obleth somewhere else (a Kubernetes chart install with
+# `*.enabled: false`, a bare-metal binary, or a separate Compose project) and
+# want Postgres, Redis, and ClickHouse hosted as long-lived external services.
+#
+# Unlike the bundled containers in docker-compose.yml, these are tuned to be a
+# durable backing tier:
+#   - named volumes for persistence
+#   - host-published ports so an off-box obleth can reach them
+#   - healthchecks and restart policy
+#
+# Quick start:
+#   cd deploy/docker
+#   cp datastores.env.example datastores.env   # then edit the passwords
+#   docker compose --env-file datastores.env -f datastores.compose.yml up -d
+#
+# Then point obleth at them. From another host replace 127.0.0.1 with the host's
+# reachable address/DNS name and ensure the firewall allows the ports.
+#
+#   OBLETH_DATABASE_URL=postgres://obleth:CHANGE_ME@DB_HOST:5432/obleth
+#   OBLETH_REDIS_URL=redis://DB_HOST:6379
+#   OBLETH_CLICKHOUSE_URL=http://DB_HOST:8123
+#   OBLETH_CLICKHOUSE_USER=obleth
+#   OBLETH_CLICKHOUSE_PASSWORD=CHANGE_ME
+#   OBLETH_CLICKHOUSE_DB=obleth
+#
+# Or in Helm values (examples/values-external.yaml):
+#   postgres.external.url:   postgres://obleth:CHANGE_ME@DB_HOST:5432/obleth
+#   redis.external.url:      redis://DB_HOST:6379
+#   clickhouse.external.url: http://DB_HOST:8123
+#
+# SECURITY: by default ports bind to 127.0.0.1 (loopback) so they are NOT exposed
+# to your LAN/internet. To let an off-box obleth connect, change BIND_ADDR to the
+# private interface address and protect it with a firewall / private network.
+# Never expose these ports to the public internet.
+name: obleth-datastores
+
+services:
+  postgres:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-obleth}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in datastores.env}
+      POSTGRES_DB: ${POSTGRES_DB:-obleth}
+    ports: ["${BIND_ADDR:-127.0.0.1}:5432:5432"]
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-obleth}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    # AOF persistence so the cache/token budgets survive a restart.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "everysec"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:6379:6379"]
+    volumes: ["redisdata:/data"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
+    environment:
+      # The image restricts the built-in `default` user to localhost; provision a
+      # network-accessible user instead.
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-obleth}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in datastores.env}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-obleth}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:8123:8123"   # HTTP interface (obleth uses this)
+      - "${BIND_ADDR:-127.0.0.1}:9000:9000"   # native protocol (optional clients)
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+    volumes:
+      - "chdata:/var/lib/clickhouse"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  pgdata:
+  redisdata:
+  chdata:

@@ -15,6 +15,93 @@ via `--set`, a local untracked file, or a secrets manager.
 
 Full value reference: [obleth.com — Helm Values](https://obleth.com/docs/reference/helm-values).
 
+## Pick a storage scenario
+
+The bundled Postgres, Redis, and ClickHouse support three storage models. Ready-
+made values files live in [`obleth/examples/`](obleth/examples/).
+
+| Scenario | When to use | Values file | Data on restart |
+| --- | --- | --- | --- |
+| **Persistent (PVC)** | Self-hosted single cluster, no external DBs yet | [`values-persistent.yaml`](obleth/examples/values-persistent.yaml) | **Survives** (PVCs) |
+| **Ephemeral** | Throwaway demo / CI / kicking the tires | [`values-ephemeral.yaml`](obleth/examples/values-ephemeral.yaml) | **LOST** (emptyDir) |
+| **External** | Production; managed or self-hosted datastores | [`values-external.yaml`](obleth/examples/values-external.yaml) | Managed by you |
+
+```bash
+helm install obleth deploy/k8s/obleth -n obleth --create-namespace \
+  -f deploy/k8s/obleth/examples/values-persistent.yaml \
+  --set obleth.adminToken="$(openssl rand -hex 32)" \
+  --set postgres.password="$(openssl rand -hex 16)" \
+  --set clickhouse.password="$(openssl rand -hex 16)" \
+  --set controlPlane.dashboardPassword="$(openssl rand -hex 16)" \
+  --set controlPlane.dashboardSessionSecret="$(openssl rand -hex 32)"
+```
+
+### 1. Persistent (PVC) — recommended for self-hosting
+
+Each bundled datastore has a `persistence` block. When `enabled: true` (the
+default) the chart provisions a PVC and uses the `Recreate` rollout strategy so
+data survives pod restarts and reschedules. Requires a `StorageClass` (most
+clusters ship a default; `kubectl get storageclass` to check).
+
+```yaml
+postgres:
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: ""        # "" = cluster default; set a name to pin one
+    accessMode: ReadWriteOnce
+redis:
+  persistence: { enabled: true, size: 1Gi }
+clickhouse:
+  persistence: { enabled: true, size: 20Gi }
+```
+
+### 2. Ephemeral (test only) — data is lost on restart
+
+Set `persistence.enabled: false` to use `emptyDir`. **Every datastore pod
+restart wipes all tenants, keys, models, config, and usage history.** Use only
+for demos/CI or clusters with no `StorageClass`.
+
+```yaml
+postgres:   { persistence: { enabled: false } }
+redis:      { persistence: { enabled: false } }
+clickhouse: { persistence: { enabled: false } }
+```
+
+### 3. External — managed or self-hosted datastores
+
+Disable the bundled containers and point obleth at endpoints you operate. This is
+the recommended production topology — stateful systems get real backups/HA.
+
+```yaml
+postgres:
+  enabled: false
+  external: { url: "postgres://obleth:pass@my-pg:5432/obleth" }
+redis:
+  enabled: false
+  external: { url: "redis://my-redis:6379" }
+clickhouse:
+  enabled: false
+  user: obleth
+  password: "pass"          # obleth authenticates with these even when external
+  db: obleth
+  external: { url: "http://my-clickhouse:8123" }
+benchmarkBackend:
+  enabled: false
+```
+
+Need to stand the external datastores up quickly in Docker? Use
+[`deploy/docker/datastores.compose.yml`](../docker/datastores.compose.yml):
+
+```bash
+cd deploy/docker
+cp datastores.env.example datastores.env   # edit the passwords
+docker compose --env-file datastores.env -f datastores.compose.yml up -d
+```
+
+See [obleth.com — Self-Hosting](https://obleth.com/docs/guides/self-hosting) for
+the full walkthrough.
+
 ## What the chart starts
 
 A self-contained demo install brings up:
@@ -131,24 +218,10 @@ Or maintain a local `values-prod.yaml` that stays out of git.
 
 ## Production topology
 
-Disable bundled dependencies and point at managed services:
+For production, use the **External** storage scenario above: disable the bundled
+datastores and point obleth at managed/operator endpoints (CloudNativePG for
+Postgres, an operator/managed ClickHouse, and HA Redis). Keep
+`benchmarkBackend.enabled: false` and set a real `obleth.upstreamBaseUrl`.
 
-```yaml
-postgres:
-  enabled: false
-  external:
-    url: postgres://user:pass@my-pg:5432/obleth
-redis:
-  enabled: false
-  external:
-    url: redis://my-redis:6379
-clickhouse:
-  enabled: false
-  external:
-    url: http://my-clickhouse:8123
-benchmarkBackend:
-  enabled: false
-```
-
-See [Modular deploy](https://obleth.com/docs/guides/modular-deploy) on
-docs.obleth.dev.
+See [Modular deploy](https://obleth.com/docs/guides/modular-deploy) and
+[Self-Hosting](https://obleth.com/docs/guides/self-hosting) on obleth.com.

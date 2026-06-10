@@ -1,4 +1,20 @@
 {{- if .Values.postgres.enabled }}
+{{- if .Values.postgres.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-postgres
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  accessModes: [{{ .Values.postgres.persistence.accessMode | quote }}]
+  resources:
+    requests:
+      storage: {{ .Values.postgres.persistence.size | quote }}
+  {{- with .Values.postgres.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -6,6 +22,9 @@ metadata:
   labels: {{- include "obleth.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  # Recreate avoids a second pod attaching the same RWO PVC during a rollout.
+  strategy:
+    type: Recreate
   selector: { matchLabels: { app: {{ .Release.Name }}-postgres } }
   template:
     metadata: { labels: { app: {{ .Release.Name }}-postgres } }
@@ -17,9 +36,19 @@ spec:
             - { name: POSTGRES_USER, value: {{ .Values.postgres.user | quote }} }
             - { name: POSTGRES_PASSWORD, value: {{ required "postgres.password is required (set via --set or an external Secret)" .Values.postgres.password | quote }} }
             - { name: POSTGRES_DB, value: {{ .Values.postgres.db | quote }} }
+            # Keep data in a subdirectory so a freshly provisioned volume's
+            # lost+found entry does not block Postgres init.
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
           ports: [{ containerPort: 5432 }]
           volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
-      volumes: [{ name: data, emptyDir: {} }]
+      volumes:
+        - name: data
+        {{- if .Values.postgres.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-postgres
+        {{- else }}
+          emptyDir: {}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -30,6 +59,22 @@ spec:
 {{- end }}
 {{- if .Values.redis.enabled }}
 ---
+{{- if .Values.redis.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-redis
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  accessModes: [{{ .Values.redis.persistence.accessMode | quote }}]
+  resources:
+    requests:
+      storage: {{ .Values.redis.persistence.size | quote }}
+  {{- with .Values.redis.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -37,6 +82,8 @@ metadata:
   labels: {{- include "obleth.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector: { matchLabels: { app: {{ .Release.Name }}-redis } }
   template:
     metadata: { labels: { app: {{ .Release.Name }}-redis } }
@@ -46,6 +93,15 @@ spec:
           image: {{ .Values.redis.image }}
           args: ["redis-server", "--appendonly", "yes"]
           ports: [{ containerPort: 6379 }]
+          volumeMounts: [{ name: data, mountPath: /data }]
+      volumes:
+        - name: data
+        {{- if .Values.redis.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-redis
+        {{- else }}
+          emptyDir: {}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service
@@ -56,6 +112,22 @@ spec:
 {{- end }}
 {{- if .Values.clickhouse.enabled }}
 ---
+{{- if .Values.clickhouse.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ .Release.Name }}-clickhouse
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  accessModes: [{{ .Values.clickhouse.persistence.accessMode | quote }}]
+  resources:
+    requests:
+      storage: {{ .Values.clickhouse.persistence.size | quote }}
+  {{- with .Values.clickhouse.persistence.storageClass }}
+  storageClassName: {{ . | quote }}
+  {{- end }}
+---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -63,6 +135,8 @@ metadata:
   labels: {{- include "obleth.labels" . | nindent 4 }}
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector: { matchLabels: { app: {{ .Release.Name }}-clickhouse } }
   template:
     metadata: { labels: { app: {{ .Release.Name }}-clickhouse } }
@@ -77,7 +151,14 @@ spec:
             - { name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT, value: "1" }
           ports: [{ containerPort: 8123 }, { containerPort: 9000 }]
           volumeMounts: [{ name: data, mountPath: /var/lib/clickhouse }]
-      volumes: [{ name: data, emptyDir: {} }]
+      volumes:
+        - name: data
+        {{- if .Values.clickhouse.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ .Release.Name }}-clickhouse
+        {{- else }}
+          emptyDir: {}
+        {{- end }}
 ---
 apiVersion: v1
 kind: Service

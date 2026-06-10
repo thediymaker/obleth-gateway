@@ -1,0 +1,73 @@
+# Scenario 1: Bundled datastores with persistent storage (PVCs)
+# -----------------------------------------------------------------------------
+# Self-hosted, single-cluster install where obleth runs its own Postgres, Redis,
+# and ClickHouse and keeps their data on PersistentVolumeClaims. Data survives
+# pod restarts and reschedules. Requires a StorageClass in the cluster (most
+# managed/k3s/kind clusters ship a default one).
+#
+# This is the recommended starting point for a real self-hosted deployment that
+# does not yet have external managed datastores.
+#
+# Secrets below are placeholders — DO NOT commit real values. Override at install:
+#   helm install obleth ./deploy/k8s/obleth -n obleth --create-namespace \
+#     -f deploy/k8s/obleth/examples/values-persistent.yaml \
+#     --set obleth.adminToken="$(openssl rand -hex 32)" \
+#     --set obleth.encryptionKey="$(openssl rand -base64 32)" \
+#     --set postgres.password="$(openssl rand -hex 16)" \
+#     --set clickhouse.password="$(openssl rand -hex 16)" \
+#     --set controlPlane.dashboardPassword="$(openssl rand -hex 16)" \
+#     --set controlPlane.dashboardSessionSecret="$(openssl rand -hex 32)"
+
+obleth:
+  replicas: 3
+  adminToken: ""        # REQUIRED — set via --set or a Secret
+  encryptionKey: ""     # recommended — base64 of 32 bytes
+  # Point at your real inference upstream; leave benchmarkBackend enabled only
+  # for demos.
+  upstreamBaseUrl: "http://aibrix-gateway.aibrix.svc.cluster.local:8080/v1"
+
+postgres:
+  enabled: true
+  password: ""          # REQUIRED
+  persistence:
+    enabled: true
+    size: 10Gi
+    storageClass: ""    # "" = cluster default; set a name to pin one (e.g. gp3)
+    accessMode: ReadWriteOnce
+
+redis:
+  enabled: true
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+
+clickhouse:
+  enabled: true
+  password: ""          # REQUIRED
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+
+# Disable the demo fixture backend once you have a real upstream above.
+benchmarkBackend:
+  enabled: false
+
+controlPlane:
+  enabled: true
+  dashboardUsername: admin
+  dashboardPassword: ""        # REQUIRED
+  dashboardSessionSecret: ""   # REQUIRED — >= 32 chars
+
+# Expose the data plane through your ingress controller.
+ingress:
+  enabled: true
+  className: nginx
+  host: obleth.example.com
+  servicePort: 8080
+  tls:
+    - secretName: obleth-tls
+      hosts: [obleth.example.com]

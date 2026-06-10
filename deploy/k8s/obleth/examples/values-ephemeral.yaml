@@ -1,0 +1,57 @@
+# Scenario 2: Bundled datastores WITHOUT persistence (ephemeral / test only)
+# -----------------------------------------------------------------------------
+# WARNING: ALL DATA IS LOST WHEN A DATASTORE POD RESTARTS.
+#
+# With persistence disabled the bundled Postgres, Redis, and ClickHouse use
+# emptyDir volumes. Every pod restart, reschedule, node drain, or `helm upgrade`
+# that rolls the datastore pods wipes:
+#   - Postgres: tenants, API keys, model registry, audit log, all config
+#   - ClickHouse: usage history
+#   - Redis: token budgets and cache (rebuildable, but also gone)
+#
+# Use this ONLY for throwaway demos, CI, or kicking the tires on a kind/minikube
+# cluster that has no StorageClass. NEVER use it for anything you care about.
+#
+#   helm install obleth ./deploy/k8s/obleth -n obleth --create-namespace \
+#     -f deploy/k8s/obleth/examples/values-ephemeral.yaml \
+#     --set obleth.adminToken="$(openssl rand -hex 32)" \
+#     --set postgres.password=devpassword \
+#     --set clickhouse.password=devpassword \
+#     --set controlPlane.dashboardPassword=devpassword \
+#     --set controlPlane.dashboardSessionSecret=dev-session-secret-at-least-32-chars
+
+obleth:
+  replicas: 1
+  adminToken: ""        # REQUIRED — set via --set
+  # Keep the demo fixture backend as the default upstream for a zero-config test.
+
+postgres:
+  enabled: true
+  password: ""          # REQUIRED
+  persistence:
+    enabled: false      # ephemeral — data lost on restart
+
+redis:
+  enabled: true
+  persistence:
+    enabled: false      # ephemeral
+
+clickhouse:
+  enabled: true
+  password: ""          # REQUIRED
+  persistence:
+    enabled: false      # ephemeral — usage history lost on restart
+
+# Built-in GPU-free fixture backend so test calls succeed with no real upstream.
+benchmarkBackend:
+  enabled: true
+
+# Single replica is plenty for a test env; no need to autoscale.
+hpa:
+  enabled: false
+
+controlPlane:
+  enabled: true
+  dashboardUsername: admin
+  dashboardPassword: ""        # REQUIRED
+  dashboardSessionSecret: ""   # REQUIRED — >= 32 chars

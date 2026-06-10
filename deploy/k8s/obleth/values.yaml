@@ -60,12 +60,17 @@ ingress:
   annotations: {}
   tls: []   # e.g. [{ secretName: obleth-tls, hosts: [obleth.example.com] }]
 
-# Bundled dependencies for a self-contained demo. In production, prefer the
+# Bundled dependencies for a self-contained install. In production, prefer the
 # CloudNativePG operator (Postgres), a managed/operator ClickHouse, and a real
 # Redis (the data plane treats Redis as a hot cache, so HA Redis is recommended).
 #
-# Set `enabled: false` and provide `external.url` to point obleth at an external,
-# operator-managed, or cloud endpoint instead of the bundled container.
+# Three storage scenarios are supported per datastore:
+#   1. Persistent (default): `persistence.enabled: true` provisions a PVC so data
+#      survives pod restarts/reschedules. Requires a StorageClass in the cluster.
+#   2. Ephemeral (test only): `persistence.enabled: false` uses an emptyDir —
+#      ALL DATA IS LOST when the pod restarts. Use only for throwaway test envs.
+#   3. External: `enabled: false` + `external.url` points obleth at a managed or
+#      self-hosted datastore and the bundled container is not deployed at all.
 postgres:
   enabled: true
   image: postgres:16
@@ -73,6 +78,15 @@ postgres:
   # REQUIRED when postgres.enabled=true. Supply via --set or an external Secret.
   password: ""
   db: obleth
+  # PVC-backed storage for the bundled Postgres. Disable for ephemeral test envs
+  # (data is lost on restart). Postgres is the config source of truth — keep this
+  # enabled for anything you care about.
+  persistence:
+    enabled: true
+    size: 10Gi
+    # "" uses the cluster's default StorageClass. Set a name to pin one.
+    storageClass: ""
+    accessMode: ReadWriteOnce
   external:
     # Full connection URL used when enabled=false, e.g.
     # postgres://user:pass@my-pg-host:5432/obleth
@@ -81,6 +95,14 @@ postgres:
 redis:
   enabled: true
   image: redis:7
+  # PVC-backed AOF persistence. Redis is a rebuildable hot cache, so this is
+  # optional — disable for ephemeral test envs. obleth re-warms from Postgres if
+  # Redis data is lost.
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
   external:
     # e.g. redis://my-redis-host:6379
     url: ""
@@ -92,6 +114,13 @@ clickhouse:
   user: obleth
   # REQUIRED when clickhouse.enabled=true. Supply via --set or an external Secret.
   password: ""
+  # PVC-backed storage for the usage ledger. Disable for ephemeral test envs
+  # (usage history is lost on restart).
+  persistence:
+    enabled: true
+    size: 20Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
   external:
     # e.g. http://my-clickhouse-host:8123
     url: ""

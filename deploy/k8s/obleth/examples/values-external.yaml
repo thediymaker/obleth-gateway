@@ -1,0 +1,73 @@
+# Scenario 3: External datastores (managed or self-hosted outside the chart)
+# -----------------------------------------------------------------------------
+# obleth runs only its own stateless workloads (data plane + control plane) and
+# connects to Postgres, Redis, and ClickHouse you operate yourself — managed
+# cloud services, a database operator, or standalone Docker containers.
+#
+# This is the recommended topology for production: stateful systems are managed
+# by purpose-built tooling (backups, HA, PITR) instead of plain Deployments.
+#
+# To stand up the external datastores in Docker, see:
+#   deploy/docker/datastores.compose.yml
+# and the Self-Hosting guide at https://obleth.com/docs/guides/self-hosting
+#
+# When `enabled: false`, the matching `external.url` is REQUIRED — the chart
+# fails to render with a clear message if it is missing, so obleth never boots
+# misconfigured.
+#
+#   helm install obleth ./deploy/k8s/obleth -n obleth --create-namespace \
+#     -f deploy/k8s/obleth/examples/values-external.yaml \
+#     --set obleth.adminToken="$(openssl rand -hex 32)" \
+#     --set obleth.encryptionKey="$(openssl rand -base64 32)"
+
+obleth:
+  replicas: 3
+  adminToken: ""        # REQUIRED
+  encryptionKey: ""     # recommended — base64 of 32 bytes
+  upstreamBaseUrl: "https://my-vllm-or-aibrix-endpoint/v1"
+  # If you run external datastores at private/LAN addresses AND enable strict
+  # SSRF (OBLETH_BLOCK_PRIVATE_NETWORKS=1), allow your network here.
+  allowedPrivateCidrs: ""
+
+postgres:
+  enabled: false
+  external:
+    # Include credentials in the URL or inject the whole URL via a Secret.
+    url: "postgres://obleth:STRONGPASSWORD@my-postgres-host:5432/obleth"
+
+redis:
+  enabled: false
+  external:
+    url: "redis://my-redis-host:6379"
+
+clickhouse:
+  enabled: false
+  # obleth authenticates to ClickHouse with these even when external. Set them
+  # to match the user/password/db on your external server.
+  user: obleth
+  password: ""          # REQUIRED — set via --set or a Secret
+  db: obleth
+  external:
+    url: "http://my-clickhouse-host:8123"
+
+# No bundled fixture backend in production.
+benchmarkBackend:
+  enabled: false
+
+controlPlane:
+  enabled: true
+  dashboardUsername: admin
+  dashboardPassword: ""        # REQUIRED
+  dashboardSessionSecret: ""   # REQUIRED — >= 32 chars
+
+ingress:
+  enabled: true
+  className: nginx
+  host: obleth.example.com
+  servicePort: 8080
+  tls:
+    - secretName: obleth-tls
+      hosts: [obleth.example.com]
+
+serviceMonitor:
+  enabled: true   # set true only if the Prometheus Operator CRDs are installed
