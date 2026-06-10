@@ -1,0 +1,76 @@
+obleth has been installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Data plane (OpenAI-compatible) : svc/{{ include "obleth.fullname" . }}:8080
+Management API                 : svc/{{ include "obleth.fullname" . }}:9180
+Metrics                        : svc/{{ include "obleth.fullname" . }}:9091
+{{- if .Values.controlPlane.enabled }}
+Control-plane dashboard        : svc/{{ .Release.Name }}-control-plane:3000
+{{- end }}
+
+----------------------------------------------------------------------
+STORAGE / DURABILITY
+----------------------------------------------------------------------
+{{- if or .Values.postgres.enabled .Values.redis.enabled .Values.clickhouse.enabled }}
+This release runs one or more BUNDLED datastores. How long their data
+survives depends entirely on the storage scenario you chose:
+
+{{- if and .Values.postgres.enabled (not .Values.postgres.persistence.enabled) }}
+  postgres   : EPHEMERAL (emptyDir) -> tenants, API keys, models, config
+               are LOST on any pod restart, reschedule, node drain, or reboot.
+{{- else if .Values.postgres.enabled }}
+  postgres   : persistent (PVC{{ with .Values.postgres.persistence.storageClass }}, storageClass={{ . }}{{ end }}) -> survives pod restarts.
+{{- end }}
+{{- if and .Values.clickhouse.enabled (not .Values.clickhouse.persistence.enabled) }}
+  clickhouse : EPHEMERAL (emptyDir) -> usage history LOST on restart.
+{{- else if .Values.clickhouse.enabled }}
+  clickhouse : persistent (PVC{{ with .Values.clickhouse.persistence.storageClass }}, storageClass={{ . }}{{ end }}) -> survives pod restarts.
+{{- end }}
+{{- if and .Values.redis.enabled (not .Values.redis.persistence.enabled) }}
+  redis      : EPHEMERAL (emptyDir) -> cache LOST on restart (rebuilt from Postgres).
+{{- else if .Values.redis.enabled }}
+  redis      : persistent (PVC{{ with .Values.redis.persistence.storageClass }}, storageClass={{ . }}{{ end }}).
+{{- end }}
+
+  NOTE: even a PVC-backed bundled datastore is a single plain Deployment with
+  no backups or HA. A PVC also does not protect you from permanent loss of the
+  node it lives on (e.g. node-local provisioners like local-path). For anything
+  you care about long-term, use the EXTERNAL storage scenario (managed/operator
+  Postgres + HA Redis + ClickHouse): examples/values-external.yaml.
+
+  If a datastore pod is stuck Pending after install, its PVC almost certainly
+  did not bind. Check it:
+
+    kubectl get pvc -n {{ .Release.Namespace }}
+
+  A PVC stuck "Pending" with "no persistent volumes available ... and no storage
+  class is set" means the cluster has NO DEFAULT StorageClass and you left
+  persistence.storageClass empty. Fix either by pinning a class:
+
+    --set postgres.persistence.storageClass=<name> (likewise redis/clickhouse)
+
+  or by marking one StorageClass default:
+
+    kubectl patch storageclass <name> -p \
+      '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+{{- else }}
+This release uses EXTERNAL datastores. obleth runs only its stateless
+workloads; durability/backups/HA are managed by your external Postgres,
+Redis, and ClickHouse.
+{{- end }}
+
+----------------------------------------------------------------------
+NEXT STEPS (a fresh install has an EMPTY model registry)
+----------------------------------------------------------------------
+1. Wait for all pods to be Running:
+     kubectl get pods -n {{ .Release.Namespace }} -w
+
+2. Reach the Management API:
+     kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "obleth.fullname" . }} 9180:9180
+
+3. Create a tenant + mint a key, then register models, then call the data
+   plane on :8080. Full walkthrough: deploy/k8s/README.md ("Post-install").
+{{- if not .Values.ingress.enabled }}
+
+   Ingress is disabled; use port-forward or your own LB/gateway to expose
+   svc/{{ include "obleth.fullname" . }} (:8080 data plane, :9180 admin).
+{{- end }}

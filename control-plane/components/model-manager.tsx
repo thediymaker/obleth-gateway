@@ -397,7 +397,7 @@ export function ModelManager({
             </div>
           )}
           <div className="text-sm">
-            <div className="grid border-b border-border text-left text-xs text-muted-foreground md:grid-cols-[44fr_16fr_28fr_12fr]">
+            <div className="grid border-b border-border text-left text-xs text-muted-foreground md:grid-cols-[40fr_16fr_32fr_12fr]">
               <div className="px-6 py-3 font-medium">Model</div>
               <div className="hidden px-3 py-3 font-medium md:block">Health</div>
               <div className="hidden px-3 py-3 font-medium md:block">Route</div>
@@ -422,15 +422,17 @@ export function ModelManager({
                       className="relative cursor-pointer overflow-hidden transition-colors"
                     >
                       <ModelProviderBackdrop name={model.model_name} upstream={model.upstream_model} selected={selected} />
-                      <div className="relative z-10 grid md:grid-cols-[44fr_16fr_28fr_12fr] md:items-center">
-                        <div className="px-5 py-3.5 pr-14 md:pr-5">
+                      <div className="relative z-10 grid min-w-0 md:grid-cols-[40fr_16fr_32fr_12fr] md:items-center">
+                        <div className="min-w-0 px-5 py-3.5 pr-14 md:pr-5">
                           <div className="min-w-0">
-                            <div className="flex items-baseline gap-2">
-                              <p className="truncate font-medium">{model.model_name}</p>
-                              {model.description && (
-                                <p className="hidden truncate text-xs text-muted-foreground lg:block">{model.description}</p>
-                              )}
-                            </div>
+                            <p className="truncate font-medium" title={model.model_name}>
+                              {model.model_name}
+                            </p>
+                            {model.description && (
+                              <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground" title={model.description}>
+                                {model.description}
+                              </p>
+                            )}
                             <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1">
                               {model.model_type && model.model_type !== "chat" && (
                                 <Badge className="border-primary/40 bg-primary/15 text-[10px] text-primary">
@@ -452,15 +454,26 @@ export function ModelManager({
                                 </span>
                               )}
                             </div>
-                            <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground md:hidden">{model.upstream_model}</p>
+                            <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground md:hidden" title={model.upstream_model}>
+                              {model.upstream_model}
+                            </p>
+                            {model.api_base && (
+                              <p className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground/70 md:hidden" title={model.api_base}>
+                                {middleTruncate(model.api_base, 56)}
+                              </p>
+                            )}
                           </div>
                         </div>
-                        <div className="hidden px-3 py-3.5 md:block">
+                        <div className="hidden min-w-0 px-3 py-3.5 md:block">
                           <HealthCell summary={summary} />
                         </div>
-                        <div className="hidden px-3 py-3.5 md:block">
-                          <p className="truncate font-mono text-xs text-muted-foreground">{model.upstream_model}</p>
-                          <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground/70">{model.api_base}</p>
+                        <div className="hidden min-w-0 px-3 py-3.5 md:block">
+                          <p className="truncate font-mono text-xs text-muted-foreground" title={model.upstream_model}>
+                            {model.upstream_model}
+                          </p>
+                          <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground/70" title={model.api_base}>
+                            {middleTruncate(model.api_base, 56)}
+                          </p>
                         </div>
                         <div className="absolute right-3 top-3 md:static md:px-3 md:py-3.5">
                           <div className="flex items-center justify-end gap-1">
@@ -2051,6 +2064,14 @@ function isInMaintenance(summary: ModelHealthSummary) {
 
 function formatTime(value: string) {
   return new Date(value).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+
+function middleTruncate(value: string, maxLength = 48): string {
+  const trimmed = value.trim();
+  if (trimmed.length <= maxLength) return trimmed;
+  const head = Math.ceil((maxLength - 1) / 2);
+  const tail = Math.floor((maxLength - 1) / 2);
+  return `${trimmed.slice(0, head)}…${trimmed.slice(-tail)}`;
 }
 
 function datetimeLocalValue(value: string | null) {

@@ -12,12 +12,11 @@ use obleth_config::{
 };
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use uuid::Uuid;
 
-mod backup;
 mod crypto;
-pub use backup::BACKUP_KEY_SENTINEL;
 pub use crypto::{Cipher, CryptoError};
 
 /// Process-wide cipher for upstream secret columns, initialized once from the
@@ -37,8 +36,6 @@ pub enum StoreError {
     NotFound,
     #[error("crypto: {0}")]
     Crypto(#[from] CryptoError),
-    #[error("{0}")]
-    Conflict(String),
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -46,6 +43,10 @@ type Result<T> = std::result::Result<T, StoreError>;
 /// Embedded idempotent schema, applied on boot. A versioned copy also lives in
 /// `schema/postgres/` for operators who manage migrations out of band.
 const SCHEMA: &str = include_str!("../../../../schema/postgres/0001_init.sql");
+
+/// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
+/// across connections, replicas and parallel test binaries.
+const MIGRATE_LOCK_KEY: i64 = 0x0B1E_7480_0001;
 
 #[derive(Clone)]
 pub struct Store {
@@ -68,8 +69,27 @@ impl Store {
     }
 
     /// Apply the embedded schema (CREATE ... IF NOT EXISTS).
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` is *not* safe under concurrency: two
+    /// backends can both pass the existence check and then collide creating the
+    /// table's implicit row-type, failing with a duplicate-key violation on
+    /// `pg_type_typname_nsp_index`. Since this runs on every gateway boot (and
+    /// thus races across replicas / parallel test binaries), we serialize the
+    /// whole schema apply behind a session-level advisory lock taken on a single
+    /// dedicated connection.
     pub async fn migrate(&self) -> Result<()> {
-        sqlx::raw_sql(SCHEMA).execute(&self.pool).await?;
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("select pg_advisory_lock($1)")
+            .bind(MIGRATE_LOCK_KEY)
+            .execute(&mut *conn)
+            .await?;
+        let result = sqlx::raw_sql(SCHEMA).execute(&mut *conn).await;
+        // Always release the lock, even if the schema apply failed.
+        let _ = sqlx::query("select pg_advisory_unlock($1)")
+            .bind(MIGRATE_LOCK_KEY)
+            .execute(&mut *conn)
+            .await;
+        result?;
         Ok(())
     }
 
@@ -339,20 +359,28 @@ impl Store {
     /// Hard-delete a tenant. Cascades to its API keys (FK `on delete cascade`).
     /// Returns the key hashes that were removed so callers can evict caches.
     pub async fn delete_tenant(&self, id: Uuid) -> Result<Vec<String>> {
+        let mut tx = self.pool.begin().await?;
+        // Lock the tenant row before snapshotting key hashes: a concurrent key
+        // insert must take a KEY SHARE lock on this row for its FK check, so
+        // holding FOR UPDATE guarantees no key can appear between the hash
+        // snapshot and the cascade delete and dodge cache eviction.
+        sqlx::query("select 1 from tenants where id = $1 for update")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?;
         let hashes: Vec<String> = sqlx::query("select key_hash from api_keys where tenant_id = $1")
             .bind(id)
-            .fetch_all(&self.pool)
+            .fetch_all(&mut *tx)
             .await?
             .iter()
             .map(|r| r.try_get::<String, _>("key_hash"))
             .collect::<std::result::Result<_, _>>()?;
-        let res = sqlx::query("delete from tenants where id = $1")
+        sqlx::query("delete from tenants where id = $1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-        if res.rows_affected() == 0 {
-            return Err(StoreError::NotFound);
-        }
+        tx.commit().await?;
         Ok(hashes)
     }
 
@@ -876,11 +904,35 @@ impl Store {
         )
         .fetch_all(&self.pool)
         .await?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Fetch every endpoint in one batched query instead of one per model.
+        let model_ids: Vec<Uuid> = rows
+            .iter()
+            .map(|r| r.try_get("id"))
+            .collect::<std::result::Result<_, _>>()?;
+        let endpoint_rows = sqlx::query(
+            "select model_id, id, api_base, api_key, priority, weight, enabled, health_status
+             from model_endpoints
+             where model_id = any($1)
+             order by priority asc, created_at asc",
+        )
+        .bind(&model_ids)
+        .fetch_all(&self.pool)
+        .await?;
+        let mut endpoints_by_model: HashMap<Uuid, Vec<ResolvedEndpoint>> = HashMap::new();
+        for row in &endpoint_rows {
+            endpoints_by_model
+                .entry(row.try_get("model_id")?)
+                .or_default()
+                .push(resolved_endpoint_from_row(row)?);
+        }
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let name: String = row.try_get("model_name")?;
             let model_id: Uuid = row.try_get("id")?;
-            let endpoints = self.resolved_endpoints_for(model_id).await?;
+            let endpoints = endpoints_by_model.remove(&model_id).unwrap_or_default();
             out.push((
                 name.clone(),
                 ResolvedModel {
@@ -1009,22 +1061,7 @@ impl Store {
         .bind(model_id)
         .fetch_all(&self.pool)
         .await?;
-        rows.iter()
-            .map(|r| {
-                let status: String = r.try_get("health_status")?;
-                Ok(ResolvedEndpoint {
-                    id: r.try_get::<Uuid, _>("id")?.to_string(),
-                    api_base: r.try_get("api_base")?,
-                    api_key: cipher().decrypt_opt(r.try_get("api_key")?)?,
-                    priority: r.try_get("priority")?,
-                    weight: r.try_get("weight")?,
-                    enabled: r.try_get("enabled")?,
-                    // Treat unknown/degraded as eligible (soft-pass); only an
-                    // explicit unhealthy/disabled state removes an endpoint.
-                    healthy: !matches!(status.as_str(), "unhealthy" | "disabled"),
-                })
-            })
-            .collect()
+        rows.iter().map(resolved_endpoint_from_row).collect()
     }
 
     pub async fn list_model_endpoints(&self, model_id: Uuid) -> Result<Vec<ModelEndpoint>> {
@@ -1946,6 +1983,21 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
     })
 }
 
+fn resolved_endpoint_from_row(row: &PgRow) -> Result<ResolvedEndpoint> {
+    let status: String = row.try_get("health_status")?;
+    Ok(ResolvedEndpoint {
+        id: row.try_get::<Uuid, _>("id")?.to_string(),
+        api_base: row.try_get("api_base")?,
+        api_key: cipher().decrypt_opt(row.try_get("api_key")?)?,
+        priority: row.try_get("priority")?,
+        weight: row.try_get("weight")?,
+        enabled: row.try_get("enabled")?,
+        // Treat unknown/degraded as eligible (soft-pass); only an
+        // explicit unhealthy/disabled state removes an endpoint.
+        healthy: !matches!(status.as_str(), "unhealthy" | "disabled"),
+    })
+}
+
 fn endpoint_from_row(row: &PgRow) -> Result<ModelEndpoint> {
     Ok(ModelEndpoint {
         id: row.try_get("id")?,
@@ -2181,5 +2233,27 @@ mod tests {
             .await
             .expect("delete old checks");
         assert!(deleted >= 2);
+
+        // the batched resolve must attach this model's endpoints
+        store
+            .create_model_endpoint(model.id, "primary", "http://127.0.0.1:8082", None, 0, 1, true)
+            .await
+            .expect("create endpoint");
+        let resolved_models = store.all_resolved_models().await.expect("resolved models");
+        let (_, resolved_model) = resolved_models
+            .iter()
+            .find(|(n, _)| n == &model.model_name)
+            .expect("model resolved");
+        assert_eq!(resolved_model.endpoints.len(), 1);
+        assert_eq!(resolved_model.endpoints[0].api_base, "http://127.0.0.1:8082");
+
+        // tenant delete must report the cascade-deleted key hashes
+        let hashes = store.delete_tenant(tenant.id).await.expect("delete tenant");
+        assert!(hashes.contains(&hash));
+        assert!(store.resolved_key_by_hash(&hash).await.unwrap().is_none());
+        assert!(matches!(
+            store.delete_tenant(tenant.id).await,
+            Err(StoreError::NotFound)
+        ));
     }
 }

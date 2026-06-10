@@ -186,6 +186,39 @@ Port-forward `svc/obleth` on `:8080`, or use your Ingress on `ingress.servicePor
 
 ## Common gotchas
 
+### Datastore pods stuck `Pending` (PVC never binds)
+
+A bundled datastore pod that stays `Pending` after install almost always means
+its PVC did not bind. Check:
+
+```bash
+kubectl get pvc -n obleth
+kubectl describe pvc <release>-postgres -n obleth
+```
+
+If the PVC shows `no persistent volumes available for this claim and no storage
+class is set`, the cluster has **no default StorageClass** and you left
+`persistence.storageClass` empty (the chart then omits `storageClassName`, so
+the claim matches nothing). The persistent scenario assumes either a default
+StorageClass or an explicit class. Fix with one of:
+
+```bash
+# Pin a class per datastore (find names with: kubectl get storageclass)
+--set postgres.persistence.storageClass=local-path \
+--set redis.persistence.storageClass=local-path \
+--set clickhouse.persistence.storageClass=local-path
+
+# ...or mark one StorageClass the cluster default (one-time, cluster-wide)
+kubectl patch storageclass <name> \
+  -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+```
+
+`local-path` (k3s/k0s) and similar node-local provisioners use
+`volumeBindingMode: WaitForFirstConsumer` — the PVC binds only once a consuming
+pod is scheduled, and the volume is then pinned to that node. That is fine for a
+single-cluster self-host, but the data does **not** move if the node is lost;
+use the External scenario for true HA.
+
 ### SSRF and in-cluster `api_base`
 
 By default, obleth allows private/LAN upstream addresses when registering models.
