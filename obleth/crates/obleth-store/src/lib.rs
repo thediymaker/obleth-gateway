@@ -16,7 +16,9 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use uuid::Uuid;
 
+mod backup;
 mod crypto;
+pub use backup::BACKUP_KEY_SENTINEL;
 pub use crypto::{Cipher, CryptoError};
 
 /// Process-wide cipher for upstream secret columns, initialized once from the
@@ -36,6 +38,8 @@ pub enum StoreError {
     NotFound,
     #[error("crypto: {0}")]
     Crypto(#[from] CryptoError),
+    #[error("{0}")]
+    Conflict(String),
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
