@@ -39,14 +39,34 @@
 }
 
 @layer components {
-  /* Muted mono provider marks — sits near muted-foreground without shouting */
-  .provider-logo {
-    opacity: 0.52;
-    filter: grayscale(1);
-    transition: opacity 150ms ease;
+  .provider-logo-backdrop-shell {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    transition: transform 450ms cubic-bezier(0.22, 1, 0.36, 1);
   }
 
-  tr:hover .provider-logo {
-    opacity: 0.72;
+  .provider-logo-backdrop {
+    opacity: 0.09;
+    filter: grayscale(1);
+    transition:
+      opacity 450ms cubic-bezier(0.22, 1, 0.36, 1),
+      transform 450ms cubic-bezier(0.22, 1, 0.36, 1);
+  }
+
+  .provider-logo-backdrop-shell.is-selected .provider-logo-backdrop {
+    opacity: 0.12;
+  }
+
+  .group:hover .provider-logo-backdrop-shell {
+    transform: scale(1.06);
+  }
+
+  .group:hover .provider-logo-backdrop {
+    opacity: 0.16;
+  }
+
+  .group:hover .provider-logo-backdrop-shell.is-selected .provider-logo-backdrop {
+    opacity: 0.18;
   }
 }

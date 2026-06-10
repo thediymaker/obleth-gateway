@@ -1,6 +1,6 @@
 "use client";
 
-import { Fragment, useEffect, useMemo, useRef, useState, useTransition, type ChangeEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition, type ChangeEvent, type ReactNode } from "react";
 import {
   Activity,
   Check,
@@ -396,34 +396,35 @@ export function ModelManager({
               <ImportResultBanner result={importResult} onDismiss={() => setImportResult(null)} />
             </div>
           )}
-          <table className="w-full table-fixed text-sm">
-            <thead>
-              <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                <th className="w-[44%] px-6 py-3 font-medium">Model</th>
-                <th className="w-[16%] px-3 py-3 font-medium">Health</th>
-                <th className="hidden w-[30%] px-3 py-3 font-medium md:table-cell">Route</th>
-                <th className="w-[40%] px-3 py-3 text-right font-medium md:w-[10%]" />
-              </tr>
-            </thead>
-            <tbody>
+          <div className="text-sm">
+            <div className="grid border-b border-border text-left text-xs text-muted-foreground md:grid-cols-[44fr_16fr_28fr_12fr]">
+              <div className="px-6 py-3 font-medium">Model</div>
+              <div className="hidden px-3 py-3 font-medium md:block">Health</div>
+              <div className="hidden px-3 py-3 font-medium md:block">Route</div>
+              <div className="hidden px-3 py-3 text-right font-medium md:block" />
+            </div>
+            <div className="space-y-3 px-4 py-4">
               {visibleModels.map((model) => {
                 const summary = healthByModel.get(model.id) ?? fallbackHealth(model);
                 const selected = selectedId === model.id;
                 return (
-                  <Fragment key={model.id}>
-                    <tr
+                  <div
+                    key={model.id}
+                    className={cn(
+                      "group overflow-hidden rounded-lg border shadow-sm transition-colors",
+                      selected
+                        ? "border-primary/35 bg-muted/25 ring-1 ring-primary/15"
+                        : "border-border/70 bg-card/35 hover:border-border hover:bg-muted/15",
+                    )}
+                  >
+                    <div
                       onClick={() => setSelectedId((current) => (current === model.id ? null : model.id))}
-                      className={cn(
-                        "cursor-pointer transition-colors",
-                        selected
-                          ? "border-t border-t-border bg-muted/30"
-                          : "border-b border-border/60 hover:bg-muted/20",
-                      )}
+                      className="relative cursor-pointer overflow-hidden transition-colors"
                     >
-                      <td className={cn("border-l-2 px-6 py-3 transition-colors", selected ? "border-l-primary" : "border-l-transparent")}>
-                        <div className="flex items-center gap-3">
-                          <ModelAvatar name={model.model_name} upstream={model.upstream_model} />
-                          <div className="min-w-0 flex-1">
+                      <ModelProviderBackdrop name={model.model_name} upstream={model.upstream_model} selected={selected} />
+                      <div className="relative z-10 grid md:grid-cols-[44fr_16fr_28fr_12fr] md:items-center">
+                        <div className="px-5 py-3.5 pr-14 md:pr-5">
+                          <div className="min-w-0">
                             <div className="flex items-baseline gap-2">
                               <p className="truncate font-medium">{model.model_name}</p>
                               {model.description && (
@@ -454,58 +455,62 @@ export function ModelManager({
                             <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground md:hidden">{model.upstream_model}</p>
                           </div>
                         </div>
-                      </td>
-                      <td className="px-3 py-3">
-                        <HealthCell summary={summary} />
-                      </td>
-                      <td className="hidden px-3 py-3 md:table-cell">
-                        <p className="truncate font-mono text-xs text-muted-foreground">{model.upstream_model}</p>
-                        <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground/70">{model.api_base}</p>
-                      </td>
-                      <td className="px-3 py-3">
-                        <div className="flex items-center justify-end gap-1">
-                          <DropdownMenu>
-                            <DropdownMenuTrigger asChild>
-                              <Button
-                                type="button"
-                                size="icon"
-                                variant="ghost"
-                                className="h-8 w-8 text-muted-foreground hover:text-foreground"
-                                disabled={pending}
-                                title="Model actions"
-                                onClick={(event) => event.stopPropagation()}
-                              >
-                                <MoreHorizontal className="h-4 w-4" />
-                              </Button>
-                            </DropdownMenuTrigger>
-                            <DropdownMenuContent align="end" onClick={(event) => event.stopPropagation()}>
-                              <DropdownMenuItem onSelect={() => checkOne(model.id)}>
-                                <Activity className="mr-2 h-3.5 w-3.5" />
-                                Check health
-                              </DropdownMenuItem>
-                              <DropdownMenuSeparator />
-                              <DropdownMenuItem
-                                className="text-destructive focus:text-destructive"
-                                onSelect={() => removeModel(model)}
-                              >
-                                <Trash2 className="mr-2 h-3.5 w-3.5" />
-                                Delete model
-                              </DropdownMenuItem>
-                            </DropdownMenuContent>
-                          </DropdownMenu>
-                          <ChevronDown
-                            aria-hidden
-                            className={cn(
-                              "h-3.5 w-3.5 text-muted-foreground transition-transform duration-200",
-                              selected && "rotate-180 text-foreground",
-                            )}
-                          />
+                        <div className="hidden px-3 py-3.5 md:block">
+                          <HealthCell summary={summary} />
                         </div>
-                      </td>
-                    </tr>
+                        <div className="hidden px-3 py-3.5 md:block">
+                          <p className="truncate font-mono text-xs text-muted-foreground">{model.upstream_model}</p>
+                          <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground/70">{model.api_base}</p>
+                        </div>
+                        <div className="absolute right-3 top-3 md:static md:px-3 md:py-3.5">
+                          <div className="flex items-center justify-end gap-1">
+                            <DropdownMenu>
+                              <DropdownMenuTrigger asChild>
+                                <Button
+                                  type="button"
+                                  size="icon"
+                                  variant="ghost"
+                                  className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                                  disabled={pending}
+                                  title="Model actions"
+                                  onClick={(event) => event.stopPropagation()}
+                                >
+                                  <MoreHorizontal className="h-4 w-4" />
+                                </Button>
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent align="end" onClick={(event) => event.stopPropagation()}>
+                                <DropdownMenuItem onSelect={() => checkOne(model.id)}>
+                                  <Activity className="mr-2 h-3.5 w-3.5" />
+                                  Check health
+                                </DropdownMenuItem>
+                                <DropdownMenuSeparator />
+                                <DropdownMenuItem
+                                  className="text-destructive focus:text-destructive"
+                                  onSelect={() => removeModel(model)}
+                                >
+                                  <Trash2 className="mr-2 h-3.5 w-3.5" />
+                                  Delete model
+                                </DropdownMenuItem>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                            <ChevronDown
+                              aria-hidden
+                              className={cn(
+                                "h-3.5 w-3.5 text-muted-foreground transition-transform duration-200",
+                                selected && "rotate-180 text-foreground",
+                              )}
+                            />
+                          </div>
+                        </div>
+                        <div className="border-t border-border/40 px-5 pb-3.5 pt-0 md:hidden">
+                          <HealthCell summary={summary} />
+                        </div>
+                      </div>
+                    </div>
                     {selected && (
-                      <tr className="border-b border-border">
-                        <td colSpan={4} className="border-l-2 border-l-primary bg-muted/10 px-6 py-4">
+                      <div className="relative overflow-hidden border-t border-border/60 bg-muted/10">
+                        <ModelProviderBackdrop name={model.model_name} upstream={model.upstream_model} selected variant="detail" />
+                        <div className="relative z-10 px-5 py-4">
                           <ModelDetailPanel
                             model={model}
                             summary={summary}
@@ -514,21 +519,19 @@ export function ModelManager({
                             pending={pending}
                             onCacheToggle={() => start(() => setModelCacheAction(model.id, !model.cache_enabled, model.cache_ttl_secs || 300))}
                           />
-                        </td>
-                      </tr>
+                        </div>
+                      </div>
                     )}
-                  </Fragment>
+                  </div>
                 );
               })}
               {visibleModels.length === 0 && (
-                <tr>
-                  <td colSpan={4} className="px-6 py-8 text-center text-muted-foreground">
-                    {models.length === 0 ? "No models configured." : "Only benchmark endpoints are hidden."}
-                  </td>
-                </tr>
+                <div className="rounded-lg border border-dashed border-border/70 px-6 py-10 text-center text-muted-foreground">
+                  {models.length === 0 ? "No models configured." : "Only benchmark endpoints are hidden."}
+                </div>
               )}
-            </tbody>
-          </table>
+            </div>
+          </div>
         </CardContent>
       </Card>
     </div>
@@ -1207,27 +1210,72 @@ export function ModelWeightControl({ id, initial }: { id: string; initial: numbe
   );
 }
 
-// Provider logo for the row; falls back to a lettered tile when we don't
-// recognise the model family or the image fails to load.
-function ModelAvatar({ name, upstream }: { name: string; upstream?: string }) {
+// Ghosted provider backdrop — large mark in the row's right dead zone with a
+// soft fade so foreground text stays crisp.
+function ModelProviderBackdrop({
+  name,
+  upstream,
+  selected = false,
+  variant = "row",
+}: {
+  name: string;
+  upstream?: string;
+  selected?: boolean;
+  variant?: "row" | "detail";
+}) {
   const provider = providerForModel(name, upstream);
   const [failed, setFailed] = useState(false);
-  if (provider && !failed) {
-    return (
+  const letter = name.replace(/[^a-z0-9]/gi, "").slice(0, 1).toUpperCase() || "?";
+
+  const mark =
+    provider && !failed ? (
       // eslint-disable-next-line @next/next/no-img-element
       <img
         src={provider.src}
-        alt={provider.label}
-        title={provider.label}
-        className="provider-logo h-10 w-10 shrink-0 object-contain"
+        alt=""
+        className={cn(
+          "provider-logo-backdrop object-contain",
+          variant === "row" ? "h-24 w-24 md:h-28 md:w-28" : "h-44 w-44 md:h-52 md:w-52",
+        )}
         onError={() => setFailed(true)}
       />
+    ) : (
+      <span
+        className={cn(
+          "provider-logo-backdrop font-bold uppercase text-muted-foreground",
+          variant === "row" ? "text-6xl md:text-7xl" : "text-8xl md:text-9xl",
+        )}
+      >
+        {letter}
+      </span>
+    );
+
+  if (variant === "detail") {
+    return (
+      <div aria-hidden className="pointer-events-none absolute -bottom-10 -right-6 z-0 hidden select-none md:block">
+        <div className={cn("provider-logo-backdrop-shell", selected && "is-selected")}>{mark}</div>
+      </div>
     );
   }
+
   return (
-    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-secondary/60 text-xs font-semibold uppercase text-muted-foreground">
-      {name.replace(/[^a-z0-9]/gi, "").slice(0, 2) || "?"}
-    </div>
+    <>
+      <div
+        aria-hidden
+        className={cn(
+          "pointer-events-none absolute inset-y-0 left-0 z-[1] hidden w-[58%] md:block",
+          selected
+            ? "bg-gradient-to-r from-muted/45 from-[38%] via-muted/15 to-transparent"
+            : "bg-gradient-to-r from-card/95 from-[38%] via-card/45 to-transparent",
+        )}
+      />
+      <div
+        aria-hidden
+        className="pointer-events-none absolute right-[4.25rem] top-1/2 z-0 hidden -translate-y-1/2 select-none md:block"
+      >
+        <div className={cn("provider-logo-backdrop-shell", selected && "is-selected")}>{mark}</div>
+      </div>
+    </>
   );
 }
 
