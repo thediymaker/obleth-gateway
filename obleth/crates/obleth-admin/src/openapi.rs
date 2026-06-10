@@ -24,8 +24,10 @@ use crate::{
 };
 use crate::autotune::{AutotuneReport, AutotuneRequest, AutotuneStep, KneeReason, WorkloadProfile};
 use obleth_config::{
-    ApiKey, FairshareGroup, McpServer, ModelEndpoint, ModelHealthCheck, ModelHealthDetail,
-    ModelHealthSummary, ModelRoute, Tenant, WeeklyWindow,
+    ApiKey, ApiKeyBackup, AppSettingBackup, BackupData, BackupEncryption, ConfigBackup,
+    FairshareGroup, FairshareGroupBackup, McpServer, McpServerBackup, ModelBackup, ModelEndpoint,
+    ModelEndpointBackup, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelRoute,
+    RestoreCounts, RestoreReport, Tenant, TenantBackup, WeeklyWindow,
 };
 
 #[derive(OpenApi)]
@@ -115,6 +117,9 @@ use obleth_config::{
         crate::put_boon_settings,
         crate::get_usage_retention,
         crate::put_usage_retention,
+        // backup
+        crate::backup::export_backup,
+        crate::backup::restore_backup,
     ),
     components(schemas(
         Tenant,
@@ -197,6 +202,18 @@ use obleth_config::{
         AutotuneStep,
         KneeReason,
         WorkloadProfile,
+        ConfigBackup,
+        BackupEncryption,
+        BackupData,
+        FairshareGroupBackup,
+        TenantBackup,
+        ApiKeyBackup,
+        ModelBackup,
+        ModelEndpointBackup,
+        McpServerBackup,
+        AppSettingBackup,
+        RestoreReport,
+        RestoreCounts,
     )),
     tags(
         (name = "tenants", description = "Tenant lifecycle, quotas, and fairshare group assignment"),
@@ -207,7 +224,8 @@ use obleth_config::{
         (name = "mcp", description = "MCP server registry"),
         (name = "audit", description = "Admin audit log"),
         (name = "capacity", description = "Global gateway in-flight capacity"),
-        (name = "settings", description = "Runtime alerting, auto-router, and retention configuration")
+        (name = "settings", description = "Runtime alerting, auto-router, and retention configuration"),
+        (name = "backup", description = "Configuration backup and restore")
     )
 )]
 pub struct ApiDoc;

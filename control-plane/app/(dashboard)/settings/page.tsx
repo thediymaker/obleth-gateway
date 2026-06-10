@@ -4,6 +4,7 @@ import {
   BoonsSettingsForm,
   UsageRetentionForm,
 } from "@/components/settings-form";
+import { BackupRestore } from "@/components/backup-restore";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
@@ -29,6 +30,7 @@ export default async function SettingsPage() {
       <AutoRouterSettingsForm settings={autoRouter} models={models} />
       <BoonsSettingsForm settings={boons} models={models} />
       <UsageRetentionForm retention={retention} />
+      <BackupRestore />
     </div>
   );
 }

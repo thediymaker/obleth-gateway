@@ -28,6 +28,13 @@ fn pepper() -> &'static [u8] {
         .as_slice()
 }
 
+/// True when a server-side pepper is configured. Exposed so config backups can
+/// record the flag — restored key hashes only authenticate when the target
+/// instance uses the same pepper, and the hashes themselves are opaque.
+pub fn pepper_is_set() -> bool {
+    !pepper().is_empty()
+}
+
 /// A freshly minted key. `secret` is returned to the caller once and never stored.
 #[derive(Debug, Clone)]
 pub struct GeneratedKey {

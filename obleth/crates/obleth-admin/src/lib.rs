@@ -8,6 +8,7 @@
 
 pub mod alerts;
 pub mod autotune;
+mod backup;
 mod error;
 pub mod model_health;
 mod openapi;
@@ -182,6 +183,14 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/api/v1/settings/usage-retention",
             get(get_usage_retention).put(put_usage_retention),
+        )
+        .route("/api/v1/backup/export", get(backup::export_backup))
+        .route(
+            "/api/v1/backup/restore",
+            // Backups with large key fleets exceed axum's 2 MB default body
+            // limit; raise it for this route only.
+            post(backup::restore_backup)
+                .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024)),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

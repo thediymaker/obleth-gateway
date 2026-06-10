@@ -916,3 +916,246 @@ impl VisionBoonSettings {
                 .is_some_and(|m| !m.trim().is_empty())
     }
 }
+
+// ---- config backup / restore ------------------------------------------------
+
+/// File-format discriminator for config backups.
+pub const BACKUP_FORMAT: &str = "obleth-config-backup";
+/// Current backup schema version. Bump when the file shape changes.
+pub const BACKUP_VERSION: u32 = 1;
+
+/// A portable snapshot of all gateway configuration: everything needed to
+/// recreate an instance except usage history (audit log, health-check history,
+/// ClickHouse ledger). Provider secrets are carried exactly as stored — i.e.
+/// AES-GCM ciphertext when `OBLETH_ENCRYPTION_KEY` is set — so restoring an
+/// encrypted backup requires the same key.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ConfigBackup {
+    /// Always [`BACKUP_FORMAT`].
+    pub format: String,
+    /// Backup schema version ([`BACKUP_VERSION`]).
+    pub version: u32,
+    pub exported_at: chrono::DateTime<chrono::Utc>,
+    /// Gateway version that produced the backup (informational).
+    pub gateway_version: String,
+    pub encryption: BackupEncryption,
+    pub data: BackupData,
+}
+
+/// Describes how secrets in the backup are protected, and carries a sentinel
+/// that lets a restoring instance prove its encryption key matches before
+/// touching the database.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BackupEncryption {
+    /// Whether the exporting instance had `OBLETH_ENCRYPTION_KEY` configured.
+    pub cipher_enabled: bool,
+    /// A known plaintext encrypted with the exporter's key. `None` when the
+    /// cipher was disabled. Restore decrypts this first; a failure means the
+    /// keys differ and the restore is rejected before any write.
+    pub key_check: Option<String>,
+    /// Whether the exporting instance hashed client keys with an
+    /// `OBLETH_API_KEY_PEPPER`. A pepper mismatch can't be detected from the
+    /// opaque hashes; this flag lets restore at least warn about it.
+    #[serde(default)]
+    pub api_key_pepper_set: bool,
+}
+
+/// The configuration rows themselves, in foreign-key order (groups before
+/// tenants, tenants before keys, models before endpoints).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct BackupData {
+    #[serde(default)]
+    pub fairshare_groups: Vec<FairshareGroupBackup>,
+    #[serde(default)]
+    pub tenants: Vec<TenantBackup>,
+    #[serde(default)]
+    pub api_keys: Vec<ApiKeyBackup>,
+    #[serde(default)]
+    pub models: Vec<ModelBackup>,
+    #[serde(default)]
+    pub model_endpoints: Vec<ModelEndpointBackup>,
+    #[serde(default)]
+    pub mcp_servers: Vec<McpServerBackup>,
+    #[serde(default)]
+    pub app_settings: Vec<AppSettingBackup>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct FairshareGroupBackup {
+    pub name: String,
+    pub weight: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// [`Tenant`] minus server-managed `updated_at`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TenantBackup {
+    pub id: Uuid,
+    pub name: String,
+    pub fairshare_group: String,
+    pub weight: i64,
+    pub tokens_per_minute: i64,
+    pub max_in_flight: Option<i64>,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub organization: String,
+    #[serde(default)]
+    pub contact_email: String,
+    #[serde(default = "default_tenant_status")]
+    pub status: String,
+    #[serde(default = "default_timezone")]
+    pub timezone: String,
+    #[serde(default)]
+    pub active_from: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub active_until: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub weekly_windows: Option<Vec<WeeklyWindow>>,
+    #[serde(default)]
+    pub budget_tokens: Option<i64>,
+    #[serde(default)]
+    pub budget_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub budget_period: Option<String>,
+    #[serde(default)]
+    pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub allowed_models: Option<Vec<String>>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// [`ApiKey`] plus the stored `key_hash`, so client keys issued before the
+/// backup keep authenticating after a restore. The hash is a one-way SHA-256
+/// digest — it cannot be reversed into a usable secret.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ApiKeyBackup {
+    pub id: Uuid,
+    pub tenant_id: Uuid,
+    pub name: String,
+    pub key_prefix: String,
+    pub key_hash: String,
+    pub disabled: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// [`ModelRoute`] configuration columns plus health *configuration* (intervals,
+/// thresholds, maintenance window). Runtime health state (status, failure
+/// counters, last-check telemetry) is deliberately absent: a restored model is
+/// re-probed from scratch. `api_key` carries the stored value verbatim —
+/// ciphertext on encrypted instances.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelBackup {
+    pub id: Uuid,
+    pub model_name: String,
+    #[serde(default)]
+    pub description: String,
+    pub upstream_model: String,
+    pub api_base: String,
+    pub api_key: Option<String>,
+    #[serde(default = "default_model_type")]
+    pub model_type: String,
+    pub input_cost_per_token: f64,
+    pub output_cost_per_token: f64,
+    #[serde(default)]
+    pub cost_per_image: f64,
+    #[serde(default)]
+    pub cost_per_audio_second: f64,
+    #[serde(default)]
+    pub cost_per_character: f64,
+    pub context_window: i64,
+    pub admission_weight: i64,
+    pub max_in_flight: Option<i64>,
+    #[serde(default = "default_capacity_mode")]
+    pub capacity_mode: String,
+    #[serde(default)]
+    pub capacity_tuned_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub supports_function_calling: bool,
+    pub supports_system_messages: bool,
+    pub supports_response_schema: bool,
+    pub supports_tool_choice: bool,
+    #[serde(default)]
+    pub supports_vision: bool,
+    pub enabled: bool,
+    pub cache_enabled: bool,
+    pub cache_ttl_secs: i64,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub boons: Vec<String>,
+    #[serde(default)]
+    pub request_timeout_secs: Option<i64>,
+    #[serde(default)]
+    pub max_retries: i64,
+    #[serde(default = "default_retry_backoff_ms")]
+    pub retry_backoff_ms: i64,
+    #[serde(default = "default_endpoint_selection_mode")]
+    pub endpoint_selection_mode: String,
+    pub health_checks_enabled: bool,
+    pub health_alerts_enabled: bool,
+    pub health_check_interval_secs: i64,
+    pub health_failure_threshold: i64,
+    #[serde(default)]
+    pub health_maintenance_until: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub health_maintenance_note: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// [`ModelEndpoint`] configuration columns, without runtime health state.
+/// `api_key` carries the stored value verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelEndpointBackup {
+    pub id: Uuid,
+    #[schema(value_type = String)]
+    pub model_id: Uuid,
+    pub name: String,
+    pub api_base: String,
+    pub api_key: Option<String>,
+    pub priority: i64,
+    pub weight: i64,
+    pub enabled: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// [`McpServer`] with `auth_header` carried verbatim as stored.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct McpServerBackup {
+    pub id: Uuid,
+    pub name: String,
+    pub upstream_url: String,
+    pub auth_header: Option<String>,
+    pub enabled: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One `app_settings` row, value carried verbatim. Exported generically so
+/// settings keys added after this format shipped are still covered.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct AppSettingBackup {
+    pub key: String,
+    #[schema(value_type = Object)]
+    pub value: serde_json::Value,
+}
+
+/// Per-entity insert/update tallies from a restore.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, ToSchema)]
+pub struct RestoreCounts {
+    pub inserted: u64,
+    pub updated: u64,
+}
+
+/// Outcome of a successful restore: what was inserted vs updated, plus any
+/// non-fatal warnings (e.g. a possible API-key pepper mismatch).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+pub struct RestoreReport {
+    pub fairshare_groups: RestoreCounts,
+    pub tenants: RestoreCounts,
+    pub api_keys: RestoreCounts,
+    pub models: RestoreCounts,
+    pub model_endpoints: RestoreCounts,
+    pub mcp_servers: RestoreCounts,
+    pub app_settings: RestoreCounts,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}

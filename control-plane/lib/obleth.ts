@@ -497,6 +497,50 @@ export interface ChannelResult {
   detail: string;
 }
 
+// ---- config backup / restore ----
+
+export interface BackupEncryptionInfo {
+  cipher_enabled: boolean;
+  key_check: string | null;
+  api_key_pepper_set: boolean;
+}
+
+/** Entity arrays in the backup. The dashboard only ever counts them. */
+export interface ConfigBackupData {
+  fairshare_groups: unknown[];
+  tenants: unknown[];
+  api_keys: unknown[];
+  models: unknown[];
+  model_endpoints: unknown[];
+  mcp_servers: unknown[];
+  app_settings: unknown[];
+}
+
+export interface ConfigBackup {
+  format: string;
+  version: number;
+  exported_at: string;
+  gateway_version: string;
+  encryption: BackupEncryptionInfo;
+  data: ConfigBackupData;
+}
+
+export interface RestoreCounts {
+  inserted: number;
+  updated: number;
+}
+
+export interface RestoreReport {
+  fairshare_groups: RestoreCounts;
+  tenants: RestoreCounts;
+  api_keys: RestoreCounts;
+  models: RestoreCounts;
+  model_endpoints: RestoreCounts;
+  mcp_servers: RestoreCounts;
+  app_settings: RestoreCounts;
+  warnings: string[];
+}
+
 export interface TestAlertResult {
   results: ChannelResult[];
 }
@@ -932,6 +976,12 @@ export const obleth = {
   setBoonSettings: (body: UpdateBoonSettings) =>
     api<BoonSettingsView>("/settings/boons", {
       method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  exportBackup: () => api<ConfigBackup>("/backup/export"),
+  restoreBackup: (body: ConfigBackup) =>
+    api<RestoreReport>("/backup/restore", {
+      method: "POST",
       body: JSON.stringify(body),
     }),
 };

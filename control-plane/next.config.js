@@ -39,6 +39,13 @@ const nextConfig = {
   reactStrictMode: true,
   // pin tracing root to this app (avoids picking up stray parent lockfiles)
   outputFileTracingRoot: path.join(__dirname),
+  experimental: {
+    serverActions: {
+      // Config-backup restores upload the whole backup file through a server
+      // action; large key fleets exceed the 1 MB default.
+      bodySizeLimit: "64mb",
+    },
+  },
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];
   },

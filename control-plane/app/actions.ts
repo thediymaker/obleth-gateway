@@ -9,7 +9,9 @@ import { CACHE_TAGS, obleth, OblethApiError } from "@/lib/obleth";
 import type {
   AutotuneReport,
   AutotuneWorkload,
+  ConfigBackup,
   ModelRoute,
+  RestoreReport,
   UpdateAlertSettings,
   UpdateAutoRouterSettings,
   UpdateBoonSettings,
@@ -752,6 +754,48 @@ export async function importModelsAction(
   revalidatePath("/models");
   revalidatePath("/fairshare");
   return { ok: true, created, updated, failed: errors.length, errors };
+}
+
+export type RestoreBackupResult =
+  | { ok: true; report: RestoreReport }
+  | { ok: false; error: string };
+
+// Restores an uploaded obleth config backup. The file is parsed and
+// format-checked here, then handed to the admin API's atomic merge-restore;
+// the gateway rejects it up front when its encryption key doesn't match the
+// backup's. Every entity list the restore can touch is revalidated.
+export async function restoreBackupAction(
+  text: string,
+): Promise<RestoreBackupResult> {
+  await requireSession();
+
+  let parsed: ConfigBackup;
+  try {
+    parsed = JSON.parse(text) as ConfigBackup;
+  } catch {
+    return { ok: false, error: "Not a valid JSON file." };
+  }
+  if (!parsed || parsed.format !== "obleth-config-backup") {
+    return { ok: false, error: "Not an obleth config backup file." };
+  }
+
+  try {
+    const report = await obleth.restoreBackup(parsed);
+    updateTag(CACHE_TAGS.tenants);
+    updateTag(CACHE_TAGS.keys);
+    updateTag(CACHE_TAGS.models);
+    revalidatePath("/");
+    revalidatePath("/tenants");
+    revalidatePath("/keys");
+    revalidatePath("/models");
+    revalidatePath("/mcp");
+    revalidatePath("/fairshare");
+    revalidatePath("/settings");
+    return { ok: true, report };
+  } catch (e) {
+    const err = actionError(e);
+    return err.ok ? { ok: false, error: "Unexpected error" } : err;
+  }
 }
 
 export async function setModelHealthConfigAction(formData: FormData) {
