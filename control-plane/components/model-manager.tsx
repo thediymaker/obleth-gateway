@@ -7,12 +7,15 @@ import {
   ChevronDown,
   Database,
   Download,
-  Gauge,
   HeartPulse,
   Info,
+  MoreHorizontal,
   PauseCircle,
+  Plus,
   RefreshCw,
   Save,
+  Sparkles,
+  Tag,
   Trash2,
   Upload,
   XCircle,
@@ -61,9 +64,17 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   Tooltip as UiTooltip,
   TooltipContent,
@@ -71,6 +82,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import type { AutotuneReport, AutotuneWorkload, CacheStats, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
+import { providerForModel } from "@/lib/model-providers";
 import { cn, formatNumber } from "@/lib/utils";
 
 // Fixed routing-tag vocabulary; mirrors obleth-config `MODEL_TAGS`. Used by the
@@ -84,6 +96,18 @@ const MODEL_TAGS = [
   "long-context",
   "fast",
   "creative",
+] as const;
+
+// Fixed boon vocabulary; mirrors obleth-config `MODEL_BOONS`. A boon grants a
+// capability the model lacks natively. Each boon is configured globally in
+// Settings → Boons, then enabled per model here. Nothing is granted by default.
+const MODEL_BOONS = [
+  {
+    value: "vision",
+    label: "Vision",
+    description:
+      "Relay image inputs to the global describer model and inject text descriptions, so this model can accept images it doesn't natively support. Configure the describer in Settings → Boons.",
+  },
 ] as const;
 
 // Model modality vocabulary; mirrors obleth-config `MODEL_TYPES`. The type
@@ -115,6 +139,7 @@ export function ModelManager({
 }) {
   const [pending, start] = useTransition();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [createOpen, setCreateOpen] = useState(false);
   const [createType, setCreateType] = useState<string>("chat");
   const [showBenchmarkRoutes, setShowBenchmarkRoutes] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
@@ -196,6 +221,7 @@ export function ModelManager({
       const result = await createModelAction(formData);
       if (result.ok) {
         createFormRef.current?.reset();
+        setCreateOpen(false);
       } else {
         setCreateError(result.error);
       }
@@ -216,15 +242,24 @@ export function ModelManager({
 
   return (
     <div className="space-y-6">
-      <CachePanel stats={cacheStats} />
-      <Card>
-        <CardHeader>
-          <CardTitle>Add model route</CardTitle>
-          <CardDescription>
-            Map a client-facing model name to an upstream OpenAI-compatible endpoint.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
+      <FleetStats models={models} health={health} cacheStats={cacheStats} />
+      <Dialog
+        open={createOpen}
+        onOpenChange={(next) => {
+          setCreateOpen(next);
+          if (!next) {
+            setCreateError(null);
+            setCreateType("chat");
+          }
+        }}
+      >
+        <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Add model route</DialogTitle>
+            <DialogDescription>
+              Map a client-facing model name to an upstream OpenAI-compatible endpoint.
+            </DialogDescription>
+          </DialogHeader>
           <form ref={createFormRef} action={submitModel} className="grid gap-4 md:grid-cols-2">
             <Field label="Model name (client)" name="model_name" placeholder="qwen3-vl-32b-instruct" required />
             <Field label="Upstream model" name="upstream_model" placeholder="asuair/qwen3-vl-32b-instruct" required />
@@ -267,44 +302,49 @@ export function ModelManager({
             )}
             {createType === "chat" && (
               <>
-                <div className="flex flex-wrap gap-4 md:col-span-2">
-                  <Checkbox name="supports_function_calling" label="Function calling" />
-                  <Checkbox name="supports_system_messages" label="System messages" defaultChecked />
-                  <Checkbox name="supports_response_schema" label="Response schema" />
-                  <Checkbox name="supports_tool_choice" label="Tool choice" />
-                </div>
-                <div className="md:col-span-2">
-                  <Label className="mb-2 block">Routing tags (auto)</Label>
-                  <div className="flex flex-wrap gap-3">
-                    {MODEL_TAGS.map((tag) => (
-                      <Checkbox key={tag} name={`tag_${tag}`} label={tag} />
-                    ))}
-                  </div>
-                </div>
+                <FieldGroup label="Capabilities" hint="What the model natively supports. These gate request features and routing.">
+                  <ChipCheckbox name="supports_function_calling" label="Function calling" />
+                  <ChipCheckbox name="supports_system_messages" label="System messages" defaultChecked />
+                  <ChipCheckbox name="supports_response_schema" label="Response schema" />
+                  <ChipCheckbox name="supports_tool_choice" label="Tool choice" />
+                </FieldGroup>
+                <FieldGroup label="Routing tags" hint="Hints the auto router matches against request intent. The “vision” tag marks native image support and makes the model eligible as a system-wide vision describer.">
+                  {MODEL_TAGS.map((tag) => (
+                    <ChipCheckbox key={tag} name={`tag_${tag}`} label={tag} />
+                  ))}
+                </FieldGroup>
+                <FieldGroup label="Boons" hint="Gateway capabilities granted to this model that it lacks natively. Configure each boon in Settings → Boons, then enable it per model here.">
+                  {MODEL_BOONS.map((boon) => (
+                    <ChipCheckbox key={boon.value} name={`boon_${boon.value}`} label={boon.label} hint={boon.description} />
+                  ))}
+                </FieldGroup>
               </>
             )}
-            <div className="md:col-span-2">
-              <Button type="submit" disabled={pending}>{pending ? "Adding..." : "Add model"}</Button>
-            </div>
             {createError && (
               <p className="md:col-span-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
                 {createError}
               </p>
             )}
+            <DialogFooter className="md:col-span-2">
+              <Button type="button" variant="ghost" disabled={pending} onClick={() => setCreateOpen(false)}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={pending}>{pending ? "Adding..." : "Add model"}</Button>
+            </DialogFooter>
           </form>
-        </CardContent>
-      </Card>
+        </DialogContent>
+      </Dialog>
 
       <Card>
         <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div>
             <CardTitle>Configured models</CardTitle>
-              <CardDescription>
-                {visibleModels.length} visible / {models.length} registered
+            <CardDescription>
+              {visibleModels.length} visible / {models.length} registered
               {!showBenchmarkRoutes && benchmarkRouteCount > 0 ? ` / ${benchmarkRouteCount} benchmark hidden` : ""}
             </CardDescription>
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             {benchmarkRouteCount > 0 && (
               <Button type="button" size="sm" variant="outline" onClick={() => setShowBenchmarkRoutes((value) => !value)}>
                 {showBenchmarkRoutes ? "Hide benchmark" : "Show benchmark"}
@@ -328,6 +368,10 @@ export function ModelManager({
             <Button type="button" size="sm" variant="secondary" disabled={pending || visibleModels.length === 0} onClick={checkAll}>
               <RefreshCw className="h-3.5 w-3.5" />
               Check listed
+            </Button>
+            <Button type="button" size="sm" onClick={() => setCreateOpen(true)}>
+              <Plus className="h-3.5 w-3.5" />
+              Add model
             </Button>
           </div>
         </CardHeader>
@@ -355,10 +399,10 @@ export function ModelManager({
           <table className="w-full table-fixed text-sm">
             <thead>
               <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                <th className="w-[30%] px-6 py-3 font-medium">Model</th>
-                <th className="w-[24%] px-3 py-3 font-medium">Health</th>
-                <th className="hidden w-[28%] px-3 py-3 font-medium md:table-cell">Route</th>
-                <th className="w-[46%] px-3 py-3 text-right font-medium md:w-[18%]" />
+                <th className="w-[44%] px-6 py-3 font-medium">Model</th>
+                <th className="w-[16%] px-3 py-3 font-medium">Health</th>
+                <th className="hidden w-[30%] px-3 py-3 font-medium md:table-cell">Route</th>
+                <th className="w-[40%] px-3 py-3 text-right font-medium md:w-[10%]" />
               </tr>
             </thead>
             <tbody>
@@ -367,23 +411,49 @@ export function ModelManager({
                 const selected = selectedId === model.id;
                 return (
                   <Fragment key={model.id}>
-                    <tr className="border-b border-border/60 align-top">
-                      <td className="px-6 py-3">
-                        <p className="font-medium">{model.model_name}</p>
-                        {model.description && <p className="mt-1 line-clamp-2 text-xs text-muted-foreground">{model.description}</p>}
-                        <div className="mt-2 flex flex-wrap gap-1.5">
-                          {model.model_type && model.model_type !== "chat" && (
-                            <Badge className="border-primary/40 bg-primary/15 text-[10px] text-primary">
-                              {MODEL_TYPE_LABELS[model.model_type] ?? model.model_type}
-                            </Badge>
-                          )}
-                          <Badge className="border-border bg-background text-[10px] text-muted-foreground">{formatModelCost(model)}</Badge>
-                          <Badge className="border-border bg-background text-[10px] text-muted-foreground">{formatNumber(model.context_window)} ctx</Badge>
-                          {model.tags?.map((tag) => (
-                            <Badge key={tag} className="border-primary/30 bg-primary/10 text-[10px] text-primary">{tag}</Badge>
-                          ))}
+                    <tr
+                      onClick={() => setSelectedId((current) => (current === model.id ? null : model.id))}
+                      className={cn(
+                        "cursor-pointer transition-colors",
+                        selected
+                          ? "border-t border-t-border bg-muted/30"
+                          : "border-b border-border/60 hover:bg-muted/20",
+                      )}
+                    >
+                      <td className={cn("border-l-2 px-6 py-3 transition-colors", selected ? "border-l-primary" : "border-l-transparent")}>
+                        <div className="flex items-center gap-3">
+                          <ModelAvatar name={model.model_name} upstream={model.upstream_model} />
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-baseline gap-2">
+                              <p className="truncate font-medium">{model.model_name}</p>
+                              {model.description && (
+                                <p className="hidden truncate text-xs text-muted-foreground lg:block">{model.description}</p>
+                              )}
+                            </div>
+                            <div className="mt-1.5 flex flex-wrap items-center gap-x-2.5 gap-y-1">
+                              {model.model_type && model.model_type !== "chat" && (
+                                <Badge className="border-primary/40 bg-primary/15 text-[10px] text-primary">
+                                  {MODEL_TYPE_LABELS[model.model_type] ?? model.model_type}
+                                </Badge>
+                              )}
+                              <Badge className="border-border bg-background text-[10px] text-muted-foreground">{formatModelCost(model)}</Badge>
+                              <Badge className="border-border bg-background text-[10px] text-muted-foreground">{formatNumber(model.context_window)} ctx</Badge>
+                              {(model.tags?.length ?? 0) > 0 && (
+                                <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
+                                  <Tag className="h-3 w-3" aria-hidden />
+                                  {model.tags!.join(" · ")}
+                                </span>
+                              )}
+                              {(model.boons?.length ?? 0) > 0 && (
+                                <span className="inline-flex items-center gap-1 text-[11px] text-amber-600 dark:text-amber-400/90">
+                                  <Sparkles className="h-3 w-3" aria-hidden />
+                                  {model.boons!.join(" · ")}
+                                </span>
+                              )}
+                            </div>
+                            <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground md:hidden">{model.upstream_model}</p>
+                          </div>
                         </div>
-                        <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground md:hidden">{model.upstream_model}</p>
                       </td>
                       <td className="px-3 py-3">
                         <HealthCell summary={summary} />
@@ -393,35 +463,49 @@ export function ModelManager({
                         <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground/70">{model.api_base}</p>
                       </td>
                       <td className="px-3 py-3">
-                        <div className="flex items-center justify-end gap-1.5">
-                          <Button type="button" size="icon" variant="secondary" disabled={pending} onClick={() => checkOne(model.id)} title="Check health">
-                            <Activity className="h-3.5 w-3.5" />
-                          </Button>
-                          <Button
-                            type="button"
-                            size="icon"
-                            variant="ghost"
-                            aria-expanded={selected}
-                            title={selected ? "Collapse details" : "Expand details"}
-                            onClick={() => setSelectedId((current) => (current === model.id ? null : model.id))}
-                          >
-                            <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", selected && "rotate-180")} />
-                          </Button>
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="text-destructive hover:text-destructive"
-                            disabled={pending}
-                            onClick={() => removeModel(model)}
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </Button>
+                        <div className="flex items-center justify-end gap-1">
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button
+                                type="button"
+                                size="icon"
+                                variant="ghost"
+                                className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                                disabled={pending}
+                                title="Model actions"
+                                onClick={(event) => event.stopPropagation()}
+                              >
+                                <MoreHorizontal className="h-4 w-4" />
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end" onClick={(event) => event.stopPropagation()}>
+                              <DropdownMenuItem onSelect={() => checkOne(model.id)}>
+                                <Activity className="mr-2 h-3.5 w-3.5" />
+                                Check health
+                              </DropdownMenuItem>
+                              <DropdownMenuSeparator />
+                              <DropdownMenuItem
+                                className="text-destructive focus:text-destructive"
+                                onSelect={() => removeModel(model)}
+                              >
+                                <Trash2 className="mr-2 h-3.5 w-3.5" />
+                                Delete model
+                              </DropdownMenuItem>
+                            </DropdownMenuContent>
+                          </DropdownMenu>
+                          <ChevronDown
+                            aria-hidden
+                            className={cn(
+                              "h-3.5 w-3.5 text-muted-foreground transition-transform duration-200",
+                              selected && "rotate-180 text-foreground",
+                            )}
+                          />
                         </div>
                       </td>
                     </tr>
                     {selected && (
-                      <tr className="border-b border-border/60">
-                        <td colSpan={4} className="bg-background/35 px-6 py-5">
+                      <tr className="border-b border-border">
+                        <td colSpan={4} className="border-l-2 border-l-primary bg-muted/10 px-6 py-4">
                           <ModelDetailPanel
                             model={model}
                             summary={summary}
@@ -478,220 +562,282 @@ function ModelDetailPanel({
     }));
 
   return (
-    <div className="grid gap-5 xl:grid-cols-[minmax(0,1.1fr)_minmax(320px,0.9fr)]">
-      <div className="space-y-5">
-        <div className="rounded-md border border-border bg-card/40 p-4">
-          <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-            <div className="min-w-0">
-              <p className="text-sm font-medium">Model metadata</p>
-              <p className="mt-1 text-sm text-muted-foreground">
-                {model.description || "No description set."}
-              </p>
-            </div>
-            <div className="shrink-0">
-              <HealthBadge summary={summary} />
-            </div>
-          </div>
-          <div className="mt-4 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
-            <MiniStat label="Input" value={formatCostPerMillion(model.input_cost_per_token)} />
-            <MiniStat label="Output" value={formatCostPerMillion(model.output_cost_per_token)} />
-            <MiniStat label="Context" value={formatNumber(model.context_window)} />
-            <MiniStat label="Features" value={formatCapabilities(model)} />
-          </div>
-        </div>
+    <Tabs defaultValue="overview">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <TabsList>
+          <TabsTrigger value="overview">Overview</TabsTrigger>
+          <TabsTrigger value="route">Route</TabsTrigger>
+          <TabsTrigger value="reliability">
+            Reliability
+            {endpoints.length > 0 && (
+              <span className="tabular-nums opacity-60">{endpoints.length}</span>
+            )}
+          </TabsTrigger>
+          <TabsTrigger value="health">Health</TabsTrigger>
+        </TabsList>
+        <p className="text-[11px] tabular-nums text-muted-foreground">
+          {summary.last_checked_at
+            ? `Last check ${formatTime(summary.last_checked_at)} / ${summary.last_latency_ms ?? "-"} ms`
+            : "Not checked yet"}
+        </p>
+      </div>
 
-        <div className="rounded-md border border-border bg-card/40 p-4">
-          <p className="text-sm font-medium">Operational controls</p>
-          <div className="mt-4 grid grid-cols-[repeat(auto-fit,minmax(170px,1fr))] gap-3">
-            <ControlBlock label="Route status">
-              <Badge className={model.enabled ? "text-foreground" : "opacity-50"}>{model.enabled ? "enabled" : "disabled"}</Badge>
-            </ControlBlock>
-            <ControlBlock label="Response cache">
-              <CacheToggle
-                enabled={model.cache_enabled}
-                ttlSecs={model.cache_ttl_secs || 300}
-                disabled={pending}
-                onToggle={onCacheToggle}
-              />
-            </ControlBlock>
-            <ControlBlock label="Admission weight">
-              <ModelWeightControl id={model.id} initial={model.admission_weight} />
-            </ControlBlock>
-            <ControlBlock label="Capacity mode">
-              <CapacityModeToggle id={model.id} mode={model.capacity_mode} />
-            </ControlBlock>
-            <ControlBlock label="Max slots">
-              <ModelCapacityControl id={model.id} initial={model.max_in_flight} />
-            </ControlBlock>
-          </div>
-          <AutotunePanel model={model} />
-        </div>
-
-        <ReliabilityPanel model={model} endpoints={endpoints} pending={pending} />
-
-        <div className="rounded-md border border-border bg-card/40 p-4">
-          <div className="mb-4 flex items-center justify-between gap-3">
-            <div>
-              <p className="text-sm font-medium">Route settings</p>
-              <p className="text-xs text-muted-foreground">Client name stays fixed; update upstream routing and capabilities here.</p>
-            </div>
-          </div>
-          <form action={updateModelAction} className="grid gap-3 md:grid-cols-2">
-            <input type="hidden" name="id" value={model.id} />
-            <Field label="Upstream model" name="upstream_model" defaultValue={model.upstream_model} required />
-            <Field label="API base URL" name="api_base" defaultValue={model.api_base} required />
-            <div className="md:col-span-2">
-              <Field label="Description" name="description" defaultValue={model.description} />
-            </div>
-            <div className="md:col-span-2">
-              <SelectField
-                label="Model type"
-                name="model_type"
-                value={editType}
-                onChange={setEditType}
-                options={MODEL_TYPE_OPTIONS}
-                hint={modelTypeHint(editType)}
-              />
-            </div>
-            <Field label="Upstream API key" name="api_key" placeholder="Leave blank to keep current" />
-            <Field label="Admission weight" name="admission_weight" type="number" defaultValue={String(model.admission_weight)} />
-            <Field label="Max in-flight" name="max_in_flight" type="number" defaultValue={model.max_in_flight == null ? "" : String(model.max_in_flight)} />
-            {(editType === "chat" || editType === "embedding") && (
-              <Field label="Context window" name="context_window" type="number" defaultValue={String(model.context_window)} />
-            )}
-            {(editType === "chat" || editType === "embedding") && (
-              <Field label="Input cost / token" name="input_cost_per_token" defaultValue={toPlainDecimal(model.input_cost_per_token)} />
-            )}
-            {editType === "chat" && (
-              <Field label="Output cost / token" name="output_cost_per_token" defaultValue={toPlainDecimal(model.output_cost_per_token)} />
-            )}
-            {editType === "image" && (
-              <Field label="Cost / image" name="cost_per_image" defaultValue={toPlainDecimal(model.cost_per_image)} />
-            )}
-            {editType === "audio_speech" && (
-              <Field label="Cost / character" name="cost_per_character" defaultValue={toPlainDecimal(model.cost_per_character)} />
-            )}
-            {editType === "audio_transcription" && (
-              <Field label="Cost / audio second" name="cost_per_audio_second" defaultValue={toPlainDecimal(model.cost_per_audio_second)} />
-            )}
-            {editType === "chat" ? (
-              <>
-                <div className="flex flex-wrap gap-4 md:col-span-2">
-                  <Checkbox name="enabled" label="Enabled" defaultChecked={model.enabled} />
-                  <Checkbox name="supports_function_calling" label="Function calling" defaultChecked={model.supports_function_calling} />
-                  <Checkbox name="supports_system_messages" label="System messages" defaultChecked={model.supports_system_messages} />
-                  <Checkbox name="supports_response_schema" label="Response schema" defaultChecked={model.supports_response_schema} />
-                  <Checkbox name="supports_tool_choice" label="Tool choice" defaultChecked={model.supports_tool_choice} />
-                </div>
-                <div className="md:col-span-2">
-                  <Label className="mb-2 block">Routing tags (auto)</Label>
-                  <div className="flex flex-wrap gap-3">
-                    {MODEL_TAGS.map((tag) => (
-                      <Checkbox
-                        key={tag}
-                        name={`tag_${tag}`}
-                        label={tag}
-                        defaultChecked={model.tags?.includes(tag) ?? false}
-                      />
-                    ))}
-                  </div>
-                </div>
-              </>
-            ) : (
-              <div className="flex flex-wrap gap-4 md:col-span-2">
-                <Checkbox name="enabled" label="Enabled" defaultChecked={model.enabled} />
+      <TabsContent value="overview">
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(320px,400px)]">
+          <div className="space-y-4">
+            <PanelCard>
+              <div className="flex flex-wrap gap-x-4 gap-y-3 px-4 py-3">
+                <SpecItem label="Input">{formatCostPerMillion(model.input_cost_per_token)}</SpecItem>
+                <SpecItem label="Output">{formatCostPerMillion(model.output_cost_per_token)}</SpecItem>
+                <SpecItem label="Context">{formatNumber(model.context_window)}</SpecItem>
+                <SpecItem label="Features">
+                  <ChipList items={capabilityList(model)} empty="None declared" />
+                </SpecItem>
+                <SpecItem label="Boons">
+                  <ChipList items={boonList(model)} empty="None" tone="boon" />
+                </SpecItem>
               </div>
-            )}
-            <div className="md:col-span-2">
+            </PanelCard>
+
+            <PanelCard
+              title="Controls"
+              description="Live operational state. Changes apply immediately."
+              actions={
+                <Badge className={model.enabled ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-300" : "border-border bg-muted/30 text-muted-foreground"}>
+                  {model.enabled ? "route enabled" : "route disabled"}
+                </Badge>
+              }
+            >
+              <div className="divide-y divide-border/60">
+                <SettingRow label="Response cache" hint="Serve repeated identical requests from cache instead of the upstream.">
+                  <CacheToggle
+                    enabled={model.cache_enabled}
+                    ttlSecs={model.cache_ttl_secs || 300}
+                    disabled={pending}
+                    onToggle={onCacheToggle}
+                  />
+                </SettingRow>
+                <SettingRow label="Admission weight" hint="Relative share of gateway capacity when demand exceeds supply.">
+                  <div className="w-44">
+                    <ModelWeightControl id={model.id} initial={model.admission_weight} />
+                  </div>
+                </SettingRow>
+                <SettingRow label="Capacity mode" hint="Static uses the max-slots cap below; tuned follows the auto-tune result.">
+                  <div className="w-44">
+                    <CapacityModeToggle id={model.id} mode={model.capacity_mode} />
+                  </div>
+                </SettingRow>
+                <SettingRow label="Max slots" hint="Hard cap on concurrent in-flight requests to the upstream.">
+                  <div className="w-44">
+                    <ModelCapacityControl id={model.id} initial={model.max_in_flight} />
+                  </div>
+                </SettingRow>
+                <AutotunePanel model={model} />
+              </div>
+            </PanelCard>
+          </div>
+
+          <PanelCard
+            title="Health trend"
+            description="Recent health probe latency"
+            actions={<HealthBadge summary={summary} />}
+            className="self-start"
+          >
+            <div className="p-4">
+              {chartData.length === 0 ? (
+                <div className="flex h-48 items-center justify-center rounded-sm border border-dashed border-border/70 text-xs text-muted-foreground">No checks yet</div>
+              ) : (
+                <ChartShell heightClass="h-48">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+                      <CartesianGrid {...chartGrid} />
+                      <XAxis dataKey="time" tick={axisTick} tickLine={false} axisLine={false} minTickGap={18} />
+                      <YAxis tick={axisTick} tickLine={false} axisLine={false} width={44} tickFormatter={compactAxis} />
+                      <Tooltip content={tip({ valueFormatter: (v) => `${formatNumber(v)} ms` })} cursor={timeCursor} />
+                      <Line type="monotone" dataKey="latency" name="Latency" stroke="hsl(158 42% 48%)" strokeWidth={2} dot={false} isAnimationActive={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </ChartShell>
+              )}
+              {summary.last_message && (
+                <p className="mt-3 rounded-sm border border-border/70 bg-background/40 p-2 text-xs text-muted-foreground">{summary.last_message}</p>
+              )}
+            </div>
+          </PanelCard>
+        </div>
+      </TabsContent>
+
+      <TabsContent value="route">
+        <form action={updateModelAction}>
+          <input type="hidden" name="id" value={model.id} />
+          <PanelCard
+            title="Route settings"
+            description="Client name stays fixed; update upstream routing and capabilities here."
+            actions={
               <Button type="submit" size="sm" disabled={pending}>
                 <Save className="h-3.5 w-3.5" />
                 Save route
               </Button>
-            </div>
-          </form>
-        </div>
+            }
+          >
+            <div className="grid divide-y divide-border/60 lg:grid-cols-3 lg:divide-x lg:divide-y-0">
+              <FormSection title="Upstream" columns={1}>
+                <Field label="Upstream model" name="upstream_model" defaultValue={model.upstream_model} required />
+                <Field label="API base URL" name="api_base" defaultValue={model.api_base} required />
+                <Field label="Upstream API key" name="api_key" placeholder="Leave blank to keep current" />
+                <SelectField
+                  label="Model type"
+                  name="model_type"
+                  value={editType}
+                  onChange={setEditType}
+                  options={MODEL_TYPE_OPTIONS}
+                  hint={modelTypeHint(editType)}
+                />
+                <Field label="Description" name="description" defaultValue={model.description} />
+              </FormSection>
 
-        <div className="rounded-md border border-border bg-card/40 p-4">
-          <p className="text-sm font-medium">Health config</p>
-          <form action={setModelHealthConfigAction} className="mt-4 grid gap-3 md:grid-cols-2">
-            <input type="hidden" name="id" value={model.id} />
-            <Field label="Interval seconds" name="check_interval_secs" type="number" defaultValue={String(summary.check_interval_secs)} />
-            <Field label="Failure threshold" name="failure_threshold" type="number" defaultValue={String(summary.failure_threshold)} />
-            <Field label="Maintenance until" name="maintenance_until" type="datetime-local" defaultValue={datetimeLocalValue(summary.maintenance_until)} />
-            <Field label="Maintenance note" name="maintenance_note" defaultValue={summary.maintenance_note ?? ""} />
-            <div className="flex flex-wrap gap-4 md:col-span-2">
-              <Checkbox name="checks_enabled" label="Scheduled checks" defaultChecked={summary.checks_enabled} />
-              <Checkbox name="alerts_enabled" label="Slack alerts" defaultChecked={summary.alerts_enabled} />
-            </div>
-            <div className="md:col-span-2">
-              <Button type="submit" size="sm" disabled={pending}>
-                <Save className="h-3.5 w-3.5" />
-                Save health
-              </Button>
-            </div>
-          </form>
-        </div>
-      </div>
-
-      <div className="space-y-5">
-        <div className="rounded-md border border-border bg-card/40 p-4">
-          <div className="mb-3 flex items-center justify-between gap-3">
-            <div>
-              <p className="text-sm font-medium">Health trend</p>
-              <p className="text-xs text-muted-foreground">Recent health probe latency</p>
-            </div>
-            <HealthBadge summary={summary} />
-          </div>
-          {chartData.length === 0 ? (
-            <div className="flex h-48 items-center justify-center rounded-sm border border-border/70 text-xs text-muted-foreground">No checks yet</div>
-          ) : (
-            <ChartShell heightClass="h-48">
-              <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
-                  <CartesianGrid {...chartGrid} />
-                  <XAxis dataKey="time" tick={axisTick} tickLine={false} axisLine={false} minTickGap={18} />
-                  <YAxis tick={axisTick} tickLine={false} axisLine={false} width={44} tickFormatter={compactAxis} />
-                  <Tooltip content={tip({ valueFormatter: (v) => `${formatNumber(v)} ms` })} cursor={timeCursor} />
-                  <Line type="monotone" dataKey="latency" name="Latency" stroke="hsl(158 42% 48%)" strokeWidth={2} dot={false} isAnimationActive={false} />
-                </LineChart>
-              </ResponsiveContainer>
-            </ChartShell>
-          )}
-        </div>
-
-        <div className="rounded-md border border-border bg-card/40 p-4">
-          <p className="text-sm font-medium">Recent checks</p>
-          <div className="mt-3 max-h-80 overflow-auto">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="border-b border-border text-left text-muted-foreground">
-                  <th className="py-2 pr-3 font-medium">Time</th>
-                  <th className="py-2 pr-3 font-medium">Status</th>
-                  <th className="py-2 pr-3 font-medium">HTTP</th>
-                  <th className="py-2 pr-3 font-medium">Latency</th>
-                </tr>
-              </thead>
-              <tbody>
-                {checks.map((check) => (
-                  <tr key={check.id} className="border-b border-border/50">
-                    <td className="py-2 pr-3 tabular-nums text-muted-foreground">{formatTime(check.checked_at)}</td>
-                    <td className="py-2 pr-3"><StatusPill status={check.status} /></td>
-                    <td className="py-2 pr-3 tabular-nums text-muted-foreground">{check.http_status ?? "-"}</td>
-                    <td className="py-2 pr-3 tabular-nums text-muted-foreground">{check.latency_ms == null ? "-" : `${formatNumber(check.latency_ms)} ms`}</td>
-                  </tr>
-                ))}
-                {checks.length === 0 && (
-                  <tr>
-                    <td colSpan={4} className="py-8 text-center text-muted-foreground">No checks yet</td>
-                  </tr>
+              <FormSection title="Capacity & cost">
+                <Field label="Admission weight" name="admission_weight" type="number" defaultValue={String(model.admission_weight)} />
+                <Field label="Max in-flight" name="max_in_flight" type="number" defaultValue={model.max_in_flight == null ? "" : String(model.max_in_flight)} />
+                {(editType === "chat" || editType === "embedding") && (
+                  <Field label="Context window" name="context_window" type="number" defaultValue={String(model.context_window)} />
                 )}
-              </tbody>
-            </table>
-          </div>
-          {summary.last_message && <p className="mt-3 rounded-sm border border-border/70 bg-background/40 p-2 text-xs text-muted-foreground">{summary.last_message}</p>}
+                {(editType === "chat" || editType === "embedding") && (
+                  <Field label="Input cost / token" name="input_cost_per_token" defaultValue={toPlainDecimal(model.input_cost_per_token)} />
+                )}
+                {editType === "chat" && (
+                  <Field label="Output cost / token" name="output_cost_per_token" defaultValue={toPlainDecimal(model.output_cost_per_token)} />
+                )}
+                {editType === "image" && (
+                  <Field label="Cost / image" name="cost_per_image" defaultValue={toPlainDecimal(model.cost_per_image)} />
+                )}
+                {editType === "audio_speech" && (
+                  <Field label="Cost / character" name="cost_per_character" defaultValue={toPlainDecimal(model.cost_per_character)} />
+                )}
+                {editType === "audio_transcription" && (
+                  <Field label="Cost / audio second" name="cost_per_audio_second" defaultValue={toPlainDecimal(model.cost_per_audio_second)} />
+                )}
+              </FormSection>
+
+              {editType === "chat" ? (
+                <FormSection title="Capabilities & routing" columns={1}>
+                  <ChipGroup label="Status">
+                    <ChipCheckbox name="enabled" label="Route enabled" defaultChecked={model.enabled} />
+                  </ChipGroup>
+                  <ChipGroup label="Native capabilities" hint="What the model natively supports. These gate request features and routing.">
+                    <ChipCheckbox name="supports_function_calling" label="Function calling" defaultChecked={model.supports_function_calling} />
+                    <ChipCheckbox name="supports_system_messages" label="System messages" defaultChecked={model.supports_system_messages} />
+                    <ChipCheckbox name="supports_response_schema" label="Response schema" defaultChecked={model.supports_response_schema} />
+                    <ChipCheckbox name="supports_tool_choice" label="Tool choice" defaultChecked={model.supports_tool_choice} />
+                  </ChipGroup>
+                  <ChipGroup label="Routing tags" hint="Hints the auto router matches against request intent. The “vision” tag marks native image support.">
+                    {MODEL_TAGS.map((tag) => (
+                      <ChipCheckbox
+                        key={tag}
+                        name={`tag_${tag}`}
+                        label={tag}
+                        defaultChecked={(model.tags?.includes(tag) ?? false) || (tag === "vision" && model.supports_vision)}
+                      />
+                    ))}
+                  </ChipGroup>
+                  <ChipGroup label="Boons" hint="Gateway capabilities granted that the model lacks natively. Configure in Settings → Boons.">
+                    {MODEL_BOONS.map((boon) => (
+                      <ChipCheckbox
+                        key={boon.value}
+                        name={`boon_${boon.value}`}
+                        label={boon.label}
+                        hint={boon.description}
+                        defaultChecked={model.boons?.includes(boon.value) ?? false}
+                      />
+                    ))}
+                  </ChipGroup>
+                </FormSection>
+              ) : (
+                <FormSection title="Status" columns={1}>
+                  <ChipGroup label="Status">
+                    <ChipCheckbox name="enabled" label="Route enabled" defaultChecked={model.enabled} />
+                  </ChipGroup>
+                </FormSection>
+              )}
+            </div>
+          </PanelCard>
+        </form>
+      </TabsContent>
+
+      <TabsContent value="reliability">
+        <ReliabilityPanel model={model} endpoints={endpoints} pending={pending} />
+      </TabsContent>
+
+      <TabsContent value="health">
+        <div className="grid gap-4 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)]">
+          <form action={setModelHealthConfigAction}>
+            <input type="hidden" name="id" value={model.id} />
+            <PanelCard
+              className="h-full"
+              title="Health config"
+              description="Probe cadence, alerting and maintenance."
+              actions={
+                <Button type="submit" size="sm" disabled={pending}>
+                  <Save className="h-3.5 w-3.5" />
+                  Save
+                </Button>
+              }
+            >
+              <div className="grid gap-3 p-4">
+                <div className="grid grid-cols-2 gap-3">
+                  <Field label="Interval seconds" name="check_interval_secs" type="number" defaultValue={String(summary.check_interval_secs)} />
+                  <Field label="Failure threshold" name="failure_threshold" type="number" defaultValue={String(summary.failure_threshold)} />
+                </div>
+                <Field label="Maintenance until" name="maintenance_until" type="datetime-local" defaultValue={datetimeLocalValue(summary.maintenance_until)} />
+                <Field label="Maintenance note" name="maintenance_note" defaultValue={summary.maintenance_note ?? ""} />
+                <div className="flex flex-wrap gap-1.5 pt-1">
+                  <ChipCheckbox name="checks_enabled" label="Scheduled checks" defaultChecked={summary.checks_enabled} />
+                  <ChipCheckbox name="alerts_enabled" label="Slack alerts" defaultChecked={summary.alerts_enabled} />
+                </div>
+              </div>
+            </PanelCard>
+          </form>
+
+          <PanelCard
+            className="flex h-full flex-col"
+            title="Recent checks"
+            description="Latest health probe results."
+            actions={<HealthBadge summary={summary} />}
+          >
+            <div className="max-h-80 min-h-0 flex-1 overflow-auto">
+              <table className="w-full text-xs">
+                <thead className="sticky top-0 bg-card">
+                  <tr className="border-b border-border/60 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
+                    <th className="py-2 pl-4 pr-3 font-medium">Time</th>
+                    <th className="py-2 pr-3 font-medium">Status</th>
+                    <th className="py-2 pr-3 font-medium">HTTP</th>
+                    <th className="py-2 pr-4 font-medium">Latency</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {checks.map((check) => (
+                    <tr key={check.id} className="border-b border-border/40 last:border-b-0">
+                      <td className="py-2 pl-4 pr-3 tabular-nums text-muted-foreground">{formatTime(check.checked_at)}</td>
+                      <td className="py-2 pr-3"><StatusPill status={check.status} /></td>
+                      <td className="py-2 pr-3 tabular-nums text-muted-foreground">{check.http_status ?? "-"}</td>
+                      <td className="py-2 pr-4 tabular-nums text-muted-foreground">{check.latency_ms == null ? "-" : `${formatNumber(check.latency_ms)} ms`}</td>
+                    </tr>
+                  ))}
+                  {checks.length === 0 && (
+                    <tr>
+                      <td colSpan={4} className="py-8 text-center text-muted-foreground">No checks yet</td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+            {summary.last_message && (
+              <p className="border-t border-border/60 bg-background/30 px-4 py-2.5 text-xs text-muted-foreground">{summary.last_message}</p>
+            )}
+          </PanelCard>
         </div>
-      </div>
-    </div>
+      </TabsContent>
+    </Tabs>
   );
 }
 
@@ -841,16 +987,10 @@ export function AutotunePanel({ model }: { model: ModelRoute }) {
   };
 
   return (
-    <div className="mt-4 flex flex-wrap items-center justify-between gap-3 rounded-md border border-dashed border-border/70 bg-background/40 p-3">
-      <div className="flex items-start gap-2">
-        <Gauge className="mt-0.5 h-4 w-4 shrink-0 text-muted-foreground" />
-        <div>
-          <p className="text-xs font-medium">Auto-tune capacity</p>
-          <p className="text-xs text-muted-foreground">
-            Ramp live load against the upstream to find the in-flight knee. Best for self-hosted models.
-          </p>
-        </div>
-      </div>
+    <SettingRow
+      label="Auto-tune capacity"
+      hint="Ramp live load against the upstream to find the in-flight knee. Best for self-hosted models."
+    >
       <Dialog
         open={open}
         onOpenChange={(next) => {
@@ -1037,7 +1177,7 @@ export function AutotunePanel({ model }: { model: ModelRoute }) {
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </SettingRow>
   );
 }
 
@@ -1063,6 +1203,30 @@ export function ModelWeightControl({ id, initial }: { id: string; initial: numbe
       <Button type="button" size="sm" variant="secondary" disabled={pending || !changed} onClick={() => start(() => setModelWeightAction(id, next))}>
         {pending ? "Saving" : "Apply"}
       </Button>
+    </div>
+  );
+}
+
+// Provider logo for the row; falls back to a lettered tile when we don't
+// recognise the model family or the image fails to load.
+function ModelAvatar({ name, upstream }: { name: string; upstream?: string }) {
+  const provider = providerForModel(name, upstream);
+  const [failed, setFailed] = useState(false);
+  if (provider && !failed) {
+    return (
+      // eslint-disable-next-line @next/next/no-img-element
+      <img
+        src={provider.src}
+        alt={provider.label}
+        title={provider.label}
+        className="provider-logo h-10 w-10 shrink-0 object-contain"
+        onError={() => setFailed(true)}
+      />
+    );
+  }
+  return (
+    <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-secondary/60 text-xs font-semibold uppercase text-muted-foreground">
+      {name.replace(/[^a-z0-9]/gi, "").slice(0, 2) || "?"}
     </div>
   );
 }
@@ -1143,73 +1307,83 @@ function ReliabilityPanel({
   }
 
   return (
-    <div className="rounded-md border border-border bg-card/40 p-4">
-      <p className="text-sm font-medium">Reliability &amp; endpoints</p>
-      <p className="text-xs text-muted-foreground">
-        Per-request timeout, automatic retries, and multiple upstream clusters for the same model.
-      </p>
-
-      <form action={saveReliability} className="mt-4 grid gap-3 md:grid-cols-2">
-        <Field
-          label="Request timeout (s)"
-          name="request_timeout_secs"
-          type="number"
-          placeholder="default"
-          defaultValue={model.request_timeout_secs == null ? "" : String(model.request_timeout_secs)}
-        />
-        <Field label="Max retries" name="max_retries" type="number" defaultValue={String(model.max_retries)} />
-        <Field label="Retry backoff (ms)" name="retry_backoff_ms" type="number" defaultValue={String(model.retry_backoff_ms)} />
-        <div className="space-y-1.5">
-          <Label htmlFor={`selection-${model.id}`}>Endpoint selection</Label>
-          <select
-            id={`selection-${model.id}`}
-            name="endpoint_selection_mode"
-            defaultValue={model.endpoint_selection_mode}
-            className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-          >
-            <option value="failover">failover (priority order)</option>
-            <option value="load_balance">load_balance (weighted)</option>
-          </select>
-        </div>
-        <div className="md:col-span-2">
-          <Button type="submit" size="sm" disabled={disabled}>
-            <Save className="h-3.5 w-3.5" />
-            Save reliability
-          </Button>
-        </div>
+    <div className="grid gap-4 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)]">
+      <form action={saveReliability}>
+        <PanelCard
+          className="h-full"
+          title="Delivery"
+          description="Per-request timeout and retry behaviour."
+          actions={
+            <Button type="submit" size="sm" disabled={disabled}>
+              <Save className="h-3.5 w-3.5" />
+              Save
+            </Button>
+          }
+        >
+          <div className="grid gap-3 p-4">
+            <Field
+              label="Request timeout (s)"
+              name="request_timeout_secs"
+              type="number"
+              placeholder="default"
+              defaultValue={model.request_timeout_secs == null ? "" : String(model.request_timeout_secs)}
+            />
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Max retries" name="max_retries" type="number" defaultValue={String(model.max_retries)} />
+              <Field label="Retry backoff (ms)" name="retry_backoff_ms" type="number" defaultValue={String(model.retry_backoff_ms)} />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor={`selection-${model.id}`}>Endpoint selection</Label>
+              <select
+                id={`selection-${model.id}`}
+                name="endpoint_selection_mode"
+                defaultValue={model.endpoint_selection_mode}
+                className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+              >
+                <option value="failover">failover (priority order)</option>
+                <option value="load_balance">load_balance (weighted)</option>
+              </select>
+            </div>
+          </div>
+        </PanelCard>
       </form>
 
-      <div className="mt-5">
-        <p className="text-xs font-medium uppercase tracking-wider text-muted-foreground">Endpoints</p>
+      <PanelCard
+        className="flex h-full flex-col"
+        title="Endpoints"
+        description="Additional upstream clusters serving this model."
+      >
         {endpoints.length === 0 ? (
-          <p className="mt-2 text-xs text-muted-foreground">
-            No explicit endpoints. Requests use the model&apos;s primary API base above.
-          </p>
+          <div className="flex flex-1 items-center justify-center px-4 py-8">
+            <p className="text-xs text-muted-foreground">
+              No explicit endpoints. Requests use the model&apos;s primary API base.
+            </p>
+          </div>
         ) : (
-          <div className="mt-2 overflow-x-auto">
+          <div className="flex-1 overflow-x-auto">
             <table className="w-full text-left text-xs">
               <thead className="text-[10px] uppercase tracking-wider text-muted-foreground">
-                <tr>
-                  <th className="py-1 pr-3">Name</th>
-                  <th className="py-1 pr-3">API base</th>
-                  <th className="py-1 pr-3">Priority</th>
-                  <th className="py-1 pr-3">Weight</th>
-                  <th className="py-1 pr-3">Health</th>
-                  <th className="py-1 pr-3" />
+                <tr className="border-b border-border/60">
+                  <th className="py-2 pl-4 pr-3 font-medium">Name</th>
+                  <th className="py-2 pr-3 font-medium">API base</th>
+                  <th className="py-2 pr-3 font-medium">Priority</th>
+                  <th className="py-2 pr-3 font-medium">Weight</th>
+                  <th className="py-2 pr-3 font-medium">Health</th>
+                  <th className="py-2 pr-4" />
                 </tr>
               </thead>
               <tbody>
                 {endpoints.map((ep) => (
-                  <tr key={ep.id} className="border-t border-border/60">
-                    <td className="py-1.5 pr-3 font-medium">{ep.name}</td>
-                    <td className="py-1.5 pr-3 font-mono text-[11px] text-muted-foreground">{ep.api_base}</td>
-                    <td className="py-1.5 pr-3 tabular-nums">{ep.priority}</td>
-                    <td className="py-1.5 pr-3 tabular-nums">{ep.weight}</td>
-                    <td className="py-1.5 pr-3">
+                  <tr key={ep.id} className="border-b border-border/40 last:border-b-0">
+                    <td className="py-2 pl-4 pr-3 font-medium">{ep.name}</td>
+                    <td className="py-2 pr-3 font-mono text-[11px] text-muted-foreground">{ep.api_base}</td>
+                    <td className="py-2 pr-3 tabular-nums">{ep.priority}</td>
+                    <td className="py-2 pr-3 tabular-nums">{ep.weight}</td>
+                    <td className="py-2 pr-3">
                       <StatusPill status={ep.enabled ? ep.health_status : "disabled"} />
                     </td>
-                    <td className="py-1.5 pr-3">
-                      <div className="flex items-center gap-1.5">
+                    <td className="py-2 pr-4">
+                      <div className="flex items-center justify-end gap-1.5">
                         <Button
                           type="button"
                           size="sm"
@@ -1250,40 +1424,125 @@ function ReliabilityPanel({
           </div>
         )}
 
-        <form ref={addFormRef} action={addEndpoint} className="mt-3 grid gap-3 md:grid-cols-2">
-          <Field label="Name" name="name" placeholder="cluster-b" required />
-          <Field label="API base URL" name="api_base" placeholder="http://cluster-b/v1" required />
-          <Field label="API key" name="api_key" placeholder="Leave blank to inherit" />
-          <div className="grid grid-cols-2 gap-3">
-            <Field label="Priority" name="priority" type="number" defaultValue="100" />
-            <Field label="Weight" name="weight" type="number" defaultValue="100" />
+        <form ref={addFormRef} action={addEndpoint} className="border-t border-border/60 bg-background/30 px-4 py-4">
+          <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Add endpoint</p>
+          <div className="mt-3 grid gap-3 md:grid-cols-2">
+            <Field label="Name" name="name" placeholder="cluster-b" required />
+            <Field label="API base URL" name="api_base" placeholder="http://cluster-b/v1" required />
+            <Field label="API key" name="api_key" placeholder="Leave blank to inherit" />
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Priority" name="priority" type="number" defaultValue="100" />
+              <Field label="Weight" name="weight" type="number" defaultValue="100" />
+            </div>
           </div>
-          <div className="md:col-span-2">
-            <Button type="submit" size="sm" variant="secondary" disabled={disabled}>
-              Add endpoint
-            </Button>
-          </div>
+          <Button type="submit" size="sm" variant="secondary" disabled={disabled} className="mt-3">
+            <Plus className="h-3.5 w-3.5" />
+            Add endpoint
+          </Button>
         </form>
-      </div>
+      </PanelCard>
     </div>
   );
 }
 
-function ControlBlock({ label, children }: { label: string; children: ReactNode }) {
+// Bordered section with an optional header row; the shared container for every
+// block inside the model detail tabs so they all read as one design system.
+function PanelCard({
+  title,
+  description,
+  actions,
+  className,
+  children,
+}: {
+  title?: string;
+  description?: string;
+  actions?: ReactNode;
+  className?: string;
+  children: ReactNode;
+}) {
   return (
-    <div className="min-w-0 rounded-sm border border-border/70 bg-background/35 p-3">
-      <p className="mb-2 text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
+    <section className={cn("overflow-hidden rounded-lg border border-border bg-card/40", className)}>
+      {title && (
+        <header className="flex items-center justify-between gap-3 border-b border-border/60 bg-background/30 px-4 py-2.5">
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium">{title}</p>
+            {description && <p className="text-xs text-muted-foreground">{description}</p>}
+          </div>
+          {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
+        </header>
+      )}
       {children}
+    </section>
+  );
+}
+
+// One labeled row in a settings list: label + hint on the left, the control on
+// the right. Stack these inside `divide-y` instead of tiling identical boxes.
+function SettingRow({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-2 px-4 py-3">
+      <div className="min-w-0 max-w-sm">
+        <p className="text-xs font-medium">{label}</p>
+        {hint && <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">{hint}</p>}
+      </div>
+      <div className="flex min-w-0 shrink-0 items-center gap-2">{children}</div>
     </div>
   );
 }
 
-function MiniStat({ label, value }: { label: string; value: string }) {
+// Inline label-over-value pair for the overview spec strip. Values render in
+// full (chips for lists) instead of truncating inside fixed-width boxes.
+function SpecItem({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <div className="min-w-0 rounded-sm border border-border/70 bg-background/35 p-3">
+    <div className="min-w-0 border-l border-border/60 pl-4 first:border-l-0 first:pl-0">
       <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
-      <p className="mt-1 truncate text-sm font-medium tabular-nums">{value}</p>
+      <div className="mt-1 text-sm font-medium tabular-nums">{children}</div>
     </div>
+  );
+}
+
+// Titled slice of a form inside a PanelCard. Borderless on its own; the parent
+// applies `divide-y` / `divide-x` so sections work stacked or side by side.
+function FormSection({ title, columns = 2, children }: { title: string; columns?: 1 | 2; children: ReactNode }) {
+  return (
+    <div className="min-w-0 px-4 py-4">
+      <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{title}</p>
+      <div className={cn("mt-3 grid gap-x-4 gap-y-3", columns === 2 && "md:grid-cols-2")}>{children}</div>
+    </div>
+  );
+}
+
+// A labeled cluster of chip checkboxes.
+function ChipGroup({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+  return (
+    <div>
+      <p className="text-xs font-medium">{label}</p>
+      {hint && <p className="mt-0.5 max-w-prose text-[11px] leading-snug text-muted-foreground">{hint}</p>}
+      <div className="mt-2 flex flex-wrap gap-1.5">{children}</div>
+    </div>
+  );
+}
+
+// Checkbox dressed as a selectable chip. Keeps native form semantics (the
+// hidden input still submits) while reading as a tag picker instead of a
+// wall of checkboxes.
+function ChipCheckbox({ name, label, defaultChecked, hint }: { name: string; label: string; defaultChecked?: boolean; hint?: string }) {
+  return (
+    <label title={hint} className="cursor-pointer">
+      <input type="checkbox" name={name} defaultChecked={defaultChecked} className="peer sr-only" />
+      <span
+        className={cn(
+          "inline-flex items-center gap-1.5 rounded-md border border-border bg-transparent px-2 py-1 text-xs font-medium text-muted-foreground transition-colors",
+          "hover:bg-accent hover:text-accent-foreground",
+          "peer-checked:bg-secondary peer-checked:text-foreground",
+          "peer-focus-visible:ring-1 peer-focus-visible:ring-ring",
+          "[&>svg]:hidden peer-checked:[&>svg]:block",
+        )}
+      >
+        <Check className="h-3 w-3" strokeWidth={2.5} />
+        {label}
+      </span>
+    </label>
   );
 }
 
@@ -1403,42 +1662,78 @@ function SelectField({
   );
 }
 
-function CachePanel({ stats }: { stats?: CacheStats }) {
-  const hits = stats?.hits ?? 0;
-  const misses = stats?.misses ?? 0;
+// Page-level summary strip: route inventory and fleet health alongside the
+// 24h response-cache offload, so the table below can stay focused on per-model
+// state.
+function FleetStats({
+  models,
+  health,
+  cacheStats,
+}: {
+  models: ModelRoute[];
+  health: ModelHealthSummary[];
+  cacheStats?: CacheStats;
+}) {
+  const byModel = new Map(health.map((row) => [row.model_id, row]));
+  const routes = models.filter((model) => !isBenchmarkRoute(model));
+  const enabled = routes.filter((model) => model.enabled).length;
+  let healthy = 0;
+  let unhealthy = 0;
+  for (const model of routes) {
+    const status = byModel.get(model.id)?.status ?? "unknown";
+    if (status === "healthy") healthy += 1;
+    else if (status === "unhealthy") unhealthy += 1;
+  }
+  const unchecked = routes.length - healthy - unhealthy;
+  const hits = cacheStats?.hits ?? 0;
+  const misses = cacheStats?.misses ?? 0;
   const lookups = hits + misses;
-  const hitRate = lookups > 0 ? (hits / lookups) * 100 : 0;
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Response cache</CardTitle>
-        <CardDescription>Exact-match cache offload over the last 24h.</CardDescription>
-      </CardHeader>
-      <CardContent className="grid grid-cols-2 gap-4 md:grid-cols-4">
-        <Stat label="Hit rate" value={`${hitRate.toFixed(1)}%`} />
-        <Stat label="Cache hits" value={formatNumber(hits)} />
-        <Stat label="Misses" value={formatNumber(misses)} />
-        <Stat label="Tokens saved" value={formatNumber(stats?.tokens_saved ?? 0)} />
-      </CardContent>
-    </Card>
-  );
-}
-
-function Stat({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <div className="text-xs text-muted-foreground">{label}</div>
-      <div className="text-2xl font-semibold tabular-nums">{value}</div>
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <StatCard label="Model routes" value={formatNumber(routes.length)} hint={`${formatNumber(enabled)} enabled`} />
+      <StatCard
+        label="Fleet health"
+        value={routes.length === 0 ? "—" : `${formatNumber(healthy)} / ${formatNumber(routes.length)}`}
+        hint={
+          unhealthy > 0
+            ? `${formatNumber(unhealthy)} unhealthy${unchecked > 0 ? ` / ${formatNumber(unchecked)} unchecked` : ""}`
+            : unchecked > 0
+              ? `${formatNumber(unchecked)} unchecked`
+              : "all healthy"
+        }
+        tone={unhealthy > 0 ? "bad" : undefined}
+      />
+      <StatCard
+        label="Cache hit rate"
+        value={lookups > 0 ? `${((hits / lookups) * 100).toFixed(1)}%` : "—"}
+        hint={`${formatNumber(lookups)} lookups / 24h`}
+      />
+      <StatCard label="Tokens saved" value={formatNumber(cacheStats?.tokens_saved ?? 0)} hint="response cache / 24h" />
     </div>
   );
 }
 
-function Checkbox({ name, label, defaultChecked }: { name: string; label: string; defaultChecked?: boolean }) {
+function StatCard({ label, value, hint, tone }: { label: string; value: string; hint?: string; tone?: "bad" }) {
   return (
-    <label className="flex items-center gap-2 text-xs text-muted-foreground">
-      <input type="checkbox" name={name} defaultChecked={defaultChecked} className="rounded border-border" />
-      {label}
-    </label>
+    <div className="rounded-lg border border-border bg-card p-4">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="mt-1 text-2xl font-semibold tabular-nums">{value}</p>
+      {hint && (
+        <p className={cn("mt-0.5 text-[11px]", tone === "bad" ? "text-destructive" : "text-muted-foreground")}>{hint}</p>
+      )}
+    </div>
+  );
+}
+
+// A labeled, bordered cluster of related checkboxes. Keeps the capability,
+// routing-tag and boon groups visually consistent inside the model forms.
+function FieldGroup({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+  return (
+    <div className="md:col-span-2 rounded-md border border-border/60 bg-background/30 p-3">
+      <Label className="block text-xs font-medium text-foreground">{label}</Label>
+      {hint && <p className="mt-0.5 mb-2 max-w-prose text-[11px] leading-snug text-muted-foreground">{hint}</p>}
+      <div className={cn("flex flex-wrap gap-x-4 gap-y-2", !hint && "mt-2")}>{children}</div>
+    </div>
   );
 }
 
@@ -1492,10 +1787,12 @@ function toExportShape(model: ModelRoute) {
     supports_system_messages: model.supports_system_messages,
     supports_response_schema: model.supports_response_schema,
     supports_tool_choice: model.supports_tool_choice,
+    supports_vision: model.supports_vision,
     enabled: model.enabled,
     cache_enabled: model.cache_enabled,
     cache_ttl_secs: model.cache_ttl_secs,
     tags: model.tags,
+    boons: model.boons,
   };
 }
 
@@ -1661,14 +1958,43 @@ function toPlainDecimal(value: number): string {
   return (negative ? "-" : "") + body;
 }
 
-function formatCapabilities(model: ModelRoute) {
-  const capabilities = [
+function capabilityList(model: ModelRoute): string[] {
+  return [
     model.supports_function_calling && "functions",
     model.supports_system_messages && "system",
     model.supports_response_schema && "schema",
     model.supports_tool_choice && "tools",
-  ].filter(Boolean);
-  return capabilities.length > 0 ? capabilities.join(", ") : "None";
+    model.supports_vision && "vision",
+  ].filter((value): value is string => Boolean(value));
+}
+
+function boonList(model: ModelRoute): string[] {
+  return (model.boons ?? [])
+    .map((value) => MODEL_BOONS.find((boon) => boon.value === value)?.label ?? value);
+}
+
+// Small read-only chip set for the overview spec strip.
+function ChipList({ items, empty, tone }: { items: string[]; empty: string; tone?: "boon" }) {
+  if (items.length === 0) {
+    return <span className="text-xs font-normal text-muted-foreground">{empty}</span>;
+  }
+  return (
+    <div className="flex max-w-[18rem] flex-wrap gap-1">
+      {items.map((item) => (
+        <Badge
+          key={item}
+          className={cn(
+            "text-[10px] font-normal",
+            tone === "boon"
+              ? "border-amber-500/40 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+              : "border-border bg-background/60 text-muted-foreground",
+          )}
+        >
+          {item}
+        </Badge>
+      ))}
+    </div>
+  );
 }
 
 function isInMaintenance(summary: ModelHealthSummary) {

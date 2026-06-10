@@ -15,7 +15,7 @@ pub use capacity::{CapacityProvider, StaticCapacity};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use obleth_config::{Admission, FairshareAlgorithm};
@@ -143,6 +143,9 @@ enum Ctl {
 pub struct FairShare {
     ctl: mpsc::UnboundedSender<Ctl>,
     stats: Arc<Stats>,
+    /// Mirror of the scheduler's per-model in-flight counts, maintained on
+    /// grant/release so readers never round-trip through the scheduler task.
+    model_load: Arc<RwLock<HashMap<String, usize>>>,
 }
 
 impl FairShare {
@@ -152,10 +155,12 @@ impl FairShare {
     ) -> Self {
         let (ctl, rx) = mpsc::unbounded_channel();
         let stats = Arc::new(Stats::default());
+        let model_load = Arc::new(RwLock::new(HashMap::new()));
         let scheduler = Scheduler {
             algorithm,
             capacity,
             in_flight: 0,
+            queued_total: 0,
             tenant_in_flight: HashMap::new(),
             model_in_flight: HashMap::new(),
             tenant_group: HashMap::new(),
@@ -167,13 +172,28 @@ impl FairShare {
             virtual_time: 0.0,
             ctl_tx: ctl.clone(),
             stats: stats.clone(),
+            model_load: model_load.clone(),
         };
         tokio::spawn(scheduler.run(rx));
-        FairShare { ctl, stats }
+        FairShare {
+            ctl,
+            stats,
+            model_load,
+        }
     }
 
     pub fn stats(&self) -> Arc<Stats> {
         self.stats.clone()
+    }
+
+    /// Live in-flight request count per model. Cheap (one read-lock + clone of
+    /// a small map); used by the `auto` router on every request, so it must not
+    /// serialize through the scheduler task the way [`Self::snapshot`] does.
+    pub fn model_load(&self) -> HashMap<String, usize> {
+        self.model_load
+            .read()
+            .map(|m| m.clone())
+            .unwrap_or_default()
     }
 
     pub async fn snapshot(&self) -> Option<FairshareSnapshot> {
@@ -210,6 +230,9 @@ struct Scheduler {
     algorithm: FairshareAlgorithm,
     capacity: Arc<dyn CapacityProvider>,
     in_flight: usize,
+    /// Total queued waiters across all tenants, maintained incrementally so the
+    /// hot admit/dispatch paths never re-sum every queue.
+    queued_total: usize,
     tenant_in_flight: HashMap<Uuid, usize>,
     model_in_flight: HashMap<String, usize>,
     tenant_group: HashMap<Uuid, String>,
@@ -221,6 +244,8 @@ struct Scheduler {
     virtual_time: f64,
     ctl_tx: mpsc::UnboundedSender<Ctl>,
     stats: Arc<Stats>,
+    /// Shared mirror of `model_in_flight` read by [`FairShare::model_load`].
+    model_load: Arc<RwLock<HashMap<String, usize>>>,
 }
 
 impl Scheduler {
@@ -266,9 +291,10 @@ impl Scheduler {
                                 enqueued,
                                 respond,
                             });
+                        self.queued_total += 1;
                         self.stats
                             .queued
-                            .store(self.backlog() as i64, Ordering::Relaxed);
+                            .store(self.queued_total as i64, Ordering::Relaxed);
                         self.dispatch();
                     }
                 }
@@ -283,12 +309,7 @@ impl Scheduler {
                             self.tenant_in_flight.remove(&tenant);
                         }
                     }
-                    if let Some(n) = self.model_in_flight.get_mut(&model) {
-                        *n = n.saturating_sub(1);
-                        if *n == 0 {
-                            self.model_in_flight.remove(&model);
-                        }
-                    }
+                    self.dec_model_in_flight(&model);
                     self.dispatch();
                 }
                 Ctl::Snapshot { respond } => {
@@ -313,8 +334,39 @@ impl Scheduler {
         }
     }
 
-    fn backlog(&self) -> usize {
-        self.queues.values().map(VecDeque::len).sum()
+    /// Bump a model's in-flight count and propagate the change to the shared
+    /// mirror read by [`FairShare::model_load`].
+    fn inc_model_in_flight(&mut self, model: &str) {
+        *self
+            .model_in_flight
+            .entry(model.to_string())
+            .or_insert(0) += 1;
+        self.publish_model_load(model);
+    }
+
+    /// Decrement a model's in-flight count (dropping the entry at zero) and
+    /// propagate the change to the shared mirror.
+    fn dec_model_in_flight(&mut self, model: &str) {
+        if let Some(n) = self.model_in_flight.get_mut(model) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                self.model_in_flight.remove(model);
+            }
+        }
+        self.publish_model_load(model);
+    }
+
+    fn publish_model_load(&self, model: &str) {
+        if let Ok(mut shared) = self.model_load.write() {
+            match self.model_in_flight.get(model) {
+                Some(n) => {
+                    shared.insert(model.to_string(), *n);
+                }
+                None => {
+                    shared.remove(model);
+                }
+            }
+        }
     }
 
     fn group_in_flight(&self, group: &str) -> usize {
@@ -402,7 +454,7 @@ impl Scheduler {
     }
 
     fn can_grant_immediately(&self, req: &AdmitRequest, max: usize) -> bool {
-        if self.in_flight >= max || self.backlog() > 0 {
+        if self.in_flight >= max || self.queued_total > 0 {
             return false;
         }
         if !self.model_has_slot(&req.model) {
@@ -457,7 +509,7 @@ impl Scheduler {
     ) {
         self.in_flight += 1;
         *self.tenant_in_flight.entry(tenant).or_insert(0) += 1;
-        *self.model_in_flight.entry(model.clone()).or_insert(0) += 1;
+        self.inc_model_in_flight(&model);
         self.stats
             .in_flight
             .store(self.in_flight, Ordering::Relaxed);
@@ -601,7 +653,7 @@ impl Scheduler {
             algorithm: self.algorithm.as_str().into(),
             max_in_flight: max,
             global_in_flight: self.in_flight,
-            global_queued: self.backlog(),
+            global_queued: self.queued_total,
             groups,
             tenants,
             model_in_flight: self.model_in_flight.clone(),
@@ -620,6 +672,7 @@ impl Scheduler {
 
             let queue = self.queues.get_mut(&tenant).expect("picked tenant exists");
             let waiter = queue.pop_front().expect("picked tenant non-empty");
+            self.queued_total = self.queued_total.saturating_sub(1);
             if queue.is_empty() {
                 self.queues.remove(&tenant);
             }
@@ -637,16 +690,13 @@ impl Scheduler {
 
             self.in_flight += 1;
             *self.tenant_in_flight.entry(tenant).or_insert(0) += 1;
-            *self
-                .model_in_flight
-                .entry(waiter.model.clone())
-                .or_insert(0) += 1;
+            self.inc_model_in_flight(&waiter.model);
             self.stats
                 .in_flight
                 .store(self.in_flight, Ordering::Relaxed);
             self.stats
                 .queued
-                .store(self.backlog() as i64, Ordering::Relaxed);
+                .store(self.queued_total as i64, Ordering::Relaxed);
             self.tenant_weight.insert(tenant, waiter.weight.max(1));
 
             let waited = waiter.enqueued.elapsed();
@@ -694,7 +744,29 @@ impl Scheduler {
 
     fn pick_tenant_hierarchical(&self, max: usize) -> Option<Uuid> {
         let caps = self.compute_group_caps(max);
-        let mut eligible: Vec<(Uuid, String, f64)> = Vec::new();
+
+        // Aggregate per-group in-flight and served totals in one pass each,
+        // instead of rescanning every tenant for every queued candidate. This
+        // keeps each pick O(tenants), not O(queued x tenants).
+        let mut in_flight_by_group: HashMap<&str, usize> = HashMap::new();
+        for (tenant, n) in &self.tenant_in_flight {
+            if *n > 0 {
+                if let Some(g) = self.tenant_group.get(tenant) {
+                    *in_flight_by_group.entry(g.as_str()).or_insert(0) += *n;
+                }
+            }
+        }
+        let mut served_by_group: HashMap<&str, f64> = HashMap::new();
+        for (tenant, s) in &self.served {
+            if let Some(g) = self.tenant_group.get(tenant) {
+                *served_by_group.entry(g.as_str()).or_insert(0.0) += *s;
+            }
+        }
+        // The per-tenant slot split is identical for every candidate in the
+        // same group, so compute it lazily and at most once per group.
+        let mut tenant_caps_by_group: HashMap<String, HashMap<Uuid, usize>> = HashMap::new();
+
+        let mut eligible: Vec<(Uuid, f64)> = Vec::new();
 
         for (tenant, queue) in &self.queues {
             if queue.is_empty() {
@@ -712,11 +784,17 @@ impl Scheduler {
                 .cloned()
                 .unwrap_or_else(|| waiter.group.clone());
             let cap = caps.get(&group).copied().unwrap_or(max);
-            if self.group_in_flight(&group) >= cap {
+            if in_flight_by_group
+                .get(group.as_str())
+                .copied()
+                .unwrap_or(0)
+                >= cap
+            {
                 continue;
             }
-            let tenant_cap = self
-                .tenant_slot_caps(&group, cap)
+            let tenant_cap = tenant_caps_by_group
+                .entry(group.clone())
+                .or_insert_with(|| self.tenant_slot_caps(&group, cap))
                 .get(tenant)
                 .copied()
                 .unwrap_or(cap);
@@ -724,8 +802,12 @@ impl Scheduler {
                 continue;
             }
             let group_weight = self.group_weight.get(&group).copied().unwrap_or(100).max(1) as f64;
-            let group_score = self.group_served(&group) / group_weight;
-            eligible.push((*tenant, group, group_score));
+            let group_score = served_by_group
+                .get(group.as_str())
+                .copied()
+                .unwrap_or(0.0)
+                / group_weight;
+            eligible.push((*tenant, group_score));
         }
 
         if eligible.is_empty() {
@@ -734,11 +816,11 @@ impl Scheduler {
 
         let min_group_score = eligible
             .iter()
-            .map(|(_, _, score)| *score)
+            .map(|(_, score)| *score)
             .fold(f64::INFINITY, f64::min);
 
         let mut best: Option<(Uuid, f64)> = None;
-        for (tenant, group, group_score) in eligible {
+        for (tenant, group_score) in eligible {
             if (group_score - min_group_score).abs() > f64::EPSILON && group_score > min_group_score
             {
                 continue;
@@ -752,7 +834,6 @@ impl Scheduler {
                 Some((_, best_score)) if tenant_score >= best_score => {}
                 _ => best = Some((tenant, tenant_score)),
             }
-            let _ = group;
         }
         best.map(|(t, _)| t)
     }

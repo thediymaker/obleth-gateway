@@ -11,6 +11,7 @@ mod router;
 mod state;
 
 mod classifier;
+mod boons;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -110,6 +111,18 @@ async fn main() -> anyhow::Result<()> {
     };
     let classifier = classifier::Classifier::new(initial_router_settings);
 
+    // Model-boon settings live in Postgres (app_settings, key='boons') and are
+    // hot-reloadable, mirroring the auto-router classifier above.
+    let initial_boon_settings = match store.get_boon_settings().await {
+        Ok(Some(settings)) => settings,
+        Ok(None) => obleth_config::BoonSettings::default(),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load boon settings; using defaults");
+            obleth_config::BoonSettings::default()
+        }
+    };
+    let boons = boons::BoonEngine::new(initial_boon_settings);
+
     // Alert settings are persisted in Postgres (app_settings, key='alerts') and
     // hot-reloadable at runtime. On boot, prefer the saved settings; otherwise
     // seed from the legacy env-configured Slack webhook so existing deployments
@@ -144,6 +157,7 @@ async fn main() -> anyhow::Result<()> {
         mcp_cache: mcp_cache.clone(),
         model_registry: model_registry.clone(),
         classifier: classifier.clone(),
+        boons: boons.clone(),
         metrics: metrics.clone(),
         fail_open: cfg.fail_open,
         alerts: alerts.clone(),
@@ -165,7 +179,12 @@ async fn main() -> anyhow::Result<()> {
 
     // Keep the `auto`-router candidate list fresh: model edits, enable/disable,
     // and health/maintenance transitions are all reflected within one interval.
-    spawn_model_registry_refresh(store.clone(), model_registry.clone(), classifier.clone());
+    spawn_model_registry_refresh(
+        store.clone(),
+        model_registry.clone(),
+        classifier.clone(),
+        boons.clone(),
+    );
 
     match store.all_resolved_mcp_servers().await {
         Ok(servers) => {
@@ -319,6 +338,7 @@ fn spawn_model_registry_refresh(
     store: Store,
     registry: router::ModelRegistry,
     classifier: classifier::Classifier,
+    boons: boons::BoonEngine,
 ) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(15));
@@ -333,6 +353,11 @@ fn spawn_model_registry_refresh(
                 Ok(Some(settings)) => classifier.update(settings),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(error = %e, "auto-router settings refresh failed"),
+            }
+            match store.get_boon_settings().await {
+                Ok(Some(settings)) => boons.update(settings),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "boon settings refresh failed"),
             }
         }
     });

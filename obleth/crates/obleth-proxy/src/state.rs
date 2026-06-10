@@ -11,6 +11,7 @@ use obleth_redis::RedisStore;
 use obleth_telemetry::TelemetrySink;
 use obleth_tokenizer::HeuristicTokenizer;
 
+use crate::boons::BoonEngine;
 use crate::classifier::Classifier;
 use crate::metrics::Metrics;
 use crate::router::ModelRegistry;
@@ -39,6 +40,9 @@ pub struct AppState {
     /// Intent classifier for `auto` routing; its settings are refreshed by the
     /// same background task that refreshes `model_registry`.
     pub classifier: Classifier,
+    /// Engine for model "boons" (e.g. the vision boon). Its settings are
+    /// refreshed by the same background task that refreshes `model_registry`.
+    pub boons: BoonEngine,
     pub metrics: Arc<Metrics>,
     pub fail_open: bool,
     pub alerts: obleth_admin::AlertDispatcher,

@@ -6,11 +6,30 @@
 
 pub mod scripts;
 
+use std::sync::OnceLock;
+
 use futures_util::StreamExt;
 use obleth_config::{CachedResponse, ResolvedKey, ResolvedMcpServer, ResolvedModel};
 use redis::aio::ConnectionManager;
 use redis::AsyncCommands;
 use uuid::Uuid;
+
+/// Lua scripts are wrapped in `redis::Script` once (constructing one SHA-1
+/// hashes the source) instead of per call on the request hot path.
+macro_rules! cached_script {
+    ($name:ident, $src:expr) => {
+        fn $name() -> &'static redis::Script {
+            static SCRIPT: OnceLock<redis::Script> = OnceLock::new();
+            SCRIPT.get_or_init(|| redis::Script::new($src))
+        }
+    };
+}
+
+cached_script!(reserve_script, scripts::RESERVE);
+cached_script!(reserve_with_term_script, scripts::RESERVE_WITH_TERM);
+cached_script!(reconcile_script, scripts::RECONCILE);
+cached_script!(term_usage_read_script, scripts::TERM_USAGE_READ);
+cached_script!(term_usage_add_script, scripts::TERM_USAGE_ADD);
 
 const KEY_PREFIX: &str = "obleth:key:";
 const MODEL_PREFIX: &str = "obleth:model:";
@@ -29,6 +48,30 @@ pub enum RedisError {
 }
 
 type Result<T> = std::result::Result<T, RedisError>;
+
+/// Caps for the cumulative term-budget gate of
+/// [`RedisStore::reserve_budget_with_term`].
+#[derive(Debug, Clone)]
+pub struct TermGate<'a> {
+    /// Period key namespacing the counters (see `term_period_key`).
+    pub period_key: &'a str,
+    /// Cumulative token cap, `None` = uncapped.
+    pub budget_tokens: Option<i64>,
+    /// Cumulative USD cap, `None` = uncapped.
+    pub budget_cost_usd: Option<f64>,
+}
+
+/// Result of the combined term-gate + token-bucket admission check.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ReserveOutcome {
+    /// Tokens reserved; carries the per-minute bucket remainder.
+    Reserved { remaining: i64 },
+    /// Per-minute bucket exhausted; nothing reserved.
+    RateLimited { remaining: i64 },
+    /// Cumulative term budget exhausted; nothing reserved. Carries the term
+    /// usage observed by the gate, for alerting.
+    TermExhausted { used_tokens: i64, used_cost: f64 },
+}
 
 /// Cloneable handle to Redis. Holds a multiplexed connection manager (auto
 /// reconnecting) plus the client for creating dedicated pub/sub connections.
@@ -181,7 +224,7 @@ impl RedisStore {
         let mut conn = self.conn.clone();
         let now_ms = now_ms();
         let refill_per_ms = tokens_per_minute as f64 / 60_000.0;
-        let (allowed, remaining): (i64, i64) = redis::Script::new(scripts::RESERVE)
+        let (allowed, remaining): (i64, i64) = reserve_script()
             .key(Self::budget_key(tenant))
             .arg(capacity)
             .arg(refill_per_ms)
@@ -190,6 +233,56 @@ impl RedisStore {
             .invoke_async(&mut conn)
             .await?;
         Ok((allowed == 1, remaining))
+    }
+
+    /// Combined admission check in a single round trip: an optional cumulative
+    /// term-budget gate followed by the atomic token-bucket reserve. The term
+    /// gate runs first, so a term-exhausted request never reserves per-minute
+    /// tokens it has no completion path to refund.
+    pub async fn reserve_budget_with_term(
+        &self,
+        tenant: &Uuid,
+        capacity: i64,
+        tokens_per_minute: i64,
+        requested: u32,
+        term: Option<TermGate<'_>>,
+    ) -> Result<ReserveOutcome> {
+        let mut conn = self.conn.clone();
+        let now_ms = now_ms();
+        let refill_per_ms = tokens_per_minute as f64 / 60_000.0;
+        let (check_term, period_key, cap_tokens, cap_cost) = match &term {
+            Some(gate) => (
+                1u8,
+                gate.period_key,
+                gate.budget_tokens.map(|t| t.to_string()).unwrap_or_default(),
+                gate.budget_cost_usd
+                    .map(|c| c.to_string())
+                    .unwrap_or_default(),
+            ),
+            None => (0u8, "", String::new(), String::new()),
+        };
+        let (status, remaining, term_tokens, term_cost): (i64, i64, i64, String) =
+            reserve_with_term_script()
+                .key(Self::budget_key(tenant))
+                .key(Self::term_usage_key(tenant))
+                .arg(capacity)
+                .arg(refill_per_ms)
+                .arg(now_ms)
+                .arg(requested)
+                .arg(check_term)
+                .arg(period_key)
+                .arg(cap_tokens)
+                .arg(cap_cost)
+                .invoke_async(&mut conn)
+                .await?;
+        Ok(match status {
+            1 => ReserveOutcome::Reserved { remaining },
+            -1 => ReserveOutcome::TermExhausted {
+                used_tokens: term_tokens,
+                used_cost: term_cost.parse().unwrap_or(0.0),
+            },
+            _ => ReserveOutcome::RateLimited { remaining },
+        })
     }
 
     /// Reconcile the difference between estimated and actual cost.
@@ -202,7 +295,7 @@ impl RedisStore {
     ) -> Result<i64> {
         let mut conn = self.conn.clone();
         let delta = estimated as i64 - actual as i64;
-        let remaining: i64 = redis::Script::new(scripts::RECONCILE)
+        let remaining: i64 = reconcile_script()
             .key(Self::budget_key(tenant))
             .arg(capacity)
             .arg(delta)
@@ -215,7 +308,7 @@ impl RedisStore {
     /// period counters if `period_key` no longer matches the stored term.
     pub async fn term_usage_read(&self, tenant: &Uuid, period_key: &str) -> Result<(i64, f64)> {
         let mut conn = self.conn.clone();
-        let (tokens, cost): (i64, String) = redis::Script::new(scripts::TERM_USAGE_READ)
+        let (tokens, cost): (i64, String) = term_usage_read_script()
             .key(Self::term_usage_key(tenant))
             .arg(period_key)
             .invoke_async(&mut conn)
@@ -233,7 +326,7 @@ impl RedisStore {
         add_cost: f64,
     ) -> Result<(i64, f64)> {
         let mut conn = self.conn.clone();
-        let (tokens, cost): (i64, String) = redis::Script::new(scripts::TERM_USAGE_ADD)
+        let (tokens, cost): (i64, String) = term_usage_add_script()
             .key(Self::term_usage_key(tenant))
             .arg(period_key)
             .arg(add_tokens)
@@ -307,6 +400,86 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after, 90);
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn combined_reserve_gates_on_term_budget_first() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let store = RedisStore::connect(&url).await.expect("connect");
+        let tenant = Uuid::new_v4();
+        let capacity = 100i64;
+        let tpm = 0i64; // no refill, so accounting is deterministic
+
+        // No term gate: behaves like a plain reserve.
+        let out = store
+            .reserve_budget_with_term(&tenant, capacity, tpm, 60, None)
+            .await
+            .unwrap();
+        assert_eq!(out, ReserveOutcome::Reserved { remaining: 40 });
+
+        // Bucket exhausted -> RateLimited, nothing reserved.
+        let out = store
+            .reserve_budget_with_term(&tenant, capacity, tpm, 50, None)
+            .await
+            .unwrap();
+        assert!(matches!(out, ReserveOutcome::RateLimited { .. }));
+
+        // Accumulate term usage, then a gate below that usage must reject
+        // WITHOUT touching the bucket.
+        store
+            .term_usage_add(&tenant, "l:0", 500, 1.25)
+            .await
+            .unwrap();
+        let gate = TermGate {
+            period_key: "l:0",
+            budget_tokens: Some(500),
+            budget_cost_usd: None,
+        };
+        let out = store
+            .reserve_budget_with_term(&tenant, capacity, tpm, 10, Some(gate))
+            .await
+            .unwrap();
+        assert_eq!(
+            out,
+            ReserveOutcome::TermExhausted {
+                used_tokens: 500,
+                used_cost: 1.25
+            }
+        );
+        // Bucket untouched by the term rejection: 40 tokens still reservable.
+        let out = store
+            .reserve_budget_with_term(&tenant, capacity, tpm, 40, None)
+            .await
+            .unwrap();
+        assert_eq!(out, ReserveOutcome::Reserved { remaining: 0 });
+
+        // A roomy term gate passes through to the bucket (now empty).
+        let gate = TermGate {
+            period_key: "l:0",
+            budget_tokens: Some(1_000_000),
+            budget_cost_usd: Some(100.0),
+        };
+        let out = store
+            .reserve_budget_with_term(&tenant, capacity, tpm, 10, Some(gate))
+            .await
+            .unwrap();
+        assert!(matches!(out, ReserveOutcome::RateLimited { .. }));
+
+        // A different period key rolls the counters: gate opens again.
+        let gate = TermGate {
+            period_key: "m:2026-06",
+            budget_tokens: Some(500),
+            budget_cost_usd: None,
+        };
+        let out = store
+            .reserve_budget_with_term(&Uuid::new_v4(), capacity, tpm, 10, Some(gate))
+            .await
+            .unwrap();
+        assert_eq!(out, ReserveOutcome::Reserved { remaining: 90 });
     }
 
     #[tokio::test]

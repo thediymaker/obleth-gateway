@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use clickhouse::{Client, Row};
 use obleth_config::UsageRecord;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -28,17 +28,19 @@ pub enum TelemetryError {
     InvalidDatabase(String),
 }
 
-/// ClickHouse row mirror of [`UsageRecord`].
-#[derive(Debug, Clone, Row, Serialize, Deserialize)]
-struct UsageRow {
+/// Borrowed ClickHouse row mirror of [`UsageRecord`], so a batch insert
+/// serializes straight from the buffered records instead of cloning every
+/// string field per row.
+#[derive(Debug, Row, Serialize)]
+struct UsageRow<'a> {
     #[serde(with = "clickhouse::serde::uuid")]
     request_id: Uuid,
     #[serde(with = "clickhouse::serde::uuid")]
     tenant_id: Uuid,
     #[serde(with = "clickhouse::serde::uuid")]
     key_id: Uuid,
-    model: String,
-    admission: String,
+    model: &'a str,
+    admission: &'a str,
     weight: i64,
     input_tokens: u32,
     output_tokens: u32,
@@ -47,21 +49,21 @@ struct UsageRow {
     ttft_ms: u32,
     total_ms: u32,
     status_code: u16,
-    cache_status: String,
+    cache_status: &'a str,
     cost_usd: f64,
     ts_ms: i64,
-    session_id: String,
-    request_type: String,
+    session_id: &'a str,
+    request_type: &'a str,
 }
 
-impl From<UsageRecord> for UsageRow {
-    fn from(r: UsageRecord) -> Self {
+impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
+    fn from(r: &'a UsageRecord) -> Self {
         UsageRow {
             request_id: r.request_id,
             tenant_id: r.tenant_id,
             key_id: r.key_id,
-            model: r.model,
-            admission: r.admission,
+            model: &r.model,
+            admission: &r.admission,
             weight: r.weight,
             input_tokens: r.input_tokens,
             output_tokens: r.output_tokens,
@@ -70,11 +72,11 @@ impl From<UsageRecord> for UsageRow {
             ttft_ms: r.ttft_ms,
             total_ms: r.total_ms,
             status_code: r.status_code,
-            cache_status: r.cache_status,
+            cache_status: &r.cache_status,
             cost_usd: r.cost_usd,
             ts_ms: r.ts_ms,
-            session_id: r.session_id,
-            request_type: r.request_type,
+            session_id: &r.session_id,
+            request_type: &r.request_type,
         }
     }
 }
@@ -194,8 +196,7 @@ impl Flusher {
     async fn insert(&self, batch: &[UsageRecord]) -> Result<(), TelemetryError> {
         let mut insert = self.client.insert("usage")?;
         for rec in batch {
-            let row = UsageRow::from(rec.clone());
-            insert.write(&row).await?;
+            insert.write(&UsageRow::from(rec)).await?;
         }
         insert.end().await?;
         Ok(())
@@ -297,12 +298,25 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             ts_ms Int64,
             session_id String DEFAULT '',
             request_type LowCardinality(String) DEFAULT '',
-            ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms)
+            ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms),
+            INDEX idx_ts_ms ts_ms TYPE minmax GRANULARITY 4
         ) ENGINE = MergeTree()
         PARTITION BY toYYYYMMDD(ts)
         ORDER BY (tenant_id, ts_ms)"
     );
     client.query(&ddl).execute().await?;
+    // The sort key leads with tenant_id, so cross-tenant time-range reads (the
+    // live request log, the usage series) cannot use the primary index. A
+    // minmax skip index on ts_ms lets those queries skip granules outside the
+    // requested window. Idempotent add for tables created before the index
+    // existed; it applies to newly written parts (old parts age out via the
+    // retention worker, so we deliberately skip an expensive MATERIALIZE).
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD INDEX IF NOT EXISTS idx_ts_ms ts_ms TYPE minmax GRANULARITY 4"
+        ))
+        .execute()
+        .await?;
     // Idempotent add for databases created before the cache column existed.
     client
         .query(&format!(

@@ -13,12 +13,12 @@ use crate::usage::{
 };
 use crate::{
     AlertSettingsView, ApplyAutotuneCapacity, AuditEntryView, AuditQuery, AutoRouterSettingsView,
-    CapacityView, CompactUsageResult, CreateFairshareGroup, CreateKey, CreateMcpServer,
+    BoonSettingsView, CapacityView, CompactUsageResult, CreateFairshareGroup, CreateKey, CreateMcpServer,
     CreateModel, CreateModelEndpoint, CreateTenant, CreatedKey, EmailSettingsView, FairshareLiveView,
     GroupFairshareView, ListKeysQuery, LiveStats, SetCapacity, SetDisabled, SetModelCapacity,
     SetModelCache, SetModelCapacityMode, SetModelReliability, SetModelWeight, SetTenantAllowlist,
     SetTenantBudget, SetTenantSchedule, SetTenantStatus, TenantFairshareView, TestAlertResult,
-    UpdateAlertSettings, UpdateAutoRouterSettings, UpdateEmailSettings, UpdateGroupWeight,
+    UpdateAlertSettings, UpdateAutoRouterSettings, UpdateBoonSettings, UpdateEmailSettings, UpdateGroupWeight,
     UpdateMcpServer, UpdateModel, UpdateModelEndpoint, UpdateQuota, UpdateTenant,
     UpdateTenantGroup, UpdateUsageRetention, UpdateWeight, UsageRetentionView,
 };
@@ -111,6 +111,8 @@ use obleth_config::{
         crate::test_alert_settings,
         crate::get_auto_router_settings,
         crate::put_auto_router_settings,
+        crate::get_boon_settings,
+        crate::put_boon_settings,
         crate::get_usage_retention,
         crate::put_usage_retention,
     ),
@@ -187,6 +189,8 @@ use obleth_config::{
         TestAlertResult,
         AutoRouterSettingsView,
         UpdateAutoRouterSettings,
+        BoonSettingsView,
+        UpdateBoonSettings,
         crate::alerts::ChannelResult,
         AutotuneRequest,
         AutotuneReport,

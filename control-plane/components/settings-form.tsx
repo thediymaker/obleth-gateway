@@ -5,6 +5,7 @@ import { Send, Database, Trash2 } from "lucide-react";
 import {
   setAlertSettingsAction,
   setAutoRouterSettingsAction,
+  setBoonSettingsAction,
   testAlertAction,
   setUsageRetentionAction,
   compactUsageAction,
@@ -17,9 +18,11 @@ import { DestructiveConfirm } from "@/components/ui/destructive-confirm";
 import type {
   AlertSettingsView,
   AutoRouterSettingsView,
+  BoonSettingsView,
   ModelRoute,
   UpdateAlertSettings,
   UpdateAutoRouterSettings,
+  UpdateBoonSettings,
   UsageRetentionView,
 } from "@/lib/obleth";
 
@@ -415,6 +418,130 @@ export function AutoRouterSettingsForm({
         </div>
         <Button onClick={save} disabled={pending}>
           {pending ? "Saving..." : "Save auto routing"}
+        </Button>
+        {status && (
+          <p
+            className={
+              status.ok
+                ? "rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
+                : "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            }
+          >
+            {status.message}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+export function BoonsSettingsForm({
+  settings,
+  models,
+}: {
+  settings: BoonSettingsView | null;
+  models: ModelRoute[];
+}) {
+  const [pending, start] = useTransition();
+  const [status, setStatus] = useState<{ ok: boolean; message: string } | null>(null);
+  const [enabled, setEnabled] = useState(settings?.vision_enabled ?? false);
+  const [model, setModel] = useState(settings?.vision_fallback_model ?? "");
+  const [prompt, setPrompt] = useState(settings?.vision_describe_prompt ?? "");
+  const [maxImages, setMaxImages] = useState(String(settings?.vision_max_images ?? 6));
+  const [timeout, setTimeoutMs] = useState(String(settings?.vision_timeout_ms ?? 30000));
+
+  function save() {
+    setStatus(null);
+    const body: UpdateBoonSettings = {
+      vision_enabled: enabled,
+      vision_fallback_model: model.trim() ? model.trim() : "",
+      vision_describe_prompt: prompt.trim(),
+      vision_max_images: Number(maxImages) || 6,
+      vision_timeout_ms: Number(timeout) || 30000,
+    };
+    start(async () => {
+      const result = await setBoonSettingsAction(body);
+      setStatus(
+        result.ok
+          ? { ok: true, message: "Boon settings saved." }
+          : { ok: false, message: result.error },
+      );
+    });
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Model boons</CardTitle>
+        <CardDescription>
+          Gateway-granted capabilities for models that lack them natively. The{" "}
+          <strong>vision</strong> boon relays images to a describer model and rewrites them as text
+          so a non-vision model can still answer. Applies only to models without the{" "}
+          <code>Vision</code> capability. Fail-open: if the describer is unavailable the request is
+          forwarded unchanged.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
+            className="h-4 w-4"
+          />
+          Enable vision boon
+        </label>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-1">
+            <Label htmlFor="vision_fallback_model">Describer model</Label>
+            <select
+              id="vision_fallback_model"
+              value={model}
+              onChange={(e) => setModel(e.target.value)}
+              className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
+            >
+              <option value="">None</option>
+              {models
+                .filter((m) => m.model_name !== "auto" && m.supports_vision)
+                .map((m) => (
+                  <option key={m.id} value={m.model_name}>
+                    {m.model_name}
+                  </option>
+                ))}
+            </select>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="vision_max_images">Max images per request</Label>
+            <Input
+              id="vision_max_images"
+              type="number"
+              value={maxImages}
+              onChange={(e) => setMaxImages(e.target.value)}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="vision_timeout_ms">Describe timeout (ms)</Label>
+            <Input
+              id="vision_timeout_ms"
+              type="number"
+              value={timeout}
+              onChange={(e) => setTimeoutMs(e.target.value)}
+            />
+          </div>
+        </div>
+        <div className="space-y-1">
+          <Label htmlFor="vision_describe_prompt">Describe prompt</Label>
+          <textarea
+            id="vision_describe_prompt"
+            value={prompt}
+            onChange={(e) => setPrompt(e.target.value)}
+            rows={3}
+            className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+            placeholder="Describe this image in detail..."
+          />
+        </div>
+        <Button onClick={save} disabled={pending}>
+          {pending ? "Saving..." : "Save boons"}
         </Button>
         {status && (
           <p

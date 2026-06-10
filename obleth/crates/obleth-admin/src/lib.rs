@@ -27,7 +27,7 @@ use obleth_config::{
     hash_api_key, ApiKey, FairshareGroup, McpServer, ModelEndpoint, ModelRoute, ResolvedKey,
     ResolvedMcpServer, ResolvedModel, Tenant,
 };
-use obleth_config::{AlertSettings, AutoRouterSettings, EmailSettings};
+use obleth_config::{AlertSettings, AutoRouterSettings, BoonSettings, EmailSettings, VisionBoonSettings};
 use obleth_fairshare::{FairShare, StaticCapacity, Stats};
 use obleth_redis::RedisStore;
 use obleth_store::{AuditEntry, Store};
@@ -174,6 +174,10 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/api/v1/settings/auto-router",
             get(get_auto_router_settings).put(put_auto_router_settings),
+        )
+        .route(
+            "/api/v1/settings/boons",
+            get(get_boon_settings).put(put_boon_settings),
         )
         .route(
             "/api/v1/settings/usage-retention",
@@ -394,7 +398,11 @@ pub struct CreateModel {
     pub supports_response_schema: Option<bool>,
     pub supports_tool_choice: Option<bool>,
     #[serde(default)]
+    pub supports_vision: Option<bool>,
+    #[serde(default)]
     pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub boons: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -420,9 +428,13 @@ pub struct UpdateModel {
     pub supports_system_messages: Option<bool>,
     pub supports_response_schema: Option<bool>,
     pub supports_tool_choice: Option<bool>,
+    #[serde(default)]
+    pub supports_vision: Option<bool>,
     pub enabled: Option<bool>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
+    #[serde(default)]
+    pub boons: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1122,6 +1134,110 @@ async fn put_auto_router_settings(
         )
         .await?;
     Ok(Json(AutoRouterSettingsView::from_settings(&settings)))
+}
+
+/// View of the persisted model-"boons" settings. Flattened to the vision boon's
+/// fields since it is currently the only boon.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BoonSettingsView {
+    pub vision_enabled: bool,
+    pub vision_fallback_model: Option<String>,
+    pub vision_describe_prompt: String,
+    pub vision_max_images: u32,
+    pub vision_timeout_ms: u64,
+}
+
+impl BoonSettingsView {
+    fn from_settings(s: &BoonSettings) -> Self {
+        BoonSettingsView {
+            vision_enabled: s.vision.enabled,
+            vision_fallback_model: s.vision.fallback_model.clone(),
+            vision_describe_prompt: s.vision.describe_prompt.clone(),
+            vision_max_images: s.vision.max_images,
+            vision_timeout_ms: s.vision.timeout_ms,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateBoonSettings {
+    #[serde(default)]
+    pub vision_enabled: Option<bool>,
+    /// `model_name` of the vision describer model. Empty string clears it.
+    #[serde(default)]
+    pub vision_fallback_model: Option<String>,
+    #[serde(default)]
+    pub vision_describe_prompt: Option<String>,
+    #[serde(default)]
+    pub vision_max_images: Option<u32>,
+    #[serde(default)]
+    pub vision_timeout_ms: Option<u64>,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/settings/boons", tag = "settings",
+    responses((status = 200, body = BoonSettingsView))
+)]
+async fn get_boon_settings(State(state): State<AdminState>) -> Result<Json<BoonSettingsView>> {
+    let settings = state.store.get_boon_settings().await?.unwrap_or_default();
+    Ok(Json(BoonSettingsView::from_settings(&settings)))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/settings/boons", tag = "settings",
+    request_body = UpdateBoonSettings,
+    responses((status = 200, body = BoonSettingsView))
+)]
+async fn put_boon_settings(
+    State(state): State<AdminState>,
+    Json(body): Json<UpdateBoonSettings>,
+) -> Result<Json<BoonSettingsView>> {
+    let existing = state.store.get_boon_settings().await?.unwrap_or_default();
+
+    let fallback_model = match body.vision_fallback_model.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.vision.fallback_model.clone(),
+    };
+
+    let describe_prompt = match body.vision_describe_prompt.as_deref().map(str::trim) {
+        Some("") | None => existing.vision.describe_prompt.clone(),
+        Some(p) => p.to_string(),
+    };
+
+    let settings = BoonSettings {
+        vision: VisionBoonSettings {
+            enabled: body.vision_enabled.unwrap_or(existing.vision.enabled),
+            fallback_model,
+            describe_prompt,
+            max_images: body
+                .vision_max_images
+                .filter(|n| *n > 0)
+                .unwrap_or(existing.vision.max_images),
+            timeout_ms: body
+                .vision_timeout_ms
+                .filter(|ms| *ms > 0)
+                .unwrap_or(existing.vision.timeout_ms),
+        },
+    };
+
+    state.store.put_boon_settings(&settings).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "set_boon_settings",
+            "settings",
+            "boons",
+            serde_json::json!({
+                "vision_enabled": settings.vision.enabled,
+                "vision_fallback_model": settings.vision.fallback_model,
+                "vision_max_images": settings.vision.max_images,
+                "vision_timeout_ms": settings.vision.timeout_ms,
+            }),
+        )
+        .await?;
+    Ok(Json(BoonSettingsView::from_settings(&settings)))
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1880,7 +1996,9 @@ async fn create_model(
             body.supports_system_messages.unwrap_or(true),
             body.supports_response_schema.unwrap_or(false),
             body.supports_tool_choice.unwrap_or(false),
+            body.supports_vision.unwrap_or(false),
             &body.tags.clone().unwrap_or_default(),
+            &body.boons.clone().unwrap_or_default(),
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -1976,8 +2094,10 @@ async fn update_model(
                 .unwrap_or(existing.supports_response_schema),
             body.supports_tool_choice
                 .unwrap_or(existing.supports_tool_choice),
+            body.supports_vision.unwrap_or(existing.supports_vision),
             body.enabled.unwrap_or(existing.enabled),
             &body.tags.clone().unwrap_or_else(|| existing.tags.clone()),
+            &body.boons.clone().unwrap_or_else(|| existing.boons.clone()),
         )
         .await?;
     sync_model(&state, &model).await?;
@@ -2605,7 +2725,9 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         supports_system_messages: model.supports_system_messages,
         supports_response_schema: model.supports_response_schema,
         supports_tool_choice: model.supports_tool_choice,
+        supports_vision: model.supports_vision,
         tags: model.tags.clone(),
+        boons: model.boons.clone(),
         request_timeout_secs: model.request_timeout_secs,
         max_retries: model.max_retries,
         retry_backoff_ms: model.retry_backoff_ms,

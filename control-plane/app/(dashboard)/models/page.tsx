@@ -16,21 +16,26 @@ export default async function ModelsPage() {
     safe<CacheStats | undefined>(obleth.cacheStats(), undefined),
     safe<ModelHealthSummary[]>(obleth.modelHealth(), []),
   ]);
+  // Fetch each model's health detail and endpoint list concurrently in a
+  // single fan-out, so the page waits for the slowest request once instead of
+  // two sequential per-model batches.
+  const perModel = await Promise.all(
+    models.map(async (model) => {
+      const [detail, endpointList] = await Promise.all([
+        safe<ModelHealthDetail | undefined>(
+          obleth.modelHealthDetail(model.id),
+          undefined,
+        ),
+        safe<ModelEndpoint[]>(obleth.listModelEndpoints(model.id), []),
+      ]);
+      return [model.id, detail, endpointList] as const;
+    }),
+  );
   const healthDetails = Object.fromEntries(
-    await Promise.all(
-      models.map(async (model) => {
-        const detail = await safe<ModelHealthDetail | undefined>(obleth.modelHealthDetail(model.id), undefined);
-        return [model.id, detail] as const;
-      }),
-    ),
+    perModel.map(([id, detail]) => [id, detail]),
   );
   const endpoints = Object.fromEntries(
-    await Promise.all(
-      models.map(async (model) => {
-        const list = await safe<ModelEndpoint[]>(obleth.listModelEndpoints(model.id), []);
-        return [model.id, list] as const;
-      }),
-    ),
+    perModel.map(([id, , endpointList]) => [id, endpointList]),
   );
 
   return (
@@ -38,7 +43,8 @@ export default async function ModelsPage() {
       <div>
         <h1 className="text-lg font-semibold tracking-tight">Models</h1>
         <p className="text-sm text-muted-foreground">
-          Route client model names to upstream inference endpoints. Pod selection remains with Aibrix.
+          Route client model names to upstream inference endpoints. Pod
+          selection remains with Aibrix.
         </p>
       </div>
       <ModelManager

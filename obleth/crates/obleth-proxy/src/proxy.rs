@@ -88,11 +88,11 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     }
 
     // ---- read + parse body ----
-    let body_bytes = match axum::body::to_bytes(body, BODY_LIMIT).await {
+    let mut body_bytes = match axum::body::to_bytes(body, BODY_LIMIT).await {
         Ok(b) => b,
         Err(_) => return error_json(StatusCode::PAYLOAD_TOO_LARGE, "request body too large"),
     };
-    let json: serde_json::Value =
+    let mut json: serde_json::Value =
         serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
     // Audio transcription/translation send the model as a `multipart/form-data`
     // field alongside the uploaded file, not as JSON. Parse the fields once so
@@ -140,13 +140,17 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         request_type: request_type_for_path(&path),
     };
 
+    // Cost estimate, computed once per request body. Re-estimated below only
+    // when a boon actually rewrites the body; the later upstream model-name
+    // swap does not affect it (the tokenizer ignores the `model` field).
+    let mut est = state.tokenizer.estimate_request(&json);
+
     // ---- auto model selection ----
     // `model: "auto"` is resolved to a concrete registered model from request
     // shape (estimated context size, required capabilities) and live load. From
     // here on, everything downstream — admission, budgets, caching, telemetry,
     // upstream dispatch — sees the concrete model as if the client named it.
     let route = if model == crate::router::AUTO_MODEL_NAME {
-        let est = state.tokenizer.estimate_request(&json);
         let max_tokens = json.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
         let features = crate::router::RequestFeatures::from_request(
             &json,
@@ -154,12 +158,8 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             max_tokens,
         );
         let candidates = state.model_registry.load();
-        let busyness = state
-            .fairshare
-            .snapshot()
-            .await
-            .map(|s| s.model_in_flight)
-            .unwrap_or_default();
+        // Cheap shared-map read; the full scheduler snapshot is dashboard-only.
+        let busyness = state.fairshare.model_load();
         let allowed = if resolved.internal {
             None
         } else {
@@ -212,8 +212,33 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             }
         }
     }
+
+    // ---- model boons (gateway-granted capabilities) ----
+    // e.g. the vision boon rewrites image content into text descriptions for
+    // models that lack native vision. Runs before estimation/caching/dispatch so
+    // every downstream stage sees the rewritten body. Fail-open: on any error
+    // the body is left unchanged.
+    if state
+        .boons
+        .enrich_request(
+            &state,
+            route.as_deref(),
+            &resolved,
+            &req_meta.session_id,
+            &mut json,
+        )
+        .await
+    {
+        match serde_json::to_vec(&json) {
+            Ok(bytes) => body_bytes = Bytes::from(bytes),
+            Err(e) => tracing::warn!(error = %e, "failed to re-serialize boon-rewritten body"),
+        }
+        // The body changed (e.g. images became text descriptions); the
+        // admission estimate must reflect what is actually sent upstream.
+        est = state.tokenizer.estimate_request(&json);
+    }
+
     let effective_weight = effective_admission_weight(resolved.weight, route.as_deref());
-    let mut est = state.tokenizer.estimate_request(&json);
 
     // Cost rates and per-request modality surcharge captured up front so every
     // `finalize` path (cache hit, rejection, upstream error, streamed success)
@@ -308,21 +333,34 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
 
     let send_bytes = body_bytes;
 
-    // ---- token budget reserve (atomic, cross-pod) ----
+    // ---- token budget reserve + cumulative term gate (atomic, cross-pod) ----
+    // One Redis round trip covers both checks. The term gate (Phase 3: caps on
+    // lifetime/monthly/term usage) runs first inside the script, so a
+    // term-exhausted request never reserves per-minute tokens it has no
+    // completion path to refund.
     let capacity = resolved.tokens_per_minute.max(1);
+    let term_period = term_period_key(&resolved, chrono::Utc::now());
+    let term_gate = term_period
+        .as_deref()
+        .map(|period_key| obleth_redis::TermGate {
+            period_key,
+            budget_tokens: resolved.budget_tokens,
+            budget_cost_usd: resolved.budget_cost_usd,
+        });
     match state
         .redis
-        .reserve_budget(
+        .reserve_budget_with_term(
             &resolved.tenant_id,
             capacity,
             resolved.tokens_per_minute,
             est.total(),
+            term_gate,
         )
         .instrument(tracing::info_span!("reserve_budget"))
         .await
     {
-        Ok((true, _)) => {}
-        Ok((false, _)) => {
+        Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {}
+        Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {
             drop(permit);
             finalize(
                 &state,
@@ -341,6 +379,39 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 0.0,
             );
             return error_json(StatusCode::TOO_MANY_REQUESTS, "token budget exceeded");
+        }
+        Ok(obleth_redis::ReserveOutcome::TermExhausted {
+            used_tokens,
+            used_cost,
+        }) => {
+            drop(permit);
+            state.alerts.issue(
+                format!("term_budget_exhausted:{}", resolved.tenant_id),
+                "Tenant term budget exhausted",
+                format!(
+                    "tenant `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
+                    resolved.tenant_name,
+                    resolved.budget_tokens,
+                    resolved.budget_cost_usd,
+                ),
+            );
+            finalize(
+                &state,
+                &resolved,
+                &req_meta,
+                &model,
+                Admission::Rejected,
+                est,
+                0,
+                0,
+                queue_wait_ms,
+                0,
+                0,
+                403,
+                cache_status_label,
+                0.0,
+            );
+            return error_json(StatusCode::FORBIDDEN, "tenant term budget exhausted");
         }
         Err(e) => {
             if !state.fail_open {
@@ -364,59 +435,6 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                     resolved.tenant_name
                 ),
             );
-        }
-    }
-
-    // ---- cumulative term budget (Phase 3): caps on lifetime/monthly/term usage ----
-    let term_period = term_period_key(&resolved, chrono::Utc::now());
-    if let Some(period) = &term_period {
-        match state
-            .redis
-            .term_usage_read(&resolved.tenant_id, period)
-            .await
-        {
-            Ok((used_tokens, used_cost)) => {
-                let token_exhausted = resolved.budget_tokens.is_some_and(|cap| used_tokens >= cap);
-                let cost_exhausted = resolved.budget_cost_usd.is_some_and(|cap| used_cost >= cap);
-                if token_exhausted || cost_exhausted {
-                    drop(permit);
-                    state.alerts.issue(
-                        format!("term_budget_exhausted:{}", resolved.tenant_id),
-                        "Tenant term budget exhausted",
-                        format!(
-                            "tenant `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
-                            resolved.tenant_name,
-                            resolved.budget_tokens,
-                            resolved.budget_cost_usd,
-                        ),
-                    );
-                    finalize(
-                        &state,
-                        &resolved,
-                        &req_meta,
-                        &model,
-                        Admission::Rejected,
-                        est,
-                        0,
-                        0,
-                        queue_wait_ms,
-                        0,
-                        0,
-                        403,
-                        cache_status_label,
-                        0.0,
-                    );
-                    return error_json(StatusCode::FORBIDDEN, "tenant term budget exhausted");
-                }
-            }
-            Err(e) => {
-                // Treat read failure like the per-minute bucket: fail open unless configured closed.
-                if !state.fail_open {
-                    drop(permit);
-                    return error_json(StatusCode::SERVICE_UNAVAILABLE, "budget check failed");
-                }
-                tracing::warn!(error = %e, "term usage read failed; failing open");
-            }
         }
     }
 
@@ -451,19 +469,8 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // Multipart bodies cannot be replayed, so they get a single attempt against
     // the first target only.
     let replayable = multipart_fields.is_none();
-    let prepared_body: Option<Bytes> = if replayable {
-        let (_, mut sb, upstream_model) =
-            prepare_upstream(route.as_deref(), &state.upstream_base, &model, &json, send_bytes);
-        if let Some(upstream_model) = upstream_model {
-            if let Ok(bytes) = serde_json::to_vec(&upstream_model) {
-                sb = Bytes::from(bytes);
-                est = state.tokenizer.estimate_request(&upstream_model);
-            }
-        }
-        Some(sb)
-    } else {
-        None
-    };
+    let prepared_body: Option<Bytes> =
+        replayable.then(|| prepare_upstream_body(route.as_deref(), &mut json, send_bytes));
 
     // TTFT is measured from the moment we dispatch the *successful* upstream
     // request, *after* fairshare admission. Time spent waiting in the queue is
@@ -650,7 +657,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         let mut byte_stream = upstream.bytes_stream();
         let mut first = true;
         let mut ttft_ms = 0u32;
-        let mut tail = String::new();
+        let mut tail: Vec<u8> = Vec::with_capacity(TAIL_CAP.min(4 * 1024));
         let mut full: Vec<u8> = Vec::new();
         let mut cacheable = store_in_cache.is_some();
 
@@ -689,17 +696,29 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             }
         }
 
-        let (input_tokens, output_tokens) = extract_usage(&tail)
+        // The upstream stream has fully drained: the request no longer occupies
+        // upstream capacity, so release the fairshare slot *before* the Redis
+        // bookkeeping below. Cache stores and budget reconciliation are
+        // accounting, not occupancy; holding the permit through them would
+        // shrink effective concurrency whenever Redis is slow.
+        drop(permit);
+
+        let (input_tokens, output_tokens) = extract_usage(&String::from_utf8_lossy(&tail))
             .unwrap_or((est.input_tokens, est.estimated_output_tokens));
         let total_ms = request_start.elapsed().as_millis() as u32;
 
         // store the full response for identical future requests
         if cacheable && status_code == 200 {
             if let Some(ck) = &store_in_cache {
+                // Take ownership of the buffer instead of copying it; the
+                // lossy re-encode only runs for invalid UTF-8 (never for the
+                // JSON/SSE bodies this cache is meant for).
+                let body = String::from_utf8(std::mem::take(&mut full))
+                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
                 let cached = obleth_config::CachedResponse {
                     status: status_code,
                     content_type: content_type_str.clone(),
-                    body: String::from_utf8_lossy(&full).into_owned(),
+                    body,
                     input_tokens,
                     output_tokens,
                 };
@@ -794,9 +813,6 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             cost_usd,
         );
         stream_state.metrics.total_ms.observe(total_ms as f64);
-
-        // permit released here, after the full stream has drained
-        drop(permit);
     };
 
     let mut builder = Response::builder().status(status_code);
@@ -925,7 +941,7 @@ fn message_text(content: Option<&serde_json::Value>) -> String {
     }
 }
 
-async fn resolve_model(state: &AppState, name: &str) -> Option<Arc<ResolvedModel>> {
+pub(crate) async fn resolve_model(state: &AppState, name: &str) -> Option<Arc<ResolvedModel>> {
     if let Some(r) = state.model_cache.get(name).await {
         return Some(r);
     }
@@ -1190,30 +1206,28 @@ fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value
     }
 }
 
-fn prepare_upstream(
+/// Swap the body's `model` field for the upstream model name, mutating the
+/// already-parsed JSON in place (no deep clone) and re-serializing once.
+/// Bodies that are not JSON objects (e.g. multipart audio uploads, handled
+/// separately) pass through untouched, as does everything when the model has
+/// no registered route. The token estimate is unaffected by this rewrite —
+/// the tokenizer never reads the `model` field.
+fn prepare_upstream_body(
     route: Option<&ResolvedModel>,
-    default_base: &str,
-    _client_model: &str,
-    json: &serde_json::Value,
+    json: &mut serde_json::Value,
     body: Bytes,
-) -> (String, Bytes, Option<serde_json::Value>) {
+) -> Bytes {
     let Some(route) = route else {
-        return (default_base.to_string(), body, None);
+        return body;
     };
-    // Only rewrite when the original body is a JSON object we can edit; non-JSON
-    // bodies (e.g. multipart audio uploads) are handled separately and must pass
-    // through untouched.
-    if !json.is_object() {
-        return (route.api_base.clone(), body, None);
-    }
-    let mut upstream_json = json.clone();
-    if let Some(obj) = upstream_json.as_object_mut() {
-        obj.insert(
-            "model".into(),
-            serde_json::Value::String(route.upstream_model.clone()),
-        );
-    }
-    (route.api_base.clone(), body, Some(upstream_json))
+    let Some(obj) = json.as_object_mut() else {
+        return body;
+    };
+    obj.insert(
+        "model".into(),
+        serde_json::Value::String(route.upstream_model.clone()),
+    );
+    serde_json::to_vec(&*json).map(Bytes::from).unwrap_or(body)
 }
 
 /// One resolved upstream target: a base URL plus an optional bearer key.
@@ -1380,16 +1394,23 @@ pub(crate) fn forward_headers(headers: &HeaderMap) -> HeaderMap {
     out
 }
 
-fn append_tail(tail: &mut String, chunk: &[u8]) {
-    tail.push_str(&String::from_utf8_lossy(chunk));
-    if tail.len() > TAIL_CAP {
-        let cut = tail.len() - TAIL_CAP;
-        // keep the last TAIL_CAP bytes on a char boundary
-        let boundary = (cut..tail.len())
-            .find(|i| tail.is_char_boundary(*i))
-            .unwrap_or(tail.len());
-        *tail = tail[boundary..].to_string();
+/// Append a chunk to the rolling response tail, keeping only the last
+/// `TAIL_CAP` bytes. Works on raw bytes with `copy_within` so a long stream
+/// never re-allocates per chunk; the one UTF-8 conversion happens at stream
+/// end (a partial char at the buffer start is replaced lossily there, which is
+/// harmless — `extract_usage` only scans for ASCII JSON keys).
+fn append_tail(tail: &mut Vec<u8>, chunk: &[u8]) {
+    if chunk.len() >= TAIL_CAP {
+        tail.clear();
+        tail.extend_from_slice(&chunk[chunk.len() - TAIL_CAP..]);
+        return;
     }
+    let overflow = (tail.len() + chunk.len()).saturating_sub(TAIL_CAP);
+    if overflow > 0 {
+        tail.copy_within(overflow.., 0);
+        tail.truncate(tail.len() - overflow);
+    }
+    tail.extend_from_slice(chunk);
 }
 
 /// Pull `prompt_tokens` / `completion_tokens` out of the (possibly streamed)
@@ -1774,13 +1795,43 @@ mod tests {
             supports_system_messages: true,
             supports_response_schema: true,
             supports_tool_choice: true,
+            supports_vision: false,
             tags: Vec::new(),
+            boons: Vec::new(),
             request_timeout_secs: None,
             max_retries: 0,
             retry_backoff_ms: obleth_config::DEFAULT_RETRY_BACKOFF_MS,
             endpoint_selection_mode: obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
             endpoints,
         }
+    }
+
+    #[test]
+    fn append_tail_keeps_last_cap_bytes() {
+        use super::{append_tail, extract_usage, TAIL_CAP};
+        let mut tail = Vec::new();
+        // Small chunks accumulate verbatim.
+        append_tail(&mut tail, b"hello ");
+        append_tail(&mut tail, b"world");
+        assert_eq!(tail, b"hello world");
+        // Filling past the cap keeps only the newest TAIL_CAP bytes.
+        append_tail(&mut tail, &vec![b'x'; TAIL_CAP]);
+        assert_eq!(tail.len(), TAIL_CAP);
+        assert!(tail.iter().all(|b| *b == b'x'));
+        // A usage blob appended at the end survives intact and parses.
+        append_tail(
+            &mut tail,
+            br#"{"usage":{"prompt_tokens":12,"completion_tokens":34}}"#,
+        );
+        assert_eq!(tail.len(), TAIL_CAP);
+        assert_eq!(
+            extract_usage(&String::from_utf8_lossy(&tail)),
+            Some((12, 34))
+        );
+        // A chunk larger than the cap replaces the buffer with its own tail.
+        append_tail(&mut tail, &vec![b'y'; TAIL_CAP * 2]);
+        assert_eq!(tail.len(), TAIL_CAP);
+        assert!(tail.iter().all(|b| *b == b'y'));
     }
 
     #[test]

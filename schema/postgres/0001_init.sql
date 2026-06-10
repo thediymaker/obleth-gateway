@@ -135,6 +135,12 @@ create table if not exists models (
     supports_system_messages    boolean not null default true,
     supports_response_schema    boolean not null default false,
     supports_tool_choice        boolean not null default false,
+    -- native image-input capability. When false, the gateway's vision boon can
+    -- relay images to a designated vision model and inject text descriptions.
+    supports_vision             boolean not null default false,
+    -- gateway boons opted into for this model (fixed vocabulary, JSON array).
+    -- A boon grants a capability the model lacks natively (e.g. `vision`).
+    boons                       jsonb not null default '[]'::jsonb,
     enabled                     boolean not null default true,
     -- exact-match response caching; opt-in with operator-controlled TTL
     cache_enabled               boolean not null default false,
@@ -164,6 +170,10 @@ create index if not exists models_enabled_idx on models (enabled) where enabled 
 -- Routing tags for the `auto` router (fixed vocabulary, stored as a JSON array
 -- so adding tags needs no migration). Added via if-not-exists for upgrades.
 alter table models add column if not exists tags jsonb not null default '[]'::jsonb;
+
+-- Gateway boons opted into per model (fixed vocabulary, JSON array). Added via
+-- if-not-exists for upgrades.
+alter table models add column if not exists boons jsonb not null default '[]'::jsonb;
 
 -- Capacity tuning mode (added via if-not-exists for upgrades). 'static' keeps
 -- the operator-set max_in_flight; 'tuned' lets auto-tune set it from a ramp
@@ -205,6 +215,11 @@ do $$ begin
             check (endpoint_selection_mode in ('failover', 'load_balance'));
     end if;
 end $$;
+
+-- Native image-input capability (added via if-not-exists for upgrades). When
+-- false, the gateway's vision boon relays images to a designated vision model
+-- and injects text descriptions before forwarding to this model.
+alter table models add column if not exists supports_vision boolean not null default false;
 
 create index if not exists models_health_due_idx
     on models (health_next_check_at)

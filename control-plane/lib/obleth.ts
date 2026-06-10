@@ -81,6 +81,7 @@ export interface ModelRoute {
   supports_system_messages: boolean;
   supports_response_schema: boolean;
   supports_tool_choice: boolean;
+  supports_vision: boolean;
   enabled: boolean;
   cache_enabled: boolean;
   cache_ttl_secs: number;
@@ -89,6 +90,7 @@ export interface ModelRoute {
   retry_backoff_ms: number;
   endpoint_selection_mode: string;
   tags: string[];
+  boons: string[];
   created_at: string;
   updated_at: string;
 }
@@ -343,7 +345,12 @@ export interface CompactUsageResult {
   partitions_dropped: number;
 }
 
-export type UsageDailyGroupBy = "day" | "tenant" | "key" | "model" | "key_model";
+export type UsageDailyGroupBy =
+  | "day"
+  | "tenant"
+  | "key"
+  | "model"
+  | "key_model";
 
 export interface UsageDailyParams {
   startDay: string;
@@ -468,6 +475,22 @@ export interface UpdateAutoRouterSettings {
   classifier_timeout_ms?: number;
 }
 
+export interface BoonSettingsView {
+  vision_enabled: boolean;
+  vision_fallback_model: string | null;
+  vision_describe_prompt: string;
+  vision_max_images: number;
+  vision_timeout_ms: number;
+}
+
+export interface UpdateBoonSettings {
+  vision_enabled?: boolean;
+  vision_fallback_model?: string | null;
+  vision_describe_prompt?: string;
+  vision_max_images?: number;
+  vision_timeout_ms?: number;
+}
+
 export interface ChannelResult {
   channel: string;
   ok: boolean;
@@ -524,7 +547,11 @@ async function api<T>(path: string, init?: ApiInit): Promise<T> {
     } catch {
       // Non-JSON body; fall back to the raw text.
     }
-    throw new OblethApiError(res.status, message || `request failed with status ${res.status}`, path);
+    throw new OblethApiError(
+      res.status,
+      message || `request failed with status ${res.status}`,
+      path,
+    );
   }
   if (res.status === 204) return undefined as T;
   return (await res.json()) as T;
@@ -539,8 +566,24 @@ function qs(params: Record<string, string | number | undefined>) {
   return s ? `?${s}` : "";
 }
 
+// The slow-changing entity lists are opted into Next's Data Cache with a short
+// revalidate window plus a tag. Every mutating server action calls
+// `revalidateTag` for the lists it changes, so dashboards see writes
+// immediately while auto-refresh polling stops re-fetching unchanged lists
+// from the admin API on every tick. The window only bounds staleness for
+// writes made outside the control plane (e.g. direct admin-API calls).
+const LIST_REVALIDATE_SECS = 30;
+export const CACHE_TAGS = {
+  tenants: "tenants",
+  keys: "keys",
+  models: "models",
+} as const;
+
 export const obleth = {
-  listTenants: () => api<Tenant[]>("/tenants"),
+  listTenants: () =>
+    api<Tenant[]>("/tenants", {
+      next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.tenants] },
+    }),
   createTenant: (body: {
     name: string;
     weight?: number;
@@ -548,8 +591,15 @@ export const obleth = {
     max_in_flight?: number | null;
   }) => api<Tenant>("/tenants", { method: "POST", body: JSON.stringify(body) }),
   setWeight: (id: string, weight: number) =>
-    api<Tenant>(`/tenants/${id}/weight`, { method: "PATCH", body: JSON.stringify({ weight }) }),
-  setQuota: (id: string, tokens_per_minute: number, max_in_flight: number | null) =>
+    api<Tenant>(`/tenants/${id}/weight`, {
+      method: "PATCH",
+      body: JSON.stringify({ weight }),
+    }),
+  setQuota: (
+    id: string,
+    tokens_per_minute: number,
+    max_in_flight: number | null,
+  ) =>
     api<Tenant>(`/tenants/${id}/quota`, {
       method: "PUT",
       body: JSON.stringify({ tokens_per_minute, max_in_flight }),
@@ -562,9 +612,16 @@ export const obleth = {
       organization?: string;
       contact_email?: string;
     },
-  ) => api<Tenant>(`/tenants/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  ) =>
+    api<Tenant>(`/tenants/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
   setTenantStatus: (id: string, status: string) =>
-    api<Tenant>(`/tenants/${id}/status`, { method: "PATCH", body: JSON.stringify({ status }) }),
+    api<Tenant>(`/tenants/${id}/status`, {
+      method: "PATCH",
+      body: JSON.stringify({ status }),
+    }),
   setTenantSchedule: (
     id: string,
     body: {
@@ -596,25 +653,47 @@ export const obleth = {
       method: "PATCH",
       body: JSON.stringify({ allowed_models }),
     }),
-  deleteTenant: (id: string) => api<void>(`/tenants/${id}`, { method: "DELETE" }),
+  deleteTenant: (id: string) =>
+    api<void>(`/tenants/${id}`, { method: "DELETE" }),
   listKeys: (tenantId?: string) =>
-    api<ApiKey[]>(`/keys${tenantId ? `?tenant_id=${tenantId}` : ""}`),
+    api<ApiKey[]>(`/keys${tenantId ? `?tenant_id=${tenantId}` : ""}`, {
+      next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.keys] },
+    }),
   createKey: (tenantId: string, name: string) =>
     api<CreatedKey>(`/tenants/${tenantId}/keys`, {
       method: "POST",
       body: JSON.stringify({ name }),
     }),
   setKeyDisabled: (id: string, disabled: boolean) =>
-    api<void>(`/keys/${id}/disabled`, { method: "PUT", body: JSON.stringify({ disabled }) }),
+    api<void>(`/keys/${id}/disabled`, {
+      method: "PUT",
+      body: JSON.stringify({ disabled }),
+    }),
   deleteKey: (id: string) => api<void>(`/keys/${id}`, { method: "DELETE" }),
-  listModels: () => api<ModelRoute[]>("/models"),
-  createModel: (body: Partial<ModelRoute> & { model_name: string; upstream_model: string; api_base: string }) =>
+  listModels: () =>
+    api<ModelRoute[]>("/models", {
+      next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.models] },
+    }),
+  createModel: (
+    body: Partial<ModelRoute> & {
+      model_name: string;
+      upstream_model: string;
+      api_base: string;
+    },
+  ) =>
     api<ModelRoute>("/models", { method: "POST", body: JSON.stringify(body) }),
-  updateModel: (id: string, body: Partial<ModelRoute> & { upstream_model: string; api_base: string }) =>
-    api<ModelRoute>(`/models/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  updateModel: (
+    id: string,
+    body: Partial<ModelRoute> & { upstream_model: string; api_base: string },
+  ) =>
+    api<ModelRoute>(`/models/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
   deleteModel: (id: string) => api<void>(`/models/${id}`, { method: "DELETE" }),
   modelHealth: () => api<ModelHealthSummary[]>("/models/health"),
-  modelHealthDetail: (id: string) => api<ModelHealthDetail>(`/models/${id}/health`),
+  modelHealthDetail: (id: string) =>
+    api<ModelHealthDetail>(`/models/${id}/health`),
   checkModelHealth: (id: string) =>
     api<ModelHealthDetail>(`/models/${id}/health/check`, { method: "POST" }),
   checkAllModelHealth: () =>
@@ -641,7 +720,11 @@ export const obleth = {
     }),
   autotuneModel: (
     id: string,
-    opts?: { workload?: AutotuneWorkload; latency_headroom?: number; replicas?: number }
+    opts?: {
+      workload?: AutotuneWorkload;
+      latency_headroom?: number;
+      replicas?: number;
+    },
   ) =>
     api<AutotuneReport>(`/models/${id}/autotune`, {
       method: "POST",
@@ -652,7 +735,11 @@ export const obleth = {
       method: "POST",
       body: JSON.stringify({ max_in_flight }),
     }),
-  setModelCache: (id: string, cache_enabled: boolean, cache_ttl_secs?: number) =>
+  setModelCache: (
+    id: string,
+    cache_enabled: boolean,
+    cache_ttl_secs?: number,
+  ) =>
     api<ModelRoute>(`/models/${id}/cache`, {
       method: "PUT",
       body: JSON.stringify({ cache_enabled, cache_ttl_secs }),
@@ -705,21 +792,37 @@ export const obleth = {
     }),
   deleteModelEndpoint: (id: string, endpointId: string) =>
     api<void>(`/models/${id}/endpoints/${endpointId}`, { method: "DELETE" }),
-  cacheStats: (sinceMs?: number) => api<CacheStats>(`/usage/cache${qs({ since_ms: sinceMs })}`),
+  cacheStats: (sinceMs?: number) =>
+    api<CacheStats>(`/usage/cache${qs({ since_ms: sinceMs })}`),
   listMcpServers: () => api<McpServer[]>("/mcp-servers"),
-  createMcpServer: (body: { name: string; upstream_url: string; auth_header?: string }) =>
-    api<McpServer>("/mcp-servers", { method: "POST", body: JSON.stringify(body) }),
+  createMcpServer: (body: {
+    name: string;
+    upstream_url: string;
+    auth_header?: string;
+  }) =>
+    api<McpServer>("/mcp-servers", {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
   updateMcpServer: (
     id: string,
     body: { upstream_url: string; auth_header?: string; enabled?: boolean },
-  ) => api<McpServer>(`/mcp-servers/${id}`, { method: "PUT", body: JSON.stringify(body) }),
-  deleteMcpServer: (id: string) => api<void>(`/mcp-servers/${id}`, { method: "DELETE" }),
-  usage: (sinceMs?: number) => api<UsageAgg[]>(`/usage${qs({ since_ms: sinceMs })}`),
+  ) =>
+    api<McpServer>(`/mcp-servers/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  deleteMcpServer: (id: string) =>
+    api<void>(`/mcp-servers/${id}`, { method: "DELETE" }),
+  usage: (sinceMs?: number) =>
+    api<UsageAgg[]>(`/usage${qs({ since_ms: sinceMs })}`),
   usageByKey: (sinceMs?: number, limit?: number) =>
     api<UsageKeyAgg[]>(`/usage/keys${qs({ since_ms: sinceMs, limit })}`),
   keyUsage: (id: string, sinceMs?: number) =>
     api<KeyUsageSummary>(`/keys/${id}/usage${qs({ since_ms: sinceMs })}`),
-  usageKeysSummary: (params: { tenantId?: string; sinceMs?: number; limit?: number } = {}) =>
+  usageKeysSummary: (
+    params: { tenantId?: string; sinceMs?: number; limit?: number } = {},
+  ) =>
     api<KeyUsageSummary[]>(
       `/usage/keys/summary${qs({
         tenant_id: params.tenantId,
@@ -728,7 +831,9 @@ export const obleth = {
       })}`,
     ),
   /** Bulk per-key summary with automatic fallback to `/usage/keys` while summary is rolling out. */
-  keyUsageForDashboard: async (params: { sinceMs?: number; limit?: number } = {}) => {
+  keyUsageForDashboard: async (
+    params: { sinceMs?: number; limit?: number } = {},
+  ) => {
     try {
       return await api<KeyUsageSummary[]>(
         `/usage/keys/summary${qs({ since_ms: params.sinceMs, limit: params.limit })}`,
@@ -751,12 +856,18 @@ export const obleth = {
       }));
     }
   },
-  usageByModel: (sinceMs?: number) => api<UsageModelAgg[]>(`/usage/models${qs({ since_ms: sinceMs })}`),
+  usageByModel: (sinceMs?: number) =>
+    api<UsageModelAgg[]>(`/usage/models${qs({ since_ms: sinceMs })}`),
   usageSeries: (bucketMs = 300_000, sinceMs?: number) =>
-    api<UsageTimePoint[]>(`/usage/series${qs({ bucket_ms: bucketMs, since_ms: sinceMs })}`),
+    api<UsageTimePoint[]>(
+      `/usage/series${qs({ bucket_ms: bucketMs, since_ms: sinceMs })}`,
+    ),
   usageSeriesByTenant: (bucketMs = 10_000, sinceMs?: number) =>
-    api<TenantUsageTimePoint[]>(`/usage/series/tenants${qs({ bucket_ms: bucketMs, since_ms: sinceMs })}`),
-  costs: (sinceMs?: number) => api<CostAgg[]>(`/costs${qs({ since_ms: sinceMs })}`),
+    api<TenantUsageTimePoint[]>(
+      `/usage/series/tenants${qs({ bucket_ms: bucketMs, since_ms: sinceMs })}`,
+    ),
+  costs: (sinceMs?: number) =>
+    api<CostAgg[]>(`/costs${qs({ since_ms: sinceMs })}`),
   usageDaily: (params: UsageDailyParams) =>
     api<UsageDailyRow[]>(
       `/usage/daily${qs({
@@ -791,7 +902,8 @@ export const obleth = {
       method: "PUT",
       body: JSON.stringify({ days }),
     }),
-  compactUsage: () => api<CompactUsageResult>("/usage/compact", { method: "POST" }),
+  compactUsage: () =>
+    api<CompactUsageResult>("/usage/compact", { method: "POST" }),
   stats: () => api<LiveStats>("/stats"),
   fairshareLive: () => api<FairshareLiveView>("/fairshare/live"),
   audit: (limit = 100) => api<AuditEntry[]>(`/audit?limit=${limit}`),
@@ -807,10 +919,18 @@ export const obleth = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
-  testAlert: () => api<TestAlertResult>("/settings/alerts/test", { method: "POST" }),
-  getAutoRouterSettings: () => api<AutoRouterSettingsView>("/settings/auto-router"),
+  testAlert: () =>
+    api<TestAlertResult>("/settings/alerts/test", { method: "POST" }),
+  getAutoRouterSettings: () =>
+    api<AutoRouterSettingsView>("/settings/auto-router"),
   setAutoRouterSettings: (body: UpdateAutoRouterSettings) =>
     api<AutoRouterSettingsView>("/settings/auto-router", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  getBoonSettings: () => api<BoonSettingsView>("/settings/boons"),
+  setBoonSettings: (body: UpdateBoonSettings) =>
+    api<BoonSettingsView>("/settings/boons", {
       method: "PUT",
       body: JSON.stringify(body),
     }),

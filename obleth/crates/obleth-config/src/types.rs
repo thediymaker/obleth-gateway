@@ -248,6 +248,11 @@ pub struct ModelRoute {
     pub supports_system_messages: bool,
     pub supports_response_schema: bool,
     pub supports_tool_choice: bool,
+    /// Native image-input capability. When false, the gateway's vision boon can
+    /// relay images to a designated vision model and inject text descriptions
+    /// before forwarding the request to this model.
+    #[serde(default)]
+    pub supports_vision: bool,
     pub enabled: bool,
     /// When true, identical requests to this model are served from the response
     /// cache (exact-match on model + request body) instead of the upstream.
@@ -258,6 +263,11 @@ pub struct ModelRoute {
     /// prefers models whose tags match the request's classified intent.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Gateway boons enabled for this model from the fixed [`MODEL_BOONS`]
+    /// vocabulary. Boons grant capabilities the model lacks natively (e.g. the
+    /// `vision` boon relays images to a describer). Empty by default.
+    #[serde(default)]
+    pub boons: Vec<String>,
     /// Per-request upstream timeout in seconds. `None` falls back to the global
     /// `OBLETH_UPSTREAM_TIMEOUT_SECS` default.
     #[serde(default)]
@@ -362,9 +372,18 @@ pub struct ResolvedModel {
     pub supports_response_schema: bool,
     #[serde(default)]
     pub supports_tool_choice: bool,
+    /// Native image-input capability. When false, the gateway's vision boon can
+    /// relay images to a designated vision model. `#[serde(default)]` keeps
+    /// older cached payloads (without this field) deserializable as `false`.
+    #[serde(default)]
+    pub supports_vision: bool,
     /// Routing tags from the fixed [`MODEL_TAGS`] vocabulary.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Gateway boons enabled for this model from the fixed [`MODEL_BOONS`]
+    /// vocabulary. `#[serde(default)]` keeps older cached payloads readable.
+    #[serde(default)]
+    pub boons: Vec<String>,
     /// Per-request upstream timeout in seconds. `None` falls back to the global
     /// default. `#[serde(default)]` keeps older cached payloads readable.
     #[serde(default)]
@@ -629,6 +648,35 @@ pub fn is_valid_tag(tag: &str) -> bool {
     MODEL_TAGS.contains(&tag)
 }
 
+/// Fixed vocabulary of gateway boons. A boon grants a capability a model lacks
+/// natively; the data plane applies a model's enabled boons before dispatch.
+/// `vision` relays image parts to a configured describer model. Operators opt
+/// each model into a subset of these; nothing is granted by default.
+pub const MODEL_BOONS: &[&str] = &["vision"];
+
+/// True when `boon` is part of the fixed [`MODEL_BOONS`] vocabulary.
+pub fn is_valid_boon(boon: &str) -> bool {
+    MODEL_BOONS.contains(&boon)
+}
+
+/// Normalize an arbitrary list of boon strings to the canonical form used in
+/// storage: trimmed, lowercased, restricted to the known vocabulary,
+/// de-duplicated, and order-stable by first appearance.
+pub fn normalize_boons<I, S>(boons: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<String> = Vec::new();
+    for boon in boons {
+        let b = boon.as_ref().trim().to_ascii_lowercase();
+        if is_valid_boon(&b) && !out.contains(&b) {
+            out.push(b);
+        }
+    }
+    out
+}
+
 /// Fixed vocabulary of model modalities. Each value maps to a family of
 /// OpenAI-compatible endpoints the model serves (see
 /// `endpoint_matches_model_type` in the proxy). `chat` is the default.
@@ -786,6 +834,84 @@ impl AutoRouterSettings {
         self.classifier_enabled
             && self
                 .classifier_model
+                .as_ref()
+                .is_some_and(|m| !m.trim().is_empty())
+    }
+}
+
+/// Default prompt sent to the vision model when describing an image for a
+/// non-vision model. Operators can override it from the control plane.
+pub const DEFAULT_VISION_DESCRIBE_PROMPT: &str = "You are assisting a text-only \
+model that cannot see images. Describe this image in thorough, faithful detail: \
+all visible text (verbatim), UI elements, code, diagrams, charts, layout, and \
+any information needed to reason about it. Be concise but complete.";
+
+fn default_vision_describe_prompt() -> String {
+    DEFAULT_VISION_DESCRIBE_PROMPT.to_string()
+}
+
+fn default_vision_max_images() -> u32 {
+    6
+}
+
+fn default_vision_timeout_ms() -> u64 {
+    30_000
+}
+
+/// Runtime-editable configuration for the gateway's model "boons" — gateway-side
+/// capabilities granted to models that lack them natively. Persisted in
+/// `app_settings` under the `boons` key so it is editable from the control plane
+/// without a restart.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct BoonSettings {
+    /// The vision boon: relay images to a designated vision model for models
+    /// that do not natively accept image input.
+    #[serde(default)]
+    pub vision: VisionBoonSettings,
+}
+
+/// Configuration for the vision boon (image-to-text relay).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct VisionBoonSettings {
+    /// Master switch for the vision boon. When false, requests pass through
+    /// unchanged (today's behavior).
+    #[serde(default)]
+    pub enabled: bool,
+    /// `model_name` of the registered vision model used to describe images.
+    /// `None` disables the relay regardless of `enabled`.
+    #[serde(default)]
+    pub fallback_model: Option<String>,
+    /// Instruction sent to the vision model when asking it to describe an image.
+    #[serde(default = "default_vision_describe_prompt")]
+    pub describe_prompt: String,
+    /// Maximum number of images relayed per request (cost/latency guard).
+    /// Images beyond this cap are left untouched.
+    #[serde(default = "default_vision_max_images")]
+    pub max_images: u32,
+    /// Hard timeout for each describe call, in milliseconds. On timeout the
+    /// relay is abandoned and the original request passes through unchanged.
+    #[serde(default = "default_vision_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for VisionBoonSettings {
+    fn default() -> Self {
+        VisionBoonSettings {
+            enabled: false,
+            fallback_model: None,
+            describe_prompt: default_vision_describe_prompt(),
+            max_images: default_vision_max_images(),
+            timeout_ms: default_vision_timeout_ms(),
+        }
+    }
+}
+
+impl VisionBoonSettings {
+    /// True when the vision boon is enabled and points at a fallback model.
+    pub fn active(&self) -> bool {
+        self.enabled
+            && self
+                .fallback_model
                 .as_ref()
                 .is_some_and(|m| !m.trim().is_empty())
     }

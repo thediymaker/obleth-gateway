@@ -37,3 +37,16 @@
     @apply bg-background font-sans text-foreground antialiased;
   }
 }
+
+@layer components {
+  /* Muted mono provider marks — sits near muted-foreground without shouting */
+  .provider-logo {
+    opacity: 0.52;
+    filter: grayscale(1);
+    transition: opacity 150ms ease;
+  }
+
+  tr:hover .provider-logo {
+    opacity: 0.72;
+  }
+}

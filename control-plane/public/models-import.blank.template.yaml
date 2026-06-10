@@ -47,7 +47,13 @@
 #   tags                      (optional) Routing tags for the auto router.
 #                                        Allowed: coding, general, reasoning,
 #                                        math, vision, long-context, fast,
-#                                        creative.
+#                                        creative. The `vision` tag also marks
+#                                        native image support (eligible as a
+#                                        system-wide vision describer).
+#   boons                     (optional) Gateway boons granted to this model
+#                                        that it lacks natively. Allowed: vision
+#                                        (relays images to the global describer).
+#                                        Configure boons in Settings -> Boons.
 
 models:
   # ---- Example 1: full template (every field shown) ----
@@ -68,6 +74,7 @@ models:
     supports_tool_choice: true
     enabled: true
     tags: [general]
+    boons: []              # e.g. [vision] to grant the vision boon
 
   # ---- Example 2: minimal (only the required fields) ----
   - model_name: my-minimal-model

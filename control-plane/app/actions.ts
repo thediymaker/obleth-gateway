@@ -1,17 +1,29 @@
 "use server";
 
-import { revalidatePath } from "next/cache";
+// `updateTag` (Next 16) expires tagged Data Cache entries from a server action
+// with read-your-own-writes semantics, so the post-action render refetches.
+import { revalidatePath, updateTag } from "next/cache";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
-import { obleth, OblethApiError } from "@/lib/obleth";
-import type { AutotuneReport, AutotuneWorkload, ModelRoute, UpdateAlertSettings, UpdateAutoRouterSettings } from "@/lib/obleth";
+import { CACHE_TAGS, obleth, OblethApiError } from "@/lib/obleth";
+import type {
+  AutotuneReport,
+  AutotuneWorkload,
+  ModelRoute,
+  UpdateAlertSettings,
+  UpdateAutoRouterSettings,
+  UpdateBoonSettings,
+} from "@/lib/obleth";
 import { requireSession } from "@/lib/auth/session";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
 
 function actionError(e: unknown): ActionResult {
   if (e instanceof OblethApiError) return { ok: false, error: e.message };
-  return { ok: false, error: e instanceof Error ? e.message : "Unexpected error" };
+  return {
+    ok: false,
+    error: e instanceof Error ? e.message : "Unexpected error",
+  };
 }
 
 // ----------------------------------------------------------------------------
@@ -39,11 +51,15 @@ const optionalText = z.preprocess(trimmed, z.string());
 const checkbox = z.preprocess((v) => v === "on", z.boolean());
 
 /** Optional positive integer (absent when the field is blank). */
-const optionalPositiveInt = z
-  .preprocess(blankToUndef, z.coerce.number().int().positive().optional());
+const optionalPositiveInt = z.preprocess(
+  blankToUndef,
+  z.coerce.number().int().positive().optional(),
+);
 /** Optional non-negative integer. */
-const optionalNonNegInt = z
-  .preprocess(blankToUndef, z.coerce.number().int().nonnegative().optional());
+const optionalNonNegInt = z.preprocess(
+  blankToUndef,
+  z.coerce.number().int().nonnegative().optional(),
+);
 /** Non-negative number with a default applied when the field is blank. */
 const nonNegNumber = (def: number) =>
   z.preprocess(blankToUndef, z.coerce.number().nonnegative().default(def));
@@ -94,14 +110,16 @@ const modelCreateSchema = z.object({
 
 const mcpCreateSchema = z.object({
   name: requiredText("Name is required"),
-  upstream_url: z.preprocess(trimmed, z.string().url("A valid upstream URL is required")),
+  upstream_url: z.preprocess(
+    trimmed,
+    z.string().url("A valid upstream URL is required"),
+  ),
 });
 
 /** Return the first zod issue message for surfacing to the UI. */
 function firstIssue(error: z.ZodError): string {
   return error.issues[0]?.message ?? "Invalid input";
 }
-
 
 export async function createTenantAction(formData: FormData) {
   await requireSession();
@@ -113,6 +131,7 @@ export async function createTenantAction(formData: FormData) {
   });
   if (!parsed.success) return;
   await obleth.createTenant(parsed.data);
+  updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/");
 }
@@ -134,6 +153,7 @@ export async function updateTenantAction(formData: FormData) {
     organization: rest.organization,
     contact_email: rest.contact_email ?? "",
   });
+  updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/");
 }
@@ -142,6 +162,7 @@ export async function setTenantStatusAction(id: string, status: string) {
   await requireSession();
   if (!id) return;
   await obleth.setTenantStatus(id, status);
+  updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/fairshare");
   revalidatePath("/");
@@ -153,7 +174,9 @@ export async function setTenantScheduleAction(
     timezone: string;
     active_from?: string | null;
     active_until?: string | null;
-    weekly_windows?: { day: number; start_min: number; end_min: number }[] | null;
+    weekly_windows?:
+      | { day: number; start_min: number; end_min: number }[]
+      | null;
   },
 ): Promise<ActionResult> {
   await requireSession();
@@ -163,6 +186,7 @@ export async function setTenantScheduleAction(
   } catch (e) {
     return actionError(e);
   }
+  updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/fairshare");
   revalidatePath("/");
@@ -185,6 +209,7 @@ export async function setTenantBudgetAction(
   } catch (e) {
     return actionError(e);
   }
+  updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/");
   return { ok: true };
@@ -201,6 +226,7 @@ export async function setTenantAllowlistAction(
   } catch (e) {
     return actionError(e);
   }
+  updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/");
   return { ok: true };
@@ -210,6 +236,8 @@ export async function deleteTenantAction(id: string) {
   await requireSession();
   if (!id) return;
   await obleth.deleteTenant(id);
+  updateTag(CACHE_TAGS.tenants);
+  updateTag(CACHE_TAGS.keys);
   revalidatePath("/tenants");
   revalidatePath("/keys");
   revalidatePath("/fairshare");
@@ -219,6 +247,7 @@ export async function deleteTenantAction(id: string) {
 export async function setWeightAction(id: string, weight: number) {
   await requireSession();
   await obleth.setWeight(id, weight);
+  updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/fairshare");
   revalidatePath("/");
@@ -231,15 +260,19 @@ export async function setQuotaAction(formData: FormData) {
   const mif = numOrNull(formData.get("max_in_flight"));
   if (!id || !tpm || tpm <= 0 || (mif !== null && mif <= 0)) return;
   await obleth.setQuota(id, tpm, mif);
+  updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/");
 }
 
-export async function createKeyAction(formData: FormData): Promise<string | null> {
+export async function createKeyAction(
+  formData: FormData,
+): Promise<string | null> {
   await requireSession();
   const tenantId = String(formData.get("tenant_id"));
   const name = String(formData.get("name") ?? "key").trim() || "key";
   const created = await obleth.createKey(tenantId, name);
+  updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
   return created.secret;
 }
@@ -247,20 +280,25 @@ export async function createKeyAction(formData: FormData): Promise<string | null
 export async function toggleKeyAction(id: string, disabled: boolean) {
   await requireSession();
   await obleth.setKeyDisabled(id, disabled);
+  updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
 }
 
 export async function deleteKeyAction(id: string) {
   await requireSession();
   await obleth.deleteKey(id);
+  updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
   revalidatePath("/");
 }
 
-export async function deleteKeysAction(ids: string[]): Promise<{ deleted: number; failed: number }> {
+export async function deleteKeysAction(
+  ids: string[],
+): Promise<{ deleted: number; failed: number }> {
   await requireSession();
   const uniqueIds = [...new Set(ids.map((id) => String(id)).filter(Boolean))];
   const result = await deleteKeys(uniqueIds);
+  updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
   revalidatePath("/");
   return result;
@@ -272,20 +310,28 @@ export async function deleteFilteredKeysAction(filters: {
   status?: "all" | "active" | "disabled";
 }): Promise<{ deleted: number; failed: number; matched: number }> {
   await requireSession();
-  const query = String(filters.query ?? "").trim().toLowerCase();
+  const query = String(filters.query ?? "")
+    .trim()
+    .toLowerCase();
   const tenantId = String(filters.tenantId ?? "all");
   const status = filters.status ?? "all";
   const hasFilter = query !== "" || tenantId !== "all" || status !== "all";
   if (!hasFilter) return { deleted: 0, failed: 0, matched: 0 };
 
-  const [tenants, keys] = await Promise.all([obleth.listTenants(), obleth.listKeys()]);
-  const tenantNames = new Map(tenants.map((tenant) => [tenant.id, tenant.name]));
+  const [tenants, keys] = await Promise.all([
+    obleth.listTenants(),
+    obleth.listKeys(),
+  ]);
+  const tenantNames = new Map(
+    tenants.map((tenant) => [tenant.id, tenant.name]),
+  );
   const matched = keys.filter((key) => {
     if (tenantId !== "all" && key.tenant_id !== tenantId) return false;
     if (status === "active" && key.disabled) return false;
     if (status === "disabled" && !key.disabled) return false;
     if (!query) return true;
-    const tenantName = tenantNames.get(key.tenant_id) ?? key.tenant_id.slice(0, 8);
+    const tenantName =
+      tenantNames.get(key.tenant_id) ?? key.tenant_id.slice(0, 8);
     return (
       key.key_prefix.toLowerCase().includes(query) ||
       key.name.toLowerCase().includes(query) ||
@@ -294,6 +340,7 @@ export async function deleteFilteredKeysAction(filters: {
   });
 
   const result = await deleteKeys(matched.map((key) => key.id));
+  updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
   revalidatePath("/");
   return { ...result, matched: matched.length };
@@ -306,7 +353,9 @@ export async function setCapacityAction(max: number) {
   revalidatePath("/fairshare");
 }
 
-export async function createModelAction(formData: FormData): Promise<ActionResult> {
+export async function createModelAction(
+  formData: FormData,
+): Promise<ActionResult> {
   await requireSession();
   const parsed = modelCreateSchema.safeParse({
     model_name: formData.get("model_name"),
@@ -328,36 +377,52 @@ export async function createModelAction(formData: FormData): Promise<ActionResul
   });
   if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
   try {
+    const tags = tagsFromForm(formData);
     await obleth.createModel({
       ...parsed.data,
       api_key: strOrNull(formData.get("api_key")),
       max_in_flight: numOrNull(formData.get("max_in_flight")),
-      tags: tagsFromForm(formData),
+      supports_vision: tags.includes("vision"),
+      tags,
+      boons: boonsFromForm(formData),
     });
   } catch (e) {
     return actionError(e);
   }
+  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   return { ok: true };
 }
 
-export async function setModelCapacityAction(id: string, max_in_flight: number | null) {
+export async function setModelCapacityAction(
+  id: string,
+  max_in_flight: number | null,
+) {
   await requireSession();
   await obleth.setModelCapacity(id, max_in_flight);
+  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
 }
 
-export async function setModelCapacityModeAction(id: string, capacityMode: string) {
+export async function setModelCapacityModeAction(
+  id: string,
+  capacityMode: string,
+) {
   await requireSession();
   await obleth.setModelCapacityMode(id, capacityMode);
+  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
 }
 
 export async function autotuneModelAction(
   id: string,
-  opts?: { workload?: AutotuneWorkload; latency_headroom?: number; replicas?: number }
+  opts?: {
+    workload?: AutotuneWorkload;
+    latency_headroom?: number;
+    replicas?: number;
+  },
 ): Promise<AutotuneReport> {
   await requireSession();
   // Recommend-only: drives a live probe against the upstream and returns the
@@ -365,16 +430,24 @@ export async function autotuneModelAction(
   return obleth.autotuneModel(id, opts);
 }
 
-export async function applyAutotuneCapacityAction(id: string, max_in_flight: number) {
+export async function applyAutotuneCapacityAction(
+  id: string,
+  max_in_flight: number,
+) {
   await requireSession();
   await obleth.applyAutotuneCapacity(id, max_in_flight);
+  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
 }
 
-export async function setModelWeightAction(id: string, admission_weight: number) {
+export async function setModelWeightAction(
+  id: string,
+  admission_weight: number,
+) {
   await requireSession();
   await obleth.setModelWeight(id, admission_weight);
+  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
 }
@@ -382,12 +455,18 @@ export async function setModelWeightAction(id: string, admission_weight: number)
 export async function deleteModelAction(id: string) {
   await requireSession();
   await obleth.deleteModel(id);
+  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
 }
 
-export async function setModelCacheAction(id: string, enabled: boolean, ttlSecs?: number) {
+export async function setModelCacheAction(
+  id: string,
+  enabled: boolean,
+  ttlSecs?: number,
+) {
   await requireSession();
   await obleth.setModelCache(id, enabled, ttlSecs);
+  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
 }
 
@@ -402,10 +481,14 @@ export async function setModelReliabilityAction(
 ) {
   await requireSession();
   await obleth.setModelReliability(id, body);
+  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
 }
 
-export async function createModelEndpointAction(id: string, formData: FormData) {
+export async function createModelEndpointAction(
+  id: string,
+  formData: FormData,
+) {
   await requireSession();
   await obleth.createModelEndpoint(id, {
     name: String(formData.get("name") ?? "").trim(),
@@ -435,7 +518,10 @@ export async function updateModelEndpointAction(
   revalidatePath("/models");
 }
 
-export async function deleteModelEndpointAction(id: string, endpointId: string) {
+export async function deleteModelEndpointAction(
+  id: string,
+  endpointId: string,
+) {
   await requireSession();
   await obleth.deleteModelEndpoint(id, endpointId);
   revalidatePath("/models");
@@ -463,13 +549,17 @@ export async function updateModelAction(formData: FormData) {
     supports_tool_choice: formData.get("supports_tool_choice"),
   });
   if (!parsed.success) return;
+  const tags = tagsFromForm(formData);
   await obleth.updateModel(id, {
     ...parsed.data,
     api_key: strOrNull(formData.get("api_key")),
     max_in_flight: numOrNull(formData.get("max_in_flight")),
     enabled: formData.get("enabled") === "on",
-    tags: tagsFromForm(formData),
+    supports_vision: tags.includes("vision"),
+    tags,
+    boons: boonsFromForm(formData),
   });
+  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
 }
@@ -487,7 +577,13 @@ export async function checkAllModelHealthAction() {
 }
 
 export type ImportModelsResult =
-  | { ok: true; created: number; updated: number; failed: number; errors: string[] }
+  | {
+      ok: true;
+      created: number;
+      updated: number;
+      failed: number;
+      errors: string[];
+    }
   | { ok: false; error: string };
 
 export interface ImportPlanItem {
@@ -505,7 +601,9 @@ export type ImportPlanResult =
 // Dry-run preview: parses the uploaded obleth models template and reports which
 // routes would be created vs. updated (matched by `model_name`) without writing
 // anything. The UI shows this plan and only then calls `importModelsAction`.
-export async function planModelImportAction(text: string): Promise<ImportPlanResult> {
+export async function planModelImportAction(
+  text: string,
+): Promise<ImportPlanResult> {
   await requireSession();
   const read = readModelInputs(text);
   if (read.error) return { ok: false, error: read.error };
@@ -514,7 +612,10 @@ export async function planModelImportAction(text: string): Promise<ImportPlanRes
   try {
     existing = await obleth.listModels();
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "Failed to load existing models." };
+    return {
+      ok: false,
+      error: e instanceof Error ? e.message : "Failed to load existing models.",
+    };
   }
   const names = new Set(existing.map((m) => m.model_name));
 
@@ -532,7 +633,9 @@ export async function planModelImportAction(text: string): Promise<ImportPlanRes
 // with a top-level `models:` list). Existing routes are matched by `model_name`
 // and updated in place; unknown names are created. Per-model failures are
 // collected so a single bad entry doesn't abort the whole import.
-export async function importModelsAction(text: string): Promise<ImportModelsResult> {
+export async function importModelsAction(
+  text: string,
+): Promise<ImportModelsResult> {
   await requireSession();
   const read = readModelInputs(text);
   if (read.error) return { ok: false, error: read.error };
@@ -542,7 +645,10 @@ export async function importModelsAction(text: string): Promise<ImportModelsResu
   try {
     existing = await obleth.listModels();
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "Failed to load existing models." };
+    return {
+      ok: false,
+      error: e instanceof Error ? e.message : "Failed to load existing models.",
+    };
   }
   const byName = new Map(existing.map((m) => [m.model_name, m]));
 
@@ -550,63 +656,99 @@ export async function importModelsAction(text: string): Promise<ImportModelsResu
   let updated = 0;
   const errors: string[] = [];
 
-  for (const input of inputs) {
-    try {
-      const found = byName.get(input.model_name);
-      if (found) {
-        await obleth.updateModel(found.id, {
-          description: input.description ?? found.description,
-          upstream_model: input.upstream_model,
-          api_base: input.api_base,
-          api_key: input.api_key ?? undefined,
-          model_type: input.model_type ?? found.model_type,
-          input_cost_per_token: input.input_cost_per_token ?? found.input_cost_per_token,
-          output_cost_per_token: input.output_cost_per_token ?? found.output_cost_per_token,
-          cost_per_image: input.cost_per_image ?? found.cost_per_image,
-          cost_per_audio_second: input.cost_per_audio_second ?? found.cost_per_audio_second,
-          cost_per_character: input.cost_per_character ?? found.cost_per_character,
-          context_window: input.context_window ?? found.context_window,
-          admission_weight: input.admission_weight ?? found.admission_weight,
-          max_in_flight: input.max_in_flight !== undefined ? input.max_in_flight : found.max_in_flight,
-          supports_function_calling: input.supports_function_calling ?? found.supports_function_calling,
-          supports_system_messages: input.supports_system_messages ?? found.supports_system_messages,
-          supports_response_schema: input.supports_response_schema ?? found.supports_response_schema,
-          supports_tool_choice: input.supports_tool_choice ?? found.supports_tool_choice,
-          enabled: input.enabled ?? found.enabled,
-          tags: input.tags ?? found.tags,
-        });
-        updated += 1;
-      } else {
-        await obleth.createModel({
-          model_name: input.model_name,
-          description: input.description ?? "",
-          upstream_model: input.upstream_model,
-          api_base: input.api_base,
-          api_key: input.api_key ?? undefined,
-          model_type: input.model_type ?? "chat",
-          input_cost_per_token: input.input_cost_per_token ?? 0,
-          output_cost_per_token: input.output_cost_per_token ?? 0,
-          cost_per_image: input.cost_per_image ?? 0,
-          cost_per_audio_second: input.cost_per_audio_second ?? 0,
-          cost_per_character: input.cost_per_character ?? 0,
-          context_window: input.context_window ?? 8192,
-          admission_weight: input.admission_weight ?? 100,
-          max_in_flight: input.max_in_flight ?? null,
-          supports_function_calling: input.supports_function_calling ?? false,
-          supports_system_messages: input.supports_system_messages ?? true,
-          supports_response_schema: input.supports_response_schema ?? false,
-          supports_tool_choice: input.supports_tool_choice ?? false,
-          enabled: input.enabled ?? true,
-          tags: input.tags ?? [],
-        });
-        created += 1;
-      }
-    } catch (e) {
-      const detail = e instanceof OblethApiError ? e.message : e instanceof Error ? e.message : "unknown error";
-      errors.push(`${input.model_name}: ${detail}`);
+  // One model per request is the admin API's shape, but the requests are
+  // independent — run them in bounded-concurrency chunks so large imports
+  // don't pay one round trip per model sequentially.
+  const importOne = async (
+    input: ModelImportInput,
+  ): Promise<"created" | "updated"> => {
+    const found = byName.get(input.model_name);
+    if (found) {
+      await obleth.updateModel(found.id, {
+        description: input.description ?? found.description,
+        upstream_model: input.upstream_model,
+        api_base: input.api_base,
+        api_key: input.api_key ?? undefined,
+        model_type: input.model_type ?? found.model_type,
+        input_cost_per_token:
+          input.input_cost_per_token ?? found.input_cost_per_token,
+        output_cost_per_token:
+          input.output_cost_per_token ?? found.output_cost_per_token,
+        cost_per_image: input.cost_per_image ?? found.cost_per_image,
+        cost_per_audio_second:
+          input.cost_per_audio_second ?? found.cost_per_audio_second,
+        cost_per_character:
+          input.cost_per_character ?? found.cost_per_character,
+        context_window: input.context_window ?? found.context_window,
+        admission_weight: input.admission_weight ?? found.admission_weight,
+        max_in_flight:
+          input.max_in_flight !== undefined
+            ? input.max_in_flight
+            : found.max_in_flight,
+        supports_function_calling:
+          input.supports_function_calling ?? found.supports_function_calling,
+        supports_system_messages:
+          input.supports_system_messages ?? found.supports_system_messages,
+        supports_response_schema:
+          input.supports_response_schema ?? found.supports_response_schema,
+        supports_tool_choice:
+          input.supports_tool_choice ?? found.supports_tool_choice,
+        supports_vision: input.supports_vision ?? found.supports_vision,
+        enabled: input.enabled ?? found.enabled,
+        tags: input.tags ?? found.tags,
+        boons: input.boons ?? found.boons,
+      });
+      return "updated";
     }
+    await obleth.createModel({
+      model_name: input.model_name,
+      description: input.description ?? "",
+      upstream_model: input.upstream_model,
+      api_base: input.api_base,
+      api_key: input.api_key ?? undefined,
+      model_type: input.model_type ?? "chat",
+      input_cost_per_token: input.input_cost_per_token ?? 0,
+      output_cost_per_token: input.output_cost_per_token ?? 0,
+      cost_per_image: input.cost_per_image ?? 0,
+      cost_per_audio_second: input.cost_per_audio_second ?? 0,
+      cost_per_character: input.cost_per_character ?? 0,
+      context_window: input.context_window ?? 8192,
+      admission_weight: input.admission_weight ?? 100,
+      max_in_flight: input.max_in_flight ?? null,
+      supports_function_calling: input.supports_function_calling ?? false,
+      supports_system_messages: input.supports_system_messages ?? true,
+      supports_response_schema: input.supports_response_schema ?? false,
+      supports_tool_choice: input.supports_tool_choice ?? false,
+      supports_vision: input.supports_vision ?? false,
+      enabled: input.enabled ?? true,
+      tags: input.tags ?? [],
+      boons: input.boons ?? [],
+    });
+    return "created";
+  };
+
+  const chunkSize = 10;
+  for (let i = 0; i < inputs.length; i += chunkSize) {
+    const chunk = inputs.slice(i, i + chunkSize);
+    const results = await Promise.allSettled(chunk.map(importOne));
+    results.forEach((result, idx) => {
+      if (result.status === "fulfilled") {
+        if (result.value === "created") created += 1;
+        else updated += 1;
+      } else {
+        const e = result.reason;
+        const detail =
+          e instanceof OblethApiError
+            ? e.message
+            : e instanceof Error
+              ? e.message
+              : "unknown error";
+        errors.push(`${chunk[idx].model_name}: ${detail}`);
+      }
+    });
   }
 
+  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
   return { ok: true, created, updated, failed: errors.length, errors };
@@ -627,7 +769,9 @@ export async function setModelHealthConfigAction(formData: FormData) {
   revalidatePath("/models");
 }
 
-export async function createMcpServerAction(formData: FormData): Promise<ActionResult> {
+export async function createMcpServerAction(
+  formData: FormData,
+): Promise<ActionResult> {
   await requireSession();
   const parsed = mcpCreateSchema.safeParse({
     name: formData.get("name"),
@@ -647,7 +791,11 @@ export async function createMcpServerAction(formData: FormData): Promise<ActionR
   return { ok: true };
 }
 
-export async function toggleMcpServerAction(id: string, upstreamUrl: string, enabled: boolean) {
+export async function toggleMcpServerAction(
+  id: string,
+  upstreamUrl: string,
+  enabled: boolean,
+) {
   await requireSession();
   await obleth.updateMcpServer(id, { upstream_url: upstreamUrl, enabled });
   revalidatePath("/mcp");
@@ -685,7 +833,22 @@ export async function setAutoRouterSettingsAction(
   return { ok: true };
 }
 
-export async function setUsageRetentionAction(days: number): Promise<ActionResult> {
+export async function setBoonSettingsAction(
+  body: UpdateBoonSettings,
+): Promise<ActionResult> {
+  await requireSession();
+  try {
+    await obleth.setBoonSettings(body);
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/settings");
+  return { ok: true };
+}
+
+export async function setUsageRetentionAction(
+  days: number,
+): Promise<ActionResult> {
   await requireSession();
   if (!Number.isFinite(days) || days < 1) {
     return { ok: false, error: "Retention must be at least 1 day" };
@@ -716,7 +879,9 @@ export async function compactUsageAction(): Promise<
 }
 
 export async function testAlertAction(): Promise<
-  ActionResult & { results?: { channel: string; ok: boolean; detail: string }[] }
+  ActionResult & {
+    results?: { channel: string; ok: boolean; detail: string }[];
+  }
 > {
   await requireSession();
   try {
@@ -727,13 +892,17 @@ export async function testAlertAction(): Promise<
   }
 }
 
-async function deleteKeys(ids: string[]): Promise<{ deleted: number; failed: number }> {
+async function deleteKeys(
+  ids: string[],
+): Promise<{ deleted: number; failed: number }> {
   let deleted = 0;
   let failed = 0;
   const chunkSize = 25;
   for (let i = 0; i < ids.length; i += chunkSize) {
     const chunk = ids.slice(i, i + chunkSize);
-    const results = await Promise.allSettled(chunk.map((id) => obleth.deleteKey(id)));
+    const results = await Promise.allSettled(
+      chunk.map((id) => obleth.deleteKey(id)),
+    );
     for (const result of results) {
       if (result.status === "fulfilled") deleted += 1;
       else failed += 1;
@@ -758,6 +927,18 @@ function tagsFromForm(formData: FormData): string[] {
     }
   }
   return tags;
+}
+
+// Collects checked boon checkboxes (named `boon_<name>`) from a model form into
+// an array of boon names, e.g. { boon_vision: "on" } -> ["vision"].
+function boonsFromForm(formData: FormData): string[] {
+  const boons: string[] = [];
+  for (const [key, value] of formData.entries()) {
+    if (key.startsWith("boon_") && value === "on") {
+      boons.push(key.slice("boon_".length));
+    }
+  }
+  return boons;
 }
 
 function strOrNull(v: FormDataEntryValue | null): string | undefined {
@@ -811,8 +992,10 @@ interface ModelImportInput {
   supports_system_messages?: boolean;
   supports_response_schema?: boolean;
   supports_tool_choice?: boolean;
+  supports_vision?: boolean;
   enabled?: boolean;
   tags?: string[];
+  boons?: string[];
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
@@ -822,7 +1005,10 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 // Parses and normalizes an uploaded obleth models template into import inputs.
 // Returns a human-readable `error` instead of throwing so callers can surface
 // it directly. The template is YAML or JSON with a top-level `models:` list.
-function readModelInputs(text: string): { inputs: ModelImportInput[]; error?: string } {
+function readModelInputs(text: string): {
+  inputs: ModelImportInput[];
+  error?: string;
+} {
   if (!text || !text.trim()) {
     return { inputs: [], error: "No file content provided." };
   }
@@ -831,7 +1017,11 @@ function readModelInputs(text: string): { inputs: ModelImportInput[]; error?: st
   try {
     parsed = parseModelDocument(text);
   } catch {
-    return { inputs: [], error: "Could not parse file. Expected an obleth models YAML/JSON template." };
+    return {
+      inputs: [],
+      error:
+        "Could not parse file. Expected an obleth models YAML/JSON template.",
+    };
   }
 
   const inputs = extractModelEntries(parsed)
@@ -841,7 +1031,8 @@ function readModelInputs(text: string): { inputs: ModelImportInput[]; error?: st
   if (inputs.length === 0) {
     return {
       inputs: [],
-      error: "No valid models found. Use the obleth template: a top-level `models:` list where each entry has model_name, upstream_model and api_base.",
+      error:
+        "No valid models found. Use the obleth template: a top-level `models:` list where each entry has model_name, upstream_model and api_base.",
     };
   }
   return { inputs };
@@ -888,13 +1079,22 @@ function toImportInput(entry: unknown): ModelImportInput | null {
     cost_per_character: coerceNum(entry.cost_per_character),
     context_window: coerceNum(entry.context_window),
     admission_weight: coerceNum(entry.admission_weight),
-    max_in_flight: entry.max_in_flight == null ? undefined : coerceNum(entry.max_in_flight) ?? null,
+    max_in_flight:
+      entry.max_in_flight == null
+        ? undefined
+        : (coerceNum(entry.max_in_flight) ?? null),
     supports_function_calling: coerceBool(entry.supports_function_calling),
     supports_system_messages: coerceBool(entry.supports_system_messages),
     supports_response_schema: coerceBool(entry.supports_response_schema),
     supports_tool_choice: coerceBool(entry.supports_tool_choice),
+    supports_vision: coerceBool(entry.supports_vision),
     enabled: coerceBool(entry.enabled),
-    tags: Array.isArray(entry.tags) ? entry.tags.map(coerceStr).filter(Boolean) : undefined,
+    tags: Array.isArray(entry.tags)
+      ? entry.tags.map(coerceStr).filter(Boolean)
+      : undefined,
+    boons: Array.isArray(entry.boons)
+      ? entry.boons.map(coerceStr).filter(Boolean)
+      : undefined,
   };
 }
 

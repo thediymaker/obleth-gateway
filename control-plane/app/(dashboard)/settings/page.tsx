@@ -1,6 +1,7 @@
 import {
   AlertSettingsForm,
   AutoRouterSettingsForm,
+  BoonsSettingsForm,
   UsageRetentionForm,
 } from "@/components/settings-form";
 import { obleth } from "@/lib/obleth";
@@ -11,6 +12,7 @@ export const dynamic = "force-dynamic";
 export default async function SettingsPage() {
   const settings = await safe(obleth.getAlertSettings(), null);
   const autoRouter = await safe(obleth.getAutoRouterSettings(), null);
+  const boons = await safe(obleth.getBoonSettings(), null);
   const models = await safe(obleth.listModels(), []);
   const retention = await safe(obleth.getUsageRetention(), null);
 
@@ -25,6 +27,7 @@ export default async function SettingsPage() {
       </div>
       <AlertSettingsForm settings={settings} />
       <AutoRouterSettingsForm settings={autoRouter} models={models} />
+      <BoonsSettingsForm settings={boons} models={models} />
       <UsageRetentionForm retention={retention} />
     </div>
   );
