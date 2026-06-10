@@ -13,7 +13,7 @@ helm install obleth deploy/k8s/obleth \
 passwords, dashboard credentials). Use placeholders in git; inject real values
 via `--set`, a local untracked file, or a secrets manager.
 
-Full value reference: [docs.obleth.dev — Helm Values](https://docs.obleth.dev/docs/reference/helm-values).
+Full value reference: [obleth.com — Helm Values](https://obleth.com/docs/reference/helm-values).
 
 ## What the chart starts
 
@@ -150,5 +150,5 @@ benchmarkBackend:
   enabled: false
 ```
 
-See [Modular deploy](https://docs.obleth.dev/docs/guides/modular-deploy) on
+See [Modular deploy](https://obleth.com/docs/guides/modular-deploy) on
 docs.obleth.dev.

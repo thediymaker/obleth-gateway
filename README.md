@@ -195,7 +195,7 @@ deploying anywhere real.
 
 Architecture, the fairshare engine internals, auto routing and the classifier,
 scheduling, budgets, secrets, SSRF policy, alerting, dashboard auth, and the
-full configuration reference live at **[docs.obleth.dev](https://docs.obleth.dev)**.
+full configuration reference live at **[obleth.com](https://obleth.com)**.
 
 ## License
 
