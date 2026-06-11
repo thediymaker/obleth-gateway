@@ -1052,10 +1052,7 @@ impl Store {
 
     /// Hot-path endpoint views for one model: enabled endpoints with their
     /// decrypted upstream keys and current health, ordered by priority.
-    pub async fn resolved_endpoints_for(
-        &self,
-        model_id: Uuid,
-    ) -> Result<Vec<ResolvedEndpoint>> {
+    pub async fn resolved_endpoints_for(&self, model_id: Uuid) -> Result<Vec<ResolvedEndpoint>> {
         let rows = sqlx::query(
             "select id, api_base, api_key, priority, weight, enabled, health_status
              from model_endpoints
@@ -2240,7 +2237,15 @@ mod tests {
 
         // the batched resolve must attach this model's endpoints
         store
-            .create_model_endpoint(model.id, "primary", "http://127.0.0.1:8082", None, 0, 1, true)
+            .create_model_endpoint(
+                model.id,
+                "primary",
+                "http://127.0.0.1:8082",
+                None,
+                0,
+                1,
+                true,
+            )
             .await
             .expect("create endpoint");
         let resolved_models = store.all_resolved_models().await.expect("resolved models");
@@ -2249,7 +2254,10 @@ mod tests {
             .find(|(n, _)| n == &model.model_name)
             .expect("model resolved");
         assert_eq!(resolved_model.endpoints.len(), 1);
-        assert_eq!(resolved_model.endpoints[0].api_base, "http://127.0.0.1:8082");
+        assert_eq!(
+            resolved_model.endpoints[0].api_base,
+            "http://127.0.0.1:8082"
+        );
 
         // tenant delete must report the cascade-deleted key hashes
         let hashes = store.delete_tenant(tenant.id).await.expect("delete tenant");

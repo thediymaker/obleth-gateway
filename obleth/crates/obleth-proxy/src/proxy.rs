@@ -15,7 +15,9 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use futures_util::StreamExt;
-use obleth_config::{hash_api_key, Admission, ResolvedEndpoint, ResolvedKey, ResolvedModel, UsageRecord};
+use obleth_config::{
+    hash_api_key, Admission, ResolvedEndpoint, ResolvedKey, ResolvedModel, UsageRecord,
+};
 use obleth_tokenizer::{CostEstimate, Tokenizer};
 use tokio::time::timeout;
 use tracing::Instrument;
@@ -103,19 +105,18 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
-    let mut multipart_fields = if is_multipart_endpoint(&path)
-        && content_type_in.starts_with("multipart/form-data")
-    {
-        match multer::parse_boundary(&content_type_in) {
-            Ok(boundary) => match parse_multipart(&body_bytes, &boundary).await {
-                Ok(fields) => Some(fields),
-                Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid multipart body"),
-            },
-            Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid multipart boundary"),
-        }
-    } else {
-        None
-    };
+    let mut multipart_fields =
+        if is_multipart_endpoint(&path) && content_type_in.starts_with("multipart/form-data") {
+            match multer::parse_boundary(&content_type_in) {
+                Ok(boundary) => match parse_multipart(&body_bytes, &boundary).await {
+                    Ok(fields) => Some(fields),
+                    Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid multipart body"),
+                },
+                Err(_) => return error_json(StatusCode::BAD_REQUEST, "invalid multipart boundary"),
+            }
+        } else {
+            None
+        };
 
     let mut model = if let Some(fields) = &multipart_fields {
         fields
@@ -338,7 +339,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // lifetime/monthly/term usage) runs first inside the script, so a
     // term-exhausted request never reserves per-minute tokens it has no
     // completion path to refund.
-    let capacity = resolved.tokens_per_minute.max(1);
+    let capacity = resolved.tokens_per_minute.max(0);
     let term_period = term_period_key(&resolved, chrono::Utc::now());
     let term_gate = term_period
         .as_deref()
@@ -347,94 +348,97 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             budget_tokens: resolved.budget_tokens,
             budget_cost_usd: resolved.budget_cost_usd,
         });
-    match state
-        .redis
-        .reserve_budget_with_term(
-            &resolved.tenant_id,
-            capacity,
-            resolved.tokens_per_minute,
-            est.total(),
-            term_gate,
-        )
-        .instrument(tracing::info_span!("reserve_budget"))
-        .await
-    {
-        Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {}
-        Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {
-            drop(permit);
-            finalize(
-                &state,
-                &resolved,
-                &req_meta,
-                &model,
-                Admission::Rejected,
-                est,
-                0,
-                0,
-                queue_wait_ms,
-                0,
-                0,
-                429,
-                cache_status_label,
-                0.0,
-            );
-            return error_json(StatusCode::TOO_MANY_REQUESTS, "token budget exceeded");
-        }
-        Ok(obleth_redis::ReserveOutcome::TermExhausted {
-            used_tokens,
-            used_cost,
-        }) => {
-            drop(permit);
-            state.alerts.issue(
-                format!("term_budget_exhausted:{}", resolved.tenant_id),
-                "Tenant term budget exhausted",
-                format!(
-                    "tenant `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
-                    resolved.tenant_name,
-                    resolved.budget_tokens,
-                    resolved.budget_cost_usd,
-                ),
-            );
-            finalize(
-                &state,
-                &resolved,
-                &req_meta,
-                &model,
-                Admission::Rejected,
-                est,
-                0,
-                0,
-                queue_wait_ms,
-                0,
-                0,
-                403,
-                cache_status_label,
-                0.0,
-            );
-            return error_json(StatusCode::FORBIDDEN, "tenant term budget exhausted");
-        }
-        Err(e) => {
-            if !state.fail_open {
+    let should_check_budget = capacity > 0 || term_gate.is_some();
+    if should_check_budget {
+        match state
+            .redis
+            .reserve_budget_with_term(
+                &resolved.tenant_id,
+                capacity,
+                resolved.tokens_per_minute,
+                est.total(),
+                term_gate,
+            )
+            .instrument(tracing::info_span!("reserve_budget"))
+            .await
+        {
+            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {}
+            Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {
+                drop(permit);
+                finalize(
+                    &state,
+                    &resolved,
+                    &req_meta,
+                    &model,
+                    Admission::Rejected,
+                    est,
+                    0,
+                    0,
+                    queue_wait_ms,
+                    0,
+                    0,
+                    429,
+                    cache_status_label,
+                    0.0,
+                );
+                return error_json(StatusCode::TOO_MANY_REQUESTS, "token budget exceeded");
+            }
+            Ok(obleth_redis::ReserveOutcome::TermExhausted {
+                used_tokens,
+                used_cost,
+            }) => {
                 drop(permit);
                 state.alerts.issue(
-                    "redis_budget_reserve_failed_closed",
+                    format!("term_budget_exhausted:{}", resolved.tenant_id),
+                    "Tenant term budget exhausted",
+                    format!(
+                        "tenant `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
+                        resolved.tenant_name,
+                        resolved.budget_tokens,
+                        resolved.budget_cost_usd,
+                    ),
+                );
+                finalize(
+                    &state,
+                    &resolved,
+                    &req_meta,
+                    &model,
+                    Admission::Rejected,
+                    est,
+                    0,
+                    0,
+                    queue_wait_ms,
+                    0,
+                    0,
+                    403,
+                    cache_status_label,
+                    0.0,
+                );
+                return error_json(StatusCode::FORBIDDEN, "tenant term budget exhausted");
+            }
+            Err(e) => {
+                if !state.fail_open {
+                    drop(permit);
+                    state.alerts.issue(
+                        "redis_budget_reserve_failed_closed",
+                        "Redis budget reserve failed",
+                        format!(
+                            "fail-open is disabled; rejecting tenant `{}` model `{model}`: {e}",
+                            resolved.tenant_name
+                        ),
+                    );
+                    return error_json(StatusCode::SERVICE_UNAVAILABLE, "budget check failed");
+                }
+                tracing::warn!(error = %e, "budget reserve failed; failing open");
+                state.alerts.issue(
+                    "redis_budget_reserve_failed_open",
                     "Redis budget reserve failed",
                     format!(
-                        "fail-open is disabled; rejecting tenant `{}` model `{model}`: {e}",
+                        "fail-open is enabled; admitting tenant `{}` model `{model}` without budget enforcement: {e}",
                         resolved.tenant_name
                     ),
                 );
-                return error_json(StatusCode::SERVICE_UNAVAILABLE, "budget check failed");
             }
-            tracing::warn!(error = %e, "budget reserve failed; failing open");
-            state.alerts.issue(
-                "redis_budget_reserve_failed_open",
-                "Redis budget reserve failed",
-                format!(
-                    "fail-open is enabled; admitting tenant `{}` model `{model}` without budget enforcement: {e}",
-                    resolved.tenant_name
-                ),
-            );
         }
     }
 
@@ -486,7 +490,11 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     'targets: for (ti, target) in targets.iter().enumerate() {
         let url = build_upstream_url(&target.base, &path, &query);
         last_url = url.clone();
-        let attempts: u32 = if replayable { max_retries as u32 + 1 } else { 1 };
+        let attempts: u32 = if replayable {
+            max_retries as u32 + 1
+        } else {
+            1
+        };
         for attempt in 0..attempts {
             let more_attempts = attempt + 1 < attempts;
             let more_targets = replayable && ti + 1 < total_targets;
@@ -736,28 +744,31 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             }
         }
 
-        // reconcile estimate vs actual against the budget bucket
-        if let Err(e) = stream_state
-            .redis
-            .reconcile_budget(
-                &resolved_for_stream.tenant_id,
-                capacity,
-                est.total(),
-                input_tokens.saturating_add(output_tokens),
-            )
-            .await
-        {
-            tracing::warn!(error = %e, "budget reconcile failed");
-            stream_state.alerts.issue(
-                "redis_budget_reconcile_failed",
-                "Redis budget reconcile failed",
-                format!(
-                    "tenant `{}` model `{model}` estimated `{}` actual `{}`: {e}",
-                    resolved_for_stream.tenant_name,
+        // Reconcile estimate vs actual against the per-minute budget bucket.
+        // A zero token rate means the tenant has no per-minute limiter.
+        if capacity > 0 {
+            if let Err(e) = stream_state
+                .redis
+                .reconcile_budget(
+                    &resolved_for_stream.tenant_id,
+                    capacity,
                     est.total(),
                     input_tokens.saturating_add(output_tokens),
-                ),
-            );
+                )
+                .await
+            {
+                tracing::warn!(error = %e, "budget reconcile failed");
+                stream_state.alerts.issue(
+                    "redis_budget_reconcile_failed",
+                    "Redis budget reconcile failed",
+                    format!(
+                        "tenant `{}` model `{model}` estimated `{}` actual `{}`: {e}",
+                        resolved_for_stream.tenant_name,
+                        est.total(),
+                        input_tokens.saturating_add(output_tokens),
+                    ),
+                );
+            }
         }
 
         // ---- term-usage commit + budget alerts (Phase 3 + Phase 5) ----
@@ -1103,10 +1114,7 @@ fn requires_registered_model(path: &str) -> bool {
 /// True when the endpoint carries the model name in a multipart/form-data body
 /// (audio transcription/translation file uploads) rather than JSON.
 fn is_multipart_endpoint(path: &str) -> bool {
-    matches!(
-        path,
-        "/v1/audio/transcriptions" | "/v1/audio/translations"
-    )
+    matches!(path, "/v1/audio/transcriptions" | "/v1/audio/translations")
 }
 
 /// A single parsed `multipart/form-data` field, held in memory so it can be
@@ -1120,7 +1128,10 @@ struct MultipartField {
 
 /// Parse an in-memory multipart body into its fields. The whole body is already
 /// buffered (bounded by `BODY_LIMIT`), so this just re-reads it through `multer`.
-async fn parse_multipart(body: &Bytes, boundary: &str) -> Result<Vec<MultipartField>, multer::Error> {
+async fn parse_multipart(
+    body: &Bytes,
+    boundary: &str,
+) -> Result<Vec<MultipartField>, multer::Error> {
     let bytes = body.clone();
     let stream =
         futures_util::stream::once(async move { Ok::<Bytes, std::convert::Infallible>(bytes) });
@@ -1187,11 +1198,7 @@ fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value
     };
     match route.model_type.as_str() {
         "image" => {
-            let n = json
-                .get("n")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1)
-                .max(1);
+            let n = json.get("n").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
             n as f64 * route.cost_per_image
         }
         "audio_speech" => {
@@ -1602,7 +1609,14 @@ mod tests {
     use std::time::Duration;
     use uuid::Uuid;
 
-    fn endpoint(id: &str, base: &str, priority: i64, weight: i64, enabled: bool, healthy: bool) -> ResolvedEndpoint {
+    fn endpoint(
+        id: &str,
+        base: &str,
+        priority: i64,
+        weight: i64,
+        enabled: bool,
+        healthy: bool,
+    ) -> ResolvedEndpoint {
         ResolvedEndpoint {
             id: id.into(),
             api_base: base.into(),
@@ -1664,7 +1678,11 @@ mod tests {
     fn api_base_with_full_endpoint_is_not_doubled() {
         // Operator pasted the full endpoint URL as api_base instead of the base.
         assert_eq!(
-            build_upstream_url("https://openai.rc.asu.edu/v1/embeddings", "/v1/embeddings", ""),
+            build_upstream_url(
+                "https://openai.rc.asu.edu/v1/embeddings",
+                "/v1/embeddings",
+                ""
+            ),
             "https://openai.rc.asu.edu/v1/embeddings"
         );
         assert_eq!(

@@ -1,7 +1,7 @@
 "use client";
 
 import { Fragment, useState, useTransition } from "react";
-import { ChevronDown, Plus, Trash2, X } from "lucide-react";
+import { ChevronDown, Info, Plus, Trash2, X } from "lucide-react";
 import {
   deleteTenantAction,
   setTenantAllowlistAction,
@@ -16,6 +16,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Tenant, WeeklyWindow } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 
@@ -87,7 +88,12 @@ export function TenantTable({ tenants, models }: { tenants: Tenant[]; models: st
         <tr className="border-b border-border text-left text-xs text-muted-foreground">
           <th className="px-6 py-3 font-medium">Name</th>
           <th className="px-3 py-3 font-medium">Status</th>
-          <th className="px-3 py-3 font-medium">Quotas</th>
+          <th className="px-3 py-3 font-medium">
+            <div className="flex items-center gap-1.5">
+              Limits
+              <InfoTip>Optional safety caps for tokens per minute and tenant in-flight requests. Blank or 0 means no token-rate cap.</InfoTip>
+            </div>
+          </th>
           <th className="px-3 py-3 font-medium">Fairshare weight</th>
           <th className="px-3 py-3 text-right font-medium">Edit</th>
         </tr>
@@ -164,6 +170,25 @@ export function TenantTable({ tenants, models }: { tenants: Tenant[]; models: st
         )}
       </tbody>
     </table>
+  );
+}
+
+function InfoTip({ children }: { children: string }) {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label={children}
+          className="inline-flex h-4 w-4 items-center justify-center rounded-sm text-muted-foreground hover:bg-muted/30 hover:text-foreground"
+        >
+          <Info className="h-3.5 w-3.5" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" align="start" className="max-w-xs leading-relaxed">
+        {children}
+      </TooltipContent>
+    </Tooltip>
   );
 }
 

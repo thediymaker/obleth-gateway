@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useState, useTransition, type ReactNode } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Pencil, RefreshCw, Search, X } from "lucide-react";
+import { Activity, BarChart3, Check, LayoutDashboard, Network, Pencil, RefreshCw, Search, Users, X } from "lucide-react";
 import {
   Area,
   AreaChart,
@@ -123,6 +123,7 @@ const OTHERS_COLOR = "hsl(240 6% 42%)";
 
 type ThroughputMetric = "requests" | "tokens";
 type TenantSort = "pressure" | "queued" | "deficit" | "served" | "score" | "weight" | "share";
+type TenantScope = "all" | "active" | "waiting" | "starved";
 
 // ---------------------------------------------------------------------------
 // Root
@@ -163,38 +164,66 @@ export function FairshareDashboard({
   };
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-6">
       <LiveConsoleHeader
         view={view}
+        summary={summary}
         isFetching={isFetching}
         onRefresh={refresh}
       />
 
-      <PressureStrip view={view} summary={summary} />
+      <FairshareSectionNav />
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.75fr)_minmax(21rem,0.75fr)]">
-        <CapacityTimeline history={groupHistory} groups={groupKeys} view={view} />
-        <SchedulerNow view={view} summary={summary} />
-      </div>
+      <section id="live" className="scroll-mt-20 space-y-4">
+        <SectionHeader
+          eyebrow="Live state"
+          title="Scheduler pressure"
+          description="Backlog, active work, and the next admission decision."
+        />
+        <PressureStrip view={view} summary={summary} />
+        <div className="grid gap-4 xl:grid-cols-[minmax(21rem,0.82fr)_minmax(0,1.55fr)]">
+          <SchedulerNow view={view} summary={summary} />
+          <CapacityTimeline history={groupHistory} groups={groupKeys} view={view} />
+        </div>
+      </section>
 
-      <FairshareDebtExplainer algorithm={view?.algorithm} />
+      <section id="allocation" className="scroll-mt-20 space-y-4">
+        <SectionHeader
+          eyebrow="Allocation"
+          title="Group pools"
+          description="How groups and tenants are apportioned before an individual tenant is picked."
+        />
+        <GroupAllocation view={view} />
+      </section>
 
-      <GroupAllocation view={view} />
+      <section id="tenants" className="scroll-mt-20 space-y-4">
+        <SectionHeader
+          eyebrow="Tenants"
+          title="Contention ledger"
+          description="Search, filter, sort, and adjust tenant fairshare weight."
+        />
+        <TenantOperations view={view} />
+      </section>
 
-      <TenantOperations view={view} />
-
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.4fr)_minmax(24rem,0.8fr)]">
-        <ThroughputPanel
-          data={throughput.data}
-          series={throughput.series}
-          metric={throughputMetric}
-          onMetricChange={setThroughputMetric}
+      <section id="workload" className="scroll-mt-20 space-y-4">
+        <SectionHeader
+          eyebrow="Workload"
+          title="Traffic evidence"
+          description="Request streams, models, and keys that are driving scheduler state."
         />
         <div className="space-y-4">
-          <ModelUsagePanel rows={modelRows} />
-          <KeyUsagePanel rows={keyRows} />
+          <ThroughputPanel
+            data={throughput.data}
+            series={throughput.series}
+            metric={throughputMetric}
+            onMetricChange={setThroughputMetric}
+          />
+          <div className="grid gap-4 lg:grid-cols-2">
+            <ModelUsagePanel rows={modelRows} />
+            <KeyUsagePanel rows={keyRows} />
+          </div>
         </div>
-      </div>
+      </section>
     </div>
   );
 }
@@ -323,7 +352,6 @@ function useModelRoutes() {
 
 interface FairshareSummary {
   utilization: number;
-  headroom: number;
   activeTenants: number;
   activeGroups: number;
   starvedTenants: number;
@@ -339,7 +367,6 @@ function summarizeFairshare(view?: FairshareLiveView): FairshareSummary {
   if (!view) {
     return {
       utilization: 0,
-      headroom: 0,
       activeTenants: 0,
       activeGroups: 0,
       starvedTenants: 0,
@@ -361,7 +388,6 @@ function summarizeFairshare(view?: FairshareLiveView): FairshareSummary {
 
   return {
     utilization: view.max_in_flight > 0 ? (view.global_in_flight / view.max_in_flight) * 100 : 0,
-    headroom: Math.max(0, view.max_in_flight - view.global_in_flight),
     activeTenants,
     activeGroups,
     starvedTenants: starved.length,
@@ -510,40 +536,124 @@ function buildModelUsageRows(usage: UsageModelRow[], routes: ModelRoute[]): Mode
 
 function LiveConsoleHeader({
   view,
+  summary,
   isFetching,
   onRefresh,
 }: {
   view?: FairshareLiveView;
+  summary: FairshareSummary;
   isFetching: boolean;
   onRefresh: () => void;
 }) {
+  const tone = pressureStatus(summary.utilization, view?.global_queued ?? 0);
+  const label =
+    tone === "hot"
+      ? "Admission hot"
+      : tone === "warn"
+        ? (view?.global_queued ?? 0) > 0
+          ? "Queue building"
+          : "High usage"
+        : "Scheduler clear";
+  const detail = view
+    ? `${formatNumber(view.global_in_flight)} active / ${formatNumber(view.global_queued)} queued / ${formatNumber(summary.waitingTenants)} waiting tenants`
+    : "Waiting for live scheduler state";
+
   return (
     <div className="rounded-md border border-border bg-card px-4 py-3">
       <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge className="capitalize">{view?.algorithm ?? "loading"} admission</Badge>
-          <Badge className="gap-1.5">
-            <span className="h-1.5 w-1.5 rounded-full bg-[hsl(160_14%_58%)]" />
-            poll {FAIRSHARE_POLL_MS / 1000}s
-          </Badge>
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge
+              className={cn(
+                "gap-1.5",
+                tone === "hot" && "border-red-500/35 bg-red-500/10 text-red-300",
+                tone === "warn" && "border-amber-500/35 bg-amber-500/10 text-amber-300",
+              )}
+            >
+              <Activity className="h-3.5 w-3.5" />
+              {label}
+            </Badge>
+            <Badge className="capitalize">{view?.algorithm ?? "loading"} admission</Badge>
+            <Badge className="gap-1.5">
+              <span className="h-1.5 w-1.5 rounded-full bg-[hsl(160_14%_58%)]" />
+              poll {FAIRSHARE_POLL_MS / 1000}s
+            </Badge>
+          </div>
+          <p className="mt-2 truncate text-xs text-muted-foreground">{detail}</p>
         </div>
-        <Button type="button" variant="secondary" size="sm" onClick={onRefresh}>
-          <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
-          Refresh
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Button type="button" variant="outline" size="sm" asChild>
+            <Link href="/">
+              <LayoutDashboard className="h-3.5 w-3.5" />
+              Overview
+            </Link>
+          </Button>
+          <Button type="button" variant="secondary" size="sm" onClick={onRefresh}>
+            <RefreshCw className={cn("h-3.5 w-3.5", isFetching && "animate-spin")} />
+            Refresh
+          </Button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function FairshareSectionNav() {
+  const items = [
+    { href: "#live", label: "Live", icon: Activity },
+    { href: "#allocation", label: "Allocation", icon: Network },
+    { href: "#tenants", label: "Tenants", icon: Users },
+    { href: "#workload", label: "Workload", icon: BarChart3 },
+  ];
+
+  return (
+    <div className="sticky top-2 z-20 overflow-x-auto rounded-md border border-border bg-card/95 p-2 backdrop-blur">
+      <nav className="flex min-w-max items-center gap-2" aria-label="Fairshare sections">
+        {items.map((item) => {
+          const Icon = item.icon;
+          return (
+            <a
+              key={item.href}
+              href={item.href}
+              className="inline-flex h-8 items-center gap-2 rounded-sm border border-border bg-background/35 px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/20 hover:text-foreground"
+            >
+              <Icon className="h-3.5 w-3.5" />
+              {item.label}
+            </a>
+          );
+        })}
+      </nav>
+    </div>
+  );
+}
+
+function SectionHeader({
+  eyebrow,
+  title,
+  description,
+}: {
+  eyebrow: string;
+  title: string;
+  description: string;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{eyebrow}</p>
+      <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
+        <h2 className="text-base font-semibold tracking-tight">{title}</h2>
+        <p className="max-w-2xl text-xs text-muted-foreground">{description}</p>
       </div>
     </div>
   );
 }
 
 function PressureStrip({ view, summary }: { view?: FairshareLiveView; summary: FairshareSummary }) {
-  const pressureTone = pressureStatus(summary.utilization, view?.global_queued ?? 0);
   const items = [
     {
-      label: "Capacity",
-      value: view ? `${formatNumber(view.global_in_flight)} / ${formatNumber(view.max_in_flight)}` : "--",
-      sub: view ? `${formatPct(summary.utilization)} used, ${formatNumber(summary.headroom)} open` : "waiting",
-      tone: pressureTone,
+      label: "In flight",
+      value: view ? formatNumber(view.global_in_flight) : "--",
+      sub: view && view.global_in_flight > 0 ? "requests active now" : "no active requests",
+      tone: "neutral",
     },
     {
       label: "Queue",
@@ -557,7 +667,7 @@ function PressureStrip({ view, summary }: { view?: FairshareLiveView; summary: F
     {
       label: "Tenants",
       value: view ? `${formatNumber(summary.activeTenants)} / ${formatNumber(view.tenants.length)}` : "--",
-      sub: `${formatNumber(summary.starvedTenants)} below fair slots`,
+      sub: `${formatNumber(summary.starvedTenants)} below fair share`,
       tone: summary.starvedTenants > 0 ? "hot" : "ok",
     },
     {
@@ -566,16 +676,10 @@ function PressureStrip({ view, summary }: { view?: FairshareLiveView; summary: F
       sub: `${formatNumber(summary.totalGroupWeight)} total group weight`,
       tone: "neutral",
     },
-    {
-      label: "Served work",
-      value: view ? formatCompact(summary.totalServed) : "--",
-      sub: `${formatNumber(summary.totalTenantWeight)} total tenant weight`,
-      tone: "neutral",
-    },
   ] satisfies MetricTile[];
 
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-5">
+    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
       {items.map((item) => (
         <MetricCard key={item.label} item={item} />
       ))}
@@ -610,7 +714,7 @@ function MetricCard({ item }: { item: MetricTile }) {
 }
 
 // ---------------------------------------------------------------------------
-// Capacity timeline and scheduler now
+// Live timeline and scheduler now
 // ---------------------------------------------------------------------------
 
 function CapacityTimeline({
@@ -626,16 +730,13 @@ function CapacityTimeline({
     <Card className="h-full rounded-md">
       <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <CardTitle>Live slots</CardTitle>
-          <CardDescription>
-            Group occupancy scales to active slots; queued work uses the right axis
-          </CardDescription>
+          <CardTitle>Live occupancy</CardTitle>
+          <CardDescription>Group activity over time; queued work uses the right axis</CardDescription>
         </div>
         {view && (
           <div className="flex flex-wrap justify-start gap-2 text-xs sm:justify-end">
             <Badge>{formatNumber(view.global_in_flight)} in flight</Badge>
             <Badge>{formatNumber(view.global_queued)} queued</Badge>
-            <Badge>{formatNumber(view.max_in_flight)} max</Badge>
           </div>
         )}
       </CardHeader>
@@ -724,14 +825,12 @@ function SchedulerNow({ view, summary }: { view?: FairshareLiveView; summary: Fa
         <CardTitle>Scheduler now</CardTitle>
         <CardDescription>Admission pressure and current fair-share posture</CardDescription>
       </CardHeader>
-      <CardContent className="space-y-5">
-        <CapacityMeter view={view} summary={summary} />
-
+      <CardContent className="space-y-4">
         <div className="grid grid-cols-2 gap-3">
-          <MiniStat label="Headroom" value={view ? formatNumber(summary.headroom) : "--"} />
-          <MiniStat label="Waiting tenants" value={view ? formatNumber(summary.waitingTenants) : "--"} />
-          <MiniStat label="Starved" value={view ? formatNumber(summary.starvedTenants) : "--"} tone={summary.starvedTenants > 0 ? "hot" : "ok"} />
-          <MiniStat label="Queue depth" value={view ? formatNumber(view.global_queued) : "--"} tone={(view?.global_queued ?? 0) > 0 ? "warn" : "ok"} />
+          <MiniStat label="In flight" value={view ? formatNumber(view.global_in_flight) : "--"} />
+          <MiniStat label="Queued" value={view ? formatNumber(view.global_queued) : "--"} tone={(view?.global_queued ?? 0) > 0 ? "warn" : "ok"} />
+          <MiniStat label="Waiting tenants" value={view ? formatNumber(summary.waitingTenants) : "--"} tone={summary.waitingTenants > 0 ? "warn" : "ok"} />
+          <MiniStat label="Below fair" value={view ? formatNumber(summary.starvedTenants) : "--"} tone={summary.starvedTenants > 0 ? "hot" : "ok"} />
         </div>
 
         <PriorityReadout
@@ -741,37 +840,14 @@ function SchedulerNow({ view, summary }: { view?: FairshareLiveView; summary: Fa
           valueLabel={next ? `debt ${formatScore(tenantDebt(view, next))}` : ""}
         />
         <PriorityReadout
-          title="Largest slot deficit"
+          title="Largest fair-share gap"
           tenant={deficit}
           empty="No active deficit"
-          valueLabel={deficit ? `${formatDelta(fairnessGap(deficit))} slots` : ""}
+          valueLabel={deficit ? formatDelta(fairnessGap(deficit)) : ""}
           highlight={deficit ? isStarved(deficit) : false}
         />
       </CardContent>
     </Card>
-  );
-}
-
-function CapacityMeter({ view, summary }: { view?: FairshareLiveView; summary: FairshareSummary }) {
-  const util = clamp(summary.utilization, 0, 100);
-  const color = util >= 90 ? STARVED_COLOR : util >= 70 ? QUEUED_COLOR : HEALTHY_COLOR;
-
-  return (
-    <div>
-      <div className="mb-2 flex items-baseline justify-between gap-2">
-        <span className="text-xs font-medium text-muted-foreground">Capacity used</span>
-        <span className="text-2xl font-semibold tabular-nums" style={{ color }}>
-          {view ? formatPct(util) : "--"}
-        </span>
-      </div>
-      <div className="relative h-3 overflow-hidden rounded-sm bg-muted/40">
-        <div className="h-full rounded-sm transition-all duration-500" style={{ width: `${util}%`, background: color }} />
-      </div>
-      <div className="mt-2 flex items-center justify-between text-[11px] tabular-nums text-muted-foreground">
-        <span>{view ? `${formatNumber(view.global_in_flight)} active` : "waiting"}</span>
-        <span>{view ? `${formatNumber(view.max_in_flight)} slots` : "--"}</span>
-      </div>
-    </div>
   );
 }
 
@@ -844,56 +920,6 @@ function PriorityReadout({
 // ---------------------------------------------------------------------------
 // Groups
 // ---------------------------------------------------------------------------
-
-function FairshareDebtExplainer({ algorithm }: { algorithm?: string }) {
-  const hierarchical = algorithm === "hierarchical";
-
-  return (
-    <Card className="rounded-md">
-      <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <CardTitle>Fairshare debt</CardTitle>
-          <CardDescription>
-            Lower debt is closer to the front of the scheduler line. Weight makes expensive tenants or groups accrue
-            debt more slowly.
-          </CardDescription>
-        </div>
-        {algorithm && <Badge className="capitalize">{algorithm}</Badge>}
-      </CardHeader>
-      <CardContent className="grid gap-3 text-xs text-muted-foreground md:grid-cols-3">
-        <DebtNote
-          label="Group debt"
-          value="served tokens / group weight"
-          detail={
-            hierarchical
-              ? "Hierarchical mode picks the lowest-debt eligible group before picking a tenant inside it."
-              : "Weighted mode still exposes group totals, but groups do not gate admission."
-          }
-        />
-        <DebtNote
-          label="Tenant debt"
-          value="served tokens / tenant weight"
-          detail="Within an eligible pool, the queued tenant with the lowest debt is owed service first."
-        />
-        <DebtNote
-          label="Slot deficit"
-          value="active slots - expected slots"
-          detail="Deficit is separate from debt: it flags tenants waiting below their steady-state slot share."
-        />
-      </CardContent>
-    </Card>
-  );
-}
-
-function DebtNote({ label, value, detail }: { label: string; value: string; detail: string }) {
-  return (
-    <div className="rounded-sm border border-border bg-background/30 px-3 py-2">
-      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
-      <p className="mt-1 font-mono text-[11px] text-foreground">{value}</p>
-      <p className="mt-1 leading-5">{detail}</p>
-    </div>
-  );
-}
 
 function GroupAllocation({ view }: { view?: FairshareLiveView }) {
   const groups = useMemo(
@@ -1020,6 +1046,7 @@ function GroupNumber({
 function TenantOperations({ view }: { view?: FairshareLiveView }) {
   const [query, setQuery] = useState("");
   const [groupFilter, setGroupFilter] = useState("all");
+  const [scope, setScope] = useState<TenantScope>("active");
   const [sort, setSort] = useState<TenantSort>("pressure");
 
   const groups = useMemo(() => {
@@ -1033,6 +1060,9 @@ function TenantOperations({ view }: { view?: FairshareLiveView }) {
     const q = query.trim().toLowerCase();
     let out = [...(view?.tenants ?? [])];
     if (groupFilter !== "all") out = out.filter((t) => t.fairshare_group === groupFilter);
+    if (scope === "active") out = out.filter(isTenantActive);
+    if (scope === "waiting") out = out.filter((t) => t.queued > 0);
+    if (scope === "starved") out = out.filter(isStarved);
     if (q) {
       out = out.filter(
         (t) =>
@@ -1063,10 +1093,13 @@ function TenantOperations({ view }: { view?: FairshareLiveView }) {
     });
 
     return out;
-  }, [view, query, groupFilter, sort]);
+  }, [view, query, groupFilter, scope, sort]);
 
   const shown = rows.slice(0, TENANT_PAGE);
   const starved = useMemo(() => rows.filter(isStarved).length, [rows]);
+  const totalActive = view?.tenants.filter(isTenantActive).length ?? 0;
+  const totalWaiting = view?.tenants.filter((t) => t.queued > 0).length ?? 0;
+  const totalStarved = view?.tenants.filter(isStarved).length ?? 0;
 
   return (
     <Card className="rounded-md">
@@ -1080,6 +1113,12 @@ function TenantOperations({ view }: { view?: FairshareLiveView }) {
           </CardDescription>
         </div>
         <div className="flex flex-wrap items-center gap-2">
+          <div className="inline-flex rounded-sm border border-border bg-background/35 p-0.5">
+            <ScopeToggle active={scope === "active"} label={`Active ${formatNumber(totalActive)}`} onClick={() => setScope("active")} />
+            <ScopeToggle active={scope === "waiting"} label={`Waiting ${formatNumber(totalWaiting)}`} onClick={() => setScope("waiting")} />
+            <ScopeToggle active={scope === "starved"} label={`Below fair ${formatNumber(totalStarved)}`} onClick={() => setScope("starved")} />
+            <ScopeToggle active={scope === "all"} label="All" onClick={() => setScope("all")} />
+          </div>
           <div className="relative">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
@@ -1307,6 +1346,30 @@ function WeightCell({ id, weight }: { id: string; weight: number }) {
         <X className="h-3.5 w-3.5" />
       </button>
     </div>
+  );
+}
+
+function ScopeToggle({
+  active,
+  label,
+  onClick,
+}: {
+  active: boolean;
+  label: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-pressed={active}
+      onClick={onClick}
+      className={cn(
+        "inline-flex h-7 items-center rounded-sm px-2.5 text-xs transition-colors",
+        active ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {label}
+    </button>
   );
 }
 

@@ -20,7 +20,7 @@ create table if not exists tenants (
     -- fairshare weight; higher = larger share under contention (priority boost)
     weight            bigint not null default 100 check (weight >= 1),
     -- sustained token budget refilled per minute (token-bucket rate)
-    tokens_per_minute bigint not null default 60000 check (tokens_per_minute >= 0),
+    tokens_per_minute bigint not null default 0 check (tokens_per_minute >= 0),
     -- optional per-tenant in-flight cap; null = only the global limit applies
     max_in_flight     bigint,
     fairshare_group   text not null default 'default' references fairshare_groups (name),

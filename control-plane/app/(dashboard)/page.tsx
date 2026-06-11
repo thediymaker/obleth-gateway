@@ -24,7 +24,6 @@ export default async function OverviewPage() {
     costs,
     volumeSeries,
     tenantSeries,
-    audit,
     cacheStats,
     health,
     fairshare,
@@ -39,7 +38,6 @@ export default async function OverviewPage() {
     safe(obleth.costs(dayAgo), []),
     safe(obleth.usageSeries(300_000, dayAgo), []),
     safe(obleth.usageSeriesByTenant(60_000, hourAgo), []),
-    safe(obleth.audit(8), []),
     safe<CacheStats | undefined>(obleth.cacheStats(dayAgo), undefined),
     safe<ModelHealthSummary[]>(obleth.modelHealth(), []),
     safe<FairshareLiveView | undefined>(obleth.fairshareLive(), undefined),
@@ -53,7 +51,7 @@ export default async function OverviewPage() {
       <div>
         <h1 className="text-lg font-semibold tracking-tight">Overview</h1>
         <p className="text-sm text-muted-foreground">
-          Gateway traffic, capacity, and route health. For full scheduler state see{" "}
+          At-a-glance gateway health, traffic, and route posture. For scheduler details see{" "}
           <Link href="/fairshare" className="underline underline-offset-2 hover:text-foreground">
             Fairshare
           </Link>
@@ -69,7 +67,6 @@ export default async function OverviewPage() {
         initialTenantSeries={tenantSeries}
         initialModelUsage={usageByModel}
         initialKeyUsage={usageByKey}
-        initialAudit={audit}
         initialCacheStats={cacheStats}
         initialHealth={health}
         initialFairshare={fairshare}

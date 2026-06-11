@@ -277,12 +277,9 @@ fn bill_describe(
     let cost_usd = (result.input_tokens as f64) * describer.input_cost_per_token
         + (result.output_tokens as f64) * describer.output_cost_per_token;
 
-    state.metrics.record_request(
-        "boon",
-        200,
-        result.input_tokens,
-        result.output_tokens,
-    );
+    state
+        .metrics
+        .record_request("boon", 200, result.input_tokens, result.output_tokens);
     // Internal probe keys are not billed; mirror `finalize`.
     if key.internal {
         return;

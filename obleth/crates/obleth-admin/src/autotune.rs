@@ -34,8 +34,8 @@
 //! in the store). Local/self-hosted models are the intended target — cloud
 //! models should stay on a `static` cap to bound spend.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use obleth_config::ModelRoute;
@@ -231,8 +231,22 @@ fn probe_url(api_base: &str, modality: Modality) -> String {
 /// per token, so we emit that many words from a small repeating vocabulary.
 fn filler_text(approx_tokens: usize) -> String {
     const WORDS: [&str; 16] = [
-        "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dog", "lorem", "ipsum", "dolor",
-        "sit", "amet", "consectetur", "adipiscing", "elit",
+        "the",
+        "quick",
+        "brown",
+        "fox",
+        "jumps",
+        "over",
+        "lazy",
+        "dog",
+        "lorem",
+        "ipsum",
+        "dolor",
+        "sit",
+        "amet",
+        "consectetur",
+        "adipiscing",
+        "elit",
     ];
     let n_words = ((approx_tokens as f64) * 0.75).ceil() as usize;
     let mut s = String::with_capacity(n_words * 7);
@@ -328,7 +342,11 @@ fn recommend(steps: &[AutotuneStep], latency_ceiling_ms: u64) -> (usize, KneeRea
         // Even a single request degraded past the ceiling — recommend the
         // lowest level and flag latency as the limit.
         let first = usable[0];
-        return (first.concurrency, KneeReason::LatencyDegraded, first.throughput_rps);
+        return (
+            first.concurrency,
+            KneeReason::LatencyDegraded,
+            first.throughput_rps,
+        );
     }
 
     let peak = allowed
@@ -619,11 +637,7 @@ mod tests {
 
     #[test]
     fn recommends_max_when_still_climbing() {
-        let steps = vec![
-            step(1, 10.0, 100),
-            step(2, 20.0, 120),
-            step(4, 40.0, 150),
-        ];
+        let steps = vec![step(1, 10.0, 100), step(2, 20.0, 120), step(4, 40.0, 150)];
         let (rec, reason, _) = recommend(&steps, 5000);
         assert_eq!(rec, 4);
         assert_eq!(reason, KneeReason::MaxConcurrency);

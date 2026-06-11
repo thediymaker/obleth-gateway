@@ -45,7 +45,9 @@ async fn effective_retention_days(state: &AdminState) -> i64 {
 
 /// Drop every `usage` day-partition older than the retention window. Safe to
 /// call repeatedly; only partitions strictly older than the cutoff are removed.
-pub async fn compact_usage_now(state: &AdminState) -> Result<CompactResult, clickhouse::error::Error> {
+pub async fn compact_usage_now(
+    state: &AdminState,
+) -> Result<CompactResult, clickhouse::error::Error> {
     let retention_days = effective_retention_days(state).await;
     let cutoff_date = (Utc::now() - ChronoDuration::days(retention_days)).date_naive();
     // Partition ids are `YYYYMMDD` integers; build the same shape to compare.

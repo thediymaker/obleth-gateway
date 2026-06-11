@@ -21,6 +21,10 @@ local rate  = tonumber(ARGV[2])
 local now   = tonumber(ARGV[3])
 local req   = tonumber(ARGV[4])
 
+if cap <= 0 then
+  return { 1, 0 }
+end
+
 local data    = redis.call('HMGET', key, 'tokens', 'ts')
 local tokens  = tonumber(data[1])
 local ts      = tonumber(data[2])
@@ -90,6 +94,10 @@ if ARGV[5] == '1' then
   end
 end
 
+if cap <= 0 then
+  return { 1, 0, term_tokens, term_cost }
+end
+
 local data    = redis.call('HMGET', bucket, 'tokens', 'ts')
 local tokens  = tonumber(data[1])
 local ts      = tonumber(data[2])
@@ -122,6 +130,10 @@ pub const RECONCILE: &str = r#"
 local key   = KEYS[1]
 local cap   = tonumber(ARGV[1])
 local delta = tonumber(ARGV[2])
+
+if cap <= 0 then
+  return 0
+end
 
 local tokens = tonumber(redis.call('HGET', key, 'tokens'))
 if tokens == nil then tokens = cap end

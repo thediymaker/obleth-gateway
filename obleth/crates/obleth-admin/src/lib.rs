@@ -28,7 +28,9 @@ use obleth_config::{
     hash_api_key, ApiKey, FairshareGroup, McpServer, ModelEndpoint, ModelRoute, ResolvedKey,
     ResolvedMcpServer, ResolvedModel, Tenant,
 };
-use obleth_config::{AlertSettings, AutoRouterSettings, BoonSettings, EmailSettings, VisionBoonSettings};
+use obleth_config::{
+    AlertSettings, AutoRouterSettings, BoonSettings, EmailSettings, VisionBoonSettings,
+};
 use obleth_fairshare::{FairShare, StaticCapacity, Stats};
 use obleth_redis::RedisStore;
 use obleth_store::{AuditEntry, Store};
@@ -628,7 +630,7 @@ async fn create_tenant(
         .create_tenant(
             &body.name,
             body.weight.unwrap_or(100),
-            body.tokens_per_minute.unwrap_or(60_000),
+            body.tokens_per_minute.unwrap_or(0),
             body.max_in_flight,
             body.fairshare_group.as_deref(),
         )
@@ -1740,9 +1742,7 @@ pub struct UpdateUsageRetention {
     get, path = "/api/v1/settings/usage-retention", tag = "settings",
     responses((status = 200, body = UsageRetentionView))
 )]
-async fn get_usage_retention(
-    State(state): State<AdminState>,
-) -> Result<Json<UsageRetentionView>> {
+async fn get_usage_retention(State(state): State<AdminState>) -> Result<Json<UsageRetentionView>> {
     let saved = state.store.get_usage_retention_settings().await?;
     let view = match saved {
         Some(s) => UsageRetentionView {

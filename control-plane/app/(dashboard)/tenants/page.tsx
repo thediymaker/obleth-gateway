@@ -1,6 +1,6 @@
 import { CreateTenant } from "@/components/create-tenant";
 import { TenantTable } from "@/components/tenant-table";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { obleth, type ModelRoute, type Tenant } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
@@ -17,7 +17,7 @@ export default async function TenantsPage() {
     <div className="space-y-6">
       <div>
         <h1 className="text-lg font-semibold tracking-tight">Tenants</h1>
-        <p className="text-sm text-muted-foreground">Fairshare units — adjust weight for live priority boosts</p>
+        <p className="text-sm text-muted-foreground">Fairshare units - adjust weight for live priority boosts</p>
       </div>
 
       <Card>
@@ -32,7 +32,6 @@ export default async function TenantsPage() {
       <Card>
         <CardHeader>
           <CardTitle>Tenant configuration</CardTitle>
-          <CardDescription>Update request budgets and fairshare weights, or expand a row to edit details</CardDescription>
         </CardHeader>
         <CardContent className="overflow-x-auto p-0">
           <TenantTable tenants={tenants} models={modelNames} />

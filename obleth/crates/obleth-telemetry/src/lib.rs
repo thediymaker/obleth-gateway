@@ -261,9 +261,7 @@ fn is_valid_identifier(name: &str) -> bool {
             .bytes()
             .next()
             .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryError> {

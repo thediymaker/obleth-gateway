@@ -60,20 +60,19 @@ impl Store {
     /// instances — and `api_keys.key_hash` is included so client keys keep
     /// authenticating after a restore.
     pub async fn export_backup_data(&self) -> Result<BackupData> {
-        let fairshare_groups = sqlx::query(
-            "select name, weight, created_at from fairshare_groups order by name",
-        )
-        .fetch_all(&self.pool)
-        .await?
-        .iter()
-        .map(|row| {
-            Ok(FairshareGroupBackup {
-                name: row.try_get("name")?,
-                weight: row.try_get("weight")?,
-                created_at: row.try_get("created_at")?,
-            })
-        })
-        .collect::<Result<Vec<_>>>()?;
+        let fairshare_groups =
+            sqlx::query("select name, weight, created_at from fairshare_groups order by name")
+                .fetch_all(&self.pool)
+                .await?
+                .iter()
+                .map(|row| {
+                    Ok(FairshareGroupBackup {
+                        name: row.try_get("name")?,
+                        weight: row.try_get("weight")?,
+                        created_at: row.try_get("created_at")?,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
 
         let tenants = sqlx::query(
             "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight,

@@ -149,10 +149,7 @@ pub struct FairShare {
 }
 
 impl FairShare {
-    pub fn start(
-        capacity: Arc<dyn CapacityProvider>,
-        algorithm: FairshareAlgorithm,
-    ) -> Self {
+    pub fn start(capacity: Arc<dyn CapacityProvider>, algorithm: FairshareAlgorithm) -> Self {
         let (ctl, rx) = mpsc::unbounded_channel();
         let stats = Arc::new(Stats::default());
         let model_load = Arc::new(RwLock::new(HashMap::new()));
@@ -337,10 +334,7 @@ impl Scheduler {
     /// Bump a model's in-flight count and propagate the change to the shared
     /// mirror read by [`FairShare::model_load`].
     fn inc_model_in_flight(&mut self, model: &str) {
-        *self
-            .model_in_flight
-            .entry(model.to_string())
-            .or_insert(0) += 1;
+        *self.model_in_flight.entry(model.to_string()).or_insert(0) += 1;
         self.publish_model_load(model);
     }
 
@@ -784,12 +778,7 @@ impl Scheduler {
                 .cloned()
                 .unwrap_or_else(|| waiter.group.clone());
             let cap = caps.get(&group).copied().unwrap_or(max);
-            if in_flight_by_group
-                .get(group.as_str())
-                .copied()
-                .unwrap_or(0)
-                >= cap
-            {
+            if in_flight_by_group.get(group.as_str()).copied().unwrap_or(0) >= cap {
                 continue;
             }
             let tenant_cap = tenant_caps_by_group
@@ -802,11 +791,8 @@ impl Scheduler {
                 continue;
             }
             let group_weight = self.group_weight.get(&group).copied().unwrap_or(100).max(1) as f64;
-            let group_score = served_by_group
-                .get(group.as_str())
-                .copied()
-                .unwrap_or(0.0)
-                / group_weight;
+            let group_score =
+                served_by_group.get(group.as_str()).copied().unwrap_or(0.0) / group_weight;
             eligible.push((*tenant, group_score));
         }
 

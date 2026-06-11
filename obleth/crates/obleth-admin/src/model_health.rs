@@ -443,8 +443,7 @@ async fn probe_target(
                 );
             }
             Err(error) => {
-                let retryable =
-                    error.is_timeout() || error.is_connect() || error.is_request();
+                let retryable = error.is_timeout() || error.is_connect() || error.is_request();
                 if retryable && attempt < LIVENESS_MAX_ATTEMPTS {
                     continue;
                 }
@@ -713,7 +712,10 @@ mod tests {
 
     #[test]
     fn unrecognized_body_is_unknown() {
-        assert!(matches!(model_in_list("not json", "m"), ModelPresence::Unknown));
+        assert!(matches!(
+            model_in_list("not json", "m"),
+            ModelPresence::Unknown
+        ));
         assert!(matches!(
             model_in_list(r#"{"data":[]}"#, "m"),
             ModelPresence::Unknown

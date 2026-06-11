@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Boxes, Gauge, KeyRound, RefreshCw, ScrollText, Users } from "lucide-react";
+import { AlertTriangle, Boxes, Gauge, KeyRound, Radio, RefreshCw, ShieldCheck, Users, type LucideIcon } from "lucide-react";
 import {
   Area,
   CartesianGrid,
@@ -20,7 +20,6 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import type { OverviewSummary } from "@/lib/overview-summary";
 import type {
-  AuditEntry,
   CacheStats,
   FairshareLiveView,
   LiveStats,
@@ -30,6 +29,7 @@ import type {
   TenantUsageTimePoint,
   UsageAgg,
   UsageKeyAgg,
+  UsageLogEntry,
   UsageModelAgg,
   UsageTimePoint,
 } from "@/lib/obleth";
@@ -39,6 +39,7 @@ const SUMMARY_POLL_MS = 30_000;
 const FAST_POLL_MS = 2_000;
 const STATS_POLL_MS = 5_000;
 const USAGE_POLL_MS = 20_000;
+const REQUEST_LOG_POLL_MS = 15_000;
 const SLOW_POLL_MS = 60_000;
 
 const DAY_MS = 86_400_000;
@@ -69,11 +70,10 @@ const GROUP_PALETTE: Record<string, string> = {
 
 const TOKEN_COLOR = "hsl(205 18% 58%)";
 const REQUEST_COLOR = "hsl(38 65% 62%)";
-const HOT_COLOR = "hsl(350 55% 64%)";
-const OK_COLOR = "hsl(160 14% 58%)";
 
 type TrafficRange = "live" | "day";
 type MetricTone = "ok" | "warn" | "hot" | "neutral";
+type ActivityView = "tenants" | "models" | "keys";
 
 export function OverviewDashboard({
   tenants,
@@ -84,7 +84,6 @@ export function OverviewDashboard({
   initialTenantSeries,
   initialModelUsage,
   initialKeyUsage,
-  initialAudit,
   initialCacheStats,
   initialHealth,
   initialFairshare,
@@ -98,7 +97,6 @@ export function OverviewDashboard({
   initialTenantSeries: TenantUsageTimePoint[];
   initialModelUsage: UsageModelAgg[];
   initialKeyUsage: UsageKeyAgg[];
-  initialAudit: AuditEntry[];
   initialCacheStats?: CacheStats;
   initialHealth: ModelHealthSummary[];
   initialFairshare?: FairshareLiveView;
@@ -203,6 +201,7 @@ export function OverviewDashboard({
   const capacity = summarizeCapacity(fairshare, stats);
   const healthSummary = summarizeHealth(activeHealth, visibleModels);
   const cacheSummary = summarizeCache(activeCache);
+  const overviewStatus = summarizeOverviewStatus(capacity, healthSummary, fairshare);
 
   function refreshAll() {
     queryClient.invalidateQueries({ queryKey: ["live-summary"] });
@@ -228,6 +227,7 @@ export function OverviewDashboard({
     <div className="space-y-5">
       <OverviewConsoleHeader
         fairshare={fairshare}
+        status={overviewStatus}
         isFetching={isFetching}
         onRefresh={refreshAll}
       />
@@ -250,21 +250,16 @@ export function OverviewDashboard({
         <OperationsPanel
           summary={summaryQuery.data}
           capacity={capacity}
-          fairshare={fairshare}
           health={healthSummary}
           cache={cacheSummary}
           modelCount={visibleModels.length}
+          status={overviewStatus}
         />
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
-        <TenantPanel rows={tenantRows} />
-        <ModelPanel rows={modelRows} />
-      </div>
-
-      <div className="grid gap-4 xl:grid-cols-[minmax(22rem,0.82fr)_minmax(0,1.18fr)]">
-        <KeyPanel rows={keyRows} />
-        <RecentChangesPanel entries={initialAudit} />
+      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.05fr)_minmax(22rem,0.95fr)]">
+        <ActivityPanel tenantRows={tenantRows} modelRows={modelRows} keyRows={keyRows} />
+        <RequestFeedPanel />
       </div>
     </div>
   );
@@ -272,22 +267,31 @@ export function OverviewDashboard({
 
 function OverviewConsoleHeader({
   fairshare,
+  status,
   isFetching,
   onRefresh,
 }: {
   fairshare?: FairshareLiveView;
+  status: OverviewStatus;
   isFetching: boolean;
   onRefresh: () => void;
 }) {
   return (
     <div className="rounded-md border border-border bg-card px-4 py-3">
       <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
-        <div className="flex flex-wrap items-center gap-2">
-          <Badge className="capitalize">{fairshare?.algorithm ?? "loading"} admission</Badge>
-          <Badge className="gap-1.5">
-            <span className="h-1.5 w-1.5 rounded-full bg-[hsl(160_14%_58%)]" />
-            live
-          </Badge>
+        <div className="min-w-0">
+          <div className="flex flex-wrap items-center gap-2">
+            <Badge className={cn("gap-1.5", status.tone === "hot" && "border-red-500/35 bg-red-500/10 text-red-300", status.tone === "warn" && "border-amber-500/35 bg-amber-500/10 text-amber-300")}>
+              {status.tone === "ok" ? <ShieldCheck className="h-3.5 w-3.5" /> : <AlertTriangle className="h-3.5 w-3.5" />}
+              {status.label}
+            </Badge>
+            <Badge className="capitalize">{fairshare?.algorithm ?? "loading"} admission</Badge>
+            <Badge className="gap-1.5">
+              <span className="h-1.5 w-1.5 rounded-full bg-[hsl(160_14%_58%)]" />
+              live
+            </Badge>
+          </div>
+          <p className="mt-2 truncate text-xs text-muted-foreground">{status.detail}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button type="button" variant="outline" size="sm" asChild>
@@ -329,57 +333,33 @@ function OverviewMetricStrip({
   const activeGroups = new Set(tenants.filter((t) => t.fairshare_group).map((t) => t.fairshare_group)).size;
   const items = [
     {
-      label: "Capacity",
-      value: capacity.max > 0 ? `${formatNumber(capacity.inFlight)} / ${formatNumber(capacity.max)}` : "--",
-      sub: capacity.max > 0 ? `${formatPct(capacity.utilization)} used` : "waiting",
-      tone: capacity.tone,
-    },
-    {
-      label: "Queue",
+      label: "Backlog",
       value: formatNumber(capacity.queued),
       sub: capacity.waitingTenants > 0 ? `${formatNumber(capacity.waitingTenants)} tenants waiting` : "no backlog",
       tone: capacity.queued > 0 ? "warn" : "ok",
     },
     {
-      label: "Requests 24h",
-      value: formatCompact(summary.requests),
-      sub: `${formatNumber(summary.activeTenants)} active tenants`,
+      label: "Traffic 24h",
+      value: `${formatCompact(summary.requests)} req`,
+      sub: `${formatCompact(summary.tokens)} tokens / avg ${formatCompact(avgTokens)}`,
       tone: "neutral",
     },
     {
-      label: "Tokens 24h",
-      value: formatCompact(summary.tokens),
-      sub: avgTokens > 0 ? `avg ${formatCompact(avgTokens)} / request` : "input + output",
-      tone: "neutral",
-    },
-    {
-      label: "Spend 24h",
-      value: summary.hasPricing ? formatCurrency(summary.cost) : "--",
-      sub: summary.hasPricing ? "priced routes" : "pricing not set",
-      tone: "neutral",
-    },
-    {
-      label: "Model health",
+      label: "Routes",
       value: `${formatNumber(health.healthy)} / ${formatNumber(health.enabled)}`,
       sub: health.unhealthy > 0 ? `${formatNumber(health.unhealthy)} unhealthy` : `${formatNumber(health.unknown)} unknown`,
       tone: health.unhealthy > 0 ? "hot" : health.unknown > 0 ? "warn" : "ok",
     },
     {
-      label: "Tenants",
-      value: formatNumber(summary.tenantCount),
-      sub: `${formatNumber(summary.activeTenants)} active / ${formatNumber(activeGroups)} groups`,
-      tone: "neutral",
-    },
-    {
-      label: "API keys",
-      value: formatCompact(summary.keyCount),
-      sub: `cache ${cache.hitRateLabel}`,
+      label: "Cost and cache",
+      value: summary.hasPricing ? formatCurrency(summary.cost) : "--",
+      sub: `${formatNumber(summary.activeTenants)} active tenants / cache ${cache.hitRateLabel} / ${formatNumber(activeGroups)} groups`,
       tone: "neutral",
     },
   ] satisfies MetricTile[];
 
   return (
-    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+    <div className="grid grid-cols-2 gap-3 xl:grid-cols-4">
       {items.map((item) => (
         <MetricCard key={item.label} item={item} />
       ))}
@@ -520,64 +500,87 @@ function TrafficPanel({
 function OperationsPanel({
   summary,
   capacity,
-  fairshare,
   health,
   cache,
   modelCount,
+  status,
 }: {
   summary: OverviewSummary;
   capacity: CapacitySummary;
-  fairshare?: FairshareLiveView;
   health: HealthSummary;
   cache: CacheSummary;
   modelCount: number;
+  status: OverviewStatus;
 }) {
-  const busiestGroup = fairshare?.groups
-    .slice()
-    .sort((a, b) => b.in_flight + b.queued - (a.in_flight + a.queued))[0];
-  const slotLabel = capacity.max > 0 ? `${formatPct(capacity.utilization)} occupied` : "waiting";
+  const checks = [
+    {
+      label: "Admission",
+      value: capacity.queued > 0 ? `${formatNumber(capacity.queued)} queued` : "clear",
+      detail:
+        capacity.waitingTenants > 0
+          ? `${formatNumber(capacity.waitingTenants)} tenant${capacity.waitingTenants === 1 ? "" : "s"} waiting`
+          : "no tenants waiting",
+      tone: capacity.queued > 0 ? "warn" : "ok",
+      href: "/fairshare",
+    },
+    {
+      label: "Models",
+      value: health.unhealthy > 0 ? `${formatNumber(health.unhealthy)} unhealthy` : "healthy",
+      detail: `${formatNumber(health.healthy)} healthy / ${formatNumber(health.enabled)} enabled`,
+      tone: health.unhealthy > 0 ? "hot" : health.unknown > 0 ? "warn" : "ok",
+      href: "/models",
+    },
+    {
+      label: "Tenants",
+      value: `${formatNumber(summary.activeTenants)} active`,
+      detail: `${formatNumber(summary.tenantCount)} total / ${formatNumber(summary.keyCount)} keys`,
+      tone: "neutral",
+      href: "/tenants",
+    },
+    {
+      label: "Cache",
+      value: cache.hitRateLabel,
+      detail: cache.tokensSaved > 0 ? `${formatCompact(cache.tokensSaved)} tokens saved` : "no savings window",
+      tone: "neutral",
+      href: "/settings",
+    },
+  ] satisfies SnapshotCheck[];
 
   return (
     <Card className="h-full rounded-md">
       <CardHeader>
-        <CardTitle>Gateway now</CardTitle>
-        <CardDescription>Scheduler, fleet, and cache state</CardDescription>
+        <CardTitle>Gateway snapshot</CardTitle>
+        <CardDescription>{status.detail}</CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div>
-          <div className="mb-2 flex items-center justify-between gap-3 text-xs">
-            <span className="text-muted-foreground">Slots</span>
-            <span className="tabular-nums">{slotLabel}</span>
+        <div className="rounded-sm border border-border bg-background/35 p-3">
+          <div className="mb-3 flex items-center justify-between gap-3">
+            <div>
+              <p className="text-xs font-medium">Live scheduler</p>
+              <p className="mt-0.5 text-[11px] text-muted-foreground">Current admission pressure</p>
+            </div>
+            <Badge className={capacity.queued > 0 ? "border-amber-500/35 bg-amber-500/10 text-amber-300" : ""}>
+              {capacity.queued > 0 ? "waiting" : "clear"}
+            </Badge>
           </div>
-          <SlotBar pct={capacity.utilization} tone={capacity.tone} />
           <div className="mt-2 grid grid-cols-3 gap-2 text-xs">
             <DetailStat label="In flight" value={formatNumber(capacity.inFlight)} />
             <DetailStat label="Queued" value={formatNumber(capacity.queued)} tone={capacity.queued > 0 ? "warn" : "neutral"} />
-            <DetailStat label="Headroom" value={formatNumber(capacity.headroom)} />
+            <DetailStat label="Waiting" value={formatNumber(capacity.waitingTenants)} tone={capacity.waitingTenants > 0 ? "warn" : "neutral"} />
           </div>
         </div>
 
         <div className="grid grid-cols-2 gap-2 text-xs">
           <DetailStat label="Tenants" value={`${formatNumber(summary.activeTenants)} / ${formatNumber(summary.tenantCount)}`} />
-          <DetailStat label="Models" value={`${formatNumber(health.enabled)} / ${formatNumber(modelCount)}`} />
+          <DetailStat label="Routes" value={`${formatNumber(health.enabled)} / ${formatNumber(modelCount)}`} />
           <DetailStat label="Keys" value={formatNumber(summary.keyCount)} />
-          <DetailStat label="Cache" value={cache.hitRateLabel} />
+          <DetailStat label="Cache saved" value={formatCompact(cache.tokensSaved)} />
         </div>
 
-        <div className="rounded-sm border border-border bg-background/35 p-3">
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0">
-              <p className="text-xs font-medium">Fairshare pressure</p>
-              <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
-                {busiestGroup
-                  ? `${busiestGroup.name} / ${formatNumber(busiestGroup.in_flight)} running / ${formatNumber(busiestGroup.queued)} queued`
-                  : "No active group pressure"}
-              </p>
-            </div>
-            <Badge className={capacity.queued > 0 ? "border-amber-500/35 bg-amber-500/10 text-amber-300" : ""}>
-              {capacity.waitingTenants > 0 ? `${formatNumber(capacity.waitingTenants)} waiting` : "clear"}
-            </Badge>
-          </div>
+        <div className="space-y-2">
+          {checks.map((check) => (
+            <SnapshotCheckRow key={check.label} check={check} />
+          ))}
         </div>
 
         <div className="rounded-sm border border-border bg-background/35 p-3">
@@ -601,20 +604,202 @@ function OperationsPanel({
 
         <div className="grid grid-cols-2 gap-2">
           <Button type="button" variant="outline" size="sm" asChild>
-            <Link href="/tenants">
-              <Users className="h-3.5 w-3.5" />
-              Tenants
+            <Link href="/fairshare">
+              <Gauge className="h-3.5 w-3.5" />
+              Fairshare
             </Link>
           </Button>
           <Button type="button" variant="outline" size="sm" asChild>
-            <Link href="/keys">
-              <KeyRound className="h-3.5 w-3.5" />
-              Keys
+            <Link href="/models">
+              <Boxes className="h-3.5 w-3.5" />
+              Models
             </Link>
           </Button>
         </div>
       </CardContent>
     </Card>
+  );
+}
+
+interface SnapshotCheck {
+  label: string;
+  value: string;
+  detail: string;
+  tone: MetricTone;
+  href: string;
+}
+
+function SnapshotCheckRow({ check }: { check: SnapshotCheck }) {
+  const toneClass =
+    check.tone === "hot"
+      ? "text-[hsl(350_55%_64%)]"
+      : check.tone === "warn"
+        ? "text-[hsl(38_65%_62%)]"
+        : "text-foreground";
+
+  return (
+    <Link
+      href={check.href}
+      className="block rounded-sm border border-border bg-background/35 px-3 py-2 transition-colors hover:bg-muted/20"
+    >
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="truncate text-xs font-medium">{check.label}</p>
+          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{check.detail}</p>
+        </div>
+        <span className={cn("shrink-0 text-xs font-medium tabular-nums", toneClass)}>{check.value}</span>
+      </div>
+    </Link>
+  );
+}
+
+function ActivityPanel({
+  tenantRows,
+  modelRows,
+  keyRows,
+}: {
+  tenantRows: TenantDisplayRow[];
+  modelRows: ModelDisplayRow[];
+  keyRows: KeyDisplayRow[];
+}) {
+  const [view, setView] = useState<ActivityView>("tenants");
+  const config = {
+    tenants: {
+      title: "Tenants",
+      description: "Top live tenant pressure",
+      href: "/fairshare",
+      icon: Users,
+      rows: tenantRows.slice(0, 6).map((row) => ({
+        key: row.id,
+        label: row.name,
+        detail: `${row.group} / ${formatCompact(row.tokens)} tokens`,
+        value: formatNumber(row.requests),
+        sub: `${formatNumber(row.inFlight)} running / ${formatNumber(row.queued)} queued`,
+        color: row.color,
+        href: `/tenants?tenant=${encodeURIComponent(row.id)}`,
+        weight: row.requests + row.inFlight + row.queued,
+      })),
+      empty: "No tenant traffic in the last hour",
+    },
+    models: {
+      title: "Models",
+      description: "Routes receiving traffic",
+      href: "/models",
+      icon: Boxes,
+      rows: modelRows.slice(0, 6).map((row, index) => ({
+        key: row.model,
+        label: row.model,
+        detail: `in ${formatCompact(row.inputTokens)} / out ${formatCompact(row.outputTokens)}`,
+        value: formatNumber(row.requests),
+        sub: row.status,
+        color: PALETTE[index % PALETTE.length],
+        href: `/models?model=${encodeURIComponent(row.model)}`,
+        weight: row.requests,
+      })),
+      empty: "No model traffic in the last hour",
+    },
+    keys: {
+      title: "Keys",
+      description: "Busiest API keys",
+      href: "/keys",
+      icon: KeyRound,
+      rows: keyRows.slice(0, 6).map((row) => ({
+        key: row.keyId,
+        label: `key ${row.keyLabel}`,
+        detail: `${row.tenant} / ${row.group}`,
+        value: formatNumber(row.requests),
+        sub: `${formatCompact(row.tokens)} tokens`,
+        color: row.color,
+        href: `/keys?key=${encodeURIComponent(row.keyLabel)}`,
+        weight: row.requests,
+      })),
+      empty: "No key traffic in the last hour",
+    },
+  } satisfies Record<ActivityView, ActivityConfig>;
+  const active = config[view];
+  const maxWeight = active.rows.reduce((max, row) => Math.max(max, row.weight), 0);
+  const Icon = active.icon;
+
+  return (
+    <Card className="h-full rounded-md">
+      <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
+        <div>
+          <CardTitle>Top activity</CardTitle>
+          <CardDescription>{active.description}</CardDescription>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="inline-flex rounded-sm border border-border bg-background/40 p-0.5">
+            <MetricToggle active={view === "tenants"} label="Tenants" onClick={() => setView("tenants")} />
+            <MetricToggle active={view === "models"} label="Models" onClick={() => setView("models")} />
+            <MetricToggle active={view === "keys"} label="Keys" onClick={() => setView("keys")} />
+          </div>
+          <Button type="button" variant="outline" size="sm" asChild>
+            <Link href={active.href}>
+              <Icon className="h-3.5 w-3.5" />
+              {active.title}
+            </Link>
+          </Button>
+        </div>
+      </CardHeader>
+      <CardContent>
+        {active.rows.length === 0 ? (
+          <EmptyState className="h-72">{active.empty}</EmptyState>
+        ) : (
+          <div className="space-y-2">
+            {active.rows.map((row) => (
+              <ActivityListRow
+                key={row.key}
+                row={row}
+                pct={maxWeight > 0 ? (row.weight / maxWeight) * 100 : 0}
+              />
+            ))}
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+interface ActivityConfig {
+  title: string;
+  description: string;
+  href: string;
+  icon: LucideIcon;
+  rows: ActivityRow[];
+  empty: string;
+}
+
+interface ActivityRow {
+  key: string;
+  label: string;
+  detail: string;
+  value: string;
+  sub: string;
+  color: string;
+  href: string;
+  weight: number;
+}
+
+function ActivityListRow({ row, pct }: { row: ActivityRow; pct: number }) {
+  return (
+    <Link
+      href={row.href}
+      className="block rounded-sm border border-border bg-background/30 px-3 py-2 transition-colors hover:bg-muted/20"
+    >
+      <div className="flex items-center justify-between gap-3">
+        <div className="min-w-0">
+          <p className="truncate text-xs font-medium">{row.label}</p>
+          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{row.detail}</p>
+        </div>
+        <div className="shrink-0 text-right">
+          <p className="text-xs font-medium tabular-nums">{row.value}</p>
+          <p className="text-[11px] tabular-nums text-muted-foreground">{row.sub}</p>
+        </div>
+      </div>
+      <div className="mt-2 h-1.5 overflow-hidden rounded-sm bg-muted/35">
+        <div className="h-full rounded-sm" style={{ width: `${clamp(pct, 0, 100)}%`, background: row.color }} />
+      </div>
+    </Link>
   );
 }
 
@@ -844,43 +1029,99 @@ function KeyDetail({ row }: { row: KeyDisplayRow }) {
   );
 }
 
-function RecentChangesPanel({ entries }: { entries: AuditEntry[] }) {
+function RequestFeedPanel() {
+  const query = useQuery({
+    queryKey: ["overview-request-feed"],
+    queryFn: () =>
+      getJson<UsageLogEntry[]>(
+        `/api/live/usage/logs?since_ms=${Date.now() - HOUR_MS}&limit=18`,
+      ),
+    refetchInterval: REQUEST_LOG_POLL_MS,
+  });
+  const rows = query.data ?? [];
+  const errorCount = rows.filter((row) => row.status_code >= 400).length;
+
   return (
     <Card className="h-full rounded-md">
       <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <CardTitle>Recent changes</CardTitle>
-          <CardDescription>Latest configuration events</CardDescription>
+          <CardTitle>Live requests</CardTitle>
+          <CardDescription>Last hour / newest first / refresh {REQUEST_LOG_POLL_MS / 1000}s</CardDescription>
         </div>
-        <Button type="button" variant="outline" size="sm" asChild>
-          <Link href="/audit">
-            <ScrollText className="h-3.5 w-3.5" />
-            Audit
-          </Link>
-        </Button>
+        <div className="flex flex-wrap items-center gap-2">
+          <Badge className={errorCount > 0 ? "border-red-500/35 bg-red-500/10 text-red-300" : ""}>
+            {errorCount > 0 ? `${formatNumber(errorCount)} errors` : "healthy"}
+          </Badge>
+          <Button type="button" variant="outline" size="sm" asChild>
+            <Link href="/logs">
+              <Radio className="h-3.5 w-3.5" />
+              Logs
+            </Link>
+          </Button>
+        </div>
       </CardHeader>
       <CardContent className="p-0">
-        {entries.length === 0 ? (
-          <EmptyState className="h-72">No audit events yet</EmptyState>
+        {rows.length === 0 ? (
+          <EmptyState className="h-72">{query.isLoading ? "Loading requests..." : "No recent requests"}</EmptyState>
         ) : (
-          <ul className="divide-y divide-border/60">
-            {entries.map((entry) => (
-              <li key={entry.id} className="flex items-baseline justify-between gap-4 px-6 py-3 text-sm">
-                <div className="min-w-0">
-                  <p className="truncate font-mono text-xs">{entry.action}</p>
-                  <p className="mt-0.5 truncate text-muted-foreground">
-                    {entry.entity_type} / {entry.actor}
-                  </p>
-                </div>
-                <time className="shrink-0 text-xs tabular-nums text-muted-foreground">
-                  {new Date(entry.ts).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
-                </time>
-              </li>
-            ))}
-          </ul>
+          <div className="max-h-[31rem] overflow-auto">
+            <table className="w-full min-w-[720px] text-xs">
+              <thead className="sticky top-0 z-10 bg-card">
+                <tr className="border-b border-border text-left text-[10px] uppercase tracking-wider text-muted-foreground">
+                  <th className="px-4 py-2 font-medium">Time</th>
+                  <th className="px-3 py-2 font-medium">Status</th>
+                  <th className="px-3 py-2 font-medium">Type</th>
+                  <th className="px-3 py-2 font-medium">Model</th>
+                  <th className="px-3 py-2 font-medium">Team</th>
+                  <th className="px-3 py-2 text-right font-medium">Tokens</th>
+                  <th className="px-4 py-2 text-right font-medium">Duration</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((row) => (
+                  <RequestFeedRow key={`${row.request_id}-${row.ts_ms}`} row={row} />
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </CardContent>
     </Card>
+  );
+}
+
+function RequestFeedRow({ row }: { row: UsageLogEntry }) {
+  const error = row.status_code >= 400;
+  const totalMs = Number(row.total_ms);
+  const tokenCount = Number(row.total_tokens);
+
+  return (
+    <tr className="border-b border-border/60 transition-colors hover:bg-muted/20">
+      <td className="px-4 py-2 tabular-nums text-muted-foreground">
+        {new Date(row.ts_ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+      </td>
+      <td className="px-3 py-2">
+        <span
+          className={cn(
+            "inline-flex h-5 items-center rounded-sm border border-border px-1.5 text-[10px] font-medium tabular-nums",
+            error ? "border-red-500/35 bg-red-500/10 text-red-300" : "bg-background/35 text-muted-foreground",
+          )}
+        >
+          {error ? row.status_code : "ok"}
+        </span>
+      </td>
+      <td className="px-3 py-2 font-mono text-[11px]">{row.request_type || "request"}</td>
+      <td className="max-w-44 truncate px-3 py-2 text-muted-foreground">{row.model || "unknown"}</td>
+      <td className="max-w-36 truncate px-3 py-2 text-muted-foreground">
+        {row.tenant_name || row.tenant_id.slice(0, 8)}
+        <span className="text-muted-foreground/50"> / </span>
+        {row.key_name || row.key_prefix || row.key_id.slice(0, 8)}
+      </td>
+      <td className="px-3 py-2 text-right tabular-nums">{formatCompact(tokenCount)}</td>
+      <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
+        {Number.isFinite(totalMs) && totalMs > 0 ? `${formatNumber(Math.round(totalMs))} ms` : formatCurrency(Number(row.cost_usd) || 0)}
+      </td>
+    </tr>
   );
 }
 
@@ -946,15 +1187,6 @@ function MetricToggle({ active, onClick, label }: { active: boolean; onClick: ()
   );
 }
 
-function SlotBar({ pct, tone }: { pct: number; tone: MetricTone }) {
-  const color = tone === "hot" ? HOT_COLOR : tone === "warn" ? REQUEST_COLOR : OK_COLOR;
-  return (
-    <div className="h-2 overflow-hidden rounded-sm bg-muted/35">
-      <div className="h-full rounded-sm transition-[width]" style={{ width: `${clamp(pct, 0, 100)}%`, background: color }} />
-    </div>
-  );
-}
-
 function DetailStat({
   label,
   value,
@@ -988,6 +1220,56 @@ interface CapacitySummary {
   utilization: number;
   waitingTenants: number;
   tone: MetricTone;
+}
+
+interface OverviewStatus {
+  tone: MetricTone;
+  label: string;
+  detail: string;
+}
+
+function summarizeOverviewStatus(
+  capacity: CapacitySummary,
+  health: HealthSummary,
+  fairshare?: FairshareLiveView,
+): OverviewStatus {
+  const issues = [
+    capacity.queued > 0,
+    health.unhealthy > 0,
+    health.unknown > 0,
+    (fairshare?.tenants ?? []).some(isWaitingBelowShare),
+  ].filter(Boolean).length;
+  const waitingBelowShare = fairshare?.tenants.filter(isWaitingBelowShare).length ?? 0;
+
+  if (health.unhealthy > 0 || (capacity.queued > 0 && capacity.utilization >= 90)) {
+    return {
+      tone: "hot",
+      label: `${formatNumber(issues)} need attention`,
+      detail:
+        health.unhealthy > 0
+          ? `${formatNumber(health.unhealthy)} model route${health.unhealthy === 1 ? "" : "s"} unhealthy`
+          : `${formatNumber(capacity.queued)} queued while the scheduler is saturated`,
+    };
+  }
+
+  if (capacity.queued > 0 || health.unknown > 0 || waitingBelowShare > 0) {
+    return {
+      tone: "warn",
+      label: `${formatNumber(Math.max(1, issues))} watch item${issues === 1 ? "" : "s"}`,
+      detail:
+        capacity.queued > 0
+          ? `${formatNumber(capacity.waitingTenants)} waiting tenant${capacity.waitingTenants === 1 ? "" : "s"} across ${formatNumber(capacity.queued)} queued requests`
+          : waitingBelowShare > 0
+            ? `${formatNumber(waitingBelowShare)} tenant${waitingBelowShare === 1 ? "" : "s"} below fair share`
+            : `${formatNumber(health.unknown)} route${health.unknown === 1 ? "" : "s"} have unknown health`,
+    };
+  }
+
+  return {
+    tone: "ok",
+    label: "All clear",
+    detail: "No backlog, routes healthy",
+  };
 }
 
 function summarizeCapacity(view?: FairshareLiveView, stats?: LiveStats): CapacitySummary {
@@ -1241,6 +1523,10 @@ function buildKeyRows(
 
 function colorForGroup(name: string, index = 0) {
   return GROUP_PALETTE[name] ?? PALETTE[index % PALETTE.length];
+}
+
+function isWaitingBelowShare(tenant: FairshareLiveView["tenants"][number]) {
+  return tenant.queued > 0 && tenant.in_flight < Math.floor(tenant.expected_slots);
 }
 
 function healthStatus(row: ModelHealthSummary) {

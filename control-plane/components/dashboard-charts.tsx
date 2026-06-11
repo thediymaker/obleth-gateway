@@ -123,7 +123,7 @@ export function OverviewKpiStrip({
 
 const QUICK_LINKS = [
   { href: "/fairshare", title: "Fairshare", desc: "Live scheduler, slots, and contention" },
-  { href: "/tenants", title: "Tenants", desc: "Weights, quotas, and groups" },
+  { href: "/tenants", title: "Tenants", desc: "Weights, limits, and groups" },
   { href: "/keys", title: "API keys", desc: "Credentials and key usage" },
   { href: "/models", title: "Models", desc: "Routes, pricing, and admission weight" },
 ];

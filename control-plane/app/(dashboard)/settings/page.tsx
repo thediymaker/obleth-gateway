@@ -1,10 +1,4 @@
-import {
-  AlertSettingsForm,
-  AutoRouterSettingsForm,
-  BoonsSettingsForm,
-  UsageRetentionForm,
-} from "@/components/settings-form";
-import { BackupRestore } from "@/components/backup-restore";
+import { SettingsTabs } from "@/components/settings-tabs";
 import { VersionCard } from "@/components/version-card";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
@@ -23,16 +17,18 @@ export default async function SettingsPage() {
       <div>
         <h1 className="text-lg font-semibold tracking-tight">Settings</h1>
         <p className="text-sm text-muted-foreground">
-          Configure operational alerting. Changes apply immediately to the running gateway&mdash;no
-          restart required.
+          Configure alerting, routing, and data retention. Changes apply immediately to the running
+          gateway&mdash;no restart required.
         </p>
       </div>
-      <AlertSettingsForm settings={settings} />
-      <AutoRouterSettingsForm settings={autoRouter} models={models} />
-      <BoonsSettingsForm settings={boons} models={models} />
-      <UsageRetentionForm retention={retention} />
-      <BackupRestore />
-      <VersionCard />
+      <SettingsTabs
+        alertSettings={settings}
+        autoRouter={autoRouter}
+        boons={boons}
+        models={models}
+        retention={retention}
+        versionCard={<VersionCard />}
+      />
     </div>
   );
 }

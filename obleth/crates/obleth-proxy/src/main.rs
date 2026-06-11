@@ -10,8 +10,8 @@ mod proxy;
 mod router;
 mod state;
 
-mod classifier;
 mod boons;
+mod classifier;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -169,7 +169,9 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = redis.put_resolved_model(name, resolved).await {
                     tracing::warn!(error = %e, "failed to warm model into redis");
                 }
-                model_cache.insert(name.clone(), Arc::new(resolved.clone())).await;
+                model_cache
+                    .insert(name.clone(), Arc::new(resolved.clone()))
+                    .await;
             }
             tracing::info!(count = models.len(), "warmed model cache");
             model_registry.store(build_candidates(&store, models).await);
@@ -192,7 +194,9 @@ async fn main() -> anyhow::Result<()> {
                 if let Err(e) = redis.put_resolved_mcp_server(name, resolved).await {
                     tracing::warn!(error = %e, "failed to warm mcp server into redis");
                 }
-                mcp_cache.insert(name.clone(), Arc::new(resolved.clone())).await;
+                mcp_cache
+                    .insert(name.clone(), Arc::new(resolved.clone()))
+                    .await;
             }
             tracing::info!(count = servers.len(), "warmed mcp server cache");
         }

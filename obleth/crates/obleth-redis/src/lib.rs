@@ -254,7 +254,9 @@ impl RedisStore {
             Some(gate) => (
                 1u8,
                 gate.period_key,
-                gate.budget_tokens.map(|t| t.to_string()).unwrap_or_default(),
+                gate.budget_tokens
+                    .map(|t| t.to_string())
+                    .unwrap_or_default(),
                 gate.budget_cost_usd
                     .map(|c| c.to_string())
                     .unwrap_or_default(),
@@ -480,6 +482,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, ReserveOutcome::Reserved { remaining: 90 });
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn zero_capacity_means_no_per_minute_token_cap() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let store = RedisStore::connect(&url).await.expect("connect");
+        let tenant = Uuid::new_v4();
+
+        let out = store
+            .reserve_budget_with_term(&tenant, 0, 0, 1_000_000, None)
+            .await
+            .unwrap();
+        assert_eq!(out, ReserveOutcome::Reserved { remaining: 0 });
+
+        store
+            .term_usage_add(&tenant, "l:0", 500, 1.25)
+            .await
+            .unwrap();
+        let gate = TermGate {
+            period_key: "l:0",
+            budget_tokens: Some(500),
+            budget_cost_usd: None,
+        };
+        let out = store
+            .reserve_budget_with_term(&tenant, 0, 0, 10, Some(gate))
+            .await
+            .unwrap();
+        assert!(matches!(out, ReserveOutcome::TermExhausted { .. }));
     }
 
     #[tokio::test]

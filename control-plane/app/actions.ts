@@ -132,7 +132,7 @@ export async function createTenantAction(formData: FormData) {
     max_in_flight: formData.get("max_in_flight"),
   });
   if (!parsed.success) return;
-  await obleth.createTenant(parsed.data);
+  await obleth.createTenant({ ...parsed.data, tokens_per_minute: parsed.data.tokens_per_minute ?? 0 });
   updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/");
@@ -258,9 +258,9 @@ export async function setWeightAction(id: string, weight: number) {
 export async function setQuotaAction(formData: FormData) {
   await requireSession();
   const id = String(formData.get("id"));
-  const tpm = numOrUndef(formData.get("tokens_per_minute"));
+  const tpm = numOrUndef(formData.get("tokens_per_minute")) ?? 0;
   const mif = numOrNull(formData.get("max_in_flight"));
-  if (!id || !tpm || tpm <= 0 || (mif !== null && mif <= 0)) return;
+  if (!id || tpm < 0 || (mif !== null && mif <= 0)) return;
   await obleth.setQuota(id, tpm, mif);
   updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
