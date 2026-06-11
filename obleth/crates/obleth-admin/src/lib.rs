@@ -69,6 +69,7 @@ pub struct AdminState {
 pub fn router(state: AdminState) -> Router {
     let public = Router::new()
         .route("/api/v1/health", get(health))
+        .route("/api/v1/version", get(get_version))
         .route("/api/v1/openapi.json", get(openapi_json));
 
     let protected = Router::new()
@@ -577,6 +578,35 @@ pub struct AuditEntryView {
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Build/version identity of the running gateway binary.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct VersionInfo {
+    /// Crate version, in lockstep with the release tag (`vX.Y.Z`).
+    pub version: String,
+    /// Git commit the binary was built from; absent for local builds.
+    pub git_sha: Option<String>,
+    /// RFC 3339 build timestamp; absent for local builds.
+    pub built_at: Option<String>,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/version", tag = "meta",
+    responses((status = 200, body = VersionInfo))
+)]
+async fn get_version() -> Json<VersionInfo> {
+    Json(VersionInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        // Docker sets these to "" when the build-args are omitted (local
+        // builds); treat empty as absent.
+        git_sha: option_env!("OBLETH_BUILD_SHA")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        built_at: option_env!("OBLETH_BUILD_TIMESTAMP")
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    })
 }
 
 async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {

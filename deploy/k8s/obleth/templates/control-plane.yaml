@@ -23,7 +23,7 @@ spec:
     spec:
       containers:
         - name: control-plane
-          image: {{ .Values.image.controlPlane }}
+          image: {{ .Values.image.controlPlane }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             - { name: OBLETH_ADMIN_BASE_URL, value: "http://{{ include "obleth.fullname" . }}:9180" }

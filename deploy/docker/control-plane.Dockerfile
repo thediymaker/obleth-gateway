@@ -11,8 +11,13 @@ COPY . .
 RUN npm run build
 
 FROM node:22-slim AS runner
+LABEL org.opencontainers.image.source="https://github.com/thediymaker/obleth-gateway"
 WORKDIR /app
 ENV NODE_ENV=production
+# Commit this image was built from, shown in the dashboard version card.
+# Read at request time, so it only needs to exist in the runner stage.
+ARG GIT_SHA
+ENV OBLETH_BUILD_SHA=$GIT_SHA
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static

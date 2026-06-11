@@ -30,7 +30,7 @@ spec:
     spec:
       containers:
         - name: obleth
-          image: {{ .Values.image.obleth }}
+          image: {{ .Values.image.obleth }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
             - { name: proxy, containerPort: 8080 }

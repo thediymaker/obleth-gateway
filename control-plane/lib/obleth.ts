@@ -610,6 +610,13 @@ function qs(params: Record<string, string | number | undefined>) {
   return s ? `?${s}` : "";
 }
 
+/** Build/version identity reported by the gateway's public /version endpoint. */
+export interface VersionInfo {
+  version: string;
+  git_sha: string | null;
+  built_at: string | null;
+}
+
 // The slow-changing entity lists are opted into Next's Data Cache with a short
 // revalidate window plus a tag. Every mutating server action calls
 // `revalidateTag` for the lists it changes, so dashboards see writes
@@ -624,6 +631,8 @@ export const CACHE_TAGS = {
 } as const;
 
 export const obleth = {
+  gatewayVersion: () =>
+    api<VersionInfo>("/version", { next: { revalidate: 300 } }),
   listTenants: () =>
     api<Tenant[]>("/tenants", {
       next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.tenants] },

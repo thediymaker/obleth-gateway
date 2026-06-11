@@ -10,6 +10,11 @@ name: obleth
 #
 # Enable extras per-command:    docker compose --profile benchmark --profile observability up
 # Or set COMPOSE_PROFILES in .env (see .env.example) to default them on for dev.
+#
+# First-party services declare both image: (published to GHCR by the release
+# workflow) and build: (local source). `docker compose pull && up -d` runs the
+# published images — pin one with OBLETH_VERSION=vX.Y.Z in .env; developers use
+# `docker compose up --build` to build from the working tree instead.
 services:
   postgres:
     image: postgres:16
@@ -62,6 +67,7 @@ services:
 
   benchmark-backend:
     profiles: ["benchmark", "mock"]
+    image: ghcr.io/thediymaker/obleth-gateway/benchmark-backend:${OBLETH_VERSION:-latest}
     build:
       context: ../../benchmark-backend
       dockerfile: ../deploy/docker/benchmark-backend.Dockerfile
@@ -77,6 +83,7 @@ services:
           - mock-backend
 
   obleth:
+    image: ghcr.io/thediymaker/obleth-gateway/obleth:${OBLETH_VERSION:-latest}
     build:
       context: ../..
       dockerfile: deploy/docker/obleth.Dockerfile
@@ -132,6 +139,7 @@ services:
       clickhouse: { condition: service_healthy }
 
   control-plane:
+    image: ghcr.io/thediymaker/obleth-gateway/control-plane:${OBLETH_VERSION:-latest}
     build:
       context: ../../control-plane
       dockerfile: ../deploy/docker/control-plane.Dockerfile

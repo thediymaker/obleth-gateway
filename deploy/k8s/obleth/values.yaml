@@ -1,7 +1,10 @@
 image:
-  obleth: obleth/obleth:latest
-  benchmarkBackend: obleth/benchmark-backend:latest
-  controlPlane: obleth/control-plane:latest
+  obleth: ghcr.io/thediymaker/obleth-gateway/obleth
+  benchmarkBackend: ghcr.io/thediymaker/obleth-gateway/benchmark-backend
+  controlPlane: ghcr.io/thediymaker/obleth-gateway/control-plane
+  # Empty -> v{appVersion} from Chart.yaml, so each chart release pins its own
+  # images. Override to test a specific tag (e.g. "main" for edge builds).
+  tag: ""
   pullPolicy: IfNotPresent
 
 obleth:

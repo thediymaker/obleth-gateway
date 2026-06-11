@@ -7,6 +7,7 @@ COPY . .
 RUN cargo build --release
 
 FROM debian:bookworm-slim AS runtime
+LABEL org.opencontainers.image.source="https://github.com/thediymaker/obleth-gateway"
 RUN groupadd --system --gid 10001 bench \
     && useradd --system --uid 10001 --gid bench --no-create-home bench
 COPY --from=builder /app/target/release/benchmark-backend /usr/local/bin/benchmark-backend

@@ -6,9 +6,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends build-essential
 COPY schema ./schema
 COPY obleth ./obleth
 WORKDIR /app/obleth
+# Release builds inject the commit + timestamp, surfaced by /api/v1/version.
+# Must be set before cargo build: option_env! reads them at compile time.
+ARG GIT_SHA
+ARG BUILD_TIMESTAMP
+ENV OBLETH_BUILD_SHA=$GIT_SHA OBLETH_BUILD_TIMESTAMP=$BUILD_TIMESTAMP
 RUN cargo build --release --bin obleth
 
 FROM debian:bookworm-slim AS runtime
+LABEL org.opencontainers.image.source="https://github.com/thediymaker/obleth-gateway"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 obleth \

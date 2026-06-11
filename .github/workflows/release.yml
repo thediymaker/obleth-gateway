@@ -1,0 +1,123 @@
+name: release
+
+# Pushing a vX.Y.Z tag publishes everything in lockstep: multi-arch images for
+# the three components to GHCR, the Helm chart as an OCI artifact, and a
+# GitHub Release. Prerelease tags (vX.Y.Z-rc.N) publish images + chart but
+# skip the :latest tag and mark the release as a prerelease.
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  REGISTRY: ghcr.io/thediymaker/obleth-gateway
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: tag matches lockstep version
+        run: bash scripts/check-versions.sh "$GITHUB_REF_NAME"
+
+  build:
+    needs: verify
+    strategy:
+      matrix:
+        component: [obleth, control-plane, benchmark-backend]
+        # Native runners for both arches — never QEMU (Rust under emulation
+        # takes 30-60 min per image).
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+          - component: obleth
+            context: .
+          - component: control-plane
+            context: ./control-plane
+          - component: benchmark-backend
+            context: ./benchmark-backend
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        run: echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+      - uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: deploy/docker/${{ matrix.component }}.Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ matrix.component }}:${{ github.ref_name }}-${{ matrix.arch }}
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            BUILD_TIMESTAMP=${{ steps.meta.outputs.built_at }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ github.ref_name }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.component }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.component }}-${{ matrix.arch }}
+
+  # Merge the per-arch tags into one multi-arch manifest (:vX.Y.Z, plus
+  # :latest for stable releases).
+  manifest:
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [obleth, control-plane, benchmark-backend]
+    steps:
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: create multi-arch manifest
+        run: |
+          image="$REGISTRY/${{ matrix.component }}"
+          tags=(-t "$image:$GITHUB_REF_NAME")
+          case "$GITHUB_REF_NAME" in
+            *-*) ;;  # prerelease: never move :latest
+            *) tags+=(-t "$image:latest") ;;
+          esac
+          docker buildx imagetools create "${tags[@]}" \
+            "$image:$GITHUB_REF_NAME-amd64" \
+            "$image:$GITHUB_REF_NAME-arm64"
+
+  helm:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: package and push chart
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | helm registry login ghcr.io -u "${{ github.actor }}" --password-stdin
+          version="${GITHUB_REF_NAME#v}"
+          helm package deploy/k8s/obleth --version "$version" --app-version "$version"
+          helm push "obleth-$version.tgz" oci://ghcr.io/thediymaker/charts
+
+  release:
+    needs: [manifest, helm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          args=(--generate-notes --verify-tag)
+          case "$GITHUB_REF_NAME" in
+            *-*) args+=(--prerelease) ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" "${args[@]}"

@@ -5,6 +5,7 @@ import {
   UsageRetentionForm,
 } from "@/components/settings-form";
 import { BackupRestore } from "@/components/backup-restore";
+import { VersionCard } from "@/components/version-card";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
@@ -31,6 +32,7 @@ export default async function SettingsPage() {
       <BoonsSettingsForm settings={boons} models={models} />
       <UsageRetentionForm retention={retention} />
       <BackupRestore />
+      <VersionCard />
     </div>
   );
 }

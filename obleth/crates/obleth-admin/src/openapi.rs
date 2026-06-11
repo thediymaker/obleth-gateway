@@ -34,10 +34,11 @@ use obleth_config::{
 #[openapi(
     info(
         title = "obleth Management API",
-        version = "0.1.0",
         description = "Programmatic control plane: tenants, keys, models, usage, fairshare, and settings."
     ),
     paths(
+        // meta
+        crate::get_version,
         // tenants
         crate::create_tenant,
         crate::list_tenants,
@@ -214,8 +215,10 @@ use obleth_config::{
         AppSettingBackup,
         RestoreReport,
         RestoreCounts,
+        crate::VersionInfo,
     )),
     tags(
+        (name = "meta", description = "Gateway build/version identity"),
         (name = "tenants", description = "Tenant lifecycle, quotas, and fairshare group assignment"),
         (name = "keys", description = "API key lifecycle and per-key usage summary"),
         (name = "usage", description = "Usage, cost, request logs, and live stats"),

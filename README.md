@@ -98,9 +98,17 @@ cost ledger).
 
 ## Quick start (Docker)
 
+Pull the published images (recommended — no toolchain needed):
+
 ```bash
-docker compose -f deploy/docker/docker-compose.yml --profile benchmark --profile edge --profile observability up --build -d
+cd deploy/docker && cp .env.example .env
+docker compose --profile benchmark --profile edge --profile observability pull
+docker compose --profile benchmark --profile edge --profile observability up -d
 ```
+
+Images are published to `ghcr.io/thediymaker/obleth-gateway/*` on every
+release; pin one by setting `OBLETH_VERSION=vX.Y.Z` in `.env` (defaults to
+`latest`). To build from source instead, add `--build` to the `up` command.
 
 Services: HAProxy (`:80`), obleth data plane (`:8088` on the host, `:8080` inside
 the network), Management API (`:9180`), metrics (`:9091`), dashboard (`:3002` on
@@ -151,6 +159,14 @@ curl -s localhost/v1/chat/completions \
 Full API spec: `GET http://localhost:9180/api/v1/openapi.json`.
 
 ### Kubernetes
+
+Install the published chart (each release pins its own image tags):
+
+```bash
+helm install obleth oci://ghcr.io/thediymaker/charts/obleth --version <X.Y.Z> -f my-values.yaml
+```
+
+Or install from a checkout:
 
 ```bash
 helm install obleth deploy/k8s/obleth -f my-values.yaml
