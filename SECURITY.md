@@ -2,7 +2,9 @@
 
 ## Reporting a vulnerability
 
-Do not open public issues for security vulnerabilities.
+Public issues are fine for general bugs, hardening ideas, and non-sensitive
+security discussions. For actual vulnerabilities or suspected vulnerabilities,
+please use a private reporting channel.
 
 Please report vulnerabilities privately using one of these channels:
 
