@@ -502,7 +502,11 @@ export function BoonsSettingsForm({
             >
               <option value="">None</option>
               {models
-                .filter((m) => m.model_name !== "auto" && m.supports_vision)
+                .filter(
+                  (m) =>
+                    m.model_name !== "auto" &&
+                    (m.supports_vision || (m.tags?.includes("vision") ?? false)),
+                )
                 .map((m) => (
                   <option key={m.id} value={m.model_name}>
                     {m.model_name}
