@@ -1,7 +1,7 @@
 # obleth-gateway
 
 [![CI](https://github.com/thediymaker/obleth-gateway/actions/workflows/ci.yml/badge.svg)](https://github.com/thediymaker/obleth-gateway/actions/workflows/ci.yml)
-[![License: ELv2](https://img.shields.io/badge/license-ELv2-blue.svg)](LICENSE)
+[![License: BSL 1.1](https://img.shields.io/badge/license-BSL%201.1-blue.svg)](LICENSE)
 [![Built with Rust](https://img.shields.io/badge/built%20with-Rust-dea584.svg?logo=rust&logoColor=white)](https://www.rust-lang.org/)
 
 ![obleth dashboard overview](.github/assets/dashboard.png)
@@ -213,12 +213,21 @@ Architecture, the fairshare engine internals, auto routing and the classifier,
 scheduling, budgets, secrets, SSRF policy, alerting, dashboard auth, and the
 full configuration reference live at **[obleth.com](https://obleth.com)**.
 
+For contribution workflow, security reporting, and expected collaboration
+standards, see [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md),
+and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+
 ## License
 
-[Elastic License 2.0](LICENSE) (ELv2). The codebase is **source-available**, not
-OSI open source.
+[Business Source License 1.1](LICENSE) (BSL 1.1). The codebase is
+**source-available**, not OSI open source — but each released version
+automatically converts to the [Apache License 2.0](https://www.apache.org/licenses/LICENSE-2.0)
+on its Change Date (four years after that version's first publication).
 
-You may use, modify, and run obleth in production for your own workloads. You may
-not provide the software to third parties as a hosted or managed service where
-users get access to a substantial set of the gateway's features (see ELv2).
-Contact the maintainers for alternative licensing.
+You may use, modify, and run obleth in production for your own workloads, and
+use it freely for internal, academic, research, and educational purposes. You
+may **not** offer obleth to third parties as a hosted or managed service, nor
+distribute or sell a competing gateway product derived from it, until the
+Change Date (see [LICENSE](LICENSE) for the full Additional Use Grant).
+Contributions back to the project are welcome and encouraged. Contact the
+maintainers for alternative commercial licensing.

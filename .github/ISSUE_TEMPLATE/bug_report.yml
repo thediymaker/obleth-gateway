@@ -1,0 +1,50 @@
+name: Bug report
+description: Report a defect, regression, or operational problem.
+title: "bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. Keep it concrete and reproducible.
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened, and what did you expect instead?
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction
+      description: Steps, sample request, config, or test case that reproduces it.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs or screenshots
+      description: Include relevant logs, traces, screenshots, or error messages.
+  - type: input
+    id: version
+    attributes:
+      label: Version
+      placeholder: e.g. 0.2.0 or commit SHA
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - obleth runtime
+        - control plane
+        - deployment / Docker
+        - Helm / Kubernetes
+        - benchmark tooling
+        - documentation
+    validations:
+      required: true

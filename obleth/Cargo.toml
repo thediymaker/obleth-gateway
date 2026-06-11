@@ -14,7 +14,7 @@ members = [
 [workspace.package]
 version = "0.2.0"
 edition = "2021"
-license = "Elastic-2.0"
+license = "BUSL-1.1"
 repository = "https://github.com/thediymaker/obleth-gateway"
 
 [workspace.dependencies]

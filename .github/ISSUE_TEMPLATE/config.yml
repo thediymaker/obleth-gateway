@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security issue
+    url: https://github.com/thediymaker/obleth-gateway/security/advisories/new
+    about: Report security vulnerabilities privately.
+  - name: Documentation
+    url: https://obleth.com
+    about: Read the product and deployment documentation.
