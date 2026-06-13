@@ -30,6 +30,18 @@ const TAIL_CAP: usize = 16 * 1024;
 /// Upper bound on a response we are willing to cache. Larger responses stream
 /// through uncached so the cache can't be used to balloon Redis memory.
 const CACHE_MAX_BYTES: usize = 512 * 1024;
+/// Largest upstream completion a response-transforming boon will rewrite.
+/// Bigger bodies pass through verbatim (fail-open).
+const BOON_BUFFER_MAX: usize = 4 * 1024 * 1024;
+/// Floor for the per-request upstream timeout when a response-transforming
+/// boon is active: the upstream call is forced non-streaming, so the timeout
+/// bounds the whole generation instead of time-to-first-byte.
+const BOON_MIN_TIMEOUT: Duration = Duration::from_secs(120);
+/// Tells an intermediary reverse proxy (nginx / ingress-nginx) not to buffer
+/// the response, so streamed SSE tokens reach the client as they are produced
+/// instead of in proxy-buffer-sized bursts. Harmless when no such proxy is in
+/// front of the gateway. (HAProxy honours `option http-no-delay` instead.)
+const NO_BUFFER_HEADER: (&str, &str) = ("x-accel-buffering", "no");
 
 #[tracing::instrument(skip_all, name = "proxy_request")]
 pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) -> Response<Body> {
@@ -173,8 +185,18 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         let desired_tags =
             derive_desired_tags(&state, &json, est.input_tokens as u64, &available_tags).await;
 
-        match crate::router::select_model(&candidates, &features, &busyness, allowed, &desired_tags)
-        {
+        // Boon-granted capabilities count as native in the hard filters: a
+        // model carrying the structured_output boon can serve requests that
+        // need it, because the boon engine emulates the capability.
+        let grants = crate::router::BoonGrants::from_settings(&state.boons.settings());
+        match crate::router::select_model(
+            &candidates,
+            &features,
+            &busyness,
+            allowed,
+            &desired_tags,
+            grants,
+        ) {
             Some(chosen) => {
                 tracing::debug!(chosen = %chosen.model_name, "auto-routed request");
                 model = chosen.model_name.clone();
@@ -218,18 +240,27 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // e.g. the vision boon rewrites image content into text descriptions for
     // models that lack native vision. Runs before estimation/caching/dispatch so
     // every downstream stage sees the rewritten body. Fail-open: on any error
-    // the body is left unchanged.
-    if state
+    // the body is left unchanged. `x-obleth-boons: off` skips boons for one
+    // request; the structured-output boon and the gateway tool loop may arm a
+    // response plan that intercepts and rewrites the completion below (streaming
+    // clients of the tool loop are driven live; see `stream_tap`).
+    let boons_opt_out = headers
+        .get(crate::boons::BOONS_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
+    let boon_outcome = state
         .boons
         .enrich_request(
             &state,
             route.as_deref(),
             &resolved,
             &req_meta.session_id,
+            boons_opt_out,
+            req_meta.request_type == "chat",
             &mut json,
         )
-        .await
-    {
+        .await;
+    if boon_outcome.rewritten {
         match serde_json::to_vec(&json) {
             Ok(bytes) => body_bytes = Bytes::from(bytes),
             Err(e) => tracing::warn!(error = %e, "failed to re-serialize boon-rewritten body"),
@@ -238,6 +269,19 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         // admission estimate must reflect what is actually sent upstream.
         est = state.tokenizer.estimate_request(&json);
     }
+    let boons_applied = boon_outcome.applied;
+    let response_plan = boon_outcome.response_plan;
+
+    // Live streaming tool loop: when the *only* response transform is the
+    // gateway tool loop and the client asked to stream, keep the upstream call
+    // streaming and drive it through `tool_stream`. Content/reasoning deltas
+    // stream straight through, a visible marker shows when a gateway tool runs,
+    // and only the tool execution between turns pauses the stream. The
+    // structured-output transform still needs a fully buffered completion, so it
+    // keeps forcing the upstream non-streaming.
+    let stream_tap = response_plan.as_ref().is_some_and(|p| {
+        p.tool_loop.is_some() && p.structured.is_none() && p.client_stream
+    }) && route.is_some();
 
     let effective_weight = effective_admission_weight(resolved.weight, route.as_deref());
 
@@ -252,7 +296,13 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let modality_cost = compute_modality_cost(route.as_deref(), &json);
 
     // ---- response cache (exact-match, before admission so hits cost nothing) ----
-    let cache_enabled = route.as_ref().map(|r| r.cache_enabled).unwrap_or(false);
+    // Tool-loop answers depend on live tool results (e.g. a web search), so a
+    // cached answer would be wrong by definition: skip the cache entirely.
+    let tool_loop_armed = response_plan
+        .as_ref()
+        .is_some_and(|p| p.tool_loop.is_some());
+    let cache_enabled =
+        route.as_ref().map(|r| r.cache_enabled).unwrap_or(false) && !tool_loop_armed;
     let cache_ttl = route.as_ref().map(|r| r.cache_ttl_secs).unwrap_or(0);
     let cache_key = cache_enabled.then(|| obleth_config::cache_key(&model, &body_bytes));
     if let Some(ck) = &cache_key {
@@ -445,12 +495,17 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // ---- proxy upstream ----
     // Resolve the per-request timeout and retry policy. Both default to the
     // model-level config, falling back to the global gateway settings.
-    let req_timeout = route
+    let mut req_timeout = route
         .as_ref()
         .and_then(|r| r.request_timeout_secs)
         .filter(|s| *s >= 1)
         .map(|s| Duration::from_secs(s as u64))
         .unwrap_or(state.upstream_timeout);
+    // With a response-transforming boon the upstream call is non-streaming, so
+    // the send timeout covers the entire generation, not just the headers.
+    if response_plan.is_some() {
+        req_timeout = req_timeout.max(BOON_MIN_TIMEOUT);
+    }
     let max_retries = route.as_ref().map(|r| r.max_retries.max(0)).unwrap_or(0);
     let backoff = Duration::from_millis(
         route
@@ -473,8 +528,15 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // Multipart bodies cannot be replayed, so they get a single attempt against
     // the first target only.
     let replayable = multipart_fields.is_none();
-    let prepared_body: Option<Bytes> =
-        replayable.then(|| prepare_upstream_body(route.as_deref(), &mut json, send_bytes));
+    let prepared_body: Option<Bytes> = replayable.then(|| {
+        prepare_upstream_body(
+            route.as_deref(),
+            &mut json,
+            send_bytes,
+            response_plan.is_some() && !stream_tap,
+            stream_tap,
+        )
+    });
 
     // TTFT is measured from the moment we dispatch the *successful* upstream
     // request, *after* fairshare admission. Time spent waiting in the queue is
@@ -657,6 +719,239 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // Cache only successful responses.
     let store_in_cache = cache_key.clone();
 
+    // ---- streaming gateway tool loop ----
+    // When the only response transform is the tool loop and the client asked to
+    // stream, drive the loop live (see `stream_tap`): the model's content and
+    // reasoning stream straight through, a visible marker is shown when a
+    // gateway tool runs, and only the tool execution between turns pauses the
+    // stream. The first turn reuses the upstream response already opened above.
+    if stream_tap && status_code == 200 {
+        if let (Some(plan), Some(route_owned)) = (response_plan.as_ref(), route.clone()) {
+            if let Some(loop_plan) = &plan.tool_loop {
+                let stats = std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::boons::tool_stream::StreamStats::default(),
+                ));
+                let driver = crate::boons::tool_stream::run(
+                    crate::boons::tool_stream::StreamLoop {
+                        state: state.clone(),
+                        route: (*route_owned).clone(),
+                        key: (*resolved).clone(),
+                        session_id: req_meta.session_id.clone(),
+                        base_request: loop_plan.request.clone(),
+                        tool_servers: loop_plan.tool_servers.clone(),
+                        settings: loop_plan.settings.clone(),
+                        passthrough_unmapped: loop_plan.passthrough_unmapped,
+                        dispatch_timeout: req_timeout,
+                        client_include_usage: plan.include_usage,
+                        upstream_start,
+                    },
+                    upstream,
+                    stats.clone(),
+                );
+
+                let stream_state = state.clone();
+                let resolved_for_stream = resolved.clone();
+                let meta_for_stream = req_meta.clone();
+                let model_for_stream = model.clone();
+                let term_for_stream = term_period.clone();
+                let body_stream = async_stream::stream! {
+                    futures_util::pin_mut!(driver);
+                    while let Some(item) = driver.next().await {
+                        yield item;
+                    }
+                    drop(permit);
+                    let (ttft_ms, input_tokens, output_tokens) = {
+                        let s = stats.lock().unwrap_or_else(|e| e.into_inner());
+                        let toks = if s.final_set {
+                            (s.input_tokens, s.output_tokens)
+                        } else {
+                            (est.input_tokens, est.estimated_output_tokens)
+                        };
+                        (s.ttft_ms, toks.0, toks.1)
+                    };
+                    let total_ms = request_start.elapsed().as_millis() as u32;
+                    settle_request(
+                        &stream_state,
+                        &resolved_for_stream,
+                        &meta_for_stream,
+                        &model_for_stream,
+                        admission,
+                        est,
+                        input_tokens,
+                        output_tokens,
+                        queue_wait_ms,
+                        ttft_ms,
+                        total_ms,
+                        status_code,
+                        cache_status_label,
+                        capacity,
+                        term_for_stream.as_deref(),
+                        in_cost_rate,
+                        out_cost_rate,
+                        modality_cost,
+                        None,
+                    )
+                    .await;
+                };
+                let mut builder = Response::builder()
+                    .status(status_code)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
+                if !boons_applied.is_empty() {
+                    builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
+                }
+                return builder.body(Body::from_stream(body_stream)).unwrap_or_else(|_| {
+                    error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+                });
+            }
+        }
+    }
+
+    // ---- boon response interception (structured output / buffered tool loop) ----
+    // The upstream call was forced non-streaming; buffer the completion,
+    // transform it, and reply — synthesizing SSE when the client asked for a
+    // stream. Fail-open: a body that can't be buffered or parsed passes
+    // through verbatim. Non-200 responses skip transformation entirely and
+    // fall through to the normal pass-through path below.
+    if let Some(plan) = response_plan.filter(|_| status_code == 200) {
+        // Buffer the upstream body, recording TTFT at the first byte for
+        // metric continuity with the streaming path.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut ttft_ms = 0u32;
+        let mut truncated = false;
+        let mut byte_stream = upstream.bytes_stream();
+        while let Some(item) = byte_stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    if buf.is_empty() && !chunk.is_empty() {
+                        ttft_ms = upstream_start.elapsed().as_millis() as u32;
+                    }
+                    if buf.len().saturating_add(chunk.len()) > BODY_LIMIT {
+                        truncated = true;
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "upstream read failed during boon interception");
+                    truncated = true;
+                    break;
+                }
+            }
+        }
+
+        // Parse + transform. Oversized, truncated, or unparseable bodies pass
+        // through unchanged (fail-open); only well-formed completions are
+        // rewritten.
+        let mut warning: Option<&'static str> = None;
+        let mut completion: Option<serde_json::Value> = (!truncated
+            && buf.len() <= BOON_BUFFER_MAX)
+            .then(|| serde_json::from_slice::<serde_json::Value>(&buf).ok())
+            .flatten();
+        let (final_body, final_content_type): (Bytes, String) = match completion.as_mut() {
+            Some(body_json) => {
+                // Tool-loop and repair calls run while the fairshare permit is
+                // still held — they occupy upstream capacity just like the
+                // original call. `tool_loop::run` falls through to the plain
+                // boon transform when no tool loop is armed.
+                let outcome = crate::boons::tool_loop::run(
+                    &state,
+                    &plan,
+                    route.as_deref(),
+                    &resolved,
+                    &req_meta.session_id,
+                    req_timeout,
+                    body_json,
+                )
+                .await;
+                warning = outcome.warning;
+                if plan.client_stream {
+                    (
+                        Bytes::from(crate::boons::respond::synthesize_sse(
+                            body_json,
+                            plan.include_usage,
+                        )),
+                        "text/event-stream".to_string(),
+                    )
+                } else {
+                    (
+                        serde_json::to_vec(body_json)
+                            .map(Bytes::from)
+                            .unwrap_or_else(|_| Bytes::from(std::mem::take(&mut buf))),
+                        content_type_str.clone(),
+                    )
+                }
+            }
+            None => (
+                Bytes::from(std::mem::take(&mut buf)),
+                content_type_str.clone(),
+            ),
+        };
+        drop(permit);
+
+        let (input_tokens, output_tokens) = completion
+            .as_ref()
+            .and_then(|c| {
+                let input = c.pointer("/usage/prompt_tokens")?.as_u64()? as u32;
+                let output = c
+                    .pointer("/usage/completion_tokens")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as u32;
+                Some((input, output))
+            })
+            .unwrap_or((est.input_tokens, est.estimated_output_tokens));
+        let total_ms = request_start.elapsed().as_millis() as u32;
+
+        // Cache the *transformed* body so cache hits replay exactly what the
+        // client received. The cache key was computed from the client body
+        // (original `stream` flag included), so JSON and SSE representations
+        // never collide.
+        let cache_body = (!truncated && final_body.len() <= CACHE_MAX_BYTES)
+            .then(|| String::from_utf8_lossy(&final_body).into_owned());
+        let cache_put = match (&store_in_cache, cache_body) {
+            (Some(ck), Some(body)) => {
+                Some((ck.as_str(), cache_ttl, final_content_type.as_str(), body))
+            }
+            _ => None,
+        };
+        settle_request(
+            &state,
+            &resolved,
+            &req_meta,
+            &model,
+            admission,
+            est,
+            input_tokens,
+            output_tokens,
+            queue_wait_ms,
+            ttft_ms,
+            total_ms,
+            status_code,
+            cache_status_label,
+            capacity,
+            term_period.as_deref(),
+            in_cost_rate,
+            out_cost_rate,
+            modality_cost,
+            cache_put,
+        )
+        .await;
+
+        let mut builder = Response::builder()
+            .status(status_code)
+            .header(header::CONTENT_TYPE, final_content_type)
+            .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
+        if !boons_applied.is_empty() {
+            builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
+        }
+        if let Some(w) = warning {
+            builder = builder.header(crate::boons::BOONS_WARNING_HEADER, w);
+        }
+        return builder.body(Body::from(final_body)).unwrap_or_else(|_| {
+            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+        });
+    }
+
     // ---- stream back, inspecting for actual usage, then reconcile ----
     let stream_state = state.clone();
     let resolved_for_stream = resolved.clone();
@@ -716,98 +1011,20 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         let total_ms = request_start.elapsed().as_millis() as u32;
 
         // store the full response for identical future requests
-        if cacheable && status_code == 200 {
-            if let Some(ck) = &store_in_cache {
+        let cache_put = if cacheable && status_code == 200 {
+            store_in_cache.as_deref().map(|ck| {
                 // Take ownership of the buffer instead of copying it; the
                 // lossy re-encode only runs for invalid UTF-8 (never for the
                 // JSON/SSE bodies this cache is meant for).
                 let body = String::from_utf8(std::mem::take(&mut full))
                     .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-                let cached = obleth_config::CachedResponse {
-                    status: status_code,
-                    content_type: content_type_str.clone(),
-                    body,
-                    input_tokens,
-                    output_tokens,
-                };
-                if let Err(e) = stream_state.redis.cache_put(ck, &cached, cache_ttl).await {
-                    tracing::warn!(error = %e, "cache store failed");
-                    stream_state.alerts.issue(
-                        "redis_cache_store_failed",
-                        "Redis response-cache store failed",
-                        format!(
-                            "tenant `{}` model `{model}` cache ttl `{cache_ttl}`: {e}",
-                            resolved_for_stream.tenant_name
-                        ),
-                    );
-                }
-            }
-        }
+                (ck, cache_ttl, content_type_str.as_str(), body)
+            })
+        } else {
+            None
+        };
 
-        // Reconcile estimate vs actual against the per-minute budget bucket.
-        // A zero token rate means the tenant has no per-minute limiter.
-        if capacity > 0 {
-            if let Err(e) = stream_state
-                .redis
-                .reconcile_budget(
-                    &resolved_for_stream.tenant_id,
-                    capacity,
-                    est.total(),
-                    input_tokens.saturating_add(output_tokens),
-                )
-                .await
-            {
-                tracing::warn!(error = %e, "budget reconcile failed");
-                stream_state.alerts.issue(
-                    "redis_budget_reconcile_failed",
-                    "Redis budget reconcile failed",
-                    format!(
-                        "tenant `{}` model `{model}` estimated `{}` actual `{}`: {e}",
-                        resolved_for_stream.tenant_name,
-                        est.total(),
-                        input_tokens.saturating_add(output_tokens),
-                    ),
-                );
-            }
-        }
-
-        // ---- term-usage commit + budget alerts (Phase 3 + Phase 5) ----
-        // Frozen request cost: per-token rates (captured at admission) plus any
-        // per-request modality surcharge. Computed once and used for both the
-        // term-budget commit and the persisted usage ledger so they agree.
-        let cost_usd = (input_tokens as f64) * in_cost_rate
-            + (output_tokens as f64) * out_cost_rate
-            + modality_cost;
-        if let Some(period) = &term_period {
-            let added = input_tokens.saturating_add(output_tokens) as i64;
-            match stream_state
-                .redis
-                .term_usage_add(&resolved_for_stream.tenant_id, period, added, cost_usd)
-                .await
-            {
-                Ok((total_tokens, total_cost)) => {
-                    maybe_alert_budget(
-                        &stream_state,
-                        &resolved_for_stream,
-                        total_tokens,
-                        total_cost,
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "term usage commit failed");
-                    stream_state.alerts.issue(
-                        "redis_term_usage_failed",
-                        "Redis term-usage commit failed",
-                        format!(
-                            "tenant `{}` model `{model}`: {e}",
-                            resolved_for_stream.tenant_name
-                        ),
-                    );
-                }
-            }
-        }
-
-        finalize(
+        settle_request(
             &stream_state,
             &resolved_for_stream,
             &meta_for_stream,
@@ -821,16 +1038,151 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             total_ms,
             status_code,
             cache_status_label,
-            cost_usd,
-        );
-        stream_state.metrics.total_ms.observe(total_ms as f64);
+            capacity,
+            term_period.as_deref(),
+            in_cost_rate,
+            out_cost_rate,
+            modality_cost,
+            cache_put,
+        )
+        .await;
     };
 
     let mut builder = Response::builder().status(status_code);
-    builder = builder.header(header::CONTENT_TYPE, content_type);
+    builder = builder
+        .header(header::CONTENT_TYPE, content_type)
+        .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
+    if !boons_applied.is_empty() {
+        builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
+    }
     builder
         .body(Body::from_stream(body_stream))
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+}
+
+/// End-of-request bookkeeping shared by the streaming pass-through path and
+/// the boon interception path: cache store, per-minute budget reconciliation,
+/// term-usage commit + budget alerts, and the usage-ledger record.
+///
+/// `cache_put` carries `(key, ttl, content_type, body)` when the response
+/// should be stored for identical future requests; callers gate it on a
+/// successful (200) response.
+#[allow(clippy::too_many_arguments)]
+async fn settle_request(
+    state: &AppState,
+    resolved: &ResolvedKey,
+    meta: &RequestMeta,
+    model: &str,
+    admission: Admission,
+    est: CostEstimate,
+    input_tokens: u32,
+    output_tokens: u32,
+    queue_wait_ms: u32,
+    ttft_ms: u32,
+    total_ms: u32,
+    status_code: u16,
+    cache_status: &str,
+    capacity: i64,
+    term_period: Option<&str>,
+    in_cost_rate: f64,
+    out_cost_rate: f64,
+    modality_cost: f64,
+    cache_put: Option<(&str, i64, &str, String)>,
+) {
+    // store the full response for identical future requests
+    if let Some((ck, ttl, content_type, body)) = cache_put {
+        let cached = obleth_config::CachedResponse {
+            status: status_code,
+            content_type: content_type.to_string(),
+            body,
+            input_tokens,
+            output_tokens,
+        };
+        if let Err(e) = state.redis.cache_put(ck, &cached, ttl).await {
+            tracing::warn!(error = %e, "cache store failed");
+            state.alerts.issue(
+                "redis_cache_store_failed",
+                "Redis response-cache store failed",
+                format!(
+                    "tenant `{}` model `{model}` cache ttl `{ttl}`: {e}",
+                    resolved.tenant_name
+                ),
+            );
+        }
+    }
+
+    // Reconcile estimate vs actual against the per-minute budget bucket.
+    // A zero token rate means the tenant has no per-minute limiter.
+    if capacity > 0 {
+        if let Err(e) = state
+            .redis
+            .reconcile_budget(
+                &resolved.tenant_id,
+                capacity,
+                est.total(),
+                input_tokens.saturating_add(output_tokens),
+            )
+            .await
+        {
+            tracing::warn!(error = %e, "budget reconcile failed");
+            state.alerts.issue(
+                "redis_budget_reconcile_failed",
+                "Redis budget reconcile failed",
+                format!(
+                    "tenant `{}` model `{model}` estimated `{}` actual `{}`: {e}",
+                    resolved.tenant_name,
+                    est.total(),
+                    input_tokens.saturating_add(output_tokens),
+                ),
+            );
+        }
+    }
+
+    // ---- term-usage commit + budget alerts (Phase 3 + Phase 5) ----
+    // Frozen request cost: per-token rates (captured at admission) plus any
+    // per-request modality surcharge. Computed once and used for both the
+    // term-budget commit and the persisted usage ledger so they agree.
+    let cost_usd = (input_tokens as f64) * in_cost_rate
+        + (output_tokens as f64) * out_cost_rate
+        + modality_cost;
+    if let Some(period) = term_period {
+        let added = input_tokens.saturating_add(output_tokens) as i64;
+        match state
+            .redis
+            .term_usage_add(&resolved.tenant_id, period, added, cost_usd)
+            .await
+        {
+            Ok((total_tokens, total_cost)) => {
+                maybe_alert_budget(state, resolved, total_tokens, total_cost);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "term usage commit failed");
+                state.alerts.issue(
+                    "redis_term_usage_failed",
+                    "Redis term-usage commit failed",
+                    format!("tenant `{}` model `{model}`: {e}", resolved.tenant_name),
+                );
+            }
+        }
+    }
+
+    finalize(
+        state,
+        resolved,
+        meta,
+        model,
+        admission,
+        est,
+        input_tokens,
+        output_tokens,
+        queue_wait_ms,
+        ttft_ms,
+        total_ms,
+        status_code,
+        cache_status,
+        cost_usd,
+    );
+    state.metrics.total_ms.observe(total_ms as f64);
 }
 
 /// Resolve a key via moka, falling back to Redis and caching the result.
@@ -1219,10 +1571,24 @@ fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value
 /// separately) pass through untouched, as does everything when the model has
 /// no registered route. The token estimate is unaffected by this rewrite —
 /// the tokenizer never reads the `model` field.
+///
+/// `force_non_streaming` is set when a response-transforming boon is armed:
+/// the upstream call is made non-streaming regardless of what the client
+/// asked for. This happens here — after the cache key was computed from the
+/// client body — so streaming and non-streaming clients keep distinct cache
+/// entries holding the representation each actually receives (JSON vs SSE).
+///
+/// `stream_with_usage` is set for the streaming tool loop's turn-0 dispatch:
+/// the upstream stays streaming but is asked to include a final usage chunk so
+/// turn-0 tokens are billed exactly instead of estimated. (`tool_stream`
+/// captures that usage but never forwards it to the client unless the client
+/// itself asked for usage.) The two flags are mutually exclusive.
 fn prepare_upstream_body(
     route: Option<&ResolvedModel>,
     json: &mut serde_json::Value,
     body: Bytes,
+    force_non_streaming: bool,
+    stream_with_usage: bool,
 ) -> Bytes {
     let Some(route) = route else {
         return body;
@@ -1234,6 +1600,16 @@ fn prepare_upstream_body(
         "model".into(),
         serde_json::Value::String(route.upstream_model.clone()),
     );
+    if force_non_streaming {
+        obj.insert("stream".into(), serde_json::Value::Bool(false));
+        obj.remove("stream_options");
+    } else if stream_with_usage {
+        obj.insert("stream".into(), serde_json::Value::Bool(true));
+        obj.insert(
+            "stream_options".into(),
+            serde_json::json!({ "include_usage": true }),
+        );
+    }
     serde_json::to_vec(&*json).map(Bytes::from).unwrap_or(body)
 }
 
@@ -1390,9 +1766,10 @@ pub(crate) fn forward_headers(headers: &HeaderMap) -> HeaderMap {
     let mut out = HeaderMap::new();
     for (name, value) in headers {
         match name.as_str() {
-            // strip hop-by-hop / auth / encoding so the body stays inspectable
+            // strip hop-by-hop / auth / encoding so the body stays inspectable;
+            // x-obleth-boons is a gateway directive, not an upstream header
             "host" | "content-length" | "authorization" | "x-api-key" | "accept-encoding"
-            | "connection" => continue,
+            | "connection" | "x-obleth-boons" => continue,
             _ => {
                 out.insert(name.clone(), value.clone());
             }
@@ -1602,7 +1979,7 @@ fn now_ms() -> i64 {
 mod tests {
     use super::{
         backoff_for, build_targets, build_upstream_url, has_path_traversal, is_retryable_status,
-        tenant_active_now, weighted_order,
+        prepare_upstream_body, tenant_active_now, weighted_order,
     };
     use chrono::{DateTime, TimeZone, Utc};
     use obleth_config::{ResolvedEndpoint, ResolvedKey, WeeklyWindow};
@@ -1816,6 +2193,7 @@ mod tests {
             supports_vision: false,
             tags: Vec::new(),
             boons: Vec::new(),
+            tool_servers: Vec::new(),
             request_timeout_secs: None,
             max_retries: 0,
             retry_backoff_ms: obleth_config::DEFAULT_RETRY_BACKOFF_MS,
@@ -1912,6 +2290,90 @@ mod tests {
         let model = model_with(vec![ep]);
         let targets = build_targets(Some(&model), "http://global/v1", "failover");
         assert_eq!(targets[0].api_key.as_deref(), Some("model-key"));
+    }
+
+    #[test]
+    fn prepare_upstream_body_forces_non_streaming() {
+        let model = model_with(Vec::new());
+        let mut json = serde_json::json!({
+            "model": "client-name",
+            "stream": true,
+            "stream_options": { "include_usage": true },
+            "messages": []
+        });
+        let body = prepare_upstream_body(
+            Some(&model),
+            &mut json,
+            axum::body::Bytes::new(),
+            true,
+            false,
+        );
+        let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sent["stream"], false);
+        assert!(sent.get("stream_options").is_none());
+        // The model-name swap still happens.
+        assert_eq!(sent["model"], "m");
+    }
+
+    #[test]
+    fn prepare_upstream_body_adds_usage_for_stream_tap() {
+        // Turn-0 of the streaming tool loop: stay streaming but ask for a final
+        // usage chunk so turn-0 billing is exact.
+        let model = model_with(Vec::new());
+        let mut json = serde_json::json!({
+            "model": "client-name",
+            "stream": true,
+            "messages": []
+        });
+        let body = prepare_upstream_body(
+            Some(&model),
+            &mut json,
+            axum::body::Bytes::new(),
+            false,
+            true,
+        );
+        let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn prepare_upstream_body_preserves_stream_without_force() {
+        let model = model_with(Vec::new());
+        let mut json = serde_json::json!({
+            "model": "client-name",
+            "stream": true,
+            "stream_options": { "include_usage": true },
+            "messages": []
+        });
+        let body = prepare_upstream_body(
+            Some(&model),
+            &mut json,
+            axum::body::Bytes::new(),
+            false,
+            false,
+        );
+        let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sent["stream"], true);
+        assert!(sent.get("stream_options").is_some());
+    }
+
+    #[test]
+    fn cache_key_diverges_on_client_stream_flag() {
+        // The cache key is computed from the client body *before* the boon
+        // interception forces `stream: false` upstream, so streaming and
+        // non-streaming clients must land on different cache entries.
+        let streaming =
+            serde_json::to_vec(&serde_json::json!({ "model": "m", "stream": true, "messages": [] }))
+                .unwrap();
+        let plain = serde_json::to_vec(
+            &serde_json::json!({ "model": "m", "stream": false, "messages": [] }),
+        )
+        .unwrap();
+        assert_ne!(
+            obleth_config::cache_key("m", &streaming),
+            obleth_config::cache_key("m", &plain)
+        );
     }
 
     #[test]

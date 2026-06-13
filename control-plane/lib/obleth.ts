@@ -91,6 +91,7 @@ export interface ModelRoute {
   endpoint_selection_mode: string;
   tags: string[];
   boons: string[];
+  tool_servers: string[];
   created_at: string;
   updated_at: string;
 }
@@ -481,6 +482,14 @@ export interface BoonSettingsView {
   vision_describe_prompt: string;
   vision_max_images: number;
   vision_timeout_ms: number;
+  structured_output_enabled: boolean;
+  structured_output_fixer_model: string | null;
+  structured_output_max_repair_attempts: number;
+  structured_output_timeout_ms: number;
+  tool_loop_enabled: boolean;
+  tool_loop_max_turns: number;
+  tool_loop_tool_timeout_ms: number;
+  tool_loop_nudge: string;
 }
 
 export interface UpdateBoonSettings {
@@ -489,6 +498,14 @@ export interface UpdateBoonSettings {
   vision_describe_prompt?: string;
   vision_max_images?: number;
   vision_timeout_ms?: number;
+  structured_output_enabled?: boolean;
+  structured_output_fixer_model?: string | null;
+  structured_output_max_repair_attempts?: number;
+  structured_output_timeout_ms?: number;
+  tool_loop_enabled?: boolean;
+  tool_loop_max_turns?: number;
+  tool_loop_tool_timeout_ms?: number;
+  tool_loop_nudge?: string;
 }
 
 export interface ChannelResult {

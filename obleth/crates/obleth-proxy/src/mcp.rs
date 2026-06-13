@@ -116,20 +116,35 @@ pub async fn mcp_handler(
         );
     }
     state.metrics.record_mcp(&server.name, status.as_u16());
-    let content_type = upstream
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .cloned()
-        .unwrap_or_else(|| header::HeaderValue::from_static("application/json"));
+
+    // Forward the upstream response headers, dropping only what the re-stream
+    // invalidates. MCP streamable-HTTP servers carry protocol state in
+    // headers — notably `mcp-session-id` on the initialize response — so
+    // stripping them breaks every follow-up request in the session.
+    let mut builder = Response::builder().status(status);
+    if let Some(headers_out) = builder.headers_mut() {
+        for (name, value) in upstream.headers() {
+            match name.as_str() {
+                "transfer-encoding" | "content-length" | "connection" => continue,
+                _ => {
+                    headers_out.insert(name.clone(), value.clone());
+                }
+            }
+        }
+        if !headers_out.contains_key(header::CONTENT_TYPE) {
+            headers_out.insert(
+                header::CONTENT_TYPE,
+                header::HeaderValue::from_static("application/json"),
+            );
+        }
+    }
 
     // Stream the response straight through (handles both JSON and SSE).
     let stream = upstream
         .bytes_stream()
         .map(|chunk| chunk.map_err(std::io::Error::other));
 
-    Response::builder()
-        .status(status)
-        .header(header::CONTENT_TYPE, content_type)
+    builder
         .body(Body::from_stream(stream))
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
 }
@@ -140,8 +155,9 @@ pub struct McpPath {
     rest: Option<String>,
 }
 
-/// Resolve a registered MCP server via moka, falling back to Redis.
-async fn resolve_mcp(state: &AppState, name: &str) -> Option<Arc<ResolvedMcpServer>> {
+/// Resolve a registered MCP server via moka, falling back to Redis. Also used
+/// by the gateway tool loop to reach granted servers directly.
+pub(crate) async fn resolve_mcp(state: &AppState, name: &str) -> Option<Arc<ResolvedMcpServer>> {
     if let Some(s) = state.mcp_cache.get(name).await {
         return Some(s);
     }

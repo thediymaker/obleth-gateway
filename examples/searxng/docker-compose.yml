@@ -1,0 +1,45 @@
+# SearXNG + MCP server for the obleth search-boon demo.
+#
+# Runs a private SearXNG metasearch instance and fronts it with an MCP server
+# (streamable HTTP). Both join the obleth gateway's docker network so the
+# gateway can reverse-proxy the MCP server at /mcp/searxng.
+#
+#   docker compose -f examples/searxng/docker-compose.yml up -d
+#
+# Then register the MCP server in obleth (control plane -> MCP, or admin API)
+# with upstream URL: http://mcp-searxng:8765/mcp
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    volumes:
+      - ./settings.yml:/etc/searxng/settings.yml:ro
+    # Host port for poking the JSON API directly while debugging.
+    ports: ["127.0.0.1:8089:8080"]
+    networks: [obleth]
+    restart: unless-stopped
+
+  mcp-searxng:
+    image: isokoliuk/mcp-searxng:latest
+    container_name: mcp-searxng
+    environment:
+      SEARXNG_URL: http://searxng:8080
+      MCP_HTTP_PORT: "8765"
+      # Bind on all interfaces so the obleth gateway can reach it across the
+      # docker network (the default is loopback-only).
+      MCP_HTTP_HOST: 0.0.0.0
+      # The gateway tool loop is the only client; the default of 20 session
+      # initializations per minute is far too low for agentic traffic.
+      MCP_RATE_INIT_MAX: "600"
+      MCP_RATE_SESSION_MAX: "3000"
+    # Host port for poking the MCP endpoint directly while debugging; the demo
+    # goes through the gateway instead.
+    ports: ["127.0.0.1:8765:8765"]
+    networks: [obleth]
+    depends_on: [searxng]
+    restart: unless-stopped
+
+networks:
+  obleth:
+    external: true
+    name: obleth_default

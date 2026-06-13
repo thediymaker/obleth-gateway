@@ -268,6 +268,13 @@ pub struct ModelRoute {
     /// `vision` boon relays images to a describer). Empty by default.
     #[serde(default)]
     pub boons: Vec<String>,
+    /// Registered MCP servers whose tools this model may use. Distinct from
+    /// capabilities: a capability is what the model can do natively (e.g.
+    /// function calling); a tool server is something the gateway grants access
+    /// to. When non-empty, plain chat requests get the servers' tools injected
+    /// and the gateway runs the tool loop itself. Empty by default (off).
+    #[serde(default)]
+    pub tool_servers: Vec<String>,
     /// Per-request upstream timeout in seconds. `None` falls back to the global
     /// `OBLETH_UPSTREAM_TIMEOUT_SECS` default.
     #[serde(default)]
@@ -384,6 +391,10 @@ pub struct ResolvedModel {
     /// vocabulary. `#[serde(default)]` keeps older cached payloads readable.
     #[serde(default)]
     pub boons: Vec<String>,
+    /// Registered MCP servers whose tools this model may use (gateway tool
+    /// loop). `#[serde(default)]` keeps older cached payloads readable.
+    #[serde(default)]
+    pub tool_servers: Vec<String>,
     /// Per-request upstream timeout in seconds. `None` falls back to the global
     /// default. `#[serde(default)]` keeps older cached payloads readable.
     #[serde(default)]
@@ -650,9 +661,11 @@ pub fn is_valid_tag(tag: &str) -> bool {
 
 /// Fixed vocabulary of gateway boons. A boon grants a capability a model lacks
 /// natively; the data plane applies a model's enabled boons before dispatch.
-/// `vision` relays image parts to a configured describer model. Operators opt
-/// each model into a subset of these; nothing is granted by default.
-pub const MODEL_BOONS: &[&str] = &["vision"];
+/// `vision` relays image parts to a configured describer model.
+/// `structured_output` enforces `response_format` JSON schemas with gateway-side
+/// validation and repair. Operators opt each model into a subset of these;
+/// nothing is granted by default.
+pub const MODEL_BOONS: &[&str] = &["vision", "structured_output"];
 
 /// True when `boon` is part of the fixed [`MODEL_BOONS`] vocabulary.
 pub fn is_valid_boon(boon: &str) -> bool {
@@ -868,6 +881,14 @@ pub struct BoonSettings {
     /// that do not natively accept image input.
     #[serde(default)]
     pub vision: VisionBoonSettings,
+    /// The structured-output boon: enforce `response_format` JSON schemas for
+    /// models without native support.
+    #[serde(default)]
+    pub structured_output: StructuredOutputBoonSettings,
+    /// The gateway tool loop: inject granted MCP-server tools into chat
+    /// requests and execute the model's tool calls at the gateway.
+    #[serde(default)]
+    pub tool_loop: ToolLoopSettings,
 }
 
 /// Configuration for the vision boon (image-to-text relay).
@@ -915,6 +936,143 @@ impl VisionBoonSettings {
                 .as_ref()
                 .is_some_and(|m| !m.trim().is_empty())
     }
+}
+
+fn default_structured_max_repair_attempts() -> u32 {
+    1
+}
+
+fn default_structured_timeout_ms() -> u64 {
+    30_000
+}
+
+/// Maximum repair attempts an operator may configure for the structured-output
+/// boon (cost guard).
+pub const STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS: u32 = 3;
+
+/// Configuration for the structured-output boon (JSON-schema enforcement).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StructuredOutputBoonSettings {
+    /// Master switch for the structured-output boon. When false, requests pass
+    /// through unchanged.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `model_name` of the registered model used to repair invalid JSON.
+    /// `None` re-prompts the request's own model instead.
+    #[serde(default)]
+    pub fixer_model: Option<String>,
+    /// Maximum repair calls per request when validation fails
+    /// (clamped to [`STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS`]).
+    #[serde(default = "default_structured_max_repair_attempts")]
+    pub max_repair_attempts: u32,
+    /// Hard timeout for each repair call, in milliseconds.
+    #[serde(default = "default_structured_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for StructuredOutputBoonSettings {
+    fn default() -> Self {
+        StructuredOutputBoonSettings {
+            enabled: false,
+            fixer_model: None,
+            max_repair_attempts: default_structured_max_repair_attempts(),
+            timeout_ms: default_structured_timeout_ms(),
+        }
+    }
+}
+
+impl StructuredOutputBoonSettings {
+    /// True when the structured-output boon is enabled.
+    pub fn active(&self) -> bool {
+        self.enabled
+    }
+}
+
+fn default_tool_loop_max_turns() -> u32 {
+    4
+}
+
+fn default_tool_loop_timeout_ms() -> u64 {
+    30_000
+}
+
+/// Default system nudge injected alongside granted tools so under-eager models
+/// reach for them. Names the capability explicitly ("you can call tools") and
+/// the situations that warrant a call, without forcing tool use on every turn.
+pub fn default_tool_loop_nudge() -> String {
+    "You have tools available in this conversation and can call them. \
+When a question needs current, external, or factual information you are not \
+certain of — news, prices, weather, software versions, documentation, recent \
+events, anything after your knowledge cutoff — call the appropriate tool to \
+look it up before answering, rather than guessing or saying you cannot. Use \
+your own knowledge directly for everything else."
+        .to_string()
+}
+
+/// Maximum tool-loop turns an operator may configure (cost/latency guard).
+pub const TOOL_LOOP_MAX_TURNS: u32 = 8;
+
+/// Configuration for the gateway tool loop: when a model is granted access to
+/// registered MCP servers (`ModelRoute::tool_servers`), the gateway injects
+/// the servers' tools into plain chat requests, executes the model's tool
+/// calls against the MCP upstream, and loops until the model produces a final
+/// answer. Clients that send their own `tools` are left untouched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ToolLoopSettings {
+    /// Master switch for the gateway tool loop. When false, granted tool
+    /// servers are ignored and requests pass through unchanged.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum model round trips per request before the loop stops and the
+    /// last completion is returned as-is (clamped to [`TOOL_LOOP_MAX_TURNS`]).
+    #[serde(default = "default_tool_loop_max_turns")]
+    pub max_turns: u32,
+    /// Hard timeout for each MCP tool execution, in milliseconds.
+    #[serde(default = "default_tool_loop_timeout_ms")]
+    pub tool_timeout_ms: u64,
+    /// System instruction injected alongside the granted tools so the model
+    /// actually calls them when a question needs external information. Tunable
+    /// per deployment; injected only for plain chat clients (clients that bring
+    /// their own `tools` manage their own tool-use policy and are left
+    /// untouched). An empty string disables the nudge.
+    #[serde(default = "default_tool_loop_nudge")]
+    pub nudge: String,
+}
+
+impl Default for ToolLoopSettings {
+    fn default() -> Self {
+        ToolLoopSettings {
+            enabled: false,
+            max_turns: default_tool_loop_max_turns(),
+            tool_timeout_ms: default_tool_loop_timeout_ms(),
+            nudge: default_tool_loop_nudge(),
+        }
+    }
+}
+
+impl ToolLoopSettings {
+    /// True when the gateway tool loop is enabled.
+    pub fn active(&self) -> bool {
+        self.enabled
+    }
+}
+
+/// Normalize a list of MCP server names granted to a model: trimmed,
+/// de-duplicated, empties dropped, order-stable by first appearance. Unlike
+/// boons/tags there is no fixed vocabulary — server names are operator-defined.
+pub fn normalize_tool_servers<I, S>(servers: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<String> = Vec::new();
+    for server in servers {
+        let s = server.as_ref().trim().to_string();
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    out
 }
 
 // ---- config backup / restore ------------------------------------------------
@@ -1084,6 +1242,8 @@ pub struct ModelBackup {
     #[serde(default)]
     pub boons: Vec<String>,
     #[serde(default)]
+    pub tool_servers: Vec<String>,
+    #[serde(default)]
     pub request_timeout_secs: Option<i64>,
     #[serde(default)]
     pub max_retries: i64,
@@ -1158,4 +1318,38 @@ pub struct RestoreReport {
     pub app_settings: RestoreCounts,
     #[serde(default)]
     pub warnings: Vec<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boon_settings_backward_compat_deserialize() {
+        // A stored blob from before the structured_output boon existed must
+        // deserialize with the new fields defaulted off. A retired `tools` blob
+        // is ignored (the field no longer exists).
+        let old = r#"{"vision":{"enabled":true,"fallback_model":"llava","describe_prompt":"p","max_images":4,"timeout_ms":1000},"tools":{"enabled":true,"max_tools":8}}"#;
+        let settings: BoonSettings = serde_json::from_str(old).expect("old blob deserializes");
+        assert!(settings.vision.enabled);
+        assert_eq!(settings.vision.fallback_model.as_deref(), Some("llava"));
+        assert!(!settings.structured_output.enabled);
+        assert_eq!(settings.structured_output.max_repair_attempts, 1);
+        assert_eq!(settings.structured_output.timeout_ms, 30_000);
+    }
+
+    #[test]
+    fn normalize_boons_accepts_new_vocabulary() {
+        // The retired `tools` boon is dropped along with any other unknown value.
+        let boons = normalize_boons([" structured_output ", "vision", "bogus", "tools"]);
+        assert_eq!(boons, vec!["structured_output", "vision"]);
+    }
+
+    #[test]
+    fn boon_active_flags() {
+        let mut structured = StructuredOutputBoonSettings::default();
+        assert!(!structured.active());
+        structured.enabled = true;
+        assert!(structured.active());
+    }
 }

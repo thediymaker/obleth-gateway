@@ -127,6 +127,25 @@ impl RequestFeatures {
     }
 }
 
+/// Which boon-granted capabilities are currently active gateway-wide. A model
+/// that carries the matching boon counts as capable in the hard filters below,
+/// because the boon engine will emulate the capability at dispatch time.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BoonGrants {
+    /// The structured-output boon is enabled in settings: models with the
+    /// `structured_output` boon can serve `response_format` requests.
+    pub structured_active: bool,
+}
+
+impl BoonGrants {
+    /// Snapshot the grants from the live boon settings.
+    pub fn from_settings(settings: &obleth_config::BoonSettings) -> Self {
+        BoonGrants {
+            structured_active: settings.structured_output.active(),
+        }
+    }
+}
+
 /// Pick the best concrete model for an `auto` request, or `None` when no
 /// registered model can serve it.
 ///
@@ -139,10 +158,19 @@ pub fn select_model(
     busyness: &HashMap<String, usize>,
     allowed_models: Option<&[String]>,
     desired_tags: &[String],
+    grants: BoonGrants,
 ) -> Option<ResolvedModel> {
     let required_context = features
         .est_input_tokens
         .saturating_add(features.max_tokens);
+
+    // Capability via boon: the gateway emulates structured output for opted-in
+    // models, so the hard filters must not exclude them. Function calling and
+    // tool choice are native capabilities only — no boon emulates them.
+    let schema_via_boon = |c: &Candidate| {
+        grants.structured_active
+            && c.model.boons.iter().any(|b| b == "structured_output")
+    };
 
     // ---- stage 1: hard filters ----
     let eligible: Vec<&Candidate> = candidates
@@ -159,7 +187,11 @@ pub fn select_model(
         })
         .filter(|c| !features.needs_function_calling || c.model.supports_function_calling)
         .filter(|c| !features.needs_tool_choice || c.model.supports_tool_choice)
-        .filter(|c| !features.needs_response_schema || c.model.supports_response_schema)
+        .filter(|c| {
+            !features.needs_response_schema
+                || c.model.supports_response_schema
+                || schema_via_boon(c)
+        })
         .filter(|c| match allowed_models {
             Some(allowed) => allowed.iter().any(|m| m == &c.model.model_name),
             None => true,
@@ -362,6 +394,7 @@ mod tests {
             supports_vision: false,
             tags: Vec::new(),
             boons: Vec::new(),
+            tool_servers: Vec::new(),
             request_timeout_secs: None,
             max_retries: 0,
             retry_backoff_ms: obleth_config::DEFAULT_RETRY_BACKOFF_MS,
@@ -379,7 +412,7 @@ mod tests {
 
     #[test]
     fn empty_registry_returns_none() {
-        let chosen = select_model(&[], &RequestFeatures::default(), &HashMap::new(), None, &[]);
+        let chosen = select_model(&[], &RequestFeatures::default(), &HashMap::new(), None, &[], BoonGrants::default());
         assert!(chosen.is_none());
     }
 
@@ -395,7 +428,7 @@ mod tests {
             max_tokens: 2_000,
             ..Default::default()
         };
-        let chosen = select_model(&candidates, &features, &HashMap::new(), None, &[]).unwrap();
+        let chosen = select_model(&candidates, &features, &HashMap::new(), None, &[], BoonGrants::default()).unwrap();
         assert_eq!(chosen.model_name, "large");
     }
 
@@ -409,7 +442,7 @@ mod tests {
             max_tokens: 2_000,
             ..Default::default()
         };
-        assert!(select_model(&candidates, &features, &HashMap::new(), None, &[]).is_none());
+        assert!(select_model(&candidates, &features, &HashMap::new(), None, &[], BoonGrants::default()).is_none());
     }
 
     #[test]
@@ -423,7 +456,7 @@ mod tests {
             needs_function_calling: true,
             ..Default::default()
         };
-        let chosen = select_model(&candidates, &features, &HashMap::new(), None, &[]).unwrap();
+        let chosen = select_model(&candidates, &features, &HashMap::new(), None, &[], BoonGrants::default()).unwrap();
         assert_eq!(chosen.model_name, "tools");
     }
 
@@ -442,6 +475,7 @@ mod tests {
             &HashMap::new(),
             None,
             &[],
+            BoonGrants::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "up");
@@ -462,6 +496,7 @@ mod tests {
             &HashMap::new(),
             None,
             &[],
+            BoonGrants::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "cheap");
@@ -482,6 +517,7 @@ mod tests {
             &busyness,
             None,
             &[],
+            BoonGrants::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "b");
@@ -497,6 +533,7 @@ mod tests {
             &HashMap::new(),
             Some(&allowed),
             &[],
+            BoonGrants::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "b");
@@ -538,6 +575,7 @@ mod tests {
             &HashMap::new(),
             None,
             &desired,
+            BoonGrants::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "coder");
@@ -559,6 +597,7 @@ mod tests {
             &HashMap::new(),
             None,
             &[],
+            BoonGrants::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "cheap");
@@ -584,5 +623,68 @@ mod tests {
         let body = serde_json::json!({ "messages": [{"role": "user", "content": "hello"}] });
         let tags = heuristic_tags(&body, 40_000);
         assert!(tags.contains(&"long-context".to_string()));
+    }
+
+    #[test]
+    fn function_calling_requires_native_support() {
+        // No boon emulates function calling / tool choice: a model lacking the
+        // native capability is filtered out regardless of any boons it carries.
+        let mut plain = model("plain");
+        plain.supports_function_calling = false;
+        plain.supports_tool_choice = false;
+        plain.boons = vec!["structured_output".to_string()];
+        let candidates = vec![healthy(plain)];
+        let features = RequestFeatures {
+            needs_function_calling: true,
+            needs_tool_choice: true,
+            ..Default::default()
+        };
+        let grants = BoonGrants {
+            structured_active: true,
+        };
+        assert!(select_model(&candidates, &features, &HashMap::new(), None, &[], grants).is_none());
+    }
+
+    #[test]
+    fn structured_boon_satisfies_schema_filter() {
+        let mut emulated = model("emulated");
+        emulated.supports_response_schema = false;
+        emulated.boons = vec!["structured_output".to_string()];
+        let candidates = vec![healthy(emulated)];
+        let features = RequestFeatures {
+            needs_response_schema: true,
+            ..Default::default()
+        };
+        assert!(select_model(
+            &candidates,
+            &features,
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default()
+        )
+        .is_none());
+        let grants = BoonGrants {
+            structured_active: true,
+        };
+        let chosen =
+            select_model(&candidates, &features, &HashMap::new(), None, &[], grants).unwrap();
+        assert_eq!(chosen.model_name, "emulated");
+    }
+
+    #[test]
+    fn grant_without_model_boon_does_not_grant() {
+        let mut plain = model("plain");
+        plain.supports_response_schema = false;
+        plain.boons = Vec::new();
+        let candidates = vec![healthy(plain)];
+        let features = RequestFeatures {
+            needs_response_schema: true,
+            ..Default::default()
+        };
+        let grants = BoonGrants {
+            structured_active: true,
+        };
+        assert!(select_model(&candidates, &features, &HashMap::new(), None, &[], grants).is_none());
     }
 }

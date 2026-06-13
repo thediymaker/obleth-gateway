@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "BUSL-1.1"
 repository = "https://github.com/thediymaker/obleth-gateway"
@@ -69,6 +69,9 @@ ipnet = "2"
 aes-gcm = "0.10"
 base64 = "0.22"
 arc-swap = "1"
+# JSON Schema validation for the structured-output boon. Default features are
+# disabled so remote `$ref` resolution stays off (client schemas are untrusted).
+jsonschema = { version = "0.30", default-features = false }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
 
 # internal

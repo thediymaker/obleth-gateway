@@ -52,8 +52,16 @@
 #                                        system-wide vision describer).
 #   boons                     (optional) Gateway boons granted to this model
 #                                        that it lacks natively. Allowed: vision
-#                                        (relays images to the global describer).
+#                                        (relays images to the global describer),
+#                                        structured_output (validates and repairs
+#                                        response_format JSON at the gateway).
 #                                        Configure boons in Settings -> Boons.
+#   tool_servers              (optional) Registered MCP servers whose tools this
+#                                        model may use. The gateway injects the
+#                                        tools into plain chat requests and runs
+#                                        the tool loop itself. Requires native
+#                                        function calling. Enable the loop in
+#                                        Settings -> Boons.
 
 models:
   # ---- Example 1: full template (every field shown) ----
@@ -74,7 +82,7 @@ models:
     supports_tool_choice: true
     enabled: true
     tags: [general]
-    boons: []              # e.g. [vision] to grant the vision boon
+    boons: []              # e.g. [vision, structured_output]
 
   # ---- Example 2: minimal (only the required fields) ----
   - model_name: my-minimal-model

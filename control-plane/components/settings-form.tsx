@@ -449,6 +449,24 @@ export function BoonsSettingsForm({
   const [prompt, setPrompt] = useState(settings?.vision_describe_prompt ?? "");
   const [maxImages, setMaxImages] = useState(String(settings?.vision_max_images ?? 6));
   const [timeout, setTimeoutMs] = useState(String(settings?.vision_timeout_ms ?? 30000));
+  const [structuredEnabled, setStructuredEnabled] = useState(
+    settings?.structured_output_enabled ?? false,
+  );
+  const [fixerModel, setFixerModel] = useState(settings?.structured_output_fixer_model ?? "");
+  const [repairAttempts, setRepairAttempts] = useState(
+    String(settings?.structured_output_max_repair_attempts ?? 1),
+  );
+  const [repairTimeout, setRepairTimeout] = useState(
+    String(settings?.structured_output_timeout_ms ?? 30000),
+  );
+  const [toolLoopEnabled, setToolLoopEnabled] = useState(settings?.tool_loop_enabled ?? false);
+  const [toolLoopMaxTurns, setToolLoopMaxTurns] = useState(
+    String(settings?.tool_loop_max_turns ?? 4),
+  );
+  const [toolLoopTimeout, setToolLoopTimeout] = useState(
+    String(settings?.tool_loop_tool_timeout_ms ?? 30000),
+  );
+  const [toolLoopNudge, setToolLoopNudge] = useState(settings?.tool_loop_nudge ?? "");
 
   function save() {
     setStatus(null);
@@ -458,6 +476,14 @@ export function BoonsSettingsForm({
       vision_describe_prompt: prompt.trim(),
       vision_max_images: Number(maxImages) || 6,
       vision_timeout_ms: Number(timeout) || 30000,
+      structured_output_enabled: structuredEnabled,
+      structured_output_fixer_model: fixerModel.trim() ? fixerModel.trim() : "",
+      structured_output_max_repair_attempts: Math.min(Number(repairAttempts) || 1, 3),
+      structured_output_timeout_ms: Number(repairTimeout) || 30000,
+      tool_loop_enabled: toolLoopEnabled,
+      tool_loop_max_turns: Math.min(Number(toolLoopMaxTurns) || 4, 8),
+      tool_loop_tool_timeout_ms: Number(toolLoopTimeout) || 30000,
+      tool_loop_nudge: toolLoopNudge,
     };
     start(async () => {
       const result = await setBoonSettingsAction(body);
@@ -475,10 +501,11 @@ export function BoonsSettingsForm({
         <CardTitle>Model boons</CardTitle>
         <CardDescription>
           Gateway-granted capabilities for models that lack them natively. The{" "}
-          <strong>vision</strong> boon relays images to a describer model and rewrites them as text
-          so a non-vision model can still answer. Applies only to models without the{" "}
-          <code>Vision</code> capability. Fail-open: if the describer is unavailable the request is
-          forwarded unchanged.
+          <strong>vision</strong> boon relays images to a describer model and rewrites them as
+          text. The <strong>structured output</strong> boon validates and repairs{" "}
+          <code>response_format</code> JSON at the gateway. Each boon applies only to models that
+          opted in and lack the native capability. Fail-open: if a helper is unavailable the
+          request passes through unchanged.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
@@ -544,6 +571,126 @@ export function BoonsSettingsForm({
             placeholder="Describe this image in detail..."
           />
         </div>
+
+        <div className="border-t pt-4 space-y-4">
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={structuredEnabled}
+              onChange={(e) => setStructuredEnabled(e.target.checked)}
+              className="h-4 w-4"
+            />
+            Enable structured output boon (JSON schema enforcement)
+          </label>
+          <p className="text-sm text-muted-foreground">
+            <code>response_format</code> requests to an opted-in model are validated at the
+            gateway; invalid JSON is repaired by the fixer model (or by re-prompting the same
+            model). On final failure the original reply passes through with a warning header.
+          </p>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-1">
+              <Label htmlFor="structured_output_fixer_model">Fixer model</Label>
+              <select
+                id="structured_output_fixer_model"
+                value={fixerModel}
+                onChange={(e) => setFixerModel(e.target.value)}
+                className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
+              >
+                <option value="">Same model (re-prompt)</option>
+                {models
+                  .filter((m) => m.model_name !== "auto" && (m.model_type ?? "chat") === "chat")
+                  .map((m) => (
+                    <option key={m.id} value={m.model_name}>
+                      {m.model_name}
+                    </option>
+                  ))}
+              </select>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="structured_output_max_repair_attempts">
+                Max repair attempts (0-3)
+              </Label>
+              <Input
+                id="structured_output_max_repair_attempts"
+                type="number"
+                min={0}
+                max={3}
+                value={repairAttempts}
+                onChange={(e) => setRepairAttempts(e.target.value)}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="structured_output_timeout_ms">Repair timeout (ms)</Label>
+              <Input
+                id="structured_output_timeout_ms"
+                type="number"
+                value={repairTimeout}
+                onChange={(e) => setRepairTimeout(e.target.value)}
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="border-t pt-4 space-y-4">
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={toolLoopEnabled}
+              onChange={(e) => setToolLoopEnabled(e.target.checked)}
+              className="h-4 w-4"
+            />
+            Enable gateway tool loop (MCP tools)
+          </label>
+          <p className="text-sm text-muted-foreground">
+            Models granted access to registered MCP servers (per model, in the model&apos;s{" "}
+            <strong>Tools</strong> section) get those tools injected into plain chat requests;
+            the gateway executes the tool calls and loops until the model answers. Requires the
+            model&apos;s native <strong>Function calling</strong> capability. Streaming clients get
+            a live token stream with a visible search marker; only the tool execution between
+            turns pauses the stream. Clients that send their own <code>tools</code> keep control
+            of those calls. Tool-loop answers are never cached.
+          </p>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-1">
+              <Label htmlFor="tool_loop_max_turns">Max tool turns (1-8)</Label>
+              <Input
+                id="tool_loop_max_turns"
+                type="number"
+                min={1}
+                max={8}
+                value={toolLoopMaxTurns}
+                onChange={(e) => setToolLoopMaxTurns(e.target.value)}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="tool_loop_tool_timeout_ms">Tool execution timeout (ms)</Label>
+              <Input
+                id="tool_loop_tool_timeout_ms"
+                type="number"
+                value={toolLoopTimeout}
+                onChange={(e) => setToolLoopTimeout(e.target.value)}
+              />
+            </div>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="tool_loop_nudge">Tool nudge</Label>
+            <textarea
+              id="tool_loop_nudge"
+              value={toolLoopNudge}
+              onChange={(e) => setToolLoopNudge(e.target.value)}
+              rows={4}
+              className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+              placeholder="Leave blank to reset to the built-in default..."
+            />
+            <p className="text-xs text-muted-foreground">
+              System instruction injected with the granted tools so the model knows it has them
+              and when to call them. Tune it to make a model search more (or less) eagerly. Only
+              applied to plain chat clients — clients that send their own <code>tools</code> are
+              left untouched. Blank resets to the built-in default.
+            </p>
+          </div>
+        </div>
+
         <Button onClick={save} disabled={pending}>
           {pending ? "Saving..." : "Save boons"}
         </Button>

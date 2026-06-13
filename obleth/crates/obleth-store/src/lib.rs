@@ -600,6 +600,7 @@ impl Store {
         supports_vision: bool,
         tags: &[String],
         boons: &[String],
+        tool_servers: &[String],
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -608,14 +609,14 @@ impl Store {
                 input_cost_per_token, output_cost_per_token,
                 cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                 admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                supports_response_schema, supports_tool_choice, supports_vision, tags, boons
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+                supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
              returning id, model_name, description, upstream_model, api_base, api_key, model_type,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons,
+                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
                        created_at, updated_at",
         )
@@ -641,6 +642,9 @@ impl Store {
         .bind(supports_vision)
         .bind(sqlx::types::Json(obleth_config::normalize_tags(tags)))
         .bind(sqlx::types::Json(obleth_config::normalize_boons(boons)))
+        .bind(sqlx::types::Json(obleth_config::normalize_tool_servers(
+            tool_servers,
+        )))
         .fetch_one(&self.pool)
         .await?;
         model_from_row(&row)
@@ -653,7 +657,7 @@ impl Store {
                     cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                    cache_enabled, cache_ttl_secs, tags, boons,
+                    cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     created_at, updated_at
              from models order by model_name",
@@ -670,7 +674,7 @@ impl Store {
                     cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                    cache_enabled, cache_ttl_secs, tags, boons,
+                    cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     created_at, updated_at
              from models where id = $1",
@@ -689,7 +693,7 @@ impl Store {
                     cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                    cache_enabled, cache_ttl_secs, tags, boons,
+                    cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     created_at, updated_at
              from models where model_name = $1",
@@ -726,6 +730,7 @@ impl Store {
         enabled: bool,
         tags: &[String],
         boons: &[String],
+        tool_servers: &[String],
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -738,7 +743,7 @@ impl Store {
                 supports_response_schema = $13, supports_tool_choice = $14,
                 enabled = $15, tags = $16, model_type = $17,
                 cost_per_image = $18, cost_per_audio_second = $19, cost_per_character = $20,
-                supports_vision = $21, boons = $22,
+                supports_vision = $21, boons = $22, tool_servers = $23,
                 updated_at = now()
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, model_type,
@@ -746,7 +751,7 @@ impl Store {
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons,
+                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
                        created_at, updated_at",
         )
@@ -772,6 +777,9 @@ impl Store {
         .bind(cost_per_character.max(0.0))
         .bind(supports_vision)
         .bind(sqlx::types::Json(obleth_config::normalize_boons(boons)))
+        .bind(sqlx::types::Json(obleth_config::normalize_tool_servers(
+            tool_servers,
+        )))
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -802,7 +810,7 @@ impl Store {
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons,
+                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
                        created_at, updated_at",
         )
@@ -830,7 +838,7 @@ impl Store {
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons,
+                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
                        created_at, updated_at",
         )
@@ -859,7 +867,7 @@ impl Store {
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons,
+                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
                        created_at, updated_at",
         )
@@ -884,7 +892,7 @@ impl Store {
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons,
+                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
                        created_at, updated_at",
         )
@@ -902,7 +910,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character,
                     context_window, supports_function_calling, supports_system_messages,
-                    supports_response_schema, supports_tool_choice, supports_vision, tags, boons,
+                    supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode
              from models where enabled = true",
         )
@@ -971,6 +979,10 @@ impl Store {
                         .try_get::<sqlx::types::Json<Vec<String>>, _>("boons")
                         .map(|j| j.0)
                         .unwrap_or_default(),
+                    tool_servers: row
+                        .try_get::<sqlx::types::Json<Vec<String>>, _>("tool_servers")
+                        .map(|j| j.0)
+                        .unwrap_or_default(),
                     request_timeout_secs: row.try_get("request_timeout_secs")?,
                     max_retries: row.try_get("max_retries")?,
                     retry_backoff_ms: row.try_get("retry_backoff_ms")?,
@@ -997,7 +1009,7 @@ impl Store {
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons,
+                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
                        created_at, updated_at",
         )
@@ -1030,7 +1042,7 @@ impl Store {
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                       cache_enabled, cache_ttl_secs, tags, boons,
+                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
                        request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
                        created_at, updated_at",
@@ -1969,6 +1981,12 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
             .try_get::<sqlx::types::Json<Vec<String>>, _>("boons")
             .map(|j| j.0)
             .unwrap_or_default(),
+        // Tolerant read: statements that don't select `tool_servers` degrade
+        // to an empty list rather than erroring.
+        tool_servers: row
+            .try_get::<sqlx::types::Json<Vec<String>>, _>("tool_servers")
+            .map(|j| j.0)
+            .unwrap_or_default(),
         // Tolerant reads for the reliability columns: statements that don't
         // select them degrade to defaults rather than erroring.
         request_timeout_secs: row.try_get("request_timeout_secs").unwrap_or(None),
@@ -2143,6 +2161,7 @@ mod tests {
                 false,
                 false,
                 false,
+                &[],
                 &[],
                 &[],
             )

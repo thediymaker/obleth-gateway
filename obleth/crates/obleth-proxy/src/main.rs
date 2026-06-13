@@ -87,6 +87,16 @@ async fn main() -> anyhow::Result<()> {
         .time_to_live(Duration::from_secs(300))
         .max_capacity(10_000)
         .build();
+    // Discovered MCP tool lists for the gateway tool loop. Discovery runs on the
+    // request's critical path (the tools must be injected before dispatch), so a
+    // cache miss adds a full `tools/list` round trip to TTFT. Tool sets change
+    // rarely, so cache them for 10 minutes: this keeps the discovery cost off all
+    // but the first request to a tool-granted model (and the occasional refresh),
+    // instead of re-paying it whenever requests arrive more than a minute apart.
+    let tool_cache: Cache<String, Arc<Vec<boons::mcp_tools::McpTool>>> = Cache::builder()
+        .time_to_live(Duration::from_secs(600))
+        .max_capacity(1_000)
+        .build();
 
     let model_registry = router::ModelRegistry::new();
 
@@ -155,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
         key_cache: key_cache.clone(),
         model_cache: model_cache.clone(),
         mcp_cache: mcp_cache.clone(),
+        tool_cache,
         model_registry: model_registry.clone(),
         classifier: classifier.clone(),
         boons: boons.clone(),
@@ -202,6 +213,13 @@ async fn main() -> anyhow::Result<()> {
         }
         Err(e) => tracing::warn!(error = %e, "failed to load mcp servers for warming"),
     }
+
+    // Keep discovered MCP tool lists warm in `tool_cache` so the request path
+    // never pays a synchronous `tools/list` round trip (which would stall TTFT
+    // and, on a slow/cold server, look like a hang). Refreshes every 5 min,
+    // under the cache's 10-min TTL, so a granted server's tools never expire on
+    // the hot path. Runs an immediate first pass at startup.
+    spawn_tool_cache_prewarm(app_state.clone(), store.clone());
 
     // ---- pub/sub cache invalidation listener ----
     spawn_invalidation_listener(
@@ -362,6 +380,70 @@ fn spawn_model_registry_refresh(
                 Ok(Some(settings)) => boons.update(settings),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(error = %e, "boon settings refresh failed"),
+            }
+        }
+    });
+}
+
+/// Background pre-warm of the gateway tool loop's `tool_cache`. Discovery
+/// (`initialize` + `tools/list`) is done here, off the request path, so a user
+/// request to a tool-granted model is always a cache hit. A granted server that
+/// fails discovery is alerted on (instead of failing open silently) because the
+/// model then receives no tools and typically claims it cannot use them.
+fn spawn_tool_cache_prewarm(state: AppState, store: Store) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_secs(300));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            // Nothing to discover when the loop is off; don't poke MCP servers.
+            if !state.boons.settings().tool_loop.active() {
+                continue;
+            }
+            let models = match store.all_resolved_models().await {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::warn!(error = %e, "tool-cache prewarm: model load failed");
+                    continue;
+                }
+            };
+            // Unique set of servers granted to any enabled model.
+            let mut servers: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for (_, model) in &models {
+                if !model.enabled {
+                    continue;
+                }
+                for s in &model.tool_servers {
+                    servers.insert(s.clone());
+                }
+            }
+            for name in servers {
+                let Some(server) = mcp::resolve_mcp(&state, &name).await else {
+                    continue;
+                };
+                if !server.enabled {
+                    continue;
+                }
+                match boons::mcp_tools::list_tools(&state, server.as_ref(), Duration::from_secs(10))
+                    .await
+                {
+                    Ok(tools) => {
+                        tracing::debug!(server = %name, count = tools.len(), "tool-cache prewarmed");
+                        state.tool_cache.insert(name.clone(), Arc::new(tools)).await;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, server = %name, "tool-cache prewarm discovery failed");
+                        state.alerts.issue(
+                            "mcp_tool_discovery_failed",
+                            "MCP tool discovery failed",
+                            format!(
+                                "granted MCP server `{name}` could not be discovered: {e}. \
+                                 Models granted this server will receive no tools and may \
+                                 report that they cannot use them."
+                            ),
+                        );
+                    }
+                }
             }
         }
     });

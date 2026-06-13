@@ -2,6 +2,7 @@ import { ModelManager } from "@/components/model-manager";
 import {
   obleth,
   type CacheStats,
+  type McpServer,
   type ModelEndpoint,
   type ModelHealthDetail,
   type ModelHealthSummary,
@@ -11,10 +12,11 @@ import { safe } from "@/lib/safe";
 export const dynamic = "force-dynamic";
 
 export default async function ModelsPage() {
-  const [models, cacheStats, health] = await Promise.all([
+  const [models, cacheStats, health, mcpServers] = await Promise.all([
     safe(obleth.listModels(), []),
     safe<CacheStats | undefined>(obleth.cacheStats(), undefined),
     safe<ModelHealthSummary[]>(obleth.modelHealth(), []),
+    safe<McpServer[]>(obleth.listMcpServers(), []),
   ]);
   // Fetch each model's health detail and endpoint list concurrently in a
   // single fan-out, so the page waits for the slowest request once instead of
@@ -53,6 +55,7 @@ export default async function ModelsPage() {
         health={health}
         healthDetails={healthDetails}
         endpoints={endpoints}
+        mcpServers={mcpServers}
       />
     </div>
   );

@@ -387,6 +387,7 @@ export async function createModelAction(
       supports_vision: tags.includes("vision"),
       tags,
       boons: boonsFromForm(formData),
+      tool_servers: toolServersFromForm(formData),
     });
   } catch (e) {
     return actionError(e);
@@ -560,6 +561,7 @@ export async function updateModelAction(formData: FormData) {
     supports_vision: tags.includes("vision"),
     tags,
     boons: boonsFromForm(formData),
+    tool_servers: toolServersFromForm(formData),
   });
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
@@ -983,6 +985,18 @@ function boonsFromForm(formData: FormData): string[] {
     }
   }
   return boons;
+}
+
+// Collects checked tool-server checkboxes (named `tool_server_<name>`) from a
+// model form into an array of MCP server names the model may use.
+function toolServersFromForm(formData: FormData): string[] {
+  const servers: string[] = [];
+  for (const [key, value] of formData.entries()) {
+    if (key.startsWith("tool_server_") && value === "on") {
+      servers.push(key.slice("tool_server_".length));
+    }
+  }
+  return servers;
 }
 
 function strOrNull(v: FormDataEntryValue | null): string | undefined {

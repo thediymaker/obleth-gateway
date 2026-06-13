@@ -81,7 +81,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { AutotuneReport, AutotuneWorkload, CacheStats, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
+import type { AutotuneReport, AutotuneWorkload, CacheStats, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import { providerForModel } from "@/lib/model-providers";
 import { cn, formatNumber } from "@/lib/utils";
 
@@ -108,6 +108,12 @@ const MODEL_BOONS = [
     description:
       "Relay image inputs to the global describer model and inject text descriptions, so this model can accept images it doesn't natively support. Configure the describer in Settings → Boons.",
   },
+  {
+    value: "structured_output",
+    label: "Structured output",
+    description:
+      "Enforce response_format JSON schemas at the gateway: the schema is rendered into the prompt and the reply is validated, with invalid JSON repaired by the configured fixer model. Applies only when the model lacks the Response schema capability. Configure in Settings → Boons.",
+  },
 ] as const;
 
 // Model modality vocabulary; mirrors obleth-config `MODEL_TYPES`. The type
@@ -130,12 +136,14 @@ export function ModelManager({
   health,
   healthDetails,
   endpoints,
+  mcpServers = [],
 }: {
   models: ModelRoute[];
   cacheStats?: CacheStats;
   health: ModelHealthSummary[];
   healthDetails: Record<string, ModelHealthDetail | undefined>;
   endpoints: Record<string, ModelEndpoint[]>;
+  mcpServers?: McpServer[];
 }) {
   const [pending, start] = useTransition();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -317,6 +325,20 @@ export function ModelManager({
                   {MODEL_BOONS.map((boon) => (
                     <ChipCheckbox key={boon.value} name={`boon_${boon.value}`} label={boon.label} hint={boon.description} />
                   ))}
+                </FieldGroup>
+                <FieldGroup label="Tools" hint="Registered MCP servers whose tools this model may use. The gateway injects the tools into plain chat requests and runs the tool loop itself — clients just ask questions. Enable the tool loop in Settings → Boons.">
+                  {mcpServers.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">No MCP servers registered. Add one on the MCP page first.</p>
+                  ) : (
+                    mcpServers.map((server) => (
+                      <ChipCheckbox
+                        key={server.id}
+                        name={`tool_server_${server.name}`}
+                        label={server.name}
+                        hint={`Grant this model the tools served by ${server.name} (${server.upstream_url}).`}
+                      />
+                    ))
+                  )}
                 </FieldGroup>
               </>
             )}
@@ -529,6 +551,7 @@ export function ModelManager({
                             summary={summary}
                             detail={healthDetails[model.id]}
                             endpoints={endpoints[model.id] ?? []}
+                            mcpServers={mcpServers}
                             pending={pending}
                             onCacheToggle={() => start(() => setModelCacheAction(model.id, !model.cache_enabled, model.cache_ttl_secs || 300))}
                           />
@@ -556,6 +579,7 @@ function ModelDetailPanel({
   summary,
   detail,
   endpoints,
+  mcpServers = [],
   pending,
   onCacheToggle,
 }: {
@@ -563,6 +587,7 @@ function ModelDetailPanel({
   summary: ModelHealthSummary;
   detail?: ModelHealthDetail;
   endpoints: ModelEndpoint[];
+  mcpServers?: McpServer[];
   pending: boolean;
   onCacheToggle: () => void;
 }) {
@@ -766,6 +791,21 @@ function ModelDetailPanel({
                         defaultChecked={model.boons?.includes(boon.value) ?? false}
                       />
                     ))}
+                  </ChipGroup>
+                  <ChipGroup label="Tools" hint="Registered MCP servers whose tools this model may use. The gateway injects the tools into plain chat requests and runs the tool loop itself. Enable the loop in Settings → Boons.">
+                    {mcpServers.length === 0 ? (
+                      <p className="text-xs text-muted-foreground">No MCP servers registered. Add one on the MCP page first.</p>
+                    ) : (
+                      mcpServers.map((server) => (
+                        <ChipCheckbox
+                          key={server.id}
+                          name={`tool_server_${server.name}`}
+                          label={server.name}
+                          hint={`Grant this model the tools served by ${server.name} (${server.upstream_url}).`}
+                          defaultChecked={model.tool_servers?.includes(server.name) ?? false}
+                        />
+                      ))
+                    )}
                   </ChipGroup>
                 </FormSection>
               ) : (

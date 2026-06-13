@@ -113,7 +113,7 @@ impl Store {
                     cost_per_audio_second, cost_per_character, context_window, admission_weight,
                     max_in_flight, capacity_mode, capacity_tuned_at, supports_function_calling,
                     supports_system_messages, supports_response_schema, supports_tool_choice,
-                    supports_vision, enabled, cache_enabled, cache_ttl_secs, tags, boons,
+                    supports_vision, enabled, cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
                     health_checks_enabled, health_alerts_enabled, health_check_interval_secs,
                     health_failure_threshold, health_maintenance_until, health_maintenance_note,
@@ -315,14 +315,14 @@ impl Store {
                         admission_weight, max_in_flight, capacity_mode, capacity_tuned_at,
                         supports_function_calling, supports_system_messages,
                         supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                        cache_enabled, cache_ttl_secs, tags, boons, request_timeout_secs,
+                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers, request_timeout_secs,
                         max_retries, retry_backoff_ms, endpoint_selection_mode,
                         health_checks_enabled, health_alerts_enabled, health_check_interval_secs,
                         health_failure_threshold, health_maintenance_until,
                         health_maintenance_note, created_at)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-                        $32, $33, $34, $35, $36, $37, $38)
+                        $32, $33, $34, $35, $36, $37, $38, $39)
                  on conflict (id) do update set
                         model_name = excluded.model_name,
                         description = excluded.description,
@@ -350,6 +350,7 @@ impl Store {
                         cache_ttl_secs = excluded.cache_ttl_secs,
                         tags = excluded.tags,
                         boons = excluded.boons,
+                        tool_servers = excluded.tool_servers,
                         request_timeout_secs = excluded.request_timeout_secs,
                         max_retries = excluded.max_retries,
                         retry_backoff_ms = excluded.retry_backoff_ms,
@@ -390,6 +391,7 @@ impl Store {
             .bind(m.cache_ttl_secs)
             .bind(sqlx::types::Json(&m.tags))
             .bind(sqlx::types::Json(&m.boons))
+            .bind(sqlx::types::Json(&m.tool_servers))
             .bind(m.request_timeout_secs)
             .bind(m.max_retries)
             .bind(m.retry_backoff_ms)
@@ -598,6 +600,10 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
             .unwrap_or_default(),
         boons: row
             .try_get::<sqlx::types::Json<Vec<String>>, _>("boons")
+            .map(|j| j.0)
+            .unwrap_or_default(),
+        tool_servers: row
+            .try_get::<sqlx::types::Json<Vec<String>>, _>("tool_servers")
             .map(|j| j.0)
             .unwrap_or_default(),
         request_timeout_secs: row.try_get("request_timeout_secs")?,

@@ -175,6 +175,10 @@ alter table models add column if not exists tags jsonb not null default '[]'::js
 -- if-not-exists for upgrades.
 alter table models add column if not exists boons jsonb not null default '[]'::jsonb;
 
+-- Registered MCP servers whose tools this model may use (gateway tool loop).
+-- Operator-defined names, JSON array. Added via if-not-exists for upgrades.
+alter table models add column if not exists tool_servers jsonb not null default '[]'::jsonb;
+
 -- Capacity tuning mode (added via if-not-exists for upgrades). 'static' keeps
 -- the operator-set max_in_flight; 'tuned' lets auto-tune set it from a ramp
 -- probe against the upstream.

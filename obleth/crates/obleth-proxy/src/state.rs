@@ -43,6 +43,10 @@ pub struct AppState {
     /// Engine for model "boons" (e.g. the vision boon). Its settings are
     /// refreshed by the same background task that refreshes `model_registry`.
     pub boons: BoonEngine,
+    /// Short-TTL cache of discovered MCP tool lists, keyed by server name, so
+    /// the gateway tool loop pays one `tools/list` per server per TTL instead
+    /// of one per request.
+    pub tool_cache: Cache<String, Arc<Vec<crate::boons::mcp_tools::McpTool>>>,
     pub metrics: Arc<Metrics>,
     pub fail_open: bool,
     pub alerts: obleth_admin::AlertDispatcher,

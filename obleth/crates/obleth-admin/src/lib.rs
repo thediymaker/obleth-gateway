@@ -29,7 +29,9 @@ use obleth_config::{
     ResolvedMcpServer, ResolvedModel, Tenant,
 };
 use obleth_config::{
-    AlertSettings, AutoRouterSettings, BoonSettings, EmailSettings, VisionBoonSettings,
+    AlertSettings, AutoRouterSettings, BoonSettings, EmailSettings, StructuredOutputBoonSettings,
+    ToolLoopSettings, VisionBoonSettings, STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS,
+    TOOL_LOOP_MAX_TURNS,
 };
 use obleth_fairshare::{FairShare, StaticCapacity, Stats};
 use obleth_redis::RedisStore;
@@ -415,6 +417,9 @@ pub struct CreateModel {
     pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub boons: Option<Vec<String>>,
+    /// Registered MCP servers whose tools this model may use (gateway tool loop).
+    #[serde(default)]
+    pub tool_servers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -447,6 +452,9 @@ pub struct UpdateModel {
     pub tags: Option<Vec<String>>,
     #[serde(default)]
     pub boons: Option<Vec<String>>,
+    /// Registered MCP servers whose tools this model may use (gateway tool loop).
+    #[serde(default)]
+    pub tool_servers: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1177,8 +1185,8 @@ async fn put_auto_router_settings(
     Ok(Json(AutoRouterSettingsView::from_settings(&settings)))
 }
 
-/// View of the persisted model-"boons" settings. Flattened to the vision boon's
-/// fields since it is currently the only boon.
+/// View of the persisted model-"boons" settings, flattened per boon
+/// (vision, structured output, tool loop).
 #[derive(Debug, Serialize, ToSchema)]
 pub struct BoonSettingsView {
     pub vision_enabled: bool,
@@ -1186,6 +1194,14 @@ pub struct BoonSettingsView {
     pub vision_describe_prompt: String,
     pub vision_max_images: u32,
     pub vision_timeout_ms: u64,
+    pub structured_output_enabled: bool,
+    pub structured_output_fixer_model: Option<String>,
+    pub structured_output_max_repair_attempts: u32,
+    pub structured_output_timeout_ms: u64,
+    pub tool_loop_enabled: bool,
+    pub tool_loop_max_turns: u32,
+    pub tool_loop_tool_timeout_ms: u64,
+    pub tool_loop_nudge: String,
 }
 
 impl BoonSettingsView {
@@ -1196,6 +1212,14 @@ impl BoonSettingsView {
             vision_describe_prompt: s.vision.describe_prompt.clone(),
             vision_max_images: s.vision.max_images,
             vision_timeout_ms: s.vision.timeout_ms,
+            structured_output_enabled: s.structured_output.enabled,
+            structured_output_fixer_model: s.structured_output.fixer_model.clone(),
+            structured_output_max_repair_attempts: s.structured_output.max_repair_attempts,
+            structured_output_timeout_ms: s.structured_output.timeout_ms,
+            tool_loop_enabled: s.tool_loop.enabled,
+            tool_loop_max_turns: s.tool_loop.max_turns,
+            tool_loop_tool_timeout_ms: s.tool_loop.tool_timeout_ms,
+            tool_loop_nudge: s.tool_loop.nudge.clone(),
         }
     }
 }
@@ -1213,6 +1237,26 @@ pub struct UpdateBoonSettings {
     pub vision_max_images: Option<u32>,
     #[serde(default)]
     pub vision_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub structured_output_enabled: Option<bool>,
+    /// `model_name` of the JSON-repair fixer model. Empty string clears it
+    /// (repairs then re-prompt the request's own model).
+    #[serde(default)]
+    pub structured_output_fixer_model: Option<String>,
+    #[serde(default)]
+    pub structured_output_max_repair_attempts: Option<u32>,
+    #[serde(default)]
+    pub structured_output_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub tool_loop_enabled: Option<bool>,
+    #[serde(default)]
+    pub tool_loop_max_turns: Option<u32>,
+    #[serde(default)]
+    pub tool_loop_tool_timeout_ms: Option<u64>,
+    /// System nudge injected with granted tools. Empty string resets it to the
+    /// built-in default; omit the field to leave it unchanged.
+    #[serde(default)]
+    pub tool_loop_nudge: Option<String>,
 }
 
 #[utoipa::path(
@@ -1246,6 +1290,16 @@ async fn put_boon_settings(
         Some(p) => p.to_string(),
     };
 
+    let fixer_model = match body
+        .structured_output_fixer_model
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.structured_output.fixer_model.clone(),
+    };
+
     let settings = BoonSettings {
         vision: VisionBoonSettings {
             enabled: body.vision_enabled.unwrap_or(existing.vision.enabled),
@@ -1259,6 +1313,37 @@ async fn put_boon_settings(
                 .vision_timeout_ms
                 .filter(|ms| *ms > 0)
                 .unwrap_or(existing.vision.timeout_ms),
+        },
+        structured_output: StructuredOutputBoonSettings {
+            enabled: body
+                .structured_output_enabled
+                .unwrap_or(existing.structured_output.enabled),
+            fixer_model,
+            max_repair_attempts: body
+                .structured_output_max_repair_attempts
+                .map(|n| n.min(STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS))
+                .unwrap_or(existing.structured_output.max_repair_attempts),
+            timeout_ms: body
+                .structured_output_timeout_ms
+                .filter(|ms| *ms > 0)
+                .unwrap_or(existing.structured_output.timeout_ms),
+        },
+        tool_loop: ToolLoopSettings {
+            enabled: body.tool_loop_enabled.unwrap_or(existing.tool_loop.enabled),
+            max_turns: body
+                .tool_loop_max_turns
+                .filter(|n| *n > 0)
+                .map(|n| n.min(TOOL_LOOP_MAX_TURNS))
+                .unwrap_or(existing.tool_loop.max_turns),
+            tool_timeout_ms: body
+                .tool_loop_tool_timeout_ms
+                .filter(|ms| *ms > 0)
+                .unwrap_or(existing.tool_loop.tool_timeout_ms),
+            nudge: match body.tool_loop_nudge.as_deref().map(str::trim) {
+                Some("") => obleth_config::default_tool_loop_nudge(),
+                Some(n) => n.to_string(),
+                None => existing.tool_loop.nudge.clone(),
+            },
         },
     };
 
@@ -1275,6 +1360,14 @@ async fn put_boon_settings(
                 "vision_fallback_model": settings.vision.fallback_model,
                 "vision_max_images": settings.vision.max_images,
                 "vision_timeout_ms": settings.vision.timeout_ms,
+                "structured_output_enabled": settings.structured_output.enabled,
+                "structured_output_fixer_model": settings.structured_output.fixer_model,
+                "structured_output_max_repair_attempts": settings.structured_output.max_repair_attempts,
+                "structured_output_timeout_ms": settings.structured_output.timeout_ms,
+                "tool_loop_enabled": settings.tool_loop.enabled,
+                "tool_loop_max_turns": settings.tool_loop.max_turns,
+                "tool_loop_tool_timeout_ms": settings.tool_loop.tool_timeout_ms,
+                "tool_loop_nudge_len": settings.tool_loop.nudge.len(),
             }),
         )
         .await?;
@@ -2038,6 +2131,7 @@ async fn create_model(
             body.supports_vision.unwrap_or(false),
             &body.tags.clone().unwrap_or_default(),
             &body.boons.clone().unwrap_or_default(),
+            &body.tool_servers.clone().unwrap_or_default(),
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -2137,6 +2231,10 @@ async fn update_model(
             body.enabled.unwrap_or(existing.enabled),
             &body.tags.clone().unwrap_or_else(|| existing.tags.clone()),
             &body.boons.clone().unwrap_or_else(|| existing.boons.clone()),
+            &body
+                .tool_servers
+                .clone()
+                .unwrap_or_else(|| existing.tool_servers.clone()),
         )
         .await?;
     sync_model(&state, &model).await?;
@@ -2767,6 +2865,7 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         supports_vision: model.supports_vision,
         tags: model.tags.clone(),
         boons: model.boons.clone(),
+        tool_servers: model.tool_servers.clone(),
         request_timeout_secs: model.request_timeout_secs,
         max_retries: model.max_retries,
         retry_backoff_ms: model.retry_backoff_ms,

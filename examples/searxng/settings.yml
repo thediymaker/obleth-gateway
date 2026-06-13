@@ -1,0 +1,14 @@
+# Minimal SearXNG settings for the obleth search-boon demo.
+# Inherits everything from the image defaults and only enables what the MCP
+# server needs: the JSON output format. The limiter is disabled because all
+# traffic arrives from the MCP container, not browsers.
+use_default_settings: true
+
+server:
+  secret_key: "obleth-searxng-demo-secret-change-me"
+  limiter: false
+
+search:
+  formats:
+    - html
+    - json

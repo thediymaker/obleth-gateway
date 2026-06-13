@@ -30,6 +30,7 @@ const PROVIDERS: Array<{ pattern: RegExp; provider: ModelProvider }> = [
   { pattern: /\bring-|\bling-|bailing/, provider: { id: "inclusionai", label: "inclusionAI", src: "/providers/inclusionai.png" } },
   { pattern: /minicpm/, provider: { id: "openbmb", label: "OpenBMB", src: "/providers/openbmb.png" } },
   { pattern: /mellum/, provider: { id: "jetbrains", label: "JetBrains", src: "/providers/jetbrains.png" } },
+  { pattern: /cohere|command-?[ar]\b|\bnorth\b/, provider: { id: "cohere", label: "Cohere", src: "/providers/cohere.png" } },
 ];
 
 export function providerForModel(...names: Array<string | null | undefined>): ModelProvider | null {

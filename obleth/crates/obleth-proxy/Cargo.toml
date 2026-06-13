@@ -35,6 +35,7 @@ moka.workspace = true
 anyhow.workspace = true
 async-stream = "0.3"
 arc-swap.workspace = true
+jsonschema.workspace = true
 clickhouse.workspace = true
 obleth-config.workspace = true
 obleth-store.workspace = true
