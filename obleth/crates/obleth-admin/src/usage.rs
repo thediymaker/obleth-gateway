@@ -25,9 +25,25 @@ pub struct UsageQuery {
 pub struct UsageSeriesQuery {
     #[schema(value_type = Option<String>)]
     pub tenant_id: Option<Uuid>,
+    /// Restrict the series to a single model. Required by the per-model series
+    /// endpoint; ignored by the global/tenant series readers.
+    pub model: Option<String>,
     pub since_ms: Option<i64>,
     /// Bucket width in milliseconds. Default 300_000 (5 minutes).
     pub bucket_ms: Option<i64>,
+}
+
+/// Filters for the per-model tenant/key breakdown
+/// (`GET /api/v1/usage/breakdown`). Scoped to a single model so the expanded
+/// model card can show which tenants/keys are driving its load.
+#[derive(Debug, Deserialize, IntoParams, ToSchema)]
+pub struct UsageBreakdownQuery {
+    /// Model to break down (required).
+    pub model: String,
+    /// Lower bound, unix epoch millis. Defaults to the last 24h.
+    pub since_ms: Option<i64>,
+    /// Cap on rows returned (busiest tenant/key pairs first).
+    pub limit: Option<u64>,
 }
 
 /// Date-range read against the permanent daily rollup (`usage_daily`).
@@ -321,6 +337,46 @@ pub struct TenantUsageTimePoint {
     pub bucket_ms: i64,
     pub requests: u64,
     pub total_tokens: u64,
+}
+
+/// Time-bucketed per-model series powering the three charts in the expanded
+/// model card (throughput, end-to-end latency, time-to-first-token). Throughput
+/// is reported as per-stream median engine rates (prefill / decode), not
+/// volume-over-wall-clock, so it stays comparable to the upstream engine even on
+/// sparse traffic. Latency carries avg + p50 so the charts match the rest of the
+/// pipeline.
+#[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
+pub struct ModelUsageTimePoint {
+    pub bucket_ms: i64,
+    pub requests: u64,
+    /// Median per-stream decode rate: output tokens / decode window (total - ttft).
+    pub gen_tokens_per_sec: f64,
+    /// Median per-stream prefill rate: input tokens / ttft.
+    pub prompt_tokens_per_sec: f64,
+    /// Average time-to-first-token in milliseconds over the bucket.
+    pub avg_ttft_ms: f64,
+    /// Median (p50) time-to-first-token in milliseconds over the bucket.
+    pub p50_ttft_ms: f64,
+    /// Average end-to-end latency in milliseconds over the bucket.
+    pub avg_total_ms: f64,
+    /// Median (p50) end-to-end latency in milliseconds over the bucket.
+    pub p50_total_ms: f64,
+}
+
+/// One tenant/key pair's usage of a single model over the window.
+/// `gen_tokens_per_sec` reuses the same median per-request decode-rate
+/// definition as `/usage/models`.
+#[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
+pub struct UsageKeyModelBreakdown {
+    #[serde(with = "clickhouse::serde::uuid")]
+    #[schema(value_type = String)]
+    pub key_id: Uuid,
+    #[serde(with = "clickhouse::serde::uuid")]
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    pub requests: u64,
+    pub total_tokens: u64,
+    pub gen_tokens_per_sec: f64,
 }
 
 /// Response-cache effectiveness over the window.
@@ -629,6 +685,77 @@ pub async fn query_usage_series_by_tenant(
         .query(&sql)
         .bind(since)
         .fetch_all::<TenantUsageTimePoint>()
+        .await
+}
+
+/// Per-model time series for the expanded model card. Mirrors the tenant
+/// series' bucketing (`intDiv(ts_ms, {bucket}) * {bucket}`) but is scoped to a
+/// single model and computes throughput + latency per bucket. Throughput is
+/// aggregate (sum of tokens over the bucket / bucket seconds); latency reuses
+/// the same guarded avg/p50 expressions as `query_usage_by_model`.
+pub async fn query_usage_series_by_model(
+    client: &clickhouse::Client,
+    q: UsageSeriesQuery,
+) -> Result<Vec<ModelUsageTimePoint>, clickhouse::error::Error> {
+    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let bucket = q.bucket_ms.unwrap_or(300_000).max(10_000);
+    // Per-stream engine rates, NOT volume-over-wall-clock. `gen_tps` is the
+    // median decode rate (output tokens over the decode window = total - ttft,
+    // falling back to total - queue when the response wasn't streamed), the same
+    // definition `/usage/models` uses. `prompt_tps` is the median prefill rate
+    // (prompt tokens over ttft, since prefill completes by the first byte). This
+    // makes the chart comparable to the upstream engine's reported throughput
+    // instead of collapsing toward zero on sparse, bursty traffic.
+    let sql = format!(
+        "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
+         count() as requests, \
+         round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
+         quantileIf(0.5)(output_tokens / (greatest(if(total_ms - ttft_ms >= 20, total_ms - ttft_ms, total_ms - queue_wait_ms), 1) / 1000.), \
+         total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps, \
+         round(if(countIf(ttft_ms >= 20 and input_tokens >= 1) > 0, \
+         quantileIf(0.5)(input_tokens / (greatest(ttft_ms, 1) / 1000.), \
+         ttft_ms >= 20 and input_tokens >= 1), 0), 1) as prompt_tps, \
+         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft, \
+         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft, \
+         round(if(countIf(total_ms > 0) > 0, avgIf(total_ms, total_ms > 0), 0), 1) as avg_total, \
+         round(if(countIf(total_ms > 0) > 0, quantileIf(0.5)(total_ms, total_ms > 0), 0), 1) as p50_total \
+         from usage where ts_ms >= ? and model = ? \
+         group by bucket_ms order by bucket_ms"
+    );
+    let model = q.model.unwrap_or_default();
+    client
+        .query(&sql)
+        .bind(since)
+        .bind(model)
+        .fetch_all::<ModelUsageTimePoint>()
+        .await
+}
+
+/// Per tenant/key breakdown for one model. Mirrors the gen-rate math in
+/// `query_usage_by_model` but groups by `(key_id, tenant_id)` and is scoped to
+/// a single model, so the expanded model card can show who is driving load.
+pub async fn query_usage_breakdown_by_model(
+    client: &clickhouse::Client,
+    model: &str,
+    since_ms: Option<i64>,
+    limit: Option<u64>,
+) -> Result<Vec<UsageKeyModelBreakdown>, clickhouse::error::Error> {
+    let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let limit = limit.unwrap_or(100).min(1000);
+    let sql = format!(
+        "select key_id, tenant_id, count() as requests, \
+         sum(input_tokens) + sum(output_tokens) as total_tokens, \
+         round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
+         quantileIf(0.5)(output_tokens / (greatest(if(total_ms - ttft_ms >= 20, total_ms - ttft_ms, total_ms - queue_wait_ms), 1) / 1000.), \
+         total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps \
+         from usage where ts_ms >= ? and model = ? \
+         group by key_id, tenant_id order by total_tokens desc limit {limit}"
+    );
+    client
+        .query(&sql)
+        .bind(since)
+        .bind(model.to_string())
+        .fetch_all::<UsageKeyModelBreakdown>()
         .await
 }
 

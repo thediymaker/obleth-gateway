@@ -105,6 +105,11 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/usage/series/tenants",
             get(get_usage_series_tenants),
         )
+        .route(
+            "/api/v1/usage/series/models",
+            get(get_usage_series_models),
+        )
+        .route("/api/v1/usage/breakdown", get(get_usage_breakdown))
         .route("/api/v1/usage/cache", get(get_cache_stats))
         .route("/api/v1/usage/logs", get(get_usage_logs))
         .route("/api/v1/usage/daily", get(get_usage_daily))
@@ -1701,6 +1706,20 @@ async fn get_usage_series_tenants(
 }
 
 #[utoipa::path(
+    get, path = "/api/v1/usage/series/models", tag = "usage",
+    params(usage::UsageSeriesQuery),
+    responses((status = 200, body = [usage::ModelUsageTimePoint]))
+)]
+async fn get_usage_series_models(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::UsageSeriesQuery>,
+) -> Result<Json<Vec<usage::ModelUsageTimePoint>>> {
+    Ok(Json(
+        usage::query_usage_series_by_model(&state.clickhouse, q).await?,
+    ))
+}
+
+#[utoipa::path(
     get, path = "/api/v1/usage/cache", tag = "usage",
     params(usage::UsageQuery),
     responses((status = 200, body = usage::CacheStats))
@@ -1798,6 +1817,77 @@ async fn get_usage_logs(
             UsageLogEntry {
                 row,
                 tenant_name,
+                key_name,
+                key_prefix,
+            }
+        })
+        .collect();
+
+    Ok(Json(entries))
+}
+
+/// A per-model breakdown row enriched with human-readable tenant/key names and
+/// the tenant's fairshare group, resolved from Postgres so the model card's
+/// breakdown table does not have to display bare UUIDs.
+#[derive(Debug, Serialize)]
+pub struct UsageBreakdownEntry {
+    #[serde(flatten)]
+    pub row: usage::UsageKeyModelBreakdown,
+    pub tenant_name: String,
+    pub fairshare_group: String,
+    pub key_name: String,
+    pub key_prefix: String,
+}
+
+/// Per tenant/key breakdown of one model's traffic over the window, powering
+/// the breakdown table in the expanded model card. UUIDs are resolved to
+/// tenant/key names in two bounded Postgres lookups, mirroring `/usage/logs`.
+#[utoipa::path(
+    get, path = "/api/v1/usage/breakdown", tag = "usage",
+    params(usage::UsageBreakdownQuery),
+    responses((status = 200, body = [usage::UsageKeyModelBreakdown],
+        description = "Each row also includes tenant_name, fairshare_group, key_name, and key_prefix resolved from Postgres"))
+)]
+async fn get_usage_breakdown(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::UsageBreakdownQuery>,
+) -> Result<Json<Vec<UsageBreakdownEntry>>> {
+    let rows =
+        usage::query_usage_breakdown_by_model(&state.clickhouse, &q.model, q.since_ms, q.limit)
+            .await?;
+
+    let tenant_meta: std::collections::HashMap<Uuid, (String, String)> = state
+        .store
+        .list_tenants()
+        .await?
+        .into_iter()
+        .map(|t| (t.id, (t.name, t.fairshare_group)))
+        .collect();
+
+    let key_ids: Vec<Uuid> = {
+        let mut ids: Vec<Uuid> = rows.iter().map(|r| r.key_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    let key_meta: std::collections::HashMap<Uuid, (String, String)> = state
+        .store
+        .keys_by_ids(&key_ids)
+        .await?
+        .into_iter()
+        .map(|k| (k.id, (k.name, k.key_prefix)))
+        .collect();
+
+    let entries = rows
+        .into_iter()
+        .map(|row| {
+            let (tenant_name, fairshare_group) =
+                tenant_meta.get(&row.tenant_id).cloned().unwrap_or_default();
+            let (key_name, key_prefix) = key_meta.get(&row.key_id).cloned().unwrap_or_default();
+            UsageBreakdownEntry {
+                row,
+                tenant_name,
+                fairshare_group,
                 key_name,
                 key_prefix,
             }

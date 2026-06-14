@@ -34,6 +34,7 @@ import type {
   UsageTimePoint,
 } from "@/lib/obleth";
 import { cn, formatCurrency, formatNumber } from "@/lib/utils";
+import { WINDOW_MS, type ModelWindow } from "@/components/model-metrics-detail";
 
 const SUMMARY_POLL_MS = 30_000;
 const FAST_POLL_MS = 2_000;
@@ -75,15 +76,6 @@ type TrafficRange = "live" | "day";
 type MetricTone = "ok" | "warn" | "hot" | "neutral";
 type ActivityView = "tenants" | "models" | "keys";
 type ModelSort = "requests" | "genTps" | "aggTps" | "ttft" | "e2e" | "tokens" | "users";
-type ModelWindow = "5m" | "15m" | "1h" | "6h" | "24h";
-
-const WINDOW_MS: Record<ModelWindow, number> = {
-  "5m": 5 * 60_000,
-  "15m": 15 * 60_000,
-  "1h": HOUR_MS,
-  "6h": 6 * HOUR_MS,
-  "24h": DAY_MS,
-};
 
 export function OverviewDashboard({
   tenants,
@@ -269,7 +261,7 @@ export function OverviewDashboard({
         />
       </div>
 
-      <div className="grid gap-4 xl:grid-cols-[minmax(0,1.05fr)_minmax(22rem,0.95fr)]">
+      <div className="space-y-4">
         <MetricsExplorer
           tenantRows={tenantRows}
           modelRows={modelRows}
@@ -806,7 +798,7 @@ function ModelSortSelect({ sort, onChange }: { sort: ModelSort; onChange: (s: Mo
       <option value="requests">Requests</option>
       <option value="genTps">Gen tok/s</option>
       <option value="aggTps">Aggregate tok/s</option>
-      <option value="ttft">TTFT p50</option>
+      <option value="ttft">TTFB p50</option>
       <option value="e2e">E2E p50</option>
       <option value="tokens">Tokens</option>
       <option value="users">Users</option>
@@ -853,7 +845,7 @@ function ModelExplorerRow({
           <span className="min-w-0 flex-1 truncate text-xs font-medium">{row.model}</span>
           <StripMetric label="req" value={formatNumber(row.requests)} />
           <StripMetric label="gen tok/s" value={formatDecimal(row.genTps)} tone={row.genTps > 0 && row.genTps < 10 ? "warn" : "neutral"} />
-          <StripMetric label="TTFT" value={`${formatNumber(Math.round(row.p50TtftMs))}ms`} tone={row.p50TtftMs > 1000 ? "warn" : "neutral"} />
+          <StripMetric label="TTFB" value={`${formatNumber(Math.round(row.p50TtftMs))}ms`} tone={row.p50TtftMs > 1000 ? "warn" : "neutral"} />
           <StripMetric label="queued" value={formatNumber(row.queued)} tone={row.queued > 0 ? "warn" : "neutral"} />
         </div>
       </button>
@@ -862,7 +854,7 @@ function ModelExplorerRow({
           <div className="grid grid-cols-2 gap-2 text-xs md:grid-cols-4">
             <DetailStat label="Aggregate tok/s" value={`${formatCompact(row.aggTps)} tok/s`} />
             <DetailStat label="E2E p50" value={`${formatNumber(Math.round(row.p50TotalMs))} ms`} />
-            <DetailStat label="TTFT avg" value={`${formatNumber(Math.round(row.avgTtftMs))} ms`} />
+            <DetailStat label="TTFB avg" value={`${formatNumber(Math.round(row.avgTtftMs))} ms`} />
             <DetailStat label="E2E avg" value={`${formatNumber(Math.round(row.avgTotalMs))} ms`} />
             <DetailStat label="In / Slots" value={slotLabel} />
             <DetailStat label="Queued" value={formatNumber(row.queued)} tone={row.queued > 0 ? "warn" : "neutral"} />
@@ -1066,9 +1058,9 @@ function ModelDetail({ row }: { row: ModelDisplayRow }) {
         <DetailStat label="Tokens" value={formatCompact(row.tokens)} />
         <DetailStat label="Stream tok/s" value={`${formatDecimal(row.genTps)} tok/s`} />
         <DetailStat label="Aggregate tok/s" value={`${formatCompact(row.aggTps)} tok/s`} />
-        <DetailStat label="TTFT" value={`${formatNumber(Math.round(row.avgTtftMs))} ms`} />
+        <DetailStat label="TTFB" value={`${formatNumber(Math.round(row.avgTtftMs))} ms`} />
         <DetailStat label="E2E" value={`${formatNumber(Math.round(row.avgTotalMs))} ms`} />
-        <DetailStat label="TTFT p50" value={`${formatNumber(Math.round(row.p50TtftMs))} ms`} />
+        <DetailStat label="TTFB p50" value={`${formatNumber(Math.round(row.p50TtftMs))} ms`} />
         <DetailStat label="E2E p50" value={`${formatNumber(Math.round(row.p50TotalMs))} ms`} />
         <DetailStat label="Avg prompt" value={`${formatCompact(row.avgPromptTokens)} tok`} />
         <DetailStat label="Avg gen" value={`${formatCompact(row.avgGenTokens)} tok`} />

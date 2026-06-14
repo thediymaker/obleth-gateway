@@ -8,9 +8,10 @@ use utoipa::OpenApi;
 use crate::autotune::{AutotuneReport, AutotuneRequest, AutotuneStep, KneeReason, WorkloadProfile};
 use crate::model_health::{BulkModelHealthResult, UpdateModelHealthConfig};
 use crate::usage::{
-    CacheStats, CostAgg, KeyUsageSummary, KeyUsageSummaryQuery, TenantUsageTimePoint, UsageAgg,
-    UsageDailyQuery, UsageDailyRow, UsageKeyAgg, UsageLogQuery, UsageLogRow, UsageModelAgg,
-    UsageQuery, UsageSeriesQuery, UsageTimePoint,
+    CacheStats, CostAgg, KeyUsageSummary, KeyUsageSummaryQuery, ModelUsageTimePoint,
+    TenantUsageTimePoint, UsageAgg, UsageBreakdownQuery, UsageDailyQuery, UsageDailyRow,
+    UsageKeyAgg, UsageKeyModelBreakdown, UsageLogQuery, UsageLogRow, UsageModelAgg, UsageQuery,
+    UsageSeriesQuery, UsageTimePoint,
 };
 use crate::{
     AlertSettingsView, ApplyAutotuneCapacity, AuditEntryView, AuditQuery, AutoRouterSettingsView,
@@ -66,6 +67,8 @@ use obleth_config::{
         crate::get_usage_models,
         crate::get_usage_series,
         crate::get_usage_series_tenants,
+        crate::get_usage_series_models,
+        crate::get_usage_breakdown,
         crate::get_cache_stats,
         crate::get_usage_logs,
         crate::get_usage_daily,
@@ -162,6 +165,9 @@ use obleth_config::{
         KeyUsageSummary,
         UsageTimePoint,
         TenantUsageTimePoint,
+        ModelUsageTimePoint,
+        UsageBreakdownQuery,
+        UsageKeyModelBreakdown,
         CacheStats,
         UsageLogRow,
         UsageDailyRow,

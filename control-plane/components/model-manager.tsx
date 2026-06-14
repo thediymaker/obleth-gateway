@@ -54,6 +54,7 @@ import {
   type ModelActionState,
 } from "@/app/actions";
 import { ChartShell, axisTick, chartGrid, compactAxis, tip, timeCursor } from "@/components/chart-tooltip";
+import { ModelMetricsDetail } from "@/components/model-metrics-detail";
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -86,6 +87,7 @@ import {
 import type { AutotuneReport, AutotuneWorkload, CacheStats, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import { providerForModel } from "@/lib/model-providers";
 import { cn, formatNumber } from "@/lib/utils";
+import { useSearchParams } from "next/navigation";
 
 // Lets any control inside a model's detail panel signal a successful save so the
 // surrounding card can flash its border glow. Default no-op for controls rendered
@@ -154,6 +156,15 @@ export function ModelManager({
 }) {
   const [pending, start] = useTransition();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Deep-link support: `/models?model=<model_name>` (used by the overview
+  // "Open in Models" link) auto-expands the matching route on first load.
+  const searchParams = useSearchParams();
+  const requestedModel = searchParams.get("model");
+  useEffect(() => {
+    if (!requestedModel) return;
+    const match = models.find((m) => m.model_name === requestedModel);
+    if (match) setSelectedId(match.id);
+  }, [requestedModel, models]);
   // Bumps a counter scoped to a model id so its card replays the save-glow on
   // every successful save (the changing `n` remounts the overlay to restart CSS).
   const [saveFlash, setSaveFlash] = useState<{ id: string; n: number } | null>(null);
@@ -714,6 +725,16 @@ function ModelDetailPanel({
             </div>
           </PanelCard>
         </div>
+
+        <PanelCard
+          title="Live traffic"
+          description="Token throughput, latency, and per-tenant breakdown for this model"
+          className="mt-4"
+        >
+          <div className="p-4">
+            <ModelMetricsDetail model={model.model_name} />
+          </div>
+        </PanelCard>
       </TabsContent>
 
       <TabsContent value="connection">

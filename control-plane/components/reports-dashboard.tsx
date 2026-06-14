@@ -84,7 +84,7 @@ const EXPORT_COLUMNS: { key: string; label: string; def: boolean }[] = [
   { key: "estimated_tokens", label: "Estimated tokens", def: false },
   { key: "cache_hits", label: "Cache hits", def: false },
   { key: "cache_misses", label: "Cache misses", def: false },
-  { key: "avg_ttft_ms", label: "Avg TTFT (ms)", def: false },
+  { key: "avg_ttft_ms", label: "Avg TTFB (ms)", def: false },
   { key: "avg_total_ms", label: "Avg total (ms)", def: false },
 ];
 
@@ -438,7 +438,7 @@ export function ReportsDashboard() {
         <Card>
           <CardHeader>
             <CardTitle>Latency trend</CardTitle>
-            <CardDescription>Average TTFT and total response time per day.</CardDescription>
+            <CardDescription>Average time-to-first-byte and total response time per day.</CardDescription>
           </CardHeader>
           <CardContent>
             {rows.length === 0 ? (
@@ -463,7 +463,7 @@ export function ReportsDashboard() {
                     <Line
                       type="monotone"
                       dataKey="avg_ttft_ms"
-                      name="Avg TTFT"
+                      name="Avg TTFB"
                       stroke={TTFT_COLOR}
                       strokeWidth={2}
                       dot={false}
@@ -590,7 +590,7 @@ export function ReportsDashboard() {
                 <th className="py-2 pr-4 text-right font-medium">Input tok</th>
                 <th className="py-2 pr-4 text-right font-medium">Output tok</th>
                 <th className="py-2 pr-4 text-right font-medium">Total tok</th>
-                <th className="py-2 pr-4 text-right font-medium">Avg TTFT</th>
+                <th className="py-2 pr-4 text-right font-medium">Avg TTFB</th>
                 <th className="py-2 text-right font-medium">Avg total</th>
               </tr>
             </thead>

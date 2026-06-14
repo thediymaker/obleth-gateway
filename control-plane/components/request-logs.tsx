@@ -342,7 +342,7 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
               <th className="px-3 py-2 font-medium">Request ID</th>
               <th className="px-3 py-2 text-right font-medium">Cost</th>
               <th className="px-3 py-2 text-right font-medium">Tokens</th>
-              <th className="px-3 py-2 text-right font-medium">TTFT</th>
+              <th className="px-3 py-2 text-right font-medium">TTFB</th>
               <th className="px-3 py-2 text-right font-medium">Duration</th>
               <th className="px-3 py-2 font-medium">Team</th>
               <th className="px-4 py-2 font-medium">Key</th>

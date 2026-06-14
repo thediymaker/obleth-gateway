@@ -423,6 +423,33 @@ export interface TenantUsageTimePoint {
   total_tokens: number;
 }
 
+/// Time-bucketed per-model series for the expanded model card charts.
+/// Throughput is aggregate tokens/sec over the bucket; latency carries avg + p50.
+export interface ModelUsageTimePoint {
+  bucket_ms: number;
+  requests: number;
+  gen_tokens_per_sec: number;
+  prompt_tokens_per_sec: number;
+  avg_ttft_ms: number;
+  p50_ttft_ms: number;
+  avg_total_ms: number;
+  p50_total_ms: number;
+}
+
+/// One tenant/key pair's usage of a single model, with names resolved from
+/// Postgres. Powers the breakdown table in the expanded model card.
+export interface UsageBreakdownEntry {
+  key_id: string;
+  tenant_id: string;
+  requests: number;
+  total_tokens: number;
+  gen_tokens_per_sec: number;
+  tenant_name: string;
+  fairshare_group: string;
+  key_name: string;
+  key_prefix: string;
+}
+
 export interface AuditEntry {
   id: number;
   ts: string;
@@ -939,6 +966,18 @@ export const obleth = {
   usageSeriesByTenant: (bucketMs = 10_000, sinceMs?: number) =>
     api<TenantUsageTimePoint[]>(
       `/usage/series/tenants${qs({ bucket_ms: bucketMs, since_ms: sinceMs })}`,
+    ),
+  usageSeriesByModel: (model: string, bucketMs = 60_000, sinceMs?: number) =>
+    api<ModelUsageTimePoint[]>(
+      `/usage/series/models${qs({
+        model,
+        bucket_ms: bucketMs,
+        since_ms: sinceMs,
+      })}`,
+    ),
+  usageBreakdownByModel: (model: string, sinceMs?: number, limit?: number) =>
+    api<UsageBreakdownEntry[]>(
+      `/usage/breakdown${qs({ model, since_ms: sinceMs, limit })}`,
     ),
   costs: (sinceMs?: number) =>
     api<CostAgg[]>(`/costs${qs({ since_ms: sinceMs })}`),
