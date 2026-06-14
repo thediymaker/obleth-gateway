@@ -70,6 +70,10 @@ pub struct FairshareSnapshot {
     /// currently have at least one in-flight request.
     #[serde(default)]
     pub model_in_flight: HashMap<String, usize>,
+    /// Live queued (waiting) request count per model name, derived from the
+    /// per-tenant queues at snapshot time. Mirrors `model_in_flight`.
+    #[serde(default)]
+    pub model_queued: HashMap<String, usize>,
 }
 
 /// Context passed to the scheduler for a single admission attempt.
@@ -643,6 +647,13 @@ impl Scheduler {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
+        let mut model_queued: HashMap<String, usize> = HashMap::new();
+        for queue in self.queues.values() {
+            for waiter in queue {
+                *model_queued.entry(waiter.model.clone()).or_insert(0) += 1;
+            }
+        }
+
         FairshareSnapshot {
             algorithm: self.algorithm.as_str().into(),
             max_in_flight: max,
@@ -651,6 +662,7 @@ impl Scheduler {
             groups,
             tenants,
             model_in_flight: self.model_in_flight.clone(),
+            model_queued,
         }
     }
 

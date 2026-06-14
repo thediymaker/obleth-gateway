@@ -410,6 +410,10 @@ export interface FairshareLiveView {
   global_queued: number;
   groups: GroupFairshareView[];
   tenants: TenantFairshareView[];
+  /** Live in-flight request count keyed by model name. */
+  model_in_flight?: Record<string, number>;
+  /** Live queued request count keyed by model name. */
+  model_queued?: Record<string, number>;
 }
 
 export interface TenantUsageTimePoint {

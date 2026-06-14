@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { AlertTriangle, Boxes, Gauge, KeyRound, Radio, RefreshCw, ShieldCheck, Users, type LucideIcon } from "lucide-react";
+import { AlertTriangle, Boxes, Gauge, KeyRound, Radio, RefreshCw, ShieldCheck } from "lucide-react";
 import {
   Area,
   CartesianGrid,
@@ -74,6 +74,16 @@ const REQUEST_COLOR = "hsl(38 65% 62%)";
 type TrafficRange = "live" | "day";
 type MetricTone = "ok" | "warn" | "hot" | "neutral";
 type ActivityView = "tenants" | "models" | "keys";
+type ModelSort = "requests" | "genTps" | "aggTps" | "ttft" | "e2e" | "tokens" | "users";
+type ModelWindow = "5m" | "15m" | "1h" | "6h" | "24h";
+
+const WINDOW_MS: Record<ModelWindow, number> = {
+  "5m": 5 * 60_000,
+  "15m": 15 * 60_000,
+  "1h": HOUR_MS,
+  "6h": 6 * HOUR_MS,
+  "24h": DAY_MS,
+};
 
 export function OverviewDashboard({
   tenants,
@@ -104,6 +114,7 @@ export function OverviewDashboard({
 }) {
   const queryClient = useQueryClient();
   const [trafficRange, setTrafficRange] = useState<TrafficRange>("live");
+  const [modelWindow, setModelWindow] = useState<ModelWindow>("1h");
 
   const summaryQuery = useQuery({
     queryKey: ["live-summary"],
@@ -138,8 +149,9 @@ export function OverviewDashboard({
   });
 
   const modelUsageQuery = useQuery({
-    queryKey: ["usage-models-top"],
-    queryFn: () => getJson<UsageModelAgg[]>(`/api/live/usage/models?since_ms=${Date.now() - HOUR_MS}`),
+    queryKey: ["usage-models-top", modelWindow],
+    queryFn: () =>
+      getJson<UsageModelAgg[]>(`/api/live/usage/models?since_ms=${Date.now() - WINDOW_MS[modelWindow]}`),
     initialData: initialModelUsage,
     refetchInterval: USAGE_POLL_MS,
   });
@@ -190,8 +202,8 @@ export function OverviewDashboard({
     [tenantSeriesQuery.data, initialTenantUsage, tenants, fairshare],
   );
   const modelRows = useMemo(
-    () => buildModelRows(modelUsageQuery.data ?? [], visibleModels, activeHealth),
-    [modelUsageQuery.data, visibleModels, activeHealth],
+    () => buildModelRows(modelUsageQuery.data ?? [], visibleModels, activeHealth, fairshare),
+    [modelUsageQuery.data, visibleModels, activeHealth, fairshare],
   );
   const keyRows = useMemo(
     () => buildKeyRows(keyUsageQuery.data ?? [], tenantNames, tenantGroups),
@@ -258,7 +270,13 @@ export function OverviewDashboard({
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1.05fr)_minmax(22rem,0.95fr)]">
-        <ActivityPanel tenantRows={tenantRows} modelRows={modelRows} keyRows={keyRows} />
+        <MetricsExplorer
+          tenantRows={tenantRows}
+          modelRows={modelRows}
+          keyRows={keyRows}
+          activeWindow={modelWindow}
+          onWindowChange={setModelWindow}
+        />
         <RequestFeedPanel />
       </div>
     </div>
@@ -653,106 +671,123 @@ function SnapshotCheckRow({ check }: { check: SnapshotCheck }) {
   );
 }
 
-function ActivityPanel({
+function MetricsExplorer({
   tenantRows,
   modelRows,
   keyRows,
+  activeWindow,
+  onWindowChange,
 }: {
   tenantRows: TenantDisplayRow[];
   modelRows: ModelDisplayRow[];
   keyRows: KeyDisplayRow[];
+  activeWindow: ModelWindow;
+  onWindowChange: (w: ModelWindow) => void;
 }) {
-  const [view, setView] = useState<ActivityView>("tenants");
-  const config = {
-    tenants: {
-      title: "Tenants",
-      description: "Top live tenant pressure",
-      href: "/fairshare",
-      icon: Users,
-      rows: tenantRows.slice(0, 6).map((row) => ({
-        key: row.id,
-        label: row.name,
-        detail: `${row.group} / ${formatCompact(row.tokens)} tokens`,
-        value: formatNumber(row.requests),
-        sub: `${formatNumber(row.inFlight)} running / ${formatNumber(row.queued)} queued`,
-        color: row.color,
-        href: `/tenants?tenant=${encodeURIComponent(row.id)}`,
-        weight: row.requests + row.inFlight + row.queued,
-      })),
-      empty: "No tenant traffic in the last hour",
-    },
-    models: {
-      title: "Models",
-      description: "Routes receiving traffic",
-      href: "/models",
-      icon: Boxes,
-      rows: modelRows.slice(0, 6).map((row, index) => ({
-        key: row.model,
-        label: row.model,
-        detail: `in ${formatCompact(row.inputTokens)} / out ${formatCompact(row.outputTokens)}`,
-        value: formatNumber(row.requests),
-        sub: row.status,
-        color: PALETTE[index % PALETTE.length],
-        href: `/models?model=${encodeURIComponent(row.model)}`,
-        weight: row.requests,
-      })),
-      empty: "No model traffic in the last hour",
-    },
-    keys: {
-      title: "Keys",
-      description: "Busiest API keys",
-      href: "/keys",
-      icon: KeyRound,
-      rows: keyRows.slice(0, 6).map((row) => ({
-        key: row.keyId,
-        label: `key ${row.keyLabel}`,
-        detail: `${row.tenant} / ${row.group}`,
-        value: formatNumber(row.requests),
-        sub: `${formatCompact(row.tokens)} tokens`,
-        color: row.color,
-        href: `/keys?key=${encodeURIComponent(row.keyLabel)}`,
-        weight: row.requests,
-      })),
-      empty: "No key traffic in the last hour",
-    },
-  } satisfies Record<ActivityView, ActivityConfig>;
-  const active = config[view];
-  const maxWeight = active.rows.reduce((max, row) => Math.max(max, row.weight), 0);
-  const Icon = active.icon;
+  const [view, setView] = useState<ActivityView>("models");
+  const [sort, setSort] = useState<ModelSort>("requests");
+  const [expanded, setExpanded] = useState<string | null>(null);
+  const [tenantSort, setTenantSort] = useState<"requests" | "queued" | "tokens">("requests");
+  const [keySort, setKeySort] = useState<"requests" | "tokens">("requests");
+
+  const sortedModels = useMemo(() => sortModelRows(modelRows, sort), [modelRows, sort]);
+
+  const sortedTenants = useMemo(() => {
+    const c = [...tenantRows];
+    if (tenantSort === "queued") c.sort((a, b) => b.queued - a.queued || b.requests - a.requests);
+    else if (tenantSort === "tokens") c.sort((a, b) => b.tokens - a.tokens);
+    else c.sort((a, b) => b.requests - a.requests);
+    return c.slice(0, 8);
+  }, [tenantRows, tenantSort]);
+
+  const sortedKeys = useMemo(() => {
+    const c = [...keyRows];
+    if (keySort === "tokens") c.sort((a, b) => b.tokens - a.tokens);
+    else c.sort((a, b) => b.requests - a.requests);
+    return c.slice(0, 8);
+  }, [keyRows, keySort]);
 
   return (
     <Card className="h-full rounded-md">
       <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
-          <CardTitle>Top activity</CardTitle>
-          <CardDescription>{active.description}</CardDescription>
+          <CardTitle>Metrics explorer</CardTitle>
+          <CardDescription>
+            {view === "models" ? "Throughput and latency per model" : view === "tenants" ? "Live tenant pressure" : "Busiest API keys"}
+          </CardDescription>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <div className="inline-flex rounded-sm border border-border bg-background/40 p-0.5">
-            <MetricToggle active={view === "tenants"} label="Tenants" onClick={() => setView("tenants")} />
             <MetricToggle active={view === "models"} label="Models" onClick={() => setView("models")} />
+            <MetricToggle active={view === "tenants"} label="Tenants" onClick={() => setView("tenants")} />
             <MetricToggle active={view === "keys"} label="Keys" onClick={() => setView("keys")} />
           </div>
-          <Button type="button" variant="outline" size="sm" asChild>
-            <Link href={active.href}>
-              <Icon className="h-3.5 w-3.5" />
-              {active.title}
-            </Link>
-          </Button>
         </div>
       </CardHeader>
       <CardContent>
-        {active.rows.length === 0 ? (
-          <EmptyState className="h-72">{active.empty}</EmptyState>
+        {view === "models" ? (
+          <div className="space-y-3">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <ModelSortSelect sort={sort} onChange={setSort} />
+              <div className="inline-flex rounded-sm border border-border bg-background/40 p-0.5">
+                {(Object.keys(WINDOW_MS) as ModelWindow[]).map((w) => (
+                  <MetricToggle key={w} active={activeWindow === w} label={w} onClick={() => onWindowChange(w)} />
+                ))}
+              </div>
+            </div>
+            {sortedModels.length === 0 ? (
+              <EmptyState className="h-72">No model traffic in this window</EmptyState>
+            ) : (
+              <div className="space-y-2">
+                {sortedModels.map((row) => (
+                  <ModelExplorerRow
+                    key={row.model}
+                    row={row}
+                    expanded={expanded === row.model}
+                    onToggle={() => setExpanded((c) => (c === row.model ? null : row.model))}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        ) : view === "tenants" ? (
+          <div className="space-y-2">
+            <div className="inline-flex rounded-sm border border-border bg-background/40 p-0.5">
+              <MetricToggle active={tenantSort === "requests"} label="Requests" onClick={() => setTenantSort("requests")} />
+              <MetricToggle active={tenantSort === "queued"} label="Queued" onClick={() => setTenantSort("queued")} />
+              <MetricToggle active={tenantSort === "tokens"} label="Tokens" onClick={() => setTenantSort("tokens")} />
+            </div>
+            <SimpleEntityList
+              rows={sortedTenants.map((r) => ({
+                key: r.id,
+                label: r.name,
+                detail: `${r.group} / ${formatCompact(r.tokens)} tokens`,
+                value: formatNumber(r.requests),
+                sub: `${formatNumber(r.inFlight)} running / ${formatNumber(r.queued)} queued`,
+                color: r.color,
+                weight: r.requests + r.inFlight + r.queued,
+              }))}
+              empty="No tenant traffic in the last hour"
+            />
+          </div>
         ) : (
           <div className="space-y-2">
-            {active.rows.map((row) => (
-              <ActivityListRow
-                key={row.key}
-                row={row}
-                pct={maxWeight > 0 ? (row.weight / maxWeight) * 100 : 0}
-              />
-            ))}
+            <div className="inline-flex rounded-sm border border-border bg-background/40 p-0.5">
+              <MetricToggle active={keySort === "requests"} label="Requests" onClick={() => setKeySort("requests")} />
+              <MetricToggle active={keySort === "tokens"} label="Tokens" onClick={() => setKeySort("tokens")} />
+            </div>
+            <SimpleEntityList
+              rows={sortedKeys.map((r) => ({
+                key: r.keyId,
+                label: `key ${r.keyLabel}`,
+                detail: `${r.tenant} / ${r.group}`,
+                value: formatNumber(r.requests),
+                sub: `${formatCompact(r.tokens)} tokens`,
+                color: r.color,
+                weight: r.requests,
+              }))}
+              empty="No key traffic in the last hour"
+            />
           </div>
         )}
       </CardContent>
@@ -760,46 +795,134 @@ function ActivityPanel({
   );
 }
 
-interface ActivityConfig {
-  title: string;
-  description: string;
-  href: string;
-  icon: LucideIcon;
-  rows: ActivityRow[];
-  empty: string;
-}
-
-interface ActivityRow {
-  key: string;
-  label: string;
-  detail: string;
-  value: string;
-  sub: string;
-  color: string;
-  href: string;
-  weight: number;
-}
-
-function ActivityListRow({ row, pct }: { row: ActivityRow; pct: number }) {
+function ModelSortSelect({ sort, onChange }: { sort: ModelSort; onChange: (s: ModelSort) => void }) {
   return (
-    <Link
-      href={row.href}
-      className="block rounded-sm border border-border bg-background/30 px-3 py-2 transition-colors hover:bg-muted/20"
+    <select
+      value={sort}
+      onChange={(e) => onChange(e.target.value as ModelSort)}
+      aria-label="Sort models"
+      className="h-8 rounded-sm border border-border bg-background/40 px-2 text-xs text-foreground"
     >
-      <div className="flex items-center justify-between gap-3">
-        <div className="min-w-0">
-          <p className="truncate text-xs font-medium">{row.label}</p>
-          <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{row.detail}</p>
+      <option value="requests">Requests</option>
+      <option value="genTps">Gen tok/s</option>
+      <option value="aggTps">Aggregate tok/s</option>
+      <option value="ttft">TTFT p50</option>
+      <option value="e2e">E2E p50</option>
+      <option value="tokens">Tokens</option>
+      <option value="users">Users</option>
+    </select>
+  );
+}
+
+function sortModelRows(rows: ModelDisplayRow[], sort: ModelSort): ModelDisplayRow[] {
+  const copy = [...rows];
+  switch (sort) {
+    case "genTps": return copy.sort((a, b) => b.genTps - a.genTps);
+    case "aggTps": return copy.sort((a, b) => b.aggTps - a.aggTps);
+    case "ttft": return copy.sort((a, b) => a.p50TtftMs - b.p50TtftMs);
+    case "e2e": return copy.sort((a, b) => a.p50TotalMs - b.p50TotalMs);
+    case "tokens": return copy.sort((a, b) => b.tokens - a.tokens);
+    case "users": return copy.sort((a, b) => b.users - a.users);
+    case "requests":
+    default: return copy.sort((a, b) => b.requests - a.requests);
+  }
+}
+
+function ModelExplorerRow({
+  row,
+  expanded,
+  onToggle,
+}: {
+  row: ModelDisplayRow;
+  expanded: boolean;
+  onToggle: () => void;
+}) {
+  const statusTone: MetricTone = row.status === "unhealthy" ? "hot" : row.status === "unknown" || row.status === "disabled" ? "warn" : "neutral";
+  const slotLabel = row.slots == null ? `${formatNumber(row.inFlight)} / ∞` : `${formatNumber(row.inFlight)} / ${formatNumber(row.slots)}`;
+
+  return (
+    <div className="rounded-sm border border-border bg-background/30">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        onClick={onToggle}
+        className="w-full px-3 py-2 text-left transition-colors hover:bg-muted/20"
+      >
+        <div className="flex items-center gap-3">
+          <span className="text-xs text-muted-foreground">{expanded ? "▾" : "▸"}</span>
+          <span className="min-w-0 flex-1 truncate text-xs font-medium">{row.model}</span>
+          <StripMetric label="req" value={formatNumber(row.requests)} />
+          <StripMetric label="gen tok/s" value={formatDecimal(row.genTps)} tone={row.genTps > 0 && row.genTps < 10 ? "warn" : "neutral"} />
+          <StripMetric label="TTFT" value={`${formatNumber(Math.round(row.p50TtftMs))}ms`} tone={row.p50TtftMs > 1000 ? "warn" : "neutral"} />
+          <StripMetric label="queued" value={formatNumber(row.queued)} tone={row.queued > 0 ? "warn" : "neutral"} />
         </div>
-        <div className="shrink-0 text-right">
-          <p className="text-xs font-medium tabular-nums">{row.value}</p>
-          <p className="text-[11px] tabular-nums text-muted-foreground">{row.sub}</p>
+      </button>
+      {expanded && (
+        <div className="border-t border-dashed border-border px-3 py-3">
+          <div className="grid grid-cols-2 gap-2 text-xs md:grid-cols-4">
+            <DetailStat label="Aggregate tok/s" value={`${formatCompact(row.aggTps)} tok/s`} />
+            <DetailStat label="E2E p50" value={`${formatNumber(Math.round(row.p50TotalMs))} ms`} />
+            <DetailStat label="TTFT avg" value={`${formatNumber(Math.round(row.avgTtftMs))} ms`} />
+            <DetailStat label="E2E avg" value={`${formatNumber(Math.round(row.avgTotalMs))} ms`} />
+            <DetailStat label="In / Slots" value={slotLabel} />
+            <DetailStat label="Queued" value={formatNumber(row.queued)} tone={row.queued > 0 ? "warn" : "neutral"} />
+            <DetailStat label="In tokens" value={formatCompact(row.inputTokens)} />
+            <DetailStat label="Out tokens" value={formatCompact(row.outputTokens)} />
+            <DetailStat label="Avg prompt" value={`${formatCompact(row.avgPromptTokens)} tok`} />
+            <DetailStat label="Avg gen" value={`${formatCompact(row.avgGenTokens)} tok`} />
+            <DetailStat label="Users" value={formatNumber(row.users)} />
+            <DetailStat label="Status" value={row.status} tone={statusTone} />
+          </div>
+          <div className="mt-3">
+            <Link href={`/models?model=${encodeURIComponent(row.model)}`} className="text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground">
+              Open in Models
+            </Link>
+          </div>
         </div>
-      </div>
-      <div className="mt-2 h-1.5 overflow-hidden rounded-sm bg-muted/35">
-        <div className="h-full rounded-sm" style={{ width: `${clamp(pct, 0, 100)}%`, background: row.color }} />
-      </div>
-    </Link>
+      )}
+    </div>
+  );
+}
+
+function StripMetric({ label, value, tone = "neutral" }: { label: string; value: string; tone?: MetricTone }) {
+  const toneClass = tone === "hot" ? "text-[hsl(350_55%_64%)]" : tone === "warn" ? "text-[hsl(38_65%_62%)]" : "text-foreground";
+  return (
+    <div className="shrink-0 text-right">
+      <p className={cn("text-xs font-medium tabular-nums", toneClass)}>{value}</p>
+      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
+    </div>
+  );
+}
+
+function SimpleEntityList({
+  rows,
+  empty,
+}: {
+  rows: { key: string; label: string; detail: string; value: string; sub: string; color: string; weight: number }[];
+  empty: string;
+}) {
+  const maxWeight = rows.reduce((m, r) => Math.max(m, r.weight), 0);
+  if (rows.length === 0) return <EmptyState className="h-72">{empty}</EmptyState>;
+  return (
+    <div className="space-y-2">
+      {rows.map((row) => (
+        <div key={row.key} className="rounded-sm border border-border bg-background/30 px-3 py-2">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="truncate text-xs font-medium">{row.label}</p>
+              <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{row.detail}</p>
+            </div>
+            <div className="shrink-0 text-right">
+              <p className="text-xs font-medium tabular-nums">{row.value}</p>
+              <p className="text-[11px] tabular-nums text-muted-foreground">{row.sub}</p>
+            </div>
+          </div>
+          <div className="mt-2 h-1.5 overflow-hidden rounded-sm bg-muted/35">
+            <div className="h-full rounded-sm" style={{ width: `${clamp(maxWeight > 0 ? (row.weight / maxWeight) * 100 : 0, 0, 100)}%`, background: row.color }} />
+          </div>
+        </div>
+      ))}
+    </div>
   );
 }
 
@@ -1452,13 +1575,23 @@ interface ModelDisplayRow {
   avgPromptTokens: number;
   avgGenTokens: number;
   users: number;
+  inFlight: number;
+  queued: number;
+  slots: number | null; // null = unlimited (no max_in_flight cap)
   status: string;
   route?: ModelRoute;
 }
 
-function buildModelRows(usage: UsageModelAgg[], routes: ModelRoute[], health: ModelHealthSummary[]): ModelDisplayRow[] {
+function buildModelRows(
+  usage: UsageModelAgg[],
+  routes: ModelRoute[],
+  health: ModelHealthSummary[],
+  fairshare?: FairshareLiveView,
+): ModelDisplayRow[] {
   const routeByName = new Map(routes.map((route) => [route.model_name, route]));
   const healthById = new Map(health.map((row) => [row.model_id, row]));
+  const inFlightByModel = fairshare?.model_in_flight ?? {};
+  const queuedByModel = fairshare?.model_queued ?? {};
 
   return usage
     .filter((row) => !isBenchmarkModelName(row.model))
@@ -1480,11 +1613,14 @@ function buildModelRows(usage: UsageModelAgg[], routes: ModelRoute[], health: Mo
         avgPromptTokens: Number(row.avg_prompt_tokens),
         avgGenTokens: Number(row.avg_gen_tokens),
         users: Number(row.users),
+        inFlight: inFlightByModel[row.model] ?? 0,
+        queued: queuedByModel[row.model] ?? 0,
+        slots: route?.max_in_flight ?? null,
         status: route && !route.enabled ? "disabled" : summary ? healthStatus(summary) : route ? "unknown" : "unrouted",
         route,
       };
     })
-    .filter((row) => row.requests > 0)
+    .filter((row) => row.requests > 0 || row.inFlight > 0 || row.queued > 0)
     .sort((a, b) => b.requests - a.requests || b.tokens - a.tokens);
 }
 

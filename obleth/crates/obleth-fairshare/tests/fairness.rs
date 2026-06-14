@@ -300,3 +300,40 @@ async fn hierarchical_group_slots_split_across_tenants() {
     drop(chatbot2_permits);
     drop(chatbot_permits);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_reports_per_model_queued() {
+    let cap = Arc::new(StaticCapacity::new(1));
+    let fs = FairShare::start(cap, FairshareAlgorithm::Weighted);
+    let tenant = Uuid::new_v4();
+
+    let req = move |model: &str| AdmitRequest {
+        tenant,
+        weight: 100,
+        group: "default".into(),
+        group_weight: 100,
+        model: model.into(),
+        model_max_in_flight: Some(1),
+        cost: 10,
+    };
+
+    // Fill the single global slot with model "alpha".
+    let held = fs.admit(req("alpha")).await.expect("first admit").permit;
+
+    // Two more requests must queue (global capacity is full): one more "alpha"
+    // and one "beta".
+    let fs2 = fs.clone();
+    let w1 = tokio::spawn(async move { fs2.admit(req("alpha")).await });
+    let fs3 = fs.clone();
+    let w2 = tokio::spawn(async move { fs3.admit(req("beta")).await });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    let snap = fs.snapshot().await.expect("snapshot");
+    assert_eq!(snap.model_in_flight.get("alpha").copied(), Some(1));
+    assert_eq!(snap.model_queued.get("alpha").copied(), Some(1));
+    assert_eq!(snap.model_queued.get("beta").copied(), Some(1));
+
+    drop(held);
+    let _ = tokio::time::timeout(Duration::from_secs(1), w1).await;
+    let _ = tokio::time::timeout(Duration::from_secs(1), w2).await;
+}

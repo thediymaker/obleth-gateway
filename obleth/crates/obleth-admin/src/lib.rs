@@ -385,6 +385,12 @@ pub struct FairshareLiveView {
     pub global_queued: i64,
     pub groups: Vec<GroupFairshareView>,
     pub tenants: Vec<TenantFairshareView>,
+    /// Live in-flight request count per model name.
+    #[serde(default)]
+    pub model_in_flight: std::collections::HashMap<String, usize>,
+    /// Live queued request count per model name.
+    #[serde(default)]
+    pub model_queued: std::collections::HashMap<String, usize>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1948,6 +1954,8 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         .cloned();
     let hidden_in_flight = hidden_group.as_ref().map(|g| g.in_flight).unwrap_or(0);
     let hidden_queued = hidden_group.as_ref().map(|g| g.queued).unwrap_or(0);
+    let model_in_flight = snap.model_in_flight.clone();
+    let model_queued = snap.model_queued.clone();
     Ok(Json(FairshareLiveView {
         algorithm: snap.algorithm,
         max_in_flight: snap.max_in_flight,
@@ -1992,6 +2000,8 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
                 weight_share: t.weight_share,
             })
             .collect(),
+        model_in_flight,
+        model_queued,
     }))
 }
 
