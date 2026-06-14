@@ -71,6 +71,18 @@ behind one provider key does not need it.
   with an operator-controlled TTL.
 - **MCP proxying.** Register Model Context Protocol servers and expose them through
   obleth's single authenticated endpoint.
+- **Model boons.** Runtime-toggled, fail-open capabilities the gateway grants to
+  models that lack them natively — all off by default and configured from the
+  dashboard with no restart. **Vision:** relays `image_url` parts to a designated
+  describer model and swaps in the text description, so a text-only model can answer
+  image prompts. **Structured output:** enforces `response_format` JSON schemas for
+  models without native support, validating at the gateway and repairing via a
+  configurable fixer model. **Gateway tool loop:** grant a model registered MCP
+  servers and obleth injects their tools into plain chat requests, executes the
+  model's tool calls against the MCP upstream, and loops until a final answer —
+  streamed live token-by-token or buffered. Clients that bring their own `tools`
+  are left untouched. Any boon failure leaves the request unchanged, so a flaky
+  helper never blocks a request the target model could still handle on its own.
 - **Audit log.** Every management action records the actor, entity, and a JSON
   detail payload.
 - **Defined behavior under load.** When saturated, requests queue in the weighted
@@ -83,7 +95,9 @@ behind one provider key does not need it.
 - **Observability.** Per-model throughput (tok/s), TTFT and end-to-end latency
   (average and p50), prompt/generation token averages, and unique users — all
   computed from obleth's own usage ledger — plus a live fairshare view in the
-  dashboard.
+  dashboard. Optional OpenTelemetry trace export (OTLP/HTTP, off unless
+  `OBLETH_OTEL_ENDPOINT` is set) gives per-request spans across admission,
+  scheduling, and upstream dispatch.
 - **SSRF protection.** Admin-registered upstreams (model `api_base`, MCP URLs) are
   validated on create/update. By default (local-first), private/LAN/loopback targets
   are allowed; link-local and cloud-metadata addresses are always blocked. Set
@@ -113,7 +127,7 @@ release; pin one by setting `OBLETH_VERSION=vX.Y.Z` in `.env` (defaults to
 Services: HAProxy (`:80`), obleth data plane (`:8088` on the host, `:8080` inside
 the network), Management API (`:9180`), metrics (`:9091`), dashboard (`:3002` on
 the host), Postgres, Redis, ClickHouse, benchmark fixture backend (`:8081`),
-Prometheus (`:9090`), Grafana (`:3001`).
+Prometheus (`:9090`), Grafana (`:3001`), Jaeger (`:16686`, OTLP trace UI).
 
 Open the dashboard at <http://localhost:3002>.
 
@@ -157,6 +171,10 @@ curl -s localhost/v1/chat/completions \
 ```
 
 Full API spec: `GET http://localhost:9180/api/v1/openapi.json`.
+
+To try the gateway tool loop end to end, `examples/searxng/` brings up a private
+SearXNG metasearch instance fronted by an MCP server; register it under MCP,
+grant it to a model, and that model can run live web searches mid-conversation.
 
 ### Kubernetes
 
@@ -210,8 +228,9 @@ deploying anywhere real.
 ## Documentation
 
 Architecture, the fairshare engine internals, auto routing and the classifier,
-scheduling, budgets, secrets, SSRF policy, alerting, dashboard auth, and the
-full configuration reference live at **[obleth.com](https://obleth.com)**.
+scheduling, budgets, model boons (vision, structured output, the MCP tool loop),
+secrets, SSRF policy, alerting, dashboard auth, and the full configuration
+reference live at **[obleth.com](https://obleth.com)**.
 
 For contribution workflow, security reporting, and expected collaboration
 standards, see [CONTRIBUTING.md](CONTRIBUTING.md), [SECURITY.md](SECURITY.md),

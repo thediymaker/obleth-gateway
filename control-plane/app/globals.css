@@ -70,3 +70,25 @@
     opacity: 0.18;
   }
 }
+
+/* Save feedback: a brief emerald border-glow swept over a model card when a save
+   succeeds. Rendered as an inset overlay so it reads as a glowing border without
+   being clipped by the card's overflow-hidden. Remounted per save to replay. */
+.card-saved-glow {
+  box-shadow:
+    inset 0 0 0 1.5px hsl(158 42% 48% / 0.9),
+    inset 0 0 22px 0 hsl(158 42% 48% / 0.35);
+  animation: card-saved 1.6s ease-out forwards;
+}
+
+@keyframes card-saved {
+  0% {
+    opacity: 0;
+  }
+  12% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}

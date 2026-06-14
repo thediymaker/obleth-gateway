@@ -1,6 +1,6 @@
-"use client";
+﻿"use client";
 
-import { useEffect, useMemo, useRef, useState, useTransition, type ChangeEvent, type ReactNode } from "react";
+import { createContext, useActionState, useContext, useEffect, useMemo, useRef, useState, useTransition, type ChangeEvent, type ReactNode } from "react";
 import {
   Activity,
   Check,
@@ -46,10 +46,12 @@ import {
   setModelHealthConfigAction,
   setModelReliabilityAction,
   setModelWeightAction,
-  updateModelAction,
+  updateModelConnectionAction,
+  updateModelCapabilitiesAction,
   updateModelEndpointAction,
   type ImportModelsResult,
   type ImportPlanItem,
+  type ModelActionState,
 } from "@/app/actions";
 import { ChartShell, axisTick, chartGrid, compactAxis, tip, timeCursor } from "@/components/chart-tooltip";
 import { Badge } from "@/components/ui/badge";
@@ -84,6 +86,11 @@ import {
 import type { AutotuneReport, AutotuneWorkload, CacheStats, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import { providerForModel } from "@/lib/model-providers";
 import { cn, formatNumber } from "@/lib/utils";
+
+// Lets any control inside a model's detail panel signal a successful save so the
+// surrounding card can flash its border glow. Default no-op for controls rendered
+// outside a panel (e.g. embedded weight controls elsewhere).
+const SaveFlashContext = createContext<() => void>(() => {});
 
 // Fixed routing-tag vocabulary; mirrors obleth-config `MODEL_TAGS`. Used by the
 // `auto` router to match requests to models.
@@ -147,6 +154,11 @@ export function ModelManager({
 }) {
   const [pending, start] = useTransition();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  // Bumps a counter scoped to a model id so its card replays the save-glow on
+  // every successful save (the changing `n` remounts the overlay to restart CSS).
+  const [saveFlash, setSaveFlash] = useState<{ id: string; n: number } | null>(null);
+  const flashSaved = (id: string) =>
+    setSaveFlash((prev) => ({ id, n: prev?.id === id ? prev.n + 1 : 1 }));
   const [createOpen, setCreateOpen] = useState(false);
   const [createType, setCreateType] = useState<string>("chat");
   const [showBenchmarkRoutes, setShowBenchmarkRoutes] = useState(false);
@@ -433,12 +445,19 @@ export function ModelManager({
                   <div
                     key={model.id}
                     className={cn(
-                      "group overflow-hidden rounded-lg border shadow-sm transition-colors",
+                      "group relative overflow-hidden rounded-lg border shadow-sm transition-colors",
                       selected
                         ? "border-primary/35 bg-muted/25 ring-1 ring-primary/15"
                         : "border-border/70 bg-card/35 hover:border-border hover:bg-muted/15",
                     )}
                   >
+                    {saveFlash?.id === model.id && (
+                      <span
+                        key={saveFlash.n}
+                        aria-hidden
+                        className="card-saved-glow pointer-events-none absolute inset-0 z-30 rounded-lg"
+                      />
+                    )}
                     <div
                       onClick={() => setSelectedId((current) => (current === model.id ? null : model.id))}
                       className="relative cursor-pointer overflow-hidden transition-colors"
@@ -546,15 +565,20 @@ export function ModelManager({
                       <div className="relative overflow-hidden border-t border-border/60 bg-muted/10">
                         <ModelProviderBackdrop name={model.model_name} upstream={model.upstream_model} selected variant="detail" />
                         <div className="relative z-10 px-5 py-4">
-                          <ModelDetailPanel
-                            model={model}
-                            summary={summary}
-                            detail={healthDetails[model.id]}
-                            endpoints={endpoints[model.id] ?? []}
-                            mcpServers={mcpServers}
-                            pending={pending}
-                            onCacheToggle={() => start(() => setModelCacheAction(model.id, !model.cache_enabled, model.cache_ttl_secs || 300))}
-                          />
+                          <SaveFlashContext.Provider value={() => flashSaved(model.id)}>
+                            <ModelDetailPanel
+                              model={model}
+                              summary={summary}
+                              detail={healthDetails[model.id]}
+                              endpoints={endpoints[model.id] ?? []}
+                              mcpServers={mcpServers}
+                              pending={pending}
+                              onCacheToggle={() => {
+                                flashSaved(model.id);
+                                start(() => setModelCacheAction(model.id, !model.cache_enabled, model.cache_ttl_secs || 300));
+                              }}
+                            />
+                          </SaveFlashContext.Provider>
                         </div>
                       </div>
                     )}
@@ -591,7 +615,16 @@ function ModelDetailPanel({
   pending: boolean;
   onCacheToggle: () => void;
 }) {
+  const flashSaved = useContext(SaveFlashContext);
   const [editType, setEditType] = useState<string>(model.model_type || "chat");
+  const [, healthAction, healthPending] = useActionState(
+    async (_prev: ModelActionState | null, formData: FormData) => {
+      await setModelHealthConfigAction(formData);
+      flashSaved();
+      return { ok: true } as ModelActionState;
+    },
+    null,
+  );
   const checks = detail?.checks ?? [];
   const chartData = checks
     .slice()
@@ -607,7 +640,9 @@ function ModelDetailPanel({
       <div className="flex flex-wrap items-center justify-between gap-3">
         <TabsList>
           <TabsTrigger value="overview">Overview</TabsTrigger>
-          <TabsTrigger value="route">Route</TabsTrigger>
+          <TabsTrigger value="connection">Connection</TabsTrigger>
+          <TabsTrigger value="capabilities">Capabilities</TabsTrigger>
+          <TabsTrigger value="capacity">Capacity</TabsTrigger>
           <TabsTrigger value="reliability">
             Reliability
             {endpoints.length > 0 && (
@@ -637,11 +672,63 @@ function ModelDetailPanel({
                 <SpecItem label="Boons">
                   <ChipList items={boonList(model)} empty="None" tone="boon" />
                 </SpecItem>
+                <SpecItem label="Route">
+                  <Badge className={model.enabled ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-300" : "border-border bg-muted/30 text-muted-foreground"}>
+                    {model.enabled ? "enabled" : "disabled"}
+                  </Badge>
+                </SpecItem>
+                <SpecItem label="Cache">
+                  <span className="text-xs font-normal text-muted-foreground">
+                    {model.cache_enabled ? `on · ${model.cache_ttl_secs || 300}s` : "off"}
+                  </span>
+                </SpecItem>
               </div>
             </PanelCard>
+          </div>
 
+          <PanelCard
+            title="Health trend"
+            description="Recent health probe latency"
+            actions={<HealthBadge summary={summary} />}
+            className="self-start"
+          >
+            <div className="p-4">
+              {chartData.length === 0 ? (
+                <div className="flex h-48 items-center justify-center rounded-sm border border-dashed border-border/70 text-xs text-muted-foreground">No checks yet</div>
+              ) : (
+                <ChartShell heightClass="h-48">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
+                      <CartesianGrid {...chartGrid} />
+                      <XAxis dataKey="time" tick={axisTick} tickLine={false} axisLine={false} minTickGap={18} />
+                      <YAxis tick={axisTick} tickLine={false} axisLine={false} width={44} tickFormatter={compactAxis} />
+                      <Tooltip content={tip({ valueFormatter: (v) => `${formatNumber(v)} ms` })} cursor={timeCursor} />
+                      <Line type="monotone" dataKey="latency" name="Latency" stroke="hsl(158 42% 48%)" strokeWidth={2} dot={false} isAnimationActive={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </ChartShell>
+              )}
+              {summary.last_message && (
+                <p className="mt-3 rounded-sm border border-border/70 bg-background/40 p-2 text-xs text-muted-foreground">{summary.last_message}</p>
+              )}
+            </div>
+          </PanelCard>
+        </div>
+      </TabsContent>
+
+      <TabsContent value="connection">
+        <ConnectionTab model={model} editType={editType} setEditType={setEditType} />
+      </TabsContent>
+
+      <TabsContent value="capabilities">
+        <CapabilitiesTab model={model} editType={editType} mcpServers={mcpServers} />
+      </TabsContent>
+
+      <TabsContent value="capacity">
+        <TooltipProvider delayDuration={150}>
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(320px,400px)]">
             <PanelCard
-              title="Controls"
+              title="Capacity & throughput"
               description="Live operational state. Changes apply immediately."
               actions={
                 <Badge className={model.enabled ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-300" : "border-border bg-muted/30 text-muted-foreground"}>
@@ -677,147 +764,7 @@ function ModelDetailPanel({
               </div>
             </PanelCard>
           </div>
-
-          <PanelCard
-            title="Health trend"
-            description="Recent health probe latency"
-            actions={<HealthBadge summary={summary} />}
-            className="self-start"
-          >
-            <div className="p-4">
-              {chartData.length === 0 ? (
-                <div className="flex h-48 items-center justify-center rounded-sm border border-dashed border-border/70 text-xs text-muted-foreground">No checks yet</div>
-              ) : (
-                <ChartShell heightClass="h-48">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={chartData} margin={{ top: 8, right: 12, left: 0, bottom: 0 }}>
-                      <CartesianGrid {...chartGrid} />
-                      <XAxis dataKey="time" tick={axisTick} tickLine={false} axisLine={false} minTickGap={18} />
-                      <YAxis tick={axisTick} tickLine={false} axisLine={false} width={44} tickFormatter={compactAxis} />
-                      <Tooltip content={tip({ valueFormatter: (v) => `${formatNumber(v)} ms` })} cursor={timeCursor} />
-                      <Line type="monotone" dataKey="latency" name="Latency" stroke="hsl(158 42% 48%)" strokeWidth={2} dot={false} isAnimationActive={false} />
-                    </LineChart>
-                  </ResponsiveContainer>
-                </ChartShell>
-              )}
-              {summary.last_message && (
-                <p className="mt-3 rounded-sm border border-border/70 bg-background/40 p-2 text-xs text-muted-foreground">{summary.last_message}</p>
-              )}
-            </div>
-          </PanelCard>
-        </div>
-      </TabsContent>
-
-      <TabsContent value="route">
-        <form action={updateModelAction}>
-          <input type="hidden" name="id" value={model.id} />
-          <PanelCard
-            title="Route settings"
-            description="Client name stays fixed; update upstream routing and capabilities here."
-            actions={
-              <Button type="submit" size="sm" disabled={pending}>
-                <Save className="h-3.5 w-3.5" />
-                Save route
-              </Button>
-            }
-          >
-            <div className="grid divide-y divide-border/60 lg:grid-cols-3 lg:divide-x lg:divide-y-0">
-              <FormSection title="Upstream" columns={1}>
-                <Field label="Upstream model" name="upstream_model" defaultValue={model.upstream_model} required />
-                <Field label="API base URL" name="api_base" defaultValue={model.api_base} required />
-                <Field label="Upstream API key" name="api_key" placeholder="Leave blank to keep current" />
-                <SelectField
-                  label="Model type"
-                  name="model_type"
-                  value={editType}
-                  onChange={setEditType}
-                  options={MODEL_TYPE_OPTIONS}
-                  hint={modelTypeHint(editType)}
-                />
-                <Field label="Description" name="description" defaultValue={model.description} />
-              </FormSection>
-
-              <FormSection title="Capacity & cost">
-                <Field label="Admission weight" name="admission_weight" type="number" defaultValue={String(model.admission_weight)} />
-                <Field label="Max in-flight" name="max_in_flight" type="number" defaultValue={model.max_in_flight == null ? "" : String(model.max_in_flight)} />
-                {(editType === "chat" || editType === "embedding") && (
-                  <Field label="Context window" name="context_window" type="number" defaultValue={String(model.context_window)} />
-                )}
-                {(editType === "chat" || editType === "embedding") && (
-                  <Field label="Input cost / token" name="input_cost_per_token" defaultValue={toPlainDecimal(model.input_cost_per_token)} />
-                )}
-                {editType === "chat" && (
-                  <Field label="Output cost / token" name="output_cost_per_token" defaultValue={toPlainDecimal(model.output_cost_per_token)} />
-                )}
-                {editType === "image" && (
-                  <Field label="Cost / image" name="cost_per_image" defaultValue={toPlainDecimal(model.cost_per_image)} />
-                )}
-                {editType === "audio_speech" && (
-                  <Field label="Cost / character" name="cost_per_character" defaultValue={toPlainDecimal(model.cost_per_character)} />
-                )}
-                {editType === "audio_transcription" && (
-                  <Field label="Cost / audio second" name="cost_per_audio_second" defaultValue={toPlainDecimal(model.cost_per_audio_second)} />
-                )}
-              </FormSection>
-
-              {editType === "chat" ? (
-                <FormSection title="Capabilities & routing" columns={1}>
-                  <ChipGroup label="Status">
-                    <ChipCheckbox name="enabled" label="Route enabled" defaultChecked={model.enabled} />
-                  </ChipGroup>
-                  <ChipGroup label="Native capabilities" hint="What the model natively supports. These gate request features and routing.">
-                    <ChipCheckbox name="supports_function_calling" label="Function calling" defaultChecked={model.supports_function_calling} />
-                    <ChipCheckbox name="supports_system_messages" label="System messages" defaultChecked={model.supports_system_messages} />
-                    <ChipCheckbox name="supports_response_schema" label="Response schema" defaultChecked={model.supports_response_schema} />
-                    <ChipCheckbox name="supports_tool_choice" label="Tool choice" defaultChecked={model.supports_tool_choice} />
-                  </ChipGroup>
-                  <ChipGroup label="Routing tags" hint="Hints the auto router matches against request intent. The “vision” tag marks native image support.">
-                    {MODEL_TAGS.map((tag) => (
-                      <ChipCheckbox
-                        key={tag}
-                        name={`tag_${tag}`}
-                        label={tag}
-                        defaultChecked={(model.tags?.includes(tag) ?? false) || (tag === "vision" && model.supports_vision)}
-                      />
-                    ))}
-                  </ChipGroup>
-                  <ChipGroup label="Boons" hint="Gateway capabilities granted that the model lacks natively. Configure in Settings → Boons.">
-                    {MODEL_BOONS.map((boon) => (
-                      <ChipCheckbox
-                        key={boon.value}
-                        name={`boon_${boon.value}`}
-                        label={boon.label}
-                        hint={boon.description}
-                        defaultChecked={model.boons?.includes(boon.value) ?? false}
-                      />
-                    ))}
-                  </ChipGroup>
-                  <ChipGroup label="Tools" hint="Registered MCP servers whose tools this model may use. The gateway injects the tools into plain chat requests and runs the tool loop itself. Enable the loop in Settings → Boons.">
-                    {mcpServers.length === 0 ? (
-                      <p className="text-xs text-muted-foreground">No MCP servers registered. Add one on the MCP page first.</p>
-                    ) : (
-                      mcpServers.map((server) => (
-                        <ChipCheckbox
-                          key={server.id}
-                          name={`tool_server_${server.name}`}
-                          label={server.name}
-                          hint={`Grant this model the tools served by ${server.name} (${server.upstream_url}).`}
-                          defaultChecked={model.tool_servers?.includes(server.name) ?? false}
-                        />
-                      ))
-                    )}
-                  </ChipGroup>
-                </FormSection>
-              ) : (
-                <FormSection title="Status" columns={1}>
-                  <ChipGroup label="Status">
-                    <ChipCheckbox name="enabled" label="Route enabled" defaultChecked={model.enabled} />
-                  </ChipGroup>
-                </FormSection>
-              )}
-            </div>
-          </PanelCard>
-        </form>
+        </TooltipProvider>
       </TabsContent>
 
       <TabsContent value="reliability">
@@ -826,18 +773,13 @@ function ModelDetailPanel({
 
       <TabsContent value="health">
         <div className="grid gap-4 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)]">
-          <form action={setModelHealthConfigAction}>
+          <form action={healthAction}>
             <input type="hidden" name="id" value={model.id} />
             <PanelCard
               className="h-full"
               title="Health config"
               description="Probe cadence, alerting and maintenance."
-              actions={
-                <Button type="submit" size="sm" disabled={pending}>
-                  <Save className="h-3.5 w-3.5" />
-                  Save
-                </Button>
-              }
+              actions={<SaveButton pending={healthPending} idleLabel="Save" />}
             >
               <div className="grid gap-3 p-4">
                 <div className="grid grid-cols-2 gap-3">
@@ -897,7 +839,178 @@ function ModelDetailPanel({
   );
 }
 
+function ConnectionTab({
+  model,
+  editType,
+  setEditType,
+}: {
+  model: ModelRoute;
+  editType: string;
+  setEditType: (value: string) => void;
+}) {
+  const flashSaved = useContext(SaveFlashContext);
+  const [state, formAction, pending] = useActionState(
+    async (prev: ModelActionState | null, formData: FormData) => {
+      const result = await updateModelConnectionAction(prev, formData);
+      if (result.ok) flashSaved();
+      return result;
+    },
+    null,
+  );
+
+  return (
+    <TooltipProvider delayDuration={150}>
+      <form action={formAction}>
+        <input type="hidden" name="id" value={model.id} />
+        <PanelCard
+          title="Connection"
+          description="Where requests are sent and how this route is billed."
+          actions={<SaveButton pending={pending} idleLabel="Save connection" />}
+        >
+          <div className="grid divide-y divide-border/60 lg:grid-cols-2 lg:divide-x lg:divide-y-0">
+            <FormSection title="Upstream" columns={1}>
+              <Field label="Upstream model" name="upstream_model" defaultValue={model.upstream_model} required />
+              <Field label="API base URL" name="api_base" defaultValue={model.api_base} required />
+              <Field label="Upstream API key" name="api_key" placeholder="Leave blank to keep current" />
+              <SelectField
+                label="Model type"
+                name="model_type"
+                value={editType}
+                onChange={setEditType}
+                options={MODEL_TYPE_OPTIONS}
+                hint={modelTypeHint(editType)}
+              />
+              <Field label="Description" name="description" defaultValue={model.description} />
+              <ChipGroup label="Status">
+                <ChipCheckbox name="enabled" label="Route enabled" defaultChecked={model.enabled} />
+              </ChipGroup>
+            </FormSection>
+
+            <FormSection title="Cost" columns={1}>
+              {(editType === "chat" || editType === "embedding") && (
+                <Field label="Input cost / token" name="input_cost_per_token" defaultValue={toPlainDecimal(model.input_cost_per_token)} />
+              )}
+              {editType === "chat" && (
+                <Field label="Output cost / token" name="output_cost_per_token" defaultValue={toPlainDecimal(model.output_cost_per_token)} />
+              )}
+              {editType === "image" && (
+                <Field label="Cost / image" name="cost_per_image" defaultValue={toPlainDecimal(model.cost_per_image)} />
+              )}
+              {editType === "audio_speech" && (
+                <Field label="Cost / character" name="cost_per_character" defaultValue={toPlainDecimal(model.cost_per_character)} />
+              )}
+              {editType === "audio_transcription" && (
+                <Field label="Cost / audio second" name="cost_per_audio_second" defaultValue={toPlainDecimal(model.cost_per_audio_second)} />
+              )}
+            </FormSection>
+          </div>
+          {state?.ok === false && (
+            <p className="border-t border-border/60 bg-destructive/10 px-4 py-2 text-xs text-destructive">{state.error}</p>
+          )}
+        </PanelCard>
+      </form>
+    </TooltipProvider>
+  );
+}
+
+function CapabilitiesTab({
+  model,
+  editType,
+  mcpServers = [],
+}: {
+  model: ModelRoute;
+  editType: string;
+  mcpServers?: McpServer[];
+}) {
+  const flashSaved = useContext(SaveFlashContext);
+  const [state, formAction, pending] = useActionState(
+    async (prev: ModelActionState | null, formData: FormData) => {
+      const result = await updateModelCapabilitiesAction(prev, formData);
+      if (result.ok) flashSaved();
+      return result;
+    },
+    null,
+  );
+
+  if (editType !== "chat" && editType !== "embedding") {
+    return (
+      <PanelCard title="Capabilities" description="Routing capabilities apply to chat and embedding models.">
+        <p className="px-4 py-6 text-xs text-muted-foreground">
+          No routing capabilities for {MODEL_TYPE_LABELS[editType] ?? editType} models.
+        </p>
+      </PanelCard>
+    );
+  }
+
+  return (
+    <TooltipProvider delayDuration={150}>
+      <form action={formAction}>
+        <input type="hidden" name="id" value={model.id} />
+        <PanelCard
+          title="Capabilities & routing"
+          description="What the model supports and how the auto router treats it."
+          actions={<SaveButton pending={pending} idleLabel="Save capabilities" />}
+        >
+          <div className="grid gap-4 p-4">
+            <Field label="Context window" name="context_window" type="number" defaultValue={String(model.context_window)} />
+            {editType === "chat" && (
+              <>
+                <ChipGroup label="Native capabilities" info="What the model natively supports. These gate request features and routing.">
+                  <ChipCheckbox name="supports_function_calling" label="Function calling" defaultChecked={model.supports_function_calling} />
+                  <ChipCheckbox name="supports_system_messages" label="System messages" defaultChecked={model.supports_system_messages} />
+                  <ChipCheckbox name="supports_response_schema" label="Response schema" defaultChecked={model.supports_response_schema} />
+                  <ChipCheckbox name="supports_tool_choice" label="Tool choice" defaultChecked={model.supports_tool_choice} />
+                </ChipGroup>
+                <ChipGroup label="Routing tags" info="Hints the auto router matches against request intent. The “vision” tag marks native image support.">
+                  {MODEL_TAGS.map((tag) => (
+                    <ChipCheckbox
+                      key={tag}
+                      name={`tag_${tag}`}
+                      label={tag}
+                      defaultChecked={(model.tags?.includes(tag) ?? false) || (tag === "vision" && model.supports_vision)}
+                    />
+                  ))}
+                </ChipGroup>
+                <ChipGroup label="Boons" info="Gateway capabilities granted that the model lacks natively. Configure in Settings → Boons.">
+                  {MODEL_BOONS.map((boon) => (
+                    <ChipCheckbox
+                      key={boon.value}
+                      name={`boon_${boon.value}`}
+                      label={boon.label}
+                      hint={boon.description}
+                      defaultChecked={model.boons?.includes(boon.value) ?? false}
+                    />
+                  ))}
+                </ChipGroup>
+                <ChipGroup label="Tools" info="Registered MCP servers whose tools this model may use. The gateway injects the tools into plain chat requests and runs the tool loop itself. Enable the loop in Settings → Boons.">
+                  {mcpServers.length === 0 ? (
+                    <p className="text-xs text-muted-foreground">No MCP servers registered. Add one on the MCP page first.</p>
+                  ) : (
+                    mcpServers.map((server) => (
+                      <ChipCheckbox
+                        key={server.id}
+                        name={`tool_server_${server.name}`}
+                        label={server.name}
+                        hint={`Grant this model the tools served by ${server.name} (${server.upstream_url}).`}
+                        defaultChecked={model.tool_servers?.includes(server.name) ?? false}
+                      />
+                    ))
+                  )}
+                </ChipGroup>
+              </>
+            )}
+          </div>
+          {state?.ok === false && (
+            <p className="border-t border-border/60 bg-destructive/10 px-4 py-2 text-xs text-destructive">{state.error}</p>
+          )}
+        </PanelCard>
+      </form>
+    </TooltipProvider>
+  );
+}
+
 export function ModelCapacityControl({ id, initial }: { id: string; initial: number | null }) {
+  const flashSaved = useContext(SaveFlashContext);
   const [value, setValue] = useState(initial == null ? "" : String(initial));
   const [pending, start] = useTransition();
   useEffect(() => {
@@ -905,6 +1018,12 @@ export function ModelCapacityControl({ id, initial }: { id: string; initial: num
   }, [initial]);
   const next = value.trim() === "" ? null : Math.max(1, Math.round(Number(value)) || 1);
   const changed = next !== initial;
+
+  const apply = () =>
+    start(async () => {
+      await setModelCapacityAction(id, next);
+      flashSaved();
+    });
 
   return (
     <div className="grid w-full grid-cols-[minmax(0,1fr)_auto] gap-2">
@@ -917,9 +1036,7 @@ export function ModelCapacityControl({ id, initial }: { id: string; initial: num
         value={value}
         onChange={(e) => setValue(e.target.value)}
       />
-      <Button type="button" size="sm" variant="secondary" disabled={pending || !changed} onClick={() => start(() => setModelCapacityAction(id, next))}>
-        {pending ? "Saving" : "Apply"}
-      </Button>
+      <SaveButton type="button" onClick={apply} pending={pending} idleLabel="Apply" variant="secondary" disabled={!changed} />
     </div>
   );
 }
@@ -1237,7 +1354,61 @@ export function AutotunePanel({ model }: { model: ModelRoute }) {
   );
 }
 
+// Save/apply button: the label and width stay fixed; only the icon swaps to a
+// spinner while the action runs, and the button is disabled until it completes.
+// Success is signalled on the surrounding model card, not on the button.
+function SaveButton({
+  pending,
+  idleLabel = "Save",
+  size = "sm",
+  variant = "default",
+  disabled,
+  type = "submit",
+  onClick,
+}: {
+  pending: boolean;
+  idleLabel?: string;
+  size?: "sm" | "default";
+  variant?: "default" | "secondary";
+  disabled?: boolean;
+  type?: "submit" | "button";
+  onClick?: () => void;
+}) {
+  return (
+    <Button type={type} onClick={onClick} size={size} variant={variant} disabled={pending || disabled} aria-busy={pending}>
+      {pending ? (
+        <RefreshCw className="h-3.5 w-3.5 animate-spin" aria-hidden />
+      ) : (
+        <Save className="h-3.5 w-3.5" aria-hidden />
+      )}
+      {idleLabel}
+    </Button>
+  );
+}
+
+// Small info affordance that reveals help text on hover. Replaces inline hint
+// paragraphs so labels stay short and scannable.
+function InfoTooltip({ text, side = "top" }: { text: string; side?: "top" | "right" | "bottom" | "left" }) {
+  return (
+    <UiTooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          aria-label="More info"
+          className="text-muted-foreground/70 transition-colors hover:text-foreground"
+        >
+          <Info className="h-3.5 w-3.5" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side={side} align="center" className="max-w-xs leading-relaxed">
+        {text}
+      </TooltipContent>
+    </UiTooltip>
+  );
+}
+
 export function ModelWeightControl({ id, initial }: { id: string; initial: number }) {
+  const flashSaved = useContext(SaveFlashContext);
   const [value, setValue] = useState(String(initial));
   const [pending, start] = useTransition();
   useEffect(() => {
@@ -1245,6 +1416,12 @@ export function ModelWeightControl({ id, initial }: { id: string; initial: numbe
   }, [initial]);
   const next = Math.max(1, Math.round(Number(value)) || 1);
   const changed = next !== initial;
+
+  const apply = () =>
+    start(async () => {
+      await setModelWeightAction(id, next);
+      flashSaved();
+    });
 
   return (
     <div className="grid w-full grid-cols-[minmax(0,1fr)_auto] gap-2">
@@ -1256,9 +1433,7 @@ export function ModelWeightControl({ id, initial }: { id: string; initial: numbe
         value={value}
         onChange={(e) => setValue(e.target.value)}
       />
-      <Button type="button" size="sm" variant="secondary" disabled={pending || !changed} onClick={() => start(() => setModelWeightAction(id, next))}>
-        {pending ? "Saving" : "Apply"}
-      </Button>
+      <SaveButton type="button" onClick={apply} pending={pending} idleLabel="Apply" variant="secondary" disabled={!changed} />
     </div>
   );
 }
@@ -1385,6 +1560,7 @@ function ReliabilityPanel({
   endpoints: ModelEndpoint[];
   pending: boolean;
 }) {
+  const flashSaved = useContext(SaveFlashContext);
   const [busy, start] = useTransition();
   const disabled = pending || busy;
   const addFormRef = useRef<HTMLFormElement>(null);
@@ -1397,7 +1573,10 @@ function ReliabilityPanel({
       retry_backoff_ms: Number(formData.get("retry_backoff_ms") ?? 200),
       endpoint_selection_mode: String(formData.get("endpoint_selection_mode") ?? "failover"),
     };
-    start(() => setModelReliabilityAction(model.id, body));
+    start(async () => {
+      await setModelReliabilityAction(model.id, body);
+      flashSaved();
+    });
   }
 
   function addEndpoint(formData: FormData) {
@@ -1414,12 +1593,7 @@ function ReliabilityPanel({
           className="h-full"
           title="Delivery"
           description="Per-request timeout and retry behaviour."
-          actions={
-            <Button type="submit" size="sm" disabled={disabled}>
-              <Save className="h-3.5 w-3.5" />
-              Save
-            </Button>
-          }
+          actions={<SaveButton pending={busy} idleLabel="Save" disabled={pending} />}
         >
           <div className="grid gap-3 p-4">
             <Field
@@ -1613,11 +1787,15 @@ function FormSection({ title, columns = 2, children }: { title: string; columns?
   );
 }
 
-// A labeled cluster of chip checkboxes.
-function ChipGroup({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+// A labeled cluster of chip checkboxes. `info` renders an info tooltip beside the
+// label; the legacy `hint` still renders inline when provided.
+function ChipGroup({ label, hint, info, children }: { label: string; hint?: string; info?: string; children: ReactNode }) {
   return (
     <div>
-      <p className="text-xs font-medium">{label}</p>
+      <div className="flex items-center gap-1.5">
+        <p className="text-xs font-medium">{label}</p>
+        {info && <InfoTooltip text={info} />}
+      </div>
       {hint && <p className="mt-0.5 max-w-prose text-[11px] leading-snug text-muted-foreground">{hint}</p>}
       <div className="mt-2 flex flex-wrap gap-1.5">{children}</div>
     </div>

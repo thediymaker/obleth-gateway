@@ -530,42 +530,120 @@ export async function deleteModelEndpointAction(
   revalidatePath("/models");
 }
 
-export async function updateModelAction(formData: FormData) {
+// ----------------------------------------------------------------------------
+// Granular model update actions (split-tab UI)
+// ----------------------------------------------------------------------------
+
+export type ModelActionState = { ok: true } | { ok: false; error: string };
+
+// Full replacement body for PUT /models/{id}, built from the current model so a
+// partial edit re-sends every field the gateway expects. `api_key` is omitted
+// on purpose: it is a write-only secret not returned by listModels, and sending
+// null would clear it. Callers spread this and override only their own fields.
+function toModelUpdateBody(model: ModelRoute) {
+  return {
+    upstream_model: model.upstream_model,
+    api_base: model.api_base,
+    model_type: model.model_type,
+    description: model.description,
+    input_cost_per_token: model.input_cost_per_token,
+    output_cost_per_token: model.output_cost_per_token,
+    cost_per_image: model.cost_per_image,
+    cost_per_audio_second: model.cost_per_audio_second,
+    cost_per_character: model.cost_per_character,
+    context_window: model.context_window,
+    admission_weight: model.admission_weight,
+    max_in_flight: model.max_in_flight,
+    supports_function_calling: model.supports_function_calling,
+    supports_system_messages: model.supports_system_messages,
+    supports_response_schema: model.supports_response_schema,
+    supports_tool_choice: model.supports_tool_choice,
+    supports_vision: model.supports_vision,
+    enabled: model.enabled,
+    cache_enabled: model.cache_enabled,
+    cache_ttl_secs: model.cache_ttl_secs,
+    tags: model.tags ?? [],
+    boons: model.boons ?? [],
+    tool_servers: model.tool_servers ?? [],
+  };
+}
+
+// Loads the current model so a granular update can preserve untouched fields.
+async function loadModel(id: string): Promise<ModelRoute | undefined> {
+  const models = await obleth.listModels();
+  return models.find((m) => m.id === id);
+}
+
+// Connection tab: upstream binding, model type, description, enabled, and costs.
+// Preserves capabilities/tags/boons/tools/capacity by spreading the current model.
+export async function updateModelConnectionAction(
+  _prev: ModelActionState | null,
+  formData: FormData,
+): Promise<ModelActionState> {
   await requireSession();
   const id = String(formData.get("id") ?? "");
-  if (!id) return;
-  const parsed = modelCreateSchema.omit({ model_name: true }).safeParse({
-    description: formData.get("description"),
-    upstream_model: formData.get("upstream_model"),
-    api_base: formData.get("api_base"),
-    model_type: formData.get("model_type"),
-    input_cost_per_token: formData.get("input_cost_per_token"),
-    output_cost_per_token: formData.get("output_cost_per_token"),
-    cost_per_image: formData.get("cost_per_image"),
-    cost_per_audio_second: formData.get("cost_per_audio_second"),
-    cost_per_character: formData.get("cost_per_character"),
-    context_window: formData.get("context_window"),
-    admission_weight: formData.get("admission_weight"),
-    supports_function_calling: formData.get("supports_function_calling"),
-    supports_system_messages: formData.get("supports_system_messages"),
-    supports_response_schema: formData.get("supports_response_schema"),
-    supports_tool_choice: formData.get("supports_tool_choice"),
-  });
-  if (!parsed.success) return;
-  const tags = tagsFromForm(formData);
-  await obleth.updateModel(id, {
-    ...parsed.data,
-    api_key: strOrNull(formData.get("api_key")),
-    max_in_flight: numOrNull(formData.get("max_in_flight")),
-    enabled: formData.get("enabled") === "on",
-    supports_vision: tags.includes("vision"),
-    tags,
-    boons: boonsFromForm(formData),
-    tool_servers: toolServersFromForm(formData),
-  });
+  if (!id) return { ok: false, error: "Missing model id." };
+  const current = await loadModel(id);
+  if (!current) return { ok: false, error: "Model not found." };
+
+  const newKey = strOrNull(formData.get("api_key")); // only sent when non-empty
+  try {
+    await obleth.updateModel(id, {
+      ...toModelUpdateBody(current),
+      upstream_model: String(formData.get("upstream_model") ?? current.upstream_model),
+      api_base: String(formData.get("api_base") ?? current.api_base),
+      model_type: String(formData.get("model_type") ?? current.model_type),
+      description: String(formData.get("description") ?? ""),
+      enabled: formData.get("enabled") === "on",
+      input_cost_per_token: numOr(formData.get("input_cost_per_token"), current.input_cost_per_token),
+      output_cost_per_token: numOr(formData.get("output_cost_per_token"), current.output_cost_per_token),
+      cost_per_image: numOr(formData.get("cost_per_image"), current.cost_per_image),
+      cost_per_character: numOr(formData.get("cost_per_character"), current.cost_per_character),
+      cost_per_audio_second: numOr(formData.get("cost_per_audio_second"), current.cost_per_audio_second),
+      ...(newKey ? { api_key: newKey } : {}),
+    });
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Save failed." };
+  }
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
+  return { ok: true };
+}
+
+// Capabilities tab: native capabilities, context window, routing tags, boons,
+// tools. Preserves connection/cost fields by spreading the current model.
+export async function updateModelCapabilitiesAction(
+  _prev: ModelActionState | null,
+  formData: FormData,
+): Promise<ModelActionState> {
+  await requireSession();
+  const id = String(formData.get("id") ?? "");
+  if (!id) return { ok: false, error: "Missing model id." };
+  const current = await loadModel(id);
+  if (!current) return { ok: false, error: "Model not found." };
+
+  const tags = tagsFromForm(formData);
+  try {
+    await obleth.updateModel(id, {
+      ...toModelUpdateBody(current),
+      context_window: numOr(formData.get("context_window"), current.context_window),
+      supports_function_calling: formData.get("supports_function_calling") === "on",
+      supports_system_messages: formData.get("supports_system_messages") === "on",
+      supports_response_schema: formData.get("supports_response_schema") === "on",
+      supports_tool_choice: formData.get("supports_tool_choice") === "on",
+      supports_vision: tags.includes("vision"),
+      tags,
+      boons: boonsFromForm(formData),
+      tool_servers: toolServersFromForm(formData),
+    });
+  } catch (e) {
+    return { ok: false, error: e instanceof Error ? e.message : "Save failed." };
+  }
+  updateTag(CACHE_TAGS.models);
+  revalidatePath("/models");
+  revalidatePath("/fairshare");
+  return { ok: true };
 }
 
 export async function checkModelHealthAction(id: string) {
