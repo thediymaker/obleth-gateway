@@ -1,11 +1,12 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { Bell, Route, Database, Info } from "lucide-react";
+import { Bell, Route, Database, Info, Server } from "lucide-react";
 import {
   AlertSettingsForm,
   AutoRouterSettingsForm,
   BoonsSettingsForm,
+  SlurmSettingsForm,
   UsageRetentionForm,
 } from "@/components/settings-form";
 import { BackupRestore } from "@/components/backup-restore";
@@ -15,6 +16,7 @@ import type {
   AutoRouterSettingsView,
   BoonSettingsView,
   ModelRoute,
+  SlurmSettingsView,
   UsageRetentionView,
 } from "@/lib/obleth";
 
@@ -24,6 +26,7 @@ export function SettingsTabs({
   boons,
   models,
   retention,
+  slurm,
   versionCard,
 }: {
   alertSettings: AlertSettingsView | null;
@@ -31,6 +34,7 @@ export function SettingsTabs({
   boons: BoonSettingsView | null;
   models: ModelRoute[];
   retention: UsageRetentionView | null;
+  slurm: SlurmSettingsView | null;
   versionCard: ReactNode;
 }) {
   return (
@@ -47,6 +51,10 @@ export function SettingsTabs({
         <TabsTrigger value="data">
           <Database className="h-3.5 w-3.5" />
           Data
+        </TabsTrigger>
+        <TabsTrigger value="slurm">
+          <Server className="h-3.5 w-3.5" />
+          Slurm
         </TabsTrigger>
         <TabsTrigger value="about">
           <Info className="h-3.5 w-3.5" />
@@ -70,6 +78,10 @@ export function SettingsTabs({
           <UsageRetentionForm retention={retention} />
           <BackupRestore />
         </div>
+      </TabsContent>
+
+      <TabsContent value="slurm">
+        <SlurmSettingsForm settings={slurm} />
       </TabsContent>
 
       <TabsContent value="about">{versionCard}</TabsContent>

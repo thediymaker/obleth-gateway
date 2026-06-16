@@ -6,9 +6,9 @@
 
 use chrono::{DateTime, Utc};
 use obleth_config::{
-    generate_api_key, ApiKey, FairshareGroup, McpServer, ModelEndpoint, ModelHealthCheck,
-    ModelHealthDetail, ModelHealthSummary, ModelRoute, ResolvedEndpoint, ResolvedKey,
-    ResolvedMcpServer, ResolvedModel, Tenant, WeeklyWindow,
+    generate_api_key, ApiKey, FairshareGroup, ManagedModelSpec, McpServer, ModelEndpoint,
+    ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelReplica, ModelRoute,
+    ResolvedEndpoint, ResolvedKey, ResolvedMcpServer, ResolvedModel, Tenant, WeeklyWindow,
 };
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
@@ -51,6 +51,28 @@ const SCHEMA: &str = include_str!("../../../../schema/postgres/0001_init.sql");
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
 const MIGRATE_LOCK_KEY: i64 = 0x0B1E_7480_0001;
+
+/// Input for `upsert_managed_model` (no timestamps; the DB sets them).
+pub struct UpsertManagedModel {
+    pub model_id: Uuid,
+    pub enabled: bool,
+    pub partition: String,
+    pub gres: String,
+    pub nodes: i64,
+    pub constraints: Option<String>,
+    pub exclude: Option<String>,
+    pub account: Option<String>,
+    pub qos: Option<String>,
+    pub time_limit: Option<String>,
+    pub image: String,
+    pub preamble: String,
+    pub log_output_dir: String,
+    pub launch_command: String,
+    pub serving_port: i64,
+    pub health_path: String,
+    pub target_replicas: i64,
+    pub max_job_failures: i64,
+}
 
 #[derive(Clone)]
 pub struct Store {
@@ -391,18 +413,35 @@ impl Store {
     // ---- api keys --------------------------------------------------------
 
     /// Create a key. Returns the stored metadata plus the one-time raw secret.
-    pub async fn create_api_key(&self, tenant_id: Uuid, name: &str) -> Result<(ApiKey, String)> {
+    pub async fn create_api_key(
+        &self,
+        tenant_id: Uuid,
+        name: &str,
+        description: &str,
+        budget_tokens: Option<i64>,
+        budget_cost_usd: Option<f64>,
+        budget_period: Option<&str>,
+        budget_started_at: Option<DateTime<Utc>>,
+    ) -> Result<(ApiKey, String)> {
         let gen = generate_api_key();
         let row = sqlx::query(
-            "insert into api_keys (id, tenant_id, name, key_prefix, key_hash)
-             values ($1, $2, $3, $4, $5)
-             returning id, tenant_id, name, key_prefix, disabled, created_at",
+            "insert into api_keys (id, tenant_id, name, description, key_prefix, key_hash,
+                    budget_tokens, budget_cost_usd, budget_period, budget_started_at)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+             returning id, tenant_id, name, description, key_prefix,
+                    budget_tokens, budget_cost_usd, budget_period, budget_started_at,
+                    disabled, created_at, updated_at",
         )
         .bind(Uuid::new_v4())
         .bind(tenant_id)
         .bind(name)
+        .bind(description)
         .bind(&gen.prefix)
         .bind(&gen.hash)
+        .bind(budget_tokens)
+        .bind(budget_cost_usd)
+        .bind(budget_period)
+        .bind(budget_started_at)
         .fetch_one(&self.pool)
         .await?;
         Ok((api_key_from_row(&row)?, gen.secret))
@@ -412,7 +451,9 @@ impl Store {
         let rows = match tenant_id {
             Some(t) => {
                 sqlx::query(
-                    "select id, tenant_id, name, key_prefix, disabled, created_at
+                    "select id, tenant_id, name, description, key_prefix,
+                            budget_tokens, budget_cost_usd, budget_period, budget_started_at,
+                            disabled, created_at, updated_at
                      from api_keys where tenant_id = $1 order by created_at",
                 )
                 .bind(t)
@@ -421,7 +462,9 @@ impl Store {
             }
             None => {
                 sqlx::query(
-                    "select id, tenant_id, name, key_prefix, disabled, created_at
+                    "select id, tenant_id, name, description, key_prefix,
+                            budget_tokens, budget_cost_usd, budget_period, budget_started_at,
+                            disabled, created_at, updated_at
                      from api_keys order by created_at",
                 )
                 .fetch_all(&self.pool)
@@ -439,7 +482,9 @@ impl Store {
             return Ok(Vec::new());
         }
         let rows = sqlx::query(
-            "select id, tenant_id, name, key_prefix, disabled, created_at
+            "select id, tenant_id, name, description, key_prefix,
+                    budget_tokens, budget_cost_usd, budget_period, budget_started_at,
+                    disabled, created_at, updated_at
              from api_keys where id = any($1)",
         )
         .bind(ids)
@@ -448,12 +493,57 @@ impl Store {
         rows.iter().map(api_key_from_row).collect()
     }
 
+    pub async fn update_api_key(
+        &self,
+        id: Uuid,
+        name: &str,
+        description: &str,
+        budget_tokens: Option<i64>,
+        budget_cost_usd: Option<f64>,
+        budget_period: Option<&str>,
+        budget_started_at: Option<DateTime<Utc>>,
+    ) -> Result<(String, ApiKey, ResolvedKey)> {
+        let row = sqlx::query(
+            "update api_keys
+             set name = $2,
+                 description = $3,
+                 budget_tokens = $4,
+                 budget_cost_usd = $5,
+                 budget_period = $6,
+                 budget_started_at = $7,
+                 updated_at = now()
+             where id = $1
+             returning key_hash, id, tenant_id, name, description, key_prefix,
+                    budget_tokens, budget_cost_usd, budget_period, budget_started_at,
+                    disabled, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(name)
+        .bind(description)
+        .bind(budget_tokens)
+        .bind(budget_cost_usd)
+        .bind(budget_period)
+        .bind(budget_started_at)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        let hash: String = row.try_get("key_hash")?;
+        let key = api_key_from_row(&row)?;
+        let resolved = self
+            .resolved_key_by_hash(&hash)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        Ok((hash, key, resolved))
+    }
+
     pub async fn set_key_disabled(
         &self,
         id: Uuid,
         disabled: bool,
     ) -> Result<(String, ResolvedKey)> {
-        let row = sqlx::query("update api_keys set disabled = $2 where id = $1 returning key_hash")
+        let row = sqlx::query(
+            "update api_keys set disabled = $2, updated_at = now() where id = $1 returning key_hash",
+        )
             .bind(id)
             .bind(disabled)
             .fetch_optional(&self.pool)
@@ -483,7 +573,12 @@ impl Store {
                     t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
                     t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
                     t.timezone, t.active_from, t.active_until, t.weekly_windows,
-                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at, t.allowed_models
+                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at,
+                    k.budget_tokens as key_budget_tokens,
+                    k.budget_cost_usd as key_budget_cost_usd,
+                    k.budget_period as key_budget_period,
+                    k.budget_started_at as key_budget_started_at,
+                    t.allowed_models
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group
@@ -502,7 +597,12 @@ impl Store {
                     t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
                     t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
                     t.timezone, t.active_from, t.active_until, t.weekly_windows,
-                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at, t.allowed_models
+                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at,
+                    k.budget_tokens as key_budget_tokens,
+                    k.budget_cost_usd as key_budget_cost_usd,
+                    k.budget_period as key_budget_period,
+                    k.budget_started_at as key_budget_started_at,
+                    t.allowed_models
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group",
@@ -525,7 +625,12 @@ impl Store {
                     t.name as tenant_name, t.fairshare_group, g.weight as group_weight,
                     t.weight, t.tokens_per_minute, t.max_in_flight, t.status,
                     t.timezone, t.active_from, t.active_until, t.weekly_windows,
-                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at, t.allowed_models
+                    t.budget_tokens, t.budget_cost_usd, t.budget_period, t.budget_started_at,
+                    k.budget_tokens as key_budget_tokens,
+                    k.budget_cost_usd as key_budget_cost_usd,
+                    k.budget_period as key_budget_period,
+                    k.budget_started_at as key_budget_started_at,
+                    t.allowed_models
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group
@@ -1224,6 +1329,196 @@ impl Store {
         Ok(row.try_get("model_id")?)
     }
 
+    // ---- managed_models (Slurm provisioning specs) -----------------------
+
+    pub async fn get_managed_model(&self, model_id: Uuid) -> Result<Option<ManagedModelSpec>> {
+        let row = sqlx::query(
+            "select model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
+             qos, time_limit, image, preamble, log_output_dir, launch_command, serving_port, \
+             health_path, target_replicas, max_job_failures, created_at, updated_at \
+             from managed_models where model_id = $1",
+        )
+        .bind(model_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(managed_model_from_row).transpose()
+    }
+
+    pub async fn list_managed_models(&self) -> Result<Vec<ManagedModelSpec>> {
+        let rows = sqlx::query(
+            "select model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
+             qos, time_limit, image, preamble, log_output_dir, launch_command, serving_port, \
+             health_path, target_replicas, max_job_failures, created_at, updated_at \
+             from managed_models order by model_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(managed_model_from_row).collect()
+    }
+
+    pub async fn upsert_managed_model(&self, m: UpsertManagedModel) -> Result<ManagedModelSpec> {
+        let row = sqlx::query(
+            "insert into managed_models
+                (model_id, enabled, partition, gres, nodes, constraints, exclude,
+                 account, qos, time_limit, image, preamble, log_output_dir, launch_command,
+                 serving_port, health_path, target_replicas, max_job_failures)
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+             on conflict (model_id) do update set
+                enabled = excluded.enabled, partition = excluded.partition,
+                gres = excluded.gres, nodes = excluded.nodes,
+                constraints = excluded.constraints, exclude = excluded.exclude,
+                account = excluded.account, qos = excluded.qos,
+                time_limit = excluded.time_limit, image = excluded.image,
+                preamble = excluded.preamble, log_output_dir = excluded.log_output_dir,
+                launch_command = excluded.launch_command,
+                serving_port = excluded.serving_port, health_path = excluded.health_path,
+                target_replicas = excluded.target_replicas,
+                max_job_failures = excluded.max_job_failures, updated_at = now()
+             returning model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
+             qos, time_limit, image, preamble, log_output_dir, launch_command, serving_port, \
+             health_path, target_replicas, max_job_failures, created_at, updated_at",
+        )
+        .bind(m.model_id)
+        .bind(m.enabled)
+        .bind(&m.partition)
+        .bind(&m.gres)
+        .bind(m.nodes.max(1))
+        .bind(&m.constraints)
+        .bind(&m.exclude)
+        .bind(&m.account)
+        .bind(&m.qos)
+        .bind(&m.time_limit)
+        .bind(&m.image)
+        .bind(&m.preamble)
+        .bind(&m.log_output_dir)
+        .bind(&m.launch_command)
+        .bind(m.serving_port)
+        .bind(&m.health_path)
+        .bind(m.target_replicas.max(1))
+        .bind(m.max_job_failures.max(0))
+        .fetch_one(&self.pool)
+        .await?;
+        managed_model_from_row(&row)
+    }
+
+    pub async fn delete_managed_model(&self, model_id: Uuid) -> Result<()> {
+        sqlx::query("delete from managed_models where model_id = $1")
+            .bind(model_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn create_replica(&self, model_id: Uuid, slurm_job_id: &str) -> Result<ModelReplica> {
+        // Idempotent: a retried insert for the same (model_id, slurm_job_id)
+        // returns the existing row instead of erroring on the unique index.
+        let row = sqlx::query(
+            "insert into model_replicas (id, model_id, slurm_job_id)
+             values ($1, $2, $3)
+             on conflict (model_id, slurm_job_id) do update set updated_at = now()
+             returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
+                       last_message, created_at, updated_at",
+        )
+        .bind(Uuid::new_v4())
+        .bind(model_id)
+        .bind(slurm_job_id)
+        .fetch_one(&self.pool)
+        .await?;
+        replica_from_row(&row)
+    }
+
+    pub async fn list_replicas(&self, model_id: Uuid) -> Result<Vec<ModelReplica>> {
+        let rows = sqlx::query(
+            "select id, model_id, slurm_job_id, nodes, endpoint_id, state,
+                    last_message, created_at, updated_at
+             from model_replicas where model_id = $1 order by created_at",
+        )
+        .bind(model_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(replica_from_row).collect()
+    }
+
+    pub async fn all_replicas(&self) -> Result<Vec<ModelReplica>> {
+        let rows = sqlx::query(
+            "select id, model_id, slurm_job_id, nodes, endpoint_id, state,
+                    last_message, created_at, updated_at
+             from model_replicas order by model_id, created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(replica_from_row).collect()
+    }
+
+    pub async fn update_replica_state(
+        &self,
+        id: Uuid,
+        state: &str,
+        message: Option<&str>,
+    ) -> Result<ModelReplica> {
+        let row = sqlx::query(
+            "update model_replicas set state = $2, last_message = $3, updated_at = now()
+             where id = $1
+             returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
+                       last_message, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(state)
+        .bind(message)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        replica_from_row(&row)
+    }
+
+    /// Set the allocated nodes and/or linked endpoint for a replica.
+    ///
+    /// A `None` argument keeps the current column value instead of overwriting
+    /// it with NULL (COALESCE semantics). Pass `Some(value)` to update a field,
+    /// `None` to leave it unchanged.
+    pub async fn set_replica_runtime(
+        &self,
+        id: Uuid,
+        nodes: Option<&str>,
+        endpoint_id: Option<Uuid>,
+    ) -> Result<ModelReplica> {
+        let row = sqlx::query(
+            "update model_replicas set nodes = coalesce($2, nodes),
+                    endpoint_id = coalesce($3, endpoint_id), updated_at = now()
+             where id = $1
+             returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
+                       last_message, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(nodes)
+        .bind(endpoint_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        replica_from_row(&row)
+    }
+
+    /// Fetch a single replica by id. Returns `None` if no row exists.
+    pub async fn get_replica(&self, id: Uuid) -> Result<Option<ModelReplica>> {
+        let row = sqlx::query(
+            "select id, model_id, slurm_job_id, nodes, endpoint_id, state,
+                    last_message, created_at, updated_at
+             from model_replicas where id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(replica_from_row).transpose()
+    }
+
+    pub async fn delete_replica(&self, id: Uuid) -> Result<()> {
+        sqlx::query("delete from model_replicas where id = $1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Record the outcome of a per-endpoint health check. Mirrors
     /// `record_model_health_check`: `healthy`/`disabled` reset the failure
     /// counter; `degraded`/`skipped` are transient (left untouched); anything
@@ -1778,6 +2073,45 @@ impl Store {
         .await?;
         Ok(())
     }
+
+    /// Load the system-wide Slurm settings, or `None` if never configured. The
+    /// stored JWT is decrypted transparently (legacy/empty values pass through).
+    pub async fn get_slurm_settings(&self) -> Result<Option<obleth_config::SlurmSettings>> {
+        let row = sqlx::query("select value from app_settings where key = 'slurm'")
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => {
+                let value: sqlx::types::Json<obleth_config::SlurmSettings> =
+                    row.try_get("value")?;
+                let mut settings = value.0;
+                if !settings.slurm_jwt.is_empty() {
+                    settings.slurm_jwt = cipher().decrypt(&settings.slurm_jwt)?;
+                }
+                Ok(Some(settings))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the system-wide Slurm settings (upsert on the single `slurm`
+    /// key). The JWT is encrypted at rest with the same envelope cipher used for
+    /// upstream provider keys before it is written.
+    pub async fn put_slurm_settings(&self, settings: &obleth_config::SlurmSettings) -> Result<()> {
+        let mut to_store = settings.clone();
+        if !to_store.slurm_jwt.is_empty() {
+            to_store.slurm_jwt = cipher().encrypt(&to_store.slurm_jwt);
+        }
+        sqlx::query(
+            "insert into app_settings (key, value, updated_at)
+             values ('slurm', $1, now())
+             on conflict (key) do update set value = excluded.value, updated_at = now()",
+        )
+        .bind(sqlx::types::Json(&to_store))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// A single audit-log entry.
@@ -1875,9 +2209,15 @@ fn api_key_from_row(row: &PgRow) -> Result<ApiKey> {
         id: row.try_get("id")?,
         tenant_id: row.try_get("tenant_id")?,
         name: row.try_get("name")?,
+        description: row.try_get("description")?,
         key_prefix: row.try_get("key_prefix")?,
+        budget_tokens: row.try_get("budget_tokens")?,
+        budget_cost_usd: row.try_get("budget_cost_usd")?,
+        budget_period: row.try_get("budget_period")?,
+        budget_started_at: row.try_get("budget_started_at")?,
         disabled: row.try_get("disabled")?,
         created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
     })
 }
 
@@ -1901,6 +2241,10 @@ fn resolved_from_row(row: &PgRow) -> Result<ResolvedKey> {
         budget_cost_usd: row.try_get("budget_cost_usd")?,
         budget_period: row.try_get("budget_period")?,
         budget_started_at: row.try_get("budget_started_at")?,
+        key_budget_tokens: row.try_get("key_budget_tokens")?,
+        key_budget_cost_usd: row.try_get("key_budget_cost_usd")?,
+        key_budget_period: row.try_get("key_budget_period")?,
+        key_budget_started_at: row.try_get("key_budget_started_at")?,
         allowed_models: allowed_models_from_row(row)?,
         internal: false,
     })
@@ -2017,6 +2361,45 @@ fn resolved_endpoint_from_row(row: &PgRow) -> Result<ResolvedEndpoint> {
     })
 }
 
+fn managed_model_from_row(row: &PgRow) -> Result<ManagedModelSpec> {
+    Ok(ManagedModelSpec {
+        model_id: row.try_get("model_id")?,
+        enabled: row.try_get("enabled")?,
+        partition: row.try_get("partition")?,
+        gres: row.try_get("gres")?,
+        nodes: row.try_get("nodes")?,
+        constraints: row.try_get("constraints")?,
+        exclude: row.try_get("exclude")?,
+        account: row.try_get("account")?,
+        qos: row.try_get("qos")?,
+        time_limit: row.try_get("time_limit")?,
+        image: row.try_get("image")?,
+        preamble: row.try_get("preamble")?,
+        log_output_dir: row.try_get("log_output_dir")?,
+        launch_command: row.try_get("launch_command")?,
+        serving_port: row.try_get("serving_port")?,
+        health_path: row.try_get("health_path")?,
+        target_replicas: row.try_get("target_replicas")?,
+        max_job_failures: row.try_get("max_job_failures")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
+fn replica_from_row(row: &PgRow) -> Result<ModelReplica> {
+    Ok(ModelReplica {
+        id: row.try_get("id")?,
+        model_id: row.try_get("model_id")?,
+        slurm_job_id: row.try_get("slurm_job_id")?,
+        nodes: row.try_get("nodes")?,
+        endpoint_id: row.try_get("endpoint_id")?,
+        state: row.try_get("state")?,
+        last_message: row.try_get("last_message")?,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 fn endpoint_from_row(row: &PgRow) -> Result<ModelEndpoint> {
     Ok(ModelEndpoint {
         id: row.try_get("id")?,
@@ -2106,7 +2489,7 @@ mod tests {
         assert_eq!(tenant.weight, 250);
 
         let (key, secret) = store
-            .create_api_key(tenant.id, "k")
+            .create_api_key(tenant.id, "k", "", None, None, None, None)
             .await
             .expect("create key");
         let hash = hash_api_key(&secret);
@@ -2286,5 +2669,261 @@ mod tests {
             store.delete_tenant(tenant.id).await,
             Err(StoreError::NotFound)
         ));
+    }
+
+    fn default_test_model(
+        name: &str,
+    ) -> (
+        &str,
+        &str,
+        &str,
+        &str,
+        Option<&str>,
+        &str,
+        f64,
+        f64,
+        f64,
+        f64,
+        f64,
+        i64,
+        i64,
+        Option<i64>,
+        bool,
+        bool,
+        bool,
+        bool,
+        bool,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+    ) {
+        (
+            name,
+            "integration test model",
+            "upstream-model",
+            "http://127.0.0.1:8081",
+            None,
+            "chat",
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            8192,
+            100,
+            None,
+            false,
+            true,
+            false,
+            false,
+            false,
+            vec![],
+            vec![],
+            vec![],
+        )
+    }
+
+    #[tokio::test]
+    async fn managed_model_roundtrip() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        // a model is required (FK). Reuse create_model with minimal args.
+        let model_name = format!("m-{}", Uuid::new_v4());
+        let args = default_test_model(&model_name);
+        let model = store
+            .create_model(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
+                &args.19, &args.20, &args.21,
+            )
+            .await
+            .expect("create model");
+
+        assert!(store
+            .get_managed_model(model.id)
+            .await
+            .expect("get")
+            .is_none());
+
+        let spec = store
+            .upsert_managed_model(UpsertManagedModel {
+                model_id: model.id,
+                enabled: true,
+                partition: "gpu-preempt".into(),
+                gres: "gpu:h100:2".into(),
+                nodes: 1,
+                constraints: None,
+                exclude: None,
+                account: None,
+                qos: None,
+                time_limit: Some("12:00:00".into()),
+                image: "vllm.sif".into(),
+                preamble: String::new(),
+                log_output_dir: String::new(),
+                launch_command: "vllm serve nemotron".into(),
+                serving_port: 8000,
+                health_path: "/health".into(),
+                target_replicas: 2,
+                max_job_failures: 0,
+            })
+            .await
+            .expect("upsert");
+        assert_eq!(spec.target_replicas, 2);
+        assert_eq!(spec.partition, "gpu-preempt");
+
+        let listed = store.list_managed_models().await.expect("list");
+        assert_eq!(listed.len(), 1);
+
+        store.delete_managed_model(model.id).await.expect("delete");
+        assert!(store
+            .get_managed_model(model.id)
+            .await
+            .expect("get")
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn model_replica_roundtrip() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        let model_name = format!("m-{}", Uuid::new_v4());
+        let args = default_test_model(&model_name);
+        let model = store
+            .create_model(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
+                &args.19, &args.20, &args.21,
+            )
+            .await
+            .expect("create model");
+
+        let r = store
+            .create_replica(model.id, "job-123")
+            .await
+            .expect("create replica");
+        assert_eq!(r.state, "pending");
+        assert_eq!(r.slurm_job_id, "job-123");
+
+        // Idempotent: re-creating the same (model_id, slurm_job_id) returns the
+        // same row rather than spawning a duplicate.
+        let again = store
+            .create_replica(model.id, "job-123")
+            .await
+            .expect("create replica again");
+        assert_eq!(again.id, r.id, "duplicate create must return the same row");
+        assert_eq!(
+            store.list_replicas(model.id).await.expect("list").len(),
+            1,
+            "no duplicate replica row"
+        );
+
+        let promoted = store
+            .update_replica_state(r.id, "starting", Some("node alloc"))
+            .await
+            .expect("update state");
+        assert_eq!(promoted.state, "starting");
+
+        store
+            .set_replica_runtime(r.id, Some("gpu-node-7"), None)
+            .await
+            .expect("set runtime");
+
+        let mine = store.list_replicas(model.id).await.expect("list");
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].nodes.as_deref(), Some("gpu-node-7"));
+
+        let all = store.all_replicas().await.expect("all");
+        assert!(all.iter().any(|x| x.id == r.id));
+
+        // keep-semantics: patching only endpoint must NOT wipe nodes (and vice versa)
+        store
+            .set_replica_runtime(r.id, None, None)
+            .await
+            .expect("noop runtime");
+        let after = store.list_replicas(model.id).await.expect("list2");
+        assert_eq!(
+            after[0].nodes.as_deref(),
+            Some("gpu-node-7"),
+            "nodes must be preserved"
+        );
+
+        // get_replica returns the row
+        let got = store
+            .get_replica(r.id)
+            .await
+            .expect("get_replica")
+            .expect("present");
+        assert_eq!(got.id, r.id);
+
+        store.delete_replica(r.id).await.expect("delete");
+        assert!(store
+            .list_replicas(model.id)
+            .await
+            .expect("list")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn slurm_settings_roundtrip() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        let settings = obleth_config::SlurmSettings {
+            enabled: true,
+            slurmrestd_url: "http://slurm:6820".into(),
+            slurmrestd_api_version: "v0.0.40".into(),
+            slurm_user: "obleth".into(),
+            slurm_jwt: "header.payload.sig-secret".into(),
+        };
+        store.put_slurm_settings(&settings).await.expect("put");
+
+        // get round-trips the JWT back to plaintext
+        let got = store
+            .get_slurm_settings()
+            .await
+            .expect("get")
+            .expect("present");
+        assert!(got.enabled);
+        assert_eq!(got.slurmrestd_url, settings.slurmrestd_url);
+        assert_eq!(got.slurm_user, settings.slurm_user);
+        assert_eq!(got.slurm_jwt, settings.slurm_jwt);
+
+        // the JWT must be ciphertext at rest whenever a cipher is configured
+        let raw: sqlx::types::Json<serde_json::Value> =
+            sqlx::query("select value from app_settings where key = 'slurm'")
+                .fetch_one(&store.pool)
+                .await
+                .expect("raw")
+                .try_get("value")
+                .expect("col");
+        let stored_jwt = raw
+            .0
+            .get("slurm_jwt")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let cipher_on = std::env::var("OBLETH_ENCRYPTION_KEY")
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false);
+        if cipher_on {
+            assert!(
+                stored_jwt.starts_with("enc:v1:"),
+                "jwt must be encrypted at rest, got {stored_jwt}"
+            );
+            assert_ne!(stored_jwt, settings.slurm_jwt);
+        }
     }
 }

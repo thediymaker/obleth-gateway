@@ -1,12 +1,14 @@
 "use client";
 
 import { useState, useTransition } from "react";
-import { Send, Database, Trash2 } from "lucide-react";
+import { Send, Database, Trash2, Server } from "lucide-react";
 import {
   setAlertSettingsAction,
   setAutoRouterSettingsAction,
   setBoonSettingsAction,
   testAlertAction,
+  setSlurmSettingsAction,
+  testSlurmConnectionAction,
   setUsageRetentionAction,
   compactUsageAction,
 } from "@/app/actions";
@@ -20,9 +22,12 @@ import type {
   AutoRouterSettingsView,
   BoonSettingsView,
   ModelRoute,
+  SlurmHealthView,
+  SlurmSettingsView,
   UpdateAlertSettings,
   UpdateAutoRouterSettings,
   UpdateBoonSettings,
+  UpdateSlurmSettings,
   UsageRetentionView,
 } from "@/lib/obleth";
 
@@ -704,6 +709,193 @@ export function BoonsSettingsForm({
           >
             {status.message}
           </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+export function SlurmSettingsForm({ settings }: { settings: SlurmSettingsView | null }) {
+  const [pending, start] = useTransition();
+  const [testing, startTest] = useTransition();
+  const [status, setStatus] = useState<{ ok: boolean; message: string } | null>(null);
+  const [health, setHealth] = useState<SlurmHealthView | null>(null);
+
+  const [enabled, setEnabled] = useState(settings?.enabled ?? false);
+  const [url, setUrl] = useState(settings?.slurmrestd_url ?? "");
+  const [version, setVersion] = useState(settings?.slurmrestd_api_version ?? "v0.0.40");
+  const [user, setUser] = useState(settings?.slurm_user ?? "");
+  const jwtSet = settings?.jwt_set ?? false;
+  const jwtLast4 = settings?.jwt_last4 ?? null;
+  const [jwt, setJwt] = useState("");
+
+  function save() {
+    setStatus(null);
+    setHealth(null);
+    const body: UpdateSlurmSettings = {
+      enabled,
+      slurmrestd_url: url.trim(),
+      slurmrestd_api_version: version.trim() || "v0.0.40",
+      slurm_user: user.trim(),
+    };
+    if (jwt.trim()) body.slurm_jwt = jwt.trim();
+    start(async () => {
+      const result = await setSlurmSettingsAction(body);
+      if (result.ok) {
+        setStatus({ ok: true, message: "Slurm settings saved." });
+        setJwt("");
+      } else {
+        setStatus({ ok: false, message: result.error });
+      }
+    });
+  }
+
+  function test() {
+    setStatus(null);
+    setHealth(null);
+    startTest(async () => {
+      const result = await testSlurmConnectionAction();
+      if (result.ok) {
+        setHealth(result.health ?? null);
+      } else {
+        setStatus({ ok: false, message: result.error });
+      }
+    });
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Server className="h-4 w-4" />
+          Slurm provisioning
+        </CardTitle>
+        <CardDescription>
+          Connection details for the optional <strong>obleth-provisioner</strong> plugin, which
+          keeps Slurm-hosted models alive on a preemptible cluster via <code>slurmrestd</code>.
+          When enabled, models created with a <strong>Slurm</strong> endpoint are provisioned
+          automatically. The JWT is stored encrypted at rest and never shown again after saving.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
+            className="h-4 w-4 rounded border-border"
+          />
+          Enable Slurm provisioning
+        </label>
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label htmlFor="slurmrestd_url">slurmrestd URL</Label>
+            <Input
+              id="slurmrestd_url"
+              type="url"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="http://slurm:6820"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="slurmrestd_api_version">API version</Label>
+            <Input
+              id="slurmrestd_api_version"
+              value={version}
+              onChange={(e) => setVersion(e.target.value)}
+              placeholder="v0.0.40"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="slurm_user">Slurm user</Label>
+            <Input
+              id="slurm_user"
+              value={user}
+              onChange={(e) => setUser(e.target.value)}
+              placeholder="obleth"
+              autoComplete="off"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="slurm_jwt">Slurm JWT</Label>
+            <Input
+              id="slurm_jwt"
+              type="password"
+              value={jwt}
+              onChange={(e) => setJwt(e.target.value)}
+              placeholder={
+                jwtSet
+                  ? `•••• ${jwtLast4 ?? ""} (configured — leave blank to keep)`
+                  : "paste the slurmrestd JWT"
+              }
+              autoComplete="new-password"
+            />
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3">
+          <Button onClick={save} disabled={pending}>
+            {pending ? "Saving…" : "Save settings"}
+          </Button>
+          <Button variant="outline" onClick={test} disabled={testing}>
+            <Send className="mr-2 h-4 w-4" />
+            {testing ? "Testing…" : "Test connection"}
+          </Button>
+          <span className="text-xs text-muted-foreground">
+            Test uses the saved settings — save first if you just made changes.
+          </span>
+        </div>
+
+        {status && (
+          <p
+            className={
+              status.ok
+                ? "rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
+                : "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            }
+          >
+            {status.message}
+          </p>
+        )}
+
+        {health && (
+          <div className="space-y-2 rounded-md border border-border bg-muted/30 p-3 text-sm">
+            <div className="flex items-start gap-2">
+              <span
+                className={
+                  health.ping.ok
+                    ? "mt-0.5 inline-block h-2 w-2 shrink-0 rounded-full bg-emerald-500"
+                    : "mt-0.5 inline-block h-2 w-2 shrink-0 rounded-full bg-destructive"
+                }
+              />
+              <span className="font-medium">slurmrestd ping:</span>
+              <span className="text-muted-foreground">
+                {health.ping.ok
+                  ? `OK (${health.ping.status_code}, ${health.ping.latency_ms}ms)`
+                  : health.ping.error ?? `failed (${health.ping.status_code ?? "no response"})`}
+              </span>
+            </div>
+            <div className="flex items-start gap-2">
+              <span
+                className={
+                  health.jwt.set && !health.jwt.expired
+                    ? "mt-0.5 inline-block h-2 w-2 shrink-0 rounded-full bg-emerald-500"
+                    : "mt-0.5 inline-block h-2 w-2 shrink-0 rounded-full bg-destructive"
+                }
+              />
+              <span className="font-medium">JWT:</span>
+              <span className="text-muted-foreground">
+                {!health.jwt.set
+                  ? "not configured"
+                  : health.jwt.expired
+                    ? `expired${health.jwt.expires_at ? ` ${new Date(health.jwt.expires_at).toLocaleString()}` : ""}`
+                    : health.jwt.expires_at
+                      ? `valid — expires ${new Date(health.jwt.expires_at).toLocaleString()}`
+                      : "valid (no expiry claim)"}
+              </span>
+            </div>
+          </div>
         )}
       </CardContent>
     </Card>

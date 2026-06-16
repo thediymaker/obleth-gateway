@@ -55,6 +55,8 @@ import {
 } from "@/app/actions";
 import { ChartShell, axisTick, chartGrid, compactAxis, tip, timeCursor } from "@/components/chart-tooltip";
 import { ModelMetricsDetail } from "@/components/model-metrics-detail";
+import { ManagedModelConfig } from "@/components/managed-model-config";
+import { ReplicaPanel } from "@/components/replica-panel";
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -139,6 +141,14 @@ const MODEL_TYPE_LABELS: Record<string, string> = Object.fromEntries(
   MODEL_TYPE_OPTIONS.map((o) => [o.value, o.label]),
 );
 
+// How a model's upstream is provided: an existing static endpoint, or
+// provisioned on a Slurm cluster by obleth-provisioner. Only offered when Slurm
+// is enabled system-wide (Settings → Slurm).
+const ENDPOINT_MODE_OPTIONS = [
+  { value: "static", label: "Static endpoint (OpenAI-compatible URL)" },
+  { value: "slurm", label: "Slurm provisioned (obleth hosts it)" },
+] as const;
+
 export function ModelManager({
   models,
   cacheStats,
@@ -146,6 +156,8 @@ export function ModelManager({
   healthDetails,
   endpoints,
   mcpServers = [],
+  managed = {},
+  slurmEnabled = false,
 }: {
   models: ModelRoute[];
   cacheStats?: CacheStats;
@@ -153,6 +165,8 @@ export function ModelManager({
   healthDetails: Record<string, ModelHealthDetail | undefined>;
   endpoints: Record<string, ModelEndpoint[]>;
   mcpServers?: McpServer[];
+  managed?: Record<string, boolean>;
+  slurmEnabled?: boolean;
 }) {
   const [pending, start] = useTransition();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -172,6 +186,9 @@ export function ModelManager({
     setSaveFlash((prev) => ({ id, n: prev?.id === id ? prev.n + 1 : 1 }));
   const [createOpen, setCreateOpen] = useState(false);
   const [createType, setCreateType] = useState<string>("chat");
+  // "static" = upstream OpenAI endpoint (api_base); "slurm" = provisioned on the
+  // cluster by obleth-provisioner. Only offered when Slurm is enabled globally.
+  const [endpointMode, setEndpointMode] = useState<string>("static");
   const [showBenchmarkRoutes, setShowBenchmarkRoutes] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const createFormRef = useRef<HTMLFormElement>(null);
@@ -281,6 +298,7 @@ export function ModelManager({
           if (!next) {
             setCreateError(null);
             setCreateType("chat");
+            setEndpointMode("static");
           }
         }}
       >
@@ -307,10 +325,70 @@ export function ModelManager({
             <div className="md:col-span-2">
               <Field label="Description" name="description" placeholder="Qwen3 235B instruction model for production chat and tool use" />
             </div>
-            <div className="md:col-span-2">
-              <Field label="API base URL" name="api_base" placeholder="http://envoy-aibrix-system.../v1" required />
-            </div>
-            <Field label="Upstream API key (optional)" name="api_key" placeholder="sk_..." />
+            {slurmEnabled && (
+              <div className="md:col-span-2">
+                <SelectField
+                  label="Hosting"
+                  name="endpoint_mode"
+                  value={endpointMode}
+                  onChange={setEndpointMode}
+                  options={ENDPOINT_MODE_OPTIONS}
+                  hint={
+                    endpointMode === "slurm"
+                      ? "obleth provisions this model on the Slurm cluster and routes to healthy replicas. No upstream URL needed."
+                      : "Point at an existing OpenAI-compatible upstream endpoint."
+                  }
+                />
+              </div>
+            )}
+            {endpointMode === "static" && (
+              <>
+                <div className="md:col-span-2">
+                  <Field label="API base URL" name="api_base" placeholder="http://envoy-aibrix-system.../v1" required />
+                </div>
+                <Field label="Upstream API key (optional)" name="api_key" placeholder="sk_..." />
+              </>
+            )}
+            {endpointMode === "slurm" && (
+              <FieldGroup label="Slurm provisioning" hint="How obleth launches and scales this model on the cluster. Job/launch specifics live here; connection details are in Settings → Slurm.">
+                <div className="grid w-full gap-3 sm:grid-cols-2">
+                  <Field label="Partition" name="slurm_partition" placeholder="gpu" required />
+                  <Field label="GRES" name="slurm_gres" placeholder="gpu:1" />
+                  <Field label="Nodes" name="slurm_nodes" type="number" defaultValue="1" />
+                  <Field label="Target replicas" name="slurm_target_replicas" type="number" defaultValue="2" />
+                  <Field label="Serving port" name="slurm_serving_port" type="number" defaultValue="8000" />
+                  <Field label="Health path" name="slurm_health_path" defaultValue="/health" />
+                  <Field label="Max job failures (0 = unlimited)" name="slurm_max_job_failures" type="number" defaultValue="0" />
+                  <Field label="Account (optional)" name="slurm_account" placeholder="my-account" />
+                  <Field label="QoS (optional)" name="slurm_qos" placeholder="normal" />
+                  <Field label="Time limit (optional)" name="slurm_time_limit" placeholder="12:00:00" />
+                  <Field label="Constraints (optional)" name="slurm_constraints" placeholder="a100" />
+                  <Field label="Exclude (optional)" name="slurm_exclude" placeholder="node[01-02]" />
+                  <Field label="Log output dir (optional)" name="slurm_log_output_dir" placeholder="/shared/logs" />
+                </div>
+                <div className="w-full space-y-1.5">
+                  <Field label="Apptainer image" name="slurm_image" placeholder="/shared/images/vllm.sif" required />
+                </div>
+                <div className="w-full space-y-1.5">
+                  <Label htmlFor="slurm_preamble-field">
+                    Preamble{" "}
+                    <span className="text-xs text-muted-foreground/60">
+                      (optional — shell lines before apptainer exec, e.g. module load apptainer)
+                    </span>
+                  </Label>
+                  <textarea
+                    id="slurm_preamble-field"
+                    name="slurm_preamble"
+                    rows={2}
+                    placeholder="module load apptainer/1.3.4"
+                    className="flex w-full rounded-md border border-border bg-background px-3 py-2 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 font-mono resize-y"
+                  />
+                </div>
+                <div className="w-full space-y-1.5">
+                  <Field label="Launch command" name="slurm_launch_command" placeholder="vllm serve <model> --port 8000" required />
+                </div>
+              </FieldGroup>
+            )}
             <Field label="Admission weight" name="admission_weight" type="number" defaultValue="100" />
             <Field label="Max in-flight (optional)" name="max_in_flight" type="number" placeholder="No cap" />
             {(createType === "chat" || createType === "embedding") && (
@@ -583,6 +661,7 @@ export function ModelManager({
                               detail={healthDetails[model.id]}
                               endpoints={endpoints[model.id] ?? []}
                               mcpServers={mcpServers}
+                              isManaged={managed[model.id] ?? false}
                               pending={pending}
                               onCacheToggle={() => {
                                 flashSaved(model.id);
@@ -615,6 +694,7 @@ function ModelDetailPanel({
   detail,
   endpoints,
   mcpServers = [],
+  isManaged = false,
   pending,
   onCacheToggle,
 }: {
@@ -623,6 +703,7 @@ function ModelDetailPanel({
   detail?: ModelHealthDetail;
   endpoints: ModelEndpoint[];
   mcpServers?: McpServer[];
+  isManaged?: boolean;
   pending: boolean;
   onCacheToggle: () => void;
 }) {
@@ -661,6 +742,7 @@ function ModelDetailPanel({
             )}
           </TabsTrigger>
           <TabsTrigger value="health">Health</TabsTrigger>
+          {isManaged && <TabsTrigger value="provisioning">Provisioning</TabsTrigger>}
         </TabsList>
         <p className="text-[11px] tabular-nums text-muted-foreground">
           {summary.last_checked_at
@@ -856,6 +938,17 @@ function ModelDetailPanel({
           </PanelCard>
         </div>
       </TabsContent>
+
+      {isManaged && (
+        <TabsContent value="provisioning" className="min-h-0">
+          <div className="grid gap-4 lg:h-[calc(100dvh-18rem)] lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:overflow-hidden">
+            <div className="min-h-0 lg:overflow-y-auto lg:pr-1">
+              <ManagedModelConfig modelId={model.id} />
+            </div>
+            <ReplicaPanel modelId={model.id} />
+          </div>
+        </TabsContent>
+      )}
     </Tabs>
   );
 }

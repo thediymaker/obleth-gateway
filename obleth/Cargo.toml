@@ -9,6 +9,7 @@ members = [
     "crates/obleth-telemetry",
     "crates/obleth-admin",
     "crates/obleth-proxy",
+    "crates/obleth-provisioner",
 ]
 
 [workspace.package]

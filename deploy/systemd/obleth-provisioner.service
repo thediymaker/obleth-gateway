@@ -1,0 +1,22 @@
+# obleth-provisioner systemd unit.
+# All configuration is via the env file below (see the crate README for the full
+# list of OBLETH_* variables and the per-model managed spec).
+[Unit]
+Description=obleth-provisioner (optional Slurm provisioner plugin)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Dedicated, unprivileged runtime user managed by systemd (no account to create).
+DynamicUser=yes
+# Operators put the OBLETH_* variables here. The leading '-' makes the file
+# optional so the unit still loads if it's absent (the binary will then fail
+# fast on the missing required vars).
+EnvironmentFile=-/etc/obleth/provisioner.env
+ExecStart=/usr/local/bin/obleth-provisioner
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

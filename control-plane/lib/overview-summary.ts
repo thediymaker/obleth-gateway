@@ -23,7 +23,12 @@ export function computeOverviewSummary(
   const totalTokens = usage.reduce((a, u) => a + Number(u.total_tokens), 0);
   const totalCost = costs.reduce((a, c) => a + c.total_cost, 0);
   const hasPricing = models.some((m) => m.input_cost_per_token > 0 || m.output_cost_per_token > 0);
-  const activeTenants = usage.filter((u) => Number(u.requests) > 0).length;
+  const tenantIds = new Set(tenants.map((tenant) => tenant.id));
+  const activeTenantIds = new Set(
+    usage
+      .filter((u) => Number(u.requests) > 0 && tenantIds.has(u.tenant_id))
+      .map((u) => u.tenant_id),
+  );
   const enabledModels = models.filter((m) => m.enabled).length;
 
   return {
@@ -32,7 +37,7 @@ export function computeOverviewSummary(
     cost: totalCost,
     hasPricing,
     tenantCount: tenants.length,
-    activeTenants,
+    activeTenants: activeTenantIds.size,
     modelCount: models.length,
     enabledModels,
     keyCount: keys.length,

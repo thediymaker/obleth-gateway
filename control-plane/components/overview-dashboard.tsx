@@ -50,6 +50,7 @@ const LIVE_BUCKET_MS = 60_000;
 const TOP_TENANTS = 8;
 const TOP_MODELS = 8;
 const TOP_KEYS = 10;
+const LIVE_REQUEST_ROWS = 12;
 
 const PALETTE = [
   "hsl(210 8% 70%)",
@@ -1149,11 +1150,11 @@ function RequestFeedPanel() {
     queryKey: ["overview-request-feed"],
     queryFn: () =>
       getJson<UsageLogEntry[]>(
-        `/api/live/usage/logs?since_ms=${Date.now() - HOUR_MS}&limit=18`,
+        `/api/live/usage/logs?since_ms=${Date.now() - HOUR_MS}&limit=${LIVE_REQUEST_ROWS}`,
       ),
     refetchInterval: REQUEST_LOG_POLL_MS,
   });
-  const rows = query.data ?? [];
+  const rows = (query.data ?? []).slice(0, LIVE_REQUEST_ROWS);
   const errorCount = rows.filter((row) => row.status_code >= 400).length;
 
   return (
@@ -1161,7 +1162,7 @@ function RequestFeedPanel() {
       <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <CardTitle>Live requests</CardTitle>
-          <CardDescription>Last hour / newest first / refresh {REQUEST_LOG_POLL_MS / 1000}s</CardDescription>
+          <CardDescription>Last hour / newest {LIVE_REQUEST_ROWS} / refresh {REQUEST_LOG_POLL_MS / 1000}s</CardDescription>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Badge className={errorCount > 0 ? "border-red-500/35 bg-red-500/10 text-red-300" : ""}>
@@ -1179,9 +1180,9 @@ function RequestFeedPanel() {
         {rows.length === 0 ? (
           <EmptyState className="h-72">{query.isLoading ? "Loading requests..." : "No recent requests"}</EmptyState>
         ) : (
-          <div className="max-h-[31rem] overflow-auto">
+          <div className="overflow-hidden">
             <table className="w-full min-w-[720px] text-xs">
-              <thead className="sticky top-0 z-10 bg-card">
+              <thead className="bg-card">
                 <tr className="border-b border-border text-left text-[10px] uppercase tracking-wider text-muted-foreground">
                   <th className="px-4 py-2 font-medium">Time</th>
                   <th className="px-3 py-2 font-medium">Status</th>
