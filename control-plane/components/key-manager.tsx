@@ -24,6 +24,7 @@ import {
   deleteKeyAction,
   deleteKeysAction,
   toggleKeyAction,
+  toggleKeyTracingAction,
   updateKeyAction,
 } from "@/app/actions";
 import { Badge } from "@/components/ui/badge";
@@ -741,6 +742,7 @@ function KeyDetailPanel({
   onSave: (formData: FormData) => void;
 }) {
   const { key, usage } = row;
+  const [tracingPending, startTracing] = useTransition();
   return (
     <div className="grid gap-4 xl:grid-cols-[minmax(26rem,1fr)_minmax(18rem,0.55fr)]">
       <form action={onSave} className="rounded-md border border-border bg-background/60 p-4">
@@ -817,6 +819,22 @@ function KeyDetailPanel({
             <UsageStat label="Cost" value={formatCurrency(Number(usage?.cost_usd ?? 0))} />
             <UsageStat label="Last used" value={formatLastUsed(usage?.last_used_ms)} />
           </div>
+        </div>
+        <div className="rounded-md border border-border bg-background/60 p-4">
+          <p className="mb-1 text-sm font-semibold">Request tracing</p>
+          <p className="mb-3 text-xs text-muted-foreground">
+            Record per-hop span data for requests made with this key.
+          </p>
+          <Button
+            type="button"
+            variant={key.tracing_enabled ? "default" : "outline"}
+            size="sm"
+            disabled={pending || tracingPending}
+            className={key.tracing_enabled ? "border border-emerald-500/40 bg-emerald-950/40 text-emerald-400 hover:bg-emerald-950/60" : ""}
+            onClick={() => startTracing(() => toggleKeyTracingAction(key.id, !key.tracing_enabled))}
+          >
+            {key.tracing_enabled ? "⬡ Tracing on" : "Tracing off"}
+          </Button>
         </div>
       </div>
     </div>

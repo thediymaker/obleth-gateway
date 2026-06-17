@@ -176,6 +176,7 @@ pub async fn run(
     session_id: &str,
     dispatch_timeout: Duration,
     body: &mut Value,
+    mut tracer: Option<&mut crate::tracer::SpanRecorder>,
 ) -> TransformResult {
     let Some(loop_plan) = &plan.tool_loop else {
         return super::respond::transform_completion(state, plan, route, key, session_id, body)
@@ -196,6 +197,12 @@ pub async fn run(
     // One MCP session per server for the whole request: rate-limited servers
     // see a single initialization instead of one per tool call.
     let mut sessions: HashMap<String, mcp_tools::Session> = HashMap::new();
+    let tool_loop_start = crate::tracer::now_ms();
+
+    let mut completed_turns: u32 = 0;
+    // Deduplicated list of every tool name called across all turns, for the
+    // parent span summary.
+    let mut all_tools_seen: Vec<String> = Vec::new();
 
     for turn in 0..max_turns {
         let calls = extract_tool_calls(body);
@@ -210,6 +217,15 @@ pub async fn run(
             tracing::debug!(
                 "tool loop yielding client-owned tool call back to the client"
             );
+            if let Some(t) = tracer {
+                t.record_elapsed(
+                    "boon:tool_loop",
+                    "proxy_request",
+                    tool_loop_start,
+                    "ok",
+                    serde_json::json!({ "turns": completed_turns, "tools": all_tools_seen }),
+                );
+            }
             return TransformResult { warning: None };
         }
         if calls.is_empty() {
@@ -228,13 +244,32 @@ pub async fn run(
                 }
                 None => None,
             };
+            if let Some(t) = tracer {
+                t.record_elapsed(
+                    "boon:tool_loop",
+                    "proxy_request",
+                    tool_loop_start,
+                    "ok",
+                    serde_json::json!({ "turns": completed_turns, "tools": all_tools_seen }),
+                );
+            }
             return TransformResult { warning };
         }
+
+        // Collect the tool names for this iteration and update the all-turns list.
+        let iter_tool_names: Vec<String> = calls.iter().map(|c| c.name.clone()).collect();
+        for name in &iter_tool_names {
+            if !all_tools_seen.contains(name) {
+                all_tools_seen.push(name.clone());
+            }
+        }
+        let iter_start = crate::tracer::now_ms();
 
         // Record the assistant turn, execute each call, and append results.
         if let Some(message) = body.pointer("/choices/0/message") {
             push_message(&mut request, message.clone());
         }
+        let tool_exec_start = crate::tracer::now_ms();
         for call in &calls {
             let result_text =
                 execute_call(state, &loop_plan.tool_servers, &mut sessions, call, tool_timeout)
@@ -254,8 +289,13 @@ pub async fn run(
                 }),
             );
         }
+        let tool_exec_ms = (crate::tracer::now_ms() - tool_exec_start) as u32;
+
+        let model_call_start = crate::tracer::now_ms();
         match super::chat_call_completion(state, route, request.clone(), dispatch_timeout).await {
             Ok(completion) => {
+                let model_ms = (crate::tracer::now_ms() - model_call_start) as u32;
+                let iter_ms = (crate::tracer::now_ms() - iter_start) as u32;
                 let input_tokens = completion
                     .pointer("/usage/prompt_tokens")
                     .and_then(|v| v.as_u64())
@@ -274,6 +314,21 @@ pub async fn run(
                     output_tokens,
                 );
                 *body = completion;
+                completed_turns += 1;
+                if let Some(t) = tracer.as_deref_mut() {
+                    t.record(
+                        &format!("boon:tool_loop:iter:{turn}"),
+                        "boon:tool_loop",
+                        iter_start,
+                        iter_ms,
+                        "ok",
+                        serde_json::json!({
+                            "tools": iter_tool_names,
+                            "tool_ms": tool_exec_ms,
+                            "model_ms": model_ms,
+                        }),
+                    );
+                }
             }
             Err(e) => {
                 tracing::warn!(
@@ -282,6 +337,28 @@ pub async fn run(
                     turn,
                     "gateway tool loop dispatch failed; returning last completion"
                 );
+                if let Some(t) = tracer.as_deref_mut() {
+                    t.record(
+                        &format!("boon:tool_loop:iter:{turn}"),
+                        "boon:tool_loop",
+                        iter_start,
+                        (crate::tracer::now_ms() - iter_start) as u32,
+                        "error",
+                        serde_json::json!({
+                            "tools": iter_tool_names,
+                            "error": e.to_string(),
+                        }),
+                    );
+                }
+                if let Some(t) = tracer {
+                    t.record_elapsed(
+                        "boon:tool_loop",
+                        "proxy_request",
+                        tool_loop_start,
+                        "error",
+                        serde_json::json!({ "turns": completed_turns, "tools": all_tools_seen }),
+                    );
+                }
                 return TransformResult {
                     warning: Some("tool_loop_dispatch_failed"),
                 };
@@ -333,6 +410,15 @@ pub async fn run(
         Err(e) => {
             tracing::warn!(error = %e, "tool loop finalization dispatch failed");
         }
+    }
+    if let Some(t) = tracer {
+        t.record_elapsed(
+            "boon:tool_loop",
+            "proxy_request",
+            tool_loop_start,
+            "ok",
+            serde_json::json!({ "turns": max_turns, "tools": all_tools_seen }),
+        );
     }
     TransformResult {
         warning: Some("tool_loop_turn_limit"),

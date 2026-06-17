@@ -549,6 +549,7 @@ mod tests {
             key_budget_started_at: None,
             allowed_models: None,
             internal: false,
+            tracing_enabled: false,
         };
         store.put_resolved_key(&hash, &key).await.unwrap();
         let got = store.get_resolved_key(&hash).await.unwrap().unwrap();

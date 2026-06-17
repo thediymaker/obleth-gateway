@@ -67,6 +67,9 @@ pub struct AdminState {
     pub ssrf: ssrf::SsrfPolicy,
     /// Runtime-reloadable alert dispatcher shared with the data plane.
     pub alerts: AlertDispatcher,
+    /// Direct in-process moka cache invalidation. Set by the binary that owns
+    /// the key cache; None when admin and proxy run in separate processes.
+    pub local_cache_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
 }
 
 /// Build the `/api/v1` router. `/health` and the OpenAPI doc are public; every
@@ -93,9 +96,11 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/tenants/:id/weight", patch(patch_weight))
         .route("/api/v1/tenants/:id/quota", put(put_quota))
         .route("/api/v1/tenants/:id/keys", post(create_key))
+        .route("/api/v1/tenants/:id/tracing", put(set_tenant_tracing_handler))
         .route("/api/v1/keys", get(list_keys))
         .route("/api/v1/keys/:id", put(update_key).delete(delete_key))
         .route("/api/v1/keys/:id/disabled", put(set_key_disabled))
+        .route("/api/v1/keys/:id/tracing", put(set_key_tracing_handler))
         .route("/api/v1/keys/:id/usage", get(get_key_usage))
         .route("/api/v1/usage", get(get_usage))
         .route("/api/v1/usage/keys", get(get_usage_keys))
@@ -110,6 +115,10 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/usage/breakdown", get(get_usage_breakdown))
         .route("/api/v1/usage/cache", get(get_cache_stats))
         .route("/api/v1/usage/logs", get(get_usage_logs))
+        .route(
+            "/api/v1/usage/logs/:request_id/spans",
+            get(get_request_spans),
+        )
         .route("/api/v1/usage/daily", get(get_usage_daily))
         .route("/api/v1/usage/compact", post(compact_usage))
         .route("/api/v1/costs", get(get_costs))
@@ -393,6 +402,11 @@ pub struct CreatedKey {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetDisabled {
     pub disabled: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetKeyTracing {
+    tracing_enabled: bool,
 }
 
 fn normalize_budget_fields(
@@ -1796,6 +1810,54 @@ async fn set_key_disabled(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn set_key_tracing_handler(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetKeyTracing>,
+) -> Result<StatusCode> {
+    let (hash, resolved) = state.store.set_key_tracing(id, body.tracing_enabled).await?;
+    push_key(&state, &hash, &resolved).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            if body.tracing_enabled {
+                "enable_key_tracing"
+            } else {
+                "disable_key_tracing"
+            },
+            "api_key",
+            &id.to_string(),
+            serde_json::json!({ "tracing_enabled": body.tracing_enabled }),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn set_tenant_tracing_handler(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetKeyTracing>,
+) -> Result<StatusCode> {
+    state.store.set_tenant_tracing(id, body.tracing_enabled).await?;
+    sync_tenant_keys(&state, id).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            if body.tracing_enabled {
+                "enable_tenant_tracing"
+            } else {
+                "disable_tenant_tracing"
+            },
+            "tenant",
+            &id.to_string(),
+            serde_json::json!({ "tracing_enabled": body.tracing_enabled }),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
 #[utoipa::path(
     get, path = "/api/v1/usage", tag = "usage",
     params(usage::UsageQuery),
@@ -1982,6 +2044,9 @@ pub struct UsageLogEntry {
     pub tenant_name: String,
     pub key_name: String,
     pub key_prefix: String,
+    /// `true` when at least one span for this request exists in ClickHouse.
+    #[serde(default)]
+    pub has_trace: bool,
 }
 
 /// Newest-first feed of individual requests for the live log view. ClickHouse
@@ -2022,6 +2087,9 @@ async fn get_usage_logs(
         .map(|k| (k.id, (k.name, k.key_prefix)))
         .collect();
 
+    let request_ids: Vec<Uuid> = rows.iter().map(|r| r.request_id).collect();
+    let traced = usage::batch_has_trace(&state.clickhouse, &request_ids).await;
+
     let entries = rows
         .into_iter()
         .map(|row| {
@@ -2030,16 +2098,27 @@ async fn get_usage_logs(
                 .cloned()
                 .unwrap_or_default();
             let (key_name, key_prefix) = key_meta.get(&row.key_id).cloned().unwrap_or_default();
+            let has_trace = traced.contains(&row.request_id);
             UsageLogEntry {
                 row,
                 tenant_name,
                 key_name,
                 key_prefix,
+                has_trace,
             }
         })
         .collect();
 
     Ok(Json(entries))
+}
+
+async fn get_request_spans(
+    State(state): State<AdminState>,
+    Path(request_id): Path<Uuid>,
+) -> Result<Json<Vec<usage::SpanEntry>>> {
+    Ok(Json(
+        usage::query_request_spans(&state.clickhouse, request_id).await?,
+    ))
 }
 
 /// A per-model breakdown row enriched with human-readable tenant/key names and
@@ -3353,6 +3432,9 @@ async fn set_capacity(
 async fn push_key(state: &AdminState, hash: &str, resolved: &ResolvedKey) -> Result<()> {
     state.redis.put_resolved_key(hash, resolved).await?;
     state.redis.publish_invalidation(hash).await?;
+    if let Some(tx) = &state.local_cache_tx {
+        let _ = tx.send(hash.to_string());
+    }
     Ok(())
 }
 

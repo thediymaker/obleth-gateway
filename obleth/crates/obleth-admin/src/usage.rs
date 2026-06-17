@@ -109,6 +109,9 @@ pub struct UsageLogQuery {
     pub before_request_id: Option<Uuid>,
     /// Page size (highest `ts_ms` first). Clamped to a sane ceiling.
     pub limit: Option<u64>,
+    /// When `true`, return only requests that have at least one span in
+    /// ClickHouse (i.e. were traced).
+    pub traced_only: Option<bool>,
 }
 
 /// A single request as stored in the `usage` ledger, returned newest-first for
@@ -183,6 +186,19 @@ pub async fn query_usage_logs(
     }
     if q.request_id.is_some() {
         sql.push_str(" and startsWith(lower(toString(request_id)), lower(?))");
+    }
+    if q.traced_only == Some(true) {
+        let since = q.since_ms.unwrap_or(0);
+        let until = q.until_ms.unwrap_or(i64::MAX);
+        // Safety: `since` and `until` are `i64` — `Display` emits only ASCII
+        // digits (and an optional leading `-`), so there is no SQL-injection
+        // surface. The clickhouse crate (v0.13) scopes bind parameters to the
+        // top-level query string and does not propagate them into subqueries,
+        // making `format!` the correct approach for subquery literals.
+        sql.push_str(&format!(
+            " AND request_id IN (SELECT DISTINCT request_id FROM spans \
+              WHERE start_ms >= {since} AND start_ms <= {until})"
+        ));
     }
     // Keyset cursor: (ts_ms, request_id) tuple strictly less than the cursor.
     // Tuple comparison matches the `order by` below for stable paging.
@@ -1011,4 +1027,64 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// One row from the `spans` table, returned by the per-request trace endpoint.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, clickhouse::Row)]
+pub struct SpanEntry {
+    #[serde(with = "clickhouse::serde::uuid")]
+    pub request_id: Uuid,
+    pub span_name: String,
+    pub parent_span: String,
+    pub start_ms: i64,
+    pub duration_ms: u32,
+    pub status: String,
+    pub attributes: String,
+}
+
+/// Fetch all spans for a single request, ordered by `start_ms`.
+pub async fn query_request_spans(
+    client: &clickhouse::Client,
+    request_id: Uuid,
+) -> Result<Vec<SpanEntry>, clickhouse::error::Error> {
+    client
+        .query(
+            "SELECT request_id, span_name, parent_span, start_ms, duration_ms, status, attributes \
+             FROM spans WHERE request_id = ? ORDER BY start_ms",
+        )
+        .bind(request_id.to_string())
+        .fetch_all::<SpanEntry>()
+        .await
+}
+
+/// Returns the subset of `request_ids` that have at least one row in `spans`.
+/// Fails-open: on ClickHouse error returns an empty set (callers treat all rows
+/// as un-traced rather than surfacing a 500 to the log-list endpoint).
+pub async fn batch_has_trace(
+    client: &clickhouse::Client,
+    request_ids: &[Uuid],
+) -> std::collections::HashSet<Uuid> {
+    if request_ids.is_empty() {
+        return std::collections::HashSet::new();
+    }
+    let in_list = request_ids
+        .iter()
+        .map(|id| format!("toUUID('{id}')"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct TracedId {
+        #[serde(with = "clickhouse::serde::uuid")]
+        request_id: Uuid,
+    }
+    let sql = format!(
+        "SELECT DISTINCT request_id FROM spans WHERE request_id IN ({in_list})"
+    );
+    match client.query(&sql).fetch_all::<TracedId>().await {
+        Ok(rows) => rows.into_iter().map(|r| r.request_id).collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "batch_has_trace failed");
+            std::collections::HashSet::new()
+        }
+    }
 }

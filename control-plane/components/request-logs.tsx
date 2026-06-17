@@ -1,13 +1,14 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useRef, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
-import { ChevronLeft, ChevronRight, Pause, Play, RefreshCw, Search } from "lucide-react";
+import { ChevronLeft, ChevronRight, Hexagon, Pause, Play, RefreshCw, Search } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent } from "@/components/ui/card";
+import { Card } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
+import { RequestDetail } from "@/components/request-detail";
 import type { UsageLogEntry } from "@/lib/obleth";
 import { cn, formatCurrency, formatNumber } from "@/lib/utils";
 
@@ -43,6 +44,7 @@ interface Filters {
   requestType: string;
   status: string;
   requestId: string;
+  tracedOnly: boolean;
 }
 
 const DEFAULT_FILTERS: Filters = {
@@ -52,6 +54,7 @@ const DEFAULT_FILTERS: Filters = {
   requestType: "",
   status: "",
   requestId: "",
+  tracedOnly: false,
 };
 
 const REQUEST_TYPES = [
@@ -78,6 +81,10 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
   const [cursor, setCursor] = useState<Cursor | undefined>(undefined);
   const [cursorStack, setCursorStack] = useState<Cursor[]>([]);
+  const [expandedRequestId, setExpandedRequestId] = useState<string | null>(null);
+
+  const toggleExpand = (id: string) =>
+    setExpandedRequestId((prev) => (prev === id ? null : id));
 
   // Pin the lower time bound for the lifetime of a filter set so paging back
   // through history doesn't keep sliding the window forward under us. Live tail
@@ -113,6 +120,7 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
       if (filters.requestType) params.set("request_type", filters.requestType);
       if (filters.status) params.set("status", filters.status);
       if (filters.requestId) params.set("request_id", filters.requestId);
+      if (filters.tracedOnly) params.set("traced_only", "true");
       if (!liveTail && cursor) {
         params.set("before_ms", String(cursor.beforeMs));
         params.set("before_request_id", cursor.beforeRequestId);
@@ -178,15 +186,16 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
       filters.requestType ||
       filters.status ||
       filters.requestId ||
-      filters.windowMs !== DEFAULT_FILTERS.windowMs,
+      filters.windowMs !== DEFAULT_FILTERS.windowMs ||
+      filters.tracedOnly,
   );
 
   return (
-    <Card className="overflow-hidden rounded-md">
+    <Card className="overflow-hidden rounded-md border-border/80">
       {/* Toolbar */}
-      <div className="flex flex-col gap-2.5 border-b border-border bg-muted/20 px-3 py-2.5">
-        <div className="flex flex-wrap items-center gap-2">
-          <div className="relative min-w-[200px] flex-1">
+      <div className="grid gap-2.5 border-b border-border bg-card/80 px-3 py-3">
+        <div className="grid gap-2 md:grid-cols-[minmax(14rem,1fr)_9rem_7rem_auto_auto]">
+          <div className="relative min-w-0">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               type="search"
@@ -204,7 +213,7 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
             value={String(filters.windowMs)}
             onChange={(e) => patchFilters({ windowMs: Number(e.target.value) })}
             aria-label="Time window"
-            className="h-8 w-36 text-xs"
+            className="h-8 w-full text-xs"
           >
             {WINDOWS.map((w) => (
               <option key={w.ms} value={w.ms}>
@@ -219,7 +228,7 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
               resetPaging();
             }}
             aria-label="Rows per page"
-            className="h-8 w-28 text-xs"
+            className="h-8 w-full text-xs"
           >
             {PAGE_SIZES.map((n) => (
               <option key={n} value={n}>
@@ -233,22 +242,29 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
             size="sm"
             onClick={toggleLiveTail}
             aria-pressed={liveTail}
+            className="h-8"
           >
             {liveTail ? <Pause className="h-3.5 w-3.5" /> : <Play className="h-3.5 w-3.5" />}
             {liveTail ? "Live" : "Paused"}
           </Button>
-          <Button type="button" variant="secondary" size="sm" onClick={() => query.refetch()}>
+          <Button
+            type="button"
+            variant="secondary"
+            size="sm"
+            onClick={() => query.refetch()}
+            className="h-8"
+          >
             <RefreshCw className={cn("h-3.5 w-3.5", query.isFetching && "animate-spin")} />
             Fetch
           </Button>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-[minmax(0,11rem)_minmax(0,11rem)_minmax(0,9rem)_minmax(0,9rem)_auto_1fr]">
           <Select
             value={filters.tenantId}
             onChange={(e) => patchFilters({ tenantId: e.target.value })}
             aria-label="Filter by team"
-            className="h-8 w-40 text-xs"
+            className="h-8 w-full text-xs"
           >
             <option value="">All teams</option>
             {tenants.map((t) => (
@@ -261,7 +277,7 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
             value={filters.model}
             onChange={(e) => patchFilters({ model: e.target.value })}
             aria-label="Filter by model"
-            className="h-8 w-40 text-xs"
+            className="h-8 w-full text-xs"
           >
             <option value="">All models</option>
             {models.map((m) => (
@@ -274,7 +290,7 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
             value={filters.requestType}
             onChange={(e) => patchFilters({ requestType: e.target.value })}
             aria-label="Filter by type"
-            className="h-8 w-32 text-xs"
+            className="h-8 w-full text-xs"
           >
             <option value="">All types</option>
             {REQUEST_TYPES.map((t) => (
@@ -287,20 +303,39 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
             value={filters.status}
             onChange={(e) => patchFilters({ status: e.target.value })}
             aria-label="Filter by status"
-            className="h-8 w-28 text-xs"
+            className="h-8 w-full text-xs"
           >
             <option value="">All status</option>
             <option value="success">Success</option>
             <option value="error">Error</option>
           </Select>
+          <button
+            type="button"
+            onClick={() => patchFilters({ tracedOnly: !filters.tracedOnly })}
+            className={cn(
+              "inline-flex h-8 items-center justify-center gap-1.5 rounded-md border px-2.5 text-[11px] transition-colors",
+              filters.tracedOnly
+                ? "border-emerald-700/60 bg-emerald-950/40 text-emerald-400"
+                : "border-border bg-muted/30 text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <span className="h-1.5 w-1.5 rounded-full border border-current" />
+            Traced only
+          </button>
           {filtersActive && (
-            <Button type="button" variant="ghost" size="sm" onClick={resetFilters}>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              onClick={resetFilters}
+              className="h-8 justify-self-start lg:justify-self-end"
+            >
               Reset
             </Button>
           )}
         </div>
 
-        <div className="flex items-center justify-between gap-3 border-t border-border/60 pt-2.5">
+        <div className="flex flex-col gap-2 border-t border-border/60 pt-2.5 sm:flex-row sm:items-center sm:justify-between">
           <span className="text-xs tabular-nums text-muted-foreground">
             {formatNumber(rows.length)} shown
           </span>
@@ -330,27 +365,42 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
       </div>
 
       {/* Table */}
-      <div className="overflow-x-auto">
-        <table className="w-full min-w-[1080px] text-sm">
+      <div className="hidden overflow-x-auto md:block">
+        <table className="w-full min-w-[680px] text-sm lg:min-w-[760px] xl:min-w-[920px] 2xl:min-w-[1120px]">
           <thead>
             <tr className="border-b border-border text-left text-xs text-muted-foreground">
-              <th className="px-4 py-2 font-medium">Time</th>
-              <th className="px-3 py-2 font-medium">Type</th>
+              <th className="w-32 px-3 py-2 font-medium">Time</th>
+              <th className="hidden px-3 py-2 font-medium lg:table-cell">Type</th>
               <th className="px-3 py-2 font-medium">Status</th>
               <th className="px-3 py-2 font-medium">Model</th>
-              <th className="px-3 py-2 font-medium">Session</th>
+              <th className="hidden px-3 py-2 font-medium 2xl:table-cell">Session</th>
               <th className="px-3 py-2 font-medium">Request ID</th>
-              <th className="px-3 py-2 text-right font-medium">Cost</th>
+              <th className="hidden px-3 py-2 text-right font-medium xl:table-cell">Cost</th>
               <th className="px-3 py-2 text-right font-medium">Tokens</th>
-              <th className="px-3 py-2 text-right font-medium">TTFB</th>
+              <th className="hidden px-3 py-2 text-right font-medium xl:table-cell">TTFB</th>
               <th className="px-3 py-2 text-right font-medium">Duration</th>
-              <th className="px-3 py-2 font-medium">Team</th>
-              <th className="px-4 py-2 font-medium">Key</th>
+              <th className="hidden px-3 py-2 font-medium 2xl:table-cell">Team</th>
+              <th className="hidden px-4 py-2 font-medium 2xl:table-cell">Key</th>
             </tr>
           </thead>
           <tbody>
             {rows.map((row) => (
-              <LogRow key={`${row.request_id}-${row.ts_ms}`} row={row} />
+              <Fragment key={`${row.request_id}-${row.ts_ms}`}>
+                <LogRow
+                  row={row}
+                  isExpanded={expandedRequestId === row.request_id}
+                  onExpand={() => toggleExpand(row.request_id)}
+                />
+                {expandedRequestId === row.request_id && (
+                  <tr>
+                    <td colSpan={12} className="max-w-0 border-b border-emerald-900/40 p-0">
+                      <div className="min-w-0 w-full max-w-full overflow-hidden">
+                        <RequestDetail row={row} />
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </Fragment>
             ))}
             {rows.length === 0 && (
               <tr>
@@ -364,55 +414,89 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
           </tbody>
         </table>
       </div>
+
+      <div className="divide-y divide-border/60 md:hidden">
+        {rows.map((row) => (
+          <Fragment key={`${row.request_id}-${row.ts_ms}`}>
+            <LogCard
+              row={row}
+              isExpanded={expandedRequestId === row.request_id}
+              onExpand={() => toggleExpand(row.request_id)}
+            />
+            {expandedRequestId === row.request_id && <RequestDetail row={row} />}
+          </Fragment>
+        ))}
+        {rows.length === 0 && (
+          <div className="px-4 py-14 text-center text-sm text-muted-foreground">
+            {query.isLoading
+              ? "Loading requests..."
+              : "No requests match the current filters and window."}
+          </div>
+        )}
+      </div>
     </Card>
   );
 }
 
-function LogRow({ row }: { row: UsageLogEntry }) {
+function LogRow({
+  row,
+  isExpanded,
+  onExpand,
+}: {
+  row: UsageLogEntry;
+  isExpanded: boolean;
+  onExpand: () => void;
+}) {
   const ok = row.status_code >= 200 && row.status_code < 400;
 
   return (
-    <tr className="border-b border-border/60 transition-colors hover:bg-muted/20">
-      <td className="px-4 py-1.5 tabular-nums text-muted-foreground">{formatTime(row.ts_ms)}</td>
-      <td className="px-3 py-1.5">
+    <tr
+      onClick={onExpand}
+      className={cn(
+        "cursor-pointer select-none border-b border-border/60 transition-colors hover:bg-muted/20",
+        row.has_trace && "bg-emerald-950/30",
+        isExpanded && "border-b-0",
+      )}
+    >
+      <td className="px-3 py-2 tabular-nums text-muted-foreground">
+        <TimeStamp ms={row.ts_ms} />
+      </td>
+      <td className="hidden px-3 py-1.5 lg:table-cell">
         <Badge className="capitalize">{row.request_type || "other"}</Badge>
       </td>
       <td className="px-3 py-1.5">
-        <span
-          className={cn(
-            "inline-flex items-center rounded-sm px-1.5 py-0.5 text-[11px] font-medium",
-            ok
-              ? "bg-[hsl(158_45%_45%/0.16)] text-[hsl(158_55%_60%)]"
-              : "bg-[hsl(350_65%_55%/0.16)] text-[hsl(350_70%_66%)]",
-          )}
-          title={`HTTP ${row.status_code}`}
-        >
-          {ok ? "Success" : `Error ${row.status_code}`}
-        </span>
+        <StatusBadge ok={ok} statusCode={row.status_code} />
       </td>
       <td className="px-3 py-1.5">
-        <span className="truncate font-mono text-xs">{row.model}</span>
+        <span className="block max-w-[13rem] truncate font-mono text-xs">{row.model}</span>
       </td>
-      <td className="px-3 py-1.5 font-mono text-xs text-muted-foreground">
+      <td className="hidden px-3 py-1.5 font-mono text-xs text-muted-foreground 2xl:table-cell">
         {truncateId(row.session_id) || <span className="text-muted-foreground/50">--</span>}
       </td>
       <td className="px-3 py-1.5 font-mono text-xs text-muted-foreground" title={row.request_id}>
-        {row.request_id.slice(0, 8)}
+        <span className="inline-flex items-center gap-1.5">
+          {row.has_trace && <TraceMarker />}
+          <span>{row.request_id.slice(0, 8)}</span>
+        </span>
       </td>
-      <td className="px-3 py-1.5 text-right tabular-nums">{formatCurrency(row.cost_usd)}</td>
+      <td className="hidden px-3 py-1.5 text-right tabular-nums xl:table-cell">
+        {formatCurrency(row.cost_usd)}
+      </td>
       <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
         {formatNumber(row.total_tokens)}
       </td>
-      <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
+      <td className="hidden px-3 py-1.5 text-right tabular-nums text-muted-foreground xl:table-cell">
         {formatSeconds(row.ttft_ms)}
       </td>
       <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
         {formatSeconds(row.total_ms)}
       </td>
-      <td className="px-3 py-1.5">
-        <span className="truncate">{row.tenant_name || row.tenant_id.slice(0, 8)}</span>
+      <td className="hidden px-3 py-1.5 2xl:table-cell">
+        <span className="block max-w-[10rem] truncate">
+          {row.tenant_name || row.tenant_id.slice(0, 8)}
+        </span>
       </td>
-      <td className="px-4 py-1.5">
+      <td className="hidden px-4 py-1.5 2xl:table-cell">
         <span className="flex min-w-0 items-baseline gap-1.5">
           <span className="truncate text-xs">{row.key_name || "--"}</span>
           {row.key_prefix && (
@@ -426,15 +510,127 @@ function LogRow({ row }: { row: UsageLogEntry }) {
   );
 }
 
-function formatTime(ms: number): string {
-  return new Date(ms).toLocaleString([], {
-    month: "2-digit",
-    day: "2-digit",
-    year: "numeric",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-  });
+function LogCard({
+  row,
+  isExpanded,
+  onExpand,
+}: {
+  row: UsageLogEntry;
+  isExpanded: boolean;
+  onExpand: () => void;
+}) {
+  const ok = row.status_code >= 200 && row.status_code < 400;
+
+  return (
+    <div
+      className={cn(
+        "bg-card/40 transition-colors",
+        row.has_trace && "bg-emerald-950/20",
+        isExpanded && "bg-muted/20",
+      )}
+    >
+      <button type="button" onClick={onExpand} className="block w-full px-3 py-3 text-left">
+        <div className="flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <div className="flex min-w-0 items-center gap-2">
+              <StatusBadge ok={ok} statusCode={row.status_code} />
+              <Badge className="capitalize">{row.request_type || "other"}</Badge>
+            </div>
+            <div className="mt-2 flex min-w-0 items-center gap-1.5 font-mono text-xs text-muted-foreground">
+              {row.has_trace && <TraceMarker />}
+              <span className="truncate" title={row.request_id}>
+                {row.request_id}
+              </span>
+            </div>
+          </div>
+          <TimeStamp ms={row.ts_ms} align="right" />
+        </div>
+
+        <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
+          <MobileMetric label="Model" value={row.model} mono />
+          <MobileMetric label="Duration" value={formatSeconds(row.total_ms)} mono />
+          <MobileMetric label="Tokens" value={formatNumber(row.total_tokens)} mono />
+          <MobileMetric label="Cost" value={formatCurrency(row.cost_usd)} mono />
+          <MobileMetric label="TTFB" value={formatSeconds(row.ttft_ms)} mono />
+          <MobileMetric label="Team" value={row.tenant_name || row.tenant_id.slice(0, 8)} />
+        </div>
+      </button>
+    </div>
+  );
+}
+
+function StatusBadge({ ok, statusCode }: { ok: boolean; statusCode: number }) {
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center rounded-sm px-1.5 py-0.5 text-[11px] font-medium",
+        ok
+          ? "bg-[hsl(158_45%_45%/0.16)] text-[hsl(158_55%_60%)]"
+          : "bg-[hsl(350_65%_55%/0.16)] text-[hsl(350_70%_66%)]",
+      )}
+      title={`HTTP ${statusCode}`}
+    >
+      {ok ? "Success" : `Error ${statusCode}`}
+    </span>
+  );
+}
+
+function TraceMarker() {
+  return (
+    <Hexagon
+      className="h-2.5 w-2.5 shrink-0 text-emerald-400/90"
+      strokeWidth={2.4}
+      aria-label="Traced request"
+    />
+  );
+}
+
+function TimeStamp({ ms, align = "left" }: { ms: number; align?: "left" | "right" }) {
+  const { date, time } = formatTimeParts(ms);
+  return (
+    <span
+      className={cn(
+        "flex flex-col leading-tight",
+        align === "right" ? "items-end text-right" : "items-start",
+      )}
+    >
+      <span>{date}</span>
+      <span>{time}</span>
+    </span>
+  );
+}
+
+function MobileMetric({
+  label,
+  value,
+  mono,
+}: {
+  label: string;
+  value: string;
+  mono?: boolean;
+}) {
+  return (
+    <div className="min-w-0">
+      <div className="text-[10px] uppercase tracking-wide text-muted-foreground">{label}</div>
+      <div className={cn("truncate", mono && "font-mono")}>{value || "--"}</div>
+    </div>
+  );
+}
+
+function formatTimeParts(ms: number): { date: string; time: string } {
+  const date = new Date(ms);
+  return {
+    date: date.toLocaleDateString([], {
+      month: "2-digit",
+      day: "2-digit",
+      year: "2-digit",
+    }),
+    time: date.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      second: "2-digit",
+    }),
+  };
 }
 
 function formatSeconds(ms: number): string {

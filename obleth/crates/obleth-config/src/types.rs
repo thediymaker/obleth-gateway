@@ -92,6 +92,10 @@ pub struct Tenant {
     /// Optional per-tenant model allowlist. Empty/`None` = all models permitted.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
+    /// Whether flight-recorder tracing is enabled for every key in this tenant
+    /// (tenant-level OR key-level enables a request's spans).
+    #[serde(default)]
+    pub tracing_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -138,6 +142,7 @@ pub struct ApiKey {
     #[serde(default)]
     pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub disabled: bool,
+    pub tracing_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -202,6 +207,11 @@ pub struct ResolvedKey {
     /// the normal usage ledger. This is used for gateway-owned health probes.
     #[serde(default)]
     pub internal: bool,
+    /// Whether flight-recorder tracing is enabled for this key (key-level OR
+    /// tenant-level flag). When true the proxy captures full request/response
+    /// payloads for replay and debugging.
+    #[serde(default)]
+    pub tracing_enabled: bool,
 }
 
 /// Outcome of admission for a single request, recorded in telemetry.
