@@ -46,6 +46,8 @@ const NO_BUFFER_HEADER: (&str, &str) = ("x-accel-buffering", "no");
 #[tracing::instrument(skip_all, name = "proxy_request")]
 pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) -> Response<Body> {
     let request_start = Instant::now();
+    let request_id = Uuid::new_v4();
+    let proxy_start_ms = crate::tracer::now_ms();
     let (parts, body) = req.into_parts();
     let method = parts.method;
     let path = parts.uri.path().to_string();
@@ -66,10 +68,12 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
     };
     let hash = hash_api_key(&secret);
+    let auth_start = crate::tracer::now_ms();
     let resolved = match resolve_key(&state, &hash).await {
         Some(r) => r,
         None => return error_json(StatusCode::UNAUTHORIZED, "invalid api key"),
     };
+    let auth_duration = (crate::tracer::now_ms() - auth_start) as u32;
     if resolved.disabled {
         return error_json(StatusCode::FORBIDDEN, "api key disabled");
     }
@@ -99,6 +103,28 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 );
             }
         }
+    }
+
+    // ---- request flight-recorder tracer ----
+    let mut tracer: Option<crate::tracer::SpanRecorder> = if resolved.tracing_enabled {
+        tracing::debug!(request_id = %request_id, "tracing enabled — recording spans");
+        Some(crate::tracer::SpanRecorder::new(request_id, proxy_start_ms, state.telemetry.clone()))
+    } else {
+        tracing::debug!(request_id = %request_id, "tracing disabled for this key");
+        None
+    };
+    if let Some(ref mut t) = tracer {
+        t.record(
+            "auth_resolve",
+            "proxy_request",
+            auth_start,
+            auth_duration,
+            "ok",
+            serde_json::json!({
+                "tenant": resolved.tenant_name,
+                "tenant_id": resolved.tenant_id.to_string(),
+            }),
+        );
     }
 
     // ---- read + parse body ----
@@ -163,6 +189,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // shape (estimated context size, required capabilities) and live load. From
     // here on, everything downstream — admission, budgets, caching, telemetry,
     // upstream dispatch — sees the concrete model as if the client named it.
+    let auto_start = crate::tracer::now_ms();
     let route = if model == crate::router::AUTO_MODEL_NAME {
         let max_tokens = json.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
         let features = crate::router::RequestFeatures::from_request(
@@ -200,6 +227,20 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             Some(chosen) => {
                 tracing::debug!(chosen = %chosen.model_name, "auto-routed request");
                 model = chosen.model_name.clone();
+                if let Some(ref mut t) = tracer {
+                    t.record(
+                        "auto_route",
+                        "proxy_request",
+                        auto_start,
+                        (crate::tracer::now_ms() - auto_start) as u32,
+                        "ok",
+                        serde_json::json!({
+                            "chosen": chosen.model_name,
+                            "candidates": candidates.len(),
+                            "tags": desired_tags,
+                        }),
+                    );
+                }
                 Some(Arc::new(chosen))
             }
             None => {
@@ -258,6 +299,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             boons_opt_out,
             req_meta.request_type == "chat",
             &mut json,
+            tracer.as_mut(),
         )
         .await;
     if boon_outcome.rewritten {
@@ -307,19 +349,36 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let cache_ttl = route.as_ref().map(|r| r.cache_ttl_secs).unwrap_or(0);
     let cache_key = cache_enabled.then(|| obleth_config::cache_key(&model, &body_bytes));
     if let Some(ck) = &cache_key {
-        match state
+        let cache_start = crate::tracer::now_ms();
+        let cache_result = state
             .redis
             .cache_get(ck)
             .instrument(tracing::info_span!("cache_lookup"))
-            .await
-        {
+            .await;
+        let cache_ms = (crate::tracer::now_ms() - cache_start) as u32;
+        match cache_result {
             Ok(Some(cached)) => {
+                if let Some(mut t) = tracer.take() {
+                    t.record(
+                        "cache_lookup",
+                        "proxy_request",
+                        cache_start,
+                        cache_ms,
+                        "hit",
+                        serde_json::json!({
+                            "result": "hit",
+                            "tokens_saved": cached.input_tokens.saturating_add(cached.output_tokens),
+                        }),
+                    );
+                    t.finish("ok");
+                }
                 state.metrics.record_cache(
                     true,
                     cached.input_tokens.saturating_add(cached.output_tokens),
                 );
                 finalize(
                     &state,
+                    request_id,
                     &resolved,
                     &req_meta,
                     &model,
@@ -338,8 +397,30 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 );
                 return cached_response(cached);
             }
-            Ok(None) => state.metrics.record_cache(false, 0),
+            Ok(None) => {
+                if let Some(ref mut t) = tracer {
+                    t.record(
+                        "cache_lookup",
+                        "proxy_request",
+                        cache_start,
+                        cache_ms,
+                        "miss",
+                        serde_json::json!({ "result": "miss" }),
+                    );
+                }
+                state.metrics.record_cache(false, 0);
+            }
             Err(e) => {
+                if let Some(ref mut t) = tracer {
+                    t.record(
+                        "cache_lookup",
+                        "proxy_request",
+                        cache_start,
+                        cache_ms,
+                        "error",
+                        serde_json::json!({}),
+                    );
+                }
                 tracing::warn!(error = %e, "cache lookup failed; treating as miss");
                 state.alerts.issue(
                     "redis_cache_lookup_failed",
@@ -353,6 +434,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let cache_status_label = if cache_enabled { "miss" } else { "off" };
 
     // ---- fairshare admission (global concurrency + weighted/hierarchical queue) ----
+    let admission_start = crate::tracer::now_ms();
     let admitted = match state
         .fairshare
         .admit(obleth_fairshare::AdmitRequest {
@@ -368,6 +450,9 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     {
         Some(a) => a,
         None => {
+            if let Some(t) = tracer.take() {
+                t.finish("error");
+            }
             state.alerts.issue(
                 "scheduler_unavailable",
                 "Fairshare scheduler unavailable",
@@ -382,6 +467,20 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let admission = admitted.admission;
     let permit = admitted.permit;
     let queue_wait_ms = admitted.waited.as_millis() as u32;
+    let admission_ms = (crate::tracer::now_ms() - admission_start) as u32;
+    if let Some(ref mut t) = tracer {
+        t.record(
+            "admission",
+            "proxy_request",
+            admission_start,
+            admission_ms,
+            "ok",
+            serde_json::json!({
+                "decision": admission.as_str(),
+                "queue_wait_ms": queue_wait_ms,
+            }),
+        );
+    }
 
     let send_bytes = body_bytes;
 
@@ -435,6 +534,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 );
                 finalize(
                     &state,
+                    request_id,
                     &resolved,
                     &req_meta,
                     &model,
@@ -449,6 +549,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                     cache_status_label,
                     0.0,
                 );
+                if let Some(t) = tracer.take() { t.finish("error"); }
                 return error_json(StatusCode::FORBIDDEN, "api key term budget exhausted");
             }
             Err(e) => {
@@ -463,6 +564,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                             resolved.key_id
                         ),
                     );
+                    if let Some(t) = tracer.take() { t.finish("error"); }
                     return error_json(StatusCode::SERVICE_UNAVAILABLE, "key budget check failed");
                 }
                 tracing::warn!(error = %e, "key budget reserve failed; failing open");
@@ -497,6 +599,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 drop(permit);
                 finalize(
                     &state,
+                    request_id,
                     &resolved,
                     &req_meta,
                     &model,
@@ -511,6 +614,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                     cache_status_label,
                     0.0,
                 );
+                if let Some(t) = tracer.take() { t.finish("error"); }
                 return error_json(StatusCode::TOO_MANY_REQUESTS, "token budget exceeded");
             }
             Ok(obleth_redis::ReserveOutcome::TermExhausted {
@@ -530,6 +634,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 );
                 finalize(
                     &state,
+                    request_id,
                     &resolved,
                     &req_meta,
                     &model,
@@ -544,6 +649,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                     cache_status_label,
                     0.0,
                 );
+                if let Some(t) = tracer.take() { t.finish("error"); }
                 return error_json(StatusCode::FORBIDDEN, "tenant term budget exhausted");
             }
             Err(e) => {
@@ -557,6 +663,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                             resolved.tenant_name
                         ),
                     );
+                    if let Some(t) = tracer.take() { t.finish("error"); }
                     return error_json(StatusCode::SERVICE_UNAVAILABLE, "budget check failed");
                 }
                 tracing::warn!(error = %e, "budget reserve failed; failing open");
@@ -622,6 +729,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // request, *after* fairshare admission. Time spent waiting in the queue is
     // reported separately as `queue_wait_ms`; folding it into TTFT would
     // double-count the wait and make a fast model look slow under contention.
+    let dispatch_start = crate::tracer::now_ms();
     let mut upstream_start = Instant::now();
     let mut upstream_resp: Option<reqwest::Response> = None;
     let mut last_url = String::new();
@@ -731,9 +839,43 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     }
 
     let url = last_url;
+    let dispatch_ms = (crate::tracer::now_ms() - dispatch_start) as u32;
     let upstream = match upstream_resp {
-        Some(r) => r,
+        Some(r) => {
+            if let Some(ref mut t) = tracer {
+                t.record(
+                    "upstream",
+                    "proxy_request",
+                    dispatch_start,
+                    dispatch_ms,
+                    "ok",
+                    serde_json::json!({
+                        "model": model,
+                        "url": url.as_str(),
+                        "status": r.status().as_u16(),
+                        "targets": total_targets,
+                    }),
+                );
+            }
+            r
+        }
         None => {
+            if let Some(mut t) = tracer.take() {
+                t.record(
+                    "upstream",
+                    "proxy_request",
+                    dispatch_start,
+                    dispatch_ms,
+                    "error",
+                    serde_json::json!({
+                        "model": model,
+                        "url": url.as_str(),
+                        "targets": total_targets,
+                        "error": last_err.clone().unwrap_or_default(),
+                    }),
+                );
+                t.finish("error");
+            }
             state.metrics.record_upstream_attempt("exhausted");
             let msg = last_err.unwrap_or_else(|| "upstream request failed".to_string());
             tracing::warn!(error = %msg, "upstream request failed after all attempts");
@@ -753,6 +895,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             };
             finalize(
                 &state,
+                request_id,
                 &resolved,
                 &req_meta,
                 &model,
@@ -853,6 +996,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                     let total_ms = request_start.elapsed().as_millis() as u32;
                     settle_request(
                         &stream_state,
+                        request_id,
                         &resolved_for_stream,
                         &meta_for_stream,
                         &model_for_stream,
@@ -875,6 +1019,9 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                     )
                     .await;
                 };
+                if let Some(t) = tracer.take() {
+                    t.finish(if status_code < 400 { "ok" } else { "error" });
+                }
                 let mut builder = Response::builder()
                     .status(status_code)
                     .header(header::CONTENT_TYPE, "text/event-stream")
@@ -946,6 +1093,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                     &req_meta.session_id,
                     req_timeout,
                     body_json,
+                    tracer.as_mut(),
                 )
                 .await;
                 warning = outcome.warning;
@@ -1000,6 +1148,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         };
         settle_request(
             &state,
+            request_id,
             &resolved,
             &req_meta,
             &model,
@@ -1032,9 +1181,18 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         if let Some(w) = warning {
             builder = builder.header(crate::boons::BOONS_WARNING_HEADER, w);
         }
+        if let Some(t) = tracer.take() {
+            t.finish(if status_code < 400 { "ok" } else { "error" });
+        }
         return builder.body(Body::from(final_body)).unwrap_or_else(|_| {
             error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
         });
+    }
+
+    // Finish the tracer before entering the async stream body — the stream macro
+    // cannot capture a non-Clone, non-Send value.
+    if let Some(t) = tracer.take() {
+        t.finish(if status_code < 400 { "ok" } else { "error" });
     }
 
     // ---- stream back, inspecting for actual usage, then reconcile ----
@@ -1111,6 +1269,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
 
         settle_request(
             &stream_state,
+            request_id,
             &resolved_for_stream,
             &meta_for_stream,
             &model,
@@ -1156,6 +1315,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
 #[allow(clippy::too_many_arguments)]
 async fn settle_request(
     state: &AppState,
+    request_id: Uuid,
     resolved: &ResolvedKey,
     meta: &RequestMeta,
     model: &str,
@@ -1278,6 +1438,7 @@ async fn settle_request(
 
     finalize(
         state,
+        request_id,
         resolved,
         meta,
         model,
@@ -2075,6 +2236,7 @@ fn extract_session_id(headers: &HeaderMap, json: &serde_json::Value) -> String {
 #[allow(clippy::too_many_arguments)]
 fn finalize(
     state: &AppState,
+    request_id: Uuid,
     resolved: &ResolvedKey,
     meta: &RequestMeta,
     model: &str,
@@ -2099,7 +2261,7 @@ fn finalize(
         return;
     }
     state.telemetry.record(UsageRecord {
-        request_id: Uuid::new_v4(),
+        request_id,
         tenant_id: resolved.tenant_id,
         key_id: resolved.key_id,
         model: model.to_string(),
@@ -2213,6 +2375,7 @@ mod tests {
             key_budget_started_at: None,
             allowed_models: None,
             internal: false,
+            tracing_enabled: false,
         }
     }
 

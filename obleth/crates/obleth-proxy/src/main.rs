@@ -12,6 +12,7 @@ mod state;
 
 mod boons;
 mod classifier;
+pub mod tracer;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -99,6 +100,14 @@ async fn main() -> anyhow::Result<()> {
         .build();
 
     let model_registry = router::ModelRegistry::new();
+
+    let (local_cache_tx, mut local_cache_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let key_cache_direct = key_cache.clone();
+    tokio::spawn(async move {
+        while let Some(hash) = local_cache_rx.recv().await {
+            key_cache_direct.invalidate(&hash).await;
+        }
+    });
 
     let http = reqwest::Client::builder()
         .pool_max_idle_per_host(256)
@@ -251,6 +260,7 @@ async fn main() -> anyhow::Result<()> {
         usage_retention_default_days: cfg.usage_retention_days,
         ssrf: obleth_admin::ssrf::SsrfPolicy::from_env(),
         alerts: alerts.clone(),
+        local_cache_tx: Some(local_cache_tx),
     };
     obleth_admin::model_health::spawn_worker(admin_state.clone());
     obleth_admin::usage_retention::spawn_worker(admin_state.clone());

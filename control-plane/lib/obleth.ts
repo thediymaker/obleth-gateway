@@ -41,6 +41,7 @@ export interface Tenant {
   budget_period: string | null;
   budget_started_at: string | null;
   allowed_models: string[] | null;
+  tracing_enabled: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -56,6 +57,7 @@ export interface ApiKey {
   budget_period: string | null;
   budget_started_at: string | null;
   disabled: boolean;
+  tracing_enabled: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -377,6 +379,18 @@ export interface UsageLogEntry {
   tenant_name: string;
   key_name: string;
   key_prefix: string;
+  has_trace: boolean;
+}
+
+/// One recorded span from the flight-recorder tracer for a single request.
+export interface SpanEntry {
+  request_id: string;
+  span_name: string;
+  parent_span: string;
+  start_ms: number;
+  duration_ms: number;
+  status: "ok" | "error";
+  attributes: string; // JSON string
 }
 
 export type UsageLogStatus = "success" | "error";
@@ -395,6 +409,8 @@ export interface UsageLogParams {
   beforeMs?: number;
   beforeRequestId?: string;
   limit?: number;
+  /** When true, only return log entries that have a recorded trace. */
+  tracedOnly?: boolean;
 }
 
 export interface UsageRetentionView {
@@ -896,6 +912,16 @@ export const obleth = {
       method: "PUT",
       body: JSON.stringify({ disabled }),
     }),
+  setKeyTracing: (id: string, tracing_enabled: boolean) =>
+    api<void>(`/keys/${id}/tracing`, {
+      method: "PUT",
+      body: JSON.stringify({ tracing_enabled }),
+    }),
+  setTenantTracing: (id: string, tracing_enabled: boolean) =>
+    api<void>(`/tenants/${id}/tracing`, {
+      method: "PUT",
+      body: JSON.stringify({ tracing_enabled }),
+    }),
   deleteKey: (id: string) => api<void>(`/keys/${id}`, { method: "DELETE" }),
   listModels: () =>
     api<ModelRoute[]>("/models", {
@@ -1144,8 +1170,11 @@ export const obleth = {
         before_ms: params.beforeMs,
         before_request_id: params.beforeRequestId,
         limit: params.limit,
+        traced_only: params.tracedOnly ? "true" : undefined,
       })}`,
     ),
+  getRequestSpans: (requestId: string) =>
+    api<SpanEntry[]>(`/usage/logs/${requestId}/spans`).catch(() => [] as SpanEntry[]),
   getUsageRetention: () => api<UsageRetentionView>("/settings/usage-retention"),
   setUsageRetention: (days: number) =>
     api<UsageRetentionView>("/settings/usage-retention", {

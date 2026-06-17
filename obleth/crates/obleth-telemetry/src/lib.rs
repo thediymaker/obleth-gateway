@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use clickhouse::{Client, Row};
 use obleth_config::UsageRecord;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -81,6 +81,45 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
     }
 }
 
+/// Public record type that the proxy constructs for each span.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpanRecord {
+    pub request_id: uuid::Uuid,
+    pub span_name: String,
+    pub parent_span: String,
+    pub start_ms: i64,
+    pub duration_ms: u32,
+    pub status: String,
+    pub attributes: String,
+}
+
+/// Borrowed ClickHouse row mirror of [`SpanRecord`] for batch insert.
+#[derive(Debug, Row, Serialize)]
+struct SpanRow<'a> {
+    #[serde(with = "clickhouse::serde::uuid")]
+    request_id: uuid::Uuid,
+    span_name: &'a str,
+    parent_span: &'a str,
+    start_ms: i64,
+    duration_ms: u32,
+    status: &'a str,
+    attributes: &'a str,
+}
+
+impl<'a> From<&'a SpanRecord> for SpanRow<'a> {
+    fn from(r: &'a SpanRecord) -> Self {
+        SpanRow {
+            request_id: r.request_id,
+            span_name: &r.span_name,
+            parent_span: &r.parent_span,
+            start_ms: r.start_ms,
+            duration_ms: r.duration_ms,
+            status: &r.status,
+            attributes: &r.attributes,
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct TelemetryStats {
     pub recorded: AtomicU64,
@@ -92,6 +131,7 @@ pub struct TelemetryStats {
 #[derive(Clone)]
 pub struct TelemetrySink {
     tx: mpsc::Sender<UsageRecord>,
+    tx_spans: mpsc::Sender<SpanRecord>,
     stats: Arc<TelemetryStats>,
 }
 
@@ -113,15 +153,21 @@ impl TelemetrySink {
         let client = client.with_database(database);
 
         let (tx, rx) = mpsc::channel(10_000);
+        let (tx_spans, rx_spans) = mpsc::channel::<SpanRecord>(10_000);
         let stats = Arc::new(TelemetryStats::default());
         let flusher = Flusher {
-            client,
+            client: client.clone(),
             wal_path: wal_path.to_string(),
             fail_open,
             stats: stats.clone(),
         };
+        let spans_flusher = SpansFlusher {
+            client,
+            stats: stats.clone(),
+        };
         tokio::spawn(flusher.run(rx));
-        Ok(TelemetrySink { tx, stats })
+        tokio::spawn(spans_flusher.run(rx_spans));
+        Ok(TelemetrySink { tx, tx_spans, stats })
     }
 
     pub fn stats(&self) -> Arc<TelemetryStats> {
@@ -139,6 +185,12 @@ impl TelemetrySink {
                 self.stats.dropped.fetch_add(1, Ordering::Relaxed);
             }
         }
+    }
+
+    /// Non-blocking span emit. Silently drops if the buffer is full so the hot
+    /// path is never stalled by the tracer.
+    pub fn record_span(&self, span: SpanRecord) {
+        let _ = self.tx_spans.try_send(span);
     }
 }
 
@@ -251,6 +303,62 @@ impl Flusher {
     }
 }
 
+struct SpansFlusher {
+    client: Client,
+    #[allow(dead_code)]
+    stats: Arc<TelemetryStats>,
+}
+
+impl SpansFlusher {
+    async fn run(self, mut rx: mpsc::Receiver<SpanRecord>) {
+        let mut buf: Vec<SpanRecord> = Vec::with_capacity(BATCH_MAX);
+        let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+        loop {
+            tokio::select! {
+                maybe = rx.recv() => {
+                    match maybe {
+                        Some(rec) => {
+                            buf.push(rec);
+                            if buf.len() >= BATCH_MAX {
+                                self.flush(&mut buf).await;
+                            }
+                        }
+                        None => {
+                            self.flush(&mut buf).await;
+                            break;
+                        }
+                    }
+                }
+                _ = ticker.tick() => {
+                    self.flush(&mut buf).await;
+                }
+            }
+        }
+    }
+
+    async fn flush(&self, buf: &mut Vec<SpanRecord>) {
+        if buf.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(buf);
+        let count = batch.len();
+        if let Err(e) = self.insert(&batch).await {
+            tracing::warn!(error = %e, count, "spans insert failed");
+        } else {
+            tracing::debug!(count, "spans flushed to ClickHouse");
+        }
+    }
+
+    async fn insert(&self, batch: &[SpanRecord]) -> Result<(), clickhouse::error::Error> {
+        let mut ins = self.client.insert("spans")?;
+        for rec in batch {
+            ins.write(&SpanRow::from(rec)).await?;
+        }
+        ins.end().await?;
+        Ok(())
+    }
+}
+
 /// True when `name` is a safe bare SQL identifier (letters, digits, underscore,
 /// not starting with a digit). Used to guard identifiers that must be string-
 /// interpolated into ClickHouse DDL.
@@ -344,6 +452,23 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
         .execute()
         .await?;
     ensure_daily_rollup(client, database).await?;
+    client
+        .query(&format!(
+            "CREATE TABLE IF NOT EXISTS {database}.spans (
+                request_id  UUID,
+                span_name   LowCardinality(String),
+                parent_span String DEFAULT '',
+                start_ms    Int64,
+                duration_ms UInt32,
+                status      LowCardinality(String) DEFAULT 'ok',
+                attributes  String DEFAULT ''
+            ) ENGINE = MergeTree()
+            PARTITION BY toYYYYMMDD(fromUnixTimestamp64Milli(start_ms))
+            ORDER BY (request_id, start_ms)
+            TTL toDate(fromUnixTimestamp64Milli(start_ms)) + INTERVAL 14 DAY DELETE"
+        ))
+        .execute()
+        .await?;
     Ok(())
 }
 

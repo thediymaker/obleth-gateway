@@ -15,35 +15,36 @@ use serde_json::{json, Value};
 use crate::state::AppState;
 
 /// Rewrite image content parts into text descriptions using the configured
-/// describer model. Returns `true` when at least one image was described.
+/// describer model. Returns the number of images successfully described (0 when
+/// none were described or the boon was skipped).
 pub(super) async fn apply(
     state: &AppState,
     cfg: &VisionBoonSettings,
     key: &ResolvedKey,
     session_id: &str,
     json: &mut Value,
-) -> bool {
+) -> u32 {
     let Some(model_name) = cfg.fallback_model.as_deref() else {
-        return false;
+        return 0;
     };
     // Cheap pre-check: bail before resolving the describer if there is nothing
     // to describe.
     if !has_image(json) {
-        return false;
+        return 0;
     }
     let Some(describer) = crate::proxy::resolve_model(state, model_name).await else {
         tracing::warn!(
             model = %model_name,
             "vision boon describer is not registered; forwarding request unchanged"
         );
-        return false;
+        return 0;
     };
     if !describer.enabled {
         tracing::warn!(
             model = %model_name,
             "vision boon describer is disabled; forwarding request unchanged"
         );
-        return false;
+        return 0;
     }
 
     let timeout = Duration::from_millis(cfg.timeout_ms.max(1));
@@ -53,7 +54,7 @@ pub(super) async fn apply(
     let mut targets: Vec<(usize, usize, String)> = Vec::new();
     {
         let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
-            return false;
+            return 0;
         };
         'collect: for (mi, msg) in messages.iter().enumerate() {
             let Some(parts) = msg.get("content").and_then(|c| c.as_array()) else {
@@ -77,7 +78,7 @@ pub(super) async fn apply(
         }
     }
     if targets.is_empty() {
-        return false;
+        return 0;
     }
 
     // Pass 2: describe all images concurrently (the set is already bounded by
@@ -131,7 +132,7 @@ pub(super) async fn apply(
         }
     }
 
-    described > 0
+    described
 }
 
 /// The chat-completions body sent to the describer for a single image.

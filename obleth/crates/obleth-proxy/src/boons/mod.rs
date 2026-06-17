@@ -129,6 +129,7 @@ impl BoonEngine {
         opt_out: bool,
         is_chat: bool,
         json: &mut Value,
+        mut tracer: Option<&mut crate::tracer::SpanRecorder>,
     ) -> EnrichOutcome {
         let mut outcome = EnrichOutcome::default();
         if opt_out {
@@ -146,10 +147,25 @@ impl BoonEngine {
         if route.boons.iter().any(|b| b == "vision")
             && !route.supports_vision
             && settings.vision.active()
-            && vision::apply(state, &settings.vision, key, session_id, json).await
         {
-            outcome.rewritten = true;
-            outcome.applied.push("vision");
+            let vision_start = crate::tracer::now_ms();
+            let images_described = vision::apply(state, &settings.vision, key, session_id, json).await;
+            if let Some(t) = tracer.as_deref_mut() {
+                t.record_elapsed(
+                    "boon:vision",
+                    "proxy_request",
+                    vision_start,
+                    "ok",
+                    serde_json::json!({
+                        "images": images_described,
+                        "describer": settings.vision.fallback_model.as_deref().unwrap_or(""),
+                    }),
+                );
+            }
+            if images_described > 0 {
+                outcome.rewritten = true;
+                outcome.applied.push("vision");
+            }
         }
 
         // The tools/structured boons and the tool loop only make sense for
@@ -209,9 +225,19 @@ impl BoonEngine {
             && !route.supports_response_schema
             && settings.structured_output.active()
         {
+            let structured_start = crate::tracer::now_ms();
             if let Some(plan) =
                 structured::apply(json, route.supports_system_messages)
             {
+                if let Some(t) = tracer.as_deref_mut() {
+                    t.record_elapsed(
+                        "boon:structured_repair",
+                        "proxy_request",
+                        structured_start,
+                        "ok",
+                        serde_json::json!({}),
+                    );
+                }
                 outcome.rewritten = true;
                 outcome.applied.push("structured_output");
                 structured_plan = Some(StructuredPlan {

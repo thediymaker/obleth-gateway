@@ -520,6 +520,20 @@ export async function toggleKeyAction(id: string, disabled: boolean) {
   revalidatePath("/keys");
 }
 
+export async function toggleKeyTracingAction(id: string, tracing_enabled: boolean) {
+  await requireSession();
+  await obleth.setKeyTracing(id, tracing_enabled);
+  updateTag(CACHE_TAGS.keys);
+  revalidatePath("/keys");
+}
+
+export async function toggleTenantTracingAction(id: string, tracing_enabled: boolean) {
+  await requireSession();
+  await obleth.setTenantTracing(id, tracing_enabled);
+  updateTag(CACHE_TAGS.tenants);
+  revalidatePath("/tenants");
+}
+
 export async function deleteKeyAction(id: string) {
   await requireSession();
   await obleth.deleteKey(id);

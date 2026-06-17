@@ -47,6 +47,7 @@ type Result<T> = std::result::Result<T, StoreError>;
 /// Embedded idempotent schema, applied on boot. A versioned copy also lives in
 /// `schema/postgres/` for operators who manage migrations out of band.
 const SCHEMA: &str = include_str!("../../../../schema/postgres/0001_init.sql");
+const SCHEMA_V2: &str = include_str!("../../../../schema/postgres/0002_tracing_flag.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -109,7 +110,12 @@ impl Store {
             .bind(MIGRATE_LOCK_KEY)
             .execute(&mut *conn)
             .await?;
-        let result = sqlx::raw_sql(SCHEMA).execute(&mut *conn).await;
+        let result: Result<()> = async {
+            sqlx::raw_sql(SCHEMA).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V2).execute(&mut *conn).await?;
+            Ok(())
+        }
+        .await;
         // Always release the lock, even if the schema apply failed.
         let _ = sqlx::query("select pg_advisory_unlock($1)")
             .bind(MIGRATE_LOCK_KEY)
@@ -206,7 +212,7 @@ impl Store {
 
     pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
         let rows = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, tracing_enabled, created_at, updated_at
              from tenants order by created_at",
         )
         .fetch_all(&self.pool)
@@ -216,7 +222,7 @@ impl Store {
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Tenant> {
         let row = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, tracing_enabled, created_at, updated_at
              from tenants where id = $1",
         )
         .bind(id)
@@ -430,7 +436,7 @@ impl Store {
              values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              returning id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, created_at, updated_at",
+                    disabled, tracing_enabled, created_at, updated_at",
         )
         .bind(Uuid::new_v4())
         .bind(tenant_id)
@@ -453,7 +459,7 @@ impl Store {
                 sqlx::query(
                     "select id, tenant_id, name, description, key_prefix,
                             budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                            disabled, created_at, updated_at
+                            disabled, tracing_enabled, created_at, updated_at
                      from api_keys where tenant_id = $1 order by created_at",
                 )
                 .bind(t)
@@ -464,7 +470,7 @@ impl Store {
                 sqlx::query(
                     "select id, tenant_id, name, description, key_prefix,
                             budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                            disabled, created_at, updated_at
+                            disabled, tracing_enabled, created_at, updated_at
                      from api_keys order by created_at",
                 )
                 .fetch_all(&self.pool)
@@ -484,7 +490,7 @@ impl Store {
         let rows = sqlx::query(
             "select id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, created_at, updated_at
+                    disabled, tracing_enabled, created_at, updated_at
              from api_keys where id = any($1)",
         )
         .bind(ids)
@@ -515,7 +521,7 @@ impl Store {
              where id = $1
              returning key_hash, id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, created_at, updated_at",
+                    disabled, tracing_enabled, created_at, updated_at",
         )
         .bind(id)
         .bind(name)
@@ -557,6 +563,44 @@ impl Store {
         Ok((hash, resolved))
     }
 
+    pub async fn set_key_tracing(
+        &self,
+        id: Uuid,
+        tracing_enabled: bool,
+    ) -> Result<(String, ResolvedKey)> {
+        let row = sqlx::query(
+            "update api_keys set tracing_enabled = $2, updated_at = now() \
+             where id = $1 returning key_hash",
+        )
+        .bind(id)
+        .bind(tracing_enabled)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        let hash: String = row.try_get("key_hash")?;
+        let resolved = self
+            .resolved_key_by_hash(&hash)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        Ok((hash, resolved))
+    }
+
+    pub async fn set_tenant_tracing(
+        &self,
+        id: Uuid,
+        tracing_enabled: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            "update tenants set tracing_enabled = $2, updated_at = now() where id = $1 returning id",
+        )
+        .bind(id)
+        .bind(tracing_enabled)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        Ok(())
+    }
+
     pub async fn delete_key(&self, id: Uuid) -> Result<String> {
         let row = sqlx::query("delete from api_keys where id = $1 returning key_hash")
             .bind(id)
@@ -578,7 +622,8 @@ impl Store {
                     k.budget_cost_usd as key_budget_cost_usd,
                     k.budget_period as key_budget_period,
                     k.budget_started_at as key_budget_started_at,
-                    t.allowed_models
+                    t.allowed_models,
+                    (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group
@@ -602,7 +647,8 @@ impl Store {
                     k.budget_cost_usd as key_budget_cost_usd,
                     k.budget_period as key_budget_period,
                     k.budget_started_at as key_budget_started_at,
-                    t.allowed_models
+                    t.allowed_models,
+                    (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group",
@@ -630,7 +676,8 @@ impl Store {
                     k.budget_cost_usd as key_budget_cost_usd,
                     k.budget_period as key_budget_period,
                     k.budget_started_at as key_budget_started_at,
-                    t.allowed_models
+                    t.allowed_models,
+                    (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group
@@ -2176,6 +2223,7 @@ fn tenant_from_row(row: &PgRow) -> Result<Tenant> {
         budget_period: row.try_get("budget_period")?,
         budget_started_at: row.try_get("budget_started_at")?,
         allowed_models: allowed_models_from_row(row)?,
+        tracing_enabled: row.try_get("tracing_enabled").unwrap_or(false),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -2216,6 +2264,7 @@ fn api_key_from_row(row: &PgRow) -> Result<ApiKey> {
         budget_period: row.try_get("budget_period")?,
         budget_started_at: row.try_get("budget_started_at")?,
         disabled: row.try_get("disabled")?,
+        tracing_enabled: row.try_get("tracing_enabled").unwrap_or(false),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -2247,6 +2296,7 @@ fn resolved_from_row(row: &PgRow) -> Result<ResolvedKey> {
         key_budget_started_at: row.try_get("key_budget_started_at")?,
         allowed_models: allowed_models_from_row(row)?,
         internal: false,
+        tracing_enabled: row.try_get::<bool, _>("tracing_enabled").unwrap_or(false),
     })
 }
 

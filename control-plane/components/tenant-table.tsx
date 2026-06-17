@@ -24,6 +24,7 @@ import {
   setTenantBudgetAction,
   setTenantScheduleAction,
   setTenantStatusAction,
+  toggleTenantTracingAction,
   updateTenantAction,
 } from "@/app/actions";
 import { CreateTenant } from "@/components/create-tenant";
@@ -499,6 +500,21 @@ function TenantDetailPanel({
                   onSaved={flashSaved}
                 />
               </div>
+            </SettingRow>
+            <SettingRow
+              label="Request tracing"
+              hint="Record per-hop span data for all requests made by this tenant's keys. Individual keys can also enable tracing independently."
+            >
+              <Button
+                type="button"
+                variant={tenant.tracing_enabled ? "default" : "outline"}
+                size="sm"
+                disabled={pending}
+                className={tenant.tracing_enabled ? "border border-emerald-500/40 bg-emerald-950/40 text-emerald-400 hover:bg-emerald-950/60" : ""}
+                onClick={() => start(() => toggleTenantTracingAction(tenant.id, !tenant.tracing_enabled))}
+              >
+                {tenant.tracing_enabled ? "⬡ Tracing on" : "Tracing off"}
+              </Button>
             </SettingRow>
           </div>
         </PanelCard>
