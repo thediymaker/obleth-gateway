@@ -753,17 +753,22 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_any_healthy_endpoint_is_healthy() {
+    fn aggregate_all_serving_is_healthy() {
+        // healthy and degraded both count as "serving"; all-serving → healthy
         let results = vec![
-            ProbeResult::unhealthy(None, None, "down".into()),
             ProbeResult::healthy(None, None, "up".into()),
+            ProbeResult::degraded(None, None, "model-id-mismatch".into()),
         ];
         assert_eq!(aggregate_endpoint_health(&results).status, "healthy");
     }
 
     #[test]
-    fn aggregate_only_degraded_is_degraded() {
-        let results = vec![ProbeResult::degraded(None, None, "404".into())];
+    fn aggregate_partial_serving_is_degraded() {
+        // some (but not all) endpoints serving → degraded (partial capacity)
+        let results = vec![
+            ProbeResult::unhealthy(None, None, "down".into()),
+            ProbeResult::degraded(None, None, "model-id-mismatch".into()),
+        ];
         assert_eq!(aggregate_endpoint_health(&results).status, "degraded");
     }
 
