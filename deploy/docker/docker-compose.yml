@@ -9,8 +9,10 @@ name: obleth
 #   observability -> Prometheus + Grafana + Jaeger (OTLP traces)
 #   slurm         -> obleth-provisioner plugin (keeps managed models alive on Slurm)
 #
-# Enable extras per-command:    docker compose --profile benchmark --profile observability up
-# Or set COMPOSE_PROFILES in .env (see .env.example) to default them on for dev.
+# Enable extras via config: add them to COMPOSE_PROFILES in .env (see
+# .env.example), then a single `docker compose up -d --build` (run from this
+# directory) builds and starts them — no --profile flag needed. You can still
+# opt in ad hoc per-command:    docker compose --profile slurm up -d
 #
 # First-party services declare both image: (published to GHCR by the release
 # workflow) and build: (local source). `docker compose pull && up -d` runs the
@@ -140,13 +142,14 @@ services:
       clickhouse: { condition: service_healthy }
 
   # Optional Slurm provisioner plugin. NOT part of the core stack: gated behind
-  # the `slurm` profile, so it only starts when explicitly enabled with
-  # `docker compose --profile slurm up -d obleth-provisioner`. It keeps each
-  # enabled managed model at its target replica count on a preemptible Slurm
-  # cluster via slurmrestd. All cluster specifics are per-model (Management API).
-  # The slurmrestd connection details + the master enable switch now live in
-  # system-wide settings (dashboard → Settings → Slurm), fetched from the
-  # Management API each tick — so this service only needs to reach the admin API.
+  # the `slurm` profile. Opt in by adding `slurm` to COMPOSE_PROFILES in .env
+  # (config), then it builds and starts with the same one command as the rest of
+  # the stack (`docker compose up -d --build`). It keeps each enabled managed
+  # model at its target replica count on a preemptible Slurm cluster via
+  # slurmrestd. All cluster specifics are per-model (Management API). The
+  # slurmrestd connection details + the master enable switch live in system-wide
+  # settings (dashboard → Settings → Slurm), fetched from the Management API each
+  # tick — so this service only needs to reach the admin API.
   obleth-provisioner:
     profiles: ["slurm"]
     image: ghcr.io/thediymaker/obleth-gateway/obleth-provisioner:${OBLETH_VERSION:-latest}

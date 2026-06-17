@@ -45,7 +45,10 @@ pub fn plan(
             }
             Some(JobState::Running) => {
                 alive += 1;
-                if r.state == "starting" {
+                // "pending" replicas haven't been probed yet (they were waiting for
+                // the job to leave Slurm-PENDING); treat them the same as "starting"
+                // so they get promoted as soon as the health check passes.
+                if r.state == "starting" || r.state == "pending" {
                     if health.get(&r.id).copied().unwrap_or(false) {
                         let node = jobs
                             .get(&r.slurm_job_id)
@@ -53,7 +56,7 @@ pub fn plan(
                             .unwrap_or_default();
                         actions.push(Action::Promote {
                             replica_id: r.id,
-                            api_base: format!("http://{node}:{serving_port}"),
+                            api_base: endpoint_api_base(&node, serving_port),
                         });
                     }
                     cancellable.push((r.id, r.slurm_job_id.clone(), 1, r.age_secs));
@@ -80,6 +83,20 @@ pub fn plan(
     }
 
     actions
+}
+
+/// Build the OpenAI-compatible `api_base` for a promoted replica's endpoint.
+///
+/// The rest of the gateway treats `api_base` as the OpenAI **root** (every
+/// statically-registered model uses `https://host/v1`), and the model health
+/// check appends `/models` to it expecting `…/v1/models`. Inference servers
+/// (vLLM, Ollama, SGLang, LiteLLM) all serve their OpenAI surface under `/v1`,
+/// so we register the node endpoint at that root. The data-plane URL builder
+/// dedups a leading `/v1` in the request path, so this stays correct for proxy
+/// traffic too. (The provisioner's *own* liveness probe uses the spec's
+/// `health_path` against the bare node — that is a separate, native check.)
+fn endpoint_api_base(node: &str, serving_port: i64) -> String {
+    format!("http://{node}:{serving_port}/v1")
 }
 
 /// The slice of ManagedModelSpec the planner needs (keeps it decoupled from the
@@ -125,7 +142,7 @@ mod tests {
         let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
         let health = HashMap::from([(id, true)]);
         let actions = plan(&spec(1), &[r], &jobs, &health, 8000, 900);
-        assert_eq!(actions, vec![Action::Promote { replica_id: id, api_base: "http://gpu7:8000".into() }]);
+        assert_eq!(actions, vec![Action::Promote { replica_id: id, api_base: "http://gpu7:8000/v1".into() }]);
     }
 
     #[test]
@@ -158,6 +175,29 @@ mod tests {
         let jobs = HashMap::from([job("j1", JobState::Running, &["n1"]), job("j2", JobState::Pending, &["",])]);
         let actions = plan(&spec(1), &[healthy, pending], &jobs, &HashMap::new(), 8000, 900);
         assert_eq!(actions, vec![Action::Cancel { replica_id: pid, job_id: "j2".into() }]);
+    }
+
+    #[test]
+    fn pending_replica_with_running_job_is_promoted_when_healthy() {
+        // Replicas are created in "pending" state. Once the Slurm job transitions
+        // to Running they should be promoted directly (no separate MarkStarting
+        // step), just like a "starting" replica would be.
+        let r = rv("pending", "j1", None, 30);
+        let id = r.id;
+        let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
+        let health = HashMap::from([(id, true)]);
+        let actions = plan(&spec(1), &[r], &jobs, &health, 8000, 900);
+        assert_eq!(actions, vec![Action::Promote { replica_id: id, api_base: "http://gpu7:8000/v1".into() }]);
+    }
+
+    #[test]
+    fn pending_replica_with_running_job_and_unhealthy_does_not_promote() {
+        let r = rv("pending", "j1", None, 30);
+        let id = r.id;
+        let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
+        let health = HashMap::from([(id, false)]);
+        let actions = plan(&spec(1), &[r], &jobs, &health, 8000, 900);
+        assert!(actions.is_empty(), "got {actions:?}");
     }
 
     #[test]

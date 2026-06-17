@@ -54,6 +54,15 @@ const requiredText = (message: string) =>
 const optionalText = z.preprocess(trimmed, z.string());
 const checkbox = z.preprocess((v) => v === "on", z.boolean());
 
+function normalizeModelApiName(value: unknown) {
+  return trimmed(value)
+    .toLowerCase()
+    .replace(/[\s_]+/g, "-")
+    .replace(/[^a-z0-9.-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "");
+}
+
 /** Optional positive integer (absent when the field is blank). */
 const optionalPositiveInt = z.preprocess(
   blankToUndef,
@@ -132,8 +141,19 @@ const modelFieldsSchema = {
   supports_tool_choice: checkbox,
 };
 
+const modelApiName = z.preprocess(
+  normalizeModelApiName,
+  z
+    .string()
+    .min(1, "API model name is required")
+    .regex(
+      /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/,
+      "API model name can use lowercase letters, numbers, dashes, and dots.",
+    ),
+);
+
 const modelCreateSchema = z.object({
-  model_name: requiredText("Model name is required"),
+  model_name: modelApiName,
   ...modelFieldsSchema,
 });
 

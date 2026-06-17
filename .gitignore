@@ -35,6 +35,10 @@ docs/superpowers
 .env.*
 !.env.example
 
+# ---- local per-machine compose overrides (may contain cluster node IPs) ----
+docker-compose.override.yml
+docker-compose.override.yaml
+
 # ---- editor / OS ----
 .DS_Store
 Thumbs.db
@@ -44,3 +48,4 @@ Thumbs.db
 *.swo
 *~
 
+deploy/docker/docker-compose.override.yml

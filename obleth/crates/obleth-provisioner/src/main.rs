@@ -110,16 +110,36 @@ async fn tick(
             }
         };
 
-        // probe only the starting replicas that have a running job
+        // probe starting and pending replicas that have a running job.
+        // "pending" means the job was submitted but we haven't seen it Running yet;
+        // once Slurm transitions the job to Running, the replica is still "pending"
+        // (there is no separate MarkStarting step), so we must probe both states.
         let mut health = HashMap::new();
         for r in &replicas {
-            if r.state == "starting" {
+            if r.state == "starting" || r.state == "pending" {
                 if let Some(j) = jobs.get(&r.slurm_job_id) {
                     if j.state == domain::JobState::Running {
-                        if let Some(node) = j.nodes.first() {
-                            let api_base = format!("http://{node}:{}", spec.serving_port);
-                            let ok = probe::is_healthy(http, &api_base, &spec.health_path, cfg.health_timeout_secs).await;
-                            health.insert(r.id, ok);
+                        match j.nodes.first() {
+                            None => {
+                                tracing::warn!(
+                                    replica_id = %r.id,
+                                    job_id = %r.slurm_job_id,
+                                    "job is RUNNING but slurmrestd returned no nodes; \
+                                     cannot probe health — check slurmrestd response"
+                                );
+                            }
+                            Some(node) => {
+                                let api_base = format!("http://{node}:{}", spec.serving_port);
+                                let ok = probe::is_healthy(http, &api_base, &spec.health_path, cfg.health_timeout_secs).await;
+                                tracing::info!(
+                                    replica_id = %r.id,
+                                    job_id = %r.slurm_job_id,
+                                    %api_base,
+                                    healthy = ok,
+                                    "health probe"
+                                );
+                                health.insert(r.id, ok);
+                            }
                         }
                     }
                 }

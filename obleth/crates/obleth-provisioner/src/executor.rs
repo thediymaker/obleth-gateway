@@ -28,6 +28,7 @@ pub async fn apply(
             obleth.create_replica(model_id, &job_id).await?;
         }
         Action::Promote { replica_id, api_base } => {
+            tracing::info!(%replica_id, %api_base, model = model_name, "promoting replica to healthy");
             let name = format!("{job_prefix}{model_name}-{replica_id}");
             // Idempotent: reuse an existing endpoint with this deterministic name
             // (e.g. when a prior tick created it but failed to patch the replica),

@@ -135,15 +135,21 @@ the enable switch — the running provisioner picks it up on the next tick.
 
 ### Docker Compose
 
-The provisioner is gated behind the `slurm` profile, so it never starts unless
-you explicitly enable it:
+The provisioner is gated behind the `slurm` profile. Opt in via **config** — add
+`slurm` to `COMPOSE_PROFILES` in `deploy/docker/.env` (see `.env.example`) — and
+it builds and starts with the same one command as the rest of the stack:
 
 ```sh
-docker compose --profile slurm up -d obleth-provisioner
+cd deploy/docker
+docker compose up -d --build      # builds + starts everything, provisioner included
+docker compose down               # tears it all down
 ```
 
-It only needs `OBLETH_ADMIN_TOKEN` (already set for the core stack) — the Slurm
-connection details are configured in the dashboard, not in `deploy/docker/.env`.
+Running from `deploy/docker/` (no `-f` flags) lets Compose auto-load `.env` (so
+the profile activates) and auto-merge a local `docker-compose.override.yml` if
+you use one. The container only needs `OBLETH_ADMIN_TOKEN` (already set for the
+core stack) — the Slurm connection details are configured in the dashboard, not
+in `.env`.
 
 ### systemd
 
@@ -156,3 +162,13 @@ sudo cp obleth/target/release/obleth-provisioner /usr/local/bin/
 sudo systemctl daemon-reload
 sudo systemctl enable --now obleth-provisioner
 ```
+
+## Documentation
+
+Full setup, Apptainer image requirements, the per-model spec reference, and
+troubleshooting (node reachability, the two health systems, the `/v1` endpoint
+convention) live in the docs:
+[Slurm Provisioning guide](https://github.com/thediymaker/obleth-gateway) →
+`obleth-docs` · `contents/docs/guides/slurm-provisioning`.
+
+
