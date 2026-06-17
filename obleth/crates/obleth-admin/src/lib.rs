@@ -12,6 +12,7 @@ mod backup;
 mod error;
 pub mod model_health;
 mod openapi;
+pub mod slurm_settings;
 pub mod ssrf;
 mod usage;
 pub mod usage_retention;
@@ -22,11 +23,11 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header::AUTHORIZATION, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
-use axum::routing::{delete, get, patch, post, put};
+use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
 use obleth_config::{
-    hash_api_key, ApiKey, FairshareGroup, McpServer, ModelEndpoint, ModelRoute, ResolvedKey,
-    ResolvedMcpServer, ResolvedModel, Tenant,
+    hash_api_key, ApiKey, FairshareGroup, ManagedModelSpec, McpServer, ModelEndpoint, ModelReplica,
+    ModelRoute, ResolvedKey, ResolvedMcpServer, ResolvedModel, Tenant,
 };
 use obleth_config::{
     AlertSettings, AutoRouterSettings, BoonSettings, EmailSettings, StructuredOutputBoonSettings,
@@ -93,7 +94,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/tenants/:id/quota", put(put_quota))
         .route("/api/v1/tenants/:id/keys", post(create_key))
         .route("/api/v1/keys", get(list_keys))
-        .route("/api/v1/keys/:id", delete(delete_key))
+        .route("/api/v1/keys/:id", put(update_key).delete(delete_key))
         .route("/api/v1/keys/:id/disabled", put(set_key_disabled))
         .route("/api/v1/keys/:id/usage", get(get_key_usage))
         .route("/api/v1/usage", get(get_usage))
@@ -105,10 +106,7 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/usage/series/tenants",
             get(get_usage_series_tenants),
         )
-        .route(
-            "/api/v1/usage/series/models",
-            get(get_usage_series_models),
-        )
+        .route("/api/v1/usage/series/models", get(get_usage_series_models))
         .route("/api/v1/usage/breakdown", get(get_usage_breakdown))
         .route("/api/v1/usage/cache", get(get_cache_stats))
         .route("/api/v1/usage/logs", get(get_usage_logs))
@@ -157,6 +155,22 @@ pub fn router(state: AdminState) -> Router {
         )
         .route("/api/v1/models/:id/cache", put(set_model_cache))
         .route("/api/v1/models/:id/reliability", put(set_model_reliability))
+        .route("/api/v1/managed", get(list_managed_models))
+        .route(
+            "/api/v1/models/:id/managed",
+            get(get_managed_model)
+                .put(put_managed_model)
+                .delete(delete_managed_model),
+        )
+        .route("/api/v1/replicas", get(list_all_replicas))
+        .route(
+            "/api/v1/replicas/:id",
+            patch(patch_replica).delete(delete_replica),
+        )
+        .route(
+            "/api/v1/models/:id/replicas",
+            get(list_replicas).post(create_replica),
+        )
         .route(
             "/api/v1/models/:id/endpoints",
             get(list_model_endpoints).post(create_model_endpoint),
@@ -193,6 +207,18 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/api/v1/settings/usage-retention",
             get(get_usage_retention).put(put_usage_retention),
+        )
+        .route(
+            "/api/v1/settings/slurm",
+            get(slurm_settings::get_slurm_settings).put(slurm_settings::put_slurm_settings),
+        )
+        .route(
+            "/api/v1/settings/slurm/test",
+            post(slurm_settings::test_slurm_settings),
+        )
+        .route(
+            "/api/v1/settings/slurm/resolved",
+            get(slurm_settings::get_slurm_settings_resolved),
         )
         .route("/api/v1/backup/export", get(backup::export_backup))
         .route(
@@ -322,6 +348,39 @@ pub struct UpdateQuota {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateKey {
     pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Cumulative token ceiling for the current key term. `null` clears the cap.
+    #[serde(default)]
+    pub budget_tokens: Option<i64>,
+    /// Cumulative USD-cost ceiling for the current key term. `null` clears the cap.
+    #[serde(default)]
+    pub budget_cost_usd: Option<f64>,
+    /// Reset period: `lifetime`, `monthly`, or `term`. `null` = lifetime.
+    #[serde(default)]
+    pub budget_period: Option<String>,
+    /// When the current key term began.
+    #[serde(default)]
+    pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateKey {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Cumulative token ceiling for the current key term. `null` clears the cap.
+    #[serde(default)]
+    pub budget_tokens: Option<i64>,
+    /// Cumulative USD-cost ceiling for the current key term. `null` clears the cap.
+    #[serde(default)]
+    pub budget_cost_usd: Option<f64>,
+    /// Reset period: `lifetime`, `monthly`, or `term`. `null` = lifetime.
+    #[serde(default)]
+    pub budget_period: Option<String>,
+    /// When the current key term began.
+    #[serde(default)]
+    pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -334,6 +393,46 @@ pub struct CreatedKey {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetDisabled {
     pub disabled: bool,
+}
+
+fn normalize_budget_fields(
+    budget_tokens: Option<i64>,
+    budget_cost_usd: Option<f64>,
+    budget_period: Option<&str>,
+    budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    token_field: &str,
+    cost_field: &str,
+    period_field: &str,
+) -> Result<(Option<String>, Option<chrono::DateTime<chrono::Utc>>)> {
+    let period = match budget_period.map(str::trim) {
+        None | Some("") => None,
+        Some(p) => {
+            let p = p.to_lowercase();
+            if !matches!(p.as_str(), "lifetime" | "monthly" | "term") {
+                return Err(AdminError::BadRequest(format!(
+                    "{period_field} must be one of: lifetime, monthly, term",
+                )));
+            }
+            Some(p)
+        }
+    };
+    if let Some(tokens) = budget_tokens {
+        if tokens < 0 {
+            return Err(AdminError::BadRequest(format!(
+                "{token_field} must be non-negative",
+            )));
+        }
+    }
+    if let Some(cost) = budget_cost_usd {
+        if cost < 0.0 || !cost.is_finite() {
+            return Err(AdminError::BadRequest(format!(
+                "{cost_field} must be a non-negative number",
+            )));
+        }
+    }
+    let started_at = budget_started_at
+        .or_else(|| (budget_tokens.is_some() || budget_cost_usd.is_some()).then(chrono::Utc::now));
+    Ok((period, started_at))
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -535,6 +634,58 @@ fn default_endpoint_weight() -> i64 {
 
 fn default_true() -> bool {
     true
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct PutManagedModel {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    partition: String,
+    #[serde(default)]
+    gres: String,
+    #[serde(default = "one")]
+    nodes: i64,
+    constraints: Option<String>,
+    exclude: Option<String>,
+    account: Option<String>,
+    qos: Option<String>,
+    time_limit: Option<String>,
+    image: String,
+    #[serde(default)]
+    preamble: String,
+    #[serde(default)]
+    log_output_dir: String,
+    launch_command: String,
+    serving_port: i64,
+    #[serde(default = "default_health_path")]
+    health_path: String,
+    #[serde(default = "two")]
+    target_replicas: i64,
+    #[serde(default)]
+    max_job_failures: i64,
+}
+fn one() -> i64 {
+    1
+}
+fn two() -> i64 {
+    2
+}
+fn default_health_path() -> String {
+    "/health".into()
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct CreateReplica {
+    slurm_job_id: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct PatchReplica {
+    state: Option<String>,
+    message: Option<String>,
+    nodes: Option<String>,
+    #[schema(value_type = Option<String>)]
+    endpoint_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -825,36 +976,15 @@ async fn patch_tenant_budget(
     Path(id): Path<Uuid>,
     Json(body): Json<SetTenantBudget>,
 ) -> Result<Json<Tenant>> {
-    let period = match body.budget_period.as_deref().map(str::trim) {
-        None | Some("") => None,
-        Some(p) => {
-            let p = p.to_lowercase();
-            if !matches!(p.as_str(), "lifetime" | "monthly" | "term") {
-                return Err(AdminError::BadRequest(
-                    "budget_period must be one of: lifetime, monthly, term".into(),
-                ));
-            }
-            Some(p)
-        }
-    };
-    if let Some(tokens) = body.budget_tokens {
-        if tokens < 0 {
-            return Err(AdminError::BadRequest(
-                "budget_tokens must be non-negative".into(),
-            ));
-        }
-    }
-    if let Some(cost) = body.budget_cost_usd {
-        if cost < 0.0 || !cost.is_finite() {
-            return Err(AdminError::BadRequest(
-                "budget_cost_usd must be a non-negative number".into(),
-            ));
-        }
-    }
-    // Default the term start to now when a cap is set without an explicit start.
-    let started_at = body.budget_started_at.or_else(|| {
-        (body.budget_tokens.is_some() || body.budget_cost_usd.is_some()).then(chrono::Utc::now)
-    });
+    let (period, started_at) = normalize_budget_fields(
+        body.budget_tokens,
+        body.budget_cost_usd,
+        body.budget_period.as_deref(),
+        body.budget_started_at,
+        "budget_tokens",
+        "budget_cost_usd",
+        "budget_period",
+    )?;
     let tenant = state
         .store
         .update_tenant_budget(
@@ -1301,11 +1431,7 @@ async fn put_boon_settings(
         Some(p) => p.to_string(),
     };
 
-    let fixer_model = match body
-        .structured_output_fixer_model
-        .as_deref()
-        .map(str::trim)
-    {
+    let fixer_model = match body.structured_output_fixer_model.as_deref().map(str::trim) {
         Some("") => None,
         Some(m) => Some(m.to_string()),
         None => existing.structured_output.fixer_model.clone(),
@@ -1498,7 +1624,32 @@ async fn create_key(
     Path(tenant_id): Path<Uuid>,
     Json(body): Json<CreateKey>,
 ) -> Result<Json<CreatedKey>> {
-    let (key, secret) = state.store.create_api_key(tenant_id, &body.name).await?;
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err(AdminError::BadRequest("key name is required".into()));
+    }
+    let description = body.description.trim().to_string();
+    let (period, started_at) = normalize_budget_fields(
+        body.budget_tokens,
+        body.budget_cost_usd,
+        body.budget_period.as_deref(),
+        body.budget_started_at,
+        "budget_tokens",
+        "budget_cost_usd",
+        "budget_period",
+    )?;
+    let (key, secret) = state
+        .store
+        .create_api_key(
+            tenant_id,
+            &name,
+            &description,
+            body.budget_tokens,
+            body.budget_cost_usd,
+            period.as_deref(),
+            started_at,
+        )
+        .await?;
     let hash = hash_api_key(&secret);
     if let Some(resolved) = state.store.resolved_key_by_hash(&hash).await? {
         push_key(&state, &hash, &resolved).await?;
@@ -1510,7 +1661,14 @@ async fn create_key(
             "create_key",
             "api_key",
             &key.id.to_string(),
-            serde_json::json!({ "tenant_id": tenant_id, "prefix": key.key_prefix }),
+            serde_json::json!({
+                "tenant_id": tenant_id,
+                "prefix": key.key_prefix,
+                "budget_tokens": key.budget_tokens,
+                "budget_cost_usd": key.budget_cost_usd,
+                "budget_period": key.budget_period,
+                "budget_started_at": key.budget_started_at,
+            }),
         )
         .await?;
     Ok(Json(CreatedKey { key, secret }))
@@ -1526,6 +1684,64 @@ async fn list_keys(
     Query(q): Query<ListKeysQuery>,
 ) -> Result<Json<Vec<ApiKey>>> {
     Ok(Json(state.store.list_keys(q.tenant_id).await?))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/keys/{id}", tag = "keys",
+    params(("id" = Uuid, Path, description = "API key id")),
+    request_body = UpdateKey,
+    responses((status = 200, body = ApiKey), (status = 404))
+)]
+async fn update_key(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<UpdateKey>,
+) -> Result<Json<ApiKey>> {
+    let name = body.name.trim().to_string();
+    if name.is_empty() {
+        return Err(AdminError::BadRequest("key name is required".into()));
+    }
+    let description = body.description.trim().to_string();
+    let (period, started_at) = normalize_budget_fields(
+        body.budget_tokens,
+        body.budget_cost_usd,
+        body.budget_period.as_deref(),
+        body.budget_started_at,
+        "budget_tokens",
+        "budget_cost_usd",
+        "budget_period",
+    )?;
+    let (hash, key, resolved) = state
+        .store
+        .update_api_key(
+            id,
+            &name,
+            &description,
+            body.budget_tokens,
+            body.budget_cost_usd,
+            period.as_deref(),
+            started_at,
+        )
+        .await?;
+    push_key(&state, &hash, &resolved).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "update_key",
+            "api_key",
+            &id.to_string(),
+            serde_json::json!({
+                "tenant_id": key.tenant_id,
+                "prefix": key.key_prefix,
+                "budget_tokens": key.budget_tokens,
+                "budget_cost_usd": key.budget_cost_usd,
+                "budget_period": key.budget_period,
+                "budget_started_at": key.budget_started_at,
+            }),
+        )
+        .await?;
+    Ok(Json(key))
 }
 
 #[utoipa::path(
@@ -2206,7 +2422,12 @@ async fn create_model(
     State(state): State<AdminState>,
     Json(body): Json<CreateModel>,
 ) -> Result<Json<ModelRoute>> {
-    state.ssrf.validate(&body.api_base)?;
+    // A blank api_base is allowed: Slurm-provisioned models have no static
+    // upstream until a replica is promoted into the endpoint rotation. Only
+    // validate a non-empty URL.
+    if !body.api_base.trim().is_empty() {
+        state.ssrf.validate(&body.api_base)?;
+    }
     let model = state
         .store
         .create_model(
@@ -2295,7 +2516,10 @@ async fn update_model(
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateModel>,
 ) -> Result<Json<ModelRoute>> {
-    state.ssrf.validate(&body.api_base)?;
+    // Blank api_base allowed for provisioned-only (Slurm) models — see create_model.
+    if !body.api_base.trim().is_empty() {
+        state.ssrf.validate(&body.api_base)?;
+    }
     let existing = state.store.get_model(id).await?;
     let api_key = body.api_key.as_deref().or(existing.api_key.as_deref());
     let model = state
@@ -2730,6 +2954,205 @@ async fn delete_model_endpoint(
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- managed model spec --------------------------------------------------
+
+#[utoipa::path(get, path = "/api/v1/managed",
+    responses((status = 200, body = [ManagedModelSpec])))]
+async fn list_managed_models(
+    State(state): State<AdminState>,
+) -> Result<Json<Vec<ManagedModelSpec>>> {
+    Ok(Json(state.store.list_managed_models().await?))
+}
+
+#[utoipa::path(get, path = "/api/v1/models/{id}/managed",
+    responses((status = 200, body = Option<ManagedModelSpec>)))]
+async fn get_managed_model(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Option<ManagedModelSpec>>> {
+    Ok(Json(state.store.get_managed_model(id).await?))
+}
+
+#[utoipa::path(put, path = "/api/v1/models/{id}/managed",
+    request_body = PutManagedModel,
+    responses((status = 200, body = ManagedModelSpec)))]
+async fn put_managed_model(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<PutManagedModel>,
+) -> Result<Json<ManagedModelSpec>> {
+    if body.serving_port < 1 || body.serving_port > 65535 {
+        return Err(AdminError::BadRequest(
+            "serving_port must be 1..=65535".into(),
+        ));
+    }
+    if body.partition.trim().is_empty() {
+        return Err(AdminError::BadRequest("partition must not be empty".into()));
+    }
+    if body.image.trim().is_empty() {
+        return Err(AdminError::BadRequest("image must not be empty".into()));
+    }
+    if body.launch_command.trim().is_empty() {
+        return Err(AdminError::BadRequest(
+            "launch_command must not be empty".into(),
+        ));
+    }
+    let spec = state
+        .store
+        .upsert_managed_model(obleth_store::UpsertManagedModel {
+            model_id: id,
+            enabled: body.enabled,
+            partition: body.partition,
+            gres: body.gres,
+            nodes: body.nodes,
+            constraints: body.constraints,
+            exclude: body.exclude,
+            account: body.account,
+            qos: body.qos,
+            time_limit: body.time_limit,
+            image: body.image,
+            preamble: body.preamble,
+            log_output_dir: body.log_output_dir,
+            launch_command: body.launch_command,
+            serving_port: body.serving_port,
+            health_path: body.health_path,
+            target_replicas: body.target_replicas,
+            max_job_failures: body.max_job_failures,
+        })
+        .await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "put_managed_model",
+            "managed_model",
+            &id.to_string(),
+            serde_json::to_value(&spec).unwrap_or_default(),
+        )
+        .await?;
+    Ok(Json(spec))
+}
+
+#[utoipa::path(delete, path = "/api/v1/models/{id}/managed",
+    responses((status = 200)))]
+async fn delete_managed_model(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>> {
+    state.store.delete_managed_model(id).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "delete_managed_model",
+            "managed_model",
+            &id.to_string(),
+            serde_json::json!({}),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({"deleted": true})))
+}
+
+// ---- replica registry ----------------------------------------------------
+
+#[utoipa::path(get, path = "/api/v1/models/{id}/replicas",
+    responses((status = 200, body = [ModelReplica])))]
+async fn list_replicas(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<ModelReplica>>> {
+    Ok(Json(state.store.list_replicas(id).await?))
+}
+
+#[utoipa::path(get, path = "/api/v1/replicas",
+    responses((status = 200, body = [ModelReplica])))]
+async fn list_all_replicas(State(state): State<AdminState>) -> Result<Json<Vec<ModelReplica>>> {
+    Ok(Json(state.store.all_replicas().await?))
+}
+
+#[utoipa::path(post, path = "/api/v1/models/{id}/replicas",
+    request_body = CreateReplica,
+    responses((status = 200, body = ModelReplica)))]
+async fn create_replica(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<CreateReplica>,
+) -> Result<Json<ModelReplica>> {
+    let r = state.store.create_replica(id, &body.slurm_job_id).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "create_replica",
+            "model_replica",
+            &r.id.to_string(),
+            serde_json::to_value(&r).unwrap_or_default(),
+        )
+        .await?;
+    Ok(Json(r))
+}
+
+#[utoipa::path(patch, path = "/api/v1/replicas/{id}",
+    request_body = PatchReplica,
+    responses((status = 200, body = ModelReplica)))]
+async fn patch_replica(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<PatchReplica>,
+) -> Result<Json<ModelReplica>> {
+    if let Some(state_val) = body.state.as_deref() {
+        if !obleth_config::REPLICA_STATES.contains(&state_val) {
+            return Err(AdminError::BadRequest("invalid replica state".into()));
+        }
+        state
+            .store
+            .update_replica_state(id, state_val, body.message.as_deref())
+            .await?;
+    }
+    if body.nodes.is_some() || body.endpoint_id.is_some() {
+        state
+            .store
+            .set_replica_runtime(id, body.nodes.as_deref(), body.endpoint_id)
+            .await?;
+    }
+    let current = state
+        .store
+        .get_replica(id)
+        .await?
+        .ok_or(AdminError::NotFound)?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "patch_replica",
+            "model_replica",
+            &id.to_string(),
+            serde_json::to_value(&current).unwrap_or_default(),
+        )
+        .await?;
+    Ok(Json(current))
+}
+
+#[utoipa::path(delete, path = "/api/v1/replicas/{id}",
+    responses((status = 200)))]
+async fn delete_replica(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>> {
+    state.store.delete_replica(id).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "delete_replica",
+            "model_replica",
+            &id.to_string(),
+            serde_json::json!({}),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({"deleted": true})))
 }
 
 #[utoipa::path(

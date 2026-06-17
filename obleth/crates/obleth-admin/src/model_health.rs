@@ -258,6 +258,16 @@ async fn run_model_health_check(
     model: ModelRoute,
     trigger: &str,
 ) -> Result<ModelHealthRecordOutcome> {
+    // Probe each configured endpoint first, both so the data plane can route
+    // around dead clusters independently of the model-level signal, and so
+    // dynamic-endpoint models (Slurm-provisioned, with no static api_base) can
+    // derive their model-level status from the live pool below.
+    let endpoint_results = if model.enabled {
+        probe_endpoints(state, &model).await
+    } else {
+        Vec::new()
+    };
+
     let status = if !model.enabled {
         ProbeResult {
             status: "disabled".to_string(),
@@ -268,14 +278,14 @@ async fn run_model_health_check(
         }
     } else if let Some(passive) = passive_signal(state, &model).await {
         passive
+    } else if model.api_base.trim().is_empty() {
+        // No static api_base (Slurm-provisioned / dynamic endpoints): the model
+        // is only as healthy as its live endpoint pool. Probing the empty base
+        // would always report "unreachable" and flap the model to "down".
+        aggregate_endpoint_health(&endpoint_results)
     } else {
         liveness_probe(state, &model).await
     };
-    // Probe each configured endpoint so the data plane can route around dead
-    // clusters independently of the model-level signal.
-    if model.enabled {
-        probe_endpoints(state, &model).await;
-    }
     let summary = state.store.get_model_health_summary(model.id).await?;
     let next_check_at = jittered_next_check_at(summary.check_interval_secs);
     state
@@ -460,16 +470,18 @@ async fn probe_target(
 /// Actively probe each enabled endpoint of a model and record its health so the
 /// data plane can route around dead clusters. Disabled endpoints are recorded
 /// as `disabled` (which resets their failure count) without a network call.
-async fn probe_endpoints(state: &AdminState, model: &ModelRoute) {
+/// Returns each endpoint's probe result so callers can derive a model-level
+/// status for dynamic-endpoint models (see `aggregate_endpoint_health`).
+async fn probe_endpoints(state: &AdminState, model: &ModelRoute) -> Vec<ProbeResult> {
     let endpoints = match state.store.list_model_endpoints(model.id).await {
         Ok(e) => e,
         Err(error) => {
             tracing::warn!(%error, model = %model.model_name, "failed to list endpoints for health probe");
-            return;
+            return Vec::new();
         }
     };
     if endpoints.is_empty() {
-        return;
+        return Vec::new();
     }
     // Decrypted keys for the actual probe call.
     let resolved = state
@@ -482,6 +494,7 @@ async fn probe_endpoints(state: &AdminState, model: &ModelRoute) {
         .map(|e| (e.id.as_str(), e.api_key.as_deref()))
         .collect();
 
+    let mut results = Vec::with_capacity(endpoints.len());
     for endpoint in &endpoints {
         let result = if !endpoint.enabled {
             ProbeResult {
@@ -511,7 +524,57 @@ async fn probe_endpoints(state: &AdminState, model: &ModelRoute) {
         {
             tracing::warn!(%error, endpoint = %endpoint.name, "failed to record endpoint health");
         }
+        results.push(result);
     }
+    results
+}
+
+/// Derive a model-level status from its endpoint pool, for models with no static
+/// `api_base` (Slurm-provisioned / dynamic). `disabled` endpoints are ignored.
+///
+/// For provisioner-managed endpoints the individual probe returns `degraded`
+/// when the endpoint is reachable but the upstream_model doesn't appear in
+/// `/v1/models` — this happens when the model ID format in the gateway (e.g.
+/// `qwen2.5-0.5b`) differs from what the serving framework advertises (e.g.
+/// `qwen2.5:0.5b` in Ollama). The provisioner's own health check already
+/// confirmed the model is serving before promoting the replica, so reachability
+/// is the correct signal here. Both `healthy` and `degraded` endpoint results
+/// are therefore treated as "serving" for the model-level aggregate.
+///
+/// Model status is then determined by capacity: if all registered endpoints are
+/// serving the model is healthy; if some (but not all) are serving it is
+/// degraded (partial capacity); if none are reachable it is unhealthy.
+fn aggregate_endpoint_health(results: &[ProbeResult]) -> ProbeResult {
+    let live: Vec<&ProbeResult> = results.iter().filter(|r| r.status != "disabled").collect();
+    let total = live.len();
+    if total == 0 {
+        return ProbeResult::unhealthy(
+            None,
+            None,
+            "no live endpoints registered for this model".to_string(),
+        );
+    }
+    // "serving" = reachable (200 response), regardless of whether the upstream
+    // model was confirmed present in /v1/models.
+    let serving = live
+        .iter()
+        .filter(|r| r.status == "healthy" || r.status == "degraded")
+        .count();
+    if serving == total {
+        return ProbeResult::healthy(
+            None,
+            None,
+            format!("{serving} of {total} endpoint(s) serving"),
+        );
+    }
+    if serving > 0 {
+        return ProbeResult::degraded(
+            None,
+            None,
+            format!("{serving} of {total} endpoint(s) serving"),
+        );
+    }
+    ProbeResult::unhealthy(None, None, format!("all {total} endpoint(s) unreachable"))
 }
 
 fn models_list_url(api_base: &str) -> String {
@@ -681,6 +744,54 @@ mod tests {
     fn excerpt_collapses_and_truncates() {
         let value = normalize_excerpt(" a\n b\t ccccc ", 7);
         assert_eq!(value, "a b cc...");
+    }
+
+    #[test]
+    fn aggregate_empty_pool_is_unhealthy() {
+        let agg = aggregate_endpoint_health(&[]);
+        assert_eq!(agg.status, "unhealthy");
+    }
+
+    #[test]
+    fn aggregate_all_serving_is_healthy() {
+        // healthy and degraded both count as "serving"; all-serving → healthy
+        let results = vec![
+            ProbeResult::healthy(None, None, "up".into()),
+            ProbeResult::degraded(None, None, "model-id-mismatch".into()),
+        ];
+        assert_eq!(aggregate_endpoint_health(&results).status, "healthy");
+    }
+
+    #[test]
+    fn aggregate_partial_serving_is_degraded() {
+        // some (but not all) endpoints serving → degraded (partial capacity)
+        let results = vec![
+            ProbeResult::unhealthy(None, None, "down".into()),
+            ProbeResult::degraded(None, None, "model-id-mismatch".into()),
+        ];
+        assert_eq!(aggregate_endpoint_health(&results).status, "degraded");
+    }
+
+    #[test]
+    fn aggregate_all_down_is_unhealthy() {
+        let results = vec![
+            ProbeResult::unhealthy(None, None, "down".into()),
+            ProbeResult::unhealthy(None, None, "down".into()),
+        ];
+        assert_eq!(aggregate_endpoint_health(&results).status, "unhealthy");
+    }
+
+    #[test]
+    fn aggregate_ignores_disabled_endpoints() {
+        let disabled = ProbeResult {
+            status: "disabled".to_string(),
+            latency_ms: None,
+            http_status: None,
+            message: None,
+            response_excerpt: None,
+        };
+        // Only a disabled endpoint -> treated as no live endpoints -> unhealthy.
+        assert_eq!(aggregate_endpoint_health(&[disabled]).status, "unhealthy");
     }
 
     #[test]

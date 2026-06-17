@@ -1,0 +1,68 @@
+use uuid::Uuid;
+
+/// Coarse, version-agnostic view of a Slurm job's state. The slurm adapter maps
+/// Slurm's many job_state strings onto these three.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobState {
+    /// Queued/configuring; not yet serving.
+    Pending,
+    /// Allocated and running (vLLM may still be booting — health gates that).
+    Running,
+    /// Terminal/absent: completed, failed, cancelled, preempted, timed out, or
+    /// not found in slurmrestd at all.
+    Gone,
+}
+
+/// What slurmrestd tells us about one job we own.
+#[derive(Debug, Clone)]
+pub struct JobInfo {
+    pub job_id: String,
+    pub state: JobState,
+    /// Allocated node hostnames (first is used for the endpoint URL in v1).
+    pub nodes: Vec<String>,
+}
+
+/// A version-agnostic job request, built from a ManagedModelSpec. The slurm
+/// adapter renders this into the slurmrestd payload for the configured version.
+#[derive(Debug, Clone)]
+pub struct JobSubmit {
+    pub name: String,
+    pub partition: String,
+    pub gres: String,
+    pub nodes: i64,
+    pub time_limit: Option<String>,
+    pub account: Option<String>,
+    pub qos: Option<String>,
+    pub constraints: Option<String>,
+    pub exclude: Option<String>,
+    /// Directory for stdout/stderr files; empty means Slurm default.
+    pub log_output_dir: String,
+    /// Shell script the job runs (apptainer exec ... <launch_command>).
+    pub script: String,
+}
+
+/// Minimal projection of a `ModelReplica` (Plan 1) the planner reasons over.
+#[derive(Debug, Clone)]
+pub struct ReplicaView {
+    pub id: Uuid,
+    pub model_id: Uuid,
+    pub slurm_job_id: String,
+    pub state: String, // pending|starting|healthy|draining|lost
+    pub endpoint_id: Option<Uuid>,
+    pub age_secs: i64, // now - created_at, for GC + cancel ordering
+}
+
+/// Actions the executor applies. The planner emits these; it performs no I/O.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Action {
+    /// Submit one new job and record a replica row.
+    Submit,
+    /// Job is running + healthy: register endpoint + mark replica healthy.
+    Promote { replica_id: Uuid, api_base: String },
+    /// Job vanished/terminal: deregister endpoint (if any) + mark replica lost.
+    MarkLost { replica_id: Uuid, endpoint_id: Option<Uuid> },
+    /// Excess replica: cancel its job + mark draining.
+    Cancel { replica_id: Uuid, job_id: String },
+    /// GC a long-dead `lost` replica row.
+    Delete { replica_id: Uuid },
+}

@@ -88,7 +88,9 @@ impl Store {
         .collect::<Result<Vec<_>>>()?;
 
         let api_keys = sqlx::query(
-            "select id, tenant_id, name, key_prefix, key_hash, disabled, created_at
+            "select id, tenant_id, name, description, key_prefix, key_hash,
+                    budget_tokens, budget_cost_usd, budget_period, budget_started_at,
+                    disabled, created_at
              from api_keys order by created_at",
         )
         .fetch_all(&self.pool)
@@ -99,8 +101,13 @@ impl Store {
                 id: row.try_get("id")?,
                 tenant_id: row.try_get("tenant_id")?,
                 name: row.try_get("name")?,
+                description: row.try_get("description")?,
                 key_prefix: row.try_get("key_prefix")?,
                 key_hash: row.try_get("key_hash")?,
+                budget_tokens: row.try_get("budget_tokens")?,
+                budget_cost_usd: row.try_get("budget_cost_usd")?,
+                budget_period: row.try_get("budget_period")?,
+                budget_started_at: row.try_get("budget_started_at")?,
                 disabled: row.try_get("disabled")?,
                 created_at: row.try_get("created_at")?,
             })
@@ -283,22 +290,34 @@ impl Store {
 
         for k in &data.api_keys {
             let row = sqlx::query(
-                "insert into api_keys (id, tenant_id, name, key_prefix, key_hash, disabled,
-                        created_at)
-                 values ($1, $2, $3, $4, $5, $6, $7)
+                "insert into api_keys (id, tenant_id, name, description, key_prefix, key_hash,
+                        budget_tokens, budget_cost_usd, budget_period, budget_started_at,
+                        disabled, created_at)
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
                  on conflict (id) do update set
                         tenant_id = excluded.tenant_id,
                         name = excluded.name,
+                        description = excluded.description,
                         key_prefix = excluded.key_prefix,
                         key_hash = excluded.key_hash,
-                        disabled = excluded.disabled
+                        budget_tokens = excluded.budget_tokens,
+                        budget_cost_usd = excluded.budget_cost_usd,
+                        budget_period = excluded.budget_period,
+                        budget_started_at = excluded.budget_started_at,
+                        disabled = excluded.disabled,
+                        updated_at = now()
                  returning (xmax = 0) as inserted",
             )
             .bind(k.id)
             .bind(k.tenant_id)
             .bind(&k.name)
+            .bind(&k.description)
             .bind(&k.key_prefix)
             .bind(&k.key_hash)
+            .bind(k.budget_tokens)
+            .bind(k.budget_cost_usd)
+            .bind(&k.budget_period)
+            .bind(k.budget_started_at)
             .bind(k.disabled)
             .bind(k.created_at)
             .fetch_one(&mut *tx)
@@ -669,7 +688,7 @@ mod tests {
             .await
             .expect("create tenant");
         let (key, secret) = store
-            .create_api_key(tenant.id, "backup-test")
+            .create_api_key(tenant.id, "backup-test", "", None, None, None, None)
             .await
             .expect("create key");
         let hash = obleth_config::hash_api_key(&secret);

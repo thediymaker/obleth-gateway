@@ -543,6 +543,10 @@ mod tests {
             budget_cost_usd: None,
             budget_period: None,
             budget_started_at: None,
+            key_budget_tokens: None,
+            key_budget_cost_usd: None,
+            key_budget_period: None,
+            key_budget_started_at: None,
             allowed_models: None,
             internal: false,
         };

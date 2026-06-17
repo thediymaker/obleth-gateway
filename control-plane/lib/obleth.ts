@@ -49,9 +49,15 @@ export interface ApiKey {
   id: string;
   tenant_id: string;
   name: string;
+  description: string;
   key_prefix: string;
+  budget_tokens: number | null;
+  budget_cost_usd: number | null;
+  budget_period: string | null;
+  budget_started_at: string | null;
   disabled: boolean;
   created_at: string;
+  updated_at: string;
 }
 
 export interface CreatedKey {
@@ -111,6 +117,61 @@ export interface ModelEndpoint {
   last_checked_at: string | null;
   last_latency_ms: number | null;
   last_http_status: number | null;
+  last_message: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ManagedModelSpec {
+  model_id: string;
+  enabled: boolean;
+  partition: string;
+  gres: string;
+  nodes: number;
+  constraints: string | null;
+  exclude: string | null;
+  account: string | null;
+  qos: string | null;
+  time_limit: string | null;
+  image: string;
+  preamble: string;
+  log_output_dir: string;
+  launch_command: string;
+  serving_port: number;
+  health_path: string;
+  target_replicas: number;
+  max_job_failures: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PutManagedModel {
+  enabled?: boolean;
+  partition: string;
+  gres?: string;
+  nodes?: number;
+  constraints?: string | null;
+  exclude?: string | null;
+  account?: string | null;
+  qos?: string | null;
+  time_limit?: string | null;
+  image: string;
+  preamble?: string;
+  log_output_dir?: string;
+  launch_command: string;
+  serving_port: number;
+  health_path?: string;
+  target_replicas?: number;
+  max_job_failures?: number;
+}
+
+export interface ModelReplica {
+  id: string;
+  model_id: string;
+  slurm_job_id: string;
+  nodes: string | null;
+  endpoint_id: string | null;
+  state: string; // pending|starting|healthy|draining|lost
   last_message: string | null;
   created_at: string;
   updated_at: string;
@@ -494,6 +555,45 @@ export interface UpdateAlertSettings {
   email?: UpdateEmailSettings | null;
 }
 
+// Masked view of the system-wide Slurm settings. The JWT is never returned;
+// presence + last 4 chars are surfaced instead.
+export interface SlurmSettingsView {
+  enabled: boolean;
+  slurmrestd_url: string;
+  slurmrestd_api_version: string;
+  slurm_user: string;
+  jwt_set: boolean;
+  jwt_last4: string | null;
+}
+
+export interface UpdateSlurmSettings {
+  enabled: boolean;
+  slurmrestd_url: string;
+  slurmrestd_api_version?: string;
+  slurm_user: string;
+  // Write-only: omit/empty to keep the stored JWT, send a value to replace it.
+  slurm_jwt?: string | null;
+}
+
+export interface SlurmJwtHealth {
+  set: boolean;
+  expired: boolean;
+  expires_at: string | null;
+  expires_in_secs: number | null;
+}
+
+export interface SlurmPingHealth {
+  ok: boolean;
+  status_code: number | null;
+  latency_ms: number | null;
+  error: string | null;
+}
+
+export interface SlurmHealthView {
+  jwt: SlurmJwtHealth;
+  ping: SlurmPingHealth;
+}
+
 export interface AutoRouterSettingsView {
   classifier_enabled: boolean;
   classifier_model: string | null;
@@ -690,6 +790,7 @@ export const obleth = {
     weight?: number;
     tokens_per_minute?: number;
     max_in_flight?: number | null;
+    fairshare_group?: string;
   }) => api<Tenant>("/tenants", { method: "POST", body: JSON.stringify(body) }),
   setWeight: (id: string, weight: number) =>
     api<Tenant>(`/tenants/${id}/weight`, {
@@ -760,10 +861,35 @@ export const obleth = {
     api<ApiKey[]>(`/keys${tenantId ? `?tenant_id=${tenantId}` : ""}`, {
       next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.keys] },
     }),
-  createKey: (tenantId: string, name: string) =>
+  createKey: (
+    tenantId: string,
+    body: {
+      name: string;
+      description?: string;
+      budget_tokens?: number | null;
+      budget_cost_usd?: number | null;
+      budget_period?: string | null;
+      budget_started_at?: string | null;
+    },
+  ) =>
     api<CreatedKey>(`/tenants/${tenantId}/keys`, {
       method: "POST",
-      body: JSON.stringify({ name }),
+      body: JSON.stringify(body),
+    }),
+  updateKey: (
+    id: string,
+    body: {
+      name: string;
+      description?: string;
+      budget_tokens?: number | null;
+      budget_cost_usd?: number | null;
+      budget_period?: string | null;
+      budget_started_at?: string | null;
+    },
+  ) =>
+    api<ApiKey>(`/keys/${id}`, {
+      method: "PUT",
+      body: JSON.stringify(body),
     }),
   setKeyDisabled: (id: string, disabled: boolean) =>
     api<void>(`/keys/${id}/disabled`, {
@@ -860,6 +986,17 @@ export const obleth = {
     }),
   listModelEndpoints: (id: string) =>
     api<ModelEndpoint[]>(`/models/${id}/endpoints`),
+  getManagedModel: (id: string) =>
+    api<ManagedModelSpec | null>(`/models/${id}/managed`),
+  putManagedModel: (id: string, body: PutManagedModel) =>
+    api<ManagedModelSpec>(`/models/${id}/managed`, {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  deleteManagedModel: (id: string) =>
+    api<void>(`/models/${id}/managed`, { method: "DELETE" }),
+  listReplicas: (id: string) =>
+    api<ModelReplica[]>(`/models/${id}/replicas`),
   createModelEndpoint: (
     id: string,
     body: {
@@ -1047,6 +1184,14 @@ export const obleth = {
       method: "PUT",
       body: JSON.stringify(body),
     }),
+  getSlurmSettings: () => api<SlurmSettingsView>("/settings/slurm"),
+  setSlurmSettings: (body: UpdateSlurmSettings) =>
+    api<SlurmSettingsView>("/settings/slurm", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  testSlurmConnection: () =>
+    api<SlurmHealthView>("/settings/slurm/test", { method: "POST" }),
   exportBackup: () => api<ConfigBackup>("/backup/export"),
   restoreBackup: (body: ConfigBackup) =>
     api<RestoreReport>("/backup/restore", {

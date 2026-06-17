@@ -1,7 +1,23 @@
 "use client";
 
-import { Fragment, useState, useTransition } from "react";
-import { ChevronDown, Info, Plus, Trash2, X } from "lucide-react";
+import {
+  createContext,
+  useContext,
+  useState,
+  useTransition,
+  type ReactNode,
+} from "react";
+import {
+  CalendarClock,
+  Check,
+  ChevronDown,
+  Info,
+  Plus,
+  RefreshCw,
+  Save,
+  Trash2,
+  X,
+} from "lucide-react";
 import {
   deleteTenantAction,
   setTenantAllowlistAction,
@@ -10,20 +26,32 @@ import {
   setTenantStatusAction,
   updateTenantAction,
 } from "@/app/actions";
+import { CreateTenant } from "@/components/create-tenant";
 import { QuotaControl } from "@/components/quota-control";
 import { WeightControl } from "@/components/weight-control";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { Tenant, WeeklyWindow } from "@/lib/obleth";
-import { cn } from "@/lib/utils";
+import { cn, formatNumber } from "@/lib/utils";
+
+const SaveFlashContext = createContext<() => void>(() => {});
 
 const STATUS_STYLES: Record<string, string> = {
-  active: "border-emerald-500/40 text-emerald-500",
-  suspended: "border-amber-500/40 text-amber-500",
-  archived: "border-muted-foreground/40 text-muted-foreground",
+  active: "border-emerald-500/40 bg-emerald-500/10 text-emerald-500",
+  suspended: "border-amber-500/40 bg-amber-500/10 text-amber-500",
+  archived: "border-muted-foreground/40 bg-muted/30 text-muted-foreground",
 };
 
 const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -41,6 +69,7 @@ function budgetLabel(t: Tenant): string {
 
 /** Compact human number (e.g. 1.2M, 15K). */
 function formatCompact(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(n % 1_000_000_000 === 0 ? 0 : 1)}B`;
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(n % 1_000 === 0 ? 0 : 1)}K`;
   return String(n);
@@ -54,10 +83,10 @@ function scheduleBadge(t: Tenant): ScheduleBadge | null {
   if (!hasSchedule) return null;
   const now = new Date();
   if (t.active_from && now < new Date(t.active_from)) {
-    return { label: "Scheduled", className: "border-sky-500/40 text-sky-500" };
+    return { label: "Scheduled", className: "border-sky-500/40 bg-sky-500/10 text-sky-500" };
   }
   if (t.active_until && now >= new Date(t.active_until)) {
-    return { label: "Expired", className: "border-muted-foreground/40 text-muted-foreground" };
+    return { label: "Expired", className: "border-muted-foreground/40 bg-muted/30 text-muted-foreground" };
   }
   if (t.weekly_windows && t.weekly_windows.length > 0) {
     let local: Date;
@@ -72,104 +101,249 @@ function scheduleBadge(t: Tenant): ScheduleBadge | null {
       (w) => w.day === day && minute >= w.start_min && minute < w.end_min,
     );
     return open
-      ? { label: "In window", className: "border-emerald-500/40 text-emerald-500" }
-      : { label: "Outside window", className: "border-amber-500/40 text-amber-500" };
+      ? { label: "In window", className: "border-emerald-500/40 bg-emerald-500/10 text-emerald-500" }
+      : { label: "Outside window", className: "border-amber-500/40 bg-amber-500/10 text-amber-500" };
   }
-  return { label: "In window", className: "border-emerald-500/40 text-emerald-500" };
+  return { label: "In window", className: "border-emerald-500/40 bg-emerald-500/10 text-emerald-500" };
 }
 
 export function TenantTable({ tenants, models }: { tenants: Tenant[]; models: string[] }) {
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [pending, start] = useTransition();
+  const [createOpen, setCreateOpen] = useState(false);
+  const [saveFlash, setSaveFlash] = useState<{ id: string; n: number } | null>(null);
+  const flashSaved = (id: string) =>
+    setSaveFlash((prev) => ({ id, n: prev?.id === id ? prev.n + 1 : 1 }));
 
   return (
-    <table className="w-full text-sm">
-      <thead>
-        <tr className="border-b border-border text-left text-xs text-muted-foreground">
-          <th className="px-6 py-3 font-medium">Name</th>
-          <th className="px-3 py-3 font-medium">Status</th>
-          <th className="px-3 py-3 font-medium">
-            <div className="flex items-center gap-1.5">
-              Limits
-              <InfoTip>Optional safety caps for tokens per minute and tenant in-flight requests. Blank or 0 means no token-rate cap.</InfoTip>
+    <div className="space-y-6">
+      <TenantStats tenants={tenants} models={models} />
+
+      <Dialog open={createOpen} onOpenChange={setCreateOpen}>
+        <DialogContent className="grid h-[min(760px,85vh)] max-h-[85vh] max-w-4xl grid-rows-[auto_minmax(0,1fr)] overflow-hidden">
+          <DialogHeader>
+            <DialogTitle>Create tenant</DialogTitle>
+            <DialogDescription>
+              Add a fairshare unit with initial priority and optional safety caps.
+            </DialogDescription>
+          </DialogHeader>
+          <CreateTenant
+            models={models}
+            tenantWeights={tenants.map((tenant) => tenant.weight)}
+            onCreated={() => setCreateOpen(false)}
+          />
+        </DialogContent>
+      </Dialog>
+
+      <Card>
+        <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <CardTitle>Tenant configuration</CardTitle>
+            <CardDescription>
+              {formatNumber(tenants.length)} tenants / {formatNumber(activeTenantCount(tenants))} active
+            </CardDescription>
+          </div>
+          <Button type="button" size="sm" onClick={() => setCreateOpen(true)}>
+            <Plus className="h-3.5 w-3.5" />
+            Add tenant
+          </Button>
+        </CardHeader>
+        <CardContent className="p-0">
+          <div className="text-sm">
+            <div className="grid border-b border-border text-left text-xs text-muted-foreground md:grid-cols-[minmax(0,1.35fr)_minmax(10rem,0.45fr)_minmax(0,1fr)_auto]">
+              <div className="px-6 py-3 font-medium">Tenant</div>
+              <div className="hidden px-3 py-3 font-medium md:block">State</div>
+              <div className="hidden px-3 py-3 font-medium md:block">
+                <div className="flex items-center gap-1.5">
+                  Configuration
+                  <InfoTip>
+                    Optional tuning fields. Token and concurrency caps show as unlimited unless a tenant-specific limit is set.
+                  </InfoTip>
+                </div>
+              </div>
+              <div className="hidden px-3 py-3 text-right font-medium md:block" />
             </div>
-          </th>
-          <th className="px-3 py-3 font-medium">Fairshare weight</th>
-          <th className="px-3 py-3 text-right font-medium">Edit</th>
-        </tr>
-      </thead>
-      <tbody>
-        {tenants.map((t) => {
-          const expanded = expandedId === t.id;
-          const subline = [t.organization, t.description].filter(Boolean).join(" — ");
-          return (
-            <Fragment key={t.id}>
-              <tr className="border-b border-border/60 align-top">
-                <td className="px-6 py-3">
-                  <div className="font-medium">{t.name}</div>
-                  {subline && <div className="text-xs text-muted-foreground">{subline}</div>}
-                </td>
-                <td className="px-3 py-3">
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    <Badge className={STATUS_STYLES[t.status] ?? STATUS_STYLES.archived}>{t.status}</Badge>
-                    {(() => {
-                      const sb = scheduleBadge(t);
-                      return sb ? <Badge className={sb.className}>{sb.label}</Badge> : null;
-                    })()}
-                    {(t.budget_tokens != null || t.budget_cost_usd != null) && (
-                      <Badge className="border-violet-500/40 text-violet-500">{budgetLabel(t)}</Badge>
+
+            <div className="space-y-3 px-4 py-4">
+              {tenants.map((tenant) => {
+                const expanded = expandedId === tenant.id;
+                const subline = [tenant.organization, tenant.description].filter(Boolean).join(" - ");
+                const schedule = scheduleBadge(tenant);
+
+                return (
+                  <div
+                    key={tenant.id}
+                    className={cn(
+                      "group relative overflow-hidden rounded-lg border shadow-sm transition-colors",
+                      expanded
+                        ? "border-primary/35 bg-muted/25 ring-1 ring-primary/15"
+                        : "border-border/70 bg-card/35 hover:border-border hover:bg-muted/15",
                     )}
-                    {t.allowed_models && t.allowed_models.length > 0 && (
-                      <Badge className="border-indigo-500/40 text-indigo-500">
-                        {t.allowed_models.length} model{t.allowed_models.length === 1 ? "" : "s"}
-                      </Badge>
+                  >
+                    {saveFlash?.id === tenant.id && (
+                      <span
+                        key={saveFlash.n}
+                        aria-hidden
+                        className="card-saved-glow pointer-events-none absolute inset-0 z-30 rounded-lg"
+                      />
+                    )}
+
+                    <div className="grid min-w-0 md:grid-cols-[minmax(0,1.35fr)_minmax(10rem,0.45fr)_minmax(0,1fr)_auto] md:items-center">
+                      <button
+                        type="button"
+                        onClick={() => setExpandedId((current) => (current === tenant.id ? null : tenant.id))}
+                        className="min-w-0 px-5 py-3.5 pr-14 text-left md:pr-5"
+                        aria-expanded={expanded}
+                      >
+                        <div className="flex min-w-0 items-center gap-2">
+                          <p className="truncate font-medium" title={tenant.name}>
+                            {tenant.name}
+                          </p>
+                        </div>
+                        {subline && (
+                          <p className="mt-0.5 line-clamp-2 text-xs leading-snug text-muted-foreground" title={subline}>
+                            {subline}
+                          </p>
+                        )}
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1.5 md:hidden">
+                          <TenantBadges tenant={tenant} schedule={schedule} />
+                        </div>
+                        <div className="mt-1.5 flex flex-wrap items-center gap-1.5 md:hidden">
+                          <TenantConfigChips tenant={tenant} />
+                        </div>
+                      </button>
+
+                      <div className="hidden min-w-0 px-3 py-3.5 md:block">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <TenantBadges tenant={tenant} schedule={schedule} />
+                        </div>
+                      </div>
+
+                      <div className="hidden min-w-0 px-3 py-3.5 md:block">
+                        <div className="flex flex-wrap items-center gap-1.5">
+                          <TenantConfigChips tenant={tenant} />
+                        </div>
+                      </div>
+
+                      <div className="absolute right-3 top-3 md:static md:px-3 md:py-3.5">
+                        <Button
+                          type="button"
+                          size="icon"
+                          variant="ghost"
+                          className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                          aria-expanded={expanded}
+                          title={expanded ? "Collapse tenant" : "Edit tenant"}
+                          onClick={() => setExpandedId((current) => (current === tenant.id ? null : tenant.id))}
+                        >
+                          <ChevronDown
+                            className={cn(
+                              "h-3.5 w-3.5 transition-transform duration-200",
+                              expanded && "rotate-180 text-foreground",
+                            )}
+                          />
+                        </Button>
+                      </div>
+                    </div>
+
+                    {expanded && (
+                      <div className="border-t border-border/60 bg-muted/10 px-5 py-4">
+                        <SaveFlashContext.Provider value={() => flashSaved(tenant.id)}>
+                          <TenantDetailPanel
+                            tenant={tenant}
+                            models={models}
+                            peerWeightTotal={tenantWeightTotal(tenants, tenant.id)}
+                            tenantCount={tenants.length}
+                            pending={pending}
+                            start={start}
+                          />
+                        </SaveFlashContext.Provider>
+                      </div>
                     )}
                   </div>
-                </td>
-                <td className="px-3 py-3">
-                  <QuotaControl id={t.id} tokensPerMinute={t.tokens_per_minute} maxInFlight={t.max_in_flight} />
-                </td>
-                <td className="px-3 py-3">
-                  <WeightControl id={t.id} initial={t.weight} />
-                </td>
-                <td className="px-3 py-3 text-right">
-                  <Button
-                    type="button"
-                    size="icon"
-                    variant="ghost"
-                    aria-expanded={expanded}
-                    title={expanded ? "Collapse" : "Edit tenant"}
-                    onClick={() => setExpandedId((current) => (current === t.id ? null : t.id))}
-                  >
-                    <ChevronDown className={cn("h-3.5 w-3.5 transition-transform", expanded && "rotate-180")} />
-                  </Button>
-                </td>
-              </tr>
-              {expanded && (
-                <tr className="border-b border-border/60">
-                  <td colSpan={5} className="bg-background/35 px-6 py-5">
-                    <TenantDetailPanel
-                      tenant={t}
-                      models={models}
-                      pending={pending}
-                      start={start}
-                      onClose={() => setExpandedId(null)}
-                    />
-                  </td>
-                </tr>
+                );
+              })}
+
+              {tenants.length === 0 && (
+                <div className="rounded-lg border border-dashed border-border/70 px-6 py-10 text-center text-muted-foreground">
+                  No tenants yet.
+                </div>
               )}
-            </Fragment>
-          );
-        })}
-        {tenants.length === 0 && (
-          <tr>
-            <td colSpan={5} className="px-6 py-8 text-center text-muted-foreground">
-              No tenants yet.
-            </td>
-          </tr>
-        )}
-      </tbody>
-    </table>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
+
+function TenantBadges({ tenant, schedule }: { tenant: Tenant; schedule: ScheduleBadge | null }) {
+  return (
+    <>
+      <Badge className={STATUS_STYLES[tenant.status] ?? STATUS_STYLES.archived}>{tenant.status}</Badge>
+      {schedule && <Badge className={schedule.className}>{schedule.label}</Badge>}
+      {(tenant.budget_tokens != null || tenant.budget_cost_usd != null) && (
+        <Badge className="border-violet-500/40 bg-violet-500/10 text-violet-500">{budgetLabel(tenant)}</Badge>
+      )}
+      {tenant.allowed_models && tenant.allowed_models.length > 0 && (
+        <Badge className="border-indigo-500/40 bg-indigo-500/10 text-indigo-500">
+          {tenant.allowed_models.length} model{tenant.allowed_models.length === 1 ? "" : "s"}
+        </Badge>
+      )}
+    </>
+  );
+}
+
+function TenantConfigChips({ tenant }: { tenant: Tenant }) {
+  return (
+    <>
+      <Badge className="border-border bg-background text-muted-foreground">
+        weight {formatCompact(tenant.weight)}
+      </Badge>
+      <Badge className="border-border bg-background text-muted-foreground">
+        {tenant.tokens_per_minute > 0 ? `${formatCompact(tenant.tokens_per_minute)} tok/min` : "tokens unlimited"}
+      </Badge>
+      <Badge className="border-border bg-background text-muted-foreground">
+        {tenant.max_in_flight != null ? `${formatCompact(tenant.max_in_flight)} concurrent` : "concurrency unlimited"}
+      </Badge>
+    </>
+  );
+}
+
+function TenantStats({ tenants, models }: { tenants: Tenant[]; models: string[] }) {
+  const active = activeTenantCount(tenants);
+  const scheduled = tenants.filter(
+    (tenant) => tenant.active_from || tenant.active_until || (tenant.weekly_windows?.length ?? 0) > 0,
+  ).length;
+  const limited = tenants.filter(
+    (tenant) => tenant.tokens_per_minute > 0 || tenant.max_in_flight != null,
+  ).length;
+  const restricted = tenants.filter((tenant) => (tenant.allowed_models?.length ?? 0) > 0).length;
+
+  return (
+    <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
+      <StatCard label="Tenants" value={formatNumber(tenants.length)} hint={`${formatNumber(active)} active`} />
+      <StatCard label="Scheduled access" value={formatNumber(scheduled)} hint="time-boxed tenants" />
+      <StatCard label="Safety limits" value={formatNumber(limited)} hint="rate or concurrency caps" />
+      <StatCard label="Model allowlists" value={formatNumber(restricted)} hint={`${formatNumber(models.length)} models available`} />
+    </div>
+  );
+}
+
+function activeTenantCount(tenants: Tenant[]) {
+  return tenants.filter((tenant) => tenant.status === "active").length;
+}
+
+function tenantWeightTotal(tenants: Tenant[], excludedId: string) {
+  return tenants.reduce((sum, tenant) => sum + (tenant.id === excludedId ? 0 : tenant.weight), 0);
+}
+
+function StatCard({ label, value, hint }: { label: string; value: string; hint?: string }) {
+  return (
+    <div className="rounded-lg border border-border bg-card p-4">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className="mt-1 text-2xl font-semibold tabular-nums">{value}</p>
+      {hint && <p className="mt-0.5 text-[11px] text-muted-foreground">{hint}</p>}
+    </div>
   );
 }
 
@@ -195,18 +369,25 @@ function InfoTip({ children }: { children: string }) {
 function TenantDetailPanel({
   tenant,
   models,
+  peerWeightTotal,
+  tenantCount,
   pending,
   start,
-  onClose,
 }: {
   tenant: Tenant;
   models: string[];
+  peerWeightTotal: number;
+  tenantCount: number;
   pending: boolean;
   start: (cb: () => void) => void;
-  onClose: () => void;
 }) {
+  const flashSaved = useContext(SaveFlashContext);
+
   function changeStatus(status: string) {
-    start(() => setTenantStatusAction(tenant.id, status));
+    start(async () => {
+      await setTenantStatusAction(tenant.id, status);
+      flashSaved();
+    });
   }
 
   function remove() {
@@ -214,100 +395,172 @@ function TenantDetailPanel({
       !window.confirm(
         `Permanently delete tenant "${tenant.name}"? This removes all of its API keys and cannot be undone. Usage history is retained.`,
       )
-    )
+    ) {
       return;
+    }
     start(() => deleteTenantAction(tenant.id));
   }
 
   return (
-    <div className="space-y-5">
-      <form
-        action={(fd) =>
-          start(async () => {
-            await updateTenantAction(fd);
-            onClose();
-          })
-        }
-        className="grid gap-4 md:grid-cols-2"
-      >
-        <input type="hidden" name="id" value={tenant.id} />
-        <div className="space-y-1.5">
-          <Label htmlFor={`edit-name-${tenant.id}`}>Name</Label>
-          <Input id={`edit-name-${tenant.id}`} name="name" required defaultValue={tenant.name} />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor={`edit-org-${tenant.id}`}>Organization</Label>
-          <Input
-            id={`edit-org-${tenant.id}`}
-            name="organization"
-            defaultValue={tenant.organization}
-            placeholder="Team, project, or customer"
-          />
-        </div>
-        <div className="space-y-1.5 md:col-span-2">
-          <Label htmlFor={`edit-desc-${tenant.id}`}>Description</Label>
-          <Input
-            id={`edit-desc-${tenant.id}`}
-            name="description"
-            defaultValue={tenant.description}
-            placeholder="What this tenant is for"
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor={`edit-contact-${tenant.id}`}>Contact email</Label>
-          <Input
-            id={`edit-contact-${tenant.id}`}
-            name="contact_email"
-            type="email"
-            defaultValue={tenant.contact_email}
-            placeholder="owner@example.com"
-          />
-        </div>
-        <div className="flex items-end gap-2">
-          <Button type="submit" disabled={pending}>
-            {pending ? "Saving..." : "Save changes"}
-          </Button>
-        </div>
-      </form>
-
-      <ScheduleEditor tenant={tenant} />
-
-      <BudgetEditor tenant={tenant} />
-
-      <AllowlistEditor tenant={tenant} models={models} />
-
-      <div className="flex flex-wrap items-center gap-2 border-t border-border/60 pt-4">
-        <span className="text-xs text-muted-foreground">Lifecycle:</span>
-        {tenant.status !== "active" && (
-          <Button type="button" size="sm" variant="secondary" disabled={pending} onClick={() => changeStatus("active")}>
-            Activate
-          </Button>
-        )}
-        {tenant.status !== "suspended" && (
-          <Button type="button" size="sm" variant="secondary" disabled={pending} onClick={() => changeStatus("suspended")}>
-            Suspend
-          </Button>
-        )}
-        {tenant.status !== "archived" && (
-          <Button type="button" size="sm" variant="secondary" disabled={pending} onClick={() => changeStatus("archived")}>
-            Archive
-          </Button>
-        )}
-        <div className="ml-auto">
-          <Button
-            type="button"
-            size="sm"
-            variant="ghost"
-            className="text-destructive hover:text-destructive"
-            disabled={pending}
-            onClick={remove}
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-            Delete tenant
-          </Button>
-        </div>
+    <Tabs defaultValue="profile">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <TabsList className="h-auto flex-wrap justify-start">
+          <TabsTrigger value="profile">Profile</TabsTrigger>
+          <TabsTrigger value="controls">Controls</TabsTrigger>
+          <TabsTrigger value="schedule">Access</TabsTrigger>
+          <TabsTrigger value="budget">Budgets</TabsTrigger>
+          <TabsTrigger value="models">Models</TabsTrigger>
+          <TabsTrigger value="lifecycle">Lifecycle</TabsTrigger>
+        </TabsList>
+        <p className="text-[11px] tabular-nums text-muted-foreground">
+          Group {tenant.fairshare_group || "default"} / ID {tenant.id.slice(0, 8)}
+        </p>
       </div>
-    </div>
+
+      <TabsContent value="profile">
+        <form
+          action={(fd) =>
+            start(async () => {
+              await updateTenantAction(fd);
+              flashSaved();
+            })
+          }
+        >
+          <input type="hidden" name="id" value={tenant.id} />
+          <PanelCard
+            title="Profile"
+            description="Human-readable ownership details for this tenant."
+            actions={<SaveButton pending={pending} idleLabel="Save profile" />}
+          >
+            <div className="grid gap-x-4 gap-y-3 p-4 md:grid-cols-2">
+              <Field label="Name" id={`edit-name-${tenant.id}`} name="name" required defaultValue={tenant.name} />
+              <Field
+                label="Organization"
+                id={`edit-org-${tenant.id}`}
+                name="organization"
+                defaultValue={tenant.organization}
+                placeholder="Team, project, or customer"
+              />
+              <div className="md:col-span-2">
+                <Field
+                  label="Description"
+                  id={`edit-desc-${tenant.id}`}
+                  name="description"
+                  defaultValue={tenant.description}
+                  placeholder="What this tenant is for"
+                />
+              </div>
+              <Field
+                label="Contact email"
+                id={`edit-contact-${tenant.id}`}
+                name="contact_email"
+                type="email"
+                defaultValue={tenant.contact_email}
+                placeholder="owner@example.com"
+              />
+              <div className="grid grid-cols-2 gap-3">
+                <SpecItem label="Created">{formatDate(tenant.created_at)}</SpecItem>
+                <SpecItem label="Updated">{formatDate(tenant.updated_at)}</SpecItem>
+              </div>
+            </div>
+          </PanelCard>
+        </form>
+      </TabsContent>
+
+      <TabsContent value="controls">
+        <PanelCard
+          title="Traffic controls"
+          description="Live fairshare priority and per-tenant safety caps."
+        >
+          <div className="divide-y divide-border/60">
+            <SettingRow
+              label="Fairshare weight"
+              hint="Relative priority when tenant demand exceeds shared capacity."
+            >
+              <div className="w-full max-w-md">
+                <WeightControl
+                  id={tenant.id}
+                  initial={tenant.weight}
+                  peerWeightTotal={peerWeightTotal}
+                  tenantCount={tenantCount}
+                  onSaved={flashSaved}
+                />
+              </div>
+            </SettingRow>
+            <SettingRow
+              label="Safety limits"
+              hint="Optional token-rate and concurrency caps. Clear either box and apply to make it unlimited."
+            >
+              <div className="w-full max-w-xl">
+                <QuotaControl
+                  id={tenant.id}
+                  tokensPerMinute={tenant.tokens_per_minute}
+                  maxInFlight={tenant.max_in_flight}
+                  onSaved={flashSaved}
+                />
+              </div>
+            </SettingRow>
+          </div>
+        </PanelCard>
+      </TabsContent>
+
+      <TabsContent value="schedule">
+        <ScheduleEditor tenant={tenant} />
+      </TabsContent>
+
+      <TabsContent value="budget">
+        <BudgetEditor tenant={tenant} />
+      </TabsContent>
+
+      <TabsContent value="models">
+        <AllowlistEditor tenant={tenant} models={models} />
+      </TabsContent>
+
+      <TabsContent value="lifecycle">
+        <PanelCard
+          title="Lifecycle"
+          description="Change access state or permanently remove this tenant."
+          actions={<Badge className={STATUS_STYLES[tenant.status] ?? STATUS_STYLES.archived}>{tenant.status}</Badge>}
+        >
+          <div className="space-y-4 p-4">
+            <div className="flex flex-wrap items-center gap-2">
+              {tenant.status !== "active" && (
+                <Button type="button" size="sm" variant="secondary" disabled={pending} onClick={() => changeStatus("active")}>
+                  Activate
+                </Button>
+              )}
+              {tenant.status !== "suspended" && (
+                <Button type="button" size="sm" variant="secondary" disabled={pending} onClick={() => changeStatus("suspended")}>
+                  Suspend
+                </Button>
+              )}
+              {tenant.status !== "archived" && (
+                <Button type="button" size="sm" variant="secondary" disabled={pending} onClick={() => changeStatus("archived")}>
+                  Archive
+                </Button>
+              )}
+            </div>
+            <div className="rounded-md border border-destructive/25 bg-destructive/5 p-3">
+              <p className="text-xs font-medium text-destructive">Danger zone</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Deleting a tenant also removes its API keys. Usage history is retained.
+              </p>
+              <Button
+                type="button"
+                size="sm"
+                variant="ghost"
+                className="mt-3 text-destructive hover:text-destructive"
+                disabled={pending}
+                onClick={remove}
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                Delete tenant
+              </Button>
+            </div>
+          </div>
+        </PanelCard>
+      </TabsContent>
+    </Tabs>
   );
 }
 
@@ -340,6 +593,7 @@ function timeToMin(value: string): number {
 }
 
 function ScheduleEditor({ tenant }: { tenant: Tenant }) {
+  const flashSaved = useContext(SaveFlashContext);
   const [pending, start] = useTransition();
   const [timezone, setTimezone] = useState(tenant.timezone || "UTC");
   const [activeFrom, setActiveFrom] = useState(isoToLocalInput(tenant.active_from));
@@ -351,9 +605,11 @@ function ScheduleEditor({ tenant }: { tenant: Tenant }) {
   function addWindow() {
     setWindows((ws) => [...ws, { day: 1, start_min: 9 * 60, end_min: 17 * 60 }]);
   }
+
   function removeWindow(idx: number) {
     setWindows((ws) => ws.filter((_, i) => i !== idx));
   }
+
   function patchWindow(idx: number, patch: Partial<WeeklyWindow>) {
     setWindows((ws) => ws.map((w, i) => (i === idx ? { ...w, ...patch } : w)));
   }
@@ -382,6 +638,7 @@ function ScheduleEditor({ tenant }: { tenant: Tenant }) {
       });
       if (res.ok) {
         setSaved(true);
+        flashSaved();
       } else {
         setError(res.error);
       }
@@ -389,102 +646,106 @@ function ScheduleEditor({ tenant }: { tenant: Tenant }) {
   }
 
   return (
-    <div className="space-y-4 border-t border-border/60 pt-4">
-      <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-        Access schedule
-      </div>
-      <div className="grid gap-4 md:grid-cols-3">
-        <div className="space-y-1.5">
-          <Label htmlFor={`tz-${tenant.id}`}>Timezone (IANA)</Label>
-          <Input
-            id={`tz-${tenant.id}`}
-            value={timezone}
-            onChange={(e) => setTimezone(e.target.value)}
-            placeholder="UTC"
-          />
+    <PanelCard
+      title="Access schedule"
+      description="Restrict tenant access by date range or local weekly windows."
+      actions={<SaveButton type="button" pending={pending} onClick={save} idleLabel="Save schedule" />}
+    >
+      <div className="space-y-4 p-4">
+        <div className="grid gap-4 md:grid-cols-3">
+          <div className="space-y-1.5">
+            <Label htmlFor={`tz-${tenant.id}`}>Timezone (IANA)</Label>
+            <Input
+              id={`tz-${tenant.id}`}
+              value={timezone}
+              onChange={(e) => setTimezone(e.target.value)}
+              placeholder="UTC"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor={`from-${tenant.id}`}>Active from</Label>
+            <Input
+              id={`from-${tenant.id}`}
+              type="datetime-local"
+              value={activeFrom}
+              onChange={(e) => setActiveFrom(e.target.value)}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor={`until-${tenant.id}`}>Active until</Label>
+            <Input
+              id={`until-${tenant.id}`}
+              type="datetime-local"
+              value={activeUntil}
+              onChange={(e) => setActiveUntil(e.target.value)}
+            />
+          </div>
         </div>
-        <div className="space-y-1.5">
-          <Label htmlFor={`from-${tenant.id}`}>Active from</Label>
-          <Input
-            id={`from-${tenant.id}`}
-            type="datetime-local"
-            value={activeFrom}
-            onChange={(e) => setActiveFrom(e.target.value)}
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor={`until-${tenant.id}`}>Active until</Label>
-          <Input
-            id={`until-${tenant.id}`}
-            type="datetime-local"
-            value={activeUntil}
-            onChange={(e) => setActiveUntil(e.target.value)}
-          />
-        </div>
-      </div>
 
-      <div className="space-y-2">
-        <div className="flex items-center justify-between">
-          <span className="text-xs text-muted-foreground">
-            Weekly windows (local to the tenant timezone). No windows = always on.
-          </span>
-          <Button type="button" size="sm" variant="secondary" onClick={addWindow}>
-            <Plus className="h-3.5 w-3.5" />
-            Add window
-          </Button>
-        </div>
-        {windows.map((w, idx) => (
-          <div key={idx} className="flex flex-wrap items-center gap-2">
-            <select
-              value={w.day}
-              onChange={(e) => patchWindow(idx, { day: Number(e.target.value) })}
-              className="h-9 rounded-md border border-input bg-background px-2 text-sm"
-            >
-              {DAY_LABELS.map((label, d) => (
-                <option key={d} value={d}>
-                  {label}
-                </option>
-              ))}
-            </select>
-            <Input
-              type="time"
-              className="w-32"
-              value={minToTime(w.start_min)}
-              onChange={(e) => patchWindow(idx, { start_min: timeToMin(e.target.value) })}
-            />
-            <span className="text-muted-foreground">to</span>
-            <Input
-              type="time"
-              className="w-32"
-              value={minToTime(w.end_min)}
-              onChange={(e) => patchWindow(idx, { end_min: timeToMin(e.target.value) })}
-            />
-            <Button
-              type="button"
-              size="icon"
-              variant="ghost"
-              title="Remove window"
-              onClick={() => removeWindow(idx)}
-            >
-              <X className="h-3.5 w-3.5" />
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
+              <CalendarClock className="h-3.5 w-3.5" />
+              Weekly windows are local to the tenant timezone. No windows means always on.
+            </span>
+            <Button type="button" size="sm" variant="secondary" onClick={addWindow}>
+              <Plus className="h-3.5 w-3.5" />
+              Add window
             </Button>
           </div>
-        ))}
-      </div>
+          <div className="space-y-2">
+            {windows.map((w, idx) => (
+              <div
+                key={idx}
+                className="flex flex-wrap items-center gap-2 rounded-md border border-border/60 bg-background/30 p-2"
+              >
+                <select
+                  value={w.day}
+                  onChange={(e) => patchWindow(idx, { day: Number(e.target.value) })}
+                  className="h-9 rounded-md border border-input bg-background px-2 text-sm"
+                >
+                  {DAY_LABELS.map((label, d) => (
+                    <option key={d} value={d}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+                <Input
+                  type="time"
+                  className="w-32"
+                  value={minToTime(w.start_min)}
+                  onChange={(e) => patchWindow(idx, { start_min: timeToMin(e.target.value) })}
+                />
+                <span className="text-xs text-muted-foreground">to</span>
+                <Input
+                  type="time"
+                  className="w-32"
+                  value={minToTime(w.end_min)}
+                  onChange={(e) => patchWindow(idx, { end_min: timeToMin(e.target.value) })}
+                />
+                <Button
+                  type="button"
+                  size="icon"
+                  variant="ghost"
+                  className="h-8 w-8"
+                  title="Remove window"
+                  onClick={() => removeWindow(idx)}
+                >
+                  <X className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            ))}
+          </div>
+        </div>
 
-      {error && <div className="text-sm text-destructive">{error}</div>}
-      {saved && !error && <div className="text-sm text-emerald-500">Schedule saved.</div>}
-
-      <div>
-        <Button type="button" disabled={pending} onClick={save}>
-          {pending ? "Saving..." : "Save schedule"}
-        </Button>
+        <StatusMessage error={error} saved={saved} savedText="Schedule saved." />
       </div>
-    </div>
+    </PanelCard>
   );
 }
 
 function BudgetEditor({ tenant }: { tenant: Tenant }) {
+  const flashSaved = useContext(SaveFlashContext);
   const [pending, start] = useTransition();
   const [tokens, setTokens] = useState(
     tenant.budget_tokens != null ? String(tenant.budget_tokens) : "",
@@ -515,94 +776,99 @@ function BudgetEditor({ tenant }: { tenant: Tenant }) {
         budget_cost_usd: costVal,
         budget_period: period,
       });
-      if (res.ok) setSaved(true);
-      else setError(res.error);
+      if (res.ok) {
+        setSaved(true);
+        flashSaved();
+      } else {
+        setError(res.error);
+      }
     });
   }
 
   function clearCaps() {
     setTokens("");
     setCost("");
+    setError(null);
+    setSaved(false);
     start(async () => {
       const res = await setTenantBudgetAction(tenant.id, {
         budget_tokens: null,
         budget_cost_usd: null,
         budget_period: period,
       });
-      if (res.ok) setSaved(true);
-      else setError(res.error);
+      if (res.ok) {
+        setSaved(true);
+        flashSaved();
+      } else {
+        setError(res.error);
+      }
     });
   }
 
   return (
-    <div className="space-y-4 border-t border-border/60 pt-4">
-      <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-        Cumulative budget caps
-      </div>
-      <div className="grid gap-4 md:grid-cols-3">
-        <div className="space-y-1.5">
-          <Label htmlFor={`budget-tokens-${tenant.id}`}>Token cap</Label>
-          <Input
-            id={`budget-tokens-${tenant.id}`}
-            type="number"
-            min={0}
-            value={tokens}
-            onChange={(e) => setTokens(e.target.value)}
-            placeholder="unlimited"
-          />
+    <PanelCard
+      title="Cumulative budget caps"
+      description="Cap total token or dollar usage per tenant."
+      actions={<SaveButton type="button" pending={pending} onClick={save} idleLabel="Save budget" />}
+    >
+      <div className="space-y-4 p-4">
+        <div className="grid gap-4 md:grid-cols-3">
+          <div className="space-y-1.5">
+            <Label htmlFor={`budget-tokens-${tenant.id}`}>Token cap</Label>
+            <Input
+              id={`budget-tokens-${tenant.id}`}
+              type="number"
+              min={0}
+              value={tokens}
+              onChange={(e) => setTokens(e.target.value)}
+              placeholder="unlimited"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor={`budget-cost-${tenant.id}`}>Cost cap (USD)</Label>
+            <Input
+              id={`budget-cost-${tenant.id}`}
+              type="number"
+              min={0}
+              step="0.01"
+              value={cost}
+              onChange={(e) => setCost(e.target.value)}
+              placeholder="unlimited"
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor={`budget-period-${tenant.id}`}>Reset period</Label>
+            <select
+              id={`budget-period-${tenant.id}`}
+              value={period}
+              onChange={(e) => setPeriod(e.target.value)}
+              className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+            >
+              {BUDGET_PERIODS.map((p) => (
+                <option key={p} value={p}>
+                  {p}
+                </option>
+              ))}
+            </select>
+          </div>
         </div>
-        <div className="space-y-1.5">
-          <Label htmlFor={`budget-cost-${tenant.id}`}>Cost cap (USD)</Label>
-          <Input
-            id={`budget-cost-${tenant.id}`}
-            type="number"
-            min={0}
-            step="0.01"
-            value={cost}
-            onChange={(e) => setCost(e.target.value)}
-            placeholder="unlimited"
-          />
-        </div>
-        <div className="space-y-1.5">
-          <Label htmlFor={`budget-period-${tenant.id}`}>Reset period</Label>
-          <select
-            id={`budget-period-${tenant.id}`}
-            value={period}
-            onChange={(e) => setPeriod(e.target.value)}
-            className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
-          >
-            {BUDGET_PERIODS.map((p) => (
-              <option key={p} value={p}>
-                {p}
-              </option>
-            ))}
-          </select>
-        </div>
-      </div>
-      <p className="text-xs text-muted-foreground">
-        Caps apply to cumulative usage. <strong>monthly</strong> resets each calendar month (tenant
-        timezone), <strong>term</strong> resets when re-applied, <strong>lifetime</strong> never
-        resets. Leave a field blank for no cap.
-      </p>
-
-      {error && <div className="text-sm text-destructive">{error}</div>}
-      {saved && !error && <div className="text-sm text-emerald-500">Budget saved.</div>}
-
-      <div className="flex items-center gap-2">
-        <Button type="button" disabled={pending} onClick={save}>
-          {pending ? "Saving..." : "Save budget"}
-        </Button>
-        {(tenant.budget_tokens != null || tenant.budget_cost_usd != null) && (
-          <Button type="button" variant="ghost" disabled={pending} onClick={clearCaps}>
+        <p className="text-xs text-muted-foreground">
+          Caps apply to cumulative usage. Monthly resets each calendar month in the tenant timezone;
+          term resets when re-applied; lifetime never resets. Leave a field blank for no cap.
+        </p>
+        <StatusMessage error={error} saved={saved} savedText="Budget saved." />
+        {(tenant.budget_tokens != null || tenant.budget_cost_usd != null || tokens || cost) && (
+          <Button type="button" variant="ghost" size="sm" disabled={pending} onClick={clearCaps}>
             Clear caps
           </Button>
         )}
       </div>
-    </div>
+    </PanelCard>
   );
 }
 
 function AllowlistEditor({ tenant, models }: { tenant: Tenant; models: string[] }) {
+  const flashSaved = useContext(SaveFlashContext);
   const [pending, start] = useTransition();
   const [selected, setSelected] = useState<string[]>(tenant.allowed_models ?? []);
   const [error, setError] = useState<string | null>(null);
@@ -623,55 +889,54 @@ function AllowlistEditor({ tenant, models }: { tenant: Tenant; models: string[] 
     setSaved(false);
     start(async () => {
       const res = await setTenantAllowlistAction(tenant.id, selected);
-      if (res.ok) setSaved(true);
-      else setError(res.error);
+      if (res.ok) {
+        setSaved(true);
+        flashSaved();
+      } else {
+        setError(res.error);
+      }
     });
   }
 
   return (
-    <div className="space-y-3 border-t border-border/60 pt-4">
-      <div className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
-        Model allowlist
-      </div>
-      <p className="text-xs text-muted-foreground">
-        When empty, the tenant may use every registered model. Select models to restrict access.
-      </p>
-      {options.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No models registered yet.</p>
-      ) : (
-        <div className="flex flex-wrap gap-2">
-          {options.map((name) => {
-            const on = selected.includes(name);
-            return (
-              <button
-                key={name}
-                type="button"
-                onClick={() => toggle(name)}
-                className={cn(
-                  "rounded-md border px-2.5 py-1 text-xs transition-colors",
-                  on
-                    ? "border-indigo-500/50 bg-indigo-500/10 text-indigo-500"
-                    : "border-input text-muted-foreground hover:border-foreground/30",
-                )}
-              >
-                {name}
-              </button>
-            );
-          })}
-        </div>
-      )}
+    <PanelCard
+      title="Model allowlist"
+      description="Leave empty to allow every registered model."
+      actions={<SaveButton type="button" pending={pending} onClick={save} idleLabel="Save allowlist" />}
+    >
+      <div className="space-y-4 p-4">
+        {options.length === 0 ? (
+          <p className="text-sm text-muted-foreground">No models registered yet.</p>
+        ) : (
+          <div className="flex flex-wrap gap-2">
+            {options.map((name) => {
+              const on = selected.includes(name);
+              return (
+                <button
+                  key={name}
+                  type="button"
+                  onClick={() => toggle(name)}
+                  className={cn(
+                    "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs transition-colors",
+                    on
+                      ? "border-indigo-500/50 bg-indigo-500/10 text-indigo-500"
+                      : "border-input text-muted-foreground hover:border-foreground/30 hover:text-foreground",
+                  )}
+                >
+                  {on && <Check className="h-3 w-3" strokeWidth={2.5} />}
+                  {name}
+                </button>
+              );
+            })}
+          </div>
+        )}
 
-      {error && <div className="text-sm text-destructive">{error}</div>}
-      {saved && !error && <div className="text-sm text-emerald-500">Allowlist saved.</div>}
-
-      <div className="flex items-center gap-2">
-        <Button type="button" disabled={pending} onClick={save}>
-          {pending ? "Saving..." : "Save allowlist"}
-        </Button>
+        <StatusMessage error={error} saved={saved} savedText="Allowlist saved." />
         {selected.length > 0 && (
           <Button
             type="button"
             variant="ghost"
+            size="sm"
             disabled={pending}
             onClick={() => {
               setSelected([]);
@@ -682,7 +947,130 @@ function AllowlistEditor({ tenant, models }: { tenant: Tenant; models: string[] 
           </Button>
         )}
       </div>
+    </PanelCard>
+  );
+}
+
+function SaveButton({
+  pending,
+  idleLabel = "Save",
+  size = "sm",
+  variant = "default",
+  disabled,
+  type = "submit",
+  onClick,
+}: {
+  pending: boolean;
+  idleLabel?: string;
+  size?: "sm" | "default";
+  variant?: "default" | "secondary";
+  disabled?: boolean;
+  type?: "submit" | "button";
+  onClick?: () => void;
+}) {
+  return (
+    <Button type={type} onClick={onClick} size={size} variant={variant} disabled={pending || disabled} aria-busy={pending}>
+      {pending ? (
+        <RefreshCw className="h-3.5 w-3.5 animate-spin" aria-hidden />
+      ) : (
+        <Save className="h-3.5 w-3.5" aria-hidden />
+      )}
+      {idleLabel}
+    </Button>
+  );
+}
+
+function PanelCard({
+  title,
+  description,
+  actions,
+  className,
+  children,
+}: {
+  title?: string;
+  description?: string;
+  actions?: ReactNode;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <section className={cn("overflow-hidden rounded-lg border border-border bg-card/40", className)}>
+      {title && (
+        <header className="flex items-center justify-between gap-3 border-b border-border/60 bg-background/30 px-4 py-2.5">
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium">{title}</p>
+            {description && <p className="text-xs text-muted-foreground">{description}</p>}
+          </div>
+          {actions && <div className="flex shrink-0 items-center gap-2">{actions}</div>}
+        </header>
+      )}
+      {children}
+    </section>
+  );
+}
+
+function SettingRow({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
+  return (
+    <div className="flex flex-col gap-3 px-4 py-3 lg:flex-row lg:items-center lg:justify-between">
+      <div className="min-w-0 max-w-sm">
+        <p className="text-xs font-medium">{label}</p>
+        {hint && <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">{hint}</p>}
+      </div>
+      <div className="min-w-0 flex-1 lg:flex lg:justify-end">{children}</div>
     </div>
   );
 }
 
+function Field({
+  label,
+  id,
+  name,
+  placeholder,
+  required,
+  type = "text",
+  defaultValue,
+}: {
+  label: string;
+  id: string;
+  name: string;
+  placeholder?: string;
+  required?: boolean;
+  type?: string;
+  defaultValue?: string;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label htmlFor={id}>{label}</Label>
+      <Input id={id} name={name} type={type} placeholder={placeholder} required={required} defaultValue={defaultValue} />
+    </div>
+  );
+}
+
+function SpecItem({ label, children }: { label: string; children: ReactNode }) {
+  return (
+    <div className="min-w-0 rounded-md border border-border/60 bg-background/30 px-3 py-2">
+      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
+      <div className="mt-1 truncate text-xs font-medium tabular-nums">{children}</div>
+    </div>
+  );
+}
+
+function StatusMessage({
+  error,
+  saved,
+  savedText,
+}: {
+  error: string | null;
+  saved: boolean;
+  savedText: string;
+}) {
+  if (error) return <div className="text-sm text-destructive">{error}</div>;
+  if (saved) return <div className="text-sm text-emerald-500">{savedText}</div>;
+  return null;
+}
+
+function formatDate(value: string) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "-";
+  return date.toLocaleDateString([], { month: "short", day: "numeric", year: "numeric" });
+}

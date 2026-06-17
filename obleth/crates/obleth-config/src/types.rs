@@ -120,10 +120,26 @@ pub struct ApiKey {
     pub id: Uuid,
     pub tenant_id: Uuid,
     pub name: String,
+    /// Operator note shown in dashboards; useful for ownership and intent.
+    #[serde(default)]
+    pub description: String,
     /// Display-only prefix, e.g. `sk_a1b2...` for dashboards.
     pub key_prefix: String,
+    /// Optional cumulative token budget for this key's current term. `None` = no cap.
+    #[serde(default)]
+    pub budget_tokens: Option<i64>,
+    /// Optional cumulative USD cost budget for this key's current term. `None` = no cap.
+    #[serde(default)]
+    pub budget_cost_usd: Option<f64>,
+    /// Key budget reset period: `lifetime`, `monthly`, or `term`. `None` = lifetime.
+    #[serde(default)]
+    pub budget_period: Option<String>,
+    /// When this key's current budget term began.
+    #[serde(default)]
+    pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub disabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// The compact, hot-path view resolved from an API key. This is what the data
@@ -167,6 +183,18 @@ pub struct ResolvedKey {
     /// When the current term began. Changing it resets cumulative term usage.
     #[serde(default)]
     pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Optional cumulative token budget for the key itself. `None` = no cap.
+    #[serde(default)]
+    pub key_budget_tokens: Option<i64>,
+    /// Optional cumulative USD budget for the key itself. `None` = no cap.
+    #[serde(default)]
+    pub key_budget_cost_usd: Option<f64>,
+    /// Key budget reset period: `lifetime`, `monthly`, or `term`. `None` = lifetime.
+    #[serde(default)]
+    pub key_budget_period: Option<String>,
+    /// When the key's current budget term began.
+    #[serde(default)]
+    pub key_budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Optional per-tenant model allowlist. Empty/`None` = all models permitted.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
@@ -468,6 +496,59 @@ pub struct ModelEndpoint {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Optional Slurm provisioning spec for a model (1:1 with a model). Absent for
+/// unmanaged models. Stored in `managed_models`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ManagedModelSpec {
+    #[schema(value_type = String)]
+    pub model_id: Uuid,
+    pub enabled: bool,
+    pub partition: String,
+    pub gres: String,
+    pub nodes: i64,
+    pub constraints: Option<String>,
+    pub exclude: Option<String>,
+    pub account: Option<String>,
+    pub qos: Option<String>,
+    pub time_limit: Option<String>,
+    pub image: String,
+    /// Shell lines injected before `apptainer exec` in the batch script.
+    /// Use this to load modules or set PATH on your cluster, e.g. `module load apptainer`.
+    pub preamble: String,
+    /// Directory for Slurm stdout/stderr files. When non-empty, jobs write
+    /// `{dir}/{job_name}-%j.out` and `{dir}/{job_name}-%j.err`. Empty = Slurm default.
+    pub log_output_dir: String,
+    pub launch_command: String,
+    pub serving_port: i64,
+    pub health_path: String,
+    pub target_replicas: i64,
+    /// Stop resubmitting when this many lost replicas are visible (0 = no limit).
+    pub max_job_failures: i64,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// One known Slurm-backed replica of a managed model. Stored in `model_replicas`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ModelReplica {
+    #[schema(value_type = String)]
+    pub id: Uuid,
+    #[schema(value_type = String)]
+    pub model_id: Uuid,
+    pub slurm_job_id: String,
+    pub nodes: Option<String>,
+    #[schema(value_type = Option<String>)]
+    pub endpoint_id: Option<Uuid>,
+    /// One of: pending, starting, healthy, draining, lost.
+    pub state: String,
+    pub last_message: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Valid `ModelReplica::state` values, in lifecycle order.
+pub const REPLICA_STATES: [&str; 5] = ["pending", "starting", "healthy", "draining", "lost"];
+
 /// A registered MCP (Model Context Protocol) server. obleth fronts it with the
 /// same identity, audit, and reliability layer it applies to LLM traffic:
 /// clients reach many MCP servers through one authenticated obleth endpoint.
@@ -557,6 +638,36 @@ pub struct UsageRecord {
 pub struct UsageRetentionSettings {
     /// Days of raw per-request history to keep. Clamped to a sane floor on use.
     pub days: i64,
+}
+
+/// System-wide Slurm provisioning settings, editable from the control plane and
+/// persisted in Postgres (single `slurm` row in `app_settings`). These hold the
+/// slurmrestd connection details the optional `obleth-provisioner` plugin uses;
+/// `enabled` is the master switch the dashboard toggles. The JWT is encrypted at
+/// rest in the store layer (same envelope cipher as upstream provider keys); it
+/// is masked in the public settings API and only returned in full on the
+/// provisioner-facing `resolved` route.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default, ToSchema)]
+pub struct SlurmSettings {
+    /// Master switch. When false the provisioner idles (no new provisioning).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL of `slurmrestd` (e.g. `http://slurm:6820`).
+    #[serde(default)]
+    pub slurmrestd_url: String,
+    /// `slurmrestd` OpenAPI plugin version path segment.
+    #[serde(default = "default_slurm_api_version")]
+    pub slurmrestd_api_version: String,
+    /// Slurm user name sent in `X-SLURM-USER-NAME`.
+    #[serde(default)]
+    pub slurm_user: String,
+    /// Slurm JWT sent in `X-SLURM-USER-TOKEN`. Encrypted at rest by the store.
+    #[serde(default)]
+    pub slurm_jwt: String,
+}
+
+fn default_slurm_api_version() -> String {
+    "v0.0.40".to_string()
 }
 
 /// Runtime-configurable alerting settings, editable from the control plane and
@@ -1191,8 +1302,18 @@ pub struct ApiKeyBackup {
     pub id: Uuid,
     pub tenant_id: Uuid,
     pub name: String,
+    #[serde(default)]
+    pub description: String,
     pub key_prefix: String,
     pub key_hash: String,
+    #[serde(default)]
+    pub budget_tokens: Option<i64>,
+    #[serde(default)]
+    pub budget_cost_usd: Option<f64>,
+    #[serde(default)]
+    pub budget_period: Option<String>,
+    #[serde(default)]
+    pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
     pub disabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }

@@ -76,13 +76,26 @@ create table if not exists api_keys (
     id          uuid primary key,
     tenant_id   uuid not null references tenants (id) on delete cascade,
     name        text not null,
+    description text not null default '',
     -- display-only prefix for dashboards, e.g. sk_a1b2c3
     key_prefix  text not null,
     -- sha-256 hex of the raw secret; the secret itself is never stored
     key_hash    text not null unique,
+    budget_tokens bigint,
+    budget_cost_usd double precision,
+    budget_period text,
+    budget_started_at timestamptz,
     disabled    boolean not null default false,
-    created_at  timestamptz not null default now()
+    created_at  timestamptz not null default now(),
+    updated_at  timestamptz not null default now()
 );
+
+alter table api_keys add column if not exists description text not null default '';
+alter table api_keys add column if not exists budget_tokens bigint;
+alter table api_keys add column if not exists budget_cost_usd double precision;
+alter table api_keys add column if not exists budget_period text;
+alter table api_keys add column if not exists budget_started_at timestamptz;
+alter table api_keys add column if not exists updated_at timestamptz not null default now();
 
 create index if not exists api_keys_tenant_id_idx on api_keys (tenant_id);
 
@@ -278,6 +291,62 @@ create table if not exists model_endpoints (
 
 create index if not exists model_endpoints_model_idx on model_endpoints (model_id);
 
+-- Optional Slurm provisioning spec for a model (1:1 with models). Present only
+-- for models obleth hosts on the cluster; absent rows mean "unmanaged / static
+-- endpoints" and the data plane behaves exactly as without the provisioner.
+create table if not exists managed_models (
+    model_id        uuid primary key references models(id) on delete cascade,
+    -- master switch: false drains replicas to zero and stops new provisioning
+    -- (the spec is retained so the model can be re-enabled later)
+    enabled         boolean not null default true,
+    -- placement
+    partition       text not null,
+    gres            text not null default '',          -- e.g. gpu:h100:2
+    nodes           bigint not null default 1 check (nodes >= 1),
+    constraints     text,                              -- slurm --constraint
+    exclude         text,                              -- nodes/features to avoid
+    account         text,
+    qos             text,
+    time_limit      text,                              -- slurm --time, e.g. 12:00:00
+    -- launch
+    image           text not null,                     -- apptainer image ref
+    preamble        text not null default '',           -- shell lines injected before apptainer exec (e.g. module load apptainer)
+    log_output_dir  text not null default '',           -- directory for slurm stdout/stderr files (e.g. /shared/logs); empty = slurm default
+    launch_command  text not null,                     -- vllm serve command template
+    serving_port    bigint not null check (serving_port between 1 and 65535),
+    health_path     text not null default '/health',
+    -- scaling (v1: fixed target, no autoscaling; default 2 for preempt safety)
+    target_replicas bigint not null default 2 check (target_replicas >= 1),
+    -- failure gating: stop resubmitting after this many consecutive lost replicas (0 = unlimited)
+    max_job_failures bigint not null default 0,
+    created_at      timestamptz not null default now(),
+    updated_at      timestamptz not null default now()
+);
+
+-- One row per known Slurm-backed replica of a managed model. The provisioner
+-- owns these rows; `endpoint_id` links to the model_endpoints row that puts the
+-- replica into routing rotation once healthy.
+create table if not exists model_replicas (
+    id            uuid primary key,
+    model_id      uuid not null references models(id) on delete cascade,
+    slurm_job_id  text not null,
+    nodes         text,                                -- allocated hostnames (csv)
+    endpoint_id   uuid references model_endpoints(id) on delete set null,
+    -- pending -> starting -> healthy -> draining -> lost
+    state         text not null default 'pending'
+                  check (state in ('pending','starting','healthy','draining','lost')),
+    last_message  text,
+    created_at    timestamptz not null default now(),
+    updated_at    timestamptz not null default now()
+);
+
+create index if not exists model_replicas_model_idx on model_replicas (model_id);
+create index if not exists model_replicas_state_idx on model_replicas (state);
+-- One replica row per Slurm job: makes create_replica idempotent and stops a
+-- retried insert from spawning a duplicate row for the same job.
+create unique index if not exists model_replicas_job_uniq
+    on model_replicas (model_id, slurm_job_id);
+
 -- MCP (Model Context Protocol) server registry. obleth reverse-proxies these
 -- through its auth + audit layer so clients reach many MCP servers via one
 -- authenticated endpoint (/mcp/{name}).
@@ -300,3 +369,8 @@ create table if not exists app_settings (
     value      jsonb not null,
     updated_at timestamptz not null default now()
 );
+
+-- Idempotent column additions for live upgrades (safe to re-run on existing installs).
+alter table managed_models add column if not exists preamble text not null default '';
+alter table managed_models add column if not exists log_output_dir text not null default '';
+alter table managed_models add column if not exists max_job_failures bigint not null default 0;

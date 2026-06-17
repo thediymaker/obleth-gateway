@@ -55,6 +55,8 @@ import {
 } from "@/app/actions";
 import { ChartShell, axisTick, chartGrid, compactAxis, tip, timeCursor } from "@/components/chart-tooltip";
 import { ModelMetricsDetail } from "@/components/model-metrics-detail";
+import { ManagedModelConfig } from "@/components/managed-model-config";
+import { ReplicaPanel } from "@/components/replica-panel";
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -139,6 +141,47 @@ const MODEL_TYPE_LABELS: Record<string, string> = Object.fromEntries(
   MODEL_TYPE_OPTIONS.map((o) => [o.value, o.label]),
 );
 
+const CREATE_MODEL_STEPS = [
+  {
+    label: "Hosting",
+    title: "Choose a hosting option",
+    description: "Select the backend that will serve this route. More hosting options can be added here later.",
+  },
+  {
+    label: "API ID",
+    title: "Choose the API model name",
+    description: "This is the exact model value clients pass to the API, not a friendly display name.",
+  },
+  {
+    label: "Connection",
+    title: "Provide connection details",
+    description: "Point obleth at the upstream endpoint or define the Slurm launch details.",
+  },
+  {
+    label: "Traffic",
+    title: "Set traffic rules",
+    description: "Start with sensible capacity and billing defaults; tune them later as load changes.",
+  },
+  {
+    label: "Review",
+    title: "Capabilities and review",
+    description: "Attach chat capabilities, routing tags, boons, and tool grants before creating the route.",
+  },
+] as const;
+
+function normalizeModelApiNameDraft(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[\s_]+/g, "-")
+    .replace(/[^a-z0-9.-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^\.+/g, "");
+}
+
+function normalizeModelApiNameFinal(value: string) {
+  return normalizeModelApiNameDraft(value).replace(/^[.-]+|[.-]+$/g, "");
+}
+
 export function ModelManager({
   models,
   cacheStats,
@@ -146,6 +189,8 @@ export function ModelManager({
   healthDetails,
   endpoints,
   mcpServers = [],
+  managed = {},
+  slurmEnabled = false,
 }: {
   models: ModelRoute[];
   cacheStats?: CacheStats;
@@ -153,6 +198,8 @@ export function ModelManager({
   healthDetails: Record<string, ModelHealthDetail | undefined>;
   endpoints: Record<string, ModelEndpoint[]>;
   mcpServers?: McpServer[];
+  managed?: Record<string, boolean>;
+  slurmEnabled?: boolean;
 }) {
   const [pending, start] = useTransition();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -170,11 +217,9 @@ export function ModelManager({
   const [saveFlash, setSaveFlash] = useState<{ id: string; n: number } | null>(null);
   const flashSaved = (id: string) =>
     setSaveFlash((prev) => ({ id, n: prev?.id === id ? prev.n + 1 : 1 }));
-  const [createOpen, setCreateOpen] = useState(false);
-  const [createType, setCreateType] = useState<string>("chat");
+  const [createWizardOpen, setCreateWizardOpen] = useState(false);
   const [showBenchmarkRoutes, setShowBenchmarkRoutes] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
-  const createFormRef = useRef<HTMLFormElement>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const [importResult, setImportResult] = useState<ImportModelsResult | null>(null);
   const [importPlan, setImportPlan] = useState<ImportPlanItem[] | null>(null);
@@ -251,12 +296,21 @@ export function ModelManager({
     start(async () => {
       const result = await createModelAction(formData);
       if (result.ok) {
-        createFormRef.current?.reset();
-        setCreateOpen(false);
+        setCreateWizardOpen(false);
       } else {
         setCreateError(result.error);
       }
     });
+  }
+
+  function openCreateWizard() {
+    setCreateError(null);
+    setCreateWizardOpen(true);
+  }
+
+  function closeCreateWizard() {
+    setCreateError(null);
+    setCreateWizardOpen(false);
   }
 
   function checkAll() {
@@ -274,111 +328,16 @@ export function ModelManager({
   return (
     <div className="space-y-6">
       <FleetStats models={models} health={health} cacheStats={cacheStats} />
-      <Dialog
-        open={createOpen}
-        onOpenChange={(next) => {
-          setCreateOpen(next);
-          if (!next) {
-            setCreateError(null);
-            setCreateType("chat");
-          }
-        }}
-      >
-        <DialogContent className="max-h-[85vh] max-w-3xl overflow-y-auto">
-          <DialogHeader>
-            <DialogTitle>Add model route</DialogTitle>
-            <DialogDescription>
-              Map a client-facing model name to an upstream OpenAI-compatible endpoint.
-            </DialogDescription>
-          </DialogHeader>
-          <form ref={createFormRef} action={submitModel} className="grid gap-4 md:grid-cols-2">
-            <Field label="Model name (client)" name="model_name" placeholder="qwen3-vl-32b-instruct" required />
-            <Field label="Upstream model" name="upstream_model" placeholder="asuair/qwen3-vl-32b-instruct" required />
-            <div className="md:col-span-2">
-              <SelectField
-                label="Model type"
-                name="model_type"
-                value={createType}
-                onChange={setCreateType}
-                options={MODEL_TYPE_OPTIONS}
-                hint={modelTypeHint(createType)}
-              />
-            </div>
-            <div className="md:col-span-2">
-              <Field label="Description" name="description" placeholder="Qwen3 235B instruction model for production chat and tool use" />
-            </div>
-            <div className="md:col-span-2">
-              <Field label="API base URL" name="api_base" placeholder="http://envoy-aibrix-system.../v1" required />
-            </div>
-            <Field label="Upstream API key (optional)" name="api_key" placeholder="sk_..." />
-            <Field label="Admission weight" name="admission_weight" type="number" defaultValue="100" />
-            <Field label="Max in-flight (optional)" name="max_in_flight" type="number" placeholder="No cap" />
-            {(createType === "chat" || createType === "embedding") && (
-              <Field label="Input cost / token" name="input_cost_per_token" placeholder="0.000000071" />
-            )}
-            {createType === "chat" && (
-              <Field label="Output cost / token" name="output_cost_per_token" placeholder="0.0000001" />
-            )}
-            {createType === "image" && (
-              <Field label="Cost / image" name="cost_per_image" placeholder="0.04" />
-            )}
-            {createType === "audio_speech" && (
-              <Field label="Cost / character" name="cost_per_character" placeholder="0.000015" />
-            )}
-            {createType === "audio_transcription" && (
-              <Field label="Cost / audio second" name="cost_per_audio_second" placeholder="0.0001" />
-            )}
-            {(createType === "chat" || createType === "embedding") && (
-              <Field label="Context window" name="context_window" type="number" defaultValue="131072" />
-            )}
-            {createType === "chat" && (
-              <>
-                <FieldGroup label="Capabilities" hint="What the model natively supports. These gate request features and routing.">
-                  <ChipCheckbox name="supports_function_calling" label="Function calling" />
-                  <ChipCheckbox name="supports_system_messages" label="System messages" defaultChecked />
-                  <ChipCheckbox name="supports_response_schema" label="Response schema" />
-                  <ChipCheckbox name="supports_tool_choice" label="Tool choice" />
-                </FieldGroup>
-                <FieldGroup label="Routing tags" hint="Hints the auto router matches against request intent. The “vision” tag marks native image support and makes the model eligible as a system-wide vision describer.">
-                  {MODEL_TAGS.map((tag) => (
-                    <ChipCheckbox key={tag} name={`tag_${tag}`} label={tag} />
-                  ))}
-                </FieldGroup>
-                <FieldGroup label="Boons" hint="Gateway capabilities granted to this model that it lacks natively. Configure each boon in Settings → Boons, then enable it per model here.">
-                  {MODEL_BOONS.map((boon) => (
-                    <ChipCheckbox key={boon.value} name={`boon_${boon.value}`} label={boon.label} hint={boon.description} />
-                  ))}
-                </FieldGroup>
-                <FieldGroup label="Tools" hint="Registered MCP servers whose tools this model may use. The gateway injects the tools into plain chat requests and runs the tool loop itself — clients just ask questions. Enable the tool loop in Settings → Boons.">
-                  {mcpServers.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">No MCP servers registered. Add one on the MCP page first.</p>
-                  ) : (
-                    mcpServers.map((server) => (
-                      <ChipCheckbox
-                        key={server.id}
-                        name={`tool_server_${server.name}`}
-                        label={server.name}
-                        hint={`Grant this model the tools served by ${server.name} (${server.upstream_url}).`}
-                      />
-                    ))
-                  )}
-                </FieldGroup>
-              </>
-            )}
-            {createError && (
-              <p className="md:col-span-2 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-                {createError}
-              </p>
-            )}
-            <DialogFooter className="md:col-span-2">
-              <Button type="button" variant="ghost" disabled={pending} onClick={() => setCreateOpen(false)}>
-                Cancel
-              </Button>
-              <Button type="submit" disabled={pending}>{pending ? "Adding..." : "Add model"}</Button>
-            </DialogFooter>
-          </form>
-        </DialogContent>
-      </Dialog>
+      {createWizardOpen && (
+        <CreateModelWizard
+          pending={pending}
+          error={createError}
+          slurmEnabled={slurmEnabled}
+          mcpServers={mcpServers}
+          onCancel={closeCreateWizard}
+          onSubmit={submitModel}
+        />
+      )}
 
       <Card>
         <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -414,9 +373,14 @@ export function ModelManager({
               <RefreshCw className="h-3.5 w-3.5" />
               Check listed
             </Button>
-            <Button type="button" size="sm" onClick={() => setCreateOpen(true)}>
+            <Button
+              type="button"
+              size="sm"
+              variant={createWizardOpen ? "secondary" : "default"}
+              onClick={createWizardOpen ? closeCreateWizard : openCreateWizard}
+            >
               <Plus className="h-3.5 w-3.5" />
-              Add model
+              {createWizardOpen ? "Close setup" : "New model"}
             </Button>
           </div>
         </CardHeader>
@@ -583,6 +547,7 @@ export function ModelManager({
                               detail={healthDetails[model.id]}
                               endpoints={endpoints[model.id] ?? []}
                               mcpServers={mcpServers}
+                              isManaged={managed[model.id] ?? false}
                               pending={pending}
                               onCacheToggle={() => {
                                 flashSaved(model.id);
@@ -609,12 +574,642 @@ export function ModelManager({
   );
 }
 
+function CreateModelWizard({
+  pending,
+  error,
+  slurmEnabled,
+  mcpServers,
+  onCancel,
+  onSubmit,
+}: {
+  pending: boolean;
+  error: string | null;
+  slurmEnabled: boolean;
+  mcpServers: McpServer[];
+  onCancel: () => void;
+  onSubmit: (formData: FormData) => void;
+}) {
+  const [step, setStep] = useState(0);
+  const [createType, setCreateType] = useState<string>("chat");
+  const [modelName, setModelName] = useState("");
+  const [endpointMode, setEndpointMode] = useState<string>("static");
+  const [localError, setLocalError] = useState<string | null>(null);
+  const [slurmBackend, setSlurmBackend] = useState<"vllm" | "ollama" | "custom">("vllm");
+  const [slurmPort, setSlurmPort] = useState("8000");
+  const [slurmModel, setSlurmModel] = useState("");
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [preview, setPreview] = useState({
+    modelName: "",
+    upstreamModel: "",
+    apiBase: "",
+    partition: "",
+  });
+  const formRef = useRef<HTMLFormElement>(null);
+  const lastStep = CREATE_MODEL_STEPS.length - 1;
+  const visibleError = localError ?? error;
+  const hostingMode = slurmEnabled ? endpointMode : "static";
+  const typeLabel = MODEL_TYPE_OPTIONS.find((option) => option.value === createType)?.label ?? createType;
+  const hostingLabel =
+    hostingMode !== "slurm"
+      ? "OpenAI-compatible API"
+      : slurmBackend === "vllm"
+        ? "vLLM on Slurm"
+        : slurmBackend === "ollama"
+          ? "Ollama on Slurm"
+          : "Custom on Slurm";
+  // Derived launch command and health endpoint for managed backends.
+  const generatedCmd =
+    slurmBackend === "vllm"
+      ? `vllm serve ${slurmModel || "<model>"} --port ${slurmPort || "8000"}`
+      : `sh -c "OLLAMA_HOST=0.0.0.0:${slurmPort || "8000"} ollama serve & sleep 5 && OLLAMA_HOST=0.0.0.0:${slurmPort || "8000"} ollama pull ${slurmModel || "<model>"} && wait"`;
+  const derivedHealthPath = slurmBackend === "ollama" ? "/api/tags" : "/health";
+
+  function value(formData: FormData, name: string) {
+    return String(formData.get(name) ?? "").trim();
+  }
+
+  function formSnapshot() {
+    if (!formRef.current) return null;
+    return new FormData(formRef.current);
+  }
+
+  function updatePreview() {
+    const formData = formSnapshot();
+    if (!formData) return;
+    setPreview({
+      modelName: normalizeModelApiNameDraft(value(formData, "model_name")),
+      upstreamModel: value(formData, "upstream_model"),
+      apiBase: value(formData, "api_base"),
+      partition: value(formData, "slurm_partition"),
+    });
+    if (localError) setLocalError(null);
+  }
+
+  function updateModelName(value: string, finalize = false) {
+    const next = finalize ? normalizeModelApiNameFinal(value) : normalizeModelApiNameDraft(value);
+    setModelName(next);
+    setPreview((current) => ({ ...current, modelName: next }));
+    if (localError) setLocalError(null);
+  }
+
+  function setHostingMode(mode: string) {
+    setEndpointMode(mode);
+    if (localError) setLocalError(null);
+  }
+
+  function stepIssue(index: number, formData: FormData) {
+    const mode = slurmEnabled ? endpointMode : "static";
+    if (index === 1) {
+      if (!normalizeModelApiNameFinal(value(formData, "model_name"))) return "Add the API model name clients will use.";
+      if (!value(formData, "upstream_model")) return "Add the upstream model identifier.";
+    }
+    if (index === 2) {
+      if (mode === "static" && !value(formData, "api_base")) return "Add the API base URL for the upstream.";
+      if (mode === "slurm") {
+        if (!value(formData, "slurm_partition")) return "Add the Slurm partition.";
+        if (!value(formData, "slurm_image")) return "Add the Apptainer image path.";
+        if (slurmBackend !== "custom" && !slurmModel.trim()) return "Add the model to serve.";
+        if (slurmBackend === "custom" && !value(formData, "slurm_launch_command")) return "Add the launch command.";
+      }
+    }
+    return null;
+  }
+
+  function goToStep(nextStep: number) {
+    const boundedStep = Math.max(0, Math.min(lastStep, nextStep));
+    if (boundedStep === step) return;
+    const formData = formSnapshot();
+    if (!formData) return;
+    if (boundedStep > step) {
+      for (let i = step; i < boundedStep; i += 1) {
+        const issue = stepIssue(i, formData);
+        if (issue) {
+          setLocalError(issue);
+          setStep(i);
+          return;
+        }
+      }
+    }
+    // For vLLM, the HuggingFace model ID (upstream_model on step 1) is exactly
+    // what goes into `vllm serve`. Pre-fill slurmModel so the user doesn't have
+    // to type it again. Ollama tags differ, so skip auto-fill for that backend.
+    if (boundedStep === 2 && step !== 2 && hostingMode === "slurm" && slurmBackend === "vllm" && !slurmModel) {
+      const um = value(formData, "upstream_model");
+      if (um) setSlurmModel(um);
+    }
+    setLocalError(null);
+    setStep(boundedStep);
+  }
+
+  function handleSubmit(formData: FormData) {
+    for (let i = 0; i <= lastStep; i += 1) {
+      const issue = stepIssue(i, formData);
+      if (issue) {
+        setLocalError(issue);
+        setStep(i);
+        return;
+      }
+    }
+    setLocalError(null);
+    onSubmit(formData);
+  }
+
+  return (
+    <Card className="overflow-hidden border-primary/25 bg-card/80">
+      <CardHeader className="border-b border-border/70 bg-background/30">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div>
+            <CardTitle>New model setup</CardTitle>
+            <CardDescription>
+              Create a route in a few focused steps, then fine-tune it from the model card.
+            </CardDescription>
+          </div>
+          <Button type="button" size="sm" variant="ghost" disabled={pending} onClick={onCancel}>
+            Cancel
+          </Button>
+        </div>
+
+        <div className="pt-2">
+          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+            {CREATE_MODEL_STEPS.map((item, index) => {
+              const complete = index < step;
+              const active = index === step;
+              return (
+                <button
+                  key={item.label}
+                  type="button"
+                  disabled={pending}
+                  onClick={() => goToStep(index)}
+                  className={cn(
+                    "flex min-w-0 items-center gap-2 rounded-md border px-3 py-2 text-left transition-colors",
+                    active
+                      ? "border-primary/45 bg-primary/10 text-foreground"
+                      : complete
+                        ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                        : "border-border/70 bg-background/40 text-muted-foreground hover:bg-accent hover:text-foreground",
+                  )}
+                >
+                  <span
+                    className={cn(
+                      "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold tabular-nums",
+                      active
+                        ? "border-primary/60 bg-primary text-primary-foreground"
+                        : complete
+                          ? "border-emerald-500/40 bg-emerald-500/20 text-emerald-200"
+                          : "border-border bg-card",
+                    )}
+                  >
+                    {complete ? <Check className="h-3.5 w-3.5" strokeWidth={2.5} /> : index + 1}
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block truncate text-xs font-medium">{item.label}</span>
+                    <span className="block truncate text-[10px] text-muted-foreground">{item.title}</span>
+                  </span>
+                </button>
+              );
+            })}
+          </div>
+          <div className="mt-3 h-1 overflow-hidden rounded-full bg-muted">
+            <div
+              className="h-full rounded-full bg-primary transition-[width] duration-200"
+              style={{ width: `${((step + 1) / CREATE_MODEL_STEPS.length) * 100}%` }}
+            />
+          </div>
+        </div>
+      </CardHeader>
+
+      <CardContent className="p-0">
+        <form ref={formRef} action={handleSubmit} onInput={updatePreview} onChange={updatePreview}>
+          <input type="hidden" name="endpoint_mode" value={hostingMode} />
+          <div className="grid min-h-[30rem] lg:grid-cols-[minmax(0,1fr)_18rem]">
+            <div className="min-w-0 p-5 sm:p-6">
+              <div className="mb-5">
+                <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Step {step + 1} of {CREATE_MODEL_STEPS.length}
+                </p>
+                <h3 className="mt-1 text-lg font-semibold tracking-tight">{CREATE_MODEL_STEPS[step].title}</h3>
+                <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+                  {CREATE_MODEL_STEPS[step].description}
+                </p>
+              </div>
+
+              {visibleError && (
+                <p className="mb-4 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                  {visibleError}
+                </p>
+              )}
+
+              <section className={cn("grid gap-3 lg:grid-cols-2", step !== 0 && "hidden")}>
+                <button
+                  type="button"
+                  aria-pressed={hostingMode === "static"}
+                  onClick={() => setHostingMode("static")}
+                  className={cn(
+                    "flex min-h-36 items-start gap-3 rounded-lg border p-4 text-left transition-colors",
+                    hostingMode === "static"
+                      ? "border-primary/50 bg-primary/10"
+                      : "border-border/70 bg-background/35 hover:bg-accent",
+                  )}
+                >
+                  <Database className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" />
+                  <span>
+                    <span className="block text-sm font-medium">OpenAI-compatible API</span>
+                    <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
+                      Connect an existing endpoint that speaks the OpenAI API.
+                    </span>
+                    <Badge className="mt-3 bg-background text-[10px]">External API</Badge>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  aria-pressed={hostingMode === "slurm"}
+                  disabled={!slurmEnabled}
+                  onClick={() => setHostingMode("slurm")}
+                  className={cn(
+                    "flex min-h-36 items-start gap-3 rounded-lg border p-4 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+                    hostingMode === "slurm"
+                      ? "border-primary/50 bg-primary/10"
+                      : "border-border/70 bg-background/35 hover:bg-accent",
+                  )}
+                >
+                  <Zap className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" />
+                  <span>
+                    <span className="block text-sm font-medium">Managed Slurm</span>
+                    <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
+                      Launch and replace model replicas on your Slurm cluster.
+                    </span>
+                    <Badge className="mt-3 bg-background text-[10px]">
+                      {slurmEnabled ? "Cluster managed" : "Not configured"}
+                    </Badge>
+                  </span>
+                </button>
+                {!slurmEnabled && (
+                  <p className="rounded-md border border-border/70 bg-background/35 px-3 py-2 text-xs text-muted-foreground lg:col-span-2">
+                    Configure Slurm in Settings before creating Managed Slurm models.
+                  </p>
+                )}
+              </section>
+
+              <section className={cn("grid gap-4 md:grid-cols-2", step !== 1 && "hidden")}>
+                <div className="space-y-1.5">
+                  <Label htmlFor="model-api-name">API model name</Label>
+                  <Input
+                    id="model-api-name"
+                    name="model_name"
+                    value={modelName}
+                    onChange={(event) => updateModelName(event.target.value)}
+                    onBlur={() => updateModelName(modelName, true)}
+                    placeholder="qwen3-vl-32b-instruct"
+                    autoCapitalize="none"
+                    autoCorrect="off"
+                    spellCheck={false}
+                    className="font-mono lowercase"
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    Not a display name. API clients pass this exact value as <code className="font-mono text-foreground">model</code>. Lowercase only; spaces and underscores become dashes.
+                  </p>
+                </div>
+                <Field label="Upstream/native model" name="upstream_model" placeholder="Qwen/Qwen3-8B" />
+                <div className="md:col-span-2">
+                  <SelectField
+                    label="Route type"
+                    name="model_type"
+                    value={createType}
+                    onChange={setCreateType}
+                    options={MODEL_TYPE_OPTIONS}
+                    hint={modelTypeHint(createType)}
+                  />
+                </div>
+                <div className="md:col-span-2">
+                  <Field label="Description (optional)" name="description" placeholder="Qwen3 235B instruction model for production chat and tool use" />
+                </div>
+              </section>
+
+              <section className={cn("grid gap-4 md:grid-cols-2", step !== 2 && "hidden")}>
+                {hostingMode === "static" && (
+                  <>
+                    <div className="md:col-span-2">
+                      <Field label="API base URL" name="api_base" placeholder="http://envoy-aibrix-system.../v1" />
+                    </div>
+                    <Field label="Upstream API key (optional)" name="api_key" placeholder="sk_..." />
+                  </>
+                )}
+                {hostingMode === "slurm" && (
+                  <div className="md:col-span-2 space-y-6">
+                    {/* Backend picker */}
+                    <div className="space-y-2">
+                      <Label>Inference backend</Label>
+                      <div className="grid grid-cols-3 gap-2">
+                        {(["vllm", "ollama", "custom"] as const).map((b) => {
+                          const meta = {
+                            vllm:   { label: "vLLM",   badge: "GPU optimised", hint: "High-throughput PagedAttention serving" },
+                            ollama:  { label: "Ollama", badge: "Multi-model",   hint: "Easy pull-and-serve, GGUF-friendly" },
+                            custom:  { label: "Custom", badge: "Manual",        hint: "Write your own launch command" },
+                          }[b];
+                          return (
+                            <button
+                              key={b}
+                              type="button"
+                              aria-pressed={slurmBackend === b}
+                              onClick={() => setSlurmBackend(b)}
+                              className={cn(
+                                "flex flex-col rounded-lg border p-3 text-left transition-colors",
+                                slurmBackend === b
+                                  ? "border-primary/50 bg-primary/10"
+                                  : "border-border/70 bg-background/35 hover:bg-accent",
+                              )}
+                            >
+                              <span className="text-sm font-semibold">{meta.label}</span>
+                              <span className="mt-1 text-xs leading-relaxed text-muted-foreground">{meta.hint}</span>
+                              <Badge className="mt-2 w-fit bg-background text-[10px]">{meta.badge}</Badge>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Partition + GRES — always required */}
+                    <div className="grid gap-3 sm:grid-cols-2">
+                      <Field label="Partition" name="slurm_partition" placeholder="gpu" />
+                      <Field label="GRES" name="slurm_gres" placeholder="gpu:1" />
+                    </div>
+
+                    {slurmBackend !== "custom" ? (
+                      /* vLLM / Ollama: smart fields with a generated command preview */
+                      <div className="space-y-4">
+                        <div className="grid gap-3 sm:grid-cols-[1fr_10rem]">
+                          <div className="space-y-1.5">
+                            <Label htmlFor="slurm-model-field">Model to serve</Label>
+                            <Input
+                              id="slurm-model-field"
+                              value={slurmModel}
+                              onChange={(e) => setSlurmModel(e.target.value)}
+                              placeholder={slurmBackend === "vllm" ? "Qwen/Qwen3-8B" : "qwen2.5:0.5b"}
+                              autoCapitalize="none"
+                              autoCorrect="off"
+                              spellCheck={false}
+                            />
+                            <p className="text-xs text-muted-foreground">
+                              {slurmBackend === "vllm"
+                                ? "HuggingFace model ID passed to vllm serve."
+                                : "Ollama model tag (e.g. from ollama pull)."}
+                            </p>
+                          </div>
+                          <div className="space-y-1.5">
+                            <Label htmlFor="slurm-port-field">Port</Label>
+                            <Input
+                              id="slurm-port-field"
+                              type="number"
+                              value={slurmPort}
+                              onChange={(e) => setSlurmPort(e.target.value)}
+                            />
+                          </div>
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <Label htmlFor="slurm-image-field">Apptainer image</Label>
+                          <Input
+                            id="slurm-image-field"
+                            name="slurm_image"
+                            placeholder={slurmBackend === "vllm" ? "/shared/images/vllm.sif" : "/shared/images/ollama.sif"}
+                          />
+                          {slurmBackend === "ollama" && (
+                            <p className="text-xs text-muted-foreground">
+                              Build with:{" "}
+                              <code className="font-mono text-foreground">apptainer pull docker://ollama/ollama</code>
+                            </p>
+                          )}
+                        </div>
+
+                        <div className="space-y-1.5">
+                          <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                            Generated launch command
+                          </p>
+                          <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-muted/40 px-3 py-2.5 font-mono text-xs leading-relaxed text-foreground/80">
+                            {generatedCmd}
+                          </pre>
+                        </div>
+
+                        {/* Carry generated values into FormData as hidden fields */}
+                        <input type="hidden" name="slurm_launch_command" value={generatedCmd} />
+                        <input type="hidden" name="slurm_health_path" value={derivedHealthPath} />
+                        <input type="hidden" name="slurm_serving_port" value={slurmPort} />
+                      </div>
+                    ) : (
+                      /* Custom: all fields manually */
+                      <div className="space-y-3">
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <Field label="Serving port" name="slurm_serving_port" type="number" defaultValue="8000" />
+                          <Field label="Health path" name="slurm_health_path" defaultValue="/health" />
+                        </div>
+                        <Field label="Apptainer image" name="slurm_image" placeholder="/shared/images/llm.sif" />
+                        <Field label="Launch command" name="slurm_launch_command" placeholder="vllm serve <model> --port 8000" />
+                        <div className="space-y-1.5">
+                          <Label htmlFor="slurm_preamble-field">
+                            Preamble{" "}
+                            <span className="text-xs text-muted-foreground/60">
+                              (optional shell lines before exec)
+                            </span>
+                          </Label>
+                          <textarea
+                            id="slurm_preamble-field"
+                            name="slurm_preamble"
+                            rows={2}
+                            placeholder="module load apptainer/1.3.4"
+                            className="flex w-full resize-y rounded-md border border-border bg-background px-3 py-2 font-mono text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                          />
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Advanced — collapsed by default to keep the happy path clean */}
+                    <div className="border-t border-border/50 pt-4">
+                      <button
+                        type="button"
+                        className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
+                        onClick={() => setShowAdvanced((v) => !v)}
+                      >
+                        <ChevronDown
+                          className={cn(
+                            "h-3.5 w-3.5 transition-transform duration-150",
+                            showAdvanced && "rotate-180",
+                          )}
+                        />
+                        {showAdvanced ? "Hide" : "Show"} advanced options
+                      </button>
+                      {showAdvanced && (
+                        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                          <Field label="Target replicas" name="slurm_target_replicas" type="number" defaultValue="2" />
+                          <Field label="Nodes" name="slurm_nodes" type="number" defaultValue="1" />
+                          <Field label="Max job failures" name="slurm_max_job_failures" type="number" defaultValue="0" />
+                          <Field label="Account (optional)" name="slurm_account" placeholder="my-account" />
+                          <Field label="QoS (optional)" name="slurm_qos" placeholder="normal" />
+                          <Field label="Time limit (optional)" name="slurm_time_limit" placeholder="12:00:00" />
+                          <Field label="Constraints (optional)" name="slurm_constraints" placeholder="a100" />
+                          <Field label="Exclude (optional)" name="slurm_exclude" placeholder="node[01-02]" />
+                          <Field label="Log output dir (optional)" name="slurm_log_output_dir" placeholder="/shared/logs" />
+                          {slurmBackend !== "custom" && (
+                            <div className="sm:col-span-2 space-y-1.5">
+                              <Label htmlFor="slurm_preamble-adv">
+                                Preamble{" "}
+                                <span className="text-xs text-muted-foreground/60">
+                                  (optional shell lines before exec)
+                                </span>
+                              </Label>
+                              <textarea
+                                id="slurm_preamble-adv"
+                                name="slurm_preamble"
+                                rows={2}
+                                placeholder="module load apptainer/1.3.4"
+                                className="flex w-full resize-y rounded-md border border-border bg-background px-3 py-2 font-mono text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+                              />
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+              </section>
+
+              <section className={cn("grid gap-4 md:grid-cols-2", step !== 3 && "hidden")}>
+                <Field label="Admission weight" name="admission_weight" type="number" defaultValue="100" />
+                <Field label="Max in-flight (optional)" name="max_in_flight" type="number" placeholder="No cap" />
+                {(createType === "chat" || createType === "embedding") && (
+                  <Field label="Input cost / token" name="input_cost_per_token" placeholder="0.000000071" />
+                )}
+                {createType === "chat" && (
+                  <Field label="Output cost / token" name="output_cost_per_token" placeholder="0.0000001" />
+                )}
+                {createType === "image" && (
+                  <Field label="Cost / image" name="cost_per_image" placeholder="0.04" />
+                )}
+                {createType === "audio_speech" && (
+                  <Field label="Cost / character" name="cost_per_character" placeholder="0.000015" />
+                )}
+                {createType === "audio_transcription" && (
+                  <Field label="Cost / audio second" name="cost_per_audio_second" placeholder="0.0001" />
+                )}
+                {(createType === "chat" || createType === "embedding") && (
+                  <Field label="Context window" name="context_window" type="number" defaultValue="131072" />
+                )}
+              </section>
+
+              <section className={cn("space-y-3", step !== 4 && "hidden")}>
+                {createType === "chat" ? (
+                  <>
+                    <FieldGroup label="Capabilities" hint="What the model natively supports. These gate request features and routing.">
+                      <ChipCheckbox name="supports_function_calling" label="Function calling" />
+                      <ChipCheckbox name="supports_system_messages" label="System messages" defaultChecked />
+                      <ChipCheckbox name="supports_response_schema" label="Response schema" />
+                      <ChipCheckbox name="supports_tool_choice" label="Tool choice" />
+                    </FieldGroup>
+                    <FieldGroup label="Routing tags" hint="Hints the auto router matches against request intent. Vision marks native image support.">
+                      {MODEL_TAGS.map((tag) => (
+                        <ChipCheckbox key={tag} name={`tag_${tag}`} label={tag} />
+                      ))}
+                    </FieldGroup>
+                    <FieldGroup label="Boons" hint="Gateway capabilities granted to this model that it lacks natively.">
+                      {MODEL_BOONS.map((boon) => (
+                        <ChipCheckbox key={boon.value} name={`boon_${boon.value}`} label={boon.label} hint={boon.description} />
+                      ))}
+                    </FieldGroup>
+                    <FieldGroup label="Tools" hint="Registered MCP servers whose tools this model may use.">
+                      {mcpServers.length === 0 ? (
+                        <p className="text-xs text-muted-foreground">No MCP servers registered. Add one on the MCP page first.</p>
+                      ) : (
+                        mcpServers.map((server) => (
+                          <ChipCheckbox
+                            key={server.id}
+                            name={`tool_server_${server.name}`}
+                            label={server.name}
+                            hint={`Grant this model the tools served by ${server.name} (${server.upstream_url}).`}
+                          />
+                        ))
+                      )}
+                    </FieldGroup>
+                  </>
+                ) : (
+                  <div className="rounded-md border border-border/70 bg-background/35 p-4">
+                    <p className="text-sm font-medium">No chat-only capability flags for this route type.</p>
+                    <p className="mt-1 text-xs text-muted-foreground">
+                      Specialized routes keep their setup focused on hosting, capacity, and billing.
+                    </p>
+                  </div>
+                )}
+              </section>
+            </div>
+
+            <aside className="border-t border-border/70 bg-background/25 p-5 lg:border-l lg:border-t-0">
+              <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Route preview</p>
+              <div className="mt-3 space-y-3">
+                <PreviewRow label="API model name" value={preview.modelName || "Not set"} muted={!preview.modelName} />
+                <PreviewRow label="Upstream" value={preview.upstreamModel || "Not set"} muted={!preview.upstreamModel} />
+                <PreviewRow label="Type" value={typeLabel} />
+                <PreviewRow label="Hosting" value={hostingLabel} />
+                {hostingMode === "slurm" ? (
+                  <>
+                    <PreviewRow label="Partition" value={preview.partition || "Not set"} muted={!preview.partition} />
+                    <PreviewRow label="Model" value={slurmModel || "Not set"} muted={!slurmModel} />
+                  </>
+                ) : (
+                  <PreviewRow label="API base" value={preview.apiBase || "Not set"} muted={!preview.apiBase} />
+                )}
+              </div>
+              <div className="mt-5 rounded-md border border-border/70 bg-card/50 p-3">
+                <p className="text-xs font-medium">What happens on create</p>
+                <p className="mt-1 text-[11px] leading-relaxed text-muted-foreground">
+                  The route is added to obleth, cache and health settings start with defaults, and this page refreshes with the new model card.
+                </p>
+              </div>
+              <div className="mt-3 flex flex-wrap gap-1.5">
+                <Badge className="bg-background text-[10px]">{typeLabel}</Badge>
+                <Badge className="bg-background text-[10px]">{hostingLabel}</Badge>
+              </div>
+            </aside>
+          </div>
+
+          <div className="flex flex-col gap-3 border-t border-border/70 bg-background/30 px-5 py-4 sm:flex-row sm:items-center sm:justify-between">
+            <Button type="button" variant="ghost" disabled={pending} onClick={onCancel}>
+              Cancel
+            </Button>
+            <div className="flex items-center justify-end gap-2">
+              <Button type="button" variant="outline" disabled={pending || step === 0} onClick={() => goToStep(step - 1)}>
+                Back
+              </Button>
+              {step < lastStep ? (
+                <Button type="button" disabled={pending} onClick={() => goToStep(step + 1)}>
+                  Next
+                </Button>
+              ) : (
+                <Button type="submit" disabled={pending}>
+                  {pending ? "Creating..." : "Create model"}
+                </Button>
+              )}
+            </div>
+          </div>
+        </form>
+      </CardContent>
+    </Card>
+  );
+}
+
+function PreviewRow({ label, value, muted }: { label: string; value: string; muted?: boolean }) {
+  return (
+    <div>
+      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
+      <p className={cn("mt-0.5 break-words text-sm font-medium", muted && "text-muted-foreground")}>{value}</p>
+    </div>
+  );
+}
+
 function ModelDetailPanel({
   model,
   summary,
   detail,
   endpoints,
   mcpServers = [],
+  isManaged = false,
   pending,
   onCacheToggle,
 }: {
@@ -623,6 +1218,7 @@ function ModelDetailPanel({
   detail?: ModelHealthDetail;
   endpoints: ModelEndpoint[];
   mcpServers?: McpServer[];
+  isManaged?: boolean;
   pending: boolean;
   onCacheToggle: () => void;
 }) {
@@ -661,6 +1257,7 @@ function ModelDetailPanel({
             )}
           </TabsTrigger>
           <TabsTrigger value="health">Health</TabsTrigger>
+          {isManaged && <TabsTrigger value="provisioning">Provisioning</TabsTrigger>}
         </TabsList>
         <p className="text-[11px] tabular-nums text-muted-foreground">
           {summary.last_checked_at
@@ -856,6 +1453,17 @@ function ModelDetailPanel({
           </PanelCard>
         </div>
       </TabsContent>
+
+      {isManaged && (
+        <TabsContent value="provisioning" className="min-h-0">
+          <div className="grid gap-4 lg:h-[calc(100dvh-18rem)] lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:overflow-hidden">
+            <div className="min-h-0 lg:overflow-y-auto lg:pr-1">
+              <ManagedModelConfig modelId={model.id} />
+            </div>
+            <ReplicaPanel modelId={model.id} />
+          </div>
+        </TabsContent>
+      )}
     </Tabs>
   );
 }

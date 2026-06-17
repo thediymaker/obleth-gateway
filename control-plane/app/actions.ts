@@ -15,6 +15,8 @@ import type {
   UpdateAlertSettings,
   UpdateAutoRouterSettings,
   UpdateBoonSettings,
+  UpdateSlurmSettings,
+  SlurmHealthView,
 } from "@/lib/obleth";
 import { requireSession } from "@/lib/auth/session";
 
@@ -52,6 +54,15 @@ const requiredText = (message: string) =>
 const optionalText = z.preprocess(trimmed, z.string());
 const checkbox = z.preprocess((v) => v === "on", z.boolean());
 
+function normalizeModelApiName(value: unknown) {
+  return trimmed(value)
+    .toLowerCase()
+    .replace(/[\s_]+/g, "-")
+    .replace(/[^a-z0-9.-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^[.-]+|[.-]+$/g, "");
+}
+
 /** Optional positive integer (absent when the field is blank). */
 const optionalPositiveInt = z.preprocess(
   blankToUndef,
@@ -62,6 +73,11 @@ const optionalNonNegInt = z.preprocess(
   blankToUndef,
   z.coerce.number().int().nonnegative().optional(),
 );
+/** Optional non-negative number. */
+const optionalNonNegNumber = z.preprocess(
+  blankToUndef,
+  z.coerce.number().nonnegative().optional(),
+);
 /** Non-negative number with a default applied when the field is blank. */
 const nonNegNumber = (def: number) =>
   z.preprocess(blankToUndef, z.coerce.number().nonnegative().default(def));
@@ -71,9 +87,29 @@ const positiveIntWithDefault = (def: number) =>
 
 const tenantCreateSchema = z.object({
   name: requiredText("Tenant name is required"),
+  description: optionalText,
+  organization: optionalText,
+  contact_email: z.preprocess(
+    blankToUndef,
+    z.string().email("Invalid contact email").optional(),
+  ),
+  status: z.preprocess(
+    blankToUndef,
+    z.enum(["active", "suspended", "archived"]).default("active"),
+  ),
+  fairshare_group: optionalText,
   weight: optionalPositiveInt,
   tokens_per_minute: optionalNonNegInt,
   max_in_flight: optionalPositiveInt,
+  timezone: z.preprocess(blankToUndef, z.string().default("UTC")),
+  active_from: z.preprocess(blankToUndef, z.string().datetime().optional()),
+  active_until: z.preprocess(blankToUndef, z.string().datetime().optional()),
+  budget_tokens: optionalNonNegInt,
+  budget_cost_usd: optionalNonNegNumber,
+  budget_period: z.preprocess(
+    blankToUndef,
+    z.enum(["lifetime", "monthly", "term"]).default("lifetime"),
+  ),
 });
 
 const tenantUpdateSchema = z.object({
@@ -105,8 +141,19 @@ const modelFieldsSchema = {
   supports_tool_choice: checkbox,
 };
 
+const modelApiName = z.preprocess(
+  normalizeModelApiName,
+  z
+    .string()
+    .min(1, "API model name is required")
+    .regex(
+      /^[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?$/,
+      "API model name can use lowercase letters, numbers, dashes, and dots.",
+    ),
+);
+
 const modelCreateSchema = z.object({
-  model_name: requiredText("Model name is required"),
+  model_name: modelApiName,
   ...modelFieldsSchema,
 });
 
@@ -118,24 +165,154 @@ const mcpCreateSchema = z.object({
   ),
 });
 
+const keyFieldsSchema = {
+  name: requiredText("Key name is required"),
+  description: optionalText,
+  budget_tokens: optionalNonNegInt,
+  budget_cost_usd: optionalNonNegNumber,
+  budget_period: z.preprocess(
+    blankToUndef,
+    z.enum(["lifetime", "monthly", "term"]).default("lifetime"),
+  ),
+  budget_started_at: z.preprocess(
+    blankToUndef,
+    z.string().datetime().optional(),
+  ),
+};
+
+const keyCreateSchema = z.object({
+  tenant_id: requiredText("Tenant is required"),
+  ...keyFieldsSchema,
+});
+
+const keyUpdateSchema = z.object({
+  id: requiredText("Missing key id"),
+  ...keyFieldsSchema,
+});
+
 /** Return the first zod issue message for surfacing to the UI. */
 function firstIssue(error: z.ZodError): string {
   return error.issues[0]?.message ?? "Invalid input";
 }
 
-export async function createTenantAction(formData: FormData) {
+const weeklyWindowSchema = z
+  .array(
+    z.object({
+      day: z.number().int().min(0).max(6),
+      start_min: z.number().int().min(0).max(1440),
+      end_min: z.number().int().min(0).max(1440),
+    }).refine((w) => w.end_min > w.start_min, {
+      message: "Each window's end time must be after its start time.",
+    }),
+  )
+  .default([]);
+
+function parseWeeklyWindows(value: FormDataEntryValue | null) {
+  const raw = trimmed(value);
+  if (!raw) return weeklyWindowSchema.safeParse([]);
+  try {
+    return weeklyWindowSchema.safeParse(JSON.parse(raw));
+  } catch {
+    return weeklyWindowSchema.safeParse("__invalid_json__");
+  }
+}
+
+export async function createTenantAction(formData: FormData): Promise<ActionResult> {
   await requireSession();
   const parsed = tenantCreateSchema.safeParse({
     name: formData.get("name"),
+    description: formData.get("description"),
+    organization: formData.get("organization"),
+    contact_email: formData.get("contact_email"),
+    status: formData.get("status"),
+    fairshare_group: formData.get("fairshare_group"),
     weight: formData.get("weight"),
     tokens_per_minute: formData.get("tokens_per_minute"),
     max_in_flight: formData.get("max_in_flight"),
+    timezone: formData.get("timezone"),
+    active_from: formData.get("active_from"),
+    active_until: formData.get("active_until"),
+    budget_tokens: formData.get("budget_tokens"),
+    budget_cost_usd: formData.get("budget_cost_usd"),
+    budget_period: formData.get("budget_period"),
   });
-  if (!parsed.success) return;
-  await obleth.createTenant({ ...parsed.data, tokens_per_minute: parsed.data.tokens_per_minute ?? 0 });
+  if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
+  const windows = parseWeeklyWindows(formData.get("weekly_windows"));
+  if (!windows.success) return { ok: false, error: firstIssue(windows.error) };
+  const allowed_models = formData
+    .getAll("allowed_models")
+    .map((value) => trimmed(value))
+    .filter(Boolean);
+
+  const data = parsed.data;
+  if (
+    data.active_from &&
+    data.active_until &&
+    new Date(data.active_until) <= new Date(data.active_from)
+  ) {
+    return { ok: false, error: "Active-until must be after active-from." };
+  }
+
+  try {
+    const tenant = await obleth.createTenant({
+      name: data.name,
+      weight: data.weight,
+      tokens_per_minute: data.tokens_per_minute ?? 0,
+      max_in_flight: data.max_in_flight,
+      fairshare_group: data.fairshare_group || undefined,
+    });
+
+    if (data.description || data.organization || data.contact_email) {
+      await obleth.updateTenant(tenant.id, {
+        name: data.name,
+        description: data.description,
+        organization: data.organization,
+        contact_email: data.contact_email ?? "",
+      });
+    }
+
+    if (data.status !== "active") {
+      await obleth.setTenantStatus(tenant.id, data.status);
+    }
+
+    const hasSchedule =
+      data.timezone !== "UTC" ||
+      data.active_from ||
+      data.active_until ||
+      windows.data.length > 0;
+    if (hasSchedule) {
+      await obleth.setTenantSchedule(tenant.id, {
+        timezone: data.timezone,
+        active_from: data.active_from ?? null,
+        active_until: data.active_until ?? null,
+        weekly_windows: windows.data.length ? windows.data : null,
+      });
+    }
+
+    const hasBudget =
+      data.budget_tokens != null ||
+      data.budget_cost_usd != null ||
+      data.budget_period !== "lifetime";
+    if (hasBudget) {
+      await obleth.setTenantBudget(tenant.id, {
+        budget_tokens: data.budget_tokens ?? null,
+        budget_cost_usd: data.budget_cost_usd ?? null,
+        budget_period: data.budget_period,
+      });
+    }
+
+    if (allowed_models.length > 0) {
+      await obleth.setTenantAllowlist(tenant.id, allowed_models);
+    }
+  } catch (e) {
+    return actionError(e);
+  }
+
   updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
+  revalidatePath("/fairshare");
   revalidatePath("/");
+  return { ok: true };
 }
 
 export async function updateTenantAction(formData: FormData) {
@@ -269,14 +446,71 @@ export async function setQuotaAction(formData: FormData) {
 
 export async function createKeyAction(
   formData: FormData,
-): Promise<string | null> {
+): Promise<ActionResult & { secret?: string }> {
   await requireSession();
-  const tenantId = String(formData.get("tenant_id"));
-  const name = String(formData.get("name") ?? "key").trim() || "key";
-  const created = await obleth.createKey(tenantId, name);
+  const parsed = keyCreateSchema.safeParse({
+    tenant_id: formData.get("tenant_id"),
+    name: formData.get("name"),
+    description: formData.get("description"),
+    budget_tokens: formData.get("budget_tokens"),
+    budget_cost_usd: formData.get("budget_cost_usd"),
+    budget_period: formData.get("budget_period"),
+    budget_started_at: formData.get("budget_started_at"),
+  });
+  if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
+  const data = parsed.data;
+  const hasBudget =
+    data.budget_tokens != null || data.budget_cost_usd != null;
+  try {
+    const created = await obleth.createKey(data.tenant_id, {
+      name: data.name,
+      description: data.description,
+      budget_tokens: data.budget_tokens ?? null,
+      budget_cost_usd: data.budget_cost_usd ?? null,
+      budget_period: hasBudget ? data.budget_period : null,
+      budget_started_at: hasBudget ? data.budget_started_at : null,
+    });
+    updateTag(CACHE_TAGS.keys);
+    revalidatePath("/keys");
+    return { ok: true, secret: created.secret };
+  } catch (e) {
+    return actionError(e);
+  }
+}
+
+export async function updateKeyAction(
+  formData: FormData,
+): Promise<ActionResult> {
+  await requireSession();
+  const parsed = keyUpdateSchema.safeParse({
+    id: formData.get("id"),
+    name: formData.get("name"),
+    description: formData.get("description"),
+    budget_tokens: formData.get("budget_tokens"),
+    budget_cost_usd: formData.get("budget_cost_usd"),
+    budget_period: formData.get("budget_period"),
+    budget_started_at: formData.get("budget_started_at"),
+  });
+  if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
+  const { id, ...data } = parsed.data;
+  const hasBudget =
+    data.budget_tokens != null || data.budget_cost_usd != null;
+  try {
+    await obleth.updateKey(id, {
+      name: data.name,
+      description: data.description,
+      budget_tokens: data.budget_tokens ?? null,
+      budget_cost_usd: data.budget_cost_usd ?? null,
+      budget_period: hasBudget ? data.budget_period : null,
+      budget_started_at: hasBudget ? data.budget_started_at : null,
+    });
+  } catch (e) {
+    return actionError(e);
+  }
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
-  return created.secret;
+  revalidatePath("/");
+  return { ok: true };
 }
 
 export async function toggleKeyAction(id: string, disabled: boolean) {
@@ -310,6 +544,7 @@ export async function deleteFilteredKeysAction(filters: {
   query?: string;
   tenantId?: string;
   status?: "all" | "active" | "disabled";
+  budget?: "all" | "budgeted" | "unlimited";
 }): Promise<{ deleted: number; failed: number; matched: number }> {
   await requireSession();
   const query = String(filters.query ?? "")
@@ -317,7 +552,9 @@ export async function deleteFilteredKeysAction(filters: {
     .toLowerCase();
   const tenantId = String(filters.tenantId ?? "all");
   const status = filters.status ?? "all";
-  const hasFilter = query !== "" || tenantId !== "all" || status !== "all";
+  const budget = filters.budget ?? "all";
+  const hasFilter =
+    query !== "" || tenantId !== "all" || status !== "all" || budget !== "all";
   if (!hasFilter) return { deleted: 0, failed: 0, matched: 0 };
 
   const [tenants, keys] = await Promise.all([
@@ -331,12 +568,17 @@ export async function deleteFilteredKeysAction(filters: {
     if (tenantId !== "all" && key.tenant_id !== tenantId) return false;
     if (status === "active" && key.disabled) return false;
     if (status === "disabled" && !key.disabled) return false;
+    const keyHasBudget =
+      key.budget_tokens != null || key.budget_cost_usd != null;
+    if (budget === "budgeted" && !keyHasBudget) return false;
+    if (budget === "unlimited" && keyHasBudget) return false;
     if (!query) return true;
     const tenantName =
       tenantNames.get(key.tenant_id) ?? key.tenant_id.slice(0, 8);
     return (
       key.key_prefix.toLowerCase().includes(query) ||
       key.name.toLowerCase().includes(query) ||
+      key.description.toLowerCase().includes(query) ||
       tenantName.toLowerCase().includes(query)
     );
   });
@@ -378,17 +620,56 @@ export async function createModelAction(
     supports_tool_choice: formData.get("supports_tool_choice"),
   });
   if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
+
+  const endpointMode = trimmed(formData.get("endpoint_mode")) || "static";
+  const isSlurm = endpointMode === "slurm";
+  if (isSlurm && !trimmed(formData.get("slurm_partition"))) {
+    return { ok: false, error: "Slurm partition is required" };
+  }
+  if (isSlurm && !trimmed(formData.get("slurm_image"))) {
+    return { ok: false, error: "Slurm image is required" };
+  }
+  if (isSlurm && !trimmed(formData.get("slurm_launch_command"))) {
+    return { ok: false, error: "Slurm launch command is required" };
+  }
+
   try {
     const tags = tagsFromForm(formData);
-    await obleth.createModel({
+    // Slurm-provisioned models have no static upstream: the provisioner promotes
+    // healthy replicas into the endpoint rotation. The gateway accepts a blank
+    // api_base for these.
+    const created = await obleth.createModel({
       ...parsed.data,
-      api_key: strOrNull(formData.get("api_key")),
+      api_base: isSlurm ? "" : parsed.data.api_base,
+      api_key: isSlurm ? null : strOrNull(formData.get("api_key")),
       max_in_flight: numOrNull(formData.get("max_in_flight")),
       supports_vision: tags.includes("vision"),
       tags,
       boons: boonsFromForm(formData),
       tool_servers: toolServersFromForm(formData),
     });
+
+    if (isSlurm) {
+      await obleth.putManagedModel(created.id, {
+        enabled: true,
+        partition: trimmed(formData.get("slurm_partition")),
+        gres: trimmed(formData.get("slurm_gres")),
+        nodes: numOr(formData.get("slurm_nodes"), 1),
+        image: trimmed(formData.get("slurm_image")),
+        preamble: trimmed(formData.get("slurm_preamble")),
+        log_output_dir: trimmed(formData.get("slurm_log_output_dir")),
+        launch_command: trimmed(formData.get("slurm_launch_command")),
+        serving_port: numOr(formData.get("slurm_serving_port"), 8000),
+        health_path: trimmed(formData.get("slurm_health_path")) || "/health",
+        target_replicas: numOr(formData.get("slurm_target_replicas"), 2),
+        max_job_failures: numOr(formData.get("slurm_max_job_failures"), 0),
+        account: strOrNull(formData.get("slurm_account")) ?? null,
+        qos: strOrNull(formData.get("slurm_qos")) ?? null,
+        time_limit: strOrNull(formData.get("slurm_time_limit")) ?? null,
+        constraints: strOrNull(formData.get("slurm_constraints")) ?? null,
+        exclude: strOrNull(formData.get("slurm_exclude")) ?? null,
+      });
+    }
   } catch (e) {
     return actionError(e);
   }
@@ -968,6 +1249,33 @@ export async function setBoonSettingsAction(
   }
   revalidatePath("/settings");
   return { ok: true };
+}
+
+export async function setSlurmSettingsAction(
+  body: UpdateSlurmSettings,
+): Promise<ActionResult> {
+  await requireSession();
+  try {
+    await obleth.setSlurmSettings(body);
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/settings");
+  // The model-create dialog gates the Slurm option on these settings.
+  revalidatePath("/models");
+  return { ok: true };
+}
+
+export async function testSlurmConnectionAction(): Promise<
+  (ActionResult & { health?: SlurmHealthView })
+> {
+  await requireSession();
+  try {
+    const health = await obleth.testSlurmConnection();
+    return { ok: true, health };
+  } catch (e) {
+    return actionError(e);
+  }
 }
 
 export async function setUsageRetentionAction(

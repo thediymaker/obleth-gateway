@@ -1582,6 +1582,7 @@ version = "0.2.1"
 dependencies = [
  "arc-swap",
  "axum",
+ "base64",
  "chrono",
  "chrono-tz",
  "clickhouse",
@@ -1627,6 +1628,23 @@ dependencies = [
  "serde",
  "tokio",
  "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "obleth-provisioner"
+version = "0.2.1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "chrono",
+ "obleth-config",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

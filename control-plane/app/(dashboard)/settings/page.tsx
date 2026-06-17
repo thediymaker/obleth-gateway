@@ -11,6 +11,7 @@ export default async function SettingsPage() {
   const boons = await safe(obleth.getBoonSettings(), null);
   const models = await safe(obleth.listModels(), []);
   const retention = await safe(obleth.getUsageRetention(), null);
+  const slurm = await safe(obleth.getSlurmSettings(), null);
 
   return (
     <div className="space-y-6">
@@ -27,6 +28,7 @@ export default async function SettingsPage() {
         boons={boons}
         models={models}
         retention={retention}
+        slurm={slurm}
         versionCard={<VersionCard />}
       />
     </div>

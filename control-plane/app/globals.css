@@ -71,7 +71,7 @@
   }
 }
 
-/* Save feedback: a brief emerald border-glow swept over a model card when a save
+/* Save feedback: a brief emerald border-glow swept over an expanded config card when a save
    succeeds. Rendered as an inset overlay so it reads as a glowing border without
    being clipped by the card's overflow-hidden. Remounted per save to replay. */
 .card-saved-glow {

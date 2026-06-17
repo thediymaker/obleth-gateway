@@ -7,9 +7,12 @@ name: obleth
 #   mock          -> legacy alias for the benchmark profile
 #   edge          -> HAProxy front door (TLS/round-robin; use a real LB in prod)
 #   observability -> Prometheus + Grafana + Jaeger (OTLP traces)
+#   slurm         -> obleth-provisioner plugin (keeps managed models alive on Slurm)
 #
-# Enable extras per-command:    docker compose --profile benchmark --profile observability up
-# Or set COMPOSE_PROFILES in .env (see .env.example) to default them on for dev.
+# Enable extras via config: add them to COMPOSE_PROFILES in .env (see
+# .env.example), then a single `docker compose up -d --build` (run from this
+# directory) builds and starts them — no --profile flag needed. You can still
+# opt in ad hoc per-command:    docker compose --profile slurm up -d
 #
 # First-party services declare both image: (published to GHCR by the release
 # workflow) and build: (local source). `docker compose pull && up -d` runs the
@@ -137,6 +140,28 @@ services:
       postgres: { condition: service_healthy }
       redis: { condition: service_healthy }
       clickhouse: { condition: service_healthy }
+
+  # Optional Slurm provisioner plugin. NOT part of the core stack: gated behind
+  # the `slurm` profile. Opt in by adding `slurm` to COMPOSE_PROFILES in .env
+  # (config), then it builds and starts with the same one command as the rest of
+  # the stack (`docker compose up -d --build`). It keeps each enabled managed
+  # model at its target replica count on a preemptible Slurm cluster via
+  # slurmrestd. All cluster specifics are per-model (Management API). The
+  # slurmrestd connection details + the master enable switch live in system-wide
+  # settings (dashboard → Settings → Slurm), fetched from the Management API each
+  # tick — so this service only needs to reach the admin API.
+  obleth-provisioner:
+    profiles: ["slurm"]
+    image: ghcr.io/thediymaker/obleth-gateway/obleth-provisioner:${OBLETH_VERSION:-latest}
+    build:
+      context: ../..
+      dockerfile: deploy/docker/obleth-provisioner.Dockerfile
+    environment:
+      OBLETH_ADMIN_BASE_URL: http://obleth:9180
+      OBLETH_ADMIN_TOKEN: ${OBLETH_ADMIN_TOKEN:?set OBLETH_ADMIN_TOKEN in deploy/docker/.env}
+      RUST_LOG: info,obleth_provisioner=debug
+    depends_on:
+      obleth: { condition: service_started }
 
   control-plane:
     image: ghcr.io/thediymaker/obleth-gateway/control-plane:${OBLETH_VERSION:-latest}

@@ -279,9 +279,10 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // and only the tool execution between turns pauses the stream. The
     // structured-output transform still needs a fully buffered completion, so it
     // keeps forcing the upstream non-streaming.
-    let stream_tap = response_plan.as_ref().is_some_and(|p| {
-        p.tool_loop.is_some() && p.structured.is_none() && p.client_stream
-    }) && route.is_some();
+    let stream_tap = response_plan
+        .as_ref()
+        .is_some_and(|p| p.tool_loop.is_some() && p.structured.is_none() && p.client_stream)
+        && route.is_some();
 
     let effective_weight = effective_admission_weight(resolved.weight, route.as_deref());
 
@@ -390,7 +391,8 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // term-exhausted request never reserves per-minute tokens it has no
     // completion path to refund.
     let capacity = resolved.tokens_per_minute.max(0);
-    let term_period = term_period_key(&resolved, chrono::Utc::now());
+    let now = chrono::Utc::now();
+    let term_period = term_period_key(&resolved, now);
     let term_gate = term_period
         .as_deref()
         .map(|period_key| obleth_redis::TermGate {
@@ -398,6 +400,84 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             budget_tokens: resolved.budget_tokens,
             budget_cost_usd: resolved.budget_cost_usd,
         });
+    let key_term_period = key_term_period_key(&resolved, now);
+    let key_term_gate = key_term_period
+        .as_deref()
+        .map(|period_key| obleth_redis::TermGate {
+            period_key,
+            budget_tokens: resolved.key_budget_tokens,
+            budget_cost_usd: resolved.key_budget_cost_usd,
+        });
+    if let Some(gate) = key_term_gate {
+        match state
+            .redis
+            .reserve_budget_with_term(&resolved.key_id, 0, 0, est.total(), Some(gate))
+            .instrument(tracing::info_span!("reserve_key_budget"))
+            .await
+        {
+            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {}
+            Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {}
+            Ok(obleth_redis::ReserveOutcome::TermExhausted {
+                used_tokens,
+                used_cost,
+            }) => {
+                drop(permit);
+                state.alerts.issue(
+                    format!("key_term_budget_exhausted:{}", resolved.key_id),
+                    "API key term budget exhausted",
+                    format!(
+                        "tenant `{}` key `{}` blocked: used {used_tokens} tokens / ${used_cost:.4} against caps tokens={:?} cost={:?}",
+                        resolved.tenant_name,
+                        resolved.key_id,
+                        resolved.key_budget_tokens,
+                        resolved.key_budget_cost_usd,
+                    ),
+                );
+                finalize(
+                    &state,
+                    &resolved,
+                    &req_meta,
+                    &model,
+                    Admission::Rejected,
+                    est,
+                    0,
+                    0,
+                    queue_wait_ms,
+                    0,
+                    0,
+                    403,
+                    cache_status_label,
+                    0.0,
+                );
+                return error_json(StatusCode::FORBIDDEN, "api key term budget exhausted");
+            }
+            Err(e) => {
+                if !state.fail_open {
+                    drop(permit);
+                    state.alerts.issue(
+                        "redis_key_budget_reserve_failed_closed",
+                        "Redis key-budget reserve failed",
+                        format!(
+                            "fail-open is disabled; rejecting tenant `{}` key `{}` model `{model}`: {e}",
+                            resolved.tenant_name,
+                            resolved.key_id
+                        ),
+                    );
+                    return error_json(StatusCode::SERVICE_UNAVAILABLE, "key budget check failed");
+                }
+                tracing::warn!(error = %e, "key budget reserve failed; failing open");
+                state.alerts.issue(
+                    "redis_key_budget_reserve_failed_open",
+                    "Redis key-budget reserve failed",
+                    format!(
+                        "fail-open is enabled; admitting tenant `{}` key `{}` model `{model}` without key budget enforcement: {e}",
+                        resolved.tenant_name,
+                        resolved.key_id
+                    ),
+                );
+            }
+        }
+    }
     let should_check_budget = capacity > 0 || term_gate.is_some();
     if should_check_budget {
         match state
@@ -754,6 +834,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 let meta_for_stream = req_meta.clone();
                 let model_for_stream = model.clone();
                 let term_for_stream = term_period.clone();
+                let key_term_for_stream = key_term_period.clone();
                 let body_stream = async_stream::stream! {
                     futures_util::pin_mut!(driver);
                     while let Some(item) = driver.next().await {
@@ -786,6 +867,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                         cache_status_label,
                         capacity,
                         term_for_stream.as_deref(),
+                        key_term_for_stream.as_deref(),
                         in_cost_rate,
                         out_cost_rate,
                         modality_cost,
@@ -800,9 +882,11 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 if !boons_applied.is_empty() {
                     builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
                 }
-                return builder.body(Body::from_stream(body_stream)).unwrap_or_else(|_| {
-                    error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
-                });
+                return builder
+                    .body(Body::from_stream(body_stream))
+                    .unwrap_or_else(|_| {
+                        error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+                    });
             }
         }
     }
@@ -930,6 +1014,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             cache_status_label,
             capacity,
             term_period.as_deref(),
+            key_term_period.as_deref(),
             in_cost_rate,
             out_cost_rate,
             modality_cost,
@@ -1040,6 +1125,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             cache_status_label,
             capacity,
             term_period.as_deref(),
+            key_term_period.as_deref(),
             in_cost_rate,
             out_cost_rate,
             modality_cost,
@@ -1084,6 +1170,7 @@ async fn settle_request(
     cache_status: &str,
     capacity: i64,
     term_period: Option<&str>,
+    key_term_period: Option<&str>,
     in_cost_rate: f64,
     out_cost_rate: f64,
     modality_cost: f64,
@@ -1161,6 +1248,29 @@ async fn settle_request(
                     "redis_term_usage_failed",
                     "Redis term-usage commit failed",
                     format!("tenant `{}` model `{model}`: {e}", resolved.tenant_name),
+                );
+            }
+        }
+    }
+    if let Some(period) = key_term_period {
+        let added = input_tokens.saturating_add(output_tokens) as i64;
+        match state
+            .redis
+            .term_usage_add(&resolved.key_id, period, added, cost_usd)
+            .await
+        {
+            Ok((total_tokens, total_cost)) => {
+                maybe_alert_key_budget(state, resolved, total_tokens, total_cost);
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "key term usage commit failed");
+                state.alerts.issue(
+                    "redis_key_term_usage_failed",
+                    "Redis key term-usage commit failed",
+                    format!(
+                        "tenant `{}` key `{}` model `{model}`: {e}",
+                        resolved.tenant_name, resolved.key_id
+                    ),
                 );
             }
         }
@@ -1380,30 +1490,56 @@ fn tenant_active_now(
 /// `term` budgets reset whenever `budget_started_at` changes, and `lifetime`
 /// budgets never reset.
 fn term_period_key(resolved: &ResolvedKey, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
-    if resolved.budget_tokens.is_none() && resolved.budget_cost_usd.is_none() {
+    budget_period_key(
+        resolved.budget_tokens,
+        resolved.budget_cost_usd,
+        resolved.budget_period.as_deref(),
+        resolved.budget_started_at,
+        &resolved.timezone,
+        now,
+    )
+}
+
+fn key_term_period_key(
+    resolved: &ResolvedKey,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    budget_period_key(
+        resolved.key_budget_tokens,
+        resolved.key_budget_cost_usd,
+        resolved.key_budget_period.as_deref(),
+        resolved.key_budget_started_at,
+        &resolved.timezone,
+        now,
+    )
+}
+
+fn budget_period_key(
+    budget_tokens: Option<i64>,
+    budget_cost_usd: Option<f64>,
+    budget_period: Option<&str>,
+    budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    timezone: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
+    if budget_tokens.is_none() && budget_cost_usd.is_none() {
         return None;
     }
-    let period = resolved.budget_period.as_deref().unwrap_or("lifetime");
+    let period = budget_period.unwrap_or("lifetime");
     let key = match period {
         "monthly" => {
             use chrono::Datelike;
-            let tz: chrono_tz::Tz = resolved.timezone.parse().unwrap_or(chrono_tz::UTC);
+            let tz: chrono_tz::Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
             let local = now.with_timezone(&tz);
             format!("m:{}-{:02}", local.year(), local.month())
         }
         "term" => {
-            let anchor = resolved
-                .budget_started_at
-                .map(|t| t.timestamp())
-                .unwrap_or(0);
+            let anchor = budget_started_at.map(|t| t.timestamp()).unwrap_or(0);
             format!("t:{anchor}")
         }
         // "lifetime" and any unknown value: a single non-rolling bucket.
         _ => {
-            let anchor = resolved
-                .budget_started_at
-                .map(|t| t.timestamp())
-                .unwrap_or(0);
+            let anchor = budget_started_at.map(|t| t.timestamp()).unwrap_or(0);
             format!("l:{anchor}")
         }
     };
@@ -1441,6 +1577,47 @@ fn maybe_alert_budget(state: &AppState, resolved: &ResolvedKey, used_tokens: i64
             format!(
                 "tenant `{}` is at {:.0}% of its budget (used {used_tokens} tokens / ${used_cost:.4})",
                 resolved.tenant_name,
+                pct * 100.0
+            ),
+        );
+    }
+}
+
+fn maybe_alert_key_budget(
+    state: &AppState,
+    resolved: &ResolvedKey,
+    used_tokens: i64,
+    used_cost: f64,
+) {
+    let token_pct = resolved
+        .key_budget_tokens
+        .filter(|c| *c > 0)
+        .map(|cap| used_tokens as f64 / cap as f64);
+    let cost_pct = resolved
+        .key_budget_cost_usd
+        .filter(|c| *c > 0.0)
+        .map(|cap| used_cost / cap);
+    let pct = [token_pct, cost_pct]
+        .into_iter()
+        .flatten()
+        .fold(0.0_f64, f64::max);
+    if pct >= 1.0 {
+        state.alerts.issue(
+            format!("key_term_budget_exhausted:{}", resolved.key_id),
+            "API key term budget exhausted",
+            format!(
+                "tenant `{}` key `{}` reached its budget cap (used {used_tokens} tokens / ${used_cost:.4})",
+                resolved.tenant_name, resolved.key_id
+            ),
+        );
+    } else if pct >= 0.8 {
+        state.alerts.issue(
+            format!("key_term_budget_warn:{}", resolved.key_id),
+            "API key term budget at 80%",
+            format!(
+                "tenant `{}` key `{}` is at {:.0}% of its budget (used {used_tokens} tokens / ${used_cost:.4})",
+                resolved.tenant_name,
+                resolved.key_id,
                 pct * 100.0
             ),
         );
@@ -2030,6 +2207,10 @@ mod tests {
             budget_cost_usd: None,
             budget_period: None,
             budget_started_at: None,
+            key_budget_tokens: None,
+            key_budget_cost_usd: None,
+            key_budget_period: None,
+            key_budget_started_at: None,
             allowed_models: None,
             internal: false,
         }
@@ -2363,9 +2544,10 @@ mod tests {
         // The cache key is computed from the client body *before* the boon
         // interception forces `stream: false` upstream, so streaming and
         // non-streaming clients must land on different cache entries.
-        let streaming =
-            serde_json::to_vec(&serde_json::json!({ "model": "m", "stream": true, "messages": [] }))
-                .unwrap();
+        let streaming = serde_json::to_vec(
+            &serde_json::json!({ "model": "m", "stream": true, "messages": [] }),
+        )
+        .unwrap();
         let plain = serde_json::to_vec(
             &serde_json::json!({ "model": "m", "stream": false, "messages": [] }),
         )
