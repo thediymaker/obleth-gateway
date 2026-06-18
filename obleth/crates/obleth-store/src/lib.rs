@@ -2519,6 +2519,15 @@ fn model_health_claim_from_row(row: &PgRow) -> Result<ModelHealthClaim> {
 mod tests {
     use super::*;
     use obleth_config::hash_api_key;
+    use std::sync::OnceLock;
+
+    // Serialise integration tests so DDL from migrate() never races with DML
+    // from a concurrently running test. Each test must hold this guard for its
+    // full duration (including the migrate() call).
+    static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    fn serial() -> &'static tokio::sync::Mutex<()> {
+        SERIAL.get_or_init(tokio::sync::Mutex::default)
+    }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` points at a
     /// throwaway Postgres. Skips silently otherwise so unit runs stay hermetic.
@@ -2528,6 +2537,7 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
+        let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
 
@@ -2779,6 +2789,7 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
+        let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
 
@@ -2843,6 +2854,7 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
+        let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
 
@@ -2929,6 +2941,7 @@ mod tests {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
+        let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
 
