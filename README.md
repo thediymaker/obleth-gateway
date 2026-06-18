@@ -48,55 +48,36 @@ The data plane is a thin async Rust service. The model registry uses a lock-free
 ## Quick start (Docker)
 
 ```bash
-cd deploy/docker && cp .env.example .env
-docker compose --profile benchmark --profile edge --profile observability up -d
+cd deploy/docker
+cp .env.example .env          # dev defaults — change passwords before exposing to a network
+docker compose up -d
 ```
 
-Open the dashboard at <http://localhost:3002>.
+`.env.example` enables the full dev/demo stack (`benchmark`, `edge`, and `observability` profiles), so everything starts with a single command. To build from source instead of pulling published images, add `--build`.
 
-### Create a tenant and call the gateway
+Once the containers are healthy:
 
-```bash
-TOKEN=dev-admin-token
-TID=$(curl -s -XPOST localhost:9180/api/v1/tenants \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"name":"chatbot","weight":500,"tokens_per_minute":2000000}' | jq -r .id)
+| Service | URL | Default login |
+| --- | --- | --- |
+| Dashboard | <http://localhost:3002> | `admin` / `obleth` |
+| Gateway (via HAProxy) | <http://localhost> | — |
+| Grafana | <http://localhost:3001> | `admin` / `obleth` |
+| Prometheus | <http://localhost:9090> | — |
+| Jaeger traces | <http://localhost:16686> | — |
 
-SECRET=$(curl -s -XPOST localhost:9180/api/v1/tenants/$TID/keys \
-  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"name":"prod"}' | jq -r .secret)
+Log in to the dashboard to register models, create tenants and API keys, configure fairshare weights, and monitor usage. The benchmark fixture backend is pre-registered as the default upstream so you can explore the UI immediately without a real GPU endpoint.
 
-curl -s localhost/v1/chat/completions \
-  -H "Authorization: Bearer $SECRET" -H 'Content-Type: application/json' \
-  -d '{"model":"benchmark-endpoint","messages":[{"role":"user","content":"hi"}],"max_tokens":32}'
-```
+## Deployment
 
-Full API spec: `GET http://localhost:9180/api/v1/openapi.json`.
-
-### Kubernetes
-
-```bash
-helm install obleth oci://ghcr.io/thediymaker/charts/obleth --version <X.Y.Z> -f my-values.yaml
-```
-
-See `deploy/k8s/README.md` for post-install steps and production configuration.
-
-## Configuration
-
-| Variable | Purpose |
-| --- | --- |
-| `OBLETH_UPSTREAM_BASE_URL` | default upstream (each model can override with its own `api_base`) |
-| `OBLETH_DATABASE_URL` / `OBLETH_REDIS_URL` / `OBLETH_CLICKHOUSE_URL` | the three datastores |
-| `OBLETH_ADMIN_TOKEN` | Management API bearer token (required) |
-| `OBLETH_FAIL_OPEN` | admit when Redis is down (default `true`) |
-
-Credentials in `*.env.example` and `values.yaml` are development examples only — replace them and add TLS before deploying anywhere real.
+obleth ships as Docker Compose (above), a Helm chart for Kubernetes, and pre-built binaries for direct installs. See **[obleth.com](https://obleth.com)** for deployment guides, configuration reference, and production setup.
 
 ## Documentation
 
 Full architecture, scheduler internals, Slurm provisioner setup, auto routing and the classifier, budgets, boons, MCP integration, alerting, and the configuration reference live at **[obleth.com](https://obleth.com)**.
 
-For contribution workflow and security reporting, see [CONTRIBUTING.md](CONTRIBUTING.md) and [SECURITY.md](SECURITY.md).
+## Contributing
+
+Bug reports and feature requests go in [GitHub Issues](https://github.com/thediymaker/obleth-gateway/issues). Pull requests are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and branching conventions. For security vulnerabilities, follow the responsible disclosure process in [SECURITY.md](SECURITY.md).
 
 ## License
 
