@@ -151,9 +151,21 @@ async fn run_state_machine(
                 let target = *target;
                 let profile = *profile;
                 let cursor = *cursor;
-                let scopes = ["all", "single (use --model flag)"];
+                // "single" requires --model; mark it disabled when the flag is absent.
+                let single_enabled = cli.model.is_some();
+                let scopes: &[(&str, bool)] = &[
+                    ("all", true),
+                    (
+                        if single_enabled {
+                            "single"
+                        } else {
+                            "single (requires --model)"
+                        },
+                        single_enabled,
+                    ),
+                ];
 
-                terminal.draw(|f| draw_pick_scope(f, target, profile, &scopes, cursor))?;
+                terminal.draw(|f| draw_pick_scope(f, target, profile, scopes, cursor))?;
                 if event::poll(Duration::from_millis(200))? {
                     if let Event::Key(k) = event::read()? {
                         match k.code {
@@ -175,20 +187,24 @@ async fn run_state_machine(
                                 };
                             }
                             KeyCode::Enter | KeyCode::Char(' ') => {
-                                // Scope::All or Scope::Single from cli.model.
-                                let scope = if cursor == 0 {
-                                    Scope::All
-                                } else {
-                                    crate::cli::scope_from(cli.model.clone(), false)
-                                };
-                                // Start the run and go to dashboard.
-                                let handles =
-                                    crate::profiles::start_run(cli, target, profile, scope)
-                                        .await?;
-                                // Dashboard render loop.
-                                run_dashboard(terminal, admin, handles).await?;
-                                // After dashboard exits, return to overview.
-                                screen = Screen::Overview;
+                                let (_, enabled) = scopes[cursor];
+                                if enabled {
+                                    // Scope::All or Scope::Single from cli.model.
+                                    let scope = if cursor == 0 {
+                                        Scope::All
+                                    } else {
+                                        crate::cli::scope_from(cli.model.clone(), false)
+                                    };
+                                    // Start the run and go to dashboard.
+                                    let handles =
+                                        crate::profiles::start_run(cli, target, profile, scope)
+                                            .await?;
+                                    // Dashboard render loop.
+                                    run_dashboard(terminal, admin, handles).await?;
+                                    // After dashboard exits, return to overview.
+                                    screen = Screen::Overview;
+                                }
+                                // If not enabled, ignore — user must pick a valid one.
                             }
                             _ => {}
                         }
@@ -211,6 +227,9 @@ async fn run_dashboard(
     let mut last_live_refresh = Instant::now();
     let mut live = crate::admin::FairshareLive { global_in_flight: 0, global_queued: 0 };
 
+    // Destructure so we can move `handle` out after the loop.
+    let crate::profiles::RunHandles { stats, stop, handle, plan, ui_base, profile_name } = handles;
+
     loop {
         // Refresh fairshare roughly every 2 s.
         if last_live_refresh.elapsed() >= Duration::from_secs(2) {
@@ -221,44 +240,44 @@ async fn run_dashboard(
         }
 
         let summary = {
-            let s = handles.stats.lock().unwrap();
+            let s = stats.lock().unwrap();
             s.summarize(
                 started.elapsed().as_secs_f64().max(1.0),
-                handles.plan.max_error_rate,
+                plan.max_error_rate,
             )
         };
 
         terminal.draw(|f| {
             dashboard::draw(
                 f,
-                &handles.profile_name,
+                &profile_name,
                 &summary,
                 live.global_in_flight,
                 live.global_queued,
-                handles.plan.capacity,
-                &handles.ui_base,
+                plan.capacity,
+                &ui_base,
             )
         })?;
 
         if event::poll(Duration::from_millis(250))? {
             if let Event::Key(k) = event::read()? {
                 if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc) {
-                    handles
-                        .stop
-                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
                     break;
                 }
             }
         }
 
         // Engine finished on its own (duration elapsed or stop set externally).
-        if handles
-            .stop
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
     }
+
+    // Drain: wait for the engine task to finish before returning.
+    // The engine exits promptly once `stop` is set; this just ensures in-flight
+    // requests complete before we leave the alternate screen.
+    let _ = handle.await;
 
     Ok(())
 }
@@ -441,7 +460,7 @@ fn draw_pick_scope(
     f: &mut Frame,
     target: Target,
     profile: Profile,
-    scopes: &[&str],
+    scopes: &[(&str, bool)],
     cursor: usize,
 ) {
     let area = f.area();
@@ -470,13 +489,18 @@ fn draw_pick_scope(
     let items: Vec<ListItem> = scopes
         .iter()
         .enumerate()
-        .map(|(i, s)| {
-            if i == cursor {
-                ListItem::new(format!("▶ {s}"))
-                    .style(Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+        .map(|(i, (s, enabled))| {
+            let color = if !enabled {
+                theme::MUTED
+            } else if i == cursor {
+                theme::ACCENT
             } else {
-                ListItem::new(format!("  {s}")).style(Style::default().fg(theme::FG))
-            }
+                theme::FG
+            };
+            let prefix = if i == cursor && *enabled { "▶ " } else { "  " };
+            let modifier = if i == cursor && *enabled { Modifier::BOLD } else { Modifier::empty() };
+            ListItem::new(format!("{prefix}{s}"))
+                .style(Style::default().fg(color).add_modifier(modifier))
         })
         .collect();
     let list = List::new(items).block(

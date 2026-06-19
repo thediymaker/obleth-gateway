@@ -90,7 +90,7 @@ pub fn draw(
         Line::from(format!("  fairshare   {ui_base}/fairshare")),
         Line::from(format!("  accounting  {ui_base}/usage")),
         Line::from(Span::styled(
-            "[q] quit & drain   [p] pause",
+            "[q] quit & drain",
             Style::default().fg(theme::MUTED),
         )),
     ]);

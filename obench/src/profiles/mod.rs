@@ -21,6 +21,7 @@ const FIXTURE_API_BASE_DEFAULT: &str = "http://benchmark-backend:8081";
 pub struct RunHandles {
     pub stats: Arc<Mutex<Stats>>,
     pub stop: Arc<AtomicBool>,
+    pub handle: tokio::task::JoinHandle<()>,
     pub plan: plan::ProfilePlan,
     pub ui_base: String,
     pub profile_name: String,
@@ -29,40 +30,42 @@ pub struct RunHandles {
 // ── shared seed → guard → capacity → make_req helper ──────────────────────────
 
 struct SeededSetup {
-    #[allow(dead_code)]
-    seeded: SeededRun,
     make_req: Box<dyn Fn() -> ChatRequest + Send + Sync + 'static>,
     plan: plan::ProfilePlan,
     profile_name: String,
 }
 
-async fn build_setup(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -> Result<SeededSetup> {
-    let admin = AdminClient::new(cli.admin_base.clone(), cli.admin_token.clone());
-    let plan = plan::resolve(profile, cli);
-
-    // Seed.
+/// Seed the target, validate the result is non-empty, then return the `SeededRun`.
+async fn seed_and_guard(cli: &Cli, tgt: Target, scope: &Scope, admin: &AdminClient) -> Result<SeededRun> {
     let seeded: SeededRun = match tgt {
         Target::Fixture => {
             let api_base = std::env::var("BENCHMARK_API_BASE")
                 .unwrap_or_else(|_| FIXTURE_API_BASE_DEFAULT.to_string());
-            seed::seed_fixture(&admin, &api_base, &scope).await?
+            seed::seed_fixture(admin, &api_base, scope).await?
         }
         Target::Live => {
             let raw = std::fs::read_to_string(&cli.config)
                 .map_err(|e| anyhow::anyhow!("reading {}: {e}", cli.config))?;
             let cfg = crate::config::load_live_config(&raw, &|k| std::env::var(k).ok())
                 .map_err(|e| anyhow::anyhow!(e))?;
-            crate::config::validate_live(&cfg, &scope).map_err(|e| anyhow::anyhow!(e))?;
-            seed::seed_live(&admin, &cfg, &scope).await?
+            crate::config::validate_live(&cfg, scope).map_err(|e| anyhow::anyhow!(e))?;
+            seed::seed_live(admin, &cfg, scope).await?
         }
     };
-
     if seeded.models.is_empty() {
         anyhow::bail!("no models were seeded — check the target/config (fixture backend reachable? live config has matching models?)");
     }
     if seeded.tenants.is_empty() {
         anyhow::bail!("no tenants were seeded — check the target/config");
     }
+    Ok(seeded)
+}
+
+async fn build_setup(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -> Result<SeededSetup> {
+    let admin = AdminClient::new(cli.admin_base.clone(), cli.admin_token.clone());
+    let plan = plan::resolve(profile, cli);
+
+    let seeded = seed_and_guard(cli, tgt, &scope, &admin).await?;
 
     // Set capacity.
     let cap = admin.set_capacity(plan.capacity).await?;
@@ -127,7 +130,6 @@ async fn build_setup(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -> 
     let profile_name = format!("{profile:?}").to_lowercase();
 
     Ok(SeededSetup {
-        seeded,
         make_req: Box::new(make_req),
         plan,
         profile_name,
@@ -144,34 +146,14 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
 
     if profile == Profile::Auto {
         // Seed independently for the Auto path (it handles its own capacity).
-        let seeded: SeededRun = match tgt {
-            Target::Fixture => {
-                let api_base = std::env::var("BENCHMARK_API_BASE")
-                    .unwrap_or_else(|_| FIXTURE_API_BASE_DEFAULT.to_string());
-                seed::seed_fixture(&admin, &api_base, &scope).await?
-            }
-            Target::Live => {
-                let raw = std::fs::read_to_string(&cli.config)
-                    .map_err(|e| anyhow::anyhow!("reading {}: {e}", cli.config))?;
-                let cfg = crate::config::load_live_config(&raw, &|k| std::env::var(k).ok())
-                    .map_err(|e| anyhow::anyhow!(e))?;
-                crate::config::validate_live(&cfg, &scope).map_err(|e| anyhow::anyhow!(e))?;
-                seed::seed_live(&admin, &cfg, &scope).await?
-            }
-        };
-        if seeded.models.is_empty() {
-            anyhow::bail!("no models were seeded");
-        }
-        if seeded.tenants.is_empty() {
-            anyhow::bail!("no tenants were seeded");
-        }
+        let seeded = seed_and_guard(cli, tgt, &scope, &admin).await?;
         let _ = admin.set_capacity(plan.capacity).await?;
         return auto::run(cli, tgt, scope, &seeded, &cli.proxy_base).await;
     }
 
     let scope_str = format!("{scope:?}");
     let setup = build_setup(cli, tgt, profile, scope).await?;
-    let SeededSetup { seeded: _, make_req, plan, profile_name } = setup;
+    let SeededSetup { make_req, plan, profile_name } = setup;
 
     // Run.
     let client = Arc::new(LoadClient::new((plan.conc as usize) * 2));
@@ -251,26 +233,27 @@ pub async fn start_run(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -
     target::validate_combo(tgt, profile).map_err(|e| anyhow::anyhow!(e))?;
 
     let setup = build_setup(cli, tgt, profile, scope).await?;
-    let SeededSetup { seeded: _, make_req, plan, profile_name } = setup;
+    let SeededSetup { make_req, plan, profile_name } = setup;
 
     let client = Arc::new(LoadClient::new((plan.conc as usize) * 2));
     let stats = Arc::new(Mutex::new(Stats::default()));
     let stop = Arc::new(AtomicBool::new(false));
 
     // Spawn the engine — do NOT await it; return handles immediately.
-    {
+    let handle = {
         let client = client.clone();
         let stats = stats.clone();
         let stop = stop.clone();
         let cfg = RunConfig { conc: plan.conc, duration_s: plan.duration_s, warmup_s: plan.warmup_s };
         tokio::spawn(async move {
             crate::engine::load::run_closed_loop(client, make_req, cfg, stop.clone(), stats).await;
-        });
-    }
+        })
+    };
 
     Ok(RunHandles {
         stats,
         stop,
+        handle,
         plan,
         ui_base: cli.ui_base.clone(),
         profile_name,
