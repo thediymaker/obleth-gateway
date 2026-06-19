@@ -24,18 +24,30 @@ pub async fn run(cli: &Cli) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    loop {
-        terminal.draw(|f| draw_overview(f, &snap))?;
-        if event::poll(Duration::from_millis(200))? {
-            if let Event::Key(k) = event::read()? {
-                if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc) { break; }
-            }
-        }
-    }
+    let loop_result = run_event_loop(&mut terminal, &snap);
 
+    // teardown ALWAYS runs, regardless of loop_result
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal.show_cursor()?;
+
+    loop_result
+}
+
+fn run_event_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    snap: &overview::Snapshot,
+) -> Result<()> {
+    loop {
+        terminal.draw(|f| draw_overview(f, snap))?;
+        if event::poll(Duration::from_millis(200))? {
+            if let Event::Key(k) = event::read()? {
+                if matches!(k.code, KeyCode::Char('q') | KeyCode::Esc) {
+                    break;
+                }
+            }
+        }
+    }
     Ok(())
 }
 
