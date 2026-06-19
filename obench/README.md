@@ -62,7 +62,7 @@ upstreams the generation time dominates and the number is not meaningful. Use
 
 | Profile | Concurrency | Duration | Output tokens | Purpose |
 |---------|-------------|----------|---------------|---------|
-| `smoke` | 3 | quick ping | 16 | Check the stack responds at all |
+| `smoke` | 2 | 30 s | 16 | Check the stack responds at all |
 | `light` | 16 | 60 s | 64 | Routine CI / sanity check |
 | `heavy` | 64 | 600 s | 128 | Sustained realistic load |
 | `extreme` | 256 | 30 s | 4 | Max req/s ceiling (fixture only) |
