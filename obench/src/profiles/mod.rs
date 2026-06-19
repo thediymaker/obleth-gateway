@@ -38,6 +38,13 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
         }
     };
 
+    if seeded.models.is_empty() {
+        anyhow::bail!("no models were seeded — check the target/config (fixture backend reachable? live config has matching models?)");
+    }
+    if seeded.tenants.is_empty() {
+        anyhow::bail!("no tenants were seeded — check the target/config");
+    }
+
     let cap = admin.set_capacity(plan.capacity).await?;
     println!("seeded {} models, {} tenants, capacity max_in_flight={cap}", seeded.models.len(), seeded.tenants.len());
 
