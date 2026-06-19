@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod engine;
 mod report;
+mod seed;
 mod seedplan;
 mod target;
 
