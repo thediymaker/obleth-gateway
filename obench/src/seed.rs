@@ -34,9 +34,36 @@ fn load_key_cache() -> HashMap<String, String> {
 
 fn save_key_cache(cache: &HashMap<String, String>) -> Result<()> {
     let s = serde_json::to_string_pretty(cache).context("serialize key cache")?;
-    fs::write(key_cache_path(), s)
-        .with_context(|| format!("write key cache to {}", key_cache_path().display()))?;
+    let path = key_cache_path();
+    write_private(&path, s.as_bytes())
+        .with_context(|| format!("write key cache to {}", path.display()))?;
     Ok(())
+}
+
+#[cfg(unix)]
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+        // Tighten the artifact dir to owner-only (defense in depth).
+        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+    }
+    let mut f = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)?;
+    f.write_all(bytes)
+}
+
+#[cfg(not(unix))]
+fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::write(path, bytes)
 }
 
 /// Resolve the secret for a tenant: a freshly minted secret wins; otherwise the
