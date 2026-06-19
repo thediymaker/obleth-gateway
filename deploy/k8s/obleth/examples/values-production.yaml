@@ -1,0 +1,117 @@
+# Scenario 4: PRODUCTION — external datastores + full workload hardening
+# -----------------------------------------------------------------------------
+# The recommended topology for production install:
+#
+#   * obleth runs ONLY its stateless workloads (data plane + control plane).
+#   * Postgres, Redis, and ClickHouse are operated OUTSIDE this chart by
+#     purpose-built tooling that gives you backups, HA, and PITR:
+#       - Postgres   : CloudNativePG operator (or a managed cloud Postgres)
+#       - ClickHouse : Altinity ClickHouse operator (or managed ClickHouse)
+#       - Redis      : a real HA Redis (operator/managed) — obleth treats Redis
+#                      as a hot cache and re-warms from Postgres, but HA avoids
+#                      cold-start latency spikes.
+#   * Secrets are sourced from PRE-CREATED Kubernetes Secrets (existingSecret),
+#     so real credentials never touch values files, git, or --set/CLI history.
+#   * The data plane runs ≥3 replicas, spread across nodes (anti-affinity),
+#     autoscaled (HPA), and protected by a PodDisruptionBudget.
+#
+# -----------------------------------------------------------------------------
+# 1. Create the Secrets out-of-band (example — use your secrets manager / SOPS /
+#    External Secrets Operator instead of raw kubectl in production):
+#
+#    kubectl create secret generic obleth-secrets -n obleth \
+#      --from-literal=OBLETH_ADMIN_TOKEN="$(openssl rand -hex 32)" \
+#      --from-literal=OBLETH_DATABASE_URL="postgres://obleth:PASS@pg-rw.db.svc:5432/obleth" \
+#      --from-literal=OBLETH_CLICKHOUSE_PASSWORD="CLICKHOUSE_PASS" \
+#      --from-literal=OBLETH_ENCRYPTION_KEY="$(openssl rand -base64 32)" \
+#      --from-literal=OBLETH_API_KEY_PEPPER="$(openssl rand -hex 32)" \
+#      --from-literal=OBLETH_SLACK_WEBHOOK_URL=""
+#
+#    kubectl create secret generic obleth-control-plane -n obleth \
+#      --from-literal=DASHBOARD_USERNAME="admin" \
+#      --from-literal=DASHBOARD_PASSWORD="$(openssl rand -hex 16)" \
+#      --from-literal=DASHBOARD_SESSION_SECRET="$(openssl rand -hex 32)"
+#
+# 2. Install:
+#    helm install obleth ./deploy/k8s/obleth -n obleth --create-namespace \
+#      -f deploy/k8s/obleth/examples/values-production.yaml
+# -----------------------------------------------------------------------------
+
+obleth:
+  replicas: 3
+  # All credentials come from the pre-created Secret above; no secret values are
+  # set inline. The Secret MUST contain every key listed in step 1.
+  existingSecret: obleth-secrets
+  upstreamBaseUrl: "https://my-vllm-or-aibrix-endpoint/v1"
+  # If your external datastores sit on private/LAN addresses AND you enable
+  # strict SSRF (OBLETH_BLOCK_PRIVATE_NETWORKS=1), allow those ranges here.
+  allowedPrivateCidrs: ""
+  otelEndpoint: ""   # e.g. http://otel-collector.observability.svc:4317
+
+# External, operator-managed datastores — nothing stateful runs in this chart.
+postgres:
+  enabled: false
+  external:
+    # Used only to satisfy chart rendering; the live URL comes from the Secret's
+    # OBLETH_DATABASE_URL above. Keep them consistent.
+    url: "postgres://obleth:PASS@pg-rw.db.svc:5432/obleth"
+
+redis:
+  enabled: false
+  external:
+    url: "redis://redis-master.db.svc:6379"
+
+clickhouse:
+  enabled: false
+  user: obleth
+  db: obleth
+  # Password is supplied via the Secret (OBLETH_CLICKHOUSE_PASSWORD); left empty
+  # here so it is never inlined.
+  password: ""
+  external:
+    url: "http://clickhouse.db.svc:8123"
+
+# No demo fixture backend in production.
+benchmarkBackend:
+  enabled: false
+
+# Stateless data plane: spread, autoscale, and protect against disruptions.
+hpa:
+  enabled: true
+  minReplicas: 3
+  maxReplicas: 20
+  targetCPUUtilizationPercentage: 70
+
+affinity:
+  antiAffinity: soft   # use "hard" on multi-node clusters to require distinct nodes
+
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+# Restricted-PSS security contexts are on by default; nothing to set here.
+# Enable NetworkPolicy only if a CNI enforces it (no bundled deps to gate, but
+# harmless to leave off for external datastores).
+networkPolicy:
+  enabled: false
+
+serviceMonitor:
+  enabled: true   # requires the Prometheus Operator CRDs
+
+controlPlane:
+  enabled: true
+  replicas: 2
+  existingSecret: obleth-control-plane
+  resources:
+    requests: { cpu: "100m", memory: "256Mi" }
+    limits: { cpu: "1", memory: "512Mi" }
+
+# Expose the data plane through your ingress controller with TLS.
+ingress:
+  enabled: true
+  className: nginx
+  host: obleth.example.com
+  servicePort: 8080
+  tls:
+    - secretName: obleth-tls
+      hosts: [obleth.example.com]

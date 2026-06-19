@@ -180,10 +180,12 @@ spec:
   template:
     metadata: { labels: { app: {{ .Release.Name }}-benchmark-backend } }
     spec:
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: benchmark-backend
           image: {{ .Values.image.benchmarkBackend }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
           env:
             - { name: BENCHMARK_BACKEND_LISTEN, value: "0.0.0.0:8081" }
             - { name: BENCHMARK_BACKEND_TTFT_MS, value: {{ .Values.benchmarkBackend.ttftMs | quote }} }

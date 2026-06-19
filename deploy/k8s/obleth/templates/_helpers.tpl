@@ -3,9 +3,63 @@
 {{- end -}}
 
 {{- define "obleth.labels" -}}
+helm.sh/chart: {{ printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" }}
 app.kubernetes.io/name: obleth
 app.kubernetes.io/instance: {{ .Release.Name }}
+app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
+{{- end -}}
+
+{{/*
+Secret names are existingSecret-aware: production installs point the chart at a
+pre-created Secret so real credentials never live in values files or CLI history.
+When the corresponding existingSecret is empty, the chart renders and references
+its own Secret instead.
+*/}}
+{{- define "obleth.secretName" -}}
+{{- if .Values.obleth.existingSecret -}}
+{{ .Values.obleth.existingSecret }}
+{{- else -}}
+{{ include "obleth.fullname" . }}-secret
+{{- end -}}
+{{- end -}}
+
+{{- define "obleth.controlPlaneSecretName" -}}
+{{- if .Values.controlPlane.existingSecret -}}
+{{ .Values.controlPlane.existingSecret }}
+{{- else -}}
+{{ .Release.Name }}-control-plane-secret
+{{- end -}}
+{{- end -}}
+
+{{/*
+Pod anti-affinity for the obleth data plane, driven by .Values.affinity.antiAffinity
+("soft" preferred | "hard" required | "" disabled). Emits the full `affinity:` key
+so callers can `{{ include "obleth.antiAffinity" . | nindent 6 }}` under a pod spec.
+*/}}
+{{- define "obleth.antiAffinity" -}}
+{{- $mode := .Values.affinity.antiAffinity -}}
+{{- if eq $mode "soft" }}
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          topologyKey: kubernetes.io/hostname
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: obleth
+              app.kubernetes.io/instance: {{ .Release.Name }}
+{{- else if eq $mode "hard" }}
+affinity:
+  podAntiAffinity:
+    requiredDuringSchedulingIgnoredDuringExecution:
+      - topologyKey: kubernetes.io/hostname
+        labelSelector:
+          matchLabels:
+            app.kubernetes.io/name: obleth
+            app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
 {{- end -}}
 
 {{/*

@@ -1,4 +1,5 @@
 {{- if .Values.controlPlane.enabled }}
+{{- if not .Values.controlPlane.existingSecret }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -10,36 +11,50 @@ stringData:
   DASHBOARD_PASSWORD: {{ required "controlPlane.dashboardPassword is required (set via --set or an external Secret; do not commit a real value)" .Values.controlPlane.dashboardPassword | quote }}
   DASHBOARD_SESSION_SECRET: {{ required "controlPlane.dashboardSessionSecret is required and must be >=32 chars" .Values.controlPlane.dashboardSessionSecret | quote }}
 ---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ .Release.Name }}-control-plane
   labels: {{- include "obleth.labels" . | nindent 4 }}
 spec:
-  replicas: 1
+  replicas: {{ .Values.controlPlane.replicas }}
   selector: { matchLabels: { app: {{ .Release.Name }}-control-plane } }
   template:
     metadata: { labels: { app: {{ .Release.Name }}-control-plane } }
     spec:
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: control-plane
           image: {{ .Values.image.controlPlane }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
           env:
             - { name: OBLETH_ADMIN_BASE_URL, value: "http://{{ include "obleth.fullname" . }}:9180" }
             - name: OBLETH_ADMIN_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ include "obleth.fullname" . }}-secret
+                  name: {{ include "obleth.secretName" . }}
                   key: OBLETH_ADMIN_TOKEN
           envFrom:
             - secretRef:
-                name: {{ .Release.Name }}-control-plane-secret
+                name: {{ include "obleth.controlPlaneSecretName" . }}
           ports: [{ containerPort: 3000 }]
+          readinessProbe:
+            httpGet: { path: /login, port: 3000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /login, port: 3000 }
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          resources: {{- toYaml .Values.controlPlane.resources | nindent 12 }}
 ---
 apiVersion: v1
 kind: Service
-metadata: { name: {{ .Release.Name }}-control-plane }
+metadata:
+  name: {{ .Release.Name }}-control-plane
+  labels: {{- include "obleth.labels" . | nindent 4 }}
 spec:
   type: ClusterIP
   selector: { app: {{ .Release.Name }}-control-plane }

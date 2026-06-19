@@ -21,6 +21,13 @@ obleth:
   # Optional server-side pepper mixed into API-key hashes. Keep secret/stable;
   # changing it invalidates issued keys. Supply via an external Secret.
   apiKeyPepper: ""
+  # PRODUCTION: reference a pre-created Secret instead of letting the chart
+  # build one from the values above (so real secrets never touch values files or
+  # --set/CLI history). When set, the chart does NOT render its own Secret and
+  # the named Secret MUST provide every key the chart would have: OBLETH_ADMIN_TOKEN,
+  # OBLETH_DATABASE_URL, OBLETH_CLICKHOUSE_PASSWORD, OBLETH_ENCRYPTION_KEY,
+  # OBLETH_API_KEY_PEPPER, OBLETH_SLACK_WEBHOOK_URL. See examples/values-production.yaml.
+  existingSecret: ""
   # SSRF allowlist for admin-registered upstream URLs (comma-separated CIDRs).
   # Default SSRF policy permits private/LAN targets (RFC1918, loopback, etc.) so
   # in-cluster api_base values work without this field. Only required when
@@ -48,6 +55,45 @@ hpa:
   minReplicas: 3
   maxReplicas: 20
   targetCPUUtilizationPercentage: 70
+
+# Pod- and container-level hardening applied to the stateless workloads this
+# chart builds (obleth data plane, control-plane, benchmark-backend). These
+# defaults satisfy the Kubernetes "restricted" Pod Security Standard. UID is NOT
+# pinned here because the images run as different non-root users (obleth=10001,
+# control-plane=1000); runAsNonRoot enforces non-root without hardcoding a UID.
+# The bundled datastores are intentionally excluded — their official images
+# manage their own users (e.g. the Postgres entrypoint must start as root).
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop: [ALL]
+  runAsNonRoot: true
+  # readOnlyRootFilesystem is opt-in: enable per environment only after
+  # confirming nothing writes to the container rootfs (Next.js may need /tmp).
+  # readOnlyRootFilesystem: true
+
+# Spread obleth replicas across nodes so a single node failure cannot take the
+# whole data plane down. "soft" prefers spreading but still schedules on a
+# single-node cluster; "hard" requires distinct nodes (won't schedule more
+# replicas than nodes); "" disables.
+affinity:
+  antiAffinity: soft
+
+# Keep a minimum number of obleth pods available during voluntary disruptions
+# (node drains, rolling upgrades). Only rendered when replicas/HPA allow it.
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1
+
+# Optional NetworkPolicy that restricts the bundled datastore ports to obleth
+# pods only. Off by default (requires a CNI that enforces NetworkPolicy). Has no
+# effect on external datastores.
+networkPolicy:
+  enabled: false
 
 serviceMonitor:
   enabled: false   # set true if the Prometheus Operator CRDs are installed
@@ -136,8 +182,17 @@ benchmarkBackend:
 
 controlPlane:
   enabled: true
+  replicas: 1
   # Dashboard login. All REQUIRED (no defaults shipped) — supply via --set or an
   # external Secret. dashboardSessionSecret MUST be at least 32 characters.
   dashboardUsername: admin
   dashboardPassword: ""
   dashboardSessionSecret: ""
+  # PRODUCTION: reference a pre-created Secret instead of inlining the dashboard
+  # credentials. When set, the chart does NOT render its own control-plane
+  # Secret; the named Secret MUST provide DASHBOARD_USERNAME, DASHBOARD_PASSWORD,
+  # and DASHBOARD_SESSION_SECRET.
+  existingSecret: ""
+  resources:
+    requests: { cpu: "100m", memory: "256Mi" }
+    limits: { cpu: "1", memory: "512Mi" }

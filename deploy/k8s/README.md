@@ -24,7 +24,25 @@ made values files live in [`obleth/examples/`](obleth/examples/).
 | --- | --- | --- | --- |
 | **Persistent (PVC)** | Self-hosted single cluster, no external DBs yet | [`values-persistent.yaml`](obleth/examples/values-persistent.yaml) | **Survives** (PVCs) |
 | **Ephemeral** | Throwaway demo / CI / kicking the tires | [`values-ephemeral.yaml`](obleth/examples/values-ephemeral.yaml) | **LOST** (emptyDir) |
-| **External** | Production; managed or self-hosted datastores | [`values-external.yaml`](obleth/examples/values-external.yaml) | Managed by you |
+| **External** | Self-hosted with your own managed datastores | [`values-external.yaml`](obleth/examples/values-external.yaml) | Managed by you |
+| **Production** | Redundant prod: external datastores + full hardening | [`values-production.yaml`](obleth/examples/values-production.yaml) | Managed by you |
+
+The four profiles differ along two independent axes — **datastore durability**
+(where state lives) and **workload posture** (how the stateless obleth pods are
+hardened and made redundant):
+
+| Profile | Datastores | Durability / HA | obleth replicas | Secrets | Use case |
+| --- | --- | --- | --- | --- | --- |
+| Ephemeral | Bundled, emptyDir | None — wiped on restart | 1 | `--set` | Demos, CI |
+| Persistent | Bundled, PVC | Survives restarts; **no backups/HA** | 3 + HPA | `--set` | Single-cluster self-host |
+| External | Yours | Whatever you operate | 3 + HPA | `--set` | Self-host w/ managed DBs |
+| Production | Yours (operator/managed) | Backups + HA + PITR (your tooling) | 3 + HPA + PDB + anti-affinity | **existingSecret** | Redundant production |
+
+> The bundled datastores are single plain Deployments with no replication or
+> backups — intentionally. Making them HA is the job of purpose-built operators
+> (CloudNativePG, Altinity ClickHouse, an HA Redis), so production points obleth
+> at external datastores rather than reimplementing stateful HA in this chart.
+
 
 ```bash
 helm install obleth deploy/k8s/obleth -n obleth --create-namespace \
@@ -101,6 +119,33 @@ docker compose --env-file datastores.env -f datastores.compose.yml up -d
 
 See [obleth.com — Self-Hosting](https://obleth.com/docs/guides/self-hosting) for
 the full walkthrough.
+
+## Production hardening
+
+These apply to every profile but are tuned for the **Production** one. All are
+toggles in `values.yaml`, on by sensible defaults.
+
+- **Restricted Pod Security Standard.** The stateless workloads (obleth,
+  control-plane, benchmark-backend) run with `runAsNonRoot`, `seccompProfile:
+  RuntimeDefault`, `allowPrivilegeEscalation: false`, and all capabilities
+  dropped (`podSecurityContext` / `securityContext`). UID is not pinned — the
+  images already ship distinct non-root users (obleth 10001, control-plane
+  1000). The bundled datastores are excluded on purpose (their official images
+  manage their own users).
+- **Pre-created Secrets (`existingSecret`).** Point the chart at a Secret you
+  created out-of-band so real credentials never enter values files or
+  `--set`/CLI history. `obleth.existingSecret` must carry `OBLETH_ADMIN_TOKEN`,
+  `OBLETH_DATABASE_URL`, `OBLETH_CLICKHOUSE_PASSWORD`, `OBLETH_ENCRYPTION_KEY`,
+  `OBLETH_API_KEY_PEPPER`, `OBLETH_SLACK_WEBHOOK_URL`;
+  `controlPlane.existingSecret` must carry `DASHBOARD_USERNAME`,
+  `DASHBOARD_PASSWORD`, `DASHBOARD_SESSION_SECRET`. See
+  [`values-production.yaml`](obleth/examples/values-production.yaml).
+- **Spread + disruption protection.** `affinity.antiAffinity` (`soft`/`hard`)
+  spreads obleth replicas across nodes; `podDisruptionBudget` keeps a minimum
+  available during drains/upgrades (rendered only when `replicas > 1`).
+- **NetworkPolicy (opt-in).** `networkPolicy.enabled: true` restricts the
+  bundled datastore ports to obleth pods. Requires a CNI that enforces
+  NetworkPolicy; inert otherwise, and a no-op for external datastores.
 
 ## What the chart starts
 

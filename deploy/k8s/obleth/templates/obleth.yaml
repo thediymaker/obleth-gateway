@@ -1,3 +1,4 @@
+{{- if not .Values.obleth.existingSecret }}
 apiVersion: v1
 kind: Secret
 metadata:
@@ -7,10 +8,12 @@ type: Opaque
 stringData:
   OBLETH_ADMIN_TOKEN: {{ required "obleth.adminToken is required: set a strong token (via --set or an external Secret); do not commit a real value" .Values.obleth.adminToken | quote }}
   OBLETH_DATABASE_URL: {{ include "obleth.databaseUrl" . | quote }}
+  OBLETH_CLICKHOUSE_PASSWORD: {{ .Values.clickhouse.password | quote }}
   OBLETH_SLACK_WEBHOOK_URL: {{ .Values.obleth.slackWebhookUrl | quote }}
   OBLETH_ENCRYPTION_KEY: {{ .Values.obleth.encryptionKey | quote }}
   OBLETH_API_KEY_PEPPER: {{ .Values.obleth.apiKeyPepper | quote }}
 ---
+{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -28,10 +31,13 @@ spec:
         app.kubernetes.io/name: obleth
         app.kubernetes.io/instance: {{ .Release.Name }}
     spec:
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- include "obleth.antiAffinity" . | nindent 6 }}
       containers:
         - name: obleth
           image: {{ .Values.image.obleth }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
           ports:
             - { name: proxy, containerPort: 8080 }
             - { name: admin, containerPort: 9180 }
@@ -44,7 +50,6 @@ spec:
             - { name: OBLETH_CLICKHOUSE_URL, value: {{ include "obleth.clickhouseUrl" . | quote }} }
             - { name: OBLETH_CLICKHOUSE_DB, value: {{ .Values.clickhouse.db | quote }} }
             - { name: OBLETH_CLICKHOUSE_USER, value: {{ .Values.clickhouse.user | quote }} }
-            - { name: OBLETH_CLICKHOUSE_PASSWORD, value: {{ .Values.clickhouse.password | quote }} }
             - { name: OBLETH_UPSTREAM_BASE_URL, value: {{ include "obleth.upstream" . | quote }} }
             - { name: OBLETH_GLOBAL_MAX_IN_FLIGHT, value: {{ .Values.obleth.globalMaxInFlight | quote }} }
             - { name: OBLETH_FAIL_OPEN, value: {{ .Values.obleth.failOpen | quote }} }
@@ -59,7 +64,7 @@ spec:
             - { name: RUST_LOG, value: "info,obleth=info" }
           envFrom:
             - secretRef:
-                name: {{ include "obleth.fullname" . }}-secret
+                name: {{ include "obleth.secretName" . }}
           readinessProbe:
             httpGet: { path: /health, port: proxy }
             initialDelaySeconds: 5
@@ -83,6 +88,20 @@ spec:
     - { name: proxy, port: 8080, targetPort: proxy }
     - { name: admin, port: 9180, targetPort: admin }
     - { name: metrics, port: 9091, targetPort: metrics }
+{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.obleth.replicas) 1) }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "obleth.fullname" . }}
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: obleth
+      app.kubernetes.io/instance: {{ .Release.Name }}
+{{- end }}
 {{- if .Values.hpa.enabled }}
 ---
 apiVersion: autoscaling/v2

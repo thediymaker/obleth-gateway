@@ -1,0 +1,68 @@
+{{- if .Values.networkPolicy.enabled }}
+{{- /*
+Restrict the BUNDLED datastore pods so only the obleth data plane may reach
+their ports. Has no effect on external datastores (those run outside the
+cluster / namespace). Requires a CNI that enforces NetworkPolicy (Calico,
+Cilium, etc.); on CNIs without enforcement these objects are inert.
+*/}}
+{{- if .Values.postgres.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-postgres
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app: {{ .Release.Name }}-postgres }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: obleth
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - { protocol: TCP, port: 5432 }
+---
+{{- end }}
+{{- if .Values.redis.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-redis
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app: {{ .Release.Name }}-redis }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: obleth
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - { protocol: TCP, port: 6379 }
+---
+{{- end }}
+{{- if .Values.clickhouse.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-clickhouse
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels: { app: {{ .Release.Name }}-clickhouse }
+  policyTypes: [Ingress]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: obleth
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - { protocol: TCP, port: 8123 }
+        - { protocol: TCP, port: 9000 }
+{{- end }}
+{{- end }}
