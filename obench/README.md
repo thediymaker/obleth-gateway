@@ -153,7 +153,7 @@ real keys. Every completion incurs cost. The `keys.json` cache in
 (it is written 0600 on Unix). Set `BENCH_OUT_DIR` to a path outside the repo if
 the default `/tmp/obleth-bench` is not suitable for your environment.
 
-`--scope all` (`--all`) requires at least 2 models and 2 clients in the config
+`--all` requires at least 2 models and 2 clients in the config
 so that load genuinely spreads across upstreams and distinct tenants.
 `--model <name>` requires that the named model appear in `models[]`.
 
