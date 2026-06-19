@@ -96,6 +96,9 @@ pub struct Tenant {
     /// (tenant-level OR key-level enables a request's spans).
     #[serde(default)]
     pub tracing_enabled: bool,
+    /// Per-tenant guardrails policy. `None` means no guardrails are applied.
+    #[serde(default)]
+    pub guardrails_policy: Option<GuardrailsPolicy>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -212,6 +215,9 @@ pub struct ResolvedKey {
     /// payloads for replay and debugging.
     #[serde(default)]
     pub tracing_enabled: bool,
+    /// Per-tenant content policy, if configured. `None` means no guardrails.
+    #[serde(default)]
+    pub guardrails_policy: Option<GuardrailsPolicy>,
 }
 
 /// Outcome of admission for a single request, recorded in telemetry.
@@ -1010,6 +1016,10 @@ pub struct BoonSettings {
     /// requests and execute the model's tool calls at the gateway.
     #[serde(default)]
     pub tool_loop: ToolLoopSettings,
+    /// The guardrails boon: content policy enforcement via Rust-native scanners
+    /// and an optional registered guard model.
+    #[serde(default)]
+    pub guardrails: GuardrailsBoonSettings,
 }
 
 /// Configuration for the vision boon (image-to-text relay).
@@ -1176,6 +1186,58 @@ impl ToolLoopSettings {
     pub fn active(&self) -> bool {
         self.enabled
     }
+}
+
+fn default_guardrails_timeout_ms() -> u64 {
+    5_000
+}
+
+/// Global tuning for the guardrails boon. There is intentionally no master
+/// `enabled` flag: guardrails are enabled per-tenant by the presence of a
+/// [`GuardrailsPolicy`], so a configured policy always takes effect.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct GuardrailsBoonSettings {
+    /// Timeout for tier-2 guard model calls (ms). Does not apply to tier-1 scanners.
+    #[serde(default = "default_guardrails_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for GuardrailsBoonSettings {
+    fn default() -> Self {
+        Self { timeout_ms: default_guardrails_timeout_ms() }
+    }
+}
+
+/// Per-tenant guardrails policy. Stored as JSONB on `tenants.guardrails_policy`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct GuardrailsPolicy {
+    /// Action taken when any scanner flags content.
+    pub action: GuardrailsAction,
+    /// Scanners to run on the incoming request body.
+    /// Valid values: "prompt_injection", "pii", "ban_keywords", "harm"
+    #[serde(default)]
+    pub input_scanners: Vec<String>,
+    /// Scanners to run on the model's response.
+    /// Valid values: "pii", "ban_keywords", "harm"
+    #[serde(default)]
+    pub output_scanners: Vec<String>,
+    /// Registered model name for the tier-2 `harm` scanner.
+    #[serde(default)]
+    pub guard_model: Option<String>,
+    /// Tenant-specific keyword list for the `ban_keywords` scanner.
+    #[serde(default)]
+    pub ban_keywords: Vec<String>,
+    /// When true, scanner errors pass through unchanged.
+    #[serde(default = "default_true")]
+    pub fail_open: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum GuardrailsAction {
+    Block,
+    Redact,
+    LogOnly,
 }
 
 /// Normalize a list of MCP server names granted to a model: trimmed,
@@ -1467,6 +1529,7 @@ mod tests {
         assert!(!settings.structured_output.enabled);
         assert_eq!(settings.structured_output.max_repair_attempts, 1);
         assert_eq!(settings.structured_output.timeout_ms, 30_000);
+        assert_eq!(settings.guardrails.timeout_ms, 5_000);
     }
 
     #[test]
@@ -1482,5 +1545,57 @@ mod tests {
         assert!(!structured.active());
         structured.enabled = true;
         assert!(structured.active());
+    }
+
+    #[test]
+    fn guardrails_settings_default_timeout() {
+        let s = GuardrailsBoonSettings::default();
+        assert_eq!(s.timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn guardrails_policy_deserializes() {
+        let json = r#"{
+            "action": "redact",
+            "input_scanners": ["pii", "prompt_injection"],
+            "output_scanners": ["pii"],
+            "guard_model": null,
+            "ban_keywords": [],
+            "fail_open": true
+        }"#;
+        let policy: GuardrailsPolicy = serde_json::from_str(json).unwrap();
+        assert!(matches!(policy.action, GuardrailsAction::Redact));
+        assert_eq!(policy.input_scanners, vec!["pii", "prompt_injection"]);
+        assert!(policy.fail_open);
+    }
+
+    #[test]
+    fn guardrails_policy_defaults_fail_open() {
+        let json = r#"{"action":"block","input_scanners":["harm"],"output_scanners":[]}"#;
+        let policy: GuardrailsPolicy = serde_json::from_str(json).unwrap();
+        assert!(policy.fail_open);
+    }
+
+    #[test]
+    fn boon_settings_includes_guardrails() {
+        // A legacy `enabled` field is ignored; timeout still parses.
+        let json = r#"{"guardrails":{"enabled":true,"timeout_ms":2000}}"#;
+        let settings: BoonSettings = serde_json::from_str(json).unwrap();
+        assert_eq!(settings.guardrails.timeout_ms, 2_000);
+    }
+
+    #[test]
+    fn resolved_key_carries_guardrails_policy() {
+        let policy = GuardrailsPolicy {
+            action: GuardrailsAction::Block,
+            input_scanners: vec!["prompt_injection".into()],
+            output_scanners: vec![],
+            guard_model: None,
+            ban_keywords: vec![],
+            fail_open: true,
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: GuardrailsPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(policy, back);
     }
 }

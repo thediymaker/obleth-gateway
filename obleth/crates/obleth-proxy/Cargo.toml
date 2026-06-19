@@ -44,3 +44,4 @@ obleth-fairshare.workspace = true
 obleth-telemetry.workspace = true
 obleth-tokenizer.workspace = true
 obleth-admin.workspace = true
+regex.workspace = true

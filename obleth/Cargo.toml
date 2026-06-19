@@ -74,6 +74,7 @@ arc-swap = "1"
 # disabled so remote `$ref` resolution stays off (client schemas are untrusted).
 jsonschema = { version = "0.30", default-features = false }
 lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
+regex = "1"
 
 # internal
 obleth-config = { path = "crates/obleth-config" }

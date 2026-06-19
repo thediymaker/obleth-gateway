@@ -31,6 +31,7 @@ pub mod tool_stream;
 pub mod structured;
 pub mod tool_loop;
 mod vision;
+pub(crate) mod guardrails;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -68,6 +69,9 @@ pub struct EnrichOutcome {
     /// When set, the proxy must buffer the upstream response and run it through
     /// [`respond::transform_completion`] before replying to the client.
     pub response_plan: Option<ResponsePlan>,
+    /// Set by the guardrails boon when a scanner rejects the request. The proxy
+    /// must return `block.status` immediately when this is Some.
+    pub blocked: Option<guardrails::GuardrailsBlock>,
 }
 
 /// Response-side work armed by request enrichment. Captures everything the
@@ -83,6 +87,15 @@ pub struct ResponsePlan {
     pub client_stream: bool,
     /// The client asked for `stream_options.include_usage`.
     pub include_usage: bool,
+    /// Output-side guardrails plan (block/redact actions only; log_only is
+    /// handled async in proxy.rs after the stream drains).
+    pub guardrails: Option<GuardrailsOutputPlan>,
+}
+
+/// Output-side guardrails: run scanners on the buffered completion.
+pub struct GuardrailsOutputPlan {
+    pub policy: obleth_config::GuardrailsPolicy,
+    pub settings: obleth_config::GuardrailsBoonSettings,
 }
 
 /// Structured-output-boon response work: validate (and repair) the completion
@@ -264,12 +277,63 @@ impl BoonEngine {
             }
         });
 
+        // ---- guardrails boon (input scanning) ----
+        // Guardrails are enabled per-tenant by the presence of a policy; there
+        // is no global master switch. Internal probe keys are always exempt.
+        if !key.internal {
+            if let Some(policy) = &key.guardrails_policy {
+                let guard_outcome = guardrails::apply_input(
+                    state,
+                    &settings.guardrails,
+                    policy,
+                    key,
+                    session_id,
+                    json,
+                    tracer,
+                )
+                .await;
+                if let Some(reason) = guard_outcome.blocked {
+                    outcome.blocked = Some(reason);
+                    return outcome;
+                }
+                if guard_outcome.sanitized {
+                    outcome.rewritten = true;
+                    outcome.applied.push("guardrails_input");
+                }
+                // Arm output plan for block/redact actions.
+                // log_only output scanning is handled async in proxy.rs after the stream drains.
+                if !policy.output_scanners.is_empty()
+                    && !matches!(policy.action, obleth_config::GuardrailsAction::LogOnly)
+                {
+                    let plan = outcome.response_plan.get_or_insert_with(|| ResponsePlan {
+                        structured: None,
+                        tool_loop: None,
+                        client_stream: json
+                            .get("stream")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        include_usage: json
+                            .pointer("/stream_options/include_usage")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        guardrails: None,
+                    });
+                    plan.guardrails = Some(GuardrailsOutputPlan {
+                        policy: policy.clone(),
+                        settings: settings.guardrails.clone(),
+                    });
+                }
+            }
+        }
+
         if structured_plan.is_some() || tool_loop_plan.is_some() {
+            let existing_guardrails = outcome.response_plan.as_mut().and_then(|p| p.guardrails.take());
             outcome.response_plan = Some(ResponsePlan {
                 structured: structured_plan,
                 tool_loop: tool_loop_plan,
                 client_stream,
                 include_usage,
+                guardrails: existing_guardrails,
             });
         }
         outcome

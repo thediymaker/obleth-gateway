@@ -21,6 +21,17 @@ export interface WeeklyWindow {
   end_min: number;
 }
 
+export type GuardrailsAction = "block" | "redact" | "log_only";
+
+export interface GuardrailsPolicy {
+  action: GuardrailsAction;
+  input_scanners: string[];
+  output_scanners: string[];
+  guard_model: string | null;
+  ban_keywords: string[];
+  fail_open: boolean;
+}
+
 export interface Tenant {
   id: string;
   name: string;
@@ -41,6 +52,7 @@ export interface Tenant {
   budget_period: string | null;
   budget_started_at: string | null;
   allowed_models: string[] | null;
+  guardrails_policy: GuardrailsPolicy | null;
   tracing_enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -870,6 +882,11 @@ export const obleth = {
     api<Tenant>(`/tenants/${id}/allowlist`, {
       method: "PATCH",
       body: JSON.stringify({ allowed_models }),
+    }),
+  setTenantGuardrails: (id: string, policy: GuardrailsPolicy | null) =>
+    api<Tenant>(`/tenants/${id}/guardrails`, {
+      method: "PATCH",
+      body: JSON.stringify({ policy }),
     }),
   deleteTenant: (id: string) =>
     api<void>(`/tenants/${id}`, { method: "DELETE" }),
