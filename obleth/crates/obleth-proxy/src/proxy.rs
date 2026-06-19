@@ -302,6 +302,10 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             tracer.as_mut(),
         )
         .await;
+    if let Some(block) = boon_outcome.blocked {
+        if let Some(t) = tracer.take() { t.finish("error"); }
+        return error_json(block.status, block.reason);
+    }
     if boon_outcome.rewritten {
         match serde_json::to_vec(&json) {
             Ok(bytes) => body_bytes = Bytes::from(bytes),
@@ -323,7 +327,20 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     // keeps forcing the upstream non-streaming.
     let stream_tap = response_plan
         .as_ref()
-        .is_some_and(|p| p.tool_loop.is_some() && p.structured.is_none() && p.client_stream)
+        .is_some_and(|p| {
+            p.tool_loop.is_some()
+                && p.structured.is_none()
+                && p.client_stream
+                && p.guardrails
+                    .as_ref()
+                    .map(|g| {
+                        matches!(
+                            g.policy.action,
+                            obleth_config::GuardrailsAction::LogOnly
+                        )
+                    })
+                    .unwrap_or(true)
+        })
         && route.is_some();
 
     let effective_weight = effective_admission_weight(resolved.weight, route.as_deref());
@@ -344,8 +361,17 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let tool_loop_armed = response_plan
         .as_ref()
         .is_some_and(|p| p.tool_loop.is_some());
-    let cache_enabled =
-        route.as_ref().map(|r| r.cache_enabled).unwrap_or(false) && !tool_loop_armed;
+    // The response cache is keyed on (model, body) and shared across tenants. A
+    // tenant with an output guardrails policy (block/redact) must never serve —
+    // or populate — a shared cache entry, or it would bypass its own scanning by
+    // replaying another tenant's un-scanned response. Disable the cache for the
+    // request whenever output guardrails are armed.
+    let output_guardrails_armed = response_plan
+        .as_ref()
+        .is_some_and(|p| p.guardrails.is_some());
+    let cache_enabled = route.as_ref().map(|r| r.cache_enabled).unwrap_or(false)
+        && !tool_loop_armed
+        && !output_guardrails_armed;
     let cache_ttl = route.as_ref().map(|r| r.cache_ttl_secs).unwrap_or(0);
     let cache_key = cache_enabled.then(|| obleth_config::cache_key(&model, &body_bytes));
     if let Some(ck) = &cache_key {
@@ -1097,6 +1123,29 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 )
                 .await;
                 warning = outcome.warning;
+                // guardrails output scan (block/redact action)
+                if let Some(guard_plan) = &plan.guardrails {
+                    match crate::boons::guardrails::apply_output(
+                        &state,
+                        &guard_plan.settings,
+                        &guard_plan.policy,
+                        &resolved,
+                        &req_meta.session_id,
+                        body_json,
+                        tracer.as_mut(),
+                    )
+                    .await
+                    {
+                        crate::boons::guardrails::ApplyOutputResult::Block(block) => {
+                            drop(permit);
+                            if let Some(t) = tracer.take() {
+                                t.finish("error");
+                            }
+                            return error_json(block.status, block.reason);
+                        }
+                        crate::boons::guardrails::ApplyOutputResult::Pass => {}
+                    }
+                }
                 if plan.client_stream {
                     (
                         Bytes::from(crate::boons::respond::synthesize_sse(
@@ -1195,6 +1244,17 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         t.finish(if status_code < 400 { "ok" } else { "error" });
     }
 
+    // Extract guardrails policy for log_only output scanning (evaluated after stream drains).
+    let scan_policy = resolved
+        .guardrails_policy
+        .as_ref()
+        .filter(|p| {
+            !p.output_scanners.is_empty()
+                && matches!(p.action, obleth_config::GuardrailsAction::LogOnly)
+        })
+        .cloned();
+    let scan_output = scan_policy.is_some();
+
     // ---- stream back, inspecting for actual usage, then reconcile ----
     let stream_state = state.clone();
     let resolved_for_stream = resolved.clone();
@@ -1215,12 +1275,12 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                         first = false;
                     }
                     append_tail(&mut tail, &chunk);
-                    if cacheable {
+                    if cacheable || scan_output {
                         if full.len() + chunk.len() <= CACHE_MAX_BYTES {
                             full.extend_from_slice(&chunk);
                         } else {
-                            // Too large to cache; stop buffering and free memory.
                             cacheable = false;
+                            // Response exceeded cache cap; clear so the log_only scan is skipped.
                             full = Vec::new();
                         }
                     }
@@ -1252,6 +1312,13 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         let (input_tokens, output_tokens) = extract_usage(&String::from_utf8_lossy(&tail))
             .unwrap_or((est.input_tokens, est.estimated_output_tokens));
         let total_ms = request_start.elapsed().as_millis() as u32;
+
+        // Capture for log_only scan before cache_put potentially consumes full.
+        let scan_full: Vec<u8> = if scan_output && !full.is_empty() && status_code == 200 {
+            full.clone()
+        } else {
+            Vec::new()
+        };
 
         // store the full response for identical future requests
         let cache_put = if cacheable && status_code == 200 {
@@ -1291,6 +1358,29 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
             cache_put,
         )
         .await;
+
+        // log_only guardrails output scan — fire-and-forget after stream drains.
+        // tier-1 detection runs inline (microseconds); the harm scan, if armed,
+        // is dispatched async by `monitor_output`.
+        if let Some(policy_clone) = scan_policy {
+            if !scan_full.is_empty() {
+                if let Ok(completion) =
+                    serde_json::from_slice::<serde_json::Value>(&scan_full)
+                {
+                    let guardrails_settings =
+                        stream_state.boons.settings().guardrails.clone();
+                    crate::boons::guardrails::monitor_output(
+                        &stream_state,
+                        &guardrails_settings,
+                        &policy_clone,
+                        &resolved_for_stream,
+                        &meta_for_stream.session_id,
+                        request_id,
+                        &completion,
+                    );
+                }
+            }
+        }
     };
 
     let mut builder = Response::builder().status(status_code);
@@ -2376,6 +2466,7 @@ mod tests {
             allowed_models: None,
             internal: false,
             tracing_enabled: false,
+            guardrails_policy: None,
         }
     }
 

@@ -10,6 +10,7 @@ import type {
   AutotuneReport,
   AutotuneWorkload,
   ConfigBackup,
+  GuardrailsPolicy,
   ModelRoute,
   RestoreReport,
   UpdateAlertSettings,
@@ -402,6 +403,23 @@ export async function setTenantAllowlistAction(
   if (!id) return { ok: false, error: "Missing tenant id" };
   try {
     await obleth.setTenantAllowlist(id, allowed_models);
+  } catch (e) {
+    return actionError(e);
+  }
+  updateTag(CACHE_TAGS.tenants);
+  revalidatePath("/tenants");
+  revalidatePath("/");
+  return { ok: true };
+}
+
+export async function setTenantGuardrailsAction(
+  id: string,
+  policy: GuardrailsPolicy | null,
+): Promise<ActionResult> {
+  await requireSession();
+  if (!id) return { ok: false, error: "Missing tenant id" };
+  try {
+    await obleth.setTenantGuardrails(id, policy);
   } catch (e) {
     return actionError(e);
   }

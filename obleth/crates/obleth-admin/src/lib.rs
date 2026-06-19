@@ -93,6 +93,10 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/tenants/:id/allowlist",
             patch(patch_tenant_allowlist),
         )
+        .route(
+            "/api/v1/tenants/:id/guardrails",
+            patch(patch_tenant_guardrails),
+        )
         .route("/api/v1/tenants/:id/weight", patch(patch_weight))
         .route("/api/v1/tenants/:id/quota", put(put_quota))
         .route("/api/v1/tenants/:id/keys", post(create_key))
@@ -325,6 +329,12 @@ pub struct SetTenantAllowlist {
     /// Permitted model names. An empty list clears the allowlist (all permitted).
     #[serde(default)]
     pub allowed_models: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetTenantGuardrails {
+    /// `null` clears the guardrails policy (no scanning for this tenant).
+    pub policy: Option<obleth_config::GuardrailsPolicy>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1064,6 +1074,32 @@ async fn patch_tenant_allowlist(
     Ok(Json(tenant))
 }
 
+#[utoipa::path(
+    patch, path = "/api/v1/tenants/{id}/guardrails", tag = "tenants",
+    request_body = SetTenantGuardrails,
+    responses((status = 200, body = Tenant))
+)]
+async fn patch_tenant_guardrails(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SetTenantGuardrails>,
+) -> Result<Json<Tenant>> {
+    let tenant = state.store.update_tenant_guardrails_policy(id, body.policy).await?;
+    // Guardrails gate data-plane behaviour; refresh the cached keys.
+    sync_tenant_keys(&state, id).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "set_tenant_guardrails",
+            "tenant",
+            &id.to_string(),
+            serde_json::json!({ "guardrails_policy": tenant.guardrails_policy }),
+        )
+        .await?;
+    Ok(Json(tenant))
+}
+
 // ---- alert settings ----
 
 /// Read-only view of the saved alert settings. Secrets (webhook URL, SMTP
@@ -1496,6 +1532,7 @@ async fn put_boon_settings(
                 None => existing.tool_loop.nudge.clone(),
             },
         },
+        guardrails: existing.guardrails.clone(),
     };
 
     state.store.put_boon_settings(&settings).await?;

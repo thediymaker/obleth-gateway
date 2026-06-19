@@ -11,17 +11,24 @@ import {
   CalendarClock,
   Check,
   ChevronDown,
+  Eye,
   Info,
   Plus,
   RefreshCw,
   Save,
+  Shield,
+  ShieldAlert,
+  ShieldCheck,
+  SlidersHorizontal,
   Trash2,
   X,
 } from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import {
   deleteTenantAction,
   setTenantAllowlistAction,
   setTenantBudgetAction,
+  setTenantGuardrailsAction,
   setTenantScheduleAction,
   setTenantStatusAction,
   toggleTenantTracingAction,
@@ -40,11 +47,17 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import type { Tenant, WeeklyWindow } from "@/lib/obleth";
+import type { GuardrailsPolicy, Tenant, WeeklyWindow } from "@/lib/obleth";
 import { cn, formatNumber } from "@/lib/utils";
 
 const SaveFlashContext = createContext<() => void>(() => {});
@@ -411,6 +424,7 @@ function TenantDetailPanel({
           <TabsTrigger value="schedule">Access</TabsTrigger>
           <TabsTrigger value="budget">Budgets</TabsTrigger>
           <TabsTrigger value="models">Models</TabsTrigger>
+          <TabsTrigger value="guardrails">Guardrails</TabsTrigger>
           <TabsTrigger value="lifecycle">Lifecycle</TabsTrigger>
         </TabsList>
         <p className="text-[11px] tabular-nums text-muted-foreground">
@@ -530,6 +544,10 @@ function TenantDetailPanel({
 
       <TabsContent value="models">
         <AllowlistEditor tenant={tenant} models={models} />
+      </TabsContent>
+
+      <TabsContent value="guardrails">
+        <GuardrailsEditor tenant={tenant} models={models} />
       </TabsContent>
 
       <TabsContent value="lifecycle">
@@ -962,6 +980,548 @@ function AllowlistEditor({ tenant, models }: { tenant: Tenant; models: string[] 
             Clear ({selected.length})
           </Button>
         )}
+      </div>
+    </PanelCard>
+  );
+}
+
+type GuardrailsAction = GuardrailsPolicy["action"];
+
+const GUARDRAIL_ACTIONS: { id: GuardrailsAction; label: string; hint: string }[] = [
+  { id: "block", label: "Block", hint: "Reject flagged requests and responses with an error." },
+  { id: "redact", label: "Redact", hint: "Replace matched personal info / keywords in place and continue." },
+  { id: "log_only", label: "Log only", hint: "Record an alert but never block or modify traffic." },
+];
+
+const SCANNER_META: Record<string, { label: string; hint: string }> = {
+  pii: { label: "Personal info (PII)", hint: "Detects SSNs, emails, phone numbers, and card numbers." },
+  prompt_injection: {
+    label: "Prompt injection",
+    hint: "Detects jailbreak / instruction-override attempts. Always blocks regardless of action.",
+  },
+  ban_keywords: {
+    label: "Banned keywords",
+    hint: "Matches the keyword list below (case-insensitive, whole-word).",
+  },
+  harm: {
+    label: "Harmful content (AI)",
+    hint: "Classifies content with a registered guard model. Requires a guard model below.",
+  },
+};
+
+const INPUT_SCANNERS = ["pii", "prompt_injection", "ban_keywords", "harm"] as const;
+const OUTPUT_SCANNERS = ["pii", "ban_keywords", "harm"] as const;
+
+type GuardrailsPreset = {
+  id: string;
+  label: string;
+  tag: string;
+  blurb: string;
+  icon: LucideIcon;
+  policy: GuardrailsPolicy;
+};
+
+const GUARDRAIL_PRESETS: GuardrailsPreset[] = [
+  {
+    id: "ferpa_pii",
+    label: "FERPA / PII redaction",
+    tag: "Redact PII both ways",
+    blurb:
+      "Redacts personal info (SSN, email, phone, card numbers) in requests and responses. Passes through on scanner error.",
+    icon: ShieldCheck,
+    policy: {
+      action: "redact",
+      input_scanners: ["pii"],
+      output_scanners: ["pii"],
+      guard_model: null,
+      ban_keywords: [],
+      fail_open: true,
+    },
+  },
+  {
+    id: "injection_defense",
+    label: "Prompt-injection defense",
+    tag: "Block injection attempts",
+    blurb: "Blocks requests containing prompt-injection patterns before they reach the model or tool loop.",
+    icon: ShieldAlert,
+    policy: {
+      action: "block",
+      input_scanners: ["prompt_injection"],
+      output_scanners: [],
+      guard_model: null,
+      ban_keywords: [],
+      fail_open: true,
+    },
+  },
+  {
+    id: "monitor_only",
+    label: "Monitor only",
+    tag: "Log, never block",
+    blurb: "Logs an alert when personal info appears, but never blocks or modifies traffic.",
+    icon: Eye,
+    policy: {
+      action: "log_only",
+      input_scanners: ["pii"],
+      output_scanners: ["pii"],
+      guard_model: null,
+      ban_keywords: [],
+      fail_open: true,
+    },
+  },
+];
+
+const CUSTOM_PRESET = {
+  id: "custom",
+  label: "Custom",
+  tag: "Hand-pick everything",
+  blurb: "Hand-pick the action, scanners, and keywords below.",
+  icon: SlidersHorizontal,
+};
+
+/** Order-insensitive string-set equality. */
+function sameSet(a: string[], b: string[]): boolean {
+  if (a.length !== b.length) return false;
+  const sb = new Set(b);
+  return a.every((x) => sb.has(x));
+}
+
+function policiesEqual(a: GuardrailsPolicy, b: GuardrailsPolicy): boolean {
+  return (
+    a.action === b.action &&
+    sameSet(a.input_scanners, b.input_scanners) &&
+    sameSet(a.output_scanners, b.output_scanners) &&
+    (a.guard_model || null) === (b.guard_model || null) &&
+    sameSet(a.ban_keywords, b.ban_keywords) &&
+    a.fail_open === b.fail_open
+  );
+}
+
+/** Small iOS-style on/off switch. */
+function ToggleSwitch({
+  checked,
+  onChange,
+  disabled,
+}: {
+  checked: boolean;
+  onChange: () => void;
+  disabled?: boolean;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      disabled={disabled}
+      onClick={onChange}
+      className={cn(
+        "inline-flex h-6 w-11 shrink-0 items-center rounded-full border transition-colors",
+        checked ? "border-primary/60 bg-primary/40" : "border-input bg-muted",
+        disabled && "cursor-not-allowed opacity-50",
+      )}
+    >
+      <span
+        className={cn(
+          "ml-0.5 h-5 w-5 rounded-full bg-foreground shadow transition-transform",
+          checked && "translate-x-5",
+        )}
+      />
+    </button>
+  );
+}
+
+function ScannerToggle({
+  scanner,
+  on,
+  onToggle,
+}: {
+  scanner: string;
+  on: boolean;
+  onToggle: () => void;
+}) {
+  const meta = SCANNER_META[scanner];
+  return (
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-pressed={on}
+      className={cn(
+        "flex w-full items-center gap-2.5 rounded-md border px-2.5 py-2 text-left text-sm transition-colors",
+        on
+          ? "border-primary/40 bg-primary/10 text-foreground"
+          : "border-border/70 bg-background/35 text-muted-foreground hover:bg-accent",
+      )}
+    >
+      <span
+        className={cn(
+          "flex h-4 w-4 shrink-0 items-center justify-center rounded-[4px] border",
+          on ? "border-primary bg-primary text-primary-foreground" : "border-input",
+        )}
+      >
+        {on && <Check className="h-3 w-3" strokeWidth={3} />}
+      </span>
+      <span className="flex-1">{meta.label}</span>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <Info className="h-3.5 w-3.5 shrink-0 text-muted-foreground/70" />
+        </TooltipTrigger>
+        <TooltipContent className="max-w-xs">{meta.hint}</TooltipContent>
+      </Tooltip>
+    </button>
+  );
+}
+
+/** Themed combobox for picking a guard model — replaces the native <select> popup. */
+function GuardModelSelect({
+  id,
+  value,
+  models,
+  invalid,
+  onChange,
+}: {
+  id: string;
+  value: string;
+  models: string[];
+  invalid: boolean;
+  onChange: (value: string) => void;
+}) {
+  const options = ["", ...models];
+  const display = value || "— none —";
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger
+        id={id}
+        className={cn(
+          "flex h-9 w-full items-center justify-between gap-2 rounded-md border bg-background px-3 text-sm transition-colors focus:outline-none focus:ring-1 focus:ring-ring data-[state=open]:ring-1 data-[state=open]:ring-ring",
+          invalid ? "border-destructive" : "border-input",
+        )}
+      >
+        <span className={cn("truncate", !value && "text-muted-foreground")}>{display}</span>
+        <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        align="start"
+        className="max-h-72 w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto"
+      >
+        {options.map((m) => {
+          const selected = m === value;
+          return (
+            <DropdownMenuItem
+              key={m || "__none__"}
+              onSelect={() => onChange(m)}
+              className="cursor-pointer justify-between gap-2"
+            >
+              <span className={cn("truncate", !m && "text-muted-foreground")}>{m || "— none —"}</span>
+              {selected && <Check className="h-3.5 w-3.5 shrink-0 text-primary" strokeWidth={2.5} />}
+            </DropdownMenuItem>
+          );
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+function GuardrailsEditor({ tenant, models }: { tenant: Tenant; models: string[] }) {
+  const flashSaved = useContext(SaveFlashContext);
+  const [pending, start] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  const initial = tenant.guardrails_policy;
+  const [enabled, setEnabled] = useState(initial != null);
+  const [action, setAction] = useState<GuardrailsAction>(initial?.action ?? "redact");
+  const [inputScanners, setInputScanners] = useState<string[]>(initial?.input_scanners ?? ["pii"]);
+  const [outputScanners, setOutputScanners] = useState<string[]>(initial?.output_scanners ?? ["pii"]);
+  const [guardModel, setGuardModel] = useState(initial?.guard_model ?? "");
+  const [banKeywords, setBanKeywords] = useState((initial?.ban_keywords ?? []).join("\n"));
+  const [failOpen, setFailOpen] = useState(initial?.fail_open ?? true);
+
+  const parsedKeywords = banKeywords
+    .split("\n")
+    .map((k) => k.trim())
+    .filter(Boolean);
+
+  const currentPolicy: GuardrailsPolicy = {
+    action,
+    input_scanners: inputScanners,
+    output_scanners: outputScanners,
+    guard_model: guardModel.trim() || null,
+    ban_keywords: parsedKeywords,
+    fail_open: failOpen,
+  };
+
+  const activePreset = GUARDRAIL_PRESETS.find((p) => policiesEqual(p.policy, currentPolicy))?.id ?? "custom";
+  const allProfiles = [...GUARDRAIL_PRESETS, CUSTOM_PRESET];
+  const activeProfile = allProfiles.find((p) => p.id === activePreset) ?? CUSTOM_PRESET;
+
+  // Customize opens automatically when the loaded policy doesn't match a preset.
+  const [customizeOpen, setCustomizeOpen] = useState(initial != null && activePreset === "custom");
+
+  const harmSelected = inputScanners.includes("harm") || outputScanners.includes("harm");
+  const usesKeywords = inputScanners.includes("ban_keywords") || outputScanners.includes("ban_keywords");
+  const missingGuardModel = harmSelected && !guardModel.trim();
+  const noScanners = inputScanners.length === 0 && outputScanners.length === 0;
+
+  function dirty() {
+    setSaved(false);
+  }
+
+  function applyPreset(p: GuardrailsPreset) {
+    setAction(p.policy.action);
+    setInputScanners(p.policy.input_scanners);
+    setOutputScanners(p.policy.output_scanners);
+    setGuardModel(p.policy.guard_model ?? "");
+    setBanKeywords((p.policy.ban_keywords ?? []).join("\n"));
+    setFailOpen(p.policy.fail_open);
+    dirty();
+  }
+
+  function toggleScanner(list: string[], set: (v: string[]) => void, name: string) {
+    dirty();
+    set(list.includes(name) ? list.filter((s) => s !== name) : [...list, name]);
+  }
+
+  function summary(): string {
+    if (!enabled) return "Guardrails are off for this tenant.";
+    if (noScanners) return "No scanners selected — this policy does nothing.";
+    const where =
+      inputScanners.length && outputScanners.length
+        ? "requests and responses"
+        : inputScanners.length
+          ? "requests"
+          : "responses";
+    const verb =
+      action === "block" ? "Blocks flagged" : action === "redact" ? "Redacts matches in" : "Monitors";
+    const failClause = failOpen ? "Passes through on scanner error." : "Returns 503 on scanner error.";
+    return `${verb} ${where}. ${failClause}`;
+  }
+
+  function save() {
+    setError(null);
+    setSaved(false);
+    if (enabled && missingGuardModel) {
+      setError("Select a guard model — the Harmful content scanner needs one.");
+      return;
+    }
+    const policy: GuardrailsPolicy | null = enabled ? currentPolicy : null;
+    start(async () => {
+      const res = await setTenantGuardrailsAction(tenant.id, policy);
+      if (res.ok) {
+        setSaved(true);
+        flashSaved();
+      } else {
+        setError(res.error);
+      }
+    });
+  }
+
+  return (
+    <PanelCard
+      title="Content guardrails"
+      description="Screen requests and responses with in-process scanners. The policy is enforced for every key in this tenant."
+      actions={<SaveButton type="button" pending={pending} disabled={enabled && missingGuardModel} onClick={save} idleLabel="Save guardrails" />}
+    >
+      <div className="space-y-5 p-4">
+        {/* enable strip */}
+        <div
+          className={cn(
+            "flex items-center gap-3 rounded-lg border px-4 py-3 transition-colors",
+            enabled ? "border-primary/40 bg-primary/5" : "border-border/70 bg-background/35",
+          )}
+        >
+          <Shield className={cn("h-5 w-5 shrink-0", enabled ? "text-primary" : "text-muted-foreground")} />
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-medium">{enabled ? "Scanning enabled" : "Scanning off"}</p>
+            <p className="text-xs leading-snug text-muted-foreground">{summary()}</p>
+          </div>
+          <ToggleSwitch checked={enabled} disabled={pending} onChange={() => { setEnabled((v) => !v); dirty(); }} />
+        </div>
+
+        {enabled && (
+          <>
+            {/* profile cards */}
+            <div>
+              <p className="mb-2 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Profile</p>
+              <div className="grid gap-2.5 sm:grid-cols-2">
+                {allProfiles.map((p) => {
+                  const selected = activePreset === p.id;
+                  const Icon = p.icon;
+                  return (
+                    <button
+                      key={p.id}
+                      type="button"
+                      aria-pressed={selected}
+                      onClick={() => (p.id === "custom" ? setCustomizeOpen(true) : applyPreset(p as GuardrailsPreset))}
+                      className={cn(
+                        "flex items-start gap-3 rounded-lg border p-3 text-left transition-colors",
+                        selected
+                          ? "border-primary/50 bg-primary/10"
+                          : "border-border/70 bg-background/35 hover:bg-accent",
+                      )}
+                    >
+                      <Icon className={cn("mt-0.5 h-5 w-5 shrink-0", selected ? "text-primary" : "text-muted-foreground")} />
+                      <span className="min-w-0 flex-1">
+                        <span className="flex items-center gap-2">
+                          <span className="text-sm font-medium leading-tight">{p.label}</span>
+                          {selected && <Check className="h-3.5 w-3.5 shrink-0 text-primary" strokeWidth={2.5} />}
+                        </span>
+                        <span className="mt-0.5 block text-[11px] leading-snug text-muted-foreground">{p.tag}</span>
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+              <p className="mt-2.5 text-xs leading-relaxed text-muted-foreground">{activeProfile.blurb}</p>
+            </div>
+
+            {/* customize */}
+            <div className="overflow-hidden rounded-lg border border-border/70">
+              <button
+                type="button"
+                onClick={() => setCustomizeOpen((v) => !v)}
+                className="flex w-full items-center justify-between bg-background/35 px-3 py-2.5 text-left text-sm font-medium hover:bg-accent"
+              >
+                <span className="flex items-center gap-2">
+                  <SlidersHorizontal className="h-4 w-4 text-muted-foreground" />
+                  Customize
+                  {activePreset === "custom" && (
+                    <Badge className="bg-primary/15 text-[10px] text-primary">Custom</Badge>
+                  )}
+                </span>
+                <ChevronDown className={cn("h-4 w-4 transition-transform", customizeOpen && "rotate-180")} />
+              </button>
+
+              {customizeOpen && (
+                <div className="space-y-5 border-t border-border/70 p-4">
+                  {/* action */}
+                  <div className="space-y-1.5">
+                    <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Action</p>
+                    <div className="inline-flex rounded-md border border-input bg-background/50 p-0.5">
+                      {GUARDRAIL_ACTIONS.map((a) => (
+                        <Tooltip key={a.id}>
+                          <TooltipTrigger asChild>
+                            <button
+                              type="button"
+                              onClick={() => { setAction(a.id); dirty(); }}
+                              className={cn(
+                                "rounded px-3 py-1 text-xs font-medium transition-colors",
+                                action === a.id
+                                  ? "bg-primary text-primary-foreground"
+                                  : "text-muted-foreground hover:text-foreground",
+                              )}
+                            >
+                              {a.label}
+                            </button>
+                          </TooltipTrigger>
+                          <TooltipContent className="max-w-xs">{a.hint}</TooltipContent>
+                        </Tooltip>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* scanners */}
+                  <div className="grid gap-5 sm:grid-cols-2">
+                    <div className="space-y-1.5">
+                      <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Scan requests for</p>
+                      <div className="space-y-1.5">
+                        {INPUT_SCANNERS.map((s) => (
+                          <ScannerToggle
+                            key={s}
+                            scanner={s}
+                            on={inputScanners.includes(s)}
+                            onToggle={() => toggleScanner(inputScanners, setInputScanners, s)}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                    <div className="space-y-1.5">
+                      <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">Scan responses for</p>
+                      <div className="space-y-1.5">
+                        {OUTPUT_SCANNERS.map((s) => (
+                          <ScannerToggle
+                            key={s}
+                            scanner={s}
+                            on={outputScanners.includes(s)}
+                            onToggle={() => toggleScanner(outputScanners, setOutputScanners, s)}
+                          />
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* conditional config: keywords + guard model */}
+                  {(usesKeywords || harmSelected) && (
+                    <div className="grid gap-5 sm:grid-cols-2">
+                      {usesKeywords && (
+                        <div className="space-y-1.5">
+                          <Label htmlFor={`guardrails-keywords-${tenant.id}`} className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                            Banned keywords
+                          </Label>
+                          <textarea
+                            id={`guardrails-keywords-${tenant.id}`}
+                            value={banKeywords}
+                            onChange={(e) => { setBanKeywords(e.target.value); dirty(); }}
+                            rows={4}
+                            placeholder={"confidential\nrestricted\n..."}
+                            className="block w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
+                          />
+                          <p className="text-[11px] leading-snug text-muted-foreground">
+                            One per line. Case-insensitive, whole-word matching.
+                          </p>
+                        </div>
+                      )}
+
+                      {harmSelected && (
+                        <div className="space-y-1.5">
+                          <Label htmlFor={`guardrails-model-${tenant.id}`} className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                            Guard model {missingGuardModel && <span className="normal-case text-destructive">— required</span>}
+                          </Label>
+                          {models.length > 0 ? (
+                            <GuardModelSelect
+                              id={`guardrails-model-${tenant.id}`}
+                              value={guardModel}
+                              models={models}
+                              invalid={missingGuardModel}
+                              onChange={(v) => { setGuardModel(v); dirty(); }}
+                            />
+                          ) : (
+                            <Input
+                              id={`guardrails-model-${tenant.id}`}
+                              value={guardModel}
+                              onChange={(e) => { setGuardModel(e.target.value); dirty(); }}
+                              placeholder="model name"
+                              className={cn(missingGuardModel && "border-destructive")}
+                            />
+                          )}
+                          <p className="text-[11px] leading-snug text-muted-foreground">
+                            Classifies harmful content (e.g. Llama Guard, ShieldGemma).
+                          </p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* fail mode */}
+                  <div className="flex items-center justify-between gap-4 border-t border-border/60 pt-4">
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium">Fail open</p>
+                      <p className="text-[11px] leading-snug text-muted-foreground">
+                        On: a scanner error (guard model down, timeout) lets the request through unchanged.
+                        Off: return 503 on scanner failure.
+                      </p>
+                    </div>
+                    <ToggleSwitch checked={failOpen} disabled={pending} onChange={() => { setFailOpen((v) => !v); dirty(); }} />
+                  </div>
+
+                  <p className="text-[11px] leading-snug text-muted-foreground">
+                    Response scanning buffers the reply (non-streaming) when the action is Block or Redact.
+                  </p>
+                </div>
+              )}
+            </div>
+          </>
+        )}
+
+        <StatusMessage error={error} saved={saved} savedText="Guardrails saved." />
       </div>
     </PanelCard>
   );
