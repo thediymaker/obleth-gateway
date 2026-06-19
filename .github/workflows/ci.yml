@@ -61,6 +61,19 @@ jobs:
       - working-directory: benchmark-backend
         run: cargo build --release
 
+  obench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: obench
+      - working-directory: obench
+        run: cargo test
+      - working-directory: obench
+        run: cargo build --release
+
   control-plane:
     runs-on: ubuntu-latest
     steps:
