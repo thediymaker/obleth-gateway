@@ -32,10 +32,11 @@ fn load_key_cache() -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn save_key_cache(cache: &HashMap<String, String>) {
-    if let Ok(s) = serde_json::to_string_pretty(cache) {
-        let _ = fs::write(key_cache_path(), s);
-    }
+fn save_key_cache(cache: &HashMap<String, String>) -> Result<()> {
+    let s = serde_json::to_string_pretty(cache).context("serialize key cache")?;
+    fs::write(key_cache_path(), s)
+        .with_context(|| format!("write key cache to {}", key_cache_path().display()))?;
+    Ok(())
 }
 
 /// Resolve the secret for a tenant: a freshly minted secret wins; otherwise the
@@ -47,7 +48,7 @@ fn resolve_key(cache: &mut HashMap<String, String>, tenant: &str, minted: Option
         return Ok(secret);
     }
     cache.get(tenant).cloned().with_context(|| {
-        format!("reused key for {tenant} but no cached secret; delete {} keys to force a fresh mint", tenant)
+        format!("reused key for tenant '{tenant}' has no cached secret in keys.json — delete that tenant's API key in the gateway and re-run to force a fresh mint")
     })
 }
 
@@ -79,7 +80,7 @@ pub async fn seed_fixture(admin: &AdminClient, fixture_api_base: &str, scope: &S
         let key = resolve_key(&mut cache, name, minted)?;
         tenants.push(SeededTenant { name: name.to_string(), group: group.to_string(), traffic_share: *share, key });
     }
-    save_key_cache(&cache);
+    save_key_cache(&cache)?;
     Ok(SeededRun { tenants, models: models.iter().map(|m| m.to_string()).collect() })
 }
 
@@ -109,6 +110,6 @@ pub async fn seed_live(admin: &AdminClient, cfg: &LiveConfig, scope: &Scope) -> 
         let key = resolve_key(&mut cache, &c.name, minted)?;
         tenants.push(SeededTenant { name: c.name.clone(), group: c.group.clone(), traffic_share: c.weight, key });
     }
-    save_key_cache(&cache);
+    save_key_cache(&cache)?;
     Ok(SeededRun { tenants, models: models.iter().map(|m| m.name.clone()).collect() })
 }
