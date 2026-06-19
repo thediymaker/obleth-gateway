@@ -7,8 +7,11 @@ mod report;
 mod seed;
 mod seedplan;
 mod target;
+mod tui;
 
 use clap::Parser;
+
+async fn mod_tui_run(args: &cli::Cli) -> anyhow::Result<()> { tui::run(args).await }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -22,7 +25,6 @@ async fn main() -> anyhow::Result<()> {
         let code = profiles::run_headless(&args, tgt, prof, scope).await?;
         std::process::exit(code);
     } else {
-        println!("obench TUI stub (no args) — TUI added in a later task");
-        Ok(())
+        mod_tui_run(&args).await
     }
 }

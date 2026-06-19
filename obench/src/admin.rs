@@ -157,4 +157,19 @@ impl AdminClient {
         let v = self.req(reqwest::Method::GET, "/fairshare/live", None).await?;
         Ok(serde_json::from_value(v).unwrap_or(FairshareLive { global_in_flight: 0, global_queued: 0 }))
     }
+
+    pub async fn list_model_names(&self) -> anyhow::Result<Vec<String>> {
+        let v = self.req(reqwest::Method::GET, "/models", None).await?;
+        Ok(v.as_array().map(|a| a.iter().filter_map(|m| m["model_name"].as_str().map(String::from)).collect()).unwrap_or_default())
+    }
+
+    pub async fn list_tenant_names(&self) -> anyhow::Result<Vec<String>> {
+        let v = self.req(reqwest::Method::GET, "/tenants", None).await?;
+        Ok(v.as_array().map(|a| a.iter().filter_map(|t| t["name"].as_str().map(String::from)).collect()).unwrap_or_default())
+    }
+
+    pub async fn get_capacity(&self) -> anyhow::Result<u32> {
+        let v = self.req(reqwest::Method::GET, "/capacity", None).await?;
+        Ok(v["max_in_flight"].as_u64().unwrap_or(0) as u32)
+    }
 }
