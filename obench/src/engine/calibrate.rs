@@ -30,7 +30,7 @@ pub enum Decision {
 }
 
 pub fn evaluate(history: &[StepResult], latest: &StepResult, cfg: &KneeConfig) -> Decision {
-    let prev_clean = history.last().map(|s| s.conc).unwrap_or(latest.conc);
+    let prev_clean = history.last().map(|s| s.conc).unwrap_or(0);
 
     if latest.error_rate > cfg.error_ceiling {
         return Decision::Stop {
@@ -92,5 +92,14 @@ mod tests {
     fn first_step_always_continues() {
         let latest = step(64, 1000.0, 0.0, 40);
         assert_eq!(evaluate(&[], &latest, &KneeConfig::default()), Decision::Continue);
+    }
+
+    #[test]
+    fn first_step_errors_reports_zero_as_no_clean_level() {
+        let latest = step(64, 100.0, 0.05, 40); // first step already over the 1% ceiling
+        match evaluate(&[], &latest, &KneeConfig::default()) {
+            Decision::Stop { last_clean_conc, .. } => assert_eq!(last_clean_conc, 0),
+            _ => panic!("expected stop at first-step error"),
+        }
     }
 }
