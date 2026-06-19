@@ -2,6 +2,7 @@ mod admin;
 mod cli;
 mod config;
 mod engine;
+mod report;
 mod seedplan;
 mod target;
 
