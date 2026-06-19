@@ -1,3 +1,4 @@
+pub mod auto;
 pub mod plan;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +44,11 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
     }
     if seeded.tenants.is_empty() {
         anyhow::bail!("no tenants were seeded — check the target/config");
+    }
+
+    if profile == Profile::Auto {
+        let _ = admin.set_capacity(plan.capacity).await?;
+        return auto::run(cli, tgt, scope, &seeded, &cli.proxy_base).await;
     }
 
     let cap = admin.set_capacity(plan.capacity).await?;
