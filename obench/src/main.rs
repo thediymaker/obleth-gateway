@@ -1,4 +1,5 @@
 mod cli;
+mod target;
 
 use clap::Parser;
 
