@@ -1,6 +1,9 @@
 #[derive(Clone, Debug, PartialEq)]
 pub struct KeyPlan {
-    /// Existing key id to reuse, if any.
+    /// Existing key id to reuse, if any. Produced by `plan_key`; the runtime
+    /// call site (`admin.rs`) only consults `prune` and `mint` — the gateway API
+    /// does not expose the secret for a reused key. Field kept for test assertions.
+    #[allow(dead_code)]
     pub reuse: Option<String>,
     /// Extra same-named keys for this tenant to delete (avoid sprawl).
     pub prune: Vec<String>,

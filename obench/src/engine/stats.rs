@@ -50,6 +50,22 @@ pub struct Summary {
     pub verdict: Verdict,
 }
 
+/// Decide whether a sequence of per-tick completed-request counts constitutes a
+/// stall. Returns `true` when the gateway should be flagged stalled.
+///
+/// Rules (pure, no I/O — extracted so the unit test can drive it directly):
+/// - `conc > 0` — there must be active workers or the check is vacuous.
+/// - `stopped == false` — the stop flag is not set (run is still live).
+/// - `consecutive_zeros >= threshold` — at least `threshold` consecutive sample
+///   windows have observed zero new completions.
+///
+/// Threshold is 2: one zero tick might be a legitimately slow request whose
+/// response hasn't landed yet; two consecutive zeros (each the sampler interval,
+/// default ~10 s) means 20 s of silence with live workers — that is a stall.
+pub fn is_stall(consecutive_zeros: u32, threshold: u32, conc: u32, stopped: bool) -> bool {
+    !stopped && conc > 0 && consecutive_zeros >= threshold
+}
+
 /// Nearest-rank percentile over an unsorted slice. Matches the .mjs harness.
 pub fn percentile(values: &[u64], p: f64) -> u64 {
     if values.is_empty() {
@@ -183,5 +199,61 @@ mod tests {
         let sum = s.summarize(1.0, 0.0);
         assert_eq!(sum.errors, 0);
         assert_eq!(sum.rejected, 1);
+    }
+
+    // ── stall watchdog decision logic ─────────────────────────────────────────
+
+    #[test]
+    fn stall_watchdog_not_triggered_below_threshold() {
+        // 1 consecutive zero: below threshold of 2 → not a stall.
+        assert!(!is_stall(1, 2, 8, false));
+    }
+
+    #[test]
+    fn stall_watchdog_triggers_at_threshold() {
+        // 2 consecutive zeros with conc > 0 and not stopped → stall.
+        assert!(is_stall(2, 2, 8, false));
+    }
+
+    #[test]
+    fn stall_watchdog_suppressed_when_stopped() {
+        // Even 3 zeros: if the stop flag is set the run is winding down — not a stall.
+        assert!(!is_stall(3, 2, 8, true));
+    }
+
+    #[test]
+    fn stall_watchdog_suppressed_when_no_workers() {
+        // Zero concurrency means no load is expected — do not flag.
+        assert!(!is_stall(5, 2, 0, false));
+    }
+
+    #[test]
+    fn stall_watchdog_progress_resets_trigger() {
+        // Simulate: [0, 0, progress, 0] → consecutive_zeros resets to 1 after
+        // progress; threshold=2 means the fourth tick alone is NOT a stall.
+        let counts: Vec<u64> = vec![0, 0, 5, 0];
+        let threshold = 2u32;
+        let mut consecutive_zeros = 0u32;
+        let mut last = 0u64;
+        let mut stalled = false;
+        for &c in &counts {
+            if c > last {
+                consecutive_zeros = 0;
+            } else {
+                consecutive_zeros += 1;
+            }
+            last = c;
+            if is_stall(consecutive_zeros, threshold, 4, false) {
+                stalled = true;
+            }
+        }
+        // First two zeros fire the stall (consecutive_zeros reaches 2 at tick 2).
+        // This test confirms the reset happens when progress arrives (tick 3).
+        // After the reset, tick 4 gives consecutive_zeros=1, which is below threshold.
+        // But the stall was already set at tick 2 — behaviour matches the spec: once
+        // set it stays set. The important thing is consecutive_zeros dropped to 1
+        // after progress, not 2 again.
+        assert!(stalled, "stall should have been flagged at tick 2");
+        assert_eq!(consecutive_zeros, 1, "progress reset the counter");
     }
 }

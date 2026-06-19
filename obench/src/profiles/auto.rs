@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use crate::cli::{Cli, Scope, Target};
 use crate::engine::calibrate::{evaluate, Decision, KneeConfig, StepResult};
-use crate::engine::load::{ChatRequest, LoadClient, RunConfig};
+use crate::engine::load::{ChatRequest, LoadClient, ProxyRequest, RunConfig};
 use crate::engine::stats::Stats;
 use crate::report;
 use crate::seed::SeededRun;
@@ -30,7 +30,7 @@ pub async fn run(cli: &Cli, tgt: Target, scope: Scope, seeded: &SeededRun, proxy
         let proxy = proxy_base.to_string();
         let input_tokens = cli.input_tokens;
         let make_req = move || {
-            ChatRequest { proxy_base: proxy.clone(), key: tenant_key.clone(), model: model.clone(), input_tokens, output_tokens: 4, stream: false }
+            ProxyRequest::Chat(ChatRequest { proxy_base: proxy.clone(), key: tenant_key.clone(), model: model.clone(), input_tokens, output_tokens: 4, stream: false })
         };
 
         let started = std::time::Instant::now();

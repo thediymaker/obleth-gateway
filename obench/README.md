@@ -165,7 +165,7 @@ per run:
 | File | Written by | Contents |
 |------|-----------|---------|
 | `<profile>-meta.json` | every profile | target, profile, scope, completions, req/s, error rate, p50/p99 TTFB, token counts, verdict |
-| `<profile>-timeline.jsonl` | every profile | per-10-second rows: `in_flight`, `queued` |
+| `<profile>-timeline.jsonl` | headless fixed-load runs | per-10-second rows: `in_flight`, `queued` |
 | `auto-meta.json` | `auto` profile | above + `sustainable_conc`, step history, `replay` block |
 | `keys.json` | seeding | tenant name → gateway API secret cache (written 0600) |
 

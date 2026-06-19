@@ -4,6 +4,9 @@ pub struct StepResult {
     pub req_per_s: f64,
     pub error_rate: f64,
     pub p99_ttfb_ms: u64,
+    /// Reserved for a future queued-depth signal; currently always 0 and not
+    /// read by `evaluate`. Keep the field to avoid a breaking struct-literal
+    /// change when the fairshare sampler is wired in.
     pub max_queued: u64,
 }
 

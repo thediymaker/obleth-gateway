@@ -11,8 +11,8 @@ use rand::Rng;
 use crate::admin::AdminClient;
 use crate::cli::{Cli, Profile, Scope, Target};
 use crate::engine::fleet::{self, TrafficKind};
-use crate::engine::load::{ChatRequest, LoadClient, RunConfig};
-use crate::engine::stats::{Stats, Verdict};
+use crate::engine::load::{ChatRequest, EmbedRequest, LoadClient, ProxyRequest, RunConfig};
+use crate::engine::stats::{is_stall, Stats, Verdict};
 use crate::seed::{self, SeededRun};
 use crate::{report, target};
 
@@ -30,7 +30,7 @@ pub struct RunHandles {
 // ── shared seed → guard → capacity → make_req helper ──────────────────────────
 
 struct SeededSetup {
-    make_req: Box<dyn Fn() -> ChatRequest + Send + Sync + 'static>,
+    make_req: Box<dyn Fn() -> ProxyRequest + Send + Sync + 'static>,
     plan: plan::ProfilePlan,
     profile_name: String,
 }
@@ -84,7 +84,7 @@ async fn build_setup(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -> 
 
     let make_req = {
         let seeded_arc = seeded_arc.clone();
-        move || -> ChatRequest {
+        move || -> ProxyRequest {
             let mut rng = rand::thread_rng();
             // Pick a tenant by traffic share.
             let tweights: Vec<u32> = seeded_arc
@@ -95,34 +95,50 @@ async fn build_setup(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -> 
             let ti = fleet::weighted_index(&tweights, rng.gen::<f64>());
             let tenant = &seeded_arc.tenants[ti];
             // Pick a model + shape. Fixture uses the traffic catalog; live uses the seeded models.
-            let (model, out_tokens, stream) =
-                if seeded_arc.models.iter().all(|m| m.starts_with("obench-")) {
-                    let cands: Vec<&fleet::TrafficType> = fleet::FIXTURE_TRAFFIC
-                        .iter()
-                        .filter(|t| seeded_arc.models.iter().any(|m| m == t.model))
-                        .collect();
-                    if cands.is_empty() {
-                        (seeded_arc.models[0].clone(), plan_out, plan_stream)
-                    } else {
-                        let w: Vec<u32> = cands.iter().map(|t| t.weight).collect();
-                        let tt = cands[fleet::weighted_index(&w, rng.gen::<f64>())];
-                        (
-                            tt.model.to_string(),
-                            if tt.output_tokens > 0 { tt.output_tokens } else { plan_out },
-                            tt.kind == TrafficKind::ChatStream,
-                        )
-                    }
-                } else {
-                    let mi = rng.gen_range(0..seeded_arc.models.len());
-                    (seeded_arc.models[mi].clone(), plan_out, plan_stream)
-                };
-            ChatRequest {
-                proxy_base: proxy_base.clone(),
-                key: tenant.key.clone(),
-                model,
-                input_tokens,
-                output_tokens: out_tokens,
-                stream,
+            if seeded_arc.models.iter().all(|m| m.starts_with("obench-")) {
+                let cands: Vec<&fleet::TrafficType> = fleet::FIXTURE_TRAFFIC
+                    .iter()
+                    .filter(|t| seeded_arc.models.iter().any(|m| m == t.model))
+                    .collect();
+                if cands.is_empty() {
+                    return ProxyRequest::Chat(ChatRequest {
+                        proxy_base: proxy_base.clone(),
+                        key: tenant.key.clone(),
+                        model: seeded_arc.models[0].clone(),
+                        input_tokens,
+                        output_tokens: plan_out,
+                        stream: plan_stream,
+                    });
+                }
+                let w: Vec<u32> = cands.iter().map(|t| t.weight).collect();
+                let tt = cands[fleet::weighted_index(&w, rng.gen::<f64>())];
+                // Route Embed traffic to the real embeddings endpoint.
+                if tt.kind == TrafficKind::Embed {
+                    return ProxyRequest::Embed(EmbedRequest {
+                        proxy_base: proxy_base.clone(),
+                        key: tenant.key.clone(),
+                        model: tt.model.to_string(),
+                        input_tokens,
+                    });
+                }
+                ProxyRequest::Chat(ChatRequest {
+                    proxy_base: proxy_base.clone(),
+                    key: tenant.key.clone(),
+                    model: tt.model.to_string(),
+                    input_tokens,
+                    output_tokens: if tt.output_tokens > 0 { tt.output_tokens } else { plan_out },
+                    stream: tt.kind == TrafficKind::ChatStream,
+                })
+            } else {
+                let mi = rng.gen_range(0..seeded_arc.models.len());
+                ProxyRequest::Chat(ChatRequest {
+                    proxy_base: proxy_base.clone(),
+                    key: tenant.key.clone(),
+                    model: seeded_arc.models[mi].clone(),
+                    input_tokens,
+                    output_tokens: plan_out,
+                    stream: plan_stream,
+                })
             }
         }
     };
@@ -169,15 +185,31 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
         });
     }
 
-    // Sample fairshare into the timeline.
+    // Sample fairshare into the timeline + run the stall watchdog.
+    // Watchdog: after warmup, if ≥2 consecutive 10-second ticks see zero new
+    // completions while concurrency is active and the run is not winding down,
+    // mark the stats as stalled and trigger stop so summarize reports FAIL.
+    // Two ticks = 20 s of silence — enough to rule out a single legitimately
+    // slow request but short enough to catch a real hang quickly.
+    const STALL_THRESHOLD: u32 = 2;
     let sampler = {
         let admin_base = cli.admin_base.clone();
         let admin_token = cli.admin_token.clone();
         let stop = stop.clone();
+        let stats_w = stats.clone();
         let pname = profile_name.clone();
+        let warmup_s = plan.warmup_s;
+        let conc = plan.conc;
         tokio::spawn(async move {
             let a = AdminClient::new(admin_base, admin_token);
+            let mut last_completed: u64 = 0;
+            let mut consecutive_zeros: u32 = 0;
+            let started = std::time::Instant::now();
             while !stop.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+                if stop.load(Ordering::Relaxed) { break; }
+
+                // Fairshare timeline sample.
                 if let Ok(live) = a.fairshare_live().await {
                     let _ = report::append_timeline(
                         &pname,
@@ -186,7 +218,24 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
                         }),
                     );
                 }
-                tokio::time::sleep(Duration::from_secs(10)).await;
+
+                // Stall watchdog — only active after the warmup window.
+                if started.elapsed().as_secs() <= warmup_s {
+                    continue;
+                }
+                let current_completed = stats_w.lock().unwrap().ok;
+                if current_completed > last_completed {
+                    consecutive_zeros = 0;
+                } else {
+                    consecutive_zeros += 1;
+                }
+                last_completed = current_completed;
+
+                if is_stall(consecutive_zeros, STALL_THRESHOLD, conc, stop.load(Ordering::Relaxed)) {
+                    stats_w.lock().unwrap().stalled = true;
+                    stop.store(true, Ordering::Relaxed);
+                    break;
+                }
             }
         })
     };
