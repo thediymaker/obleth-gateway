@@ -38,7 +38,8 @@ Pod anti-affinity for the obleth data plane, driven by .Values.affinity.antiAffi
 so callers can `{{ include "obleth.antiAffinity" . | nindent 6 }}` under a pod spec.
 */}}
 {{- define "obleth.antiAffinity" -}}
-{{- $mode := .Values.affinity.antiAffinity -}}
+{{- $aff := .Values.affinity | default dict -}}
+{{- $mode := $aff.antiAffinity | default "soft" -}}
 {{- if eq $mode "soft" }}
 affinity:
   podAntiAffinity:
