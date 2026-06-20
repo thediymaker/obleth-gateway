@@ -8,7 +8,8 @@ export function OblethLogo({ size = 28, className }: { size?: number; className?
       alt="obleth"
       width={size}
       height={size}
-      className={cn("shrink-0 rounded-sm", className)}
+      //className={cn("shrink-0 dark:invert", className)}
+      className={cn("shrink-0", className)}
       priority
     />
   );
