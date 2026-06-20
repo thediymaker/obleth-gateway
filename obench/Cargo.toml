@@ -19,6 +19,7 @@ ratatui = "0.28"
 crossterm = "0.28"
 rand = "0.8"
 anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
 
 [profile.release]
 opt-level = 3

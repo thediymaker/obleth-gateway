@@ -3,7 +3,6 @@ pub enum TrafficKind { ChatStream, ChatBuffered, Embed }
 
 #[derive(Copy, Clone, Debug)]
 pub struct TrafficType {
-    pub id: &'static str,
     pub model: &'static str,
     pub kind: TrafficKind,
     pub output_tokens: u32,
@@ -28,12 +27,12 @@ pub const FIXTURE_TENANTS: &[(&str, &str, u32, u32)] = &[
 ];
 
 pub const FIXTURE_TRAFFIC: &[TrafficType] = &[
-    TrafficType { id: "chat-fast-stream",  model: "obench-turbo", kind: TrafficKind::ChatStream,   output_tokens: 64,  weight: 25 },
-    TrafficType { id: "chat-base-stream",  model: "obench-base",  kind: TrafficKind::ChatStream,   output_tokens: 128, weight: 20 },
-    TrafficType { id: "chat-base-buffered",model: "obench-base",  kind: TrafficKind::ChatBuffered, output_tokens: 96,  weight: 10 },
-    TrafficType { id: "chat-large-stream", model: "obench-large", kind: TrafficKind::ChatStream,   output_tokens: 256, weight: 10 },
-    TrafficType { id: "chat-code-stream",  model: "obench-code",  kind: TrafficKind::ChatStream,   output_tokens: 200, weight: 10 },
-    TrafficType { id: "embed-batch",       model: "obench-embed", kind: TrafficKind::Embed,        output_tokens: 0,   weight: 25 },
+    TrafficType { model: "obench-turbo", kind: TrafficKind::ChatStream,   output_tokens: 64,  weight: 25 },
+    TrafficType { model: "obench-base",  kind: TrafficKind::ChatStream,   output_tokens: 128, weight: 20 },
+    TrafficType { model: "obench-base",  kind: TrafficKind::ChatBuffered, output_tokens: 96,  weight: 10 },
+    TrafficType { model: "obench-large", kind: TrafficKind::ChatStream,   output_tokens: 256, weight: 10 },
+    TrafficType { model: "obench-code",  kind: TrafficKind::ChatStream,   output_tokens: 200, weight: 10 },
+    TrafficType { model: "obench-embed", kind: TrafficKind::Embed,        output_tokens: 0,   weight: 25 },
 ];
 
 /// Pick an index proportional to weights. `r` in [0,1) is supplied by the

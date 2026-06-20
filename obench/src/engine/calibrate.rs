@@ -7,6 +7,7 @@ pub struct StepResult {
     /// Reserved for a future queued-depth signal; currently always 0 and not
     /// read by `evaluate`. Keep the field to avoid a breaking struct-literal
     /// change when the fairshare sampler is wired in.
+    #[allow(dead_code)]
     pub max_queued: u64,
 }
 

@@ -1,33 +1,37 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::cli::Scope;
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-pub struct LiveModel {
-    pub name: String,
-    pub upstream_model: String,
-    pub api_base: String,
-    pub api_key: String,
+// ── Live = remote obleth, black-box client ──────────────────────────────────
+//
+// `live` points obench at a *remote obleth gateway* (e.g. https://gateway.example.com).
+// obench is a pure client: it never seeds, never uses an admin token, and never
+// tears anything down. The operator supplies the proxy URL, the model names to
+// drive, and one or more real tenant API keys. Multiple keys = multiple tenants,
+// which is what produces fairshare contention on the remote gateway.
+
+/// A real tenant API key for the remote gateway. `weight` shapes how much of the
+/// load this tenant generates (so you can drive uneven fairshare contention).
+/// `secret` may contain `${VAR}` placeholders in headless config files.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct LiveKey {
+    #[serde(default)]
+    pub label: String,
     #[serde(default = "default_weight")]
     pub weight: u32,
-    #[serde(default)]
-    pub input_cost_per_token: f64,
-    #[serde(default)]
-    pub output_cost_per_token: f64,
+    pub secret: String,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-pub struct LiveClient {
-    pub name: String,
-    #[serde(default = "default_weight")]
-    pub weight: u32,
-    pub group: String,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
+/// A headless live run: which remote proxy, which models, and which tenant keys.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct LiveConfig {
-    pub models: Vec<LiveModel>,
-    pub clients: Vec<LiveClient>,
+    /// Base URL of the remote obleth proxy (OpenAI-compatible), e.g.
+    /// `https://gateway.example.com` or `https://gateway.example.com/v1`.
+    pub proxy_url: String,
+    /// Model names to drive (must exist on the remote gateway).
+    pub models: Vec<String>,
+    /// Real tenant API keys minted on the remote gateway.
+    pub keys: Vec<LiveKey>,
 }
 
 fn default_weight() -> u32 { 100 }
@@ -63,23 +67,41 @@ pub fn load_live_config(
     serde_json::from_str(&interpolated).map_err(|e| format!("invalid live config: {e}"))
 }
 
+/// Build a `LiveConfig` from the interactive TUI selection: the remote proxy URL,
+/// the tenant keys the user entered (each with its own weight), and the model
+/// names they picked. Secrets are stored literally here — the user typed the real
+/// keys into the TUI, so there is no `${VAR}` expansion.
+pub fn live_config_from_selection(
+    proxy_url: &str,
+    keys: &[LiveKey],
+    model_names: &[String],
+) -> LiveConfig {
+    LiveConfig {
+        proxy_url: proxy_url.to_string(),
+        models: model_names.to_vec(),
+        keys: keys.to_vec(),
+    }
+}
+
 pub fn validate_live(cfg: &LiveConfig, scope: &Scope) -> Result<(), String> {
+    if cfg.proxy_url.trim().is_empty() {
+        return Err("live config needs a proxy_url".to_string());
+    }
+    if cfg.keys.is_empty() {
+        return Err("live config needs at least one tenant key".to_string());
+    }
+    if cfg.keys.iter().any(|k| k.secret.trim().is_empty()) {
+        return Err("every tenant key needs a non-empty secret".to_string());
+    }
     match scope {
         Scope::All => {
-            if cfg.models.len() < 2 || cfg.clients.len() < 2 {
-                return Err(
-                    "live + scope=all needs >=2 models and >=2 clients so load spreads \
-                     across upstreams and distinct tenants"
-                        .to_string(),
-                );
+            if cfg.models.is_empty() {
+                return Err("live + scope=all needs at least one model to drive".to_string());
             }
         }
         Scope::Single(name) => {
-            if !cfg.models.iter().any(|m| &m.name == name) {
+            if !cfg.models.iter().any(|m| m == name) {
                 return Err(format!("model {name} not found in live config"));
-            }
-            if cfg.clients.is_empty() {
-                return Err("live config needs at least one client".to_string());
             }
         }
     }
@@ -111,30 +133,35 @@ mod tests {
 
     #[test]
     fn loads_config_and_substitutes() {
-        let raw = r#"{ "models": [
-            {"name":"a","upstream_model":"a","api_base":"http://x","api_key":"${K}"}
-          ], "clients": [ {"name":"c","group":"g"} ] }"#;
+        let raw = r#"{ "proxy_url": "https://gateway.example.com",
+            "models": ["gpt-4o", "llama-3"],
+            "keys": [ {"label":"a","secret":"${K}"} ] }"#;
         let m = HashMap::from([("K", "kv")]);
         let cfg = load_live_config(raw, &lookup(&m)).unwrap();
-        assert_eq!(cfg.models[0].api_key, "kv");
-        assert_eq!(cfg.models[0].weight, 100); // default applied
+        assert_eq!(cfg.keys[0].secret, "kv");
+        assert_eq!(cfg.keys[0].weight, 100); // default applied
     }
 
     #[test]
-    fn scope_all_requires_two_of_each() {
-        let cfg = LiveConfig {
-            models: vec![LiveModel {
-                name: "a".into(), upstream_model: "a".into(), api_base: "x".into(),
-                api_key: "k".into(), weight: 100, input_cost_per_token: 0.0, output_cost_per_token: 0.0,
-            }],
-            clients: vec![LiveClient { name: "c".into(), weight: 100, group: "g".into() }],
+    fn scope_all_requires_a_model_and_key() {
+        let empty = LiveConfig { proxy_url: "https://x".into(), models: vec![], keys: vec![] };
+        assert!(validate_live(&empty, &Scope::All).is_err());
+
+        let ok = LiveConfig {
+            proxy_url: "https://x".into(),
+            models: vec!["gpt-4o".into()],
+            keys: vec![LiveKey { label: "a".into(), weight: 100, secret: "k".into() }],
         };
-        assert!(validate_live(&cfg, &Scope::All).is_err());
+        assert!(validate_live(&ok, &Scope::All).is_ok());
     }
 
     #[test]
     fn scope_single_requires_named_model() {
-        let cfg = LiveConfig { models: vec![], clients: vec![] };
+        let cfg = LiveConfig {
+            proxy_url: "https://x".into(),
+            models: vec![],
+            keys: vec![LiveKey { label: "a".into(), weight: 100, secret: "k".into() }],
+        };
         assert!(validate_live(&cfg, &Scope::Single("missing".into())).is_err());
     }
 }

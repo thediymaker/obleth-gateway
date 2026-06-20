@@ -26,8 +26,8 @@ cargo build --release --manifest-path obench/Cargo.toml
 Run headless (both `--target` and `--profile` present → no TUI):
 
 ```bash
-obench --target fixture --profile smoke --all
-obench --target fixture --profile heavy --model obench-turbo
+obench --target demo --profile smoke --all
+obench --target demo --profile heavy --model obench-turbo
 obench --target live   --profile auto  --all
 ```
 
@@ -38,9 +38,49 @@ Run the interactive TUI (omit one or both of `--target`/`--profile`, or pass
 obench
 ```
 
+The TUI is a guided wizard — you don't need to pass any flags or write a config
+file. It walks you through every choice and explains what each one means:
+
+- **Pick a target.** Each option is described inline: **demo** is the local
+  GPU-free benchmark backend (seeds demo `obench-*` models + tenants, no real
+  keys, no cost); **live** is your real upstream API (real requests, real cost).
+- **Live needs nothing pre-configured.** Choose live and the wizard asks for the
+  upstream **base URL**, then the **API key** (input hidden). It then calls
+  `GET {base}/models`, lists what the endpoint actually serves, and lets you
+  multi-select which models to benchmark.
+- **Demo single-model scope** shows a model picker — no `--model` flag needed.
+- **Confirm screen.** Before anything is created, the wizard prints exactly what
+  it will do: which models it registers in the gateway, which tenants and API
+  keys it creates, and — for live — a cost warning. Nothing is seeded until you
+  confirm.
+- **Automatic cleanup.** Everything obench creates for a run (models it
+  registered, the synthetic tenants, and the minted API keys) is deleted again
+  the moment the run ends — on normal completion, a stall, or Ctrl-C. **API key
+  secrets are held in memory only and are never written to disk.**
+- **Errors never crash the TUI.** A bad URL, wrong key, or unreachable gateway
+  shows a dismissible message and drops you back to the wizard to try again.
+
 Connection defaults (`--admin-base`, `--proxy-base`, `--admin-token`,
 `--ui-base`) match the local docker-compose stack and can also be set via
 environment variables `ADMIN_BASE`, `ADMIN_TOKEN`, `PROXY_BASE`, `UI_BASE`.
+
+## Security model
+
+obench creates real gateway objects (models, tenants, API keys) through the
+admin API, so it is built to leave nothing behind:
+
+- **`demo` is local-only.** Because a demo run seeds synthetic models, tenants,
+  and keys into the gateway it points at, `--target demo` is rejected unless
+  `--admin-base` and `--proxy-base` resolve to this node (`localhost`,
+  `127.0.0.1`, `::1`, `0.0.0.0`). To exercise a remote gateway, use
+  `--target live` and give it that gateway's endpoint + key.
+- **Keys never touch disk.** Minted API key secrets live only in memory for the
+  duration of a run. There is no `keys.json` (or any other) key cache.
+- **Automatic teardown.** When a run ends — success, stall, or Ctrl-C — obench
+  deletes the API keys it minted, the tenants it created, and (for live) the
+  model route it registered (which holds your upstream key). Objects that
+  already existed and were merely updated are left intact; only what obench
+  *created* is removed.
 
 ## Target × Profile × Scope
 
@@ -48,29 +88,32 @@ Every run is described by three dimensions:
 
 | Dimension | Values | Meaning |
 |-----------|--------|---------|
-| **Target** | `fixture`, `live` | Where to send requests. `fixture` uses the GPU-free `benchmark-backend` container. `live` uses real upstream APIs listed in a config file. |
+| **Target** | `demo`, `live` | Where to send requests. `demo` uses the GPU-free `benchmark-backend` container and is **local-only**. `live` uses real upstream APIs and may target a remote gateway. |
 | **Profile** | `smoke`, `light`, `heavy`, `extreme`, `auto`, `manual` | Load intensity and duration. See below. |
 | **Scope** | `--all` (default), `--model <name>` | Drive the full demo fleet or a single named model. |
 
 **Validity constraint:** `--target live --profile extreme` is blocked. `extreme`
 measures the gateway's raw req/s ceiling using tiny 4-token outputs against the
-GPU-free fixture backend, where generation time is negligible. Against live
+GPU-free demo backend, where generation time is negligible. Against live
 upstreams the generation time dominates and the number is not meaningful. Use
-`--target fixture` for extreme, or pick `auto` or `heavy` for live.
+`--target demo` for extreme, or pick `auto` or `heavy` for live.
 
 ### Profiles
 
-| Profile | Concurrency | Duration | Output tokens | Purpose |
-|---------|-------------|----------|---------------|---------|
-| `smoke` | 2 | 30 s | 16 | Check the stack responds at all |
-| `light` | 16 | 60 s | 64 | Routine CI / sanity check |
-| `heavy` | 64 | 600 s | 128 | Sustained realistic load |
-| `extreme` | 256 | 30 s | 4 | Max req/s ceiling (fixture only) |
-| `auto` | ramp | auto | 4 | Self-calibrating (see below) |
-| `manual` | 64 | 60 s | 64 | Fully overridden by CLI flags |
+| Profile | Concurrency | Duration | Output tokens | Stream | Purpose |
+|---------|-------------|----------|---------------|--------|---------|
+| `smoke` | 2 | 30 s | 16 | yes | Check the stack responds at all |
+| `light` | 16 | 60 s | 64 | yes | Routine CI / sanity check |
+| `heavy` | 64 | 600 s | 128 | yes | Sustained realistic load |
+| `extreme` | 2048 | 30 s | 4 | no | Max req/s ceiling (demo only) |
+| `auto` | ramp | auto | 4 | no | Self-calibrating (see below) |
+| `manual` | 64 | 60 s | 64 | yes | Preset defaults, overridden by CLI flags |
 
 Per-profile defaults can be overridden with `--conc`, `--duration-s`,
-`--output-tokens`, `--capacity`, and `--max-error-rate`.
+`--output-tokens`, `--input-tokens`, `--stream`, `--capacity`, and
+`--max-error-rate`. `manual` starts from the defaults above (concurrency 64,
+60 s, 64 output tokens, streaming) and exists specifically to be reshaped by
+those flags.
 
 ## The `auto` profile
 
@@ -93,68 +136,82 @@ written into `auto-meta.json` together with a `replay` block:
 To reproduce the found ceiling, pass the `replay` values as CLI flags:
 
 ```bash
-obench --target fixture --profile manual --conc 256 --output-tokens 4 --all
+obench --target demo --profile manual --conc 256 --output-tokens 4 --all
 ```
 
 ## The `obench-` demo set (idempotent seeding)
 
-For `--target fixture`, obench seeds the gateway before every run with a
+For `--target demo`, obench seeds the gateway before every run with a
 canonical set of models, fairshare groups, and tenants whose names all start with
 `obench-`. This prefix is the identity contract:
 
 - **Models** (`obench-turbo`, `obench-base`, `obench-code`, `obench-large`,
-  `obench-embed`) are registered against the fixture backend with the correct
+  `obench-embed`) are registered against the demo backend with the correct
   upstream URL. If they already exist, obench updates them in place — it does
   not create duplicates.
 - **Tenants** and **fairshare groups** follow the same upsert logic: if a
-  tenant named `obench-chatbot` already exists, the run reuses it.
-- **API keys** are cached in `$BENCH_OUT_DIR/keys.json` (written 0600 on Unix,
-  directory tightened to 0700). On the next run obench calls `ensure_key` again:
-  if the gateway mints a new secret (because the key was deleted), the cache is
-  updated; if the key was reused, the cached secret is read back. Stale keys with
-  the same name are pruned so there is no test-key sprawl across runs.
+  tenant named `obench-chatbot` already exists, the run reuses it. The seeded
+  fleet spans three groups so a run produces genuine cross-tenant contention:
+
+  | Tenant | Group | Weight |
+  |--------|-------|--------|
+  | `obench-chatbot` | `obench-chatbot` | 500 |
+  | `obench-chatbot-2` | `obench-chatbot` | 500 |
+  | `obench-api-batch` | `obench-api` | 50 |
+  | `obench-analytics` | `obench-analytics` | 100 |
+  | `obench-embeddings` | `obench-api` | 50 |
+
+- **API keys** are minted fresh for each run and held in memory only. Any stale
+  same-named obench keys on a tenant are pruned first, so there is no test-key
+  sprawl. When the run ends, the keys obench minted (and the tenants/models it
+  created) are deleted automatically — nothing is written to disk and no
+  credentials are left on the gateway.
 
 Nothing generated is written into the source directory.
 
 ## Live config
 
-For `--target live`, obench reads a JSON config file (default `live.config.json`,
-override with `--config <path>`). The file lists the real upstream models and the
-clients (tenants) to create:
+`--target live` points obench at a **remote obleth gateway** you do not control.
+obench acts as a pure black-box client: it never seeds models, never uses an
+admin token, and never tears anything down. You supply the gateway URL, the model
+names to drive, and one or more **real tenant API keys** you already hold.
+
+The interactive TUI builds this for you (gateway URL → add keys → pick models),
+so a config file is only needed for **headless** live runs. For `--target live`
+in headless mode, obench reads a JSON config file (default `live.config.json`,
+override with `--config <path>`):
 
 ```json
 {
-  "models": [
-    {
-      "name": "gpt-4o",
-      "upstream_model": "gpt-4o",
-      "api_base": "https://api.openai.com/v1",
-      "api_key": "${OPENAI_API_KEY}",
-      "weight": 100,
-      "input_cost_per_token": 0.0000025,
-      "output_cost_per_token": 0.00001
-    }
-  ],
-  "clients": [
-    { "name": "bench-primary", "group": "api-batch", "weight": 100 },
-    { "name": "bench-secondary", "group": "chatbot",  "weight": 500 }
+  "proxy_url": "https://gateway.example.com",
+  "models": ["my-model-a", "my-model-b"],
+  "keys": [
+    { "label": "tenant-a", "weight": 100, "secret": "${OBENCH_KEY_A}" },
+    { "label": "tenant-b", "weight": 200, "secret": "${OBENCH_KEY_B}" }
   ]
 }
 ```
+
+`proxy_url` is the OpenAI-compatible base of the remote gateway (with or without a
+trailing `/v1`). Each entry in `keys[]` is a distinct **tenant** — add two or more
+to drive genuine fairshare contention on the remote gateway. `weight` shapes how
+much load each tenant generates; `label` is cosmetic (used in the dashboard and
+saved config). The models you list must already exist on the remote gateway.
 
 Any value may contain `${VAR}` placeholders. obench expands them from the
 environment at load time. A missing variable is a **hard error** — it is never
 silently replaced with an empty string. This prevents accidental runs with blank
 API keys.
 
-**Safety warning:** live runs send real requests to real upstream APIs using
-real keys. Every completion incurs cost. The `keys.json` cache in
-`$BENCH_OUT_DIR` holds real gateway secrets; protect that directory accordingly
-(it is written 0600 on Unix). Set `BENCH_OUT_DIR` to a path outside the repo if
-the default `/tmp/obleth-bench` is not suitable for your environment.
+**Safety warning:** live runs send real requests to a real remote gateway using
+real keys. Every completion may incur cost on that gateway. Key secrets are held
+in memory only — they are never written to disk by obench (the saved
+`.obench.json` keeps labels and weights, never secrets). Set `BENCH_OUT_DIR` to a
+path outside the repo if the default `/tmp/obleth-bench` is not suitable for your
+environment.
 
-`--all` requires at least 2 models and 2 clients in the config
-so that load genuinely spreads across upstreams and distinct tenants.
+`--all` requires at least 1 model and 1 key in the config. To exercise fairshare,
+supply 2+ keys so load spreads across distinct tenants.
 `--model <name>` requires that the named model appear in `models[]`.
 
 ## Artifacts
@@ -165,9 +222,11 @@ per run:
 | File | Written by | Contents |
 |------|-----------|---------|
 | `<profile>-meta.json` | every profile | target, profile, scope, completions, req/s, error rate, p50/p99 TTFB, token counts, verdict |
-| `<profile>-timeline.jsonl` | headless fixed-load runs | per-10-second rows: `in_flight`, `queued` |
+| `<profile>-timeline.jsonl` | `--target demo` runs | per-10-second rows: `in_flight`, `queued` (sampled from the gateway's fairshare state, which is only observable on the local demo target) |
 | `auto-meta.json` | `auto` profile | above + `sustainable_conc`, step history, `replay` block |
-| `keys.json` | seeding | tenant name → gateway API secret cache (written 0600) |
+
+No secrets are ever written to `BENCH_OUT_DIR` — API keys live in memory only and
+are deleted from the gateway during teardown.
 
 After every run, obench prints a summary and two control-plane URLs:
 
@@ -178,8 +237,8 @@ errors: 0.33%   429: 0
 ttfb ms: p50=42  p90=88  p99=140
 tokens: in 512000 out 268864
 watch in the control plane:
-  fairshare   http://localhost:3000/fairshare
-  accounting  http://localhost:3000/usage
+  fairshare   http://localhost:3002/fairshare
+  accounting  http://localhost:3002/usage
 ```
 
 Fairshare ratios, per-tenant accounting, and ledger reconciliation are things you

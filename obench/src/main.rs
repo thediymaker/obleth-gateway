@@ -2,6 +2,7 @@ mod admin;
 mod cli;
 mod config;
 mod engine;
+mod persist;
 mod profiles;
 mod report;
 mod seed;

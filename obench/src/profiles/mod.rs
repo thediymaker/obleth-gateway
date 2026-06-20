@@ -1,7 +1,7 @@
 pub mod auto;
 pub mod plan;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -25,65 +25,159 @@ pub struct RunHandles {
     pub plan: plan::ProfilePlan,
     pub ui_base: String,
     pub profile_name: String,
+    pub teardown: crate::admin::Teardown,
+    /// True only when obench owns a local gateway it can query over the admin
+    /// API (the demo path). For a remote `live` run obench has no admin token,
+    /// so the dashboard shows client-side metrics only.
+    pub gateway_observable: bool,
+    /// Display names of the tenant keys driving load, in counter order.
+    pub key_labels: Vec<String>,
+    /// Per-key dispatched-request counters, parallel to `key_labels`. The load
+    /// engine bumps these so the dashboard can show fairshare distribution.
+    pub key_counts: Arc<Vec<AtomicU64>>,
 }
 
-// ── shared seed → guard → capacity → make_req helper ──────────────────────────
+// ── shared seed → guard → capacity → make_req helper ────────────────────────
 
 struct SeededSetup {
     make_req: Box<dyn Fn() -> ProxyRequest + Send + Sync + 'static>,
     plan: plan::ProfilePlan,
     profile_name: String,
+    teardown: crate::admin::Teardown,
+    /// Where load is actually sent: the local proxy (demo) or the remote obleth
+    /// proxy URL the user supplied (live).
+    proxy_base: String,
+    /// Root URL for the control-plane watch links — local for demo, the remote
+    /// host for live.
+    ui_base: String,
+    /// See `RunHandles::gateway_observable`.
+    gateway_observable: bool,
+    /// See `RunHandles::key_labels`.
+    key_labels: Vec<String>,
+    /// See `RunHandles::key_counts`.
+    key_counts: Arc<Vec<AtomicU64>>,
+}
+
+/// Resolve the `LiveConfig` for a live run: either the one the TUI built in
+/// memory (`live_override`) or the headless config file at `cli.config`.
+fn resolve_live_config(
+    cli: &Cli,
+    live_override: Option<&crate::config::LiveConfig>,
+) -> Result<crate::config::LiveConfig> {
+    match live_override {
+        Some(c) => Ok(c.clone()),
+        None => {
+            let raw = std::fs::read_to_string(&cli.config)
+                .map_err(|e| anyhow::anyhow!("reading {}: {e}", cli.config))?;
+            crate::config::load_live_config(&raw, &|k| std::env::var(k).ok())
+                .map_err(|e| anyhow::anyhow!(e))
+        }
+    }
 }
 
 /// Seed the target, validate the result is non-empty, then return the `SeededRun`.
-async fn seed_and_guard(cli: &Cli, tgt: Target, scope: &Scope, admin: &AdminClient) -> Result<SeededRun> {
+///
+/// `live_override` lets the interactive TUI pass a `LiveConfig` it built from
+/// user input (proxy URL + tenant keys + picked models) instead of reading a
+/// config file. The demo path seeds via the admin API; the live path is a pure
+/// black-box client and never touches admin.
+async fn seed_and_guard(
+    cli: &Cli,
+    tgt: Target,
+    scope: &Scope,
+    admin: &AdminClient,
+    live_override: Option<&crate::config::LiveConfig>,
+) -> Result<SeededRun> {
     let seeded: SeededRun = match tgt {
-        Target::Fixture => {
+        Target::Demo => {
             let api_base = std::env::var("BENCHMARK_API_BASE")
                 .unwrap_or_else(|_| FIXTURE_API_BASE_DEFAULT.to_string());
             seed::seed_fixture(admin, &api_base, scope).await?
         }
         Target::Live => {
-            let raw = std::fs::read_to_string(&cli.config)
-                .map_err(|e| anyhow::anyhow!("reading {}: {e}", cli.config))?;
-            let cfg = crate::config::load_live_config(&raw, &|k| std::env::var(k).ok())
-                .map_err(|e| anyhow::anyhow!(e))?;
+            let cfg = resolve_live_config(cli, live_override)?;
             crate::config::validate_live(&cfg, scope).map_err(|e| anyhow::anyhow!(e))?;
-            seed::seed_live(admin, &cfg, scope).await?
+            seed::live_run_from_config(&cfg, scope)?
         }
     };
     if seeded.models.is_empty() {
-        anyhow::bail!("no models were seeded — check the target/config (fixture backend reachable? live config has matching models?)");
+        anyhow::bail!("no models to drive — check the target/config (fixture backend reachable? live config has models?)");
     }
     if seeded.tenants.is_empty() {
-        anyhow::bail!("no tenants were seeded — check the target/config");
+        anyhow::bail!("no tenants to drive — check the target/config (live config needs at least one key)");
     }
     Ok(seeded)
 }
 
-async fn build_setup(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -> Result<SeededSetup> {
+async fn build_setup(
+    cli: &Cli,
+    tgt: Target,
+    profile: Profile,
+    scope: Scope,
+    live_override: Option<&crate::config::LiveConfig>,
+) -> Result<SeededSetup> {
     let admin = AdminClient::new(cli.admin_base.clone(), cli.admin_token.clone());
     let plan = plan::resolve(profile, cli);
 
-    let seeded = seed_and_guard(cli, tgt, &scope, &admin).await?;
+    // Where load is sent + where to watch. Demo drives the local gateway and is
+    // fully observable over admin; live drives the remote proxy the user gave and
+    // is a black box (no admin token).
+    let (proxy_base, ui_base, gateway_observable) = match tgt {
+        Target::Demo => (cli.proxy_base.clone(), cli.ui_base.clone(), true),
+        Target::Live => {
+            let cfg = resolve_live_config(cli, live_override)?;
+            let root = target::endpoint_root(&cfg.proxy_url);
+            (cfg.proxy_url.clone(), root, false)
+        }
+    };
 
-    // Set capacity.
-    let cap = admin.set_capacity(plan.capacity).await?;
-    println!(
-        "seeded {} models, {} tenants, capacity max_in_flight={cap}",
-        seeded.models.len(),
-        seeded.tenants.len()
-    );
+    let seeded = seed_and_guard(cli, tgt, &scope, &admin, live_override).await?;
+    let teardown = seeded.teardown.clone();
+
+    // Only the demo path owns a local gateway whose capacity it can set.
+    if gateway_observable {
+        let cap = admin.set_capacity(plan.capacity).await?;
+        println!(
+            "seeded {} models, {} tenants, capacity max_in_flight={cap}",
+            seeded.models.len(),
+            seeded.tenants.len()
+        );
+    } else {
+        println!(
+            "driving {} models across {} tenant keys on {proxy_base}",
+            seeded.models.len(),
+            seeded.tenants.len()
+        );
+    }
 
     // Build a make_req closure over the seeded fleet.
-    let proxy_base = cli.proxy_base.clone();
+    let req_base = proxy_base.clone();
     let input_tokens = cli.input_tokens;
     let seeded_arc = Arc::new(seeded.clone());
     let plan_stream = plan.stream;
     let plan_out = plan.output_tokens;
 
+    // Per-key dispatch counters so the dashboard can show how load actually
+    // spread across tenants (the whole point of a fairshare benchmark).
+    let key_labels: Vec<String> = seeded
+        .tenants
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            if t.name.trim().is_empty() {
+                format!("tenant-{}", i + 1)
+            } else {
+                t.name.clone()
+            }
+        })
+        .collect();
+    let key_counts: Arc<Vec<AtomicU64>> =
+        Arc::new((0..seeded.tenants.len()).map(|_| AtomicU64::new(0)).collect());
+
     let make_req = {
         let seeded_arc = seeded_arc.clone();
+        let proxy_base = req_base.clone();
+        let key_counts = key_counts.clone();
         move || -> ProxyRequest {
             let mut rng = rand::thread_rng();
             // Pick a tenant by traffic share.
@@ -94,6 +188,9 @@ async fn build_setup(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -> 
                 .collect();
             let ti = fleet::weighted_index(&tweights, rng.gen::<f64>());
             let tenant = &seeded_arc.tenants[ti];
+            if let Some(c) = key_counts.get(ti) {
+                c.fetch_add(1, Ordering::Relaxed);
+            }
             // Pick a model + shape. Fixture uses the traffic catalog; live uses the seeded models.
             if seeded_arc.models.iter().all(|m| m.starts_with("obench-")) {
                 let cands: Vec<&fleet::TrafficType> = fleet::FIXTURE_TRAFFIC
@@ -149,6 +246,12 @@ async fn build_setup(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -> 
         make_req: Box::new(make_req),
         plan,
         profile_name,
+        teardown,
+        proxy_base,
+        ui_base,
+        gateway_observable,
+        key_labels,
+        key_counts,
     })
 }
 
@@ -156,20 +259,44 @@ async fn build_setup(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -> 
 
 pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -> Result<i32> {
     target::validate_combo(tgt, profile).map_err(|e| anyhow::anyhow!(e))?;
+    target::validate_target_locality(tgt, &cli.admin_base, &cli.proxy_base)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     let admin = AdminClient::new(cli.admin_base.clone(), cli.admin_token.clone());
     let plan = plan::resolve(profile, cli);
 
     if profile == Profile::Auto {
         // Seed independently for the Auto path (it handles its own capacity).
-        let seeded = seed_and_guard(cli, tgt, &scope, &admin).await?;
-        let _ = admin.set_capacity(plan.capacity).await?;
-        return auto::run(cli, tgt, scope, &seeded, &cli.proxy_base).await;
+        let seeded = seed_and_guard(cli, tgt, &scope, &admin, None).await?;
+        let teardown = seeded.teardown.clone();
+        // Demo drives the local gateway (admin sets capacity); live drives the
+        // remote proxy as a black box with no admin access.
+        let (proxy_base, observable) = match tgt {
+            Target::Demo => (cli.proxy_base.clone(), true),
+            Target::Live => (resolve_live_config(cli, None)?.proxy_url, false),
+        };
+        if observable {
+            let _ = admin.set_capacity(plan.capacity).await?;
+        }
+        let result = auto::run(cli, tgt, scope, &seeded, &proxy_base).await;
+        // Clean up anything obench created (no-op for the black-box live path).
+        admin.teardown(&teardown).await;
+        return result;
     }
 
     let scope_str = format!("{scope:?}");
-    let setup = build_setup(cli, tgt, profile, scope).await?;
-    let SeededSetup { make_req, plan, profile_name } = setup;
+    let setup = build_setup(cli, tgt, profile, scope, None).await?;
+    let SeededSetup {
+        make_req,
+        plan,
+        profile_name,
+        teardown,
+        proxy_base: _proxy_base,
+        ui_base,
+        gateway_observable,
+        key_labels: _key_labels,
+        key_counts: _key_counts,
+    } = setup;
 
     // Run.
     let client = Arc::new(LoadClient::new((plan.conc as usize) * 2));
@@ -209,14 +336,18 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
                 tokio::time::sleep(Duration::from_secs(10)).await;
                 if stop.load(Ordering::Relaxed) { break; }
 
-                // Fairshare timeline sample.
-                if let Ok(live) = a.fairshare_live().await {
-                    let _ = report::append_timeline(
-                        &pname,
-                        &serde_json::json!({
-                            "in_flight": live.global_in_flight, "queued": live.global_queued,
-                        }),
-                    );
+                // Fairshare timeline sample — only when we own the gateway (demo).
+                // A remote live gateway has no admin token, so we record client
+                // metrics only and skip the in_flight/queued timeline.
+                if gateway_observable {
+                    if let Ok(live) = a.fairshare_live().await {
+                        let _ = report::append_timeline(
+                            &pname,
+                            &serde_json::json!({
+                                "in_flight": live.global_in_flight, "queued": live.global_queued,
+                            }),
+                        );
+                    }
                 }
 
                 // Stall watchdog — only active after the warmup window.
@@ -252,10 +383,14 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
     stop.store(true, Ordering::Relaxed);
     let _ = sampler.await;
 
+    // Tear down the synthetic models/tenants/keys we created. Runs on every exit
+    // path (normal completion, stall, Ctrl-C drain) so no credentials linger.
+    admin.teardown(&teardown).await;
+
     // Summarize + report.
     let elapsed = started.elapsed().as_secs_f64().max(1.0);
     let summary = stats.lock().unwrap().summarize(elapsed, plan.max_error_rate);
-    println!("\n{}", report::render_summary(&summary, &cli.ui_base));
+    println!("\n{}", report::render_summary(&summary, &ui_base));
     report::write_meta(
         &profile_name,
         &serde_json::json!({
@@ -278,11 +413,29 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
 /// Note: Profile::Auto is not routed through start_run — it is excluded from
 /// the TUI dashboard path because it self-calibrates capacity internally and
 /// doesn't emit a fixed-load stats stream compatible with the dashboard widget.
-pub async fn start_run(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -> Result<RunHandles> {
+pub async fn start_run(
+    cli: &Cli,
+    tgt: Target,
+    profile: Profile,
+    scope: Scope,
+    live_override: Option<&crate::config::LiveConfig>,
+) -> Result<RunHandles> {
     target::validate_combo(tgt, profile).map_err(|e| anyhow::anyhow!(e))?;
+    target::validate_target_locality(tgt, &cli.admin_base, &cli.proxy_base)
+        .map_err(|e| anyhow::anyhow!(e))?;
 
-    let setup = build_setup(cli, tgt, profile, scope).await?;
-    let SeededSetup { make_req, plan, profile_name } = setup;
+    let setup = build_setup(cli, tgt, profile, scope, live_override).await?;
+    let SeededSetup {
+        make_req,
+        plan,
+        profile_name,
+        teardown,
+        proxy_base: _proxy_base,
+        ui_base,
+        gateway_observable,
+        key_labels,
+        key_counts,
+    } = setup;
 
     let client = Arc::new(LoadClient::new((plan.conc as usize) * 2));
     let stats = Arc::new(Mutex::new(Stats::default()));
@@ -296,6 +449,9 @@ pub async fn start_run(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -
         let cfg = RunConfig { conc: plan.conc, duration_s: plan.duration_s, warmup_s: plan.warmup_s };
         tokio::spawn(async move {
             crate::engine::load::run_closed_loop(client, make_req, cfg, stop.clone(), stats).await;
+            // Signal natural completion (duration elapsed) so watchers — like the
+            // TUI dashboard — see the run is done and stop ticking.
+            stop.store(true, Ordering::Relaxed);
         })
     };
 
@@ -304,7 +460,11 @@ pub async fn start_run(cli: &Cli, tgt: Target, profile: Profile, scope: Scope) -
         stop,
         handle,
         plan,
-        ui_base: cli.ui_base.clone(),
+        ui_base,
         profile_name,
+        teardown,
+        gateway_observable,
+        key_labels,
+        key_counts,
     })
 }

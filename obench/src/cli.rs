@@ -1,7 +1,13 @@
 use clap::{Parser, ValueEnum};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
-pub enum Target { Fixture, Live }
+pub enum Target {
+    /// Local, GPU-free demo backend (formerly "fixture"). `fixture` still works
+    /// as an alias so existing scripts don't break.
+    #[value(alias = "fixture")]
+    Demo,
+    Live,
+}
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Profile { Smoke, Light, Heavy, Extreme, Auto, Manual }
@@ -16,7 +22,7 @@ pub fn scope_from(model: Option<String>, all: bool) -> Scope {
     }
 }
 
-#[derive(Parser, Debug)]
+#[derive(Parser, Debug, Clone)]
 #[command(name = "obench", version, about = "obleth benchmark & readiness suite")]
 pub struct Cli {
     #[arg(long)]
@@ -34,9 +40,9 @@ pub struct Cli {
     pub admin_base: String,
     #[arg(long, env = "ADMIN_TOKEN", default_value = "dev-admin-token")]
     pub admin_token: String,
-    #[arg(long, env = "PROXY_BASE", default_value = "http://localhost")]
+    #[arg(long, env = "PROXY_BASE", default_value = "http://localhost:8088")]
     pub proxy_base: String,
-    #[arg(long, env = "UI_BASE", default_value = "http://localhost:3000")]
+    #[arg(long, env = "UI_BASE", default_value = "http://localhost:3002")]
     pub ui_base: String,
 
     #[arg(long)]
@@ -53,7 +59,8 @@ pub struct Cli {
     pub capacity: Option<u32>,
     #[arg(long)]
     pub max_error_rate: Option<f64>,
-    /// Path to live config (required for --target live).
+    /// Path to live config for headless `--target live` (remote obleth proxy
+    /// URL + tenant keys + models). The interactive TUI builds this for you.
     #[arg(long, default_value = "live.config.json")]
     pub config: String,
     /// Force headless even with no subcommand.
@@ -85,7 +92,7 @@ mod tests {
         let cli = Cli::try_parse_from([
             "obench", "--target", "fixture", "--profile", "heavy", "--all",
         ]).unwrap();
-        assert_eq!(cli.target, Some(Target::Fixture));
+        assert_eq!(cli.target, Some(Target::Demo));
         assert_eq!(cli.profile, Some(Profile::Heavy));
         assert!(cli.all);
     }

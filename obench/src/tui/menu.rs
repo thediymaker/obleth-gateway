@@ -31,6 +31,6 @@ mod tests {
 
     #[test]
     fn all_enabled_for_fixture() {
-        assert!(valid_profiles(Target::Fixture).iter().all(|(_, ok)| *ok));
+        assert!(valid_profiles(Target::Demo).iter().all(|(_, ok)| *ok));
     }
 }

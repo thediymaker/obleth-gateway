@@ -1,18 +1,13 @@
-use std::collections::HashMap;
-use std::fs;
+use anyhow::Result;
 
-use anyhow::{Context, Result};
-
-use crate::admin::{AdminClient, ModelSpec};
+use crate::admin::{AdminClient, ModelSpec, Teardown};
 use crate::cli::Scope;
 use crate::config::LiveConfig;
 use crate::engine::fleet;
-use crate::report::out_dir;
 
 #[derive(Clone, Debug)]
 pub struct SeededTenant {
     pub name: String,
-    pub group: String,
     pub traffic_share: u32,
     pub key: String,
 }
@@ -21,62 +16,10 @@ pub struct SeededTenant {
 pub struct SeededRun {
     pub tenants: Vec<SeededTenant>,
     pub models: Vec<String>,
-}
-
-fn key_cache_path() -> std::path::PathBuf { out_dir().join("keys.json") }
-
-fn load_key_cache() -> HashMap<String, String> {
-    fs::read_to_string(key_cache_path())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-fn save_key_cache(cache: &HashMap<String, String>) -> Result<()> {
-    let s = serde_json::to_string_pretty(cache).context("serialize key cache")?;
-    let path = key_cache_path();
-    write_private(&path, s.as_bytes())
-        .with_context(|| format!("write key cache to {}", path.display()))?;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-        // Tighten the artifact dir to owner-only (defense in depth).
-        fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-    }
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    f.write_all(bytes)
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, bytes)
-}
-
-/// Resolve the secret for a tenant: a freshly minted secret wins; otherwise the
-/// cached secret from a prior run; error if neither (the reused key's secret is
-/// unknown and was never cached).
-fn resolve_key(cache: &mut HashMap<String, String>, tenant: &str, minted: Option<String>) -> Result<String> {
-    if let Some(secret) = minted {
-        cache.insert(tenant.to_string(), secret.clone());
-        return Ok(secret);
-    }
-    cache.get(tenant).cloned().with_context(|| {
-        format!("reused key for tenant '{tenant}' has no cached secret in keys.json — delete that tenant's API key in the gateway and re-run to force a fresh mint")
-    })
+    /// IDs of everything obench created this run, for automatic teardown. API
+    /// key secrets live only in `tenants[].key` (in memory) and are never
+    /// written to disk.
+    pub teardown: Teardown,
 }
 
 pub async fn seed_fixture(admin: &AdminClient, fixture_api_base: &str, scope: &Scope) -> Result<SeededRun> {
@@ -84,8 +27,9 @@ pub async fn seed_fixture(admin: &AdminClient, fixture_api_base: &str, scope: &S
         Scope::Single(name) => vec![name.as_str()],
         Scope::All => fleet::FIXTURE_MODELS.to_vec(),
     };
+    let mut teardown = Teardown::default();
     for name in &models {
-        admin.ensure_model(&ModelSpec {
+        let (id, created) = admin.ensure_model(&ModelSpec {
             model_name: name.to_string(),
             upstream_model: name.to_string(),
             api_base: fixture_api_base.to_string(),
@@ -95,48 +39,55 @@ pub async fn seed_fixture(admin: &AdminClient, fixture_api_base: &str, scope: &S
             context_window: 8192,
             admission_weight: 100,
         }).await?;
+        if created {
+            teardown.model_ids.push(id);
+        }
     }
     for (name, weight) in fleet::FIXTURE_GROUPS {
         admin.ensure_group(name, *weight).await?;
     }
-    let mut cache = load_key_cache();
     let mut tenants = Vec::new();
     for (name, group, weight, share) in fleet::FIXTURE_TENANTS {
-        let id = admin.ensure_tenant(name, *weight, 1_000_000, group).await?;
-        let minted = admin.ensure_key(&id, "obench").await?;
-        let key = resolve_key(&mut cache, name, minted)?;
-        tenants.push(SeededTenant { name: name.to_string(), group: group.to_string(), traffic_share: *share, key });
+        // `tokens_per_minute = 0` means unlimited: the demo is a concurrency /
+        // fairshare stress test, so we never want the per-minute token bucket to
+        // shed traffic (that would mask the in-flight queueing we're measuring).
+        let (id, created) = admin.ensure_tenant(name, *weight, 0, group).await?;
+        if created {
+            teardown.tenant_ids.push(id.clone());
+        }
+        let (key_id, secret) = admin.ensure_key(&id, "obench").await?;
+        teardown.key_ids.push(key_id);
+        tenants.push(SeededTenant { name: name.to_string(), traffic_share: *share, key: secret });
     }
-    save_key_cache(&cache)?;
-    Ok(SeededRun { tenants, models: models.iter().map(|m| m.to_string()).collect() })
+    Ok(SeededRun { tenants, models: models.iter().map(|m| m.to_string()).collect(), teardown })
 }
 
-pub async fn seed_live(admin: &AdminClient, cfg: &LiveConfig, scope: &Scope) -> Result<SeededRun> {
-    let models: Vec<&crate::config::LiveModel> = match scope {
-        Scope::Single(name) => cfg.models.iter().filter(|m| &m.name == name).collect(),
-        Scope::All => cfg.models.iter().collect(),
+/// Build a `SeededRun` for a *remote* live gateway without any admin access.
+///
+/// `live` treats the remote obleth instance as a black box: obench does not
+/// create models, tenants, or keys — the operator already has real tenant keys
+/// on that gateway. Each supplied key becomes a `SeededTenant` (so the load
+/// engine rotates across them by weight, driving fairshare contention), and the
+/// selected model names become the fleet. Nothing is registered, so `teardown`
+/// is empty.
+pub fn live_run_from_config(cfg: &LiveConfig, scope: &Scope) -> Result<SeededRun> {
+    let models: Vec<String> = match scope {
+        Scope::Single(name) => vec![name.clone()],
+        Scope::All => cfg.models.clone(),
     };
-    for m in &models {
-        admin.ensure_model(&ModelSpec {
-            model_name: m.name.clone(),
-            upstream_model: m.upstream_model.clone(),
-            api_base: m.api_base.clone(),
-            api_key: Some(m.api_key.clone()),
-            input_cost_per_token: m.input_cost_per_token,
-            output_cost_per_token: m.output_cost_per_token,
-            context_window: 8192,
-            admission_weight: m.weight,
-        }).await?;
-    }
-    let mut cache = load_key_cache();
-    let mut tenants = Vec::new();
-    for c in &cfg.clients {
-        admin.ensure_group(&c.group, c.weight).await?;
-        let id = admin.ensure_tenant(&c.name, c.weight, 1_000_000, &c.group).await?;
-        let minted = admin.ensure_key(&id, "obench").await?;
-        let key = resolve_key(&mut cache, &c.name, minted)?;
-        tenants.push(SeededTenant { name: c.name.clone(), group: c.group.clone(), traffic_share: c.weight, key });
-    }
-    save_key_cache(&cache)?;
-    Ok(SeededRun { tenants, models: models.iter().map(|m| m.name.clone()).collect() })
+    let tenants: Vec<SeededTenant> = cfg
+        .keys
+        .iter()
+        .enumerate()
+        .map(|(i, k)| SeededTenant {
+            name: if k.label.trim().is_empty() {
+                format!("tenant-{}", i + 1)
+            } else {
+                k.label.clone()
+            },
+            traffic_share: k.weight.max(1),
+            key: k.secret.clone(),
+        })
+        .collect();
+    Ok(SeededRun { tenants, models, teardown: Teardown::default() })
 }

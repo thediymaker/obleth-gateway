@@ -36,15 +36,17 @@ pub fn render_summary(summary: &Summary, ui_base: &str) -> String {
     format!(
         "verdict: {verdict}\n\
          requests: {} ok / {} attempts  ({:.0} req/s)\n\
-         errors: {:.2}%   429: {}\n\
-         ttfb ms: p50={} p90={} p99={}\n\
+         errors: {} ({:.2}%)   429: {}\n\
+         ttfb ms:  p50={} p90={} p99={}\n\
+         total ms: p50={} p99={}\n\
          tokens: in {} out {}{est}\n\
          watch in the control plane:\n\
          \u{20}\u{20}fairshare   {ui_base}/fairshare\n\
          \u{20}\u{20}accounting  {ui_base}/usage",
         summary.completed, summary.attempts, summary.req_per_s,
-        summary.error_rate * 100.0, summary.rejected,
+        summary.errors, summary.error_rate * 100.0, summary.rejected,
         summary.p50_ttfb_ms, summary.p90_ttfb_ms, summary.p99_ttfb_ms,
+        summary.p50_total_ms, summary.p99_total_ms,
         summary.in_tokens, summary.out_tokens,
     )
 }

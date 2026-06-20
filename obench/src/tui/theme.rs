@@ -1,6 +1,7 @@
 use ratatui::style::Color;
 
 // Matched to control-plane globals.css.
+#[allow(dead_code)] // palette parity with globals.css; reserved for explicit bg fills
 pub const BASE: Color = Color::Rgb(10, 10, 12);     // near-black neutral
 pub const FG: Color = Color::Rgb(244, 244, 246);    // light foreground
 pub const MUTED: Color = Color::Rgb(140, 140, 150);

@@ -12,19 +12,7 @@ pub struct ProfilePlan {
 }
 
 pub fn resolve(profile: Profile, cli: &Cli) -> ProfilePlan {
-    // Per-profile defaults (carried from the .mjs harness as a starting point).
-    let base = match profile {
-        // smoke: bounded 30-second, 2-worker CI ping. conc=2 keeps load minimal
-        // while still exercising the weighted picker across all fixture models;
-        // 30 s is enough to cycle through all 5 models statistically.
-        // duration_s > 0 is required: 0 means "run until quit" and would hang headless.
-        Profile::Smoke   => ProfilePlan { conc: 2,    duration_s: 30,  warmup_s: 0, capacity: 64,    output_tokens: 16,  max_error_rate: 0.0,  stream: true },
-        Profile::Light   => ProfilePlan { conc: 16,   duration_s: 60,  warmup_s: 3, capacity: 64,    output_tokens: 64,  max_error_rate: 0.05, stream: true },
-        Profile::Heavy   => ProfilePlan { conc: 64,   duration_s: 600, warmup_s: 5, capacity: 64,    output_tokens: 128, max_error_rate: 0.05, stream: true },
-        Profile::Extreme => ProfilePlan { conc: 256,  duration_s: 30,  warmup_s: 3, capacity: 256,   output_tokens: 4,   max_error_rate: 0.01, stream: false },
-        Profile::Auto    => ProfilePlan { conc: 32,   duration_s: 15,  warmup_s: 2, capacity: 100000,output_tokens: 4,   max_error_rate: 0.01, stream: false },
-        Profile::Manual  => ProfilePlan { conc: 64,   duration_s: 60,  warmup_s: 3, capacity: 64,    output_tokens: 64,  max_error_rate: 0.05, stream: true },
-    };
+    let base = base_plan(profile);
     ProfilePlan {
         conc: cli.conc.unwrap_or(base.conc),
         duration_s: cli.duration_s.unwrap_or(base.duration_s),
@@ -33,6 +21,28 @@ pub fn resolve(profile: Profile, cli: &Cli) -> ProfilePlan {
         output_tokens: cli.output_tokens.unwrap_or(base.output_tokens),
         max_error_rate: cli.max_error_rate.unwrap_or(base.max_error_rate),
         stream: cli.stream,
+    }
+}
+
+/// The per-profile baseline before any CLI/TUI overrides. Exposed so the wizard
+/// can seed its editable concurrency / output-token knobs from the profile.
+pub fn base_plan(profile: Profile) -> ProfilePlan {
+    // Per-profile defaults (carried from the .mjs harness as a starting point).
+    match profile {
+        // smoke: bounded 30-second, 2-worker CI ping. conc=2 keeps load minimal
+        // while still exercising the weighted picker across all fixture models;
+        // 30 s is enough to cycle through all 5 models statistically.
+        // duration_s > 0 is required: 0 means "run until quit" and would hang headless.
+        Profile::Smoke   => ProfilePlan { conc: 2,    duration_s: 30,  warmup_s: 0, capacity: 64,    output_tokens: 16,  max_error_rate: 0.0,  stream: true },
+        Profile::Light   => ProfilePlan { conc: 16,   duration_s: 60,  warmup_s: 3, capacity: 64,    output_tokens: 64,  max_error_rate: 0.05, stream: true },
+        Profile::Heavy   => ProfilePlan { conc: 64,   duration_s: 600, warmup_s: 5, capacity: 64,    output_tokens: 128, max_error_rate: 0.05, stream: true },
+        // extreme: max-push throughput ceiling. capacity == conc is the exact
+        // "never gate on admission" value (closed loop holds <= conc in flight),
+        // so the gateway's concurrency limit is never the bottleneck and we
+        // measure raw req/s. 2048 mirrors the old max.mjs default fan-out.
+        Profile::Extreme => ProfilePlan { conc: 2048, duration_s: 30,  warmup_s: 3, capacity: 2048,  output_tokens: 4,   max_error_rate: 0.01, stream: false },
+        Profile::Auto    => ProfilePlan { conc: 32,   duration_s: 15,  warmup_s: 2, capacity: 100000,output_tokens: 4,   max_error_rate: 0.01, stream: false },
+        Profile::Manual  => ProfilePlan { conc: 64,   duration_s: 60,  warmup_s: 3, capacity: 64,    output_tokens: 64,  max_error_rate: 0.05, stream: true },
     }
 }
 
@@ -55,7 +65,7 @@ mod tests {
         let cli = Cli::try_parse_from(["obench", "--target", "fixture", "--profile", "extreme"]).unwrap();
         let plan = resolve(Profile::Extreme, &cli);
         assert_eq!(plan.output_tokens, 4);
-        assert_eq!(plan.capacity, 256);
+        assert_eq!(plan.capacity, 2048);
     }
 
     #[test]
