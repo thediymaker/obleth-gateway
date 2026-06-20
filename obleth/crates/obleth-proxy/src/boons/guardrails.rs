@@ -343,6 +343,26 @@ pub(crate) fn detect_tier1_output(text: &str, policy: &GuardrailsPolicy) -> Opti
     None
 }
 
+/// Apply the configured redacting output scanners to every text-bearing channel
+/// of `completion` (visible content plus each reasoning channel) in place.
+/// Returns true if any channel was rewritten, so the caller can report it on the
+/// trace span.
+fn redact_output_in_place(
+    completion: &mut Value,
+    scanners: &[String],
+    ban_keywords: &[String],
+) -> bool {
+    let mut changed = false;
+    for ptr in OUTPUT_TEXT_POINTERS {
+        if let Some(content) = completion.pointer_mut(ptr) {
+            if redact_content_in_place(content, scanners, ban_keywords) {
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 /// Apply the tier-1 redacting scanners named in `scanners` to `text`.
 fn redact_text(text: &str, scanners: &[String], ban_keywords: &[String]) -> String {
     let mut out = text.to_string();
@@ -573,7 +593,7 @@ pub(super) async fn apply_input(
             "proxy_request",
             start,
             "ok",
-            serde_json::json!({"scanners": policy.input_scanners, "flagged": false}),
+            serde_json::json!({"scanners": policy.input_scanners, "flagged": sanitized}),
         );
     }
 
@@ -637,12 +657,10 @@ pub(crate) async fn apply_output(
     // ---- tier-1 redact ----
     // Redact the visible content *and* every reasoning channel; a leaked
     // reasoning trace would otherwise restate exactly what we just redacted.
+    let mut redacted = false;
     if matches!(policy.action, GuardrailsAction::Redact) {
-        for ptr in OUTPUT_TEXT_POINTERS {
-            if let Some(content) = completion.pointer_mut(ptr) {
-                redact_content_in_place(content, &policy.output_scanners, &policy.ban_keywords);
-            }
-        }
+        redacted =
+            redact_output_in_place(completion, &policy.output_scanners, &policy.ban_keywords);
     }
 
     if let Some(t) = tracer {
@@ -651,7 +669,7 @@ pub(crate) async fn apply_output(
             "proxy_request",
             start,
             "ok",
-            serde_json::json!({"scanners": policy.output_scanners, "flagged": false}),
+            serde_json::json!({"scanners": policy.output_scanners, "flagged": redacted}),
         );
     }
     ApplyOutputResult::Pass
@@ -1017,6 +1035,25 @@ mod tests {
         });
         let text = extract_completion_text(&completion);
         assert!(run_tier1_output_block(&text, &policy).is_some());
+    }
+
+    #[test]
+    fn output_redact_reports_flagged_when_keyword_present() {
+        let mut completion = serde_json::json!({
+            "choices": [{ "message": { "content": "tacos are great" } }]
+        });
+        let flagged = redact_output_in_place(&mut completion, &["ban_keywords".into()], &["tacos".into()]);
+        assert!(flagged, "redaction occurred, span must report flagged=true");
+        assert!(!completion.to_string().contains("tacos"));
+    }
+
+    #[test]
+    fn output_redact_reports_not_flagged_when_clean() {
+        let mut completion = serde_json::json!({
+            "choices": [{ "message": { "content": "burritos are great" } }]
+        });
+        let flagged = redact_output_in_place(&mut completion, &["ban_keywords".into()], &["tacos".into()]);
+        assert!(!flagged, "nothing redacted, span must report flagged=false");
     }
 
     #[test]
