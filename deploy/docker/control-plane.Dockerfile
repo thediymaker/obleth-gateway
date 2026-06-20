@@ -21,8 +21,11 @@ ENV OBLETH_BUILD_SHA=$GIT_SHA
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
-# The node:22-slim image ships a non-root `node` user (uid 1000).
-USER node
+# The node:22-slim image ships a non-root `node` user (uid 1000). Declare it
+# numerically so Kubernetes `runAsNonRoot: true` can verify the user is non-root
+# without a pinned `runAsUser` — a username can't be checked and is rejected
+# with CreateContainerConfigError.
+USER 1000:1000
 EXPOSE 3000
 # Use Node's built-in fetch (no extra tooling) to probe the login page, which
 # renders without any backend dependency.
