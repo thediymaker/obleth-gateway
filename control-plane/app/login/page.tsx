@@ -3,7 +3,7 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Card, CardContent, CardDescription, CardHeader } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { OblethLogo } from "@/components/obleth-logo";
@@ -36,12 +36,19 @@ export default function LoginPage() {
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4">
       <Card className="w-full max-w-sm border-border bg-card/80">
-        <CardHeader className="space-y-3 text-center">
-          <OblethLogo size={40} className="mx-auto" />
-          <div>
-            <CardTitle className="text-base">Sign in to obleth</CardTitle>
-            <CardDescription>Control plane for the fairshare AI gateway</CardDescription>
+        <CardHeader className="space-y-4 text-center">
+          <div className="flex flex-col items-center gap-3">
+            <OblethLogo size={75} />
+            <div className="space-y-1">
+              <div className="text-3xl font-semibold lowercase leading-none tracking-tight">
+                obleth
+              </div>
+              <div className="text-[0.65rem] font-medium uppercase tracking-[0.4em] text-muted-foreground">
+                AI Gateway
+              </div>
+            </div>
           </div>
+          <CardDescription>Sign in to the control plane</CardDescription>
         </CardHeader>
         <CardContent>
           <form onSubmit={onSubmit} className="space-y-4">
