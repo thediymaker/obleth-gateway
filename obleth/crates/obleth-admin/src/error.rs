@@ -35,6 +35,7 @@ impl IntoResponse for AdminError {
             AdminError::NotFound => StatusCode::NOT_FOUND,
             AdminError::Store(obleth_store::StoreError::NotFound) => StatusCode::NOT_FOUND,
             AdminError::Store(obleth_store::StoreError::Conflict(_)) => StatusCode::CONFLICT,
+            AdminError::Store(obleth_store::StoreError::Protected(_)) => StatusCode::FORBIDDEN,
             AdminError::BadRequest(_) => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };

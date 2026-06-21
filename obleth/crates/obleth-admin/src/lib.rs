@@ -844,7 +844,11 @@ async fn create_tenant(
 
 #[utoipa::path(get, path = "/api/v1/tenants", tag = "tenants", responses((status = 200, body = [Tenant])))]
 async fn list_tenants(State(state): State<AdminState>) -> Result<Json<Vec<Tenant>>> {
-    Ok(Json(state.store.list_tenants().await?))
+    let mut tenants = state.store.list_tenants().await?;
+    // The reserved control-plane identity (Charo) is system-owned: hide it from
+    // the management surface so it can't be edited/deleted by mistake.
+    tenants.retain(|t| t.id != Store::CONTROL_PLANE_TENANT_ID);
+    Ok(Json(tenants))
 }
 
 #[utoipa::path(
@@ -1675,6 +1679,12 @@ async fn create_key(
     Path(tenant_id): Path<Uuid>,
     Json(body): Json<CreateKey>,
 ) -> Result<Json<CreatedKey>> {
+    // The reserved control-plane tenant is system-owned and not user-manageable.
+    if tenant_id == Store::CONTROL_PLANE_TENANT_ID {
+        return Err(AdminError::Store(obleth_store::StoreError::Protected(
+            "the reserved control-plane tenant cannot be modified".into(),
+        )));
+    }
     let name = body.name.trim().to_string();
     if name.is_empty() {
         return Err(AdminError::BadRequest("key name is required".into()));
@@ -1734,7 +1744,10 @@ async fn list_keys(
     State(state): State<AdminState>,
     Query(q): Query<ListKeysQuery>,
 ) -> Result<Json<Vec<ApiKey>>> {
-    Ok(Json(state.store.list_keys(q.tenant_id).await?))
+    let mut keys = state.store.list_keys(q.tenant_id).await?;
+    // Hide the reserved control-plane key (Charo's) from the management surface.
+    keys.retain(|k| k.tenant_id != Store::CONTROL_PLANE_TENANT_ID);
+    Ok(Json(keys))
 }
 
 #[utoipa::path(

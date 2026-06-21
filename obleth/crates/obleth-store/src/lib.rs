@@ -40,6 +40,10 @@ pub enum StoreError {
     Crypto(#[from] CryptoError),
     #[error("{0}")]
     Conflict(String),
+    /// A protected, system-owned resource (e.g. the reserved control-plane
+    /// identity) cannot be mutated through the management API.
+    #[error("{0}")]
+    Protected(String),
 }
 
 type Result<T> = std::result::Result<T, StoreError>;
@@ -176,6 +180,7 @@ impl Store {
         id: Uuid,
         fairshare_group: &str,
     ) -> Result<Tenant> {
+        Self::guard_reserved_tenant(id)?;
         let row = sqlx::query(
             "update tenants set fairshare_group = $2, updated_at = now() where id = $1
              returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, created_at, updated_at",
@@ -238,6 +243,7 @@ impl Store {
     }
 
     pub async fn update_tenant_weight(&self, id: Uuid, weight: i64) -> Result<Tenant> {
+        Self::guard_reserved_tenant(id)?;
         let row = sqlx::query(
             "update tenants set weight = $2, updated_at = now() where id = $1
              returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, created_at, updated_at",
@@ -256,6 +262,7 @@ impl Store {
         tokens_per_minute: i64,
         max_in_flight: Option<i64>,
     ) -> Result<Tenant> {
+        Self::guard_reserved_tenant(id)?;
         let row = sqlx::query(
             "update tenants set tokens_per_minute = $2, max_in_flight = $3, updated_at = now()
              where id = $1
@@ -280,6 +287,7 @@ impl Store {
         organization: &str,
         contact_email: &str,
     ) -> Result<Tenant> {
+        Self::guard_reserved_tenant(id)?;
         let row = sqlx::query(
             "update tenants set name = $2, description = $3, organization = $4,
                     contact_email = $5, updated_at = now()
@@ -299,6 +307,7 @@ impl Store {
 
     /// Set a tenant's lifecycle status (`active`, `suspended`, `archived`).
     pub async fn set_tenant_status(&self, id: Uuid, status: &str) -> Result<Tenant> {
+        Self::guard_reserved_tenant(id)?;
         let row = sqlx::query(
             "update tenants set status = $2, updated_at = now() where id = $1
              returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, created_at, updated_at",
@@ -322,6 +331,7 @@ impl Store {
         active_until: Option<DateTime<Utc>>,
         weekly_windows: Option<Vec<WeeklyWindow>>,
     ) -> Result<Tenant> {
+        Self::guard_reserved_tenant(id)?;
         let windows = weekly_windows
             .filter(|w| !w.is_empty())
             .map(sqlx::types::Json);
@@ -353,6 +363,7 @@ impl Store {
         budget_period: Option<&str>,
         budget_started_at: Option<DateTime<Utc>>,
     ) -> Result<Tenant> {
+        Self::guard_reserved_tenant(id)?;
         let row = sqlx::query(
             "update tenants set budget_tokens = $2, budget_cost_usd = $3, budget_period = $4,
                     budget_started_at = $5, updated_at = now()
@@ -377,6 +388,7 @@ impl Store {
         id: Uuid,
         allowed_models: Option<Vec<String>>,
     ) -> Result<Tenant> {
+        Self::guard_reserved_tenant(id)?;
         let allowed = allowed_models
             .filter(|m| !m.is_empty())
             .map(sqlx::types::Json);
@@ -399,6 +411,7 @@ impl Store {
         id: Uuid,
         policy: Option<obleth_config::GuardrailsPolicy>,
     ) -> Result<Tenant> {
+        Self::guard_reserved_tenant(id)?;
         let encoded = policy.map(sqlx::types::Json);
         let row = sqlx::query(
             "update tenants set guardrails_policy = $2, updated_at = now()
@@ -416,6 +429,7 @@ impl Store {
     /// Hard-delete a tenant. Cascades to its API keys (FK `on delete cascade`).
     /// Returns the key hashes that were removed so callers can evict caches.
     pub async fn delete_tenant(&self, id: Uuid) -> Result<Vec<String>> {
+        Self::guard_reserved_tenant(id)?;
         let mut tx = self.pool.begin().await?;
         // Lock the tenant row before snapshotting key hashes: a concurrent key
         // insert must take a KEY SHARE lock on this row for its FK check, so
@@ -567,6 +581,35 @@ impl Store {
         }
     }
 
+    /// Reject a mutation that targets the reserved control-plane tenant so
+    /// Charo's identity can't be edited, suspended, or deleted via the admin API.
+    fn guard_reserved_tenant(id: Uuid) -> Result<()> {
+        if id == Self::CONTROL_PLANE_TENANT_ID {
+            return Err(StoreError::Protected(
+                "the reserved control-plane tenant cannot be modified".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reject a mutation that targets a key owned by the reserved control-plane
+    /// tenant. A missing key is left to the method's own NotFound handling.
+    async fn guard_reserved_key(&self, key_id: Uuid) -> Result<()> {
+        let row = sqlx::query("select tenant_id from api_keys where id = $1")
+            .bind(key_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if let Some(row) = row {
+            let tenant_id: Uuid = row.try_get("tenant_id")?;
+            if tenant_id == Self::CONTROL_PLANE_TENANT_ID {
+                return Err(StoreError::Protected(
+                    "the reserved control-plane key cannot be modified".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub async fn list_keys(&self, tenant_id: Option<Uuid>) -> Result<Vec<ApiKey>> {
         let rows = match tenant_id {
             Some(t) => {
@@ -623,6 +666,7 @@ impl Store {
         budget_period: Option<&str>,
         budget_started_at: Option<DateTime<Utc>>,
     ) -> Result<(String, ApiKey, ResolvedKey)> {
+        self.guard_reserved_key(id).await?;
         let row = sqlx::query(
             "update api_keys
              set name = $2,
@@ -661,6 +705,7 @@ impl Store {
         id: Uuid,
         disabled: bool,
     ) -> Result<(String, ResolvedKey)> {
+        self.guard_reserved_key(id).await?;
         let row = sqlx::query(
             "update api_keys set disabled = $2, updated_at = now() where id = $1 returning key_hash",
         )
@@ -682,6 +727,7 @@ impl Store {
         id: Uuid,
         tracing_enabled: bool,
     ) -> Result<(String, ResolvedKey)> {
+        self.guard_reserved_key(id).await?;
         let row = sqlx::query(
             "update api_keys set tracing_enabled = $2, updated_at = now() \
              where id = $1 returning key_hash",
@@ -704,6 +750,7 @@ impl Store {
         id: Uuid,
         tracing_enabled: bool,
     ) -> Result<()> {
+        Self::guard_reserved_tenant(id)?;
         sqlx::query(
             "update tenants set tracing_enabled = $2, updated_at = now() where id = $1 returning id",
         )
@@ -716,6 +763,7 @@ impl Store {
     }
 
     pub async fn delete_key(&self, id: Uuid) -> Result<String> {
+        self.guard_reserved_key(id).await?;
         let row = sqlx::query("delete from api_keys where id = $1 returning key_hash")
             .bind(id)
             .fetch_optional(&self.pool)
@@ -2962,6 +3010,50 @@ mod tests {
             .await
             .expect("list keys");
         assert_eq!(keys.len(), 1, "exactly one reserved key");
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    #[tokio::test]
+    async fn reserved_control_plane_identity_is_protected() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        store
+            .ensure_control_plane_identity()
+            .await
+            .expect("provision");
+
+        let id = Store::CONTROL_PLANE_TENANT_ID;
+        // Tenant mutations on the reserved id are rejected with Protected.
+        assert!(matches!(
+            store.set_tenant_status(id, "suspended").await,
+            Err(StoreError::Protected(_))
+        ));
+        assert!(matches!(
+            store.update_tenant_weight(id, 5).await,
+            Err(StoreError::Protected(_))
+        ));
+        assert!(matches!(
+            store.delete_tenant(id).await,
+            Err(StoreError::Protected(_))
+        ));
+
+        // The reserved key cannot be disabled or deleted either.
+        let secret = store.control_plane_key_secret().await.unwrap().unwrap();
+        let hash = hash_api_key(&secret);
+        let resolved = store.resolved_key_by_hash(&hash).await.unwrap().unwrap();
+        assert!(matches!(
+            store.set_key_disabled(resolved.key_id, true).await,
+            Err(StoreError::Protected(_))
+        ));
+        assert!(matches!(
+            store.delete_key(resolved.key_id).await,
+            Err(StoreError::Protected(_))
+        ));
     }
 
     #[tokio::test]
