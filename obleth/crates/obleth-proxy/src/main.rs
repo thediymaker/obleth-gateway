@@ -40,6 +40,8 @@ async fn main() -> anyhow::Result<()> {
     // ---- connect dependencies (with simple boot-time retries) ----
     let store = retry("postgres", || Store::connect(&cfg.database_url)).await?;
     store.migrate().await?;
+    // Provision the reserved control-plane identity (Charo) — idempotent.
+    store.ensure_control_plane_identity().await?;
     tracing::info!("postgres connected + schema applied");
 
     let redis = retry("redis", || RedisStore::connect(&cfg.redis_url)).await?;

@@ -53,6 +53,9 @@ const SCHEMA_V3: &str = include_str!("../../../../schema/postgres/0003_guardrail
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
 const MIGRATE_LOCK_KEY: i64 = 0x0B1E_7480_0001;
+/// Advisory-lock key serializing reserved control-plane identity provisioning
+/// across racing replicas (distinct from `MIGRATE_LOCK_KEY`).
+const CONTROL_PLANE_LOCK_KEY: i64 = 0x0B1E_7480_0002;
 
 /// Input for `upsert_managed_model` (no timestamps; the DB sets them).
 pub struct UpsertManagedModel {
@@ -473,6 +476,95 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
         Ok((api_key_from_row(&row)?, gen.secret))
+    }
+
+    /// Well-known id for the reserved control-plane tenant that powers Charo,
+    /// the in-app model test console. It is a *normal, visible* tenant — its
+    /// test traffic is recorded under this identity — but is hidden from and
+    /// protected against the Tenants/Keys management surfaces (see
+    /// `StoreError::Protected`). Provisioned once on boot with no rate or term
+    /// caps so manual tests are never throttled, and no model allowlist so it
+    /// can reach every registered model (and thus every model's MCP servers).
+    pub const CONTROL_PLANE_TENANT_ID: Uuid = Uuid::from_u128(0xc0);
+
+    /// Ensure the reserved control-plane tenant + its api key exist. Idempotent
+    /// and safe to call on every boot, including across racing replicas: the
+    /// check-then-create runs under a Postgres advisory lock (mirroring
+    /// `migrate`). On first creation the one-time key secret is stored encrypted
+    /// in `app_settings` (`control_plane_key`) because the stored key hash is not
+    /// reversible and the control-plane needs the raw secret to call the proxy.
+    pub async fn ensure_control_plane_identity(&self) -> Result<()> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("select pg_advisory_lock($1)")
+            .bind(CONTROL_PLANE_LOCK_KEY)
+            .execute(&mut *conn)
+            .await?;
+        let result: Result<()> = async {
+            // Reserved tenant: fixed id, default fairshare group, no per-minute
+            // rate cap (tokens_per_minute = 0), no model allowlist (null ⇒ every
+            // model + MCP). on-conflict makes this a no-op once provisioned.
+            sqlx::query(
+                "insert into tenants
+                     (id, name, fairshare_group, weight, tokens_per_minute, description)
+                 values ($1, '__control_plane__', 'default', 100, 0,
+                         'Reserved identity for the in-app Charo model test console')
+                 on conflict (id) do nothing",
+            )
+            .bind(Self::CONTROL_PLANE_TENANT_ID)
+            .execute(&self.pool)
+            .await?;
+
+            // Key secret already stored ⇒ the api key exists; nothing more to do.
+            if self.control_plane_key_secret().await?.is_some() {
+                return Ok(());
+            }
+
+            // First provision: mint the key, capture the one-time secret, store
+            // it encrypted so it survives restarts.
+            let (_key, secret) = self
+                .create_api_key(
+                    Self::CONTROL_PLANE_TENANT_ID,
+                    "charo",
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await?;
+            let enc = cipher().encrypt(&secret);
+            sqlx::query(
+                "insert into app_settings (key, value, updated_at)
+                 values ('control_plane_key', $1, now())
+                 on conflict (key) do nothing",
+            )
+            .bind(sqlx::types::Json(enc))
+            .execute(&self.pool)
+            .await?;
+            Ok(())
+        }
+        .await;
+        // Always release the lock, even if provisioning failed.
+        let _ = sqlx::query("select pg_advisory_unlock($1)")
+            .bind(CONTROL_PLANE_LOCK_KEY)
+            .execute(&mut *conn)
+            .await;
+        result
+    }
+
+    /// Return the decrypted control-plane key secret, or `None` if it has not
+    /// been provisioned yet.
+    pub async fn control_plane_key_secret(&self) -> Result<Option<String>> {
+        let row = sqlx::query("select value from app_settings where key = 'control_plane_key'")
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => {
+                let value: sqlx::types::Json<String> = row.try_get("value")?;
+                Ok(Some(cipher().decrypt(&value.0)?))
+            }
+            None => Ok(None),
+        }
     }
 
     pub async fn list_keys(&self, tenant_id: Option<Uuid>) -> Result<Vec<ApiKey>> {
@@ -2824,6 +2916,52 @@ mod tests {
             vec![],
             vec![],
         )
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    #[tokio::test]
+    async fn control_plane_identity_is_idempotent() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        store
+            .ensure_control_plane_identity()
+            .await
+            .expect("provision");
+        let first = store.control_plane_key_secret().await.expect("read secret");
+        assert!(first.is_some(), "secret stored on first provision");
+
+        // Second call must not rotate the secret or create a duplicate key.
+        store
+            .ensure_control_plane_identity()
+            .await
+            .expect("re-provision");
+        let second = store
+            .control_plane_key_secret()
+            .await
+            .expect("read secret again");
+        assert_eq!(first, second, "secret stable across repeat provisioning");
+
+        // The stored secret resolves to a key owned by the reserved tenant.
+        let hash = hash_api_key(first.as_deref().unwrap());
+        let resolved = store
+            .resolved_key_by_hash(&hash)
+            .await
+            .expect("resolve")
+            .expect("present");
+        assert_eq!(resolved.tenant_id, Store::CONTROL_PLANE_TENANT_ID);
+
+        // Exactly one key under the reserved tenant (idempotent, no duplicates).
+        let keys = store
+            .list_keys(Some(Store::CONTROL_PLANE_TENANT_ID))
+            .await
+            .expect("list keys");
+        assert_eq!(keys.len(), 1, "exactly one reserved key");
     }
 
     #[tokio::test]
