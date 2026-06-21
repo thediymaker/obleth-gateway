@@ -235,6 +235,10 @@ pub fn router(state: AdminState) -> Router {
         )
         .route("/api/v1/backup/export", get(backup::export_backup))
         .route(
+            "/api/v1/system/control-plane-key",
+            get(get_control_plane_key),
+        )
+        .route(
             "/api/v1/backup/restore",
             // Backups with large key fleets exceed axum's 2 MB default body
             // limit; raise it for this route only.
@@ -1748,6 +1752,25 @@ async fn list_keys(
     // Hide the reserved control-plane key (Charo's) from the management surface.
     keys.retain(|k| k.tenant_id != Store::CONTROL_PLANE_TENANT_ID);
     Ok(Json(keys))
+}
+
+#[derive(Serialize)]
+struct ControlPlaneKeyView {
+    secret: String,
+}
+
+/// Admin-gated: hand the server-side control-plane (Charo) its reserved API key
+/// secret so it can call the data plane on the operator's behalf. The secret is
+/// decrypted from `app_settings` and must never reach the browser.
+async fn get_control_plane_key(
+    State(state): State<AdminState>,
+) -> Result<Json<ControlPlaneKeyView>> {
+    match state.store.control_plane_key_secret().await? {
+        Some(secret) => Ok(Json(ControlPlaneKeyView { secret })),
+        None => Err(AdminError::Internal(
+            "control-plane identity not provisioned".into(),
+        )),
+    }
 }
 
 #[utoipa::path(
