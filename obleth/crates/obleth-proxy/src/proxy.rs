@@ -421,7 +421,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                         + (cached.output_tokens as f64) * out_cost_rate
                         + modality_cost,
                 );
-                return cached_response(cached);
+                return cached_response(cached, request_id);
             }
             Ok(None) => {
                 if let Some(ref mut t) = tracer {
@@ -1051,6 +1051,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 let mut builder = Response::builder()
                     .status(status_code)
                     .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header("x-obleth-request-id", request_id.to_string())
                     .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
                 if !boons_applied.is_empty() {
                     builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -1223,6 +1224,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         let mut builder = Response::builder()
             .status(status_code)
             .header(header::CONTENT_TYPE, final_content_type)
+            .header("x-obleth-request-id", request_id.to_string())
             .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
         if !boons_applied.is_empty() {
             builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -1386,6 +1388,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let mut builder = Response::builder().status(status_code);
     builder = builder
         .header(header::CONTENT_TYPE, content_type)
+        .header("x-obleth-request-id", request_id.to_string())
         .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
     if !boons_applied.is_empty() {
         builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -2374,7 +2377,7 @@ fn finalize(
 
 /// Build an HTTP response from a cached entry, replaying the stored body and
 /// content-type (works for both JSON and buffered SSE).
-fn cached_response(cached: obleth_config::CachedResponse) -> Response<Body> {
+fn cached_response(cached: obleth_config::CachedResponse, request_id: Uuid) -> Response<Body> {
     let content_type = header::HeaderValue::from_str(&cached.content_type)
         .unwrap_or_else(|_| header::HeaderValue::from_static("application/json"));
     let status = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
@@ -2382,6 +2385,7 @@ fn cached_response(cached: obleth_config::CachedResponse) -> Response<Body> {
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
         .header("x-obleth-cache", "hit")
+        .header("x-obleth-request-id", request_id.to_string())
         .body(Body::from(cached.body))
         .unwrap_or_else(|_| {
             error_json(
