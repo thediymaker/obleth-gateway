@@ -181,6 +181,8 @@ services:
       HOSTNAME: 0.0.0.0
       PORT: "3000"
       OBLETH_ADMIN_BASE_URL: http://obleth:9180
+      # Data plane (model-test console): reach the gateway's /v1 endpoint in-cluster.
+      OBLETH_PROXY_BASE_URL: http://obleth:8080
       OBLETH_ADMIN_TOKEN: ${OBLETH_ADMIN_TOKEN:?set OBLETH_ADMIN_TOKEN in deploy/docker/.env (copy from .env.example)}
       DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:?set DASHBOARD_USERNAME in deploy/docker/.env}
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD (or DASHBOARD_PASSWORD_HASH) in deploy/docker/.env}

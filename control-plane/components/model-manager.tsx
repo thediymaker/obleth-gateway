@@ -1097,38 +1097,7 @@ function CreateModelWizard({
 
               <section className={cn("space-y-3", step !== 4 && "hidden")}>
                 {createType === "chat" ? (
-                  <>
-                    <FieldGroup label="Capabilities" hint="What the model natively supports. These gate request features and routing.">
-                      <ChipCheckbox name="supports_function_calling" label="Function calling" />
-                      <ChipCheckbox name="supports_system_messages" label="System messages" defaultChecked />
-                      <ChipCheckbox name="supports_response_schema" label="Response schema" />
-                      <ChipCheckbox name="supports_tool_choice" label="Tool choice" />
-                    </FieldGroup>
-                    <FieldGroup label="Routing tags" hint="Hints the auto router matches against request intent. Vision marks native image support.">
-                      {MODEL_TAGS.map((tag) => (
-                        <ChipCheckbox key={tag} name={`tag_${tag}`} label={tag} />
-                      ))}
-                    </FieldGroup>
-                    <FieldGroup label="Boons" hint="Gateway capabilities granted to this model that it lacks natively.">
-                      {MODEL_BOONS.map((boon) => (
-                        <ChipCheckbox key={boon.value} name={`boon_${boon.value}`} label={boon.label} hint={boon.description} />
-                      ))}
-                    </FieldGroup>
-                    <FieldGroup label="Tools" hint="Registered MCP servers whose tools this model may use.">
-                      {mcpServers.length === 0 ? (
-                        <p className="text-xs text-muted-foreground">No MCP servers registered. Add one on the MCP page first.</p>
-                      ) : (
-                        mcpServers.map((server) => (
-                          <ChipCheckbox
-                            key={server.id}
-                            name={`tool_server_${server.name}`}
-                            label={server.name}
-                            hint={`Grant this model the tools served by ${server.name} (${server.upstream_url}).`}
-                          />
-                        ))
-                      )}
-                    </FieldGroup>
-                  </>
+                  <ChatCapabilityFields mcpServers={mcpServers} />
                 ) : (
                   <div className="rounded-md border border-border/70 bg-background/35 p-4">
                     <p className="text-sm font-medium">No chat-only capability flags for this route type.</p>
@@ -1583,50 +1552,7 @@ function CapabilitiesTab({
           <div className="grid gap-4 p-4">
             <Field label="Context window" name="context_window" type="number" defaultValue={String(model.context_window)} />
             {editType === "chat" && (
-              <>
-                <ChipGroup label="Native capabilities" info="What the model natively supports. These gate request features and routing.">
-                  <ChipCheckbox name="supports_function_calling" label="Function calling" defaultChecked={model.supports_function_calling} />
-                  <ChipCheckbox name="supports_system_messages" label="System messages" defaultChecked={model.supports_system_messages} />
-                  <ChipCheckbox name="supports_response_schema" label="Response schema" defaultChecked={model.supports_response_schema} />
-                  <ChipCheckbox name="supports_tool_choice" label="Tool choice" defaultChecked={model.supports_tool_choice} />
-                </ChipGroup>
-                <ChipGroup label="Routing tags" info="Hints the auto router matches against request intent. The “vision” tag marks native image support.">
-                  {MODEL_TAGS.map((tag) => (
-                    <ChipCheckbox
-                      key={tag}
-                      name={`tag_${tag}`}
-                      label={tag}
-                      defaultChecked={(model.tags?.includes(tag) ?? false) || (tag === "vision" && model.supports_vision)}
-                    />
-                  ))}
-                </ChipGroup>
-                <ChipGroup label="Boons" info="Gateway capabilities granted that the model lacks natively. Configure in Settings → Boons.">
-                  {MODEL_BOONS.map((boon) => (
-                    <ChipCheckbox
-                      key={boon.value}
-                      name={`boon_${boon.value}`}
-                      label={boon.label}
-                      hint={boon.description}
-                      defaultChecked={model.boons?.includes(boon.value) ?? false}
-                    />
-                  ))}
-                </ChipGroup>
-                <ChipGroup label="Tools" info="Registered MCP servers whose tools this model may use. The gateway injects the tools into plain chat requests and runs the tool loop itself. Enable the loop in Settings → Boons.">
-                  {mcpServers.length === 0 ? (
-                    <p className="text-xs text-muted-foreground">No MCP servers registered. Add one on the MCP page first.</p>
-                  ) : (
-                    mcpServers.map((server) => (
-                      <ChipCheckbox
-                        key={server.id}
-                        name={`tool_server_${server.name}`}
-                        label={server.name}
-                        hint={`Grant this model the tools served by ${server.name} (${server.upstream_url}).`}
-                        defaultChecked={model.tool_servers?.includes(server.name) ?? false}
-                      />
-                    ))
-                  )}
-                </ChipGroup>
-              </>
+              <ChatCapabilityFields model={model} mcpServers={mcpServers} />
             )}
           </div>
           {state?.ok === false && (
@@ -2433,11 +2359,38 @@ function ChipGroup({ label, hint, info, children }: { label: string; hint?: stri
 
 // Checkbox dressed as a selectable chip. Keeps native form semantics (the
 // hidden input still submits) while reading as a tag picker instead of a
-// wall of checkboxes.
-function ChipCheckbox({ name, label, defaultChecked, hint }: { name: string; label: string; defaultChecked?: boolean; hint?: string }) {
+// wall of checkboxes. Supports an optional controlled mode (`checked` +
+// `onChange`) for fields whose state drives other fields, and `disabled` for
+// gated options.
+function ChipCheckbox({
+  name,
+  label,
+  defaultChecked,
+  checked,
+  onChange,
+  disabled,
+  hint,
+}: {
+  name: string;
+  label: string;
+  defaultChecked?: boolean;
+  checked?: boolean;
+  onChange?: (checked: boolean) => void;
+  disabled?: boolean;
+  hint?: string;
+}) {
+  const controlled = checked !== undefined;
   return (
-    <label title={hint} className="cursor-pointer">
-      <input type="checkbox" name={name} defaultChecked={defaultChecked} className="peer sr-only" />
+    <label title={hint} className={cn(disabled ? "cursor-not-allowed" : "cursor-pointer")}>
+      <input
+        type="checkbox"
+        name={name}
+        disabled={disabled}
+        className="peer sr-only"
+        {...(controlled
+          ? { checked, onChange: (e: ChangeEvent<HTMLInputElement>) => onChange?.(e.target.checked) }
+          : { defaultChecked })}
+      />
       <span
         className={cn(
           "inline-flex items-center gap-1.5 rounded-md border border-border bg-transparent px-2 py-1 text-xs font-medium text-muted-foreground transition-colors",
@@ -2445,12 +2398,97 @@ function ChipCheckbox({ name, label, defaultChecked, hint }: { name: string; lab
           "peer-checked:bg-secondary peer-checked:text-foreground",
           "peer-focus-visible:ring-1 peer-focus-visible:ring-ring",
           "[&>svg]:hidden peer-checked:[&>svg]:block",
+          disabled && "pointer-events-none opacity-40",
         )}
       >
         <Check className="h-3 w-3" strokeWidth={2.5} />
         {label}
       </span>
     </label>
+  );
+}
+
+// Native capabilities, routing tags, boons, and MCP tool grants for chat
+// routes, shared by the create wizard and the edit panel. Tool grants depend
+// on native function calling + tool choice: without them the gateway can't run
+// the tool loop and silently drops the tools (the model then claims it can't
+// search). Rather than letting that misconfiguration through, the Tools group
+// is disabled until both capabilities are on, and any existing grants are
+// cleared the moment either is turned off.
+function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute; mcpServers: McpServer[] }) {
+  const [fnCalling, setFnCalling] = useState(model?.supports_function_calling ?? false);
+  const [toolChoice, setToolChoice] = useState(model?.supports_tool_choice ?? false);
+  const [granted, setGranted] = useState<Set<string>>(() => new Set(model?.tool_servers ?? []));
+  const toolsReady = fnCalling && toolChoice;
+
+  useEffect(() => {
+    if (!toolsReady) {
+      setGranted((prev) => (prev.size === 0 ? prev : new Set()));
+    }
+  }, [toolsReady]);
+
+  return (
+    <>
+      <ChipGroup label="Native capabilities" info="What the model natively supports. These gate request features and routing.">
+        <ChipCheckbox name="supports_function_calling" label="Function calling" checked={fnCalling} onChange={setFnCalling} />
+        <ChipCheckbox name="supports_system_messages" label="System messages" defaultChecked={model ? model.supports_system_messages : true} />
+        <ChipCheckbox name="supports_response_schema" label="Response schema" defaultChecked={model?.supports_response_schema ?? false} />
+        <ChipCheckbox name="supports_tool_choice" label="Tool choice" checked={toolChoice} onChange={setToolChoice} />
+      </ChipGroup>
+      <ChipGroup label="Routing tags" info="Hints the auto router matches against request intent. The “vision” tag marks native image support.">
+        {MODEL_TAGS.map((tag) => (
+          <ChipCheckbox
+            key={tag}
+            name={`tag_${tag}`}
+            label={tag}
+            defaultChecked={model ? (model.tags?.includes(tag) ?? false) || (tag === "vision" && model.supports_vision) : false}
+          />
+        ))}
+      </ChipGroup>
+      <ChipGroup label="Boons" info="Gateway capabilities granted that the model lacks natively. Configure in Settings → Boons.">
+        {MODEL_BOONS.map((boon) => (
+          <ChipCheckbox
+            key={boon.value}
+            name={`boon_${boon.value}`}
+            label={boon.label}
+            hint={boon.description}
+            defaultChecked={model?.boons?.includes(boon.value) ?? false}
+          />
+        ))}
+      </ChipGroup>
+      <ChipGroup
+        label="Tools"
+        info="Registered MCP servers whose tools this model may use. The gateway runs the tool loop itself, which needs native function calling + tool choice."
+      >
+        {mcpServers.length === 0 ? (
+          <p className="text-xs text-muted-foreground">No MCP servers registered. Add one on the MCP page first.</p>
+        ) : !toolsReady ? (
+          <p className="max-w-prose text-[11px] leading-snug text-amber-500/90">
+            Enable <span className="font-medium text-foreground">Function calling</span> and{" "}
+            <span className="font-medium text-foreground">Tool choice</span> above to grant tools — the gateway’s tool
+            loop can’t run without them.
+          </p>
+        ) : (
+          mcpServers.map((server) => (
+            <ChipCheckbox
+              key={server.id}
+              name={`tool_server_${server.name}`}
+              label={server.name}
+              hint={`Grant this model the tools served by ${server.name} (${server.upstream_url}).`}
+              checked={granted.has(server.name)}
+              onChange={(c) =>
+                setGranted((prev) => {
+                  const next = new Set(prev);
+                  if (c) next.add(server.name);
+                  else next.delete(server.name);
+                  return next;
+                })
+              }
+            />
+          ))
+        )}
+      </ChipGroup>
+    </>
   );
 }
 
@@ -2629,18 +2667,6 @@ function StatCard({ label, value, hint, tone }: { label: string; value: string; 
       {hint && (
         <p className={cn("mt-0.5 text-[11px]", tone === "bad" ? "text-destructive" : "text-muted-foreground")}>{hint}</p>
       )}
-    </div>
-  );
-}
-
-// A labeled, bordered cluster of related checkboxes. Keeps the capability,
-// routing-tag and boon groups visually consistent inside the model forms.
-function FieldGroup({ label, hint, children }: { label: string; hint?: string; children: ReactNode }) {
-  return (
-    <div className="md:col-span-2 rounded-md border border-border/60 bg-background/30 p-3">
-      <Label className="block text-xs font-medium text-foreground">{label}</Label>
-      {hint && <p className="mt-0.5 mb-2 max-w-prose text-[11px] leading-snug text-muted-foreground">{hint}</p>}
-      <div className={cn("flex flex-wrap gap-x-4 gap-y-2", !hint && "mt-2")}>{children}</div>
     </div>
   );
 }

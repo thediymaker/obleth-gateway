@@ -1283,6 +1283,20 @@ export async function setBoonSettingsAction(
   return { ok: true };
 }
 
+export async function setCharoSettingsAction(
+  enabled: boolean,
+): Promise<ActionResult> {
+  await requireSession();
+  try {
+    await obleth.setCharoSettings({ enabled });
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/settings");
+  revalidatePath("/", "layout");
+  return { ok: true };
+}
+
 export async function setSlurmSettingsAction(
   body: UpdateSlurmSettings,
 ): Promise<ActionResult> {

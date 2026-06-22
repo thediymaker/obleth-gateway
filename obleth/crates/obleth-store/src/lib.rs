@@ -2253,6 +2253,34 @@ impl Store {
         Ok(())
     }
 
+    /// Whether the Charo control-plane assistant is enabled in the dashboard UI.
+    /// `None` means unset (callers should treat this as enabled by default).
+    pub async fn get_charo_enabled(&self) -> Result<Option<bool>> {
+        let row = sqlx::query("select value from app_settings where key = 'charo_enabled'")
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => {
+                let value: sqlx::types::Json<bool> = row.try_get("value")?;
+                Ok(Some(value.0))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the Charo assistant UI toggle (upsert on the `charo_enabled` key).
+    pub async fn set_charo_enabled(&self, enabled: bool) -> Result<()> {
+        sqlx::query(
+            "insert into app_settings (key, value, updated_at)
+             values ('charo_enabled', $1, now())
+             on conflict (key) do update set value = excluded.value, updated_at = now()",
+        )
+        .bind(sqlx::types::Json(enabled))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Load the persisted raw-usage retention setting, or `None` if unset.
     pub async fn get_usage_retention_settings(
         &self,

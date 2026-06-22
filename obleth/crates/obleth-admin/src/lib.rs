@@ -218,6 +218,10 @@ pub fn router(state: AdminState) -> Router {
             get(get_boon_settings).put(put_boon_settings),
         )
         .route(
+            "/api/v1/settings/charo",
+            get(get_charo_settings).put(put_charo_settings),
+        )
+        .route(
             "/api/v1/settings/usage-retention",
             get(get_usage_retention).put(put_usage_retention),
         )
@@ -1568,6 +1572,46 @@ async fn put_boon_settings(
         )
         .await?;
     Ok(Json(BoonSettingsView::from_settings(&settings)))
+}
+
+/// Whether the Charo control-plane assistant is shown in the dashboard.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CharoSettingsView {
+    pub enabled: bool,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/settings/charo", tag = "settings",
+    responses((status = 200, body = CharoSettingsView))
+)]
+async fn get_charo_settings(State(state): State<AdminState>) -> Result<Json<CharoSettingsView>> {
+    let enabled = state.store.get_charo_enabled().await?.unwrap_or(true);
+    Ok(Json(CharoSettingsView { enabled }))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/settings/charo", tag = "settings",
+    request_body = CharoSettingsView,
+    responses((status = 200, body = CharoSettingsView))
+)]
+async fn put_charo_settings(
+    State(state): State<AdminState>,
+    Json(body): Json<CharoSettingsView>,
+) -> Result<Json<CharoSettingsView>> {
+    state.store.set_charo_enabled(body.enabled).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "set_charo_settings",
+            "settings",
+            "charo",
+            serde_json::json!({ "enabled": body.enabled }),
+        )
+        .await?;
+    Ok(Json(CharoSettingsView {
+        enabled: body.enabled,
+    }))
 }
 
 #[derive(Debug, Serialize, ToSchema)]

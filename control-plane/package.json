@@ -1,6 +1,6 @@
 {
   "name": "obleth-control-plane",
-  "version": "0.3.8",
+  "version": "0.4.0",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000",
@@ -25,6 +25,7 @@
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "date-fns": "^4.4.0",
+    "framer-motion": "^12.40.0",
     "jose": "^5.9.6",
     "lucide-react": "^0.469.0",
     "next": "^16.2.6",

@@ -6,6 +6,7 @@ import {
   setAlertSettingsAction,
   setAutoRouterSettingsAction,
   setBoonSettingsAction,
+  setCharoSettingsAction,
   testAlertAction,
   setSlurmSettingsAction,
   testSlurmConnectionAction,
@@ -21,6 +22,7 @@ import type {
   AlertSettingsView,
   AutoRouterSettingsView,
   BoonSettingsView,
+  CharoSettingsView,
   ModelRoute,
   SlurmHealthView,
   SlurmSettingsView,
@@ -698,6 +700,64 @@ export function BoonsSettingsForm({
 
         <Button onClick={save} disabled={pending}>
           {pending ? "Saving..." : "Save boons"}
+        </Button>
+        {status && (
+          <p
+            className={
+              status.ok
+                ? "rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
+                : "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            }
+          >
+            {status.message}
+          </p>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+export function CharoSettingsForm({ settings }: { settings: CharoSettingsView | null }) {
+  const [pending, start] = useTransition();
+  const [status, setStatus] = useState<{ ok: boolean; message: string } | null>(null);
+  const [enabled, setEnabled] = useState(settings?.enabled ?? true);
+
+  function save() {
+    setStatus(null);
+    start(async () => {
+      const result = await setCharoSettingsAction(enabled);
+      setStatus(
+        result.ok
+          ? { ok: true, message: "Assistant settings saved." }
+          : { ok: false, message: result.error },
+      );
+    });
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Charo assistant</CardTitle>
+        <CardDescription>
+          Charo is a draggable on-screen companion for operators. Open it to chat-test any model
+          through the gateway and confirm its configured boons (web search, tools, vision,
+          guardrails, structured output, cache) actually fire. Every token is billed to the
+          reserved internal tenant, so accounting stays intact. Disable it to hide Charo from the
+          dashboard for everyone.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <label className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => setEnabled(e.target.checked)}
+            className="h-4 w-4"
+          />
+          Show Charo in the dashboard
+        </label>
+        <Button onClick={save} disabled={pending}>
+          {pending ? "Saving..." : "Save assistant"}
         </Button>
         {status && (
           <p
