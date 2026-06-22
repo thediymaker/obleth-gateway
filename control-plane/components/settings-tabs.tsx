@@ -1,11 +1,12 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { Bell, Route, Database, Info, Server } from "lucide-react";
+import { Bell, Route, Database, Info, Server, Bot } from "lucide-react";
 import {
   AlertSettingsForm,
   AutoRouterSettingsForm,
   BoonsSettingsForm,
+  CharoSettingsForm,
   SlurmSettingsForm,
   UsageRetentionForm,
 } from "@/components/settings-form";
@@ -15,6 +16,7 @@ import type {
   AlertSettingsView,
   AutoRouterSettingsView,
   BoonSettingsView,
+  CharoSettingsView,
   ModelRoute,
   SlurmSettingsView,
   UsageRetentionView,
@@ -24,6 +26,7 @@ export function SettingsTabs({
   alertSettings,
   autoRouter,
   boons,
+  charo,
   models,
   retention,
   slurm,
@@ -32,6 +35,7 @@ export function SettingsTabs({
   alertSettings: AlertSettingsView | null;
   autoRouter: AutoRouterSettingsView | null;
   boons: BoonSettingsView | null;
+  charo: CharoSettingsView | null;
   models: ModelRoute[];
   retention: UsageRetentionView | null;
   slurm: SlurmSettingsView | null;
@@ -55,6 +59,10 @@ export function SettingsTabs({
         <TabsTrigger value="slurm">
           <Server className="h-3.5 w-3.5" />
           Slurm
+        </TabsTrigger>
+        <TabsTrigger value="assistant">
+          <Bot className="h-3.5 w-3.5" />
+          Assistant
         </TabsTrigger>
         <TabsTrigger value="about">
           <Info className="h-3.5 w-3.5" />
@@ -82,6 +90,10 @@ export function SettingsTabs({
 
       <TabsContent value="slurm">
         <SlurmSettingsForm settings={slurm} />
+      </TabsContent>
+
+      <TabsContent value="assistant">
+        <CharoSettingsForm settings={charo} />
       </TabsContent>
 
       <TabsContent value="about">{versionCard}</TabsContent>

@@ -51,3 +51,5 @@ Thumbs.db
 deploy/docker/docker-compose.override.yml
 
 obench/.obench.json
+
+/asset-tools

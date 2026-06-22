@@ -43,10 +43,28 @@ const BOON_MIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// front of the gateway. (HAProxy honours `option http-no-delay` instead.)
 const NO_BUFFER_HEADER: (&str, &str) = ("x-accel-buffering", "no");
 
-#[tracing::instrument(skip_all, name = "proxy_request")]
-pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) -> Response<Body> {
-    let request_start = Instant::now();
+pub async fn proxy_handler(state: State<AppState>, req: Request<Body>) -> Response<Body> {
     let request_id = Uuid::new_v4();
+    let mut resp = proxy_handler_inner(state, req, request_id).await;
+    // Ensure every response — including error paths that build their own response —
+    // carries the request id so callers (e.g. the Charo model-test console) can always
+    // fetch the request's trace. Success/stream/cache paths set this already; this is a
+    // no-op for them and only fills it in for the error branches.
+    if !resp.headers().contains_key("x-obleth-request-id") {
+        if let Ok(value) = header::HeaderValue::from_str(&request_id.to_string()) {
+            resp.headers_mut().insert("x-obleth-request-id", value);
+        }
+    }
+    resp
+}
+
+#[tracing::instrument(skip_all, name = "proxy_request")]
+async fn proxy_handler_inner(
+    State(state): State<AppState>,
+    req: Request<Body>,
+    request_id: Uuid,
+) -> Response<Body> {
+    let request_start = Instant::now();
     let proxy_start_ms = crate::tracer::now_ms();
     let (parts, body) = req.into_parts();
     let method = parts.method;
@@ -421,7 +439,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                         + (cached.output_tokens as f64) * out_cost_rate
                         + modality_cost,
                 );
-                return cached_response(cached);
+                return cached_response(cached, request_id);
             }
             Ok(None) => {
                 if let Some(ref mut t) = tracer {
@@ -1051,6 +1069,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
                 let mut builder = Response::builder()
                     .status(status_code)
                     .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header("x-obleth-request-id", request_id.to_string())
                     .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
                 if !boons_applied.is_empty() {
                     builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -1223,6 +1242,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
         let mut builder = Response::builder()
             .status(status_code)
             .header(header::CONTENT_TYPE, final_content_type)
+            .header("x-obleth-request-id", request_id.to_string())
             .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
         if !boons_applied.is_empty() {
             builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -1386,6 +1406,7 @@ pub async fn proxy_handler(State(state): State<AppState>, req: Request<Body>) ->
     let mut builder = Response::builder().status(status_code);
     builder = builder
         .header(header::CONTENT_TYPE, content_type)
+        .header("x-obleth-request-id", request_id.to_string())
         .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
     if !boons_applied.is_empty() {
         builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
@@ -2374,7 +2395,7 @@ fn finalize(
 
 /// Build an HTTP response from a cached entry, replaying the stored body and
 /// content-type (works for both JSON and buffered SSE).
-fn cached_response(cached: obleth_config::CachedResponse) -> Response<Body> {
+fn cached_response(cached: obleth_config::CachedResponse, request_id: Uuid) -> Response<Body> {
     let content_type = header::HeaderValue::from_str(&cached.content_type)
         .unwrap_or_else(|_| header::HeaderValue::from_static("application/json"));
     let status = StatusCode::from_u16(cached.status).unwrap_or(StatusCode::OK);
@@ -2382,6 +2403,7 @@ fn cached_response(cached: obleth_config::CachedResponse) -> Response<Body> {
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
         .header("x-obleth-cache", "hit")
+        .header("x-obleth-request-id", request_id.to_string())
         .body(Body::from(cached.body))
         .unwrap_or_else(|_| {
             error_json(

@@ -218,6 +218,10 @@ pub fn router(state: AdminState) -> Router {
             get(get_boon_settings).put(put_boon_settings),
         )
         .route(
+            "/api/v1/settings/charo",
+            get(get_charo_settings).put(put_charo_settings),
+        )
+        .route(
             "/api/v1/settings/usage-retention",
             get(get_usage_retention).put(put_usage_retention),
         )
@@ -234,6 +238,10 @@ pub fn router(state: AdminState) -> Router {
             get(slurm_settings::get_slurm_settings_resolved),
         )
         .route("/api/v1/backup/export", get(backup::export_backup))
+        .route(
+            "/api/v1/system/control-plane-key",
+            get(get_control_plane_key),
+        )
         .route(
             "/api/v1/backup/restore",
             // Backups with large key fleets exceed axum's 2 MB default body
@@ -844,7 +852,11 @@ async fn create_tenant(
 
 #[utoipa::path(get, path = "/api/v1/tenants", tag = "tenants", responses((status = 200, body = [Tenant])))]
 async fn list_tenants(State(state): State<AdminState>) -> Result<Json<Vec<Tenant>>> {
-    Ok(Json(state.store.list_tenants().await?))
+    let mut tenants = state.store.list_tenants().await?;
+    // The reserved control-plane identity (Charo) is system-owned: hide it from
+    // the management surface so it can't be edited/deleted by mistake.
+    tenants.retain(|t| t.id != Store::CONTROL_PLANE_TENANT_ID);
+    Ok(Json(tenants))
 }
 
 #[utoipa::path(
@@ -1562,6 +1574,46 @@ async fn put_boon_settings(
     Ok(Json(BoonSettingsView::from_settings(&settings)))
 }
 
+/// Whether the Charo control-plane assistant is shown in the dashboard.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct CharoSettingsView {
+    pub enabled: bool,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/settings/charo", tag = "settings",
+    responses((status = 200, body = CharoSettingsView))
+)]
+async fn get_charo_settings(State(state): State<AdminState>) -> Result<Json<CharoSettingsView>> {
+    let enabled = state.store.get_charo_enabled().await?.unwrap_or(true);
+    Ok(Json(CharoSettingsView { enabled }))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/settings/charo", tag = "settings",
+    request_body = CharoSettingsView,
+    responses((status = 200, body = CharoSettingsView))
+)]
+async fn put_charo_settings(
+    State(state): State<AdminState>,
+    Json(body): Json<CharoSettingsView>,
+) -> Result<Json<CharoSettingsView>> {
+    state.store.set_charo_enabled(body.enabled).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "set_charo_settings",
+            "settings",
+            "charo",
+            serde_json::json!({ "enabled": body.enabled }),
+        )
+        .await?;
+    Ok(Json(CharoSettingsView {
+        enabled: body.enabled,
+    }))
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TestAlertResult {
     pub results: Vec<alerts::ChannelResult>,
@@ -1675,6 +1727,12 @@ async fn create_key(
     Path(tenant_id): Path<Uuid>,
     Json(body): Json<CreateKey>,
 ) -> Result<Json<CreatedKey>> {
+    // The reserved control-plane tenant is system-owned and not user-manageable.
+    if tenant_id == Store::CONTROL_PLANE_TENANT_ID {
+        return Err(AdminError::Store(obleth_store::StoreError::Protected(
+            "the reserved control-plane tenant cannot be modified".into(),
+        )));
+    }
     let name = body.name.trim().to_string();
     if name.is_empty() {
         return Err(AdminError::BadRequest("key name is required".into()));
@@ -1734,7 +1792,29 @@ async fn list_keys(
     State(state): State<AdminState>,
     Query(q): Query<ListKeysQuery>,
 ) -> Result<Json<Vec<ApiKey>>> {
-    Ok(Json(state.store.list_keys(q.tenant_id).await?))
+    let mut keys = state.store.list_keys(q.tenant_id).await?;
+    // Hide the reserved control-plane key (Charo's) from the management surface.
+    keys.retain(|k| k.tenant_id != Store::CONTROL_PLANE_TENANT_ID);
+    Ok(Json(keys))
+}
+
+#[derive(Serialize)]
+struct ControlPlaneKeyView {
+    secret: String,
+}
+
+/// Admin-gated: hand the server-side control-plane (Charo) its reserved API key
+/// secret so it can call the data plane on the operator's behalf. The secret is
+/// decrypted from `app_settings` and must never reach the browser.
+async fn get_control_plane_key(
+    State(state): State<AdminState>,
+) -> Result<Json<ControlPlaneKeyView>> {
+    match state.store.control_plane_key_secret().await? {
+        Some(secret) => Ok(Json(ControlPlaneKeyView { secret })),
+        None => Err(AdminError::Internal(
+            "control-plane identity not provisioned".into(),
+        )),
+    }
 }
 
 #[utoipa::path(

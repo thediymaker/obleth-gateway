@@ -334,20 +334,121 @@ pub fn run(
             continue 'turns;
         }
 
-        // Ran out of turns with the model still wanting tools.
-        yield Ok(Bytes::from(content_chunk(
-            "chatcmpl-toolstream",
-            &upstream_model,
-            created,
-            "\n\n[reached the tool-call turn limit; answering with what was gathered]\n\n",
-        )));
-        yield Ok(Bytes::from(finish_chunk(
-            "chatcmpl-toolstream",
-            &upstream_model,
-            created,
-            None,
-        )));
+        // Ran out of turns with the model still wanting tools. Mirror the
+        // buffered loop: strip the tools, ask the model to answer from what it
+        // already gathered, and stream that final turn live. Emitting only a
+        // bare "[turn limit]" marker (as before) left the user with no answer
+        // at all even though tool results were collected.
+        if let Some(obj) = request.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+            obj.insert("stream".into(), Value::Bool(true));
+            obj.insert("stream_options".into(), json!({ "include_usage": true }));
+            obj.insert("model".into(), Value::String(upstream_model.clone()));
+        }
+        super::tool_loop::push_message(
+            &mut request,
+            json!({
+                "role": "user",
+                "content": "Please answer the original question now using the information \
+                            already gathered above. Do not call any more tools.",
+            }),
+        );
+
+        let final_resp = match dispatch(&state, &route, &request, dispatch_timeout).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(error = %e, "tool stream finalization dispatch failed");
+                yield Ok(Bytes::from(content_chunk(
+                    "chatcmpl-toolstream",
+                    &upstream_model,
+                    created,
+                    "\n\n[reached the tool-call turn limit and could not produce a final answer]\n\n",
+                )));
+                yield Ok(Bytes::from(finish_chunk(
+                    "chatcmpl-toolstream",
+                    &upstream_model,
+                    created,
+                    None,
+                )));
+                yield Ok(Bytes::from(done()));
+                finalize_stats(&stats, None);
+                return;
+            }
+        };
+
+        let mut bytes = final_resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut usage: Option<(u32, u32)> = None;
+        let mut id = String::from("chatcmpl-toolstream");
+        let mut model_name = upstream_model.clone();
+        let mut finish_reason: Option<Value> = None;
+        let mut turn_done = false;
+
+        'final_read: while let Some(item) = bytes.next().await {
+            let chunk = match item {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(error = %e, "tool stream final read error");
+                    break 'final_read;
+                }
+            };
+            buf.extend_from_slice(&chunk);
+            while let Some(event) = split_event(&mut buf) {
+                for data in parse_data_lines(&event) {
+                    if data == "[DONE]" {
+                        turn_done = true;
+                        continue;
+                    }
+                    let Ok(v) = serde_json::from_str::<Value>(&data) else {
+                        continue;
+                    };
+                    if let Some(x) = v.get("id").and_then(|x| x.as_str()) {
+                        id = x.to_string();
+                    }
+                    if let Some(x) = v.get("model").and_then(|x| x.as_str()) {
+                        model_name = x.to_string();
+                    }
+                    if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
+                        let it = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                        let ot = u.get("completion_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+                        usage = Some((it, ot));
+                    }
+                    if let Some(fr) = v
+                        .pointer("/choices/0/finish_reason")
+                        .filter(|fr| !fr.is_null())
+                    {
+                        finish_reason = Some(fr.clone());
+                    }
+                    let delta = v.pointer("/choices/0/delta").cloned().unwrap_or(Value::Null);
+                    let content = delta.get("content").and_then(|c| c.as_str()).unwrap_or("");
+                    let reasoning = delta
+                        .get("reasoning_content")
+                        .or_else(|| delta.get("reasoning"))
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("");
+                    if !content.is_empty() || !reasoning.is_empty() {
+                        set_ttft(&stats, upstream_start.elapsed().as_millis() as u32);
+                        yield Ok(Bytes::from(format!("data: {}\n\n", forward_delta(&v))));
+                    }
+                }
+            }
+            if turn_done {
+                break 'final_read;
+            }
+        }
+
+        // The finalization turn is the client-facing final answer, so it is
+        // settled as the main request via `finalize_stats` below — not billed
+        // as a separate helper call (that would double-charge this turn).
+        yield Ok(Bytes::from(finish_chunk(&id, &model_name, created, finish_reason)));
+        if client_include_usage {
+            if let Some((it, ot)) = usage {
+                yield Ok(Bytes::from(usage_chunk(&id, &model_name, created, it, ot)));
+            }
+        }
         yield Ok(Bytes::from(done()));
+        finalize_stats(&stats, usage);
     }
 }
 

@@ -667,6 +667,10 @@ export interface UpdateBoonSettings {
   tool_loop_nudge?: string;
 }
 
+export interface CharoSettingsView {
+  enabled: boolean;
+}
+
 export interface ChannelResult {
   channel: string;
   ok: boolean;
@@ -1192,6 +1196,10 @@ export const obleth = {
     ),
   getRequestSpans: (requestId: string) =>
     api<SpanEntry[]>(`/usage/logs/${requestId}/spans`).catch(() => [] as SpanEntry[]),
+  // Server-only: hand the control-plane (Charo's model-test console) the reserved
+  // system key secret so it can call the data plane as the protected internal tenant.
+  controlPlaneKey: () =>
+    api<{ secret: string }>("/system/control-plane-key"),
   getUsageRetention: () => api<UsageRetentionView>("/settings/usage-retention"),
   setUsageRetention: (days: number) =>
     api<UsageRetentionView>("/settings/usage-retention", {
@@ -1227,6 +1235,12 @@ export const obleth = {
   getBoonSettings: () => api<BoonSettingsView>("/settings/boons"),
   setBoonSettings: (body: UpdateBoonSettings) =>
     api<BoonSettingsView>("/settings/boons", {
+      method: "PUT",
+      body: JSON.stringify(body),
+    }),
+  getCharoSettings: () => api<CharoSettingsView>("/settings/charo"),
+  setCharoSettings: (body: CharoSettingsView) =>
+    api<CharoSettingsView>("/settings/charo", {
       method: "PUT",
       body: JSON.stringify(body),
     }),
