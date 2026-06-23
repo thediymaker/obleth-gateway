@@ -20,7 +20,7 @@ import type {
   SlurmHealthView,
 } from "@/lib/obleth";
 import { requireSession } from "@/lib/auth/session";
-import { getRecipe, buildManagedFromRecipe } from "@/lib/sbatch-recipes";
+import { getRecipe, buildManagedFromRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
 
@@ -1619,7 +1619,7 @@ function coerceBool(v: unknown): boolean | undefined {
 
 export async function deployRecipeAction(
   id: string,
-  overrides?: { api_model_name?: string; target_replicas?: number },
+  overrides?: DeployOverrides,
 ): Promise<ActionResult> {
   await requireSession();
   const recipe = getRecipe(id);

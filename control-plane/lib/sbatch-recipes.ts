@@ -156,6 +156,12 @@ export function getRecipe(id: string): ParsedRecipe | null {
 export interface DeployOverrides {
   api_model_name?: string;
   target_replicas?: number;
+  /** Deploy-time placement tweaks. A provided string wins over the recipe; an
+   *  empty/whitespace string clears the field (sends null/""). `undefined` keeps
+   *  the recipe value. */
+  qos?: string;
+  time_limit?: string;
+  partition?: string;
 }
 
 export interface DeployPayload {
@@ -171,6 +177,14 @@ export interface DeployPayload {
 /** Pick the header value when set, else the parsed `#SBATCH` value. */
 function placement<T>(header: T | undefined, parsed: T | undefined): T | undefined {
   return header !== undefined ? header : parsed;
+}
+
+/** Apply a deploy-time string override over the recipe value: `undefined` keeps
+ *  the recipe value; a provided string wins (trimmed), with empty meaning "clear". */
+function overrideString(override: string | undefined, recipeValue: string | undefined): string | undefined {
+  if (override === undefined) return recipeValue;
+  const trimmed = override.trim();
+  return trimmed === "" ? undefined : trimmed;
 }
 
 /** If the recipe declares --chdir, guard the script with a `cd` after the shebang. */
@@ -203,14 +217,14 @@ export function buildManagedFromRecipe(
 
   const managedBody: PutManagedModel = {
     enabled: true,
-    partition: placement(h.partition, d.partition) ?? "",
+    partition: overrideString(overrides.partition, placement(h.partition, d.partition)) ?? "",
     gres: placement(h.gres, d.gres),
     nodes: placement(h.nodes, d.nodes),
     cpus_per_task: placement(h.cpus_per_task, d.cpus_per_task) ?? null,
     mem: placement(h.mem, d.mem) ?? null,
-    time_limit: placement(h.time_limit, d.time_limit) ?? null,
+    time_limit: overrideString(overrides.time_limit, placement(h.time_limit, d.time_limit)) ?? null,
     account: placement(h.account, d.account) ?? null,
-    qos: placement(h.qos, d.qos) ?? null,
+    qos: overrideString(overrides.qos, placement(h.qos, d.qos)) ?? null,
     constraints: placement(h.constraints, d.constraints) ?? null,
     exclude: placement(h.exclude, d.exclude) ?? null,
     log_output_dir: d.log_output_dir ?? "",

@@ -48,6 +48,30 @@ describe("buildManagedFromRecipe", () => {
     expect(p.managedBody.target_replicas).toBe(4);
   });
 
+  it("applies qos/partition/time_limit overrides over the recipe directives", () => {
+    // recipe parses partition=arm from `#SBATCH -p arm`, no qos/time
+    const p = buildManagedFromRecipe(parseRecipe("glm", file()), {
+      qos: "private",
+      partition: "gpu",
+      time_limit: "02:00:00",
+    });
+    expect(p.managedBody.qos).toBe("private");
+    expect(p.managedBody.partition).toBe("gpu");
+    expect(p.managedBody.time_limit).toBe("02:00:00");
+  });
+
+  it("keeps the recipe value when an override field is omitted", () => {
+    const p = buildManagedFromRecipe(parseRecipe("glm", file()), { qos: "private" });
+    expect(p.managedBody.qos).toBe("private");
+    expect(p.managedBody.partition).toBe("arm"); // untouched, from `#SBATCH -p arm`
+  });
+
+  it("clears a field when its override is empty/whitespace", () => {
+    const recipe = parseRecipe("glm", file("qos: private"));
+    expect(buildManagedFromRecipe(recipe).managedBody.qos).toBe("private");
+    expect(buildManagedFromRecipe(recipe, { qos: "   " }).managedBody.qos).toBeNull();
+  });
+
   it("prepends a cd guard when the recipe declares --chdir", () => {
     const p = buildManagedFromRecipe(
       parseRecipe(
