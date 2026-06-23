@@ -1,4 +1,4 @@
-use crate::domain::{JobInfo, JobState, JobSubmit};
+use crate::domain::{JobInfo, JobState, JobSubmit, NodeInfo, PartitionInfo};
 use async_trait::async_trait;
 use obleth_config::ManagedModelSpec;
 
@@ -13,8 +13,9 @@ pub trait SlurmClient: Send + Sync {
 
 /// Build a version-agnostic JobSubmit from a model's spec. The job is named
 /// `{prefix}{model_name}` so we can find our own jobs. The script runs the
-/// operator's launch command inside their apptainer image — nothing about a
-/// specific cluster is assumed.
+/// operator's launch command inside their apptainer image — or, when `image`
+/// is blank, runs the launch command directly on the node (bare-metal, e.g. a
+/// module-loaded native binary). Nothing about a specific cluster is assumed.
 pub fn job_submit_from_spec(
     spec: &ManagedModelSpec,
     model_name: &str,
@@ -32,11 +33,34 @@ pub fn job_submit_from_spec(
     // this endpoint. `image` has no such reason to contain shell syntax, so
     // quote it to stop a stray space/glob/metacharacter from corrupting the
     // apptainer invocation.
-    let script = format!(
-        "#!/bin/bash\nset -euo pipefail\n{preamble_block}apptainer exec --nv {image} {cmd}\n",
-        image = shell_quote(&spec.image),
-        cmd = spec.launch_command,
-    );
+    //
+    // A blank `image` means "no container": run the launch command directly.
+    // This supports HPC sites that serve a native, module-loaded binary (e.g.
+    // a bare-metal `llama-server`) rather than an apptainer image.
+    let image = spec.image.trim();
+    let exec_line = if image.is_empty() {
+        spec.launch_command.clone()
+    } else {
+        format!(
+            "apptainer exec --nv {image} {cmd}",
+            image = shell_quote(image),
+            cmd = spec.launch_command,
+        )
+    };
+    // A non-empty `script_body` is the rendered recipe output and wins: it is
+    // submitted verbatim so the recipe author has full control of the job
+    // script. Otherwise fall back to the legacy preamble/exec assembly.
+    let script = if spec.script_body.trim().is_empty() {
+        format!("#!/bin/bash\nset -euo pipefail\n{preamble_block}{exec_line}\n")
+    } else {
+        let body = &spec.script_body;
+        if body.starts_with("#!") {
+            // already a complete script
+            if body.ends_with('\n') { body.clone() } else { format!("{body}\n") }
+        } else {
+            format!("#!/bin/bash\nset -euo pipefail\n{body}\n")
+        }
+    };
     JobSubmit {
         name: format!("{name_prefix}{model_name}"),
         partition: spec.partition.clone(),
@@ -47,9 +71,39 @@ pub fn job_submit_from_spec(
         qos: spec.qos.clone(),
         constraints: spec.constraints.clone(),
         exclude: spec.exclude.clone(),
+        cpus_per_task: spec.cpus_per_task.filter(|&c| c > 0),
+        mem_mb: spec.mem.as_deref().and_then(parse_mem_mb),
         log_output_dir: spec.log_output_dir.clone(),
         script,
     }
+}
+
+/// Parse a Slurm-style memory string (e.g. `560G`, `512000M`, `2T`, `16000`)
+/// into an integer number of **megabytes** for slurmrestd's `memory_per_node`.
+/// A bare number is treated as megabytes (Slurm's default unit). Returns `None`
+/// for empty/unparseable input so the field is omitted entirely.
+pub fn parse_mem_mb(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let upper = s.to_ascii_uppercase();
+    // strip an optional trailing 'B' (GB/MB/TB) then read the unit letter
+    let core = upper.strip_suffix('B').unwrap_or(&upper);
+    let (num_part, mult) = match core.chars().last() {
+        Some('K') => (&core[..core.len() - 1], 1.0 / 1024.0),
+        Some('M') => (&core[..core.len() - 1], 1.0),
+        Some('G') => (&core[..core.len() - 1], 1024.0),
+        Some('T') => (&core[..core.len() - 1], 1024.0 * 1024.0),
+        Some(c) if c.is_ascii_digit() => (core.as_ref(), 1.0),
+        _ => return None,
+    };
+    let n: f64 = num_part.trim().parse().ok()?;
+    if n <= 0.0 {
+        return None;
+    }
+    let mb = (n * mult).round() as i64;
+    if mb > 0 { Some(mb) } else { None }
 }
 
 /// POSIX single-quote a value for embedding in the generated bash script.
@@ -122,6 +176,9 @@ impl SlurmClient for Slurmrestd {
         if let Some(q) = &job.qos { m.insert("qos".into(), serde_json::json!(q)); }
         if let Some(c) = &job.constraints { m.insert("constraints".into(), serde_json::json!(c)); }
         if let Some(e) = &job.exclude { m.insert("excluded_nodes".into(), serde_json::json!(e)); }
+        if let Some(c) = job.cpus_per_task { if c > 0 { m.insert("cpus_per_task".into(), serde_json::json!(c)); } }
+        // slurmrestd expects memory_per_node in megabytes (integer).
+        if let Some(mb) = job.mem_mb { if mb > 0 { m.insert("memory_per_node".into(), serde_json::json!(mb)); } }
         if !job.log_output_dir.is_empty() {
             let dir = job.log_output_dir.trim_end_matches('/');
             m.insert("standard_output".into(), serde_json::json!(format!("{dir}/{}-%j.out", job.name)));
@@ -196,6 +253,70 @@ pub fn expand_nodelist(s: &str) -> Vec<String> {
     s.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect()
 }
 
+/// Read a slurmrestd time value that may be `{"number":N}` (minutes), a bare
+/// number, or a string. Returns a display string of minutes, or None.
+fn time_minutes(v: &serde_json::Value) -> Option<String> {
+    if let Some(n) = v.get("number").and_then(|x| x.as_i64()) { return Some(n.to_string()); }
+    if let Some(n) = v.as_i64() { return Some(n.to_string()); }
+    v.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
+}
+
+/// A slurmrestd field that may be a CSV string or an array of strings.
+fn str_list(v: Option<&serde_json::Value>) -> Vec<String> {
+    match v {
+        Some(serde_json::Value::String(s)) =>
+            s.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).map(String::from).collect(),
+        Some(serde_json::Value::Array(a)) =>
+            a.iter().filter_map(|x| x.as_str()).filter(|s| !s.is_empty()).map(String::from).collect(),
+        _ => vec![],
+    }
+}
+
+pub fn parse_partitions(v: &serde_json::Value) -> Vec<PartitionInfo> {
+    v.get("partitions").and_then(|x| x.as_array()).map(|arr| arr.iter().filter_map(|p| {
+        let name = p.get("name").and_then(|x| x.as_str())?.to_string();
+        let nodes = p.get("nodes")
+            .and_then(|n| n.get("configured").map(|c| c.clone()).or_else(|| Some(n.clone())))
+            .map(|n| str_list(Some(&n))).unwrap_or_default();
+        Some(PartitionInfo {
+            name,
+            nodes,
+            default_time: p.get("defaults").and_then(|d| d.get("time")).and_then(time_minutes),
+            max_time: p.get("maximums").and_then(|d| d.get("time")).and_then(time_minutes),
+        })
+    }).collect()).unwrap_or_default()
+}
+
+pub fn parse_nodes(v: &serde_json::Value) -> Vec<NodeInfo> {
+    v.get("nodes").and_then(|x| x.as_array()).map(|arr| arr.iter().filter_map(|n| {
+        let name = n.get("name").and_then(|x| x.as_str())?.to_string();
+        let real_memory_mb = n.get("real_memory")
+            .and_then(|m| m.as_i64().or_else(|| m.get("number").and_then(|x| x.as_i64())));
+        Some(NodeInfo {
+            name,
+            partitions: str_list(n.get("partitions")),
+            gres: n.get("gres").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
+            cpus: n.get("cpus").and_then(|m| m.as_i64().or_else(|| m.get("number").and_then(|x| x.as_i64()))),
+            real_memory_mb,
+            features: str_list(n.get("features")),
+        })
+    }).collect()).unwrap_or_default()
+}
+
+pub fn parse_associations(v: &serde_json::Value) -> (Vec<String>, Vec<String>) {
+    let mut accounts = std::collections::BTreeSet::new();
+    let mut qos = std::collections::BTreeSet::new();
+    if let Some(arr) = v.get("associations").and_then(|x| x.as_array()) {
+        for a in arr {
+            if let Some(acc) = a.get("account").and_then(|x| x.as_str()) {
+                if !acc.is_empty() { accounts.insert(acc.to_string()); }
+            }
+            for q in str_list(a.get("qos")) { qos.insert(q); }
+        }
+    }
+    (accounts.into_iter().collect(), qos.into_iter().collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,10 +330,13 @@ mod tests {
             nodes: 1,
             constraints: None, exclude: None, account: None, qos: None,
             time_limit: Some("12:00:00".into()),
+            cpus_per_task: None,
+            mem: None,
             image: "vllm.sif".into(),
             preamble: String::new(),
             log_output_dir: String::new(),
             launch_command: "vllm serve nemotron --port 8000".into(),
+            script_body: String::new(),
             serving_port: 8000,
             health_path: "/health".into(),
             target_replicas: 2,
@@ -257,6 +381,67 @@ mod tests {
     }
 
     #[test]
+    fn blank_image_runs_launch_command_bare_metal() {
+        let mut s = spec();
+        s.image = "  ".into();
+        s.preamble = "module load cuda".into();
+        s.launch_command = "llama-server -m model.gguf --port 8000".into();
+        let j = job_submit_from_spec(&s, "glm", "obleth-");
+        assert!(!j.script.contains("apptainer"), "no container wrap when image is blank");
+        assert!(j.script.contains("module load cuda"));
+        assert!(j.script.contains("llama-server -m model.gguf --port 8000"));
+    }
+
+    #[test]
+    fn cpus_and_mem_flow_into_job_submit() {
+        let mut s = spec();
+        s.cpus_per_task = Some(72);
+        s.mem = Some("560G".into());
+        let j = job_submit_from_spec(&s, "glm", "obleth-");
+        assert_eq!(j.cpus_per_task, Some(72));
+        assert_eq!(j.mem_mb, Some(560 * 1024));
+    }
+
+    #[test]
+    fn zero_cpus_is_treated_as_unset() {
+        let mut s = spec();
+        s.cpus_per_task = Some(0);
+        let j = job_submit_from_spec(&s, "glm", "obleth-");
+        assert_eq!(j.cpus_per_task, None);
+    }
+
+    #[test]
+    fn parse_mem_units() {
+        assert_eq!(parse_mem_mb("560G"), Some(560 * 1024));
+        assert_eq!(parse_mem_mb("560GB"), Some(560 * 1024));
+        assert_eq!(parse_mem_mb("512000M"), Some(512000));
+        assert_eq!(parse_mem_mb("512000"), Some(512000));
+        assert_eq!(parse_mem_mb("2T"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_mem_mb(""), None);
+        assert_eq!(parse_mem_mb("   "), None);
+        assert_eq!(parse_mem_mb("lots"), None);
+        assert_eq!(parse_mem_mb("0G"), None);
+    }
+
+    #[test]
+    fn script_body_is_submitted_verbatim_with_shebang() {
+        let mut s = spec();
+        s.script_body = "#!/bin/bash\nset -e\nllama-server --port 8000\n".into();
+        let j = job_submit_from_spec(&s, "glm", "obleth-");
+        assert_eq!(j.script, "#!/bin/bash\nset -e\nllama-server --port 8000\n");
+        assert!(!j.script.contains("apptainer"), "script_body overrides legacy assembly");
+    }
+
+    #[test]
+    fn script_body_without_shebang_gets_wrapped() {
+        let mut s = spec();
+        s.script_body = "llama-server --port 8000".into();
+        let j = job_submit_from_spec(&s, "glm", "obleth-");
+        assert!(j.script.starts_with("#!/bin/bash\nset -euo pipefail\n"));
+        assert!(j.script.contains("llama-server --port 8000"));
+    }
+
+    #[test]
     fn job_state_mapping_is_version_tolerant() {
         assert_eq!(map_job_state("RUNNING"), JobState::Running);
         assert_eq!(map_job_state("Pending"), JobState::Pending);
@@ -269,6 +454,51 @@ mod tests {
         assert_eq!(expand_nodelist("gpu7"), vec!["gpu7"]);
         assert_eq!(expand_nodelist("a,b"), vec!["a", "b"]);
         assert!(expand_nodelist("").is_empty());
+    }
+
+    #[test]
+    fn parse_partitions_reads_name_and_nodes() {
+        let v = serde_json::json!({"partitions":[
+            {"name":"arm","nodes":{"total":1,"configured":"gpu[01-02]"},
+             "maximums":{"time":{"number":240}}, "defaults":{"time":{"number":60}}}
+        ]});
+        let p = parse_partitions(&v);
+        assert_eq!(p.len(), 1);
+        assert_eq!(p[0].name, "arm");
+        assert!(p[0].nodes.contains(&"gpu[01-02]".to_string()) || !p[0].nodes.is_empty());
+    }
+
+    #[test]
+    fn parse_nodes_reads_gres_cpu_mem_features() {
+        let v = serde_json::json!({"nodes":[
+            {"name":"gpu01","partitions":["arm"],"gres":"gpu:gh200:1",
+             "cpus":72,"real_memory":577536,"features":"gh200,arm"}
+        ]});
+        let n = parse_nodes(&v);
+        assert_eq!(n[0].name, "gpu01");
+        assert_eq!(n[0].gres, "gpu:gh200:1");
+        assert_eq!(n[0].cpus, Some(72));
+        assert_eq!(n[0].real_memory_mb, Some(577536));
+        assert!(n[0].features.contains(&"gh200".to_string()));
+    }
+
+    #[test]
+    fn parse_associations_dedupes_accounts_and_qos() {
+        let v = serde_json::json!({"associations":[
+            {"account":"ml-team","qos":["normal","high"]},
+            {"account":"ml-team","qos":["normal"]}
+        ]});
+        let (accounts, qos) = parse_associations(&v);
+        assert_eq!(accounts, vec!["ml-team"]);
+        assert_eq!(qos, vec!["high","normal"]); // sorted+deduped
+    }
+
+    #[test]
+    fn parsers_tolerate_missing_keys() {
+        let empty = serde_json::json!({});
+        assert!(parse_partitions(&empty).is_empty());
+        assert!(parse_nodes(&empty).is_empty());
+        assert_eq!(parse_associations(&empty), (vec![], vec![]));
     }
 }
 
