@@ -8,8 +8,7 @@ import {
   type ModelHealthSummary,
 } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
-import { listRecipes } from "@/lib/sbatch-recipes";
-import { toRecipeCards } from "@/components/recipes/recipe-card";
+import { loadRecipeCards } from "@/lib/sbatch-recipes";
 
 export const dynamic = "force-dynamic";
 
@@ -50,7 +49,7 @@ export default async function ModelsPage() {
   );
 
   // Admin-authored *.recipe files, mapped to flat cards for the create gallery.
-  const recipeCards = toRecipeCards(listRecipes());
+  const recipeCards = loadRecipeCards();
 
   return (
     <div className="space-y-6">

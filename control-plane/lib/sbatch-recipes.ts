@@ -10,6 +10,8 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
+import type { RecipeCard, RecipeDeployPreview } from "@/components/recipes/recipe-card";
+import { toRecipeCards } from "@/components/recipes/recipe-card";
 import { parseSbatchDirectives, type ParsedDirectives } from "./sbatch-directives";
 import type { PutManagedModel } from "./obleth";
 
@@ -237,4 +239,46 @@ export function buildManagedFromRecipe(
     },
     managedBody,
   };
+}
+
+/** Compute the "what will be deployed" preview, reusing the deploy builder so it
+ *  exactly matches the submitted managed body. Returns undefined for invalid recipes. */
+export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | undefined {
+  if (!recipe.valid || !recipe.header) return undefined;
+  let payload;
+  try {
+    payload = buildManagedFromRecipe(recipe);
+  } catch {
+    return undefined;
+  }
+  const m = payload.managedBody;
+  return {
+    apiModelName: payload.createBody.model_name,
+    modelType: payload.createBody.model_type,
+    engine: recipe.header.engine,
+    port: m.serving_port,
+    healthPath: m.health_path ?? "/health",
+    targetReplicas: m.target_replicas ?? 2,
+    maxJobFailures: m.max_job_failures ?? 3,
+    partition: m.partition,
+    gres: m.gres,
+    cpusPerTask: m.cpus_per_task,
+    mem: m.mem,
+    nodes: m.nodes,
+    timeLimit: m.time_limit,
+    qos: m.qos,
+    account: m.account,
+    constraints: m.constraints,
+    exclude: m.exclude,
+    logOutputDir: m.log_output_dir,
+    scriptBody: m.script_body ?? "",
+    warnings: recipe.warnings,
+  };
+}
+
+/** Server helper: every recipe as a card, summary + deploy preview. */
+export function loadRecipeCards(): RecipeCard[] {
+  const parsed = listRecipes();
+  const cards = toRecipeCards(parsed);
+  return cards.map((c, i) => ({ ...c, preview: buildDeployPreview(parsed[i]) }));
 }

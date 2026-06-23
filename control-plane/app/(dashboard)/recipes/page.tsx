@@ -1,11 +1,10 @@
-import { listRecipes } from "@/lib/sbatch-recipes";
-import { toRecipeCards } from "@/components/recipes/recipe-card";
+import { loadRecipeCards } from "@/lib/sbatch-recipes";
 import { RecipeList } from "@/components/recipes/recipe-list";
 
 export const dynamic = "force-dynamic";
 
 export default function RecipesPage() {
-  const recipes = toRecipeCards(listRecipes());
+  const recipes = loadRecipeCards();
 
   return (
     <div className="space-y-6">

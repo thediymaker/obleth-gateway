@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseRecipe, buildManagedFromRecipe } from "./sbatch-recipes";
+import { parseRecipe, buildManagedFromRecipe, buildDeployPreview } from "./sbatch-recipes";
 
 const file = (extraHeader = "", body?: string) =>
   [
@@ -99,5 +99,28 @@ describe("buildManagedFromRecipe", () => {
     const lines = (p.managedBody.script_body ?? "").split("\n");
     expect(lines[0]).toBe("#!/bin/bash -l");
     expect(lines[1]).toBe("cd '/data/o'\\''brien' || exit 1");
+  });
+});
+
+describe("buildDeployPreview", () => {
+  it("mirrors the deployed managed body (header + parsed placement)", () => {
+    const p = buildDeployPreview(parseRecipe("glm", file()));
+    expect(p).toMatchObject({
+      apiModelName: "glm-5.2",
+      modelType: "chat",
+      engine: "llamacpp",
+      port: 8000,
+      healthPath: "/health",
+      targetReplicas: 2,
+      maxJobFailures: 3,
+      partition: "arm",
+      gres: "gpu:1",
+    });
+    expect(p?.scriptBody).toContain("llama-server -hf repo:Q4");
+  });
+
+  it("returns undefined for an invalid recipe", () => {
+    const p = buildDeployPreview(parseRecipe("x", "no frontmatter here"));
+    expect(p).toBeUndefined();
   });
 });

@@ -5,6 +5,29 @@
 // fs-touching sbatch-recipes loader.
 import type { ParsedRecipe } from "@/lib/sbatch-recipes";
 
+export interface RecipeDeployPreview {
+  apiModelName: string;
+  modelType: string;
+  engine: string;
+  port: number;
+  healthPath: string;
+  targetReplicas: number;
+  maxJobFailures: number;
+  partition: string;
+  gres?: string;
+  cpusPerTask?: number | null;
+  mem?: string | null;
+  nodes?: number;
+  timeLimit?: string | null;
+  qos?: string | null;
+  account?: string | null;
+  constraints?: string | null;
+  exclude?: string | null;
+  logOutputDir?: string;
+  scriptBody: string;
+  warnings: string[];
+}
+
 export interface RecipeCard {
   id: string;
   valid: boolean;
@@ -16,6 +39,7 @@ export interface RecipeCard {
   apiModelName?: string;
   targetReplicas?: number;
   warnings: string[];
+  preview?: RecipeDeployPreview;
 }
 
 export function toRecipeCards(parsed: ParsedRecipe[]): RecipeCard[] {
