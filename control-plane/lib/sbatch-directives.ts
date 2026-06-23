@@ -77,8 +77,10 @@ export function parseSbatchDirectives(script: string): ParsedDirectives {
         out.gres = value;
         break;
       case "cpus-per-task": {
-        const n = Number(value);
-        if (Number.isFinite(n)) out.cpus_per_task = n;
+        if (value) {
+          const n = Number(value);
+          if (Number.isFinite(n)) out.cpus_per_task = n;
+        }
         break;
       }
       case "mem":
@@ -88,8 +90,10 @@ export function parseSbatchDirectives(script: string): ParsedDirectives {
         out.time_limit = value;
         break;
       case "nodes": {
-        const n = Number(value);
-        if (Number.isFinite(n)) out.nodes = n;
+        if (value) {
+          const n = Number(value);
+          if (Number.isFinite(n)) out.nodes = n;
+        }
         break;
       }
       case "account":
@@ -114,7 +118,8 @@ export function parseSbatchDirectives(script: string): ParsedDirectives {
         out.chdir = value;
         break;
       default:
-        out.warnings.push(`--${key} (not applied)`);
+        const flagStr = key.startsWith("-") ? key : `--${key}`;
+        out.warnings.push(`${flagStr} (not applied)`);
     }
   }
   return out;

@@ -115,4 +115,24 @@ describe("parseSbatchDirectives", () => {
     // --job-name is intentionally unmapped (obleth derives the job name).
     expect(d.warnings.join(" ")).toContain("--job-name");
   });
+
+  it("unknown short flags produce clean warnings without triple-dash", () => {
+    const d = parseSbatchDirectives("#SBATCH -J myjob");
+    expect(d.warnings.join(" ")).toContain("-J");
+    expect(d.warnings.join(" ")).not.toContain("---J");
+  });
+
+  it("empty numeric directives do not set the field to 0", () => {
+    const d1 = parseSbatchDirectives("#SBATCH --cpus-per-task");
+    expect(d1.cpus_per_task).toBeUndefined();
+    const d2 = parseSbatchDirectives("#SBATCH --nodes");
+    expect(d2.nodes).toBeUndefined();
+  });
+
+  it("maps short forms -o and -e to log_output_dir", () => {
+    const d1 = parseSbatchDirectives("#SBATCH -o logs/run-%j.out");
+    expect(d1.log_output_dir).toBe("logs");
+    const d2 = parseSbatchDirectives("#SBATCH -e errors/e.out");
+    expect(d2.log_output_dir).toBe("errors");
+  });
 });
