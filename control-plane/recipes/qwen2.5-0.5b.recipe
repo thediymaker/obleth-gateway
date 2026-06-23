@@ -1,6 +1,6 @@
 ---
 name: Qwen2.5 0.5B (Ollama)
-description: Qwen2.5 0.5B served via Ollama from /scratch/ollama.sif; weights pulled to the node at launch.
+description: Qwen2.5 0.5B served via Ollama from an Apptainer image; weights pulled to the node at launch. Template — set the partition at deploy and edit the image path for your cluster.
 engine: ollama
 model_type: chat
 api_model_name: qwen2.5:0.5b
@@ -10,11 +10,12 @@ target_replicas: 1
 max_job_failures: 0
 ---
 #!/bin/bash -l
-#SBATCH --partition=DaCluster
+# Partition / QoS / time limit are set at deploy (Deploy overrides) — left out
+# here so the recipe stays cluster-agnostic.
 #SBATCH --nodes=1
 #SBATCH --output=logs/qwen2.5-0.5b-%j.out
 # Recipes submit this script verbatim; ollama lives in the apptainer image, so
-# wrap the launch in `apptainer exec` (the legacy `image` field does not apply
-# to recipe script bodies).
-apptainer exec --nv /scratch/ollama.sif \
+# wrap the launch in `apptainer exec`.
+# EDIT FOR YOUR CLUSTER: path to the Ollama Apptainer image.
+apptainer exec --nv /path/to/ollama.sif \
   sh -c "OLLAMA_HOST=0.0.0.0:8000 ollama serve & sleep 5 && OLLAMA_HOST=0.0.0.0:8000 ollama pull qwen2.5:0.5b && wait"

@@ -1,6 +1,6 @@
 ---
 name: GLM-5.2 (multi-user, GH200)
-description: GLM-5.2 UD-IQ2_M, 4 concurrent slots, weights pulled to node-local NVMe.
+description: GLM-5.2 UD-IQ2_M, 4 concurrent slots, weights pulled to node-local NVMe. Template — set partition/QoS at deploy; GH200 resource sizing, edit for your hardware.
 engine: llamacpp
 model_type: chat
 api_model_name: glm-5.2
@@ -9,15 +9,15 @@ target_replicas: 2
 max_job_failures: 3
 ---
 #!/bin/bash -l
+# Partition / QoS / time limit are set at deploy (Deploy overrides) — left out
+# here so the recipe stays cluster-agnostic.
 #SBATCH --gres=gpu:1                 # one GH200 superchip
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=560G
-#SBATCH --time=04:00:00
-#SBATCH -q private
-#SBATCH -p arm
 #SBATCH --output=logs/serve-%j.out
 set -euo pipefail
-export LLAMA_CACHE=/mnt/job_tmp/glm52
+# EDIT FOR YOUR CLUSTER: node-local scratch path for weight caching.
+export LLAMA_CACHE=/path/to/job_tmp/glm52
 export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
 llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M \
   --host 0.0.0.0 --port 8000 --alias glm-5.2 \
