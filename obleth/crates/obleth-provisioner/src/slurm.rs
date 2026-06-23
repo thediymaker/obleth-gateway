@@ -387,6 +387,7 @@ mod tests {
             health_path: "/health".into(),
             target_replicas: 2,
             max_job_failures: 0,
+            launcher_spec: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

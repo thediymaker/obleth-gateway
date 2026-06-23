@@ -711,6 +711,8 @@ pub(crate) struct PutManagedModel {
     target_replicas: i64,
     #[serde(default)]
     max_job_failures: i64,
+    #[serde(default)]
+    launcher_spec: Option<serde_json::Value>,
 }
 fn one() -> i64 {
     1
@@ -3234,6 +3236,7 @@ async fn put_managed_model(
             health_path: body.health_path,
             target_replicas: body.target_replicas,
             max_job_failures: body.max_job_failures,
+            launcher_spec: body.launcher_spec,
         })
         .await?;
     state

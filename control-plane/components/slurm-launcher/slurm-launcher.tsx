@@ -225,6 +225,7 @@ export function SlurmLauncher(props: {
     fd.set("slurm_time_limit", timeLimit);
     fd.set("slurm_constraints", constraints);
     fd.set("slurm_exclude", exclude);
+    fd.set("slurm_launcher_spec", JSON.stringify(currentSpec()));
 
     const res = await props.onSubmit(fd);
     if (!res.ok) setError(res.error ?? "Launch failed.");

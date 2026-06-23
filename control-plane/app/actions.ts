@@ -699,6 +699,12 @@ export async function createModelAction(
         health_path: trimmed(formData.get("slurm_health_path")) || "/health",
         target_replicas: numOr(formData.get("slurm_target_replicas"), 2),
         max_job_failures: numOr(formData.get("slurm_max_job_failures"), 0),
+        launcher_spec: (() => {
+          const raw = trimmed(formData.get("slurm_launcher_spec"));
+          if (!raw) return null;
+          try { return JSON.parse(raw) as Record<string, unknown>; }
+          catch { return null; }
+        })(),
         account: strOrNull(formData.get("slurm_account")) ?? null,
         qos: strOrNull(formData.get("slurm_qos")) ?? null,
         time_limit: strOrNull(formData.get("slurm_time_limit")) ?? null,

@@ -158,6 +158,7 @@ export interface ManagedModelSpec {
   health_path: string;
   target_replicas: number;
   max_job_failures: number;
+  launcher_spec?: Record<string, unknown> | null;
   created_at: string;
   updated_at: string;
 }
@@ -183,6 +184,7 @@ export interface PutManagedModel {
   health_path?: string;
   target_replicas?: number;
   max_job_failures?: number;
+  launcher_spec?: Record<string, unknown> | null;
 }
 
 export type ClusterResources = {

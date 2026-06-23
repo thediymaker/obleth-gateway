@@ -54,6 +54,7 @@ const SCHEMA: &str = include_str!("../../../../schema/postgres/0001_init.sql");
 const SCHEMA_V2: &str = include_str!("../../../../schema/postgres/0002_tracing_flag.sql");
 const SCHEMA_V3: &str = include_str!("../../../../schema/postgres/0003_guardrails_policy.sql");
 const SCHEMA_V4: &str = include_str!("../../../../schema/postgres/0004_saved_recipes.sql");
+const SCHEMA_V5: &str = include_str!("../../../../schema/postgres/0005_managed_launcher_spec.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -103,6 +104,7 @@ pub struct UpsertManagedModel {
     pub health_path: String,
     pub target_replicas: i64,
     pub max_job_failures: i64,
+    pub launcher_spec: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
@@ -145,6 +147,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V2).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V3).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V4).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V5).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1571,7 +1574,7 @@ impl Store {
             "select model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
              qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
              script_body, serving_port, \
-             health_path, target_replicas, max_job_failures, created_at, updated_at \
+             health_path, target_replicas, max_job_failures, launcher_spec, created_at, updated_at \
              from managed_models where model_id = $1",
         )
         .bind(model_id)
@@ -1585,7 +1588,7 @@ impl Store {
             "select model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
              qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
              script_body, serving_port, \
-             health_path, target_replicas, max_job_failures, created_at, updated_at \
+             health_path, target_replicas, max_job_failures, launcher_spec, created_at, updated_at \
              from managed_models order by model_id",
         )
         .fetch_all(&self.pool)
@@ -1599,8 +1602,8 @@ impl Store {
                 (model_id, enabled, partition, gres, nodes, constraints, exclude,
                  account, qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir,
                  launch_command, script_body,
-                 serving_port, health_path, target_replicas, max_job_failures)
-             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
+                 serving_port, health_path, target_replicas, max_job_failures, launcher_spec)
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
              on conflict (model_id) do update set
                 enabled = excluded.enabled, partition = excluded.partition,
                 gres = excluded.gres, nodes = excluded.nodes,
@@ -1612,11 +1615,12 @@ impl Store {
                 launch_command = excluded.launch_command, script_body = excluded.script_body,
                 serving_port = excluded.serving_port, health_path = excluded.health_path,
                 target_replicas = excluded.target_replicas,
-                max_job_failures = excluded.max_job_failures, updated_at = now()
+                max_job_failures = excluded.max_job_failures,
+                launcher_spec = excluded.launcher_spec, updated_at = now()
              returning model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
              qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
              script_body, serving_port, \
-             health_path, target_replicas, max_job_failures, created_at, updated_at",
+             health_path, target_replicas, max_job_failures, launcher_spec, created_at, updated_at",
         )
         .bind(m.model_id)
         .bind(m.enabled)
@@ -1639,6 +1643,7 @@ impl Store {
         .bind(&m.health_path)
         .bind(m.target_replicas.max(1))
         .bind(m.max_job_failures.max(0))
+        .bind(m.launcher_spec.as_ref().map(sqlx::types::Json))
         .fetch_one(&self.pool)
         .await?;
         managed_model_from_row(&row)
@@ -2706,6 +2711,7 @@ fn saved_recipe_from_row(row: &PgRow) -> Result<SavedRecipe> {
 }
 
 fn managed_model_from_row(row: &PgRow) -> Result<ManagedModelSpec> {
+    let launcher_spec: Option<sqlx::types::Json<serde_json::Value>> = row.try_get("launcher_spec")?;
     Ok(ManagedModelSpec {
         model_id: row.try_get("model_id")?,
         enabled: row.try_get("enabled")?,
@@ -2728,6 +2734,7 @@ fn managed_model_from_row(row: &PgRow) -> Result<ManagedModelSpec> {
         health_path: row.try_get("health_path")?,
         target_replicas: row.try_get("target_replicas")?,
         max_job_failures: row.try_get("max_job_failures")?,
+        launcher_spec: launcher_spec.map(|j| j.0),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -3221,11 +3228,13 @@ mod tests {
                 health_path: "/health".into(),
                 target_replicas: 2,
                 max_job_failures: 0,
+                launcher_spec: Some(serde_json::json!({"backendId":"llamacpp"})),
             })
             .await
             .expect("upsert");
         assert_eq!(spec.target_replicas, 2);
         assert_eq!(spec.partition, "gpu-preempt");
+        assert_eq!(spec.launcher_spec, Some(serde_json::json!({"backendId":"llamacpp"})));
 
         let listed = store.list_managed_models().await.expect("list");
         assert_eq!(listed.len(), 1);

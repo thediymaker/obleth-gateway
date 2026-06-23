@@ -551,6 +551,11 @@ pub struct ManagedModelSpec {
     pub target_replicas: i64,
     /// Stop resubmitting when this many lost replicas are visible (0 = no limit).
     pub max_job_failures: i64,
+    /// Serialized launcher panel state (backend id + knob values + envelope) used to
+    /// repopulate the dashboard edit view. Metadata only; does not affect provisioning.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub launcher_spec: Option<serde_json::Value>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
