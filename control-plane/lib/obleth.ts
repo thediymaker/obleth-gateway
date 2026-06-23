@@ -750,6 +750,14 @@ export interface TestAlertResult {
   results: ChannelResult[];
 }
 
+export type SavedRecipe = {
+  id: string;
+  name: string;
+  backend: string;
+  author: string;
+  spec: Record<string, unknown>;
+};
+
 /// Error thrown when the management API responds with a non-2xx status. Carries
 /// the parsed `error` message so the UI can display something actionable.
 export class OblethApiError extends Error {
@@ -1068,6 +1076,13 @@ export const obleth = {
   deleteManagedModel: (id: string) =>
     api<void>(`/models/${id}/managed`, { method: "DELETE" }),
   slurmResources: () => api<ClusterResources>(`/slurm/resources`),
+  listRecipes: () => api<SavedRecipe[]>(`/recipes`),
+  createRecipe: (body: Omit<SavedRecipe, "id">) =>
+    api<SavedRecipe>(`/recipes`, { method: "POST", body: JSON.stringify(body) }),
+  updateRecipe: (id: string, body: Omit<SavedRecipe, "id">) =>
+    api<SavedRecipe>(`/recipes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteRecipe: (id: string) =>
+    api<void>(`/recipes/${id}`, { method: "DELETE" }),
   listReplicas: (id: string) =>
     api<ModelReplica[]>(`/models/${id}/replicas`),
   createModelEndpoint: (
