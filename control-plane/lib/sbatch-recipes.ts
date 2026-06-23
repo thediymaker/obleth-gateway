@@ -174,7 +174,7 @@ function placement<T>(header: T | undefined, parsed: T | undefined): T | undefin
 /** If the recipe declares --chdir, guard the script with a `cd` after the shebang. */
 function applyChdir(body: string, chdir: string | undefined): string {
   if (!chdir) return body;
-  const guard = `cd '${chdir}' || exit 1`;
+  const guard = `cd '${chdir.replace(/'/g, "'\\''")}' || exit 1`;
   const lines = body.split("\n");
   if (lines[0]?.startsWith("#!")) {
     return [lines[0], guard, ...lines.slice(1)].join("\n");

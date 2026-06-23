@@ -88,4 +88,16 @@ describe("buildManagedFromRecipe", () => {
   it("throws on an invalid recipe", () => {
     expect(() => buildManagedFromRecipe({ id: "x", valid: false, error: "bad", warnings: [] })).toThrow();
   });
+
+  it("escapes single quotes in chdir path", () => {
+    const p = buildManagedFromRecipe(
+      parseRecipe(
+        "glm",
+        file("", ["#!/bin/bash -l", "#SBATCH --chdir=/data/o'brien", "llama-server --port 8000"].join("\n")),
+      ),
+    );
+    const lines = (p.managedBody.script_body ?? "").split("\n");
+    expect(lines[0]).toBe("#!/bin/bash -l");
+    expect(lines[1]).toBe("cd '/data/o'\\''brien' || exit 1");
+  });
 });
