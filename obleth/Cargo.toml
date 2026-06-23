@@ -84,6 +84,7 @@ obleth-redis = { path = "crates/obleth-redis" }
 obleth-store = { path = "crates/obleth-store" }
 obleth-telemetry = { path = "crates/obleth-telemetry" }
 obleth-admin = { path = "crates/obleth-admin" }
+obleth-provisioner = { path = "crates/obleth-provisioner" }
 
 [profile.release]
 opt-level = 3

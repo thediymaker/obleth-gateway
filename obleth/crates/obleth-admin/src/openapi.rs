@@ -140,6 +140,7 @@ use obleth_config::{
         crate::slurm_settings::put_slurm_settings,
         crate::slurm_settings::test_slurm_settings,
         crate::slurm_settings::get_slurm_settings_resolved,
+        crate::slurm_resources::get_slurm_resources,
         // backup
         crate::backup::export_backup,
         crate::backup::restore_backup,
@@ -266,7 +267,8 @@ use obleth_config::{
         (name = "audit", description = "Admin audit log"),
         (name = "capacity", description = "Global gateway in-flight capacity"),
         (name = "settings", description = "Runtime alerting, auto-router, and retention configuration"),
-        (name = "backup", description = "Configuration backup and restore")
+        (name = "backup", description = "Configuration backup and restore"),
+        (name = "slurm", description = "Live Slurm cluster resource discovery")
     )
 )]
 pub struct ApiDoc;

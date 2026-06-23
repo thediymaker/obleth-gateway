@@ -12,6 +12,7 @@ mod backup;
 mod error;
 pub mod model_health;
 mod openapi;
+pub mod slurm_resources;
 pub mod slurm_settings;
 pub mod ssrf;
 mod usage;
@@ -236,6 +237,10 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/api/v1/settings/slurm/resolved",
             get(slurm_settings::get_slurm_settings_resolved),
+        )
+        .route(
+            "/api/v1/slurm/resources",
+            get(slurm_resources::get_slurm_resources),
         )
         .route("/api/v1/backup/export", get(backup::export_backup))
         .route(
