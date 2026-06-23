@@ -11,6 +11,7 @@ import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { parseSbatchDirectives, type ParsedDirectives } from "./sbatch-directives";
+import type { PutManagedModel } from "./obleth";
 
 export interface RecipeHeader {
   name: string;
@@ -148,4 +149,92 @@ export function getRecipe(id: string): ParsedRecipe | null {
   } catch {
     return null;
   }
+}
+
+export interface DeployOverrides {
+  api_model_name?: string;
+  target_replicas?: number;
+}
+
+export interface DeployPayload {
+  createBody: {
+    model_name: string;
+    upstream_model: string;
+    api_base: string;
+    model_type: string;
+  };
+  managedBody: PutManagedModel;
+}
+
+/** Pick the header value when set, else the parsed `#SBATCH` value. */
+function placement<T>(header: T | undefined, parsed: T | undefined): T | undefined {
+  return header !== undefined ? header : parsed;
+}
+
+/** If the recipe declares --chdir, guard the script with a `cd` after the shebang. */
+function applyChdir(body: string, chdir: string | undefined): string {
+  if (!chdir) return body;
+  const guard = `cd '${chdir}' || exit 1`;
+  const lines = body.split("\n");
+  if (lines[0]?.startsWith("#!")) {
+    return [lines[0], guard, ...lines.slice(1)].join("\n");
+  }
+  return [guard, ...lines].join("\n");
+}
+
+/**
+ * Turn a valid recipe into the create + managed request bodies obleth expects.
+ * Header placement fields override the parsed `#SBATCH` directives. Throws when
+ * the recipe is invalid (callers must check `recipe.valid` first).
+ */
+export function buildManagedFromRecipe(
+  recipe: ParsedRecipe,
+  overrides: DeployOverrides = {},
+): DeployPayload {
+  if (!recipe.valid || !recipe.header || !recipe.body || !recipe.directives) {
+    throw new Error(`cannot deploy invalid recipe "${recipe.id}": ${recipe.error ?? "unknown"}`);
+  }
+  const h = recipe.header;
+  const d = recipe.directives;
+  const modelName = overrides.api_model_name?.trim() || h.api_model_name;
+  const targetReplicas = overrides.target_replicas ?? h.target_replicas ?? 2;
+
+  const managedBody: PutManagedModel = {
+    enabled: true,
+    partition: placement(h.partition, d.partition) ?? "",
+    gres: placement(h.gres, d.gres),
+    nodes: placement(h.nodes, d.nodes),
+    cpus_per_task: placement(h.cpus_per_task, d.cpus_per_task) ?? null,
+    mem: placement(h.mem, d.mem) ?? null,
+    time_limit: placement(h.time_limit, d.time_limit) ?? null,
+    account: placement(h.account, d.account) ?? null,
+    qos: placement(h.qos, d.qos) ?? null,
+    constraints: placement(h.constraints, d.constraints) ?? null,
+    exclude: placement(h.exclude, d.exclude) ?? null,
+    log_output_dir: d.log_output_dir ?? "",
+    image: "",
+    preamble: "",
+    launch_command: "",
+    script_body: applyChdir(recipe.body, d.chdir),
+    serving_port: h.port,
+    health_path: h.health_path?.trim() || defaultHealthPath(h.engine),
+    target_replicas: targetReplicas,
+    max_job_failures: h.max_job_failures ?? 3,
+    launcher_spec: {
+      source: "recipe",
+      recipe_id: recipe.id,
+      engine: h.engine,
+      name: h.name,
+    },
+  };
+
+  return {
+    createBody: {
+      model_name: modelName,
+      upstream_model: modelName,
+      api_base: "",
+      model_type: h.model_type,
+    },
+    managedBody,
+  };
 }

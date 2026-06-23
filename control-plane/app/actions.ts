@@ -20,6 +20,7 @@ import type {
   SlurmHealthView,
 } from "@/lib/obleth";
 import { requireSession } from "@/lib/auth/session";
+import { getRecipe, buildManagedFromRecipe } from "@/lib/sbatch-recipes";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
 
@@ -1614,4 +1615,30 @@ function coerceBool(v: unknown): boolean | undefined {
   if (v === "true") return true;
   if (v === "false") return false;
   return undefined;
+}
+
+export async function deployRecipeAction(
+  id: string,
+  overrides?: { api_model_name?: string; target_replicas?: number },
+): Promise<ActionResult> {
+  await requireSession();
+  const recipe = getRecipe(id);
+  if (!recipe) return { ok: false, error: `recipe "${id}" not found` };
+  if (!recipe.valid) return { ok: false, error: recipe.error ?? "recipe is invalid" };
+
+  try {
+    const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides);
+    const created = await obleth.createModel({
+      model_name: createBody.model_name,
+      upstream_model: createBody.upstream_model,
+      api_base: createBody.api_base,
+      model_type: createBody.model_type,
+    });
+    await obleth.putManagedModel(created.id, managedBody);
+  } catch (e) {
+    return actionError(e);
+  }
+  updateTag(CACHE_TAGS.models);
+  revalidatePath("/models");
+  return { ok: true };
 }
