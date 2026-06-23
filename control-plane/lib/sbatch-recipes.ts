@@ -9,6 +9,8 @@
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { parseSbatchDirectives, type ParsedDirectives } from "./sbatch-directives";
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import path from "node:path";
 
 export interface RecipeHeader {
   name: string;
@@ -107,4 +109,43 @@ export function parseRecipe(id: string, text: string): ParsedRecipe {
   }
   const directives = parseSbatchDirectives(body);
   return { id, valid: true, header: parsed.data, body, directives, warnings: directives.warnings };
+}
+
+/** Recipes directory: OBLETH_RECIPES_DIR or ./recipes relative to cwd. */
+export function recipesDir(): string {
+  const override = process.env.OBLETH_RECIPES_DIR?.trim();
+  if (override) return path.resolve(override);
+  return path.join(process.cwd(), "recipes");
+}
+
+/** Every `*.recipe` in the directory, valid and invalid, sorted by id. Never throws. */
+export function listRecipes(): ParsedRecipe[] {
+  const dir = recipesDir();
+  let entries: string[];
+  try {
+    if (!statSync(dir).isDirectory()) return [];
+    entries = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: ParsedRecipe[] = [];
+  for (const name of entries.filter((f) => f.endsWith(".recipe")).sort()) {
+    const id = name.slice(0, -".recipe".length);
+    try {
+      out.push(parseRecipe(id, readFileSync(path.join(dir, name), "utf8")));
+    } catch (e) {
+      out.push({ id, valid: false, error: (e as Error).message, warnings: [] });
+    }
+  }
+  return out;
+}
+
+/** One recipe by id (filename stem), or null when no such `*.recipe` file. */
+export function getRecipe(id: string): ParsedRecipe | null {
+  const full = path.join(recipesDir(), `${id}.recipe`);
+  try {
+    return parseRecipe(id, readFileSync(full, "utf8"));
+  } catch {
+    return null;
+  }
 }
