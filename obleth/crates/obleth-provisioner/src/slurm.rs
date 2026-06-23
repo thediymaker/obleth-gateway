@@ -254,23 +254,32 @@ impl SlurmClient for Slurmrestd {
         let mut out = ClusterResources::default();
         match get(format!("slurm/{}/partitions", self.version)).await {
             Ok(r) if r.status().is_success() => {
-                if let Ok(v) = r.json::<serde_json::Value>().await { out.partitions = parse_partitions(&v); }
+                match r.json::<serde_json::Value>().await {
+                    Ok(v) => out.partitions = parse_partitions(&v),
+                    Err(e) => tracing::warn!(error=%e, "slurm partitions body not JSON"),
+                }
             }
             Ok(r) => tracing::warn!(status=%r.status(), "slurm partitions read failed"),
             Err(e) => tracing::warn!(error=%e, "slurm partitions read errored"),
         }
         match get(format!("slurm/{}/nodes", self.version)).await {
             Ok(r) if r.status().is_success() => {
-                if let Ok(v) = r.json::<serde_json::Value>().await { out.nodes = parse_nodes(&v); }
+                match r.json::<serde_json::Value>().await {
+                    Ok(v) => out.nodes = parse_nodes(&v),
+                    Err(e) => tracing::warn!(error=%e, "slurm nodes body not JSON"),
+                }
             }
             Ok(r) => tracing::warn!(status=%r.status(), "slurm nodes read failed"),
             Err(e) => tracing::warn!(error=%e, "slurm nodes read errored"),
         }
         match get(format!("slurmdb/{}/associations", self.version)).await {
             Ok(r) if r.status().is_success() => {
-                if let Ok(v) = r.json::<serde_json::Value>().await {
-                    let (a, q) = parse_associations(&v);
-                    out.accounts = a; out.qos = q;
+                match r.json::<serde_json::Value>().await {
+                    Ok(v) => {
+                        let (a, q) = parse_associations(&v);
+                        out.accounts = a; out.qos = q;
+                    }
+                    Err(e) => tracing::warn!(error=%e, "slurm associations body not JSON"),
                 }
             }
             Ok(r) => tracing::warn!(status=%r.status(), "slurm associations read failed"),
