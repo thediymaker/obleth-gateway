@@ -62,6 +62,24 @@ const MIGRATE_LOCK_KEY: i64 = 0x0B1E_7480_0001;
 /// across racing replicas (distinct from `MIGRATE_LOCK_KEY`).
 const CONTROL_PLANE_LOCK_KEY: i64 = 0x0B1E_7480_0002;
 
+pub struct SavedRecipe {
+    pub id: Uuid,
+    pub name: String,
+    pub backend: String,
+    pub author: String,
+    pub spec: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub struct UpsertSavedRecipe {
+    pub id: Option<Uuid>,
+    pub name: String,
+    pub backend: String,
+    pub author: String,
+    pub spec: serde_json::Value,
+}
+
 /// Input for `upsert_managed_model` (no timestamps; the DB sets them).
 pub struct UpsertManagedModel {
     pub model_id: Uuid,
@@ -1634,6 +1652,45 @@ impl Store {
         Ok(())
     }
 
+    // ---- saved recipes ---------------------------------------------------
+
+    pub async fn list_saved_recipes(&self) -> Result<Vec<SavedRecipe>> {
+        let rows = sqlx::query(
+            "select id, name, backend, author, spec, created_at, updated_at
+             from saved_recipes order by updated_at desc")
+            .fetch_all(&self.pool).await?;
+        rows.iter().map(saved_recipe_from_row).collect()
+    }
+
+    pub async fn get_saved_recipe(&self, id: Uuid) -> Result<Option<SavedRecipe>> {
+        let row = sqlx::query(
+            "select id, name, backend, author, spec, created_at, updated_at
+             from saved_recipes where id = $1")
+            .bind(id).fetch_optional(&self.pool).await?;
+        row.as_ref().map(saved_recipe_from_row).transpose()
+    }
+
+    pub async fn upsert_saved_recipe(&self, r: UpsertSavedRecipe) -> Result<SavedRecipe> {
+        let id = r.id.unwrap_or_else(Uuid::new_v4);
+        let row = sqlx::query(
+            "insert into saved_recipes (id, name, backend, author, spec)
+             values ($1,$2,$3,$4,$5)
+             on conflict (id) do update set
+               name=excluded.name, backend=excluded.backend,
+               author=excluded.author, spec=excluded.spec, updated_at=now()
+             returning id, name, backend, author, spec, created_at, updated_at")
+            .bind(id).bind(&r.name).bind(&r.backend).bind(&r.author)
+            .bind(sqlx::types::Json(&r.spec))
+            .fetch_one(&self.pool).await?;
+        saved_recipe_from_row(&row)
+    }
+
+    pub async fn delete_saved_recipe(&self, id: Uuid) -> Result<()> {
+        sqlx::query("delete from saved_recipes where id = $1")
+            .bind(id).execute(&self.pool).await?;
+        Ok(())
+    }
+
     pub async fn create_replica(&self, model_id: Uuid, slurm_job_id: &str) -> Result<ModelReplica> {
         // Idempotent: a retried insert for the same (model_id, slurm_job_id)
         // returns the existing row instead of erroring on the unique index.
@@ -2635,6 +2692,19 @@ fn resolved_endpoint_from_row(row: &PgRow) -> Result<ResolvedEndpoint> {
     })
 }
 
+fn saved_recipe_from_row(row: &PgRow) -> Result<SavedRecipe> {
+    let spec: sqlx::types::Json<serde_json::Value> = row.try_get("spec")?;
+    Ok(SavedRecipe {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        backend: row.try_get("backend")?,
+        author: row.try_get("author")?,
+        spec: spec.0,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 fn managed_model_from_row(row: &PgRow) -> Result<ManagedModelSpec> {
     Ok(ManagedModelSpec {
         model_id: row.try_get("model_id")?,
@@ -3253,6 +3323,42 @@ mod tests {
             .await
             .expect("list")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn saved_recipe_roundtrip() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        // saved_recipes has NO foreign key, so (unlike managed_model_roundtrip)
+        // you do NOT need to create_model first. Insert/list/update/delete directly.
+        let saved = store.upsert_saved_recipe(UpsertSavedRecipe {
+            id: None,
+            name: "GLM-5.2 @ GH200".into(),
+            backend: "llamacpp".into(),
+            author: "you".into(),
+            spec: serde_json::json!({"ctx_size":"1048576","n_cpu_moe":"68"}),
+        }).await.expect("insert");
+        assert_eq!(saved.name, "GLM-5.2 @ GH200");
+
+        let listed = store.list_saved_recipes().await.expect("list");
+        assert!(listed.iter().any(|r| r.id == saved.id));
+
+        let updated = store.upsert_saved_recipe(UpsertSavedRecipe {
+            id: Some(saved.id), name: "GLM-5.2 @ GH200 (1M)".into(),
+            backend: "llamacpp".into(), author: "you".into(),
+            spec: saved.spec.clone(),
+        }).await.expect("update");
+        assert_eq!(updated.id, saved.id);
+        assert_eq!(updated.name, "GLM-5.2 @ GH200 (1M)");
+
+        store.delete_saved_recipe(saved.id).await.expect("delete");
+        assert!(!store.list_saved_recipes().await.expect("list2").iter().any(|r| r.id == saved.id));
     }
 
     #[tokio::test]
