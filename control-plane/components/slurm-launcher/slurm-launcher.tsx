@@ -188,7 +188,7 @@ export function SlurmLauncher(props: {
 
   async function launch() {
     setError(null);
-    if (!modelName.trim()) return setError("Model name is required.");
+    if (props.mode === "create" && !modelName.trim()) return setError("Model name is required.");
     if (!resources.partition.trim()) return setError("Partition is required.");
     if (isCustom ? !scriptBody.trim() : !model.trim())
       return setError(
@@ -280,36 +280,38 @@ export function SlurmLauncher(props: {
 
       <CardContent className="space-y-5">
         {/* Identity */}
-        <div className="grid gap-3 sm:grid-cols-2">
-          <div className="space-y-1.5">
-            <Label htmlFor="sl-model-name">Model name (API id)</Label>
-            <Input
-              id="sl-model-name"
-              value={modelName}
-              onChange={(e) => setModelName(e.target.value)}
-              placeholder="my-model"
-              className="h-9 text-xs"
-              autoCapitalize="none"
-              autoCorrect="off"
-              spellCheck={false}
-            />
+        {props.mode === "create" && (
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="sl-model-name">Model name (API id)</Label>
+              <Input
+                id="sl-model-name"
+                value={modelName}
+                onChange={(e) => setModelName(e.target.value)}
+                placeholder="my-model"
+                className="h-9 text-xs"
+                autoCapitalize="none"
+                autoCorrect="off"
+                spellCheck={false}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="sl-model-type">Model type</Label>
+              <Select
+                id="sl-model-type"
+                value={modelType}
+                onChange={(e) => setModelType(e.target.value)}
+                className="h-9 text-xs"
+              >
+                {MODEL_TYPE_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </Select>
+            </div>
           </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="sl-model-type">Model type</Label>
-            <Select
-              id="sl-model-type"
-              value={modelType}
-              onChange={(e) => setModelType(e.target.value)}
-              className="h-9 text-xs"
-            >
-              {MODEL_TYPE_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </Select>
-          </div>
-        </div>
+        )}
 
         {/* Resources */}
         <ResourceFields
@@ -566,7 +568,13 @@ export function SlurmLauncher(props: {
             </Button>
           )}
           <Button type="button" onClick={launch} disabled={props.busy}>
-            {props.busy ? "Launching…" : "Launch"}
+            {props.mode === "edit"
+              ? props.busy
+                ? "Saving…"
+                : "Save"
+              : props.busy
+                ? "Launching…"
+                : "Launch"}
           </Button>
         </div>
       </CardContent>

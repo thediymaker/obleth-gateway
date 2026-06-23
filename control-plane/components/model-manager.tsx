@@ -96,6 +96,7 @@ import {
   type RecipeParam,
   type SlurmRecipe,
 } from "@/lib/model-recipes";
+import { SlurmLauncher } from "@/components/slurm-launcher/slurm-launcher";
 import { cn, formatNumber } from "@/lib/utils";
 import { useSearchParams } from "next/navigation";
 
@@ -603,6 +604,7 @@ function CreateModelWizard({
   onSubmit: (formData: FormData) => void;
 }) {
   const [step, setStep] = useState(0);
+  const [launcherBusy, setLauncherBusy] = useState(false);
   const [createType, setCreateType] = useState<string>("chat");
   const [modelName, setModelName] = useState("");
   const [endpointMode, setEndpointMode] = useState<string>("static");
@@ -813,6 +815,31 @@ function CreateModelWizard({
       </CardHeader>
 
       <CardContent className="p-0">
+        {hostingMode === "slurm" && step > 0 ? (
+          <div className="p-5 sm:p-6">
+            <SlurmLauncher
+              mode="create"
+              recipes={recipes}
+              onCancel={onCancel}
+              busy={launcherBusy}
+              onSubmit={async (fd) => {
+                setLauncherBusy(true);
+                try {
+                  const result = await createModelAction(fd);
+                  if (result.ok) onCancel();
+                  return result;
+                } finally {
+                  setLauncherBusy(false);
+                }
+              }}
+            />
+            <div className="mt-4 flex justify-start">
+              <Button type="button" variant="outline" disabled={launcherBusy} onClick={() => { setLocalError(null); setStep(0); }}>
+                Back
+              </Button>
+            </div>
+          </div>
+        ) : (
         <form ref={formRef} action={handleSubmit} onInput={updatePreview} onChange={updatePreview}>
           <input type="hidden" name="endpoint_mode" value={hostingMode} />
           <div className="grid min-h-[30rem] lg:grid-cols-[minmax(0,1fr)_18rem]">
@@ -1234,6 +1261,7 @@ function CreateModelWizard({
             </div>
           </div>
         </form>
+        )}
       </CardContent>
     </Card>
   );
