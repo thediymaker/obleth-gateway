@@ -8,6 +8,7 @@ import {
   type ModelHealthSummary,
 } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
+import { loadRecipes } from "@/lib/recipe-files";
 
 export const dynamic = "force-dynamic";
 
@@ -47,6 +48,9 @@ export default async function ModelsPage() {
     perModel.map(([id, , , spec]) => [id, spec !== null]),
   );
 
+  // Admin-authored launch recipes (YAML files); falls back to built-ins.
+  const recipes = loadRecipes();
+
   return (
     <div className="space-y-6">
       <div>
@@ -65,6 +69,7 @@ export default async function ModelsPage() {
         mcpServers={mcpServers}
         managed={managed}
         slurmEnabled={slurm?.enabled ?? false}
+        recipes={recipes}
       />
     </div>
   );

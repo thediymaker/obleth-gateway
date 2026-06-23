@@ -21,6 +21,10 @@ ENV OBLETH_BUILD_SHA=$GIT_SHA
 COPY --from=builder /app/public ./public
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
+# Admin-authored launch recipes (YAML). Read from cwd at request time; the
+# standalone build doesn't bundle non-imported files, so copy them explicitly.
+# Override the location at runtime with OBLETH_RECIPES_DIR.
+COPY --from=builder /app/recipes ./recipes
 # The node:22-slim image ships a non-root `node` user (uid 1000). Declare it
 # numerically so Kubernetes `runAsNonRoot: true` can verify the user is non-root
 # without a pinned `runAsUser` — a username can't be checked and is rejected

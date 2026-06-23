@@ -73,10 +73,13 @@ pub struct UpsertManagedModel {
     pub account: Option<String>,
     pub qos: Option<String>,
     pub time_limit: Option<String>,
+    pub cpus_per_task: Option<i64>,
+    pub mem: Option<String>,
     pub image: String,
     pub preamble: String,
     pub log_output_dir: String,
     pub launch_command: String,
+    pub script_body: String,
     pub serving_port: i64,
     pub health_path: String,
     pub target_replicas: i64,
@@ -1546,7 +1549,8 @@ impl Store {
     pub async fn get_managed_model(&self, model_id: Uuid) -> Result<Option<ManagedModelSpec>> {
         let row = sqlx::query(
             "select model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
-             qos, time_limit, image, preamble, log_output_dir, launch_command, serving_port, \
+             qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
+             script_body, serving_port, \
              health_path, target_replicas, max_job_failures, created_at, updated_at \
              from managed_models where model_id = $1",
         )
@@ -1559,7 +1563,8 @@ impl Store {
     pub async fn list_managed_models(&self) -> Result<Vec<ManagedModelSpec>> {
         let rows = sqlx::query(
             "select model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
-             qos, time_limit, image, preamble, log_output_dir, launch_command, serving_port, \
+             qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
+             script_body, serving_port, \
              health_path, target_replicas, max_job_failures, created_at, updated_at \
              from managed_models order by model_id",
         )
@@ -1572,22 +1577,25 @@ impl Store {
         let row = sqlx::query(
             "insert into managed_models
                 (model_id, enabled, partition, gres, nodes, constraints, exclude,
-                 account, qos, time_limit, image, preamble, log_output_dir, launch_command,
+                 account, qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir,
+                 launch_command, script_body,
                  serving_port, health_path, target_replicas, max_job_failures)
-             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21)
              on conflict (model_id) do update set
                 enabled = excluded.enabled, partition = excluded.partition,
                 gres = excluded.gres, nodes = excluded.nodes,
                 constraints = excluded.constraints, exclude = excluded.exclude,
                 account = excluded.account, qos = excluded.qos,
-                time_limit = excluded.time_limit, image = excluded.image,
+                time_limit = excluded.time_limit, cpus_per_task = excluded.cpus_per_task,
+                mem = excluded.mem, image = excluded.image,
                 preamble = excluded.preamble, log_output_dir = excluded.log_output_dir,
-                launch_command = excluded.launch_command,
+                launch_command = excluded.launch_command, script_body = excluded.script_body,
                 serving_port = excluded.serving_port, health_path = excluded.health_path,
                 target_replicas = excluded.target_replicas,
                 max_job_failures = excluded.max_job_failures, updated_at = now()
              returning model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
-             qos, time_limit, image, preamble, log_output_dir, launch_command, serving_port, \
+             qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
+             script_body, serving_port, \
              health_path, target_replicas, max_job_failures, created_at, updated_at",
         )
         .bind(m.model_id)
@@ -1600,10 +1608,13 @@ impl Store {
         .bind(&m.account)
         .bind(&m.qos)
         .bind(&m.time_limit)
+        .bind(m.cpus_per_task)
+        .bind(&m.mem)
         .bind(&m.image)
         .bind(&m.preamble)
         .bind(&m.log_output_dir)
         .bind(&m.launch_command)
+        .bind(&m.script_body)
         .bind(m.serving_port)
         .bind(&m.health_path)
         .bind(m.target_replicas.max(1))
@@ -2634,10 +2645,13 @@ fn managed_model_from_row(row: &PgRow) -> Result<ManagedModelSpec> {
         account: row.try_get("account")?,
         qos: row.try_get("qos")?,
         time_limit: row.try_get("time_limit")?,
+        cpus_per_task: row.try_get("cpus_per_task")?,
+        mem: row.try_get("mem")?,
         image: row.try_get("image")?,
         preamble: row.try_get("preamble")?,
         log_output_dir: row.try_get("log_output_dir")?,
         launch_command: row.try_get("launch_command")?,
+        script_body: row.try_get("script_body")?,
         serving_port: row.try_get("serving_port")?,
         health_path: row.try_get("health_path")?,
         target_replicas: row.try_get("target_replicas")?,
@@ -3124,10 +3138,13 @@ mod tests {
                 account: None,
                 qos: None,
                 time_limit: Some("12:00:00".into()),
+                cpus_per_task: None,
+                mem: None,
                 image: "vllm.sif".into(),
                 preamble: String::new(),
                 log_output_dir: String::new(),
                 launch_command: "vllm serve nemotron".into(),
+                script_body: String::new(),
                 serving_port: 8000,
                 health_path: "/health".into(),
                 target_replicas: 2,

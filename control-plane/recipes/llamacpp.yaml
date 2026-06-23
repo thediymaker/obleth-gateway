@@ -1,0 +1,110 @@
+# llama.cpp — single-GGUF serving, great for quantised & MoE models.
+id: llamacpp
+label: llama.cpp
+badge: GGUF / MoE
+hint: Single-GGUF serving, great for quantised & MoE models
+health_path: /health
+order: 30
+model_label: GGUF model path
+model_placeholder: /shared/models/model.gguf
+model_hint: Path to the .gguf file passed to llama-server -m.
+image_placeholder: /shared/images/llamacpp.sif (optional)
+image_hint: Leave blank to run a native, module-loaded llama-server (no container).
+image_optional: true
+
+command:
+  executable: llama-server     # set to an absolute path for a native build
+  model_flag: "-m"
+  fixed_args: ["--host", "0.0.0.0"]
+  port_flag: "--port"
+  alias_flag: "--alias"        # registers the upstream name with llama-server
+
+params:
+  - id: ngl
+    label: GPU layers (-ngl)
+    kind: number
+    default: "99"
+    hint: Layers offloaded to the GPU (99 = all).
+    arg: { flag: "-ngl" }
+  - id: ctx_size
+    label: Context size
+    kind: number
+    default: "32768"
+    hint: KV cache is pre-allocated, so larger contexts reserve more RAM up front.
+    arg: { flag: "--ctx-size" }
+  - id: n_cpu_moe
+    label: CPU MoE layers (--n-cpu-moe)
+    kind: number
+    default: "0"
+    hint: Keep expert tensors of N layers on the CPU (0 = off). Raise to fit large MoE models in VRAM.
+    arg: { flag: "--n-cpu-moe", omit_when: ["0"] }
+  - id: cache_type
+    label: KV cache type
+    kind: select
+    default: f16
+    options:
+      - { value: f16, label: f16 (full) }
+      - { value: q8_0, label: q8_0 (smaller) }
+      - { value: q4_0, label: q4_0 (smallest) }
+    hint: Quantise the KV cache to fit a larger context.
+    arg: { flags: ["--cache-type-k", "--cache-type-v"], omit_when: ["f16"] }
+  - id: unified_memory
+    label: CUDA unified memory (GH200)
+    kind: boolean
+    default: "false"
+    hint: Let GPU allocations spill into the Grace CPU's coherent LPDDR.
+    arg: { env: GGML_CUDA_ENABLE_UNIFIED_MEMORY, env_value: "1" }
+  - id: parallel
+    label: Parallel slots
+    kind: number
+    default: "1"
+    hint: KV cache slots; 1 = the whole context is one sequence.
+    advanced: true
+    arg: { flag: "--parallel", omit_when: ["1"] }
+  - id: threads
+    label: Threads
+    kind: text
+    default: ""
+    placeholder: $(nproc)
+    advanced: true
+    arg: { flag: "--threads" }
+  - id: batch_size
+    label: Batch size
+    kind: number
+    default: ""
+    placeholder: "2048"
+    advanced: true
+    arg: { flag: "--batch-size" }
+  - id: ubatch_size
+    label: U-batch size
+    kind: number
+    default: ""
+    placeholder: "512"
+    advanced: true
+    arg: { flag: "--ubatch-size" }
+  - id: flash_attn
+    label: Flash attention
+    kind: boolean
+    default: "true"
+    advanced: true
+    arg: { switch: "--flash-attn", switch_value: "on" }
+  - id: jinja
+    label: Jinja chat template
+    kind: boolean
+    default: "true"
+    advanced: true
+    arg: { switch: "--jinja" }
+  - id: no_mmap
+    label: Disable mmap (--no-mmap)
+    kind: boolean
+    default: "false"
+    hint: Sequential read instead of mmap; faster on a network filesystem.
+    advanced: true
+    arg: { switch: "--no-mmap" }
+  - id: extra_args
+    label: Extra args
+    kind: text
+    default: ""
+    placeholder: "--temp 1.0 --top-p 0.95"
+    advanced: true
+    arg: { raw: true }

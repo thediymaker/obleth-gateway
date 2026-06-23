@@ -18,10 +18,13 @@ const EMPTY: PutManagedModel = {
   partition: "",
   gres: "",
   nodes: 1,
+  cpus_per_task: null,
+  mem: "",
   image: "",
   preamble: "",
   log_output_dir: "",
   launch_command: "",
+  script_body: "",
   serving_port: 8000,
   health_path: "/health",
   target_replicas: 2,
@@ -122,6 +125,8 @@ export function ManagedModelConfig({ modelId }: { modelId: string }) {
         <div className="grid grid-cols-2 gap-3">
           {field("Partition", "partition", "e.g. gpu-preempt")}
           {field("GRES", "gres", "e.g. gpu:h100:2")}
+          {field("CPUs per task", "cpus_per_task", "cluster default", "number")}
+          {field("Memory", "mem", "e.g. 560G")}
           {field("Nodes", "nodes", "1", "number")}
           {field("Target replicas", "target_replicas", "2", "number")}
           {field("Serving port", "serving_port", "8000", "number")}
@@ -154,6 +159,21 @@ export function ManagedModelConfig({ modelId }: { modelId: string }) {
           "launch_command",
           "e.g. vllm serve <model> --port 8000",
         )}
+        <label className="flex flex-col gap-1 text-sm">
+          <span className="text-muted-foreground">
+            Job script override{" "}
+            <span className="text-xs text-muted-foreground/60">
+              (when set, submitted verbatim — overrides image/preamble/launch command)
+            </span>
+          </span>
+          <textarea
+            rows={6}
+            placeholder={"#!/bin/bash\nset -euo pipefail\nmodule load cuda\nllama-server -m model.gguf --port 8000"}
+            value={form.script_body ?? ""}
+            onChange={(e) => setForm({ ...form, script_body: e.target.value })}
+            className="flex w-full rounded-md border border-border bg-background px-3 py-2 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 font-mono resize-y"
+          />
+        </label>
         <div className="flex gap-2">
           <Button onClick={() => save.mutate(form)} disabled={save.isPending}>
             {managed ? "Save" : "Enable provisioning"}

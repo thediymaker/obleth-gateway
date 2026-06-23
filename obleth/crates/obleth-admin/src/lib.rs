@@ -682,12 +682,20 @@ pub(crate) struct PutManagedModel {
     account: Option<String>,
     qos: Option<String>,
     time_limit: Option<String>,
+    #[serde(default)]
+    cpus_per_task: Option<i64>,
+    #[serde(default)]
+    mem: Option<String>,
+    #[serde(default)]
     image: String,
     #[serde(default)]
     preamble: String,
     #[serde(default)]
     log_output_dir: String,
+    #[serde(default)]
     launch_command: String,
+    #[serde(default)]
+    script_body: String,
     serving_port: i64,
     #[serde(default = "default_health_path")]
     health_path: String,
@@ -3187,12 +3195,11 @@ async fn put_managed_model(
     if body.partition.trim().is_empty() {
         return Err(AdminError::BadRequest("partition must not be empty".into()));
     }
-    if body.image.trim().is_empty() {
-        return Err(AdminError::BadRequest("image must not be empty".into()));
-    }
-    if body.launch_command.trim().is_empty() {
+    // image is optional: an empty image means bare-metal (no apptainer wrap).
+    // A model is launchable if it has either a rendered script_body or a launch_command.
+    if body.script_body.trim().is_empty() && body.launch_command.trim().is_empty() {
         return Err(AdminError::BadRequest(
-            "launch_command must not be empty".into(),
+            "launch_command or script_body must not be empty".into(),
         ));
     }
     let spec = state
@@ -3208,10 +3215,13 @@ async fn put_managed_model(
             account: body.account,
             qos: body.qos,
             time_limit: body.time_limit,
+            cpus_per_task: body.cpus_per_task,
+            mem: body.mem,
             image: body.image,
             preamble: body.preamble,
             log_output_dir: body.log_output_dir,
             launch_command: body.launch_command,
+            script_body: body.script_body,
             serving_port: body.serving_port,
             health_path: body.health_path,
             target_replicas: body.target_replicas,

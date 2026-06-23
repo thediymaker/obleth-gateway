@@ -658,11 +658,12 @@ export async function createModelAction(
   if (isSlurm && !trimmed(formData.get("slurm_partition"))) {
     return { ok: false, error: "Slurm partition is required" };
   }
-  if (isSlurm && !trimmed(formData.get("slurm_image"))) {
-    return { ok: false, error: "Slurm image is required" };
-  }
-  if (isSlurm && !trimmed(formData.get("slurm_launch_command"))) {
-    return { ok: false, error: "Slurm launch command is required" };
+  if (
+    isSlurm &&
+    !trimmed(formData.get("slurm_launch_command")) &&
+    !trimmed(formData.get("slurm_script_body"))
+  ) {
+    return { ok: false, error: "Slurm launch command or job script is required" };
   }
 
   try {
@@ -691,6 +692,9 @@ export async function createModelAction(
         preamble: trimmed(formData.get("slurm_preamble")),
         log_output_dir: trimmed(formData.get("slurm_log_output_dir")),
         launch_command: trimmed(formData.get("slurm_launch_command")),
+        script_body: trimmed(formData.get("slurm_script_body")),
+        cpus_per_task: numOrNull(formData.get("slurm_cpus_per_task")),
+        mem: strOrNull(formData.get("slurm_mem")) ?? null,
         serving_port: numOr(formData.get("slurm_serving_port"), 8000),
         health_path: trimmed(formData.get("slurm_health_path")) || "/health",
         target_replicas: numOr(formData.get("slurm_target_replicas"), 2),

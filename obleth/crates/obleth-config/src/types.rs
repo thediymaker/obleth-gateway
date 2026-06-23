@@ -527,6 +527,12 @@ pub struct ManagedModelSpec {
     pub account: Option<String>,
     pub qos: Option<String>,
     pub time_limit: Option<String>,
+    /// Slurm `--cpus-per-task`. `None` leaves it to the cluster default.
+    #[serde(default)]
+    pub cpus_per_task: Option<i64>,
+    /// Slurm `--mem` (e.g. `560G`). `None` leaves it to the cluster default.
+    #[serde(default)]
+    pub mem: Option<String>,
     pub image: String,
     /// Shell lines injected before `apptainer exec` in the batch script.
     /// Use this to load modules or set PATH on your cluster, e.g. `module load apptainer`.
@@ -535,6 +541,11 @@ pub struct ManagedModelSpec {
     /// `{dir}/{job_name}-%j.out` and `{dir}/{job_name}-%j.err`. Empty = Slurm default.
     pub log_output_dir: String,
     pub launch_command: String,
+    /// Fully-rendered job script (recipe output). When non-empty it is submitted
+    /// verbatim and takes precedence over the `image`/`preamble`/`launch_command`
+    /// assembly. Empty preserves the legacy path.
+    #[serde(default)]
+    pub script_body: String,
     pub serving_port: i64,
     pub health_path: String,
     pub target_replicas: i64,

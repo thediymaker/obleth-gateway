@@ -1,0 +1,19 @@
+# Ollama — easy pull-and-serve, GGUF-friendly.
+#
+# Ollama doesn't fit the structured `command` model (it serves in the background,
+# pulls the tag, then waits), so it uses a `command_template` escape hatch.
+# Tokens: {{model}}, {{port}}, {{upstream}}.
+id: ollama
+label: Ollama
+badge: Multi-model
+hint: Easy pull-and-serve, GGUF-friendly
+health_path: /api/tags
+order: 20
+model_placeholder: "qwen2.5:0.5b"
+model_hint: Ollama model tag (e.g. from ollama pull).
+image_placeholder: /shared/images/ollama.sif
+image_hint: "Build with: apptainer pull docker://ollama/ollama"
+
+command_template: >-
+  sh -c "OLLAMA_HOST=0.0.0.0:{{port}} ollama serve & sleep 5 &&
+  OLLAMA_HOST=0.0.0.0:{{port}} ollama pull {{model}} && wait"
