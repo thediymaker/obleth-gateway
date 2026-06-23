@@ -13,6 +13,7 @@ max_job_failures: 3
 #SBATCH --cpus-per-task=72
 #SBATCH --mem=560G
 #SBATCH --time=04:00:00
+#SBATCH -q private
 #SBATCH -p arm
 #SBATCH --output=logs/serve-%j.out
 set -euo pipefail
