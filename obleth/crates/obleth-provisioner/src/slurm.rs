@@ -1,4 +1,4 @@
-use crate::domain::{JobInfo, JobState, JobSubmit, NodeInfo, PartitionInfo};
+use crate::domain::{ClusterResources, JobInfo, JobState, JobSubmit, NodeInfo, PartitionInfo};
 use async_trait::async_trait;
 use obleth_config::ManagedModelSpec;
 
@@ -9,6 +9,10 @@ pub trait SlurmClient: Send + Sync {
     async fn cancel(&self, job_id: &str) -> anyhow::Result<()>;
     /// All jobs whose name starts with the gateway's prefix.
     async fn list_owned_jobs(&self, name_prefix: &str) -> anyhow::Result<Vec<JobInfo>>;
+    /// Best-effort read of cluster partitions, nodes, and the caller's
+    /// accounts/QoS. Individual sub-reads that fail are logged and skipped so a
+    /// partial cluster view still powers the launcher dropdowns.
+    async fn discover_resources(&self) -> anyhow::Result<ClusterResources>;
 }
 
 /// Build a version-agnostic JobSubmit from a model's spec. The job is named
@@ -238,6 +242,39 @@ impl SlurmClient for Slurmrestd {
                 state: map_job_state(&state_str),
                 nodes: expand_nodelist(nodes),
             });
+        }
+        Ok(out)
+    }
+
+    async fn discover_resources(&self) -> anyhow::Result<ClusterResources> {
+        let get = |path: String| {
+            let url = format!("{}/{}", self.base, path);
+            self.auth(self.http.get(&url)).send()
+        };
+        let mut out = ClusterResources::default();
+        match get(format!("slurm/{}/partitions", self.version)).await {
+            Ok(r) if r.status().is_success() => {
+                if let Ok(v) = r.json::<serde_json::Value>().await { out.partitions = parse_partitions(&v); }
+            }
+            Ok(r) => tracing::warn!(status=%r.status(), "slurm partitions read failed"),
+            Err(e) => tracing::warn!(error=%e, "slurm partitions read errored"),
+        }
+        match get(format!("slurm/{}/nodes", self.version)).await {
+            Ok(r) if r.status().is_success() => {
+                if let Ok(v) = r.json::<serde_json::Value>().await { out.nodes = parse_nodes(&v); }
+            }
+            Ok(r) => tracing::warn!(status=%r.status(), "slurm nodes read failed"),
+            Err(e) => tracing::warn!(error=%e, "slurm nodes read errored"),
+        }
+        match get(format!("slurmdb/{}/associations", self.version)).await {
+            Ok(r) if r.status().is_success() => {
+                if let Ok(v) = r.json::<serde_json::Value>().await {
+                    let (a, q) = parse_associations(&v);
+                    out.accounts = a; out.qos = q;
+                }
+            }
+            Ok(r) => tracing::warn!(status=%r.status(), "slurm associations read failed"),
+            Err(e) => tracing::warn!(error=%e, "slurm associations read errored"),
         }
         Ok(out)
     }
@@ -526,5 +563,8 @@ impl SlurmClient for MockSlurm {
     }
     async fn list_owned_jobs(&self, _prefix: &str) -> anyhow::Result<Vec<JobInfo>> {
         Ok(self.jobs.lock().unwrap().clone())
+    }
+    async fn discover_resources(&self) -> anyhow::Result<ClusterResources> {
+        Ok(ClusterResources::default())
     }
 }
