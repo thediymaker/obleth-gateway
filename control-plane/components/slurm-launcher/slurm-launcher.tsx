@@ -24,10 +24,33 @@ import {
 } from "@/components/slurm-launcher/resource-fields";
 import { useClusterResources } from "@/components/slurm-launcher/use-cluster-resources";
 import { PerformanceFields } from "@/components/slurm-launcher/performance-fields";
+import { CatalogDrawer } from "@/components/slurm-launcher/catalog-drawer";
 
 export type LauncherSubmit = (
   formData: FormData,
 ) => Promise<{ ok: boolean; error?: string }>;
+
+export type LauncherSpec = {
+  backendId?: string;
+  model?: string;
+  port?: string;
+  recipeValues?: Record<string, string>;
+  preamble?: string;
+  resources?: Partial<ResourceValue>;
+  vramGb?: string;
+  nodes?: string;
+  replicas?: string;
+  healthPath?: string;
+  maxJobFailures?: string;
+  image?: string;
+  logOutputDir?: string;
+  account?: string;
+  qos?: string;
+  timeLimit?: string;
+  constraints?: string;
+  exclude?: string;
+  scriptBody?: string;
+};
 
 // MODEL_TYPE_OPTIONS is not exported from model-manager.tsx, so we keep a local
 // minimal list of the served model types.
@@ -51,6 +74,7 @@ export function SlurmLauncher(props: {
   onSubmit: LauncherSubmit;
   onCancel?: () => void;
   busy?: boolean;
+  initialSpec?: LauncherSpec;
 }): React.ReactElement {
   const recipes = props.recipes ?? SLURM_RECIPES;
 
@@ -82,8 +106,61 @@ export function SlurmLauncher(props: {
   const [scriptBody, setScriptBody] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [showAdvancedPlacement, setShowAdvancedPlacement] = useState(false);
+  const [catalogOpen, setCatalogOpen] = useState(false);
 
   const { data: resourcesData } = useClusterResources();
+
+  function currentSpec(): LauncherSpec {
+    return {
+      backendId,
+      model,
+      port,
+      recipeValues,
+      preamble,
+      resources,
+      vramGb,
+      nodes,
+      replicas,
+      healthPath,
+      maxJobFailures,
+      image,
+      logOutputDir,
+      account,
+      qos,
+      timeLimit,
+      constraints,
+      exclude,
+      scriptBody,
+    };
+  }
+
+  function applySpec(spec: LauncherSpec) {
+    if (spec.backendId !== undefined) setBackendId(spec.backendId);
+    if (spec.model !== undefined) setModel(spec.model);
+    if (spec.port !== undefined) setPort(spec.port);
+    if (spec.recipeValues !== undefined) setRecipeValues(spec.recipeValues);
+    if (spec.preamble !== undefined) setPreamble(spec.preamble);
+    if (spec.resources !== undefined) setResources({ ...EMPTY_RESOURCES, ...spec.resources });
+    if (spec.vramGb !== undefined) setVramGb(spec.vramGb);
+    if (spec.nodes !== undefined) setNodes(spec.nodes);
+    if (spec.replicas !== undefined) setReplicas(spec.replicas);
+    if (spec.healthPath !== undefined) setHealthPath(spec.healthPath);
+    if (spec.maxJobFailures !== undefined) setMaxJobFailures(spec.maxJobFailures);
+    if (spec.image !== undefined) setImage(spec.image);
+    if (spec.logOutputDir !== undefined) setLogOutputDir(spec.logOutputDir);
+    if (spec.account !== undefined) setAccount(spec.account);
+    if (spec.qos !== undefined) setQos(spec.qos);
+    if (spec.timeLimit !== undefined) setTimeLimit(spec.timeLimit);
+    if (spec.constraints !== undefined) setConstraints(spec.constraints);
+    if (spec.exclude !== undefined) setExclude(spec.exclude);
+    if (spec.scriptBody !== undefined) setScriptBody(spec.scriptBody);
+  }
+
+  const applied = React.useRef(false);
+  React.useEffect(() => {
+    if (!applied.current && props.initialSpec) { applied.current = true; applySpec(props.initialSpec); }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Derived launch script — reuse the recipe engine verbatim.
   const generatedCmd = buildRecipeCommand(recipe, {
@@ -158,10 +235,29 @@ export function SlurmLauncher(props: {
 
   return (
     <Card>
-      <CardHeader>
-        <CardTitle>
-          {props.mode === "edit" ? "Edit managed model" : "Launch a model on Slurm"}
-        </CardTitle>
+      <CardHeader className="relative">
+        <div className="flex items-center justify-between gap-2">
+          <CardTitle>
+            {props.mode === "edit" ? "Edit managed model" : "Launch a model on Slurm"}
+          </CardTitle>
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setCatalogOpen((v) => !v)}
+            className="shrink-0 text-xs"
+          >
+            Catalog
+          </Button>
+        </div>
+        <CatalogDrawer
+          open={catalogOpen}
+          onClose={() => setCatalogOpen(false)}
+          curated={recipes}
+          currentBackendId={backendId}
+          currentSpec={currentSpec}
+          onUse={(spec) => { applySpec(spec); setCatalogOpen(false); }}
+        />
         <Tabs value={backendId} onValueChange={selectBackend} className="mt-2">
           <TabsList>
             {recipes.map((r) => (
