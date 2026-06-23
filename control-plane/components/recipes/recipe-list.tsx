@@ -5,21 +5,15 @@ import { deployRecipeAction } from "@/app/actions";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import type { RecipeCard } from "./recipe-card";
 
-type RecipeCard = {
-  id: string;
-  valid: boolean;
-  error?: string;
-  name?: string;
-  engine?: string;
-  modelType?: string;
-  description?: string;
-  apiModelName?: string;
-  targetReplicas?: number;
-  warnings: string[];
-};
-
-export function RecipeList({ recipes }: { recipes: RecipeCard[] }) {
+export function RecipeList({
+  recipes,
+  onDeployed,
+}: {
+  recipes: RecipeCard[];
+  onDeployed?: () => void;
+}) {
   const [pending, startTransition] = useTransition();
   const [msg, setMsg] = useState<string | null>(null);
 
@@ -30,7 +24,12 @@ export function RecipeList({ recipes }: { recipes: RecipeCard[] }) {
         api_model_name: r.apiModelName,
         target_replicas: r.targetReplicas,
       });
-      setMsg(res.ok ? `Deployed ${r.name ?? r.id}` : `Error: ${res.error}`);
+      if (res.ok) {
+        setMsg(`Deployed ${r.name ?? r.id}`);
+        onDeployed?.();
+      } else {
+        setMsg(`Error: ${res.error}`);
+      }
     });
   }
 

@@ -1,21 +1,11 @@
 import { listRecipes } from "@/lib/sbatch-recipes";
+import { toRecipeCards } from "@/components/recipes/recipe-card";
 import { RecipeList } from "@/components/recipes/recipe-list";
 
 export const dynamic = "force-dynamic";
 
 export default function RecipesPage() {
-  const recipes = listRecipes().map((r) => ({
-    id: r.id,
-    valid: r.valid,
-    error: r.error,
-    name: r.header?.name,
-    engine: r.header?.engine,
-    modelType: r.header?.model_type,
-    description: r.header?.description,
-    apiModelName: r.header?.api_model_name,
-    targetReplicas: r.header?.target_replicas,
-    warnings: r.warnings,
-  }));
+  const recipes = toRecipeCards(listRecipes());
 
   return (
     <div className="space-y-6">
