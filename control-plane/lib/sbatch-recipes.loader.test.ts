@@ -55,4 +55,14 @@ describe("listRecipes / getRecipe", () => {
     expect(getRecipe("glm")?.header?.api_model_name).toBe("glm");
     expect(getRecipe("nope")).toBeNull();
   });
+
+  it("returns entries sorted by id regardless of disk order", () => {
+    // Write files out of alphabetical order
+    const zebraRecipe = VALID.replace("name: GLM", "name: Zebra").replace("api_model_name: glm", "api_model_name: zebra");
+    const aardvarkRecipe = VALID.replace("name: GLM", "name: Aardvark").replace("api_model_name: glm", "api_model_name: aardvark");
+    writeFileSync(path.join(dir, "zebra.recipe"), zebraRecipe);
+    writeFileSync(path.join(dir, "aardvark.recipe"), aardvarkRecipe);
+    const recipes = listRecipes();
+    expect(recipes.map((r) => r.id)).toEqual(["aardvark", "zebra"]);
+  });
 });

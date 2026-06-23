@@ -6,11 +6,11 @@
 //
 // Distinct from ./recipe-files.ts (the legacy wizard-definition `*.yaml`
 // files); this module owns the new `*.recipe` files and never imports that one.
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { parseSbatchDirectives, type ParsedDirectives } from "./sbatch-directives";
-import { readdirSync, readFileSync, statSync } from "node:fs";
-import path from "node:path";
 
 export interface RecipeHeader {
   name: string;
