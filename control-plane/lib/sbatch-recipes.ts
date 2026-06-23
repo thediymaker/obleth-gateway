@@ -74,12 +74,12 @@ const HeaderSchema = z
 function splitFrontmatter(text: string): { header: string; body: string } | null {
   const norm = text.replace(/\r\n/g, "\n");
   if (!norm.startsWith("---\n")) return null;
-  const end = norm.indexOf("\n---", 4); // closing fence
-  if (end === -1) return null;
-  const header = norm.slice(4, end);
-  // body starts after the line containing the closing `---`
-  const afterFence = norm.indexOf("\n", end + 1);
-  const body = afterFence === -1 ? "" : norm.slice(afterFence + 1);
+  // Match a closing fence: exactly "---" on its own line
+  const m = norm.slice(4).match(/\n---(?:\r?\n|$)/);
+  if (!m || m.index === undefined) return null;
+  const fenceStart = 4 + m.index;          // index of the "\n" before "---"
+  const header = norm.slice(4, fenceStart);
+  const body = norm.slice(fenceStart + m[0].length); // skip past "\n---\n"
   return { header, body };
 }
 
@@ -96,7 +96,10 @@ export function parseRecipe(id: string, text: string): ParsedRecipe {
   }
   const parsed = HeaderSchema.safeParse(raw);
   if (!parsed.success) {
-    return { id, valid: false, error: parsed.error.issues[0]?.message ?? "invalid header", warnings: [] };
+    const issue = parsed.error.issues[0];
+    const where = issue?.path.join(".") || "header";
+    const why = issue?.message ?? "invalid header";
+    return { id, valid: false, error: `${where}: ${why}`, warnings: [] };
   }
   const body = split.body.trim();
   if (!body) {

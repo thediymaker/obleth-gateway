@@ -92,4 +92,39 @@ describe("parseRecipe", () => {
     expect(r.valid).toBe(false);
     expect(r.warnings).toEqual([]);
   });
+
+  it("does not truncate body at a line containing --- section break ---", () => {
+    const bodyWithDashes = [
+      "#!/bin/bash -l",
+      "#SBATCH --gres=gpu:gh200:1",
+      "--- section break ---",
+      "module load cuda",
+      "llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M --host 0.0.0.0 --port 8000",
+    ].join("\n");
+    const r = parseRecipe(
+      "glm",
+      file(
+        [
+          "name: GLM-5.2",
+          "engine: llamacpp",
+          "model_type: chat",
+          "api_model_name: glm-5.2",
+          "port: 8000",
+        ].join("\n"),
+        bodyWithDashes,
+      ),
+    );
+    expect(r.valid).toBe(true);
+    expect(r.body).toContain("--- section break ---");
+    expect(r.body).toContain("llama-server -hf");
+  });
+
+  it("includes field path in header validation error", () => {
+    const r = parseRecipe(
+      "x",
+      file(["name: X", "engine: llamacpp", "model_type: chat", "port: 8000"].join("\n")), // missing api_model_name
+    );
+    expect(r.valid).toBe(false);
+    expect(r.error).toContain("api_model_name");
+  });
 });
