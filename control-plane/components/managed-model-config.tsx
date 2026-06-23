@@ -1,32 +1,38 @@
 "use client";
 
-import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
+import {
+  SlurmLauncher,
+  type LauncherSpec,
+} from "@/components/slurm-launcher/slurm-launcher";
 import type { ManagedModelSpec, PutManagedModel } from "@/lib/obleth";
 
-const EMPTY: PutManagedModel = {
-  enabled: true,
-  partition: "",
-  gres: "",
-  nodes: 1,
-  image: "",
-  preamble: "",
-  log_output_dir: "",
-  launch_command: "",
-  serving_port: 8000,
-  health_path: "/health",
-  target_replicas: 2,
-  max_job_failures: 0,
-};
+function fallbackSpec(d: ManagedModelSpec): LauncherSpec {
+  return {
+    backendId: "custom",
+    scriptBody: d.script_body || d.launch_command || "",
+    resources: {
+      partition: d.partition,
+      gres: d.gres,
+      cpusPerTask: d.cpus_per_task != null ? String(d.cpus_per_task) : "",
+      mem: d.mem ?? "",
+    },
+    nodes: String(d.nodes ?? 1),
+    replicas: String(d.target_replicas ?? 2),
+    healthPath: d.health_path,
+    port: String(d.serving_port),
+    maxJobFailures: String(d.max_job_failures ?? 0),
+    image: d.image ?? "",
+    preamble: d.preamble ?? "",
+    logOutputDir: d.log_output_dir ?? "",
+    account: d.account ?? "",
+    qos: d.qos ?? "",
+    timeLimit: d.time_limit ?? "",
+    constraints: d.constraints ?? "",
+    exclude: d.exclude ?? "",
+  };
+}
 
 export function ManagedModelConfig({ modelId }: { modelId: string }) {
   const qc = useQueryClient();
@@ -39,31 +45,7 @@ export function ManagedModelConfig({ modelId }: { modelId: string }) {
     },
   });
 
-  const [form, setForm] = useState<PutManagedModel>(EMPTY);
-  const [managed, setManaged] = useState(false);
-
-  useEffect(() => {
-    if (data) {
-      setManaged(true);
-      setForm({ ...data });
-    } else if (data === null) {
-      setManaged(false);
-      setForm(EMPTY);
-    }
-  }, [data]);
-
-  const save = useMutation({
-    mutationFn: async (body: PutManagedModel) => {
-      const r = await fetch(`/api/live/models/${modelId}/managed`, {
-        method: "PUT",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
-      if (!r.ok) throw new Error("save failed");
-      return r.json();
-    },
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["managed", modelId] }),
-  });
+  const managed = !!data;
 
   const remove = useMutation({
     mutationFn: async () => {
@@ -75,103 +57,79 @@ export function ManagedModelConfig({ modelId }: { modelId: string }) {
     onSuccess: () => qc.invalidateQueries({ queryKey: ["managed", modelId] }),
   });
 
+  async function editSubmit(fd: FormData): Promise<{ ok: boolean; error?: string }> {
+    const s = (k: string) => String(fd.get(k) ?? "");
+    const sOrNull = (k: string) => {
+      const v = s(k).trim();
+      return v ? v : null;
+    };
+    const n = (k: string, d: number) => {
+      const raw = s(k).trim();
+      const v = Number(raw);
+      return raw !== "" && Number.isFinite(v) ? v : d;
+    };
+    let launcher_spec: Record<string, unknown> | null = null;
+    const rawSpec = s("slurm_launcher_spec");
+    if (rawSpec) {
+      try {
+        launcher_spec = JSON.parse(rawSpec) as Record<string, unknown>;
+      } catch {
+        /* keep null */
+      }
+    }
+    const body: PutManagedModel = {
+      enabled: true,
+      partition: s("slurm_partition"),
+      gres: s("slurm_gres"),
+      nodes: n("slurm_nodes", 1),
+      constraints: sOrNull("slurm_constraints"),
+      exclude: sOrNull("slurm_exclude"),
+      account: sOrNull("slurm_account"),
+      qos: sOrNull("slurm_qos"),
+      time_limit: sOrNull("slurm_time_limit"),
+      cpus_per_task: s("slurm_cpus_per_task").trim() ? n("slurm_cpus_per_task", 0) : null,
+      mem: sOrNull("slurm_mem"),
+      image: s("slurm_image"),
+      preamble: s("slurm_preamble"),
+      log_output_dir: s("slurm_log_output_dir"),
+      launch_command: s("slurm_launch_command"),
+      script_body: s("slurm_script_body"),
+      serving_port: n("slurm_serving_port", 8000),
+      health_path: s("slurm_health_path") || "/health",
+      target_replicas: n("slurm_target_replicas", 2),
+      max_job_failures: n("slurm_max_job_failures", 0),
+      launcher_spec,
+    };
+    const r = await fetch(`/api/live/models/${modelId}/managed`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    if (!r.ok) return { ok: false, error: "Save failed." };
+    qc.invalidateQueries({ queryKey: ["managed", modelId] });
+    return { ok: true };
+  }
+
   if (isLoading) return null;
 
-  const field = (
-    label: string,
-    key: keyof PutManagedModel,
-    placeholder = "",
-    type: "text" | "number" = "text",
-  ) => (
-    <label className="flex flex-col gap-1 text-sm">
-      <span className="text-muted-foreground">{label}</span>
-      <Input
-        type={type}
-        placeholder={placeholder}
-        value={(form[key] as string | number | undefined) ?? ""}
-        onChange={(e) =>
-          setForm({
-            ...form,
-            [key]: type === "number" ? Number(e.target.value) : e.target.value,
-          })
-        }
-      />
-    </label>
-  );
+  const initialSpec: LauncherSpec | undefined = data
+    ? data.launcher_spec
+      ? (data.launcher_spec as unknown as LauncherSpec)
+      : fallbackSpec(data)
+    : undefined;
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Slurm provisioning</CardTitle>
-        <CardDescription>
-          Host this model on the cluster. Keeps {form.target_replicas ?? 2}{" "}
-          replicas alive and replaces preempted ones. Leave off for a static
-          (manually-registered) model.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-4">
-        <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            className="h-4 w-4 rounded border-border accent-primary"
-            checked={form.enabled ?? true}
-            onChange={(e) => setForm({ ...form, enabled: e.target.checked })}
-          />
-          Provisioning enabled
-        </label>
-        <div className="grid grid-cols-2 gap-3">
-          {field("Partition", "partition", "e.g. gpu-preempt")}
-          {field("GRES", "gres", "e.g. gpu:h100:2")}
-          {field("Nodes", "nodes", "1", "number")}
-          {field("Target replicas", "target_replicas", "2", "number")}
-          {field("Serving port", "serving_port", "8000", "number")}
-          {field("Health path", "health_path", "/health")}
-          {field("Time limit", "time_limit", "e.g. 12:00:00")}
-          {field("Max job failures", "max_job_failures", "0 = unlimited", "number")}
-          {field("Account", "account", "optional")}
-          {field("QOS", "qos", "optional")}
-          {field("Constraints", "constraints", "optional")}
-          {field("Log output dir", "log_output_dir", "e.g. /shared/logs (empty = Slurm default)")}
-        </div>
-        {field("Apptainer image", "image", "e.g. /shared/images/vllm.sif")}
-        <label className="flex flex-col gap-1 text-sm">
-          <span className="text-muted-foreground">
-            Preamble{" "}
-            <span className="text-xs text-muted-foreground/60">
-              (shell lines before apptainer exec, e.g. module load apptainer)
-            </span>
-          </span>
-          <textarea
-            rows={3}
-            placeholder={"module load apptainer/1.3.4"}
-            value={form.preamble ?? ""}
-            onChange={(e) => setForm({ ...form, preamble: e.target.value })}
-            className="flex w-full rounded-md border border-border bg-background px-3 py-2 text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50 font-mono resize-y"
-          />
-        </label>
-        {field(
-          "Launch command",
-          "launch_command",
-          "e.g. vllm serve <model> --port 8000",
-        )}
-        <div className="flex gap-2">
-          <Button onClick={() => save.mutate(form)} disabled={save.isPending}>
-            {managed ? "Save" : "Enable provisioning"}
-          </Button>
-          {managed && (
-            <Button
-              variant="destructive"
-              onClick={() => remove.mutate()}
-              disabled={remove.isPending}
-            >
-              Remove
-            </Button>
-          )}
-        </div>
-        {save.isError && (
-          <p className="text-sm text-destructive">Save failed.</p>
-        )}
-      </CardContent>
-    </Card>
+    <div className="space-y-3">
+      <SlurmLauncher mode="edit" initialSpec={initialSpec} onSubmit={editSubmit} />
+      {managed && (
+        <Button
+          variant="destructive"
+          onClick={() => remove.mutate()}
+          disabled={remove.isPending}
+        >
+          Remove provisioning
+        </Button>
+      )}
+    </div>
   );
 }

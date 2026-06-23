@@ -35,6 +35,10 @@ pub struct JobSubmit {
     pub qos: Option<String>,
     pub constraints: Option<String>,
     pub exclude: Option<String>,
+    /// Slurm `--cpus-per-task`; `None` leaves it to the cluster default.
+    pub cpus_per_task: Option<i64>,
+    /// Memory per node in megabytes (slurm `--mem`); `None` leaves it default.
+    pub mem_mb: Option<i64>,
     /// Directory for stdout/stderr files; empty means Slurm default.
     pub log_output_dir: String,
     /// Shell script the job runs (apptainer exec ... <launch_command>).
@@ -50,6 +54,35 @@ pub struct ReplicaView {
     pub state: String, // pending|starting|healthy|draining|lost
     pub endpoint_id: Option<Uuid>,
     pub age_secs: i64, // now - created_at, for GC + cancel ordering
+}
+
+/// Live, version-agnostic snapshot of what the configured Slurm cluster offers.
+/// Powers the launcher's resource dropdowns. Every field is best-effort: a
+/// version skew or permission gap yields empties, never an error.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ClusterResources {
+    pub partitions: Vec<PartitionInfo>,
+    pub nodes: Vec<NodeInfo>,
+    pub accounts: Vec<String>,
+    pub qos: Vec<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PartitionInfo {
+    pub name: String,
+    pub nodes: Vec<String>,
+    pub default_time: Option<String>,
+    pub max_time: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NodeInfo {
+    pub name: String,
+    pub partitions: Vec<String>,
+    pub gres: String,
+    pub cpus: Option<i64>,
+    pub real_memory_mb: Option<i64>,
+    pub features: Vec<String>,
 }
 
 /// Actions the executor applies. The planner emits these; it performs no I/O.

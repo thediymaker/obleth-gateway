@@ -308,11 +308,14 @@ create table if not exists managed_models (
     account         text,
     qos             text,
     time_limit      text,                              -- slurm --time, e.g. 12:00:00
+    cpus_per_task   bigint,                            -- slurm --cpus-per-task (null = default)
+    mem             text,                              -- slurm --mem, e.g. 560G (null = default)
     -- launch
     image           text not null,                     -- apptainer image ref
     preamble        text not null default '',           -- shell lines injected before apptainer exec (e.g. module load apptainer)
     log_output_dir  text not null default '',           -- directory for slurm stdout/stderr files (e.g. /shared/logs); empty = slurm default
     launch_command  text not null,                     -- vllm serve command template
+    script_body     text not null default '',           -- fully-rendered job script; when set, submitted verbatim (overrides image/preamble/launch_command)
     serving_port    bigint not null check (serving_port between 1 and 65535),
     health_path     text not null default '/health',
     -- scaling (v1: fixed target, no autoscaling; default 2 for preempt safety)
@@ -374,3 +377,10 @@ create table if not exists app_settings (
 alter table managed_models add column if not exists preamble text not null default '';
 alter table managed_models add column if not exists log_output_dir text not null default '';
 alter table managed_models add column if not exists max_job_failures bigint not null default 0;
+-- Scheduler resources slurmrestd needs as structured fields (#SBATCH directives in
+-- a script body are ignored by the REST submit path). NULL = leave to cluster default.
+alter table managed_models add column if not exists cpus_per_task bigint;          -- slurm --cpus-per-task
+alter table managed_models add column if not exists mem text;                       -- slurm --mem, e.g. 560G
+-- Fully-rendered job script (recipe output). When non-empty it is submitted
+-- verbatim and takes precedence over the image/preamble/launch_command assembly.
+alter table managed_models add column if not exists script_body text not null default '';

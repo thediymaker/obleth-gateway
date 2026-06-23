@@ -658,11 +658,12 @@ export async function createModelAction(
   if (isSlurm && !trimmed(formData.get("slurm_partition"))) {
     return { ok: false, error: "Slurm partition is required" };
   }
-  if (isSlurm && !trimmed(formData.get("slurm_image"))) {
-    return { ok: false, error: "Slurm image is required" };
-  }
-  if (isSlurm && !trimmed(formData.get("slurm_launch_command"))) {
-    return { ok: false, error: "Slurm launch command is required" };
+  if (
+    isSlurm &&
+    !trimmed(formData.get("slurm_launch_command")) &&
+    !trimmed(formData.get("slurm_script_body"))
+  ) {
+    return { ok: false, error: "Slurm launch command or job script is required" };
   }
 
   try {
@@ -691,10 +692,19 @@ export async function createModelAction(
         preamble: trimmed(formData.get("slurm_preamble")),
         log_output_dir: trimmed(formData.get("slurm_log_output_dir")),
         launch_command: trimmed(formData.get("slurm_launch_command")),
+        script_body: trimmed(formData.get("slurm_script_body")),
+        cpus_per_task: numOrNull(formData.get("slurm_cpus_per_task")),
+        mem: strOrNull(formData.get("slurm_mem")) ?? null,
         serving_port: numOr(formData.get("slurm_serving_port"), 8000),
         health_path: trimmed(formData.get("slurm_health_path")) || "/health",
         target_replicas: numOr(formData.get("slurm_target_replicas"), 2),
         max_job_failures: numOr(formData.get("slurm_max_job_failures"), 0),
+        launcher_spec: (() => {
+          const raw = trimmed(formData.get("slurm_launcher_spec"));
+          if (!raw) return null;
+          try { return JSON.parse(raw) as Record<string, unknown>; }
+          catch { return null; }
+        })(),
         account: strOrNull(formData.get("slurm_account")) ?? null,
         qos: strOrNull(formData.get("slurm_qos")) ?? null,
         time_limit: strOrNull(formData.get("slurm_time_limit")) ?? null,

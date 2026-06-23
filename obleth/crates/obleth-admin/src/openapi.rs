@@ -140,6 +140,12 @@ use obleth_config::{
         crate::slurm_settings::put_slurm_settings,
         crate::slurm_settings::test_slurm_settings,
         crate::slurm_settings::get_slurm_settings_resolved,
+        crate::slurm_resources::get_slurm_resources,
+        // recipes
+        crate::saved_recipes::list_recipes,
+        crate::saved_recipes::create_recipe,
+        crate::saved_recipes::update_recipe,
+        crate::saved_recipes::delete_recipe,
         // backup
         crate::backup::export_backup,
         crate::backup::restore_backup,
@@ -254,6 +260,8 @@ use obleth_config::{
         RestoreReport,
         RestoreCounts,
         crate::VersionInfo,
+        crate::saved_recipes::RecipeView,
+        crate::saved_recipes::UpsertRecipeBody,
     )),
     tags(
         (name = "meta", description = "Gateway build/version identity"),
@@ -266,7 +274,8 @@ use obleth_config::{
         (name = "audit", description = "Admin audit log"),
         (name = "capacity", description = "Global gateway in-flight capacity"),
         (name = "settings", description = "Runtime alerting, auto-router, and retention configuration"),
-        (name = "backup", description = "Configuration backup and restore")
+        (name = "backup", description = "Configuration backup and restore"),
+        (name = "slurm", description = "Live Slurm cluster resource discovery")
     )
 )]
 pub struct ApiDoc;

@@ -88,6 +88,11 @@ import {
 } from "@/components/ui/tooltip";
 import type { AutotuneReport, AutotuneWorkload, CacheStats, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import { providerForModel } from "@/lib/model-providers";
+import {
+  SLURM_RECIPES,
+  type SlurmRecipe,
+} from "@/lib/model-recipes";
+import { SlurmLauncher, type SlurmLauncherStage } from "@/components/slurm-launcher/slurm-launcher";
 import { cn, formatNumber } from "@/lib/utils";
 import { useSearchParams } from "next/navigation";
 
@@ -169,6 +174,29 @@ const CREATE_MODEL_STEPS = [
   },
 ] as const;
 
+const SLURM_CREATE_MODEL_STEPS = [
+  {
+    label: "Hosting",
+    title: "Choose Managed Slurm",
+    description: "Select the backend that will serve this route. More hosting options can be added here later.",
+  },
+  {
+    label: "Engine",
+    title: "Choose serving engine",
+    description: "Pick the runtime that should start under Slurm.",
+  },
+  {
+    label: "Template",
+    title: "Pick launch template",
+    description: "Start from a tuned recipe, saved recipe, or blank backend form.",
+  },
+  {
+    label: "Configure",
+    title: "Configure managed route",
+    description: "Choose placement, model handle, image, replicas, and health checks.",
+  },
+] as const;
+
 function normalizeModelApiNameDraft(value: string) {
   return value
     .toLowerCase()
@@ -191,6 +219,7 @@ export function ModelManager({
   mcpServers = [],
   managed = {},
   slurmEnabled = false,
+  recipes = SLURM_RECIPES,
 }: {
   models: ModelRoute[];
   cacheStats?: CacheStats;
@@ -200,6 +229,7 @@ export function ModelManager({
   mcpServers?: McpServer[];
   managed?: Record<string, boolean>;
   slurmEnabled?: boolean;
+  recipes?: readonly SlurmRecipe[];
 }) {
   const [pending, start] = useTransition();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -334,6 +364,7 @@ export function ModelManager({
           error={createError}
           slurmEnabled={slurmEnabled}
           mcpServers={mcpServers}
+          recipes={recipes}
           onCancel={closeCreateWizard}
           onSubmit={submitModel}
         />
@@ -579,6 +610,7 @@ function CreateModelWizard({
   error,
   slurmEnabled,
   mcpServers,
+  recipes,
   onCancel,
   onSubmit,
 }: {
@@ -586,43 +618,37 @@ function CreateModelWizard({
   error: string | null;
   slurmEnabled: boolean;
   mcpServers: McpServer[];
+  recipes: readonly SlurmRecipe[];
   onCancel: () => void;
   onSubmit: (formData: FormData) => void;
 }) {
   const [step, setStep] = useState(0);
+  const [slurmStage, setSlurmStage] = useState<SlurmLauncherStage>("backend");
+  const [launcherBusy, setLauncherBusy] = useState(false);
   const [createType, setCreateType] = useState<string>("chat");
   const [modelName, setModelName] = useState("");
   const [endpointMode, setEndpointMode] = useState<string>("static");
   const [localError, setLocalError] = useState<string | null>(null);
-  const [slurmBackend, setSlurmBackend] = useState<"vllm" | "ollama" | "custom">("vllm");
-  const [slurmPort, setSlurmPort] = useState("8000");
-  const [slurmModel, setSlurmModel] = useState("");
-  const [showAdvanced, setShowAdvanced] = useState(false);
   const [preview, setPreview] = useState({
     modelName: "",
     upstreamModel: "",
     apiBase: "",
-    partition: "",
   });
   const formRef = useRef<HTMLFormElement>(null);
   const lastStep = CREATE_MODEL_STEPS.length - 1;
   const visibleError = localError ?? error;
   const hostingMode = slurmEnabled ? endpointMode : "static";
+  const usingSlurmSteps = hostingMode === "slurm";
+  const inSlurmFlow = usingSlurmSteps && step > 0;
+  const slurmStepByStage: Record<SlurmLauncherStage, number> = {
+    backend: 1,
+    template: 2,
+    configure: 3,
+  };
+  const visibleSteps = usingSlurmSteps ? SLURM_CREATE_MODEL_STEPS : CREATE_MODEL_STEPS;
+  const visibleStep = usingSlurmSteps ? (step === 0 ? 0 : slurmStepByStage[slurmStage]) : step;
   const typeLabel = MODEL_TYPE_OPTIONS.find((option) => option.value === createType)?.label ?? createType;
-  const hostingLabel =
-    hostingMode !== "slurm"
-      ? "OpenAI-compatible API"
-      : slurmBackend === "vllm"
-        ? "vLLM on Slurm"
-        : slurmBackend === "ollama"
-          ? "Ollama on Slurm"
-          : "Custom on Slurm";
-  // Derived launch command and health endpoint for managed backends.
-  const generatedCmd =
-    slurmBackend === "vllm"
-      ? `vllm serve ${slurmModel || "<model>"} --port ${slurmPort || "8000"}`
-      : `sh -c "OLLAMA_HOST=0.0.0.0:${slurmPort || "8000"} ollama serve & sleep 5 && OLLAMA_HOST=0.0.0.0:${slurmPort || "8000"} ollama pull ${slurmModel || "<model>"} && wait"`;
-  const derivedHealthPath = slurmBackend === "ollama" ? "/api/tags" : "/health";
+  const hostingLabel = hostingMode !== "slurm" ? "OpenAI-compatible API" : "Managed Slurm";
 
   function value(formData: FormData, name: string) {
     return String(formData.get(name) ?? "").trim();
@@ -640,7 +666,6 @@ function CreateModelWizard({
       modelName: normalizeModelApiNameDraft(value(formData, "model_name")),
       upstreamModel: value(formData, "upstream_model"),
       apiBase: value(formData, "api_base"),
-      partition: value(formData, "slurm_partition"),
     });
     if (localError) setLocalError(null);
   }
@@ -654,23 +679,17 @@ function CreateModelWizard({
 
   function setHostingMode(mode: string) {
     setEndpointMode(mode);
+    if (mode === "slurm") setSlurmStage("backend");
     if (localError) setLocalError(null);
   }
 
   function stepIssue(index: number, formData: FormData) {
-    const mode = slurmEnabled ? endpointMode : "static";
     if (index === 1) {
       if (!normalizeModelApiNameFinal(value(formData, "model_name"))) return "Add the API model name clients will use.";
       if (!value(formData, "upstream_model")) return "Add the upstream model identifier.";
     }
     if (index === 2) {
-      if (mode === "static" && !value(formData, "api_base")) return "Add the API base URL for the upstream.";
-      if (mode === "slurm") {
-        if (!value(formData, "slurm_partition")) return "Add the Slurm partition.";
-        if (!value(formData, "slurm_image")) return "Add the Apptainer image path.";
-        if (slurmBackend !== "custom" && !slurmModel.trim()) return "Add the model to serve.";
-        if (slurmBackend === "custom" && !value(formData, "slurm_launch_command")) return "Add the launch command.";
-      }
+      if (hostingMode === "static" && !value(formData, "api_base")) return "Add the API base URL for the upstream.";
     }
     return null;
   }
@@ -690,15 +709,20 @@ function CreateModelWizard({
         }
       }
     }
-    // For vLLM, the HuggingFace model ID (upstream_model on step 1) is exactly
-    // what goes into `vllm serve`. Pre-fill slurmModel so the user doesn't have
-    // to type it again. Ollama tags differ, so skip auto-fill for that backend.
-    if (boundedStep === 2 && step !== 2 && hostingMode === "slurm" && slurmBackend === "vllm" && !slurmModel) {
-      const um = value(formData, "upstream_model");
-      if (um) setSlurmModel(um);
-    }
     setLocalError(null);
     setStep(boundedStep);
+  }
+
+  function goToVisibleStep(nextStep: number) {
+    if (inSlurmFlow) {
+      if (nextStep === 0) {
+        setLocalError(null);
+        setSlurmStage("backend");
+        setStep(0);
+      }
+      return;
+    }
+    goToStep(nextStep);
   }
 
   function handleSubmit(formData: FormData) {
@@ -724,29 +748,31 @@ function CreateModelWizard({
               Create a route in a few focused steps, then fine-tune it from the model card.
             </CardDescription>
           </div>
-          <Button type="button" size="sm" variant="ghost" disabled={pending} onClick={onCancel}>
+          <Button type="button" size="sm" variant="ghost" disabled={pending || launcherBusy} onClick={onCancel}>
             Cancel
           </Button>
         </div>
 
         <div className="pt-2">
-          <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
-            {CREATE_MODEL_STEPS.map((item, index) => {
-              const complete = index < step;
-              const active = index === step;
+          <div className={cn("grid gap-2 sm:grid-cols-2", visibleSteps.length === 4 ? "xl:grid-cols-4" : "xl:grid-cols-5")}>
+            {visibleSteps.map((item, index) => {
+              const complete = index < visibleStep;
+              const active = index === visibleStep;
+              const canClick = usingSlurmSteps ? index === 0 || (!inSlurmFlow && index === 1) : true;
               return (
                 <button
                   key={item.label}
                   type="button"
-                  disabled={pending}
-                  onClick={() => goToStep(index)}
+                  disabled={pending || launcherBusy || !canClick}
+                  onClick={() => goToVisibleStep(index)}
                   className={cn(
-                    "flex min-w-0 items-center gap-2 rounded-md border px-3 py-2 text-left transition-colors",
+                    "flex min-w-0 items-center gap-2 rounded-md border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed",
                     active
                       ? "border-primary/45 bg-primary/10 text-foreground"
                       : complete
                         ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
                         : "border-border/70 bg-background/40 text-muted-foreground hover:bg-accent hover:text-foreground",
+                    !canClick && !active && "opacity-70",
                   )}
                 >
                   <span
@@ -772,24 +798,46 @@ function CreateModelWizard({
           <div className="mt-3 h-1 overflow-hidden rounded-full bg-muted">
             <div
               className="h-full rounded-full bg-primary transition-[width] duration-200"
-              style={{ width: `${((step + 1) / CREATE_MODEL_STEPS.length) * 100}%` }}
+              style={{ width: `${((visibleStep + 1) / visibleSteps.length) * 100}%` }}
             />
           </div>
         </div>
       </CardHeader>
 
       <CardContent className="p-0">
+        {hostingMode === "slurm" && step > 0 ? (
+          <SlurmLauncher
+            mode="create"
+            recipes={recipes}
+            embedded
+            stage={slurmStage}
+            onStageChange={setSlurmStage}
+            onCancel={onCancel}
+            onBackToHost={() => { setLocalError(null); setSlurmStage("backend"); setStep(0); }}
+            busy={launcherBusy}
+            onSubmit={async (fd) => {
+              setLauncherBusy(true);
+              try {
+                const result = await createModelAction(fd);
+                if (result.ok) onCancel();
+                return result;
+              } finally {
+                setLauncherBusy(false);
+              }
+            }}
+          />
+        ) : (
         <form ref={formRef} action={handleSubmit} onInput={updatePreview} onChange={updatePreview}>
           <input type="hidden" name="endpoint_mode" value={hostingMode} />
           <div className="grid min-h-[30rem] lg:grid-cols-[minmax(0,1fr)_18rem]">
             <div className="min-w-0 p-5 sm:p-6">
               <div className="mb-5">
                 <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                  Step {step + 1} of {CREATE_MODEL_STEPS.length}
+                  Step {visibleStep + 1} of {visibleSteps.length}
                 </p>
-                <h3 className="mt-1 text-lg font-semibold tracking-tight">{CREATE_MODEL_STEPS[step].title}</h3>
+                <h3 className="mt-1 text-lg font-semibold tracking-tight">{visibleSteps[visibleStep].title}</h3>
                 <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
-                  {CREATE_MODEL_STEPS[step].description}
+                  {visibleSteps[visibleStep].description}
                 </p>
               </div>
 
@@ -886,190 +934,10 @@ function CreateModelWizard({
               </section>
 
               <section className={cn("grid gap-4 md:grid-cols-2", step !== 2 && "hidden")}>
-                {hostingMode === "static" && (
-                  <>
-                    <div className="md:col-span-2">
-                      <Field label="API base URL" name="api_base" placeholder="http://envoy-aibrix-system.../v1" />
-                    </div>
-                    <Field label="Upstream API key (optional)" name="api_key" placeholder="sk_..." />
-                  </>
-                )}
-                {hostingMode === "slurm" && (
-                  <div className="md:col-span-2 space-y-6">
-                    {/* Backend picker */}
-                    <div className="space-y-2">
-                      <Label>Inference backend</Label>
-                      <div className="grid grid-cols-3 gap-2">
-                        {(["vllm", "ollama", "custom"] as const).map((b) => {
-                          const meta = {
-                            vllm:   { label: "vLLM",   badge: "GPU optimised", hint: "High-throughput PagedAttention serving" },
-                            ollama:  { label: "Ollama", badge: "Multi-model",   hint: "Easy pull-and-serve, GGUF-friendly" },
-                            custom:  { label: "Custom", badge: "Manual",        hint: "Write your own launch command" },
-                          }[b];
-                          return (
-                            <button
-                              key={b}
-                              type="button"
-                              aria-pressed={slurmBackend === b}
-                              onClick={() => setSlurmBackend(b)}
-                              className={cn(
-                                "flex flex-col rounded-lg border p-3 text-left transition-colors",
-                                slurmBackend === b
-                                  ? "border-primary/50 bg-primary/10"
-                                  : "border-border/70 bg-background/35 hover:bg-accent",
-                              )}
-                            >
-                              <span className="text-sm font-semibold">{meta.label}</span>
-                              <span className="mt-1 text-xs leading-relaxed text-muted-foreground">{meta.hint}</span>
-                              <Badge className="mt-2 w-fit bg-background text-[10px]">{meta.badge}</Badge>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Partition + GRES — always required */}
-                    <div className="grid gap-3 sm:grid-cols-2">
-                      <Field label="Partition" name="slurm_partition" placeholder="gpu" />
-                      <Field label="GRES" name="slurm_gres" placeholder="gpu:1" />
-                    </div>
-
-                    {slurmBackend !== "custom" ? (
-                      /* vLLM / Ollama: smart fields with a generated command preview */
-                      <div className="space-y-4">
-                        <div className="grid gap-3 sm:grid-cols-[1fr_10rem]">
-                          <div className="space-y-1.5">
-                            <Label htmlFor="slurm-model-field">Model to serve</Label>
-                            <Input
-                              id="slurm-model-field"
-                              value={slurmModel}
-                              onChange={(e) => setSlurmModel(e.target.value)}
-                              placeholder={slurmBackend === "vllm" ? "Qwen/Qwen3-8B" : "qwen2.5:0.5b"}
-                              autoCapitalize="none"
-                              autoCorrect="off"
-                              spellCheck={false}
-                            />
-                            <p className="text-xs text-muted-foreground">
-                              {slurmBackend === "vllm"
-                                ? "HuggingFace model ID passed to vllm serve."
-                                : "Ollama model tag (e.g. from ollama pull)."}
-                            </p>
-                          </div>
-                          <div className="space-y-1.5">
-                            <Label htmlFor="slurm-port-field">Port</Label>
-                            <Input
-                              id="slurm-port-field"
-                              type="number"
-                              value={slurmPort}
-                              onChange={(e) => setSlurmPort(e.target.value)}
-                            />
-                          </div>
-                        </div>
-
-                        <div className="space-y-1.5">
-                          <Label htmlFor="slurm-image-field">Apptainer image</Label>
-                          <Input
-                            id="slurm-image-field"
-                            name="slurm_image"
-                            placeholder={slurmBackend === "vllm" ? "/shared/images/vllm.sif" : "/shared/images/ollama.sif"}
-                          />
-                          {slurmBackend === "ollama" && (
-                            <p className="text-xs text-muted-foreground">
-                              Build with:{" "}
-                              <code className="font-mono text-foreground">apptainer pull docker://ollama/ollama</code>
-                            </p>
-                          )}
-                        </div>
-
-                        <div className="space-y-1.5">
-                          <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                            Generated launch command
-                          </p>
-                          <pre className="overflow-x-auto whitespace-pre-wrap break-all rounded-md bg-muted/40 px-3 py-2.5 font-mono text-xs leading-relaxed text-foreground/80">
-                            {generatedCmd}
-                          </pre>
-                        </div>
-
-                        {/* Carry generated values into FormData as hidden fields */}
-                        <input type="hidden" name="slurm_launch_command" value={generatedCmd} />
-                        <input type="hidden" name="slurm_health_path" value={derivedHealthPath} />
-                        <input type="hidden" name="slurm_serving_port" value={slurmPort} />
-                      </div>
-                    ) : (
-                      /* Custom: all fields manually */
-                      <div className="space-y-3">
-                        <div className="grid gap-3 sm:grid-cols-2">
-                          <Field label="Serving port" name="slurm_serving_port" type="number" defaultValue="8000" />
-                          <Field label="Health path" name="slurm_health_path" defaultValue="/health" />
-                        </div>
-                        <Field label="Apptainer image" name="slurm_image" placeholder="/shared/images/llm.sif" />
-                        <Field label="Launch command" name="slurm_launch_command" placeholder="vllm serve <model> --port 8000" />
-                        <div className="space-y-1.5">
-                          <Label htmlFor="slurm_preamble-field">
-                            Preamble{" "}
-                            <span className="text-xs text-muted-foreground/60">
-                              (optional shell lines before exec)
-                            </span>
-                          </Label>
-                          <textarea
-                            id="slurm_preamble-field"
-                            name="slurm_preamble"
-                            rows={2}
-                            placeholder="module load apptainer/1.3.4"
-                            className="flex w-full resize-y rounded-md border border-border bg-background px-3 py-2 font-mono text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-                          />
-                        </div>
-                      </div>
-                    )}
-
-                    {/* Advanced — collapsed by default to keep the happy path clean */}
-                    <div className="border-t border-border/50 pt-4">
-                      <button
-                        type="button"
-                        className="flex items-center gap-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
-                        onClick={() => setShowAdvanced((v) => !v)}
-                      >
-                        <ChevronDown
-                          className={cn(
-                            "h-3.5 w-3.5 transition-transform duration-150",
-                            showAdvanced && "rotate-180",
-                          )}
-                        />
-                        {showAdvanced ? "Hide" : "Show"} advanced options
-                      </button>
-                      {showAdvanced && (
-                        <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                          <Field label="Target replicas" name="slurm_target_replicas" type="number" defaultValue="2" />
-                          <Field label="Nodes" name="slurm_nodes" type="number" defaultValue="1" />
-                          <Field label="Max job failures" name="slurm_max_job_failures" type="number" defaultValue="0" />
-                          <Field label="Account (optional)" name="slurm_account" placeholder="my-account" />
-                          <Field label="QoS (optional)" name="slurm_qos" placeholder="normal" />
-                          <Field label="Time limit (optional)" name="slurm_time_limit" placeholder="12:00:00" />
-                          <Field label="Constraints (optional)" name="slurm_constraints" placeholder="a100" />
-                          <Field label="Exclude (optional)" name="slurm_exclude" placeholder="node[01-02]" />
-                          <Field label="Log output dir (optional)" name="slurm_log_output_dir" placeholder="/shared/logs" />
-                          {slurmBackend !== "custom" && (
-                            <div className="sm:col-span-2 space-y-1.5">
-                              <Label htmlFor="slurm_preamble-adv">
-                                Preamble{" "}
-                                <span className="text-xs text-muted-foreground/60">
-                                  (optional shell lines before exec)
-                                </span>
-                              </Label>
-                              <textarea
-                                id="slurm_preamble-adv"
-                                name="slurm_preamble"
-                                rows={2}
-                                placeholder="module load apptainer/1.3.4"
-                                className="flex w-full resize-y rounded-md border border-border bg-background px-3 py-2 font-mono text-sm shadow-sm transition-colors placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
-                              />
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
+                <div className="md:col-span-2">
+                  <Field label="API base URL" name="api_base" placeholder="http://envoy-aibrix-system.../v1" />
+                </div>
+                <Field label="Upstream API key (optional)" name="api_key" placeholder="sk_..." />
               </section>
 
               <section className={cn("grid gap-4 md:grid-cols-2", step !== 3 && "hidden")}>
@@ -1116,14 +984,7 @@ function CreateModelWizard({
                 <PreviewRow label="Upstream" value={preview.upstreamModel || "Not set"} muted={!preview.upstreamModel} />
                 <PreviewRow label="Type" value={typeLabel} />
                 <PreviewRow label="Hosting" value={hostingLabel} />
-                {hostingMode === "slurm" ? (
-                  <>
-                    <PreviewRow label="Partition" value={preview.partition || "Not set"} muted={!preview.partition} />
-                    <PreviewRow label="Model" value={slurmModel || "Not set"} muted={!slurmModel} />
-                  </>
-                ) : (
-                  <PreviewRow label="API base" value={preview.apiBase || "Not set"} muted={!preview.apiBase} />
-                )}
+                <PreviewRow label="API base" value={preview.apiBase || "Not set"} muted={!preview.apiBase} />
               </div>
               <div className="mt-5 rounded-md border border-border/70 bg-card/50 p-3">
                 <p className="text-xs font-medium">What happens on create</p>
@@ -1158,6 +1019,7 @@ function CreateModelWizard({
             </div>
           </div>
         </form>
+        )}
       </CardContent>
     </Card>
   );
@@ -2608,9 +2470,6 @@ function SelectField({
   );
 }
 
-// Page-level summary strip: route inventory and fleet health alongside the
-// 24h response-cache offload, so the table below can stay focused on per-model
-// state.
 function FleetStats({
   models,
   health,

@@ -28,3 +28,4 @@ obleth-config.workspace = true
 obleth-store.workspace = true
 obleth-redis.workspace = true
 obleth-fairshare.workspace = true
+obleth-provisioner.workspace = true

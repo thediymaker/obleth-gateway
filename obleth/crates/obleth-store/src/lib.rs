@@ -53,6 +53,8 @@ type Result<T> = std::result::Result<T, StoreError>;
 const SCHEMA: &str = include_str!("../../../../schema/postgres/0001_init.sql");
 const SCHEMA_V2: &str = include_str!("../../../../schema/postgres/0002_tracing_flag.sql");
 const SCHEMA_V3: &str = include_str!("../../../../schema/postgres/0003_guardrails_policy.sql");
+const SCHEMA_V4: &str = include_str!("../../../../schema/postgres/0004_saved_recipes.sql");
+const SCHEMA_V5: &str = include_str!("../../../../schema/postgres/0005_managed_launcher_spec.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -60,6 +62,24 @@ const MIGRATE_LOCK_KEY: i64 = 0x0B1E_7480_0001;
 /// Advisory-lock key serializing reserved control-plane identity provisioning
 /// across racing replicas (distinct from `MIGRATE_LOCK_KEY`).
 const CONTROL_PLANE_LOCK_KEY: i64 = 0x0B1E_7480_0002;
+
+pub struct SavedRecipe {
+    pub id: Uuid,
+    pub name: String,
+    pub backend: String,
+    pub author: String,
+    pub spec: serde_json::Value,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+pub struct UpsertSavedRecipe {
+    pub id: Option<Uuid>,
+    pub name: String,
+    pub backend: String,
+    pub author: String,
+    pub spec: serde_json::Value,
+}
 
 /// Input for `upsert_managed_model` (no timestamps; the DB sets them).
 pub struct UpsertManagedModel {
@@ -73,14 +93,18 @@ pub struct UpsertManagedModel {
     pub account: Option<String>,
     pub qos: Option<String>,
     pub time_limit: Option<String>,
+    pub cpus_per_task: Option<i64>,
+    pub mem: Option<String>,
     pub image: String,
     pub preamble: String,
     pub log_output_dir: String,
     pub launch_command: String,
+    pub script_body: String,
     pub serving_port: i64,
     pub health_path: String,
     pub target_replicas: i64,
     pub max_job_failures: i64,
+    pub launcher_spec: Option<serde_json::Value>,
 }
 
 #[derive(Clone)]
@@ -122,6 +146,8 @@ impl Store {
             sqlx::raw_sql(SCHEMA).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V2).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V3).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V4).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V5).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1546,8 +1572,9 @@ impl Store {
     pub async fn get_managed_model(&self, model_id: Uuid) -> Result<Option<ManagedModelSpec>> {
         let row = sqlx::query(
             "select model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
-             qos, time_limit, image, preamble, log_output_dir, launch_command, serving_port, \
-             health_path, target_replicas, max_job_failures, created_at, updated_at \
+             qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
+             script_body, serving_port, \
+             health_path, target_replicas, max_job_failures, launcher_spec, created_at, updated_at \
              from managed_models where model_id = $1",
         )
         .bind(model_id)
@@ -1559,8 +1586,9 @@ impl Store {
     pub async fn list_managed_models(&self) -> Result<Vec<ManagedModelSpec>> {
         let rows = sqlx::query(
             "select model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
-             qos, time_limit, image, preamble, log_output_dir, launch_command, serving_port, \
-             health_path, target_replicas, max_job_failures, created_at, updated_at \
+             qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
+             script_body, serving_port, \
+             health_path, target_replicas, max_job_failures, launcher_spec, created_at, updated_at \
              from managed_models order by model_id",
         )
         .fetch_all(&self.pool)
@@ -1572,23 +1600,27 @@ impl Store {
         let row = sqlx::query(
             "insert into managed_models
                 (model_id, enabled, partition, gres, nodes, constraints, exclude,
-                 account, qos, time_limit, image, preamble, log_output_dir, launch_command,
-                 serving_port, health_path, target_replicas, max_job_failures)
-             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+                 account, qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir,
+                 launch_command, script_body,
+                 serving_port, health_path, target_replicas, max_job_failures, launcher_spec)
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
              on conflict (model_id) do update set
                 enabled = excluded.enabled, partition = excluded.partition,
                 gres = excluded.gres, nodes = excluded.nodes,
                 constraints = excluded.constraints, exclude = excluded.exclude,
                 account = excluded.account, qos = excluded.qos,
-                time_limit = excluded.time_limit, image = excluded.image,
+                time_limit = excluded.time_limit, cpus_per_task = excluded.cpus_per_task,
+                mem = excluded.mem, image = excluded.image,
                 preamble = excluded.preamble, log_output_dir = excluded.log_output_dir,
-                launch_command = excluded.launch_command,
+                launch_command = excluded.launch_command, script_body = excluded.script_body,
                 serving_port = excluded.serving_port, health_path = excluded.health_path,
                 target_replicas = excluded.target_replicas,
-                max_job_failures = excluded.max_job_failures, updated_at = now()
+                max_job_failures = excluded.max_job_failures,
+                launcher_spec = excluded.launcher_spec, updated_at = now()
              returning model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
-             qos, time_limit, image, preamble, log_output_dir, launch_command, serving_port, \
-             health_path, target_replicas, max_job_failures, created_at, updated_at",
+             qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
+             script_body, serving_port, \
+             health_path, target_replicas, max_job_failures, launcher_spec, created_at, updated_at",
         )
         .bind(m.model_id)
         .bind(m.enabled)
@@ -1600,14 +1632,18 @@ impl Store {
         .bind(&m.account)
         .bind(&m.qos)
         .bind(&m.time_limit)
+        .bind(m.cpus_per_task)
+        .bind(&m.mem)
         .bind(&m.image)
         .bind(&m.preamble)
         .bind(&m.log_output_dir)
         .bind(&m.launch_command)
+        .bind(&m.script_body)
         .bind(m.serving_port)
         .bind(&m.health_path)
         .bind(m.target_replicas.max(1))
         .bind(m.max_job_failures.max(0))
+        .bind(m.launcher_spec.as_ref().map(sqlx::types::Json))
         .fetch_one(&self.pool)
         .await?;
         managed_model_from_row(&row)
@@ -1618,6 +1654,45 @@ impl Store {
             .bind(model_id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    // ---- saved recipes ---------------------------------------------------
+
+    pub async fn list_saved_recipes(&self) -> Result<Vec<SavedRecipe>> {
+        let rows = sqlx::query(
+            "select id, name, backend, author, spec, created_at, updated_at
+             from saved_recipes order by updated_at desc")
+            .fetch_all(&self.pool).await?;
+        rows.iter().map(saved_recipe_from_row).collect()
+    }
+
+    pub async fn get_saved_recipe(&self, id: Uuid) -> Result<Option<SavedRecipe>> {
+        let row = sqlx::query(
+            "select id, name, backend, author, spec, created_at, updated_at
+             from saved_recipes where id = $1")
+            .bind(id).fetch_optional(&self.pool).await?;
+        row.as_ref().map(saved_recipe_from_row).transpose()
+    }
+
+    pub async fn upsert_saved_recipe(&self, r: UpsertSavedRecipe) -> Result<SavedRecipe> {
+        let id = r.id.unwrap_or_else(Uuid::new_v4);
+        let row = sqlx::query(
+            "insert into saved_recipes (id, name, backend, author, spec)
+             values ($1,$2,$3,$4,$5)
+             on conflict (id) do update set
+               name=excluded.name, backend=excluded.backend,
+               author=excluded.author, spec=excluded.spec, updated_at=now()
+             returning id, name, backend, author, spec, created_at, updated_at")
+            .bind(id).bind(&r.name).bind(&r.backend).bind(&r.author)
+            .bind(sqlx::types::Json(&r.spec))
+            .fetch_one(&self.pool).await?;
+        saved_recipe_from_row(&row)
+    }
+
+    pub async fn delete_saved_recipe(&self, id: Uuid) -> Result<()> {
+        sqlx::query("delete from saved_recipes where id = $1")
+            .bind(id).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -2622,7 +2697,21 @@ fn resolved_endpoint_from_row(row: &PgRow) -> Result<ResolvedEndpoint> {
     })
 }
 
+fn saved_recipe_from_row(row: &PgRow) -> Result<SavedRecipe> {
+    let spec: sqlx::types::Json<serde_json::Value> = row.try_get("spec")?;
+    Ok(SavedRecipe {
+        id: row.try_get("id")?,
+        name: row.try_get("name")?,
+        backend: row.try_get("backend")?,
+        author: row.try_get("author")?,
+        spec: spec.0,
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 fn managed_model_from_row(row: &PgRow) -> Result<ManagedModelSpec> {
+    let launcher_spec: Option<sqlx::types::Json<serde_json::Value>> = row.try_get("launcher_spec")?;
     Ok(ManagedModelSpec {
         model_id: row.try_get("model_id")?,
         enabled: row.try_get("enabled")?,
@@ -2634,14 +2723,18 @@ fn managed_model_from_row(row: &PgRow) -> Result<ManagedModelSpec> {
         account: row.try_get("account")?,
         qos: row.try_get("qos")?,
         time_limit: row.try_get("time_limit")?,
+        cpus_per_task: row.try_get("cpus_per_task")?,
+        mem: row.try_get("mem")?,
         image: row.try_get("image")?,
         preamble: row.try_get("preamble")?,
         log_output_dir: row.try_get("log_output_dir")?,
         launch_command: row.try_get("launch_command")?,
+        script_body: row.try_get("script_body")?,
         serving_port: row.try_get("serving_port")?,
         health_path: row.try_get("health_path")?,
         target_replicas: row.try_get("target_replicas")?,
         max_job_failures: row.try_get("max_job_failures")?,
+        launcher_spec: launcher_spec.map(|j| j.0),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -3124,19 +3217,24 @@ mod tests {
                 account: None,
                 qos: None,
                 time_limit: Some("12:00:00".into()),
+                cpus_per_task: None,
+                mem: None,
                 image: "vllm.sif".into(),
                 preamble: String::new(),
                 log_output_dir: String::new(),
                 launch_command: "vllm serve nemotron".into(),
+                script_body: String::new(),
                 serving_port: 8000,
                 health_path: "/health".into(),
                 target_replicas: 2,
                 max_job_failures: 0,
+                launcher_spec: Some(serde_json::json!({"backendId":"llamacpp"})),
             })
             .await
             .expect("upsert");
         assert_eq!(spec.target_replicas, 2);
         assert_eq!(spec.partition, "gpu-preempt");
+        assert_eq!(spec.launcher_spec, Some(serde_json::json!({"backendId":"llamacpp"})));
 
         let listed = store.list_managed_models().await.expect("list");
         assert_eq!(listed.len(), 1);
@@ -3234,6 +3332,42 @@ mod tests {
             .await
             .expect("list")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn saved_recipe_roundtrip() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        // saved_recipes has NO foreign key, so (unlike managed_model_roundtrip)
+        // you do NOT need to create_model first. Insert/list/update/delete directly.
+        let saved = store.upsert_saved_recipe(UpsertSavedRecipe {
+            id: None,
+            name: "GLM-5.2 @ GH200".into(),
+            backend: "llamacpp".into(),
+            author: "you".into(),
+            spec: serde_json::json!({"ctx_size":"1048576","n_cpu_moe":"68"}),
+        }).await.expect("insert");
+        assert_eq!(saved.name, "GLM-5.2 @ GH200");
+
+        let listed = store.list_saved_recipes().await.expect("list");
+        assert!(listed.iter().any(|r| r.id == saved.id));
+
+        let updated = store.upsert_saved_recipe(UpsertSavedRecipe {
+            id: Some(saved.id), name: "GLM-5.2 @ GH200 (1M)".into(),
+            backend: "llamacpp".into(), author: "you".into(),
+            spec: saved.spec.clone(),
+        }).await.expect("update");
+        assert_eq!(updated.id, saved.id);
+        assert_eq!(updated.name, "GLM-5.2 @ GH200 (1M)");
+
+        store.delete_saved_recipe(saved.id).await.expect("delete");
+        assert!(!store.list_saved_recipes().await.expect("list2").iter().any(|r| r.id == saved.id));
     }
 
     #[tokio::test]
