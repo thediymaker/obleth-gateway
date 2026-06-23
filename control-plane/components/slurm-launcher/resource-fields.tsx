@@ -68,7 +68,7 @@ export function ResourceFields(props: {
     <div className="space-y-3">
       {noDiscovery && (
         <p className="text-xs text-muted-foreground/70">
-          Slurm discovery unavailable — enter values manually.
+          Slurm discovery unavailable - enter values manually.
         </p>
       )}
 
@@ -83,7 +83,7 @@ export function ResourceFields(props: {
               onChange={(e) => handlePartitionChange(e.target.value)}
               className="h-9 w-full text-xs"
             >
-              <option value="">Select partition…</option>
+              <option value="">Select partition...</option>
               {resources!.partitions.map((p) => (
                 <option key={p.name} value={p.name}>
                   {p.name}
@@ -111,7 +111,7 @@ export function ResourceFields(props: {
               onChange={(e) => handleNodeChange(e.target.value)}
               className="h-9 w-full text-xs"
             >
-              <option value="">Select node…</option>
+              <option value="">Select node...</option>
               {nodeList.map((n) => (
                 <option key={n.name} value={n.name}>
                   {n.name}

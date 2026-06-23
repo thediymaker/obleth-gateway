@@ -4,8 +4,9 @@
 # pulls the tag, then waits), so it uses a `command_template` escape hatch.
 # Tokens: {{model}}, {{port}}, {{upstream}}.
 id: ollama
-label: Ollama
-badge: Multi-model
+label: Generic
+badge: ""
+backend: ollama
 hint: Easy pull-and-serve, GGUF-friendly
 health_path: /api/tags
 order: 20

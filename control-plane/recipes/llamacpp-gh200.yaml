@@ -9,8 +9,9 @@
 # Pair this with CPUs/Memory in the wizard (e.g. 72 CPUs, 560G) — those go to
 # slurmrestd as structured fields, not #SBATCH lines.
 id: llamacpp-gh200
-label: llama.cpp (GH200)
-badge: Grace-Hopper
+label: GH200 (Grace-Hopper)
+badge: Recommended
+backend: llamacpp
 hint: Native llama.cpp tuned for GH200 unified memory
 health_path: /health
 order: 31
@@ -38,17 +39,24 @@ params:
     label: GPU layers (-ngl)
     kind: number
     default: "99"
+    min: 0
+    max: 99
+    step: 1
     arg: { flag: "-ngl" }
   - id: ctx_size
     label: Context size
     kind: number
     default: "1048576"
+    steps: [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
     hint: GH200's coherent memory lets you reserve a very large KV cache.
     arg: { flag: "--ctx-size" }
   - id: n_cpu_moe
     label: CPU MoE layers (--n-cpu-moe)
     kind: number
     default: "68"
+    min: 0
+    max: 96
+    step: 1
     hint: Keep expert tensors of N layers on the Grace CPU to fit a large MoE model.
     arg: { flag: "--n-cpu-moe", omit_when: ["0"] }
   - id: cache_type
@@ -70,6 +78,9 @@ params:
     label: Parallel slots
     kind: number
     default: "2"
+    min: 1
+    max: 16
+    step: 1
     advanced: true
     arg: { flag: "--parallel", omit_when: ["1"] }
   - id: flash_attn

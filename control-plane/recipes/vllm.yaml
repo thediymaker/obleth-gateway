@@ -4,8 +4,9 @@
 # the backends the launch wizard offers. The directory is configurable with
 # OBLETH_RECIPES_DIR (default: control-plane/recipes/).
 id: vllm
-label: vLLM
-badge: GPU optimised
+label: Generic
+badge: ""
+backend: vllm
 hint: High-throughput PagedAttention serving
 health_path: /health
 order: 10
@@ -28,6 +29,9 @@ params:
     label: Tensor parallel size
     kind: number
     default: "1"
+    min: 1
+    max: 8
+    step: 1
     hint: GPUs to shard the model across (1 = single GPU).
     advanced: true
     arg: { flag: "--tensor-parallel-size", omit_when: ["1"] }

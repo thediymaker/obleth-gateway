@@ -41,6 +41,10 @@ const ParamSchema = z
     hint: z.string().optional(),
     placeholder: z.string().optional(),
     advanced: z.boolean().optional(),
+    min: z.number().optional(),
+    max: z.number().optional(),
+    step: z.number().optional(),
+    steps: z.array(z.number()).optional(),
     arg: ArgSchema.optional(),
   })
   .strict();
@@ -62,6 +66,7 @@ const RecipeFileSchema = z
     id: z.string().min(1),
     label: z.string().min(1),
     badge: z.string().default(""),
+    backend: z.enum(["vllm", "ollama", "llamacpp", "custom"]).optional(),
     hint: z.string().default(""),
     health_path: z.string().default("/health"),
     model_label: z.string().optional(),
@@ -89,6 +94,7 @@ function toRecipe(file: RecipeFile): SlurmRecipe {
     id: file.id,
     label: file.label,
     badge: file.badge,
+    backend: file.backend,
     hint: file.hint,
     healthPath: file.health_path,
     modelLabel: file.model_label,
@@ -107,6 +113,10 @@ function toRecipe(file: RecipeFile): SlurmRecipe {
       hint: p.hint,
       placeholder: p.placeholder,
       advanced: p.advanced,
+      min: p.min,
+      max: p.max,
+      step: p.step,
+      steps: p.steps,
       arg: p.arg
         ? {
             flag: p.arg.flag,

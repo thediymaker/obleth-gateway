@@ -1,7 +1,8 @@
 # llama.cpp — single-GGUF serving, great for quantised & MoE models.
 id: llamacpp
-label: llama.cpp
-badge: GGUF / MoE
+label: Generic (GGUF / MoE)
+badge: ""
+backend: llamacpp
 hint: Single-GGUF serving, great for quantised & MoE models
 health_path: /health
 order: 30
@@ -24,18 +25,25 @@ params:
     label: GPU layers (-ngl)
     kind: number
     default: "99"
+    min: 0
+    max: 99
+    step: 1
     hint: Layers offloaded to the GPU (99 = all).
     arg: { flag: "-ngl" }
   - id: ctx_size
     label: Context size
     kind: number
     default: "32768"
+    steps: [4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576]
     hint: KV cache is pre-allocated, so larger contexts reserve more RAM up front.
     arg: { flag: "--ctx-size" }
   - id: n_cpu_moe
     label: CPU MoE layers (--n-cpu-moe)
     kind: number
     default: "0"
+    min: 0
+    max: 96
+    step: 1
     hint: Keep expert tensors of N layers on the CPU (0 = off). Raise to fit large MoE models in VRAM.
     arg: { flag: "--n-cpu-moe", omit_when: ["0"] }
   - id: cache_type
@@ -58,6 +66,9 @@ params:
     label: Parallel slots
     kind: number
     default: "1"
+    min: 1
+    max: 16
+    step: 1
     hint: KV cache slots; 1 = the whole context is one sequence.
     advanced: true
     arg: { flag: "--parallel", omit_when: ["1"] }

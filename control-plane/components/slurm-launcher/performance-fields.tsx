@@ -9,10 +9,88 @@ import {
   type SlurmRecipe,
 } from "@/lib/model-recipes";
 
+// Humanise a token count for the slider readout (4096 to "4K", 1048576 to "1M").
+function humanizeCount(n: number): string {
+  if (n >= 1_048_576 && n % 1_048_576 === 0) return `${n / 1_048_576}M`;
+  if (n >= 1024 && n % 1024 === 0) return `${n / 1024}K`;
+  return String(n);
+}
+
+// Slider for a numeric knob. Two modes: discrete `steps` (snap to a list, e.g.
+// context sizes) or a continuous `min`/`max`/`step` range. Shows a live readout
+// of the current value next to the label.
+function ParamSlider({
+  param,
+  value,
+  onChange,
+}: {
+  param: RecipeParam;
+  value: string;
+  onChange: (value: string) => void;
+}): React.ReactElement {
+  const useSteps = (param.steps?.length ?? 0) > 0;
+  const current = Number(value) || 0;
+
+  let sliderMin: number;
+  let sliderMax: number;
+  let sliderStep: number;
+  let sliderValue: number;
+  let readout: string;
+
+  if (useSteps) {
+    const steps = param.steps!;
+    const idx = (() => {
+      const exact = steps.indexOf(current);
+      if (exact >= 0) return exact;
+      // nearest stop
+      let best = 0;
+      for (let i = 1; i < steps.length; i++) {
+        if (Math.abs(steps[i] - current) < Math.abs(steps[best] - current)) best = i;
+      }
+      return best;
+    })();
+    sliderMin = 0;
+    sliderMax = steps.length - 1;
+    sliderStep = 1;
+    sliderValue = idx;
+    readout = humanizeCount(steps[idx]);
+  } else {
+    sliderMin = param.min ?? 0;
+    sliderMax = param.max ?? 100;
+    sliderStep = param.step ?? 1;
+    sliderValue = current;
+    readout = String(current);
+  }
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-baseline justify-between">
+        <Label htmlFor={`recipe-${param.id}`}>{param.label}</Label>
+        <span className="font-mono text-xs tabular-nums text-foreground">
+          {readout}
+        </span>
+      </div>
+      <input
+        id={`recipe-${param.id}`}
+        type="range"
+        min={sliderMin}
+        max={sliderMax}
+        step={sliderStep}
+        value={sliderValue}
+        onChange={(e) => {
+          const raw = Number(e.target.value);
+          onChange(useSteps ? String(param.steps![raw]) : String(raw));
+        }}
+        className="h-2 w-full cursor-pointer appearance-none rounded-full bg-muted accent-primary"
+      />
+      {param.hint && <p className="text-xs text-muted-foreground">{param.hint}</p>}
+    </div>
+  );
+}
+
 // Self-contained renderer for one recipe knob, mirroring the original
 // `RecipeParamField` in model-manager.tsx (boolean=checkbox, select=native
-// <select> of param.options, number/text=Input). Kept local because the
-// original is being removed.
+// <select> of param.options, number with a range=slider, number/text=Input).
 function ParamField({
   param,
   value,
@@ -41,6 +119,12 @@ function ParamField({
         </span>
       </label>
     );
+  }
+  const hasRange =
+    (param.steps?.length ?? 0) > 0 ||
+    (param.min != null && param.max != null);
+  if (param.kind === "number" && hasRange) {
+    return <ParamSlider param={param} value={value} onChange={onChange} />;
   }
   if (param.kind === "select") {
     return (
@@ -84,7 +168,7 @@ function ParamField({
 }
 
 // The empirical n-cpu-moe tuning hint. Always advisory: shows a recommendation
-// only when GPU VRAM is known, with a "Use" action — never auto-applies.
+// only when GPU VRAM is known, with a "Use" action - never auto-applies.
 function NCpuMoeHint({
   values,
   vramGb,
@@ -112,7 +196,7 @@ function NCpuMoeHint({
   return (
     <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
       <span>
-        Recommended ≈ {rec} for ~{vramGb}GB @ {values.ctx_size || 0} ctx
+        Recommended approx. {rec} for ~{vramGb}GB @ {values.ctx_size || 0} ctx
       </span>
       <Button
         type="button"
@@ -138,7 +222,7 @@ export function PerformanceFields(props: {
 
   const params = recipe.params ?? [];
   if (params.length === 0) {
-    // e.g. Custom backend — no knobs to render.
+    // e.g. Custom backend - no knobs to render.
     return <></>;
   }
 
@@ -177,7 +261,7 @@ export function PerformanceFields(props: {
             onClick={() => setShowAdvanced((v) => !v)}
             className="text-xs font-medium text-muted-foreground hover:text-foreground"
           >
-            {showAdvanced ? "▾" : "▸"} Advanced
+            {showAdvanced ? "Hide" : "Show"} advanced
           </button>
           {showAdvanced && (
             <div className="grid gap-3 sm:grid-cols-2">

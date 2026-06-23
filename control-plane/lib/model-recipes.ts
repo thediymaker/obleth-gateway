@@ -7,13 +7,13 @@
 // admin can stand up a backend (e.g. llama.cpp's `--n-cpu-moe`) without writing
 // shell by hand.
 //
-// Recipes are pure, serializable DATA — no functions — so they can be authored
+// Recipes are pure, serializable DATA - no functions - so they can be authored
 // in editable YAML files (see `recipe-files.ts`), loaded on the server, and
 // passed into the client wizard as props. The command/preamble are produced by
 // the pure composer functions at the bottom (`buildRecipeCommand`,
 // `buildRecipePreamble`), which both the server and the browser can call.
 //
-// `manual: true` is the Custom escape hatch — no templating.
+// `manual: true` is the Custom escape hatch - no templating.
 
 export type RecipeParamKind = "number" | "text" | "select" | "boolean";
 
@@ -54,6 +54,19 @@ export type RecipeParam = {
   advanced?: boolean;
   /** How this knob maps onto the command line / environment. */
   arg?: RecipeArg;
+  /**
+   * Slider bounds for a `number` knob. When `min`/`max` are set the wizard
+   * renders a slider (with a numeric readout) instead of a plain input.
+   */
+  min?: number;
+  max?: number;
+  step?: number;
+  /**
+   * Discrete slider stops for a `number` knob whose useful values are not
+   * evenly spaced (e.g. context sizes 4K to 1M). The slider snaps to these; takes
+   * precedence over `min`/`max`/`step`.
+   */
+  steps?: number[];
 };
 
 /** Structured description of the launch command for the common case. */
@@ -83,11 +96,57 @@ export type RecipeBuildContext = {
   values: Record<string, string>;
 };
 
+/** The serving engine family a recipe belongs to. */
+export type BackendId = "vllm" | "ollama" | "llamacpp" | "custom";
+
+export type Backend = {
+  id: BackendId;
+  label: string;
+  badge: string;
+  /** One-line description shown on the backend picker card. */
+  blurb: string;
+  /** Custom backend: operator writes the job script directly, no templates. */
+  manual?: boolean;
+};
+
+// The four serving backends, in picker order. Each curated/file/saved recipe is
+// a *template* that belongs to exactly one of these (see `backendOf`). "Custom"
+// is the manual escape hatch with no templates.
+export const BACKENDS: readonly Backend[] = [
+  {
+    id: "vllm",
+    label: "vLLM",
+    badge: "GPU optimised",
+    blurb: "High-throughput PagedAttention serving for HuggingFace models.",
+  },
+  {
+    id: "ollama",
+    label: "Ollama",
+    badge: "Easy start",
+    blurb: "Pull-and-serve, GGUF-friendly - the quickest way to stand one up.",
+  },
+  {
+    id: "llamacpp",
+    label: "llama.cpp",
+    badge: "GGUF / MoE",
+    blurb: "Single-GGUF serving; ideal for quantised and MoE models.",
+  },
+  {
+    id: "custom",
+    label: "Custom",
+    badge: "Manual",
+    blurb: "Write the Slurm job script yourself - full control, no rails.",
+    manual: true,
+  },
+] as const;
+
 export type SlurmRecipe = {
   id: string;
   label: string;
   badge: string;
   hint: string;
+  /** Serving backend this recipe targets; inferred via `backendOf` when absent. */
+  backend?: BackendId;
   healthPath: string;
   modelLabel?: string;
   modelPlaceholder?: string;
@@ -120,7 +179,7 @@ export type SlurmRecipe = {
 // comments give ~54@16K, ~60@512K, ~68@1M on a ~96GB GH200: the offload must
 // rise with context because the KV/context buffers eat VRAM. We anchor on that
 // curve, scaled by how much VRAM the node actually has. It is a HINT the user
-// always overrides — we return null (suggest nothing) when VRAM is unknown,
+// always overrides - we return null (suggest nothing) when VRAM is unknown,
 // because a guess without the hardware fact would be dishonest.
 export function recommendNCpuMoe(
   ctxTokens: number,
@@ -233,12 +292,13 @@ export function buildRecipePreamble(
 // Built-in, read-only "curated example" recipes. The launcher surfaces these in
 // the catalog drawer as optional prefills (alongside user-saved recipes from the
 // DB); selecting one pours its values into the form. No per-recipe "curated" flag
-// is needed — every entry in this list is a curated example by definition.
+// is needed - every entry in this list is a curated example by definition.
 export const SLURM_RECIPES: readonly SlurmRecipe[] = [
   {
     id: "vllm",
     label: "vLLM",
     badge: "GPU optimised",
+    backend: "vllm",
     hint: "High-throughput PagedAttention serving",
     healthPath: "/health",
     modelPlaceholder: "Qwen/Qwen3-8B",
@@ -256,6 +316,9 @@ export const SLURM_RECIPES: readonly SlurmRecipe[] = [
         label: "Tensor parallel size",
         kind: "number",
         default: "1",
+        min: 1,
+        max: 8,
+        step: 1,
         hint: "GPUs to shard the model across (1 = single GPU).",
         advanced: true,
         arg: { flag: "--tensor-parallel-size", omitWhen: ["1"] },
@@ -306,6 +369,7 @@ export const SLURM_RECIPES: readonly SlurmRecipe[] = [
     id: "ollama",
     label: "Ollama",
     badge: "Multi-model",
+    backend: "ollama",
     hint: "Easy pull-and-serve, GGUF-friendly",
     healthPath: "/api/tags",
     modelPlaceholder: "qwen2.5:0.5b",
@@ -319,6 +383,7 @@ export const SLURM_RECIPES: readonly SlurmRecipe[] = [
     id: "llamacpp",
     label: "llama.cpp",
     badge: "GGUF / MoE",
+    backend: "llamacpp",
     hint: "Single-GGUF serving, great for quantised & MoE models",
     healthPath: "/health",
     modelLabel: "GGUF model path",
@@ -340,6 +405,9 @@ export const SLURM_RECIPES: readonly SlurmRecipe[] = [
         label: "GPU layers (-ngl)",
         kind: "number",
         default: "99",
+        min: 0,
+        max: 99,
+        step: 1,
         hint: "Layers offloaded to the GPU (99 = all).",
         arg: { flag: "-ngl" },
       },
@@ -348,6 +416,9 @@ export const SLURM_RECIPES: readonly SlurmRecipe[] = [
         label: "Context size",
         kind: "number",
         default: "32768",
+        steps: [
+          4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576,
+        ],
         hint: "KV cache is pre-allocated, so larger contexts reserve more RAM up front.",
         arg: { flag: "--ctx-size" },
       },
@@ -356,6 +427,9 @@ export const SLURM_RECIPES: readonly SlurmRecipe[] = [
         label: "CPU MoE layers (--n-cpu-moe)",
         kind: "number",
         default: "0",
+        min: 0,
+        max: 96,
+        step: 1,
         hint: "Keep expert tensors of N layers on the CPU (0 = off). Raise to fit large MoE models in VRAM.",
         arg: { flag: "--n-cpu-moe", omitWhen: ["0"] },
       },
@@ -385,6 +459,9 @@ export const SLURM_RECIPES: readonly SlurmRecipe[] = [
         label: "Parallel slots",
         kind: "number",
         default: "1",
+        min: 1,
+        max: 16,
+        step: 1,
         hint: "KV cache slots; 1 = the whole context is one sequence.",
         advanced: true,
         arg: { flag: "--parallel", omitWhen: ["1"] },
@@ -456,8 +533,56 @@ export const SLURM_RECIPES: readonly SlurmRecipe[] = [
     id: "custom",
     label: "Custom",
     badge: "Manual",
+    backend: "custom",
     hint: "Write your own launch command",
     healthPath: "/health",
     manual: true,
   },
 ] as const;
+
+// ── Backend grouping ────────────────────────────────────────────────────────
+// A recipe (built-in, file, or DB-saved) belongs to one backend family. Most
+// declare it explicitly; `backendOf` infers a sensible family for older recipes
+// that predate the field, so the picker never drops a recipe on the floor.
+export function backendOf(recipe: SlurmRecipe): BackendId {
+  if (recipe.backend) return recipe.backend;
+  if (recipe.manual) return "custom";
+  const exe = recipe.command?.executable ?? "";
+  const hay = `${recipe.id} ${exe} ${recipe.commandTemplate ?? ""}`.toLowerCase();
+  if (hay.includes("vllm")) return "vllm";
+  if (hay.includes("ollama")) return "ollama";
+  if (hay.includes("llama")) return "llamacpp";
+  return "custom";
+}
+
+/**
+ * The bare built-in recipe for a backend - the schema "Start from scratch" uses
+ * (full param set, generic defaults). Always defined for every `BackendId`.
+ */
+export function baseRecipe(backend: BackendId): SlurmRecipe {
+  return (
+    SLURM_RECIPES.find((r) => r.id === backend) ??
+    SLURM_RECIPES.find((r) => r.manual) ??
+    SLURM_RECIPES[0]
+  );
+}
+
+/** Curated/file recipes (templates) that target a given backend. */
+export function templatesForBackend(
+  recipes: readonly SlurmRecipe[],
+  backend: BackendId,
+): SlurmRecipe[] {
+  return recipes.filter((r) => !r.manual && backendOf(r) === backend);
+}
+
+/** Resolve a saved recipe id to its recipe object, falling back to the base. */
+export function resolveRecipe(
+  recipes: readonly SlurmRecipe[],
+  id: string | undefined,
+): SlurmRecipe | undefined {
+  if (!id) return undefined;
+  return (
+    recipes.find((r) => r.id === id) ??
+    SLURM_RECIPES.find((r) => r.id === id)
+  );
+}
