@@ -88,11 +88,8 @@ import {
 } from "@/components/ui/tooltip";
 import type { AutotuneReport, AutotuneWorkload, CacheStats, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import { providerForModel } from "@/lib/model-providers";
-import {
-  SLURM_RECIPES,
-  type SlurmRecipe,
-} from "@/lib/model-recipes";
-import { SlurmLauncher, type SlurmLauncherStage } from "@/components/slurm-launcher/slurm-launcher";
+import { RecipeList } from "@/components/recipes/recipe-list";
+import type { RecipeCard } from "@/components/recipes/recipe-card";
 import { cn, formatNumber } from "@/lib/utils";
 import { useSearchParams } from "next/navigation";
 
@@ -174,28 +171,6 @@ const CREATE_MODEL_STEPS = [
   },
 ] as const;
 
-const SLURM_CREATE_MODEL_STEPS = [
-  {
-    label: "Hosting",
-    title: "Choose Managed Slurm",
-    description: "Select the backend that will serve this route. More hosting options can be added here later.",
-  },
-  {
-    label: "Engine",
-    title: "Choose serving engine",
-    description: "Pick the runtime that should start under Slurm.",
-  },
-  {
-    label: "Template",
-    title: "Pick launch template",
-    description: "Start from a tuned recipe, saved recipe, or blank backend form.",
-  },
-  {
-    label: "Configure",
-    title: "Configure managed route",
-    description: "Choose placement, model handle, image, replicas, and health checks.",
-  },
-] as const;
 
 function normalizeModelApiNameDraft(value: string) {
   return value
@@ -219,7 +194,7 @@ export function ModelManager({
   mcpServers = [],
   managed = {},
   slurmEnabled = false,
-  recipes = SLURM_RECIPES,
+  recipeCards = [],
 }: {
   models: ModelRoute[];
   cacheStats?: CacheStats;
@@ -229,7 +204,7 @@ export function ModelManager({
   mcpServers?: McpServer[];
   managed?: Record<string, boolean>;
   slurmEnabled?: boolean;
-  recipes?: readonly SlurmRecipe[];
+  recipeCards?: RecipeCard[];
 }) {
   const [pending, start] = useTransition();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -364,7 +339,7 @@ export function ModelManager({
           error={createError}
           slurmEnabled={slurmEnabled}
           mcpServers={mcpServers}
-          recipes={recipes}
+          recipeCards={recipeCards}
           onCancel={closeCreateWizard}
           onSubmit={submitModel}
         />
@@ -605,12 +580,75 @@ export function ModelManager({
   );
 }
 
+function HostingChoice({
+  slurmEnabled,
+  hostingMode,
+  setHostingMode,
+}: {
+  slurmEnabled: boolean;
+  hostingMode: string;
+  setHostingMode: (mode: string) => void;
+}) {
+  return (
+    <section className="grid gap-3 lg:grid-cols-2">
+      <button
+        type="button"
+        aria-pressed={hostingMode === "static"}
+        onClick={() => setHostingMode("static")}
+        className={cn(
+          "flex min-h-36 items-start gap-3 rounded-lg border p-4 text-left transition-colors",
+          hostingMode === "static"
+            ? "border-primary/50 bg-primary/10"
+            : "border-border/70 bg-background/35 hover:bg-accent",
+        )}
+      >
+        <Database className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" />
+        <span>
+          <span className="block text-sm font-medium">OpenAI-compatible API</span>
+          <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
+            Connect an existing endpoint that speaks the OpenAI API.
+          </span>
+          <Badge className="mt-3 bg-background text-[10px]">External API</Badge>
+        </span>
+      </button>
+      <button
+        type="button"
+        aria-pressed={hostingMode === "slurm"}
+        disabled={!slurmEnabled}
+        onClick={() => setHostingMode("slurm")}
+        className={cn(
+          "flex min-h-36 items-start gap-3 rounded-lg border p-4 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50",
+          hostingMode === "slurm"
+            ? "border-primary/50 bg-primary/10"
+            : "border-border/70 bg-background/35 hover:bg-accent",
+        )}
+      >
+        <Zap className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" />
+        <span>
+          <span className="block text-sm font-medium">Managed Slurm</span>
+          <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
+            Launch and replace model replicas on your Slurm cluster.
+          </span>
+          <Badge className="mt-3 bg-background text-[10px]">
+            {slurmEnabled ? "Cluster managed" : "Not configured"}
+          </Badge>
+        </span>
+      </button>
+      {!slurmEnabled && (
+        <p className="rounded-md border border-border/70 bg-background/35 px-3 py-2 text-xs text-muted-foreground lg:col-span-2">
+          Configure Slurm in Settings before creating Managed Slurm models.
+        </p>
+      )}
+    </section>
+  );
+}
+
 function CreateModelWizard({
   pending,
   error,
   slurmEnabled,
   mcpServers,
-  recipes,
+  recipeCards,
   onCancel,
   onSubmit,
 }: {
@@ -618,13 +656,11 @@ function CreateModelWizard({
   error: string | null;
   slurmEnabled: boolean;
   mcpServers: McpServer[];
-  recipes: readonly SlurmRecipe[];
+  recipeCards: RecipeCard[];
   onCancel: () => void;
   onSubmit: (formData: FormData) => void;
 }) {
   const [step, setStep] = useState(0);
-  const [slurmStage, setSlurmStage] = useState<SlurmLauncherStage>("backend");
-  const [launcherBusy, setLauncherBusy] = useState(false);
   const [createType, setCreateType] = useState<string>("chat");
   const [modelName, setModelName] = useState("");
   const [endpointMode, setEndpointMode] = useState<string>("static");
@@ -638,15 +674,9 @@ function CreateModelWizard({
   const lastStep = CREATE_MODEL_STEPS.length - 1;
   const visibleError = localError ?? error;
   const hostingMode = slurmEnabled ? endpointMode : "static";
-  const usingSlurmSteps = hostingMode === "slurm";
-  const inSlurmFlow = usingSlurmSteps && step > 0;
-  const slurmStepByStage: Record<SlurmLauncherStage, number> = {
-    backend: 1,
-    template: 2,
-    configure: 3,
-  };
-  const visibleSteps = usingSlurmSteps ? SLURM_CREATE_MODEL_STEPS : CREATE_MODEL_STEPS;
-  const visibleStep = usingSlurmSteps ? (step === 0 ? 0 : slurmStepByStage[slurmStage]) : step;
+  const usingSlurm = hostingMode === "slurm";
+  const visibleSteps = CREATE_MODEL_STEPS;
+  const visibleStep = step;
   const typeLabel = MODEL_TYPE_OPTIONS.find((option) => option.value === createType)?.label ?? createType;
   const hostingLabel = hostingMode !== "slurm" ? "OpenAI-compatible API" : "Managed Slurm";
 
@@ -679,7 +709,6 @@ function CreateModelWizard({
 
   function setHostingMode(mode: string) {
     setEndpointMode(mode);
-    if (mode === "slurm") setSlurmStage("backend");
     if (localError) setLocalError(null);
   }
 
@@ -714,14 +743,6 @@ function CreateModelWizard({
   }
 
   function goToVisibleStep(nextStep: number) {
-    if (inSlurmFlow) {
-      if (nextStep === 0) {
-        setLocalError(null);
-        setSlurmStage("backend");
-        setStep(0);
-      }
-      return;
-    }
     goToStep(nextStep);
   }
 
@@ -748,84 +769,83 @@ function CreateModelWizard({
               Create a route in a few focused steps, then fine-tune it from the model card.
             </CardDescription>
           </div>
-          <Button type="button" size="sm" variant="ghost" disabled={pending || launcherBusy} onClick={onCancel}>
+          <Button type="button" size="sm" variant="ghost" disabled={pending} onClick={onCancel}>
             Cancel
           </Button>
         </div>
 
-        <div className="pt-2">
-          <div className={cn("grid gap-2 sm:grid-cols-2", visibleSteps.length === 4 ? "xl:grid-cols-4" : "xl:grid-cols-5")}>
-            {visibleSteps.map((item, index) => {
-              const complete = index < visibleStep;
-              const active = index === visibleStep;
-              const canClick = usingSlurmSteps ? index === 0 || (!inSlurmFlow && index === 1) : true;
-              return (
-                <button
-                  key={item.label}
-                  type="button"
-                  disabled={pending || launcherBusy || !canClick}
-                  onClick={() => goToVisibleStep(index)}
-                  className={cn(
-                    "flex min-w-0 items-center gap-2 rounded-md border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed",
-                    active
-                      ? "border-primary/45 bg-primary/10 text-foreground"
-                      : complete
-                        ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
-                        : "border-border/70 bg-background/40 text-muted-foreground hover:bg-accent hover:text-foreground",
-                    !canClick && !active && "opacity-70",
-                  )}
-                >
-                  <span
+        {!usingSlurm && (
+          <div className="pt-2">
+            <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-5">
+              {visibleSteps.map((item, index) => {
+                const complete = index < visibleStep;
+                const active = index === visibleStep;
+                const canClick = true;
+                return (
+                  <button
+                    key={item.label}
+                    type="button"
+                    disabled={pending || !canClick}
+                    onClick={() => goToVisibleStep(index)}
                     className={cn(
-                      "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold tabular-nums",
+                      "flex min-w-0 items-center gap-2 rounded-md border px-3 py-2 text-left transition-colors disabled:cursor-not-allowed",
                       active
-                        ? "border-primary/60 bg-primary text-primary-foreground"
+                        ? "border-primary/45 bg-primary/10 text-foreground"
                         : complete
-                          ? "border-emerald-500/40 bg-emerald-500/20 text-emerald-200"
-                          : "border-border bg-card",
+                          ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-200"
+                          : "border-border/70 bg-background/40 text-muted-foreground hover:bg-accent hover:text-foreground",
+                      !canClick && !active && "opacity-70",
                     )}
                   >
-                    {complete ? <Check className="h-3.5 w-3.5" strokeWidth={2.5} /> : index + 1}
-                  </span>
-                  <span className="min-w-0">
-                    <span className="block truncate text-xs font-medium">{item.label}</span>
-                    <span className="block truncate text-[10px] text-muted-foreground">{item.title}</span>
-                  </span>
-                </button>
-              );
-            })}
+                    <span
+                      className={cn(
+                        "flex h-6 w-6 shrink-0 items-center justify-center rounded-full border text-[11px] font-semibold tabular-nums",
+                        active
+                          ? "border-primary/60 bg-primary text-primary-foreground"
+                          : complete
+                            ? "border-emerald-500/40 bg-emerald-500/20 text-emerald-200"
+                            : "border-border bg-card",
+                      )}
+                    >
+                      {complete ? <Check className="h-3.5 w-3.5" strokeWidth={2.5} /> : index + 1}
+                    </span>
+                    <span className="min-w-0">
+                      <span className="block truncate text-xs font-medium">{item.label}</span>
+                      <span className="block truncate text-[10px] text-muted-foreground">{item.title}</span>
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+            <div className="mt-3 h-1 overflow-hidden rounded-full bg-muted">
+              <div
+                className="h-full rounded-full bg-primary transition-[width] duration-200"
+                style={{ width: `${((visibleStep + 1) / visibleSteps.length) * 100}%` }}
+              />
+            </div>
           </div>
-          <div className="mt-3 h-1 overflow-hidden rounded-full bg-muted">
-            <div
-              className="h-full rounded-full bg-primary transition-[width] duration-200"
-              style={{ width: `${((visibleStep + 1) / visibleSteps.length) * 100}%` }}
-            />
-          </div>
-        </div>
+        )}
       </CardHeader>
 
       <CardContent className="p-0">
-        {hostingMode === "slurm" && step > 0 ? (
-          <SlurmLauncher
-            mode="create"
-            recipes={recipes}
-            embedded
-            stage={slurmStage}
-            onStageChange={setSlurmStage}
-            onCancel={onCancel}
-            onBackToHost={() => { setLocalError(null); setSlurmStage("backend"); setStep(0); }}
-            busy={launcherBusy}
-            onSubmit={async (fd) => {
-              setLauncherBusy(true);
-              try {
-                const result = await createModelAction(fd);
-                if (result.ok) onCancel();
-                return result;
-              } finally {
-                setLauncherBusy(false);
-              }
-            }}
-          />
+        {usingSlurm ? (
+          <div className="space-y-5 p-5 sm:p-6">
+            <HostingChoice
+              slurmEnabled={slurmEnabled}
+              hostingMode={hostingMode}
+              setHostingMode={setHostingMode}
+            />
+            <div>
+              <h3 className="text-lg font-semibold tracking-tight">Deploy a recipe</h3>
+              <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+                Pick an admin-authored <code className="font-mono">*.recipe</code> file. Edit the file on disk
+                and refresh to change it — no restart needed.
+              </p>
+              <div className="mt-4">
+                <RecipeList recipes={recipeCards} onDeployed={onCancel} />
+              </div>
+            </div>
+          </div>
         ) : (
         <form ref={formRef} action={handleSubmit} onInput={updatePreview} onChange={updatePreview}>
           <input type="hidden" name="endpoint_mode" value={hostingMode} />
@@ -847,56 +867,13 @@ function CreateModelWizard({
                 </p>
               )}
 
-              <section className={cn("grid gap-3 lg:grid-cols-2", step !== 0 && "hidden")}>
-                <button
-                  type="button"
-                  aria-pressed={hostingMode === "static"}
-                  onClick={() => setHostingMode("static")}
-                  className={cn(
-                    "flex min-h-36 items-start gap-3 rounded-lg border p-4 text-left transition-colors",
-                    hostingMode === "static"
-                      ? "border-primary/50 bg-primary/10"
-                      : "border-border/70 bg-background/35 hover:bg-accent",
-                  )}
-                >
-                  <Database className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" />
-                  <span>
-                    <span className="block text-sm font-medium">OpenAI-compatible API</span>
-                    <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
-                      Connect an existing endpoint that speaks the OpenAI API.
-                    </span>
-                    <Badge className="mt-3 bg-background text-[10px]">External API</Badge>
-                  </span>
-                </button>
-                <button
-                  type="button"
-                  aria-pressed={hostingMode === "slurm"}
-                  disabled={!slurmEnabled}
-                  onClick={() => setHostingMode("slurm")}
-                  className={cn(
-                    "flex min-h-36 items-start gap-3 rounded-lg border p-4 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-50",
-                    hostingMode === "slurm"
-                      ? "border-primary/50 bg-primary/10"
-                      : "border-border/70 bg-background/35 hover:bg-accent",
-                  )}
-                >
-                  <Zap className="mt-0.5 h-5 w-5 shrink-0 text-muted-foreground" />
-                  <span>
-                    <span className="block text-sm font-medium">Managed Slurm</span>
-                    <span className="mt-1 block text-xs leading-relaxed text-muted-foreground">
-                      Launch and replace model replicas on your Slurm cluster.
-                    </span>
-                    <Badge className="mt-3 bg-background text-[10px]">
-                      {slurmEnabled ? "Cluster managed" : "Not configured"}
-                    </Badge>
-                  </span>
-                </button>
-                {!slurmEnabled && (
-                  <p className="rounded-md border border-border/70 bg-background/35 px-3 py-2 text-xs text-muted-foreground lg:col-span-2">
-                    Configure Slurm in Settings before creating Managed Slurm models.
-                  </p>
-                )}
-              </section>
+              <div className={cn(step !== 0 && "hidden")}>
+                <HostingChoice
+                  slurmEnabled={slurmEnabled}
+                  hostingMode={hostingMode}
+                  setHostingMode={setHostingMode}
+                />
+              </div>
 
               <section className={cn("grid gap-4 md:grid-cols-2", step !== 1 && "hidden")}>
                 <div className="space-y-1.5">
