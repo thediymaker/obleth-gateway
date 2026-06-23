@@ -115,6 +115,32 @@ export type SlurmRecipe = {
   preamble?: string;
 };
 
+// Starting-point suggestion for llama.cpp's --n-cpu-moe (CPU-resident MoE expert
+// layers). This is the empirical knob from asset-tools/glm52-llamacpp.sh, whose
+// comments give ~54@16K, ~60@512K, ~68@1M on a ~96GB GH200: the offload must
+// rise with context because the KV/context buffers eat VRAM. We anchor on that
+// curve, scaled by how much VRAM the node actually has. It is a HINT the user
+// always overrides — we return null (suggest nothing) when VRAM is unknown,
+// because a guess without the hardware fact would be dishonest.
+export function recommendNCpuMoe(
+  ctxTokens: number,
+  nodeVramGb: number | null,
+): number | null {
+  if (!nodeVramGb || nodeVramGb <= 0) return null;
+  // Anchor points measured on a 96GB GH200 (GLM-class MoE).
+  const anchor96 = (ctx: number): number => {
+    if (ctx <= 16_384) return 54;
+    if (ctx >= 1_048_576) return 68;
+    // log-interpolate between the 16K and 1M anchors.
+    const t = (Math.log2(ctx) - Math.log2(16_384)) /
+              (Math.log2(1_048_576) - Math.log2(16_384));
+    return Math.round(54 + t * (68 - 54));
+  };
+  // More VRAM => fewer layers need to live on the CPU (scale inversely).
+  const scaled = anchor96(ctxTokens) * (96 / nodeVramGb);
+  return Math.max(0, Math.round(scaled));
+}
+
 /** Initial value map for a recipe's parameters. */
 export function recipeDefaults(recipe: SlurmRecipe): Record<string, string> {
   const out: Record<string, string> = {};
@@ -204,6 +230,10 @@ export function buildRecipePreamble(
   return lines.join("\n");
 }
 
+// Built-in, read-only "curated example" recipes. The launcher surfaces these in
+// the catalog drawer as optional prefills (alongside user-saved recipes from the
+// DB); selecting one pours its values into the form. No per-recipe "curated" flag
+// is needed — every entry in this list is a curated example by definition.
 export const SLURM_RECIPES: readonly SlurmRecipe[] = [
   {
     id: "vllm",

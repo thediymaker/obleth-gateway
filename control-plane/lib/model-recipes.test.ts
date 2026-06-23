@@ -4,6 +4,7 @@ import {
   recipeDefaults,
   buildRecipeCommand,
   buildRecipePreamble,
+  recommendNCpuMoe,
   type SlurmRecipe,
 } from "./model-recipes";
 
@@ -93,5 +94,17 @@ describe("ollama recipe", () => {
     const cmd = build("ollama", {}, { model: "qwen2.5:0.5b", port: "9001" });
     expect(cmd).toContain("OLLAMA_HOST=0.0.0.0:9001 ollama serve");
     expect(cmd).toContain("ollama pull qwen2.5:0.5b");
+  });
+});
+
+describe("recommendNCpuMoe", () => {
+  it("rises with context length on a ~96GB GH200", () => {
+    const small = recommendNCpuMoe(16_384, 96)!;
+    const big = recommendNCpuMoe(1_048_576, 96)!;
+    expect(small).toBeGreaterThan(0);
+    expect(big).toBeGreaterThan(small); // more ctx => more offload
+  });
+  it("returns null when VRAM is unknown (no honest guess)", () => {
+    expect(recommendNCpuMoe(1_048_576, null)).toBeNull();
   });
 });
