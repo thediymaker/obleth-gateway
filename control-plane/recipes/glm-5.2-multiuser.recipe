@@ -1,0 +1,24 @@
+---
+name: GLM-5.2 (multi-user, GH200)
+description: GLM-5.2 UD-IQ2_M, 4 concurrent slots, weights pulled to node-local NVMe.
+engine: llamacpp
+model_type: chat
+api_model_name: glm-5.2
+port: 8000
+target_replicas: 2
+max_job_failures: 3
+---
+#!/bin/bash -l
+#SBATCH --gres=gpu:1                 # one GH200 superchip
+#SBATCH --cpus-per-task=72
+#SBATCH --mem=560G
+#SBATCH --time=04:00:00
+#SBATCH -p arm
+#SBATCH --output=logs/serve-%j.out
+set -euo pipefail
+export LLAMA_CACHE=/mnt/job_tmp/glm52
+export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
+llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M \
+  --host 0.0.0.0 --port 8000 --alias glm-5.2 \
+  -ngl 99 --ctx-size 1048576 --parallel 4 --threads "$(nproc)" \
+  --cont-batching --flash-attn on --jinja

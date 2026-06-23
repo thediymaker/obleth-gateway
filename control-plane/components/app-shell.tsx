@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 import {
+  BookText,
   Boxes,
   BarChart3,
   ChevronDown,
@@ -40,6 +41,7 @@ const nav = [
   { href: "/", label: "Overview", icon: LayoutDashboard },
   { href: "/fairshare", label: "Fairshare", icon: Gauge },
   { href: "/models", label: "Models", icon: Boxes },
+  { href: "/recipes", label: "Recipes", icon: BookText },
   { href: "/mcp", label: "MCP Servers", icon: Plug },
   { href: "/tenants", label: "Tenants", icon: Users },
   { href: "/keys", label: "API Keys", icon: KeyRound },
