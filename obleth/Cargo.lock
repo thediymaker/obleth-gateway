@@ -1590,6 +1590,7 @@ dependencies = [
  "lettre",
  "obleth-config",
  "obleth-fairshare",
+ "obleth-provisioner",
  "obleth-redis",
  "obleth-store",
  "rand 0.8.6",
