@@ -185,6 +185,25 @@ export interface PutManagedModel {
   max_job_failures?: number;
 }
 
+export type ClusterResources = {
+  partitions: {
+    name: string;
+    nodes: string[];
+    default_time: string | null;
+    max_time: string | null;
+  }[];
+  nodes: {
+    name: string;
+    partitions: string[];
+    gres: string;
+    cpus: number | null;
+    real_memory_mb: number | null;
+    features: string[];
+  }[];
+  accounts: string[];
+  qos: string[];
+};
+
 export interface ModelReplica {
   id: string;
   model_id: string;
@@ -1048,6 +1067,7 @@ export const obleth = {
     }),
   deleteManagedModel: (id: string) =>
     api<void>(`/models/${id}/managed`, { method: "DELETE" }),
+  slurmResources: () => api<ClusterResources>(`/slurm/resources`),
   listReplicas: (id: string) =>
     api<ModelReplica[]>(`/models/${id}/replicas`),
   createModelEndpoint: (
