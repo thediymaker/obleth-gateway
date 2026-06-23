@@ -4,8 +4,8 @@
 // verbatim as `script_body` while its `#SBATCH` directives are lifted into JSON
 // fields (slurmrestd ignores `#SBATCH` — see ./sbatch-directives).
 //
-// Distinct from ./recipe-files.ts (the legacy wizard-definition `*.yaml`
-// files); this module owns the new `*.recipe` files and never imports that one.
+// This module owns the new `*.recipe` files (distinct from the former
+// wizard yaml definitions).
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
