@@ -34,6 +34,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
+import { useClusterResources } from "@/lib/use-cluster-resources";
 import type { RecipeCard, RecipeDeployPreview } from "./recipe-card";
 
 function compactJoin(parts: Array<string | number | null | undefined>): string {
@@ -108,6 +109,7 @@ function OverrideField({
   type = "text",
   disabled,
   className,
+  options,
 }: {
   label: string;
   value: string;
@@ -116,7 +118,10 @@ function OverrideField({
   type?: string;
   disabled?: boolean;
   className?: string;
+  /** Optional suggestions rendered as a datalist; the field stays free-text. */
+  options?: string[];
 }) {
+  const listId = options && options.length > 0 ? `ovr-${label.replace(/\s+/g, "-").toLowerCase()}` : undefined;
   return (
     <div className={cn("space-y-1", className)}>
       <Label className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{label}</Label>
@@ -125,9 +130,17 @@ function OverrideField({
         value={value}
         placeholder={placeholder}
         disabled={disabled}
+        list={listId}
         onChange={(e) => onChange(e.target.value)}
         className="h-8 text-sm"
       />
+      {listId && (
+        <datalist id={listId}>
+          {options!.map((o) => (
+            <option key={o} value={o} />
+          ))}
+        </datalist>
+      )}
     </div>
   );
 }
@@ -164,6 +177,7 @@ export function RecipeList({
   recipes: RecipeCard[];
   onDeployed?: () => void;
 }) {
+  const cluster = useClusterResources();
   const [selected, setSelected] = useState<RecipeCard | null>(null);
   const [overrides, setOverrides] = useState({ qos: "", partition: "", timeLimit: "", replicas: "" });
   const [vars, setVars] = useState<Record<string, string>>({});
@@ -492,6 +506,7 @@ export function RecipeList({
                           onChange={(v) => setOverrides((o) => ({ ...o, partition: v }))}
                           placeholder="e.g. arm"
                           disabled={pending}
+                          options={cluster.partitions.map((p) => p.name)}
                         />
                         <OverrideField
                           label="QoS"
@@ -499,6 +514,7 @@ export function RecipeList({
                           onChange={(v) => setOverrides((o) => ({ ...o, qos: v }))}
                           placeholder="default"
                           disabled={pending}
+                          options={cluster.qos}
                         />
                         <OverrideField
                           label="Replicas"

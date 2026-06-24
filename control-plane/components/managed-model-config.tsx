@@ -5,10 +5,12 @@ import { useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { useClusterResources } from "@/lib/use-cluster-resources";
 import type { ManagedModelSpec, PutManagedModel } from "@/lib/obleth";
 
 export function ManagedModelConfig({ modelId }: { modelId: string }) {
   const qc = useQueryClient();
+  const cluster = useClusterResources();
   const [msg, setMsg] = useState<string | null>(null);
   const { data, isLoading } = useQuery({
     queryKey: ["managed", modelId],
@@ -89,6 +91,22 @@ export function ManagedModelConfig({ modelId }: { modelId: string }) {
 
   return (
     <form onSubmit={onSubmit} className="space-y-5">
+      {/* Suggestions pulled live from the cluster; empty when slurm is unreachable. */}
+      <datalist id="slurm-partitions">
+        {cluster.partitions.map((p) => (
+          <option key={p.name} value={p.name} />
+        ))}
+      </datalist>
+      <datalist id="slurm-qos">
+        {cluster.qos.map((q) => (
+          <option key={q} value={q} />
+        ))}
+      </datalist>
+      <datalist id="slurm-accounts">
+        {cluster.accounts.map((a) => (
+          <option key={a} value={a} />
+        ))}
+      </datalist>
       <div>
         <p className="text-sm font-medium">Launch script</p>
         <p className="text-xs text-muted-foreground">The full sbatch body submitted to slurmrestd.</p>
@@ -105,7 +123,7 @@ export function ManagedModelConfig({ modelId }: { modelId: string }) {
         <div className="mt-2 grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
           <div className="space-y-1.5">
             <Label htmlFor="slurm_partition">Partition</Label>
-            <Input id="slurm_partition" name="slurm_partition" defaultValue={d.partition} />
+            <Input id="slurm_partition" name="slurm_partition" defaultValue={d.partition} list="slurm-partitions" />
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="slurm_gres">GRES</Label>
@@ -125,11 +143,11 @@ export function ManagedModelConfig({ modelId }: { modelId: string }) {
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="slurm_qos">QoS</Label>
-            <Input id="slurm_qos" name="slurm_qos" defaultValue={d.qos ?? ""} />
+            <Input id="slurm_qos" name="slurm_qos" defaultValue={d.qos ?? ""} list="slurm-qos" />
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="slurm_account">Account</Label>
-            <Input id="slurm_account" name="slurm_account" defaultValue={d.account ?? ""} />
+            <Input id="slurm_account" name="slurm_account" defaultValue={d.account ?? ""} list="slurm-accounts" />
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="slurm_time_limit">Time limit</Label>
