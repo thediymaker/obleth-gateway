@@ -12,7 +12,7 @@ mod backup;
 mod error;
 pub mod model_health;
 mod openapi;
-pub mod saved_recipes;
+pub mod recipes;
 pub mod slurm_resources;
 pub mod slurm_settings;
 pub mod ssrf;
@@ -170,8 +170,8 @@ pub fn router(state: AdminState) -> Router {
         )
         .route("/api/v1/models/:id/cache", put(set_model_cache))
         .route("/api/v1/models/:id/reliability", put(set_model_reliability))
-        .route("/api/v1/recipes", get(saved_recipes::list_recipes).post(saved_recipes::create_recipe))
-        .route("/api/v1/recipes/:id", put(saved_recipes::update_recipe).delete(saved_recipes::delete_recipe))
+        .route("/api/v1/recipes", get(recipes::list_recipes).post(recipes::create_recipe))
+        .route("/api/v1/recipes/:id", put(recipes::update_recipe).delete(recipes::delete_recipe))
         .route("/api/v1/managed", get(list_managed_models))
         .route(
             "/api/v1/models/:id/managed",

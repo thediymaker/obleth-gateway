@@ -142,10 +142,10 @@ use obleth_config::{
         crate::slurm_settings::get_slurm_settings_resolved,
         crate::slurm_resources::get_slurm_resources,
         // recipes
-        crate::saved_recipes::list_recipes,
-        crate::saved_recipes::create_recipe,
-        crate::saved_recipes::update_recipe,
-        crate::saved_recipes::delete_recipe,
+        crate::recipes::list_recipes,
+        crate::recipes::create_recipe,
+        crate::recipes::update_recipe,
+        crate::recipes::delete_recipe,
         // backup
         crate::backup::export_backup,
         crate::backup::restore_backup,
@@ -260,8 +260,8 @@ use obleth_config::{
         RestoreReport,
         RestoreCounts,
         crate::VersionInfo,
-        crate::saved_recipes::RecipeView,
-        crate::saved_recipes::UpsertRecipeBody,
+        crate::recipes::RecipeView,
+        crate::recipes::UpsertRecipeBody,
     )),
     tags(
         (name = "meta", description = "Gateway build/version identity"),
