@@ -1,10 +1,16 @@
-mod config; mod domain; mod plan; mod slurm; mod obleth_client; mod probe; mod executor;
+mod config; mod plan; mod obleth_client; mod probe; mod executor;
+
+// `domain` and `slurm` live in the crate's library half (lib.rs) so obleth-admin
+// can call `discover_resources()`. Re-export them here rather than re-declaring
+// the modules, so they compile once — re-declaring with `mod` would compile the
+// discovery code into the binary too, where it is unused (dead-code warnings).
+pub(crate) use obleth_provisioner::{domain, slurm};
 
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use config::ProvisionerConfig;
 use obleth_client::{HttpObleth, OblethClient};
-use slurm::{SlurmClient, Slurmrestd};
+use obleth_provisioner::slurm::{SlurmClient, Slurmrestd};
 
 /// Outcome of one loop iteration, so the loop can log idle/active transitions
 /// without spamming a line every tick.

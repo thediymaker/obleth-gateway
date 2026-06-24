@@ -85,9 +85,36 @@ fn host_from_api_base(api_base: &str) -> String {
 mod tests {
     use super::*;
     use crate::obleth_client::MockObleth;
-    use crate::slurm::MockSlurm;
     use std::sync::{atomic::AtomicU64, Mutex};
     use uuid::Uuid;
+
+    /// In-memory fake for executor/loop tests — no network.
+    struct MockSlurm {
+        jobs: Mutex<Vec<JobInfo>>,
+        submitted: Mutex<Vec<JobSubmit>>,
+        cancelled: Mutex<Vec<String>>,
+        next_id: AtomicU64,
+    }
+    #[async_trait::async_trait]
+    impl SlurmClient for MockSlurm {
+        async fn submit(&self, job: &JobSubmit) -> anyhow::Result<String> {
+            let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.submitted.lock().unwrap().push(job.clone());
+            let job_id = format!("job-{id}");
+            self.jobs.lock().unwrap().push(JobInfo { job_id: job_id.clone(), state: JobState::Pending, nodes: vec![] });
+            Ok(job_id)
+        }
+        async fn cancel(&self, job_id: &str) -> anyhow::Result<()> {
+            self.cancelled.lock().unwrap().push(job_id.to_string());
+            Ok(())
+        }
+        async fn list_owned_jobs(&self, _prefix: &str) -> anyhow::Result<Vec<JobInfo>> {
+            Ok(self.jobs.lock().unwrap().clone())
+        }
+        async fn discover_resources(&self) -> anyhow::Result<ClusterResources> {
+            Ok(ClusterResources::default())
+        }
+    }
 
     fn spec() -> ManagedModelSpec {
         ManagedModelSpec {
