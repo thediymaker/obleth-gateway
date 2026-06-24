@@ -55,6 +55,7 @@ const SCHEMA_V2: &str = include_str!("../../../../schema/postgres/0002_tracing_f
 const SCHEMA_V3: &str = include_str!("../../../../schema/postgres/0003_guardrails_policy.sql");
 const SCHEMA_V4: &str = include_str!("../../../../schema/postgres/0004_saved_recipes.sql");
 const SCHEMA_V5: &str = include_str!("../../../../schema/postgres/0005_managed_launcher_spec.sql");
+const SCHEMA_V6: &str = include_str!("../../../../schema/postgres/0006_recipes.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -148,6 +149,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V3).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V4).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V5).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V6).execute(&mut *conn).await?;
             Ok(())
         }
         .await;

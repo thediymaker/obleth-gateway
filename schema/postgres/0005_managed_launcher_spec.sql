@@ -1,6 +1,6 @@
 -- Idempotent: safe to re-run.
 
--- Stores the launcher form state (backend id, knob values, envelope) as JSON so the
--- dashboard "edit" view can faithfully restore the panel. Metadata only — the
--- provisioner ignores it; the rendered launch_command/script_body remain authoritative.
+-- Per-managed-model JSON metadata. Recipe deploys store {source:"recipe", recipe_id,
+-- engine, name} here so the edit view can identify recipe-sourced rows. Metadata
+-- only — the provisioner ignores it.
 alter table managed_models add column if not exists launcher_spec jsonb;
