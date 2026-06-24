@@ -190,6 +190,7 @@ export interface DeployOverrides {
   qos?: string;
   time_limit?: string;
   partition?: string;
+  variables?: Record<string, string>;
 }
 
 export interface DeployPayload {
@@ -213,6 +214,28 @@ function overrideString(override: string | undefined, recipeValue: string | unde
   if (override === undefined) return recipeValue;
   const trimmed = override.trim();
   return trimmed === "" ? undefined : trimmed;
+}
+
+/** Replace declared {{name}} tokens with their resolved values. Only declared
+ *  names are touched; undeclared {{...}} and all shell ${...}/$(...) pass through.
+ *  Throws when a required variable has neither a submitted value nor a default. */
+function substituteVariables(
+  body: string,
+  declared: RecipeVariable[] | undefined,
+  values: Record<string, string> | undefined,
+): string {
+  if (!declared || declared.length === 0) return body;
+  let out = body;
+  for (const v of declared) {
+    const submitted = values?.[v.name]?.trim();
+    const resolved = submitted || v.default;
+    if (resolved === undefined || resolved === "") {
+      if (v.required) throw new Error(`required variable "${v.name}" has no value`);
+      continue; // optional + unset: leave the token in place
+    }
+    out = out.split(`{{${v.name}}}`).join(resolved);
+  }
+  return out;
 }
 
 /** If the recipe declares --chdir, guard the script with a `cd` after the shebang. */
@@ -259,7 +282,10 @@ export function buildManagedFromRecipe(
     image: "",
     preamble: "",
     launch_command: "",
-    script_body: applyChdir(recipe.body, d.chdir),
+    script_body: applyChdir(
+      substituteVariables(recipe.body, h.variables, overrides.variables),
+      d.chdir,
+    ),
     serving_port: h.port,
     health_path: h.health_path?.trim() || defaultHealthPath(h.engine),
     target_replicas: targetReplicas,

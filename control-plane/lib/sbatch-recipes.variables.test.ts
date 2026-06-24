@@ -54,3 +54,38 @@ describe("recipe variables parsing", () => {
     expect(r.header?.variables).toBeUndefined();
   });
 });
+
+import { buildManagedFromRecipe } from "./sbatch-recipes";
+
+const recipeWithBody = (body: string) =>
+  parseRecipe(
+    "t",
+    [
+      "---", "name: T", "engine: ollama", "model_type: chat",
+      "api_model_name: m", "port: 8000",
+      "variables:", "  - name: image", "    default: /default.sif",
+      "  - name: tag", "    required: true",
+      "---", body,
+    ].join("\n"),
+  );
+
+describe("recipe variable substitution", () => {
+  it("substitutes declared {{vars}} and leaves shell ${} and undeclared {{}} alone", () => {
+    const r = recipeWithBody("run {{image}} --tag {{tag}} --home ${HOME} --x {{undeclared}}");
+    const p = buildManagedFromRecipe(r, { variables: { image: "/my.sif", tag: "q4" } });
+    expect(p.managedBody.script_body).toContain("run /my.sif --tag q4");
+    expect(p.managedBody.script_body).toContain("${HOME}");
+    expect(p.managedBody.script_body).toContain("{{undeclared}}");
+  });
+
+  it("falls back to the declared default when a value is omitted", () => {
+    const r = recipeWithBody("run {{image}} {{tag}}");
+    const p = buildManagedFromRecipe(r, { variables: { tag: "q4" } });
+    expect(p.managedBody.script_body).toContain("run /default.sif q4");
+  });
+
+  it("throws when a required variable has no value and no default", () => {
+    const r = recipeWithBody("run {{tag}}");
+    expect(() => buildManagedFromRecipe(r, { variables: {} })).toThrow(/required/i);
+  });
+});
