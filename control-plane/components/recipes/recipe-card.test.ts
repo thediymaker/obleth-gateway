@@ -41,6 +41,7 @@ describe("toRecipeCards", () => {
       apiModelName: "glm-5.2",
       targetReplicas: 4,
       warnings: ["--job-name (not applied)"],
+      source: "file",
     });
   });
 
@@ -50,5 +51,6 @@ describe("toRecipeCards", () => {
     expect(card.error).toBe("recipe has no script body");
     expect(card.name).toBeUndefined();
     expect(card.warnings).toEqual([]);
+    expect(card.source).toBe("file");
   });
 });

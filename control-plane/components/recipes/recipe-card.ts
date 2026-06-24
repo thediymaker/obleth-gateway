@@ -41,6 +41,8 @@ export interface RecipeCard {
   targetReplicas?: number;
   warnings: string[];
   preview?: RecipeDeployPreview;
+  source: "file" | "db";
+  recipeId?: string; // DB row id, when source === "db"
 }
 
 export function toRecipeCards(parsed: ParsedRecipe[]): RecipeCard[] {
@@ -55,5 +57,6 @@ export function toRecipeCards(parsed: ParsedRecipe[]): RecipeCard[] {
     apiModelName: r.header?.api_model_name,
     targetReplicas: r.header?.target_replicas,
     warnings: r.warnings,
+    source: "file" as const,
   }));
 }

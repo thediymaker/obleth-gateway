@@ -13,7 +13,8 @@ import { z } from "zod";
 import type { RecipeCard, RecipeDeployPreview } from "@/components/recipes/recipe-card";
 import { toRecipeCards } from "@/components/recipes/recipe-card";
 import { parseSbatchDirectives, type ParsedDirectives } from "./sbatch-directives";
-import type { PutManagedModel } from "./obleth";
+import type { PutManagedModel } from "@/lib/obleth";
+import { obleth } from "@/lib/obleth";
 
 export interface RecipeVariable {
   name: string;
@@ -347,9 +348,32 @@ export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | 
   };
 }
 
-/** Server helper: every recipe as a card, summary + deploy preview. */
-export function loadRecipeCards(): RecipeCard[] {
+/** Server helper: every recipe as a card, summary + deploy preview.
+ *  Merges file-based templates (source:"file") with editable DB templates
+ *  (source:"db") fetched from the admin API. The DB fetch is wrapped in a
+ *  try/catch so file templates always render even when the admin API is down. */
+export async function loadRecipeCards(): Promise<RecipeCard[]> {
   const parsed = listRecipes();
   const cards = toRecipeCards(parsed);
-  return cards.map((c, i) => ({ ...c, preview: buildDeployPreview(parsed[i]) }));
+  const fileCards = cards.map((c, i) => ({ ...c, preview: buildDeployPreview(parsed[i]) }));
+
+  let dbCards: RecipeCard[] = [];
+  try {
+    const rows = await obleth.listRecipes();
+    dbCards = rows.map((row) => {
+      const parsedRecipe = parseRecipe(row.id, row.body);
+      const [card] = toRecipeCards([parsedRecipe]);
+      return {
+        ...card,
+        source: "db" as const,
+        recipeId: row.id,
+        name: card.name ?? row.name,
+        preview: buildDeployPreview(parsedRecipe),
+      };
+    });
+  } catch {
+    dbCards = []; // admin API unavailable — file templates still render
+  }
+
+  return [...fileCards, ...dbCards];
 }

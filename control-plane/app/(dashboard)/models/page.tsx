@@ -48,8 +48,9 @@ export default async function ModelsPage() {
     perModel.map(([id, , , spec]) => [id, spec !== null]),
   );
 
-  // Admin-authored *.recipe files, mapped to flat cards for the create gallery.
-  const recipeCards = loadRecipeCards();
+  // Admin-authored *.recipe files and editable DB templates, mapped to flat cards
+  // for the create gallery.
+  const recipeCards = await loadRecipeCards();
 
   return (
     <div className="space-y-6">

@@ -1,8 +1,15 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { listRecipes, getRecipe } from "./sbatch-recipes";
+import { listRecipes, getRecipe, loadRecipeCards } from "./sbatch-recipes";
+import { obleth } from "@/lib/obleth";
+
+vi.mock("@/lib/obleth", () => ({
+  obleth: {
+    listRecipes: vi.fn(),
+  },
+}));
 
 const VALID = [
   "---",
@@ -64,5 +71,69 @@ describe("listRecipes / getRecipe", () => {
     writeFileSync(path.join(dir, "aardvark.recipe"), aardvarkRecipe);
     const recipes = listRecipes();
     expect(recipes.map((r) => r.id)).toEqual(["aardvark", "zebra"]);
+  });
+});
+
+describe("loadRecipeCards merge (file + DB)", () => {
+  const DB_ROW_BODY = [
+    "---",
+    "name: Qwen2.5",
+    "engine: ollama",
+    "model_type: chat",
+    "api_model_name: qwen2.5",
+    "port: 11434",
+    "partition: gpu",
+    "---",
+    "#!/bin/bash -l",
+    "#SBATCH -p gpu",
+    "ollama serve",
+  ].join("\n");
+
+  beforeEach(() => {
+    vi.mocked(obleth.listRecipes).mockResolvedValue([
+      { id: "db-qwen", name: "Qwen2.5 DB", body: DB_ROW_BODY, author: "admin" },
+    ]);
+  });
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("file cards have source:file", async () => {
+    writeFileSync(path.join(dir, "glm.recipe"), VALID);
+    const cards = await loadRecipeCards();
+    const fileCard = cards.find((c) => c.id === "glm");
+    expect(fileCard?.source).toBe("file");
+    expect(fileCard?.recipeId).toBeUndefined();
+  });
+
+  it("DB rows produce source:db cards with recipeId and a parsed preview", async () => {
+    const cards = await loadRecipeCards();
+    const dbCard = cards.find((c) => c.recipeId === "db-qwen");
+    expect(dbCard?.source).toBe("db");
+    expect(dbCard?.recipeId).toBe("db-qwen");
+    expect(dbCard?.preview).toBeDefined();
+    expect(dbCard?.preview?.engine).toBe("ollama");
+    expect(dbCard?.preview?.port).toBe(11434);
+  });
+
+  it("returns file cards when admin API throws", async () => {
+    writeFileSync(path.join(dir, "glm.recipe"), VALID);
+    vi.mocked(obleth.listRecipes).mockRejectedValue(new Error("API unavailable"));
+    const cards = await loadRecipeCards();
+    expect(cards.every((c) => c.source === "file")).toBe(true);
+    expect(cards.some((c) => c.id === "glm")).toBe(true);
+  });
+
+  it("merges file and DB cards in order: files first, then DB", async () => {
+    writeFileSync(path.join(dir, "glm.recipe"), VALID);
+    const cards = await loadRecipeCards();
+    const sources = cards.map((c) => c.source);
+    const firstDbIdx = sources.indexOf("db");
+    const lastFileIdx = sources.lastIndexOf("file");
+    // All file cards appear before any DB card (or there are only file/only db cards)
+    if (firstDbIdx !== -1 && lastFileIdx !== -1) {
+      expect(lastFileIdx).toBeLessThan(firstDbIdx);
+    }
   });
 });

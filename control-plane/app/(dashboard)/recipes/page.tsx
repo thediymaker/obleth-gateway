@@ -3,8 +3,8 @@ import { RecipeList } from "@/components/recipes/recipe-list";
 
 export const dynamic = "force-dynamic";
 
-export default function RecipesPage() {
-  const recipes = loadRecipeCards();
+export default async function RecipesPage() {
+  const recipes = await loadRecipeCards();
 
   return (
     <div className="space-y-6">

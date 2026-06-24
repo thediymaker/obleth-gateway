@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { obleth, type SavedRecipe } from "@/lib/obleth";
+import { obleth } from "@/lib/obleth";
 
 export async function GET() {
   try { return NextResponse.json(await obleth.listRecipes()); }
@@ -7,7 +7,7 @@ export async function GET() {
 }
 export async function POST(req: NextRequest) {
   try {
-    const b = (await req.json()) as Omit<SavedRecipe, "id">;
+    const b = (await req.json()) as { name: string; body: string; author?: string };
     return NextResponse.json(await obleth.createRecipe(b));
   } catch (e) { return NextResponse.json({ error: String(e) }, { status: 502 }); }
 }
