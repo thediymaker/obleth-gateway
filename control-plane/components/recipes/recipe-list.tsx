@@ -201,6 +201,7 @@ export function RecipeList({
   }
 
   function handleDelete(recipe: RecipeCard) {
+    if (!window.confirm(`Delete the "${recipe.name ?? recipe.id}" template? This cannot be undone.`)) return;
     const id = recipe.recipeId;
     if (!id) return;
     startDeleteTransition(async () => {
