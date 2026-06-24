@@ -3,7 +3,7 @@
 // component can build the cards and pass them across the client boundary.
 // `import type` keeps this module free of any runtime dependency on the
 // fs-touching sbatch-recipes loader.
-import type { ParsedRecipe } from "@/lib/sbatch-recipes";
+import type { ParsedRecipe, RecipeVariable } from "@/lib/sbatch-recipes";
 
 export interface RecipeDeployPreview {
   apiModelName: string;
@@ -26,6 +26,7 @@ export interface RecipeDeployPreview {
   logOutputDir?: string;
   scriptBody: string;
   warnings: string[];
+  variables?: RecipeVariable[];
 }
 
 export interface RecipeCard {

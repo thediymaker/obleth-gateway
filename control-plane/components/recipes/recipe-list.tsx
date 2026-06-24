@@ -161,6 +161,7 @@ export function RecipeList({
 }) {
   const [selected, setSelected] = useState<RecipeCard | null>(null);
   const [overrides, setOverrides] = useState({ qos: "", partition: "", timeLimit: "", replicas: "" });
+  const [vars, setVars] = useState<Record<string, string>>({});
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
 
@@ -175,6 +176,9 @@ export function RecipeList({
       timeLimit: p?.timeLimit ?? "",
       replicas: String(p?.targetReplicas ?? recipe.targetReplicas ?? 2),
     });
+    const seeded: Record<string, string> = {};
+    for (const v of recipe.preview?.variables ?? []) seeded[v.name] = v.default ?? "";
+    setVars(seeded);
   }
 
   function confirmDeploy() {
@@ -189,6 +193,7 @@ export function RecipeList({
         qos: overrides.qos,
         time_limit: overrides.timeLimit,
         partition: overrides.partition,
+        variables: vars,
       });
       if (res.ok) {
         setSelected(null);
@@ -357,6 +362,20 @@ export function RecipeList({
                         Pre-filled from the recipe. Changes apply to this deployment only — the recipe
                         file is unchanged.
                       </p>
+                      {(preview.variables ?? []).length > 0 && (
+                        <div className="mt-3 space-y-3">
+                          {(preview.variables ?? []).map((v) => (
+                            <OverrideField
+                              key={v.name}
+                              label={v.label ?? v.name}
+                              value={vars[v.name] ?? ""}
+                              onChange={(val) => setVars((s) => ({ ...s, [v.name]: val }))}
+                              placeholder={v.required ? "required" : undefined}
+                              disabled={pending}
+                            />
+                          ))}
+                        </div>
+                      )}
                       <div className="mt-3 grid grid-cols-2 gap-3">
                         <OverrideField
                           label="Partition"

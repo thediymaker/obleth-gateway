@@ -343,6 +343,7 @@ export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | 
     logOutputDir: m.log_output_dir,
     scriptBody: m.script_body ?? "",
     warnings: recipe.warnings,
+    variables: recipe.header.variables,
   };
 }
 
