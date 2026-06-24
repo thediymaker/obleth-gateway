@@ -1,6 +1,6 @@
 ---
 name: Deploy llama.cpp (multi-user)
-description: Serve any GGUF model with llama-server (sample: GLM-5.2 on GH200). Edit the model, image/build, and GH200 sizing for your hardware.
+description: "Serve any GGUF model with llama-server (sample: GLM-5.2 on GH200). Edit the model, image/build, and GH200 sizing for your hardware."
 engine: llamacpp
 model_type: chat
 api_model_name: glm-5.2

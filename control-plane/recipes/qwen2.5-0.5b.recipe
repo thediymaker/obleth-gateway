@@ -1,6 +1,6 @@
 ---
 name: Deploy Ollama
-description: Serve any Ollama model from an Apptainer image (sample: Qwen2.5 0.5B). Edit the image path and api_model_name for your cluster/model.
+description: "Serve any Ollama model from an Apptainer image (sample: Qwen2.5 0.5B). Edit the image path and api_model_name for your cluster/model."
 engine: ollama
 model_type: chat
 api_model_name: qwen2.5:0.5b
