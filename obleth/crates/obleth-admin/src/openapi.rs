@@ -109,6 +109,7 @@ use obleth_config::{
         crate::create_replica,
         crate::patch_replica,
         crate::delete_replica,
+        crate::clear_lost_replicas,
         crate::model_health::list_health,
         crate::model_health::get_health,
         crate::model_health::check_one,

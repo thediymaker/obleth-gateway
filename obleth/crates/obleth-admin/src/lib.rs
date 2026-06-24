@@ -189,6 +189,10 @@ pub fn router(state: AdminState) -> Router {
             get(list_replicas).post(create_replica),
         )
         .route(
+            "/api/v1/models/:id/replicas/clear-lost",
+            post(clear_lost_replicas),
+        )
+        .route(
             "/api/v1/models/:id/endpoints",
             get(list_model_endpoints).post(create_model_endpoint),
         )
@@ -729,6 +733,8 @@ fn default_health_path() -> String {
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct CreateReplica {
     slurm_job_id: String,
+    #[serde(default)]
+    port_base: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -3300,7 +3306,7 @@ async fn create_replica(
     Path(id): Path<Uuid>,
     Json(body): Json<CreateReplica>,
 ) -> Result<Json<ModelReplica>> {
-    let r = state.store.create_replica(id, &body.slurm_job_id, None).await?;
+    let r = state.store.create_replica(id, &body.slurm_job_id, body.port_base).await?;
     state
         .store
         .record_audit(
@@ -3373,6 +3379,15 @@ async fn delete_replica(
         )
         .await?;
     Ok(Json(serde_json::json!({"deleted": true})))
+}
+
+#[utoipa::path(post, path = "/api/v1/models/{id}/replicas/clear-lost",
+    responses((status = 200, body = serde_json::Value)))]
+pub async fn clear_lost_replicas(
+    State(state): State<AdminState>, Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>> {
+    let n = state.store.delete_lost_replicas(id).await?;
+    Ok(Json(serde_json::json!({ "deleted": n })))
 }
 
 #[utoipa::path(
