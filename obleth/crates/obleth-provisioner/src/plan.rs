@@ -2,6 +2,20 @@ use crate::domain::*;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+/// Smallest free disjoint window base for a new replica: serving_port + i*span
+/// for the smallest i whose base is not already taken by a live replica.
+pub fn next_free_window_base(serving_port: i64, span: i64, live_port_bases: &[i64]) -> i64 {
+    let span = span.max(1);
+    let mut i = 0i64;
+    loop {
+        let base = serving_port + i * span;
+        if !live_port_bases.contains(&base) {
+            return base;
+        }
+        i += 1;
+    }
+}
+
 /// Pure reconcile. `jobs` is keyed by slurm_job_id; `health` is keyed by
 /// replica id and only needs entries for `starting` replicas being probed.
 pub fn plan(
@@ -119,6 +133,19 @@ mod tests {
     }
     fn spec(target: i64) -> ManagedSpecView { ManagedSpecView { target_replicas: target, max_job_failures: 0 } }
     fn spec_with_limit(target: i64, limit: i64) -> ManagedSpecView { ManagedSpecView { target_replicas: target, max_job_failures: limit } }
+
+    #[test]
+    fn next_free_window_base_empty_returns_serving_port() {
+        assert_eq!(next_free_window_base(8000, 8, &[]), 8000);
+    }
+
+    #[test]
+    fn next_free_window_base_skips_taken_slots() {
+        // [8000] taken → next is 8008
+        assert_eq!(next_free_window_base(8000, 8, &[8000]), 8008);
+        // [8000, 8016] taken → 8008 is free (first gap)
+        assert_eq!(next_free_window_base(8000, 8, &[8000, 8016]), 8008);
+    }
 
     #[test]
     fn empty_state_submits_target() {

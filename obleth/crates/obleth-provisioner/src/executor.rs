@@ -1,5 +1,6 @@
 use crate::domain::*;
 use crate::obleth_client::OblethClient;
+use crate::plan;
 use crate::slurm::{job_submit_from_spec, SlurmClient};
 use obleth_config::ManagedModelSpec;
 
@@ -9,23 +10,30 @@ use obleth_config::ManagedModelSpec;
 /// partition/image/launch details). Drain actions (`Cancel`/`MarkLost`/`Delete`)
 /// and `Promote` only need `model_id`, so they still run for a model whose spec
 /// has been disabled or deleted while replicas are being torn down.
+///
+/// `port_span` is the per-replica port window width (from config).
+/// `live_port_bases` is the slice of port_base values for this model's current
+/// non-lost/non-draining replicas (computed by the caller in main.rs).
 pub async fn apply(
     action: &Action,
     model_id: uuid::Uuid,
     model_name: &str,
     submit_spec: Option<&ManagedModelSpec>,
     job_prefix: &str,
+    port_span: i64,
+    live_port_bases: &[i64],
     slurm: &dyn SlurmClient,
     obleth: &dyn OblethClient,
 ) -> anyhow::Result<()> {
     match action {
         Action::Submit => {
             let spec = submit_spec.ok_or_else(|| {
-                anyhow::anyhow!("Submit requires a managed spec but none was provided (model {model_id})")
+                anyhow::anyhow!("Submit requires a managed spec (model {model_id})")
             })?;
-            let job = job_submit_from_spec(spec, model_name, job_prefix);
+            let port_base = plan::next_free_window_base(spec.serving_port, port_span, live_port_bases);
+            let job = job_submit_from_spec(spec, model_name, job_prefix, port_base, port_span);
             let job_id = slurm.submit(&job).await?;
-            obleth.create_replica(model_id, &job_id).await?;
+            obleth.create_replica(model_id, &job_id, port_base).await?;
         }
         Action::Promote { replica_id, api_base } => {
             tracing::info!(%replica_id, %api_base, model = model_name, "promoting replica to healthy");
@@ -116,7 +124,7 @@ mod tests {
         let slurm = mock_slurm();
         let obleth = MockObleth::default();
         let s = spec();
-        apply(&Action::Submit, s.model_id, "nemotron", Some(&s), "obleth-", &slurm, &obleth).await.unwrap();
+        apply(&Action::Submit, s.model_id, "nemotron", Some(&s), "obleth-", 8, &[], &slurm, &obleth).await.unwrap();
         assert_eq!(slurm.submitted.lock().unwrap().len(), 1);
         assert_eq!(obleth.created_replicas.lock().unwrap().len(), 1);
     }
@@ -125,7 +133,7 @@ mod tests {
     async fn submit_without_spec_errors() {
         let slurm = mock_slurm();
         let obleth = MockObleth::default();
-        let err = apply(&Action::Submit, Uuid::new_v4(), "nemotron", None, "obleth-", &slurm, &obleth).await;
+        let err = apply(&Action::Submit, Uuid::new_v4(), "nemotron", None, "obleth-", 8, &[], &slurm, &obleth).await;
         assert!(err.is_err(), "Submit must fail without a spec");
         assert_eq!(slurm.submitted.lock().unwrap().len(), 0);
     }
@@ -137,7 +145,7 @@ mod tests {
         let s = spec();
         let rid = Uuid::new_v4();
         apply(&Action::Promote { replica_id: rid, api_base: "http://gpu7:8000".into() },
-              s.model_id, "nemotron", Some(&s), "obleth-", &slurm, &obleth).await.unwrap();
+              s.model_id, "nemotron", Some(&s), "obleth-", 8, &[], &slurm, &obleth).await.unwrap();
         assert_eq!(obleth.created_endpoints.lock().unwrap().len(), 1);
         let patched = obleth.patched.lock().unwrap();
         assert!(patched.iter().any(|p| p.0 == rid && p.1.as_deref() == Some("healthy")));
@@ -159,7 +167,7 @@ mod tests {
         let ep = Uuid::new_v4();
         // No spec needed for drain actions (drives the disabled/deleted path).
         apply(&Action::MarkLost { replica_id: rid, endpoint_id: Some(ep) },
-              Uuid::new_v4(), "nemotron", None, "obleth-", &slurm, &obleth).await.unwrap();
+              Uuid::new_v4(), "nemotron", None, "obleth-", 8, &[], &slurm, &obleth).await.unwrap();
         assert!(obleth.deleted_endpoints.lock().unwrap().contains(&ep));
         let patched = obleth.patched.lock().unwrap();
         assert!(patched.iter().any(|p| p.0 == rid && p.1.as_deref() == Some("lost")));
@@ -172,7 +180,7 @@ mod tests {
         let rid = Uuid::new_v4();
         // No spec needed for drain actions.
         apply(&Action::Cancel { replica_id: rid, job_id: "j9".into() },
-              Uuid::new_v4(), "nemotron", None, "obleth-", &slurm, &obleth).await.unwrap();
+              Uuid::new_v4(), "nemotron", None, "obleth-", 8, &[], &slurm, &obleth).await.unwrap();
         assert!(slurm.cancelled.lock().unwrap().contains(&"j9".to_string()));
         let patched = obleth.patched.lock().unwrap();
         assert!(patched.iter().any(|p| p.0 == rid && p.1.as_deref() == Some("draining")));
