@@ -1,6 +1,6 @@
 ---
-name: Qwen2.5 0.5B (Ollama)
-description: Qwen2.5 0.5B served via Ollama from an Apptainer image; weights pulled to the node at launch. Template — set the partition at deploy and edit the image path for your cluster.
+name: Deploy Ollama
+description: Serve any Ollama model from an Apptainer image (sample: Qwen2.5 0.5B). Edit the image path and api_model_name for your cluster/model.
 engine: ollama
 model_type: chat
 api_model_name: qwen2.5:0.5b
