@@ -156,6 +156,7 @@ export interface ManagedModelSpec {
   script_body: string;
   serving_port: number;
   health_path: string;
+  min_replicas: number;
   target_replicas: number;
   max_job_failures: number;
   launcher_spec?: Record<string, unknown> | null;
@@ -182,6 +183,7 @@ export interface PutManagedModel {
   script_body?: string;
   serving_port: number;
   health_path?: string;
+  min_replicas?: number;
   target_replicas?: number;
   max_job_failures?: number;
   launcher_spec?: Record<string, unknown> | null;
@@ -1086,6 +1088,8 @@ export const obleth = {
     api<void>(`/recipes/${id}`, { method: "DELETE" }),
   listReplicas: (id: string) =>
     api<ModelReplica[]>(`/models/${id}/replicas`),
+  clearLostReplicas: (id: string) =>
+    api<{ deleted: number }>(`/models/${id}/replicas/clear-lost`, { method: "POST" }),
   createModelEndpoint: (
     id: string,
     body: {

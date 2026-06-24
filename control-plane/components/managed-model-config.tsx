@@ -62,6 +62,7 @@ export function ManagedModelConfig({ modelId }: { modelId: string }) {
       script_body: s("slurm_script_body"),
       serving_port: n("slurm_serving_port", 8000),
       health_path: s("slurm_health_path") || "/health",
+      min_replicas: n("slurm_min_replicas", 1),
       target_replicas: n("slurm_target_replicas", 2),
       max_job_failures: n("slurm_max_job_failures", 0),
       launcher_spec: data?.launcher_spec ?? null,
@@ -155,6 +156,10 @@ export function ManagedModelConfig({ modelId }: { modelId: string }) {
           <div className="space-y-1.5">
             <Label htmlFor="slurm_health_path">Health path</Label>
             <Input id="slurm_health_path" name="slurm_health_path" defaultValue={d.health_path} className="font-mono" />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="slurm_min_replicas">Min replicas</Label>
+            <Input id="slurm_min_replicas" name="slurm_min_replicas" defaultValue={String(d.min_replicas ?? 1)} />
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="slurm_target_replicas">Target replicas</Label>

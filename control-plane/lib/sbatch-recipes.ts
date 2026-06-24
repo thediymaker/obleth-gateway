@@ -31,6 +31,7 @@ export interface RecipeHeader {
   api_model_name: string;
   port: number;
   health_path?: string;
+  min_replicas?: number;
   target_replicas?: number;
   max_job_failures?: number;
   partition?: string;
@@ -76,6 +77,7 @@ const HeaderSchema = z
     api_model_name: z.string().min(1),
     port: z.coerce.number().int().positive(),
     health_path: z.string().optional(),
+    min_replicas: z.coerce.number().int().positive().optional(),
     target_replicas: z.coerce.number().int().positive().default(2),
     max_job_failures: z.coerce.number().int().nonnegative().default(3),
     partition: z.string().optional(),
@@ -291,6 +293,7 @@ export function buildManagedFromRecipe(
     ),
     serving_port: h.port,
     health_path: h.health_path?.trim() || defaultHealthPath(h.engine),
+    min_replicas: h.min_replicas ?? 1,
     target_replicas: targetReplicas,
     max_job_failures: h.max_job_failures ?? 3,
     launcher_spec: {

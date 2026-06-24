@@ -113,6 +113,16 @@ describe("buildManagedFromRecipe", () => {
     expect(() => buildManagedFromRecipe({ id: "x", valid: false, error: "bad", warnings: [] })).toThrow();
   });
 
+  it("carries min_replicas from the recipe header into the managed body", () => {
+    const p = buildManagedFromRecipe(parseRecipe("glm", file("min_replicas: 3")));
+    expect(p.managedBody.min_replicas).toBe(3);
+  });
+
+  it("defaults min_replicas to 1 when not set in the header", () => {
+    const p = buildManagedFromRecipe(parseRecipe("glm", file()));
+    expect(p.managedBody.min_replicas).toBe(1);
+  });
+
   it("escapes single quotes in chdir path", () => {
     const p = buildManagedFromRecipe(
       parseRecipe(

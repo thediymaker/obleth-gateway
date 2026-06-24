@@ -1617,6 +1617,15 @@ function coerceBool(v: unknown): boolean | undefined {
   return undefined;
 }
 
+export async function clearLostReplicasAction(modelId: string): Promise<ActionResult> {
+  await requireSession();
+  try { await obleth.clearLostReplicas(modelId); }
+  catch (e) { return actionError(e); }
+  updateTag(CACHE_TAGS.models);
+  revalidatePath("/models");
+  return { ok: true };
+}
+
 export async function saveTemplateAction(
   input: { id?: string; name: string; body: string },
 ): Promise<ActionResult> {

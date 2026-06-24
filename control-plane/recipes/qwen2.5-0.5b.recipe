@@ -18,4 +18,4 @@ max_job_failures: 0
 # wrap the launch in `apptainer exec`.
 # EDIT FOR YOUR CLUSTER: path to the Ollama Apptainer image.
 apptainer exec --nv /path/to/ollama.sif \
-  sh -c "OLLAMA_HOST=0.0.0.0:8000 ollama serve & sleep 5 && OLLAMA_HOST=0.0.0.0:8000 ollama pull qwen2.5:0.5b && wait"
+  sh -c "OLLAMA_HOST=0.0.0.0:${OBLETH_SERVING_PORT} ollama serve & sleep 5 && OLLAMA_HOST=0.0.0.0:${OBLETH_SERVING_PORT} ollama pull qwen2.5:0.5b && wait"
