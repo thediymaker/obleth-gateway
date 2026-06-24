@@ -887,8 +887,10 @@ pub fn normalize_capacity_mode(mode: &str) -> String {
 
 /// Fixed vocabulary of endpoint-selection modes. `failover` tries a model's
 /// endpoints in priority order; `load_balance` spreads requests across them by
-/// weight. Skipping unhealthy/disabled endpoints applies in both modes.
-pub const ENDPOINT_SELECTION_MODES: &[&str] = &["failover", "load_balance"];
+/// weight; `session_hash` pins a session to one endpoint (by a consistent hash
+/// of its session/user key) for cache warmth, with the rest kept for failover.
+/// Skipping unhealthy/disabled endpoints applies in all modes.
+pub const ENDPOINT_SELECTION_MODES: &[&str] = &["failover", "load_balance", "session_hash"];
 
 /// The default endpoint-selection mode assigned to a model when none is set.
 pub const DEFAULT_ENDPOINT_SELECTION_MODE: &str = "failover";
