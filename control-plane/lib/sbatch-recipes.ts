@@ -15,6 +15,13 @@ import { toRecipeCards } from "@/components/recipes/recipe-card";
 import { parseSbatchDirectives, type ParsedDirectives } from "./sbatch-directives";
 import type { PutManagedModel } from "./obleth";
 
+export interface RecipeVariable {
+  name: string;
+  label?: string;
+  default?: string;
+  required: boolean;
+}
+
 export interface RecipeHeader {
   name: string;
   description?: string;
@@ -35,6 +42,7 @@ export interface RecipeHeader {
   qos?: string;
   constraints?: string;
   exclude?: string;
+  variables?: RecipeVariable[];
 }
 
 export interface ParsedRecipe {
@@ -50,6 +58,13 @@ export interface ParsedRecipe {
 export function defaultHealthPath(engine: string): string {
   return engine === "ollama" ? "/" : "/health";
 }
+
+const VariableSchema = z.object({
+  name: z.string().regex(/^[a-zA-Z_][a-zA-Z0-9_]*$/, "invalid variable name"),
+  label: z.string().optional(),
+  default: z.string().optional(),
+  required: z.coerce.boolean().default(false),
+});
 
 const HeaderSchema = z
   .object({
@@ -72,6 +87,19 @@ const HeaderSchema = z
     qos: z.string().optional(),
     constraints: z.string().optional(),
     exclude: z.string().optional(),
+    variables: z
+      .array(VariableSchema)
+      .optional()
+      .superRefine((vars, ctx) => {
+        if (!vars) return;
+        const seen = new Set<string>();
+        for (const v of vars) {
+          if (seen.has(v.name)) {
+            ctx.addIssue({ code: z.ZodIssueCode.custom, message: `duplicate variable "${v.name}"` });
+          }
+          seen.add(v.name);
+        }
+      }),
   })
   .strip();
 
