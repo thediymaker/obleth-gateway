@@ -113,6 +113,39 @@ describe("buildManagedFromRecipe", () => {
     expect(() => buildManagedFromRecipe({ id: "x", valid: false, error: "bad", warnings: [] })).toThrow();
   });
 
+  it("uses overrides.script_body instead of recipe.body when set", () => {
+    const p = buildManagedFromRecipe(parseRecipe("glm", file()), {
+      script_body: "#!/bin/bash -l\n# OVERRIDE_MARKER\nllama-server --port 8000",
+    });
+    expect(p.managedBody.script_body).toContain("OVERRIDE_MARKER");
+    expect(p.managedBody.script_body).not.toContain("llama-server -hf repo:Q4");
+  });
+
+  it("still applies variable substitution to overrides.script_body", () => {
+    const recipe = parseRecipe(
+      "glm",
+      [
+        "---",
+        "name: GLM",
+        "engine: llamacpp",
+        "model_type: chat",
+        "api_model_name: glm-5.2",
+        "port: 8000",
+        "variables:",
+        "  - name: model",
+        "    default: /default.sif",
+        "---",
+        "original body {{model}}",
+      ].join("\n"),
+    );
+    const p = buildManagedFromRecipe(recipe, {
+      script_body: "#!/bin/bash -l\napptainer exec {{model}} serve",
+      variables: { model: "/custom.sif" },
+    });
+    expect(p.managedBody.script_body).toContain("/custom.sif");
+    expect(p.managedBody.script_body).not.toContain("{{model}}");
+  });
+
   it("carries min_replicas from the recipe header into the managed body", () => {
     const p = buildManagedFromRecipe(parseRecipe("glm", file("min_replicas: 3")));
     expect(p.managedBody.min_replicas).toBe(3);
@@ -151,6 +184,28 @@ describe("buildDeployPreview", () => {
       gres: "gpu:1",
     });
     expect(p?.scriptBody).toContain("llama-server -hf repo:Q4");
+  });
+
+  it("populates rawBody with the recipe's raw body (placeholders intact, not substituted)", () => {
+    const recipeText = [
+      "---",
+      "name: GLM",
+      "engine: llamacpp",
+      "model_type: chat",
+      "api_model_name: glm-5.2",
+      "port: 8000",
+      "variables:",
+      "  - name: model",
+      "    default: /default.sif",
+      "---",
+      "apptainer exec {{model}} serve",
+    ].join("\n");
+    const p = buildDeployPreview(parseRecipe("glm", recipeText));
+    // rawBody must contain the placeholder, not the substituted value
+    expect(p?.rawBody).toContain("{{model}}");
+    expect(p?.rawBody).not.toContain("/default.sif");
+    // scriptBody (preview) has the substituted value
+    expect(p?.scriptBody).toContain("/default.sif");
   });
 
   it("returns undefined for an invalid recipe", () => {

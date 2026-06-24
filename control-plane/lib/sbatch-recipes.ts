@@ -174,6 +174,30 @@ export function listRecipes(): ParsedRecipe[] {
   return out;
 }
 
+/** Raw text of every `*.recipe` file, paired with its id. Same ordering and
+ *  error-handling semantics as `listRecipes` — unreadable files are silently
+ *  skipped, never throws. */
+export function listRecipeDocs(): { id: string; text: string }[] {
+  const dir = recipesDir();
+  let entries: string[];
+  try {
+    if (!statSync(dir).isDirectory()) return [];
+    entries = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: { id: string; text: string }[] = [];
+  for (const name of entries.filter((f) => f.endsWith(".recipe")).sort()) {
+    const id = name.slice(0, -".recipe".length);
+    try {
+      out.push({ id, text: readFileSync(path.join(dir, name), "utf8") });
+    } catch {
+      // skip unreadable files; listRecipes already surfaces them as invalid entries
+    }
+  }
+  return out;
+}
+
 /** One recipe by id (filename stem), or null when no such `*.recipe` file. */
 export function getRecipe(id: string): ParsedRecipe | null {
   const full = path.join(recipesDir(), `${id}.recipe`);
@@ -194,6 +218,10 @@ export interface DeployOverrides {
   time_limit?: string;
   partition?: string;
   variables?: Record<string, string>;
+  /** When set, replaces the recipe's script body before variable substitution.
+   *  Carries a deploy-time edit (e.g. a fixed image path) through the normal
+   *  pipeline so variables and chdir still apply. */
+  script_body?: string;
 }
 
 export interface DeployPayload {
@@ -288,7 +316,7 @@ export function buildManagedFromRecipe(
     preamble: "",
     launch_command: "",
     script_body: applyChdir(
-      substituteVariables(recipe.body, h.variables, overrides.variables),
+      substituteVariables(overrides.script_body ?? recipe.body, h.variables, overrides.variables),
       d.chdir,
     ),
     serving_port: h.port,
@@ -346,6 +374,7 @@ export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | 
     exclude: m.exclude,
     logOutputDir: m.log_output_dir,
     scriptBody: m.script_body ?? "",
+    rawBody: recipe.body ?? "",
     warnings: recipe.warnings,
     variables: recipe.header.variables,
   };
@@ -356,9 +385,14 @@ export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | 
  *  (source:"db") fetched from the admin API. The DB fetch is wrapped in a
  *  try/catch so file templates always render even when the admin API is down. */
 export async function loadRecipeCards(): Promise<RecipeCard[]> {
-  const parsed = listRecipes();
+  const docs = listRecipeDocs();
+  const parsed = docs.map((d) => parseRecipe(d.id, d.text));
   const cards = toRecipeCards(parsed);
-  const fileCards = cards.map((c, i) => ({ ...c, preview: buildDeployPreview(parsed[i]), body: parsed[i].body }));
+  const fileCards = cards.map((c, i) => ({
+    ...c,
+    preview: buildDeployPreview(parsed[i]),
+    body: docs[i].text, // FULL raw document (---fenced), matching DB cards
+  }));
 
   let dbCards: RecipeCard[] = [];
   try {

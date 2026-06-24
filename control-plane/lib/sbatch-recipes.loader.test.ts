@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { listRecipes, getRecipe, loadRecipeCards } from "./sbatch-recipes";
+import { listRecipes, listRecipeDocs, getRecipe, loadRecipeCards } from "./sbatch-recipes";
 import { obleth } from "@/lib/obleth";
 
 vi.mock("@/lib/obleth", () => ({
@@ -74,6 +74,21 @@ describe("listRecipes / getRecipe", () => {
   });
 });
 
+describe("listRecipeDocs", () => {
+  it("returns raw text paired with id for each *.recipe file", () => {
+    writeFileSync(path.join(dir, "glm.recipe"), VALID);
+    const docs = listRecipeDocs();
+    expect(docs).toHaveLength(1);
+    expect(docs[0].id).toBe("glm");
+    expect(docs[0].text).toBe(VALID);
+  });
+
+  it("returns [] when the directory is absent", () => {
+    process.env.OBLETH_RECIPES_DIR = path.join(dir, "does-not-exist");
+    expect(listRecipeDocs()).toEqual([]);
+  });
+});
+
 describe("loadRecipeCards merge (file + DB)", () => {
   const DB_ROW_BODY = [
     "---",
@@ -105,6 +120,15 @@ describe("loadRecipeCards merge (file + DB)", () => {
     const fileCard = cards.find((c) => c.id === "glm");
     expect(fileCard?.source).toBe("file");
     expect(fileCard?.recipeId).toBeUndefined();
+  });
+
+  it("file card body is the full raw document (starts with ---), not just the script", async () => {
+    writeFileSync(path.join(dir, "glm.recipe"), VALID);
+    const cards = await loadRecipeCards();
+    const fileCard = cards.find((c) => c.id === "glm");
+    expect(fileCard?.body).toBeDefined();
+    expect(fileCard?.body?.startsWith("---")).toBe(true);
+    expect(fileCard?.body).toBe(VALID);
   });
 
   it("DB rows produce source:db cards with recipeId and a parsed preview", async () => {
