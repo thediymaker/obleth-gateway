@@ -114,7 +114,7 @@ async fn tick(
         // "pending" means the job was submitted but we haven't seen it Running yet;
         // once Slurm transitions the job to Running, the replica is still "pending"
         // (there is no separate MarkStarting step), so we must probe both states.
-        let mut health = HashMap::new();
+        let mut health: HashMap<uuid::Uuid, u16> = HashMap::new();
         for r in &replicas {
             if r.state == "starting" || r.state == "pending" {
                 if let Some(j) = jobs.get(&r.slurm_job_id) {
@@ -129,16 +129,31 @@ async fn tick(
                                 );
                             }
                             Some(node) => {
-                                let api_base = format!("http://{node}:{}", spec.serving_port);
-                                let ok = probe::is_healthy(http, &api_base, &spec.health_path, cfg.health_timeout_secs).await;
-                                tracing::info!(
-                                    replica_id = %r.id,
-                                    job_id = %r.slurm_job_id,
-                                    %api_base,
-                                    healthy = ok,
-                                    "health probe"
-                                );
-                                health.insert(r.id, ok);
+                                let mut found: Option<u16> = None;
+                                for p in r.port_base..(r.port_base + cfg.port_span) {
+                                    let api_base = format!("http://{node}:{p}");
+                                    if probe::is_healthy(http, &api_base, &spec.health_path, cfg.health_timeout_secs).await {
+                                        found = Some(p as u16);
+                                        break;
+                                    }
+                                }
+                                if let Some(p) = found {
+                                    tracing::info!(
+                                        replica_id = %r.id,
+                                        job_id = %r.slurm_job_id,
+                                        port = p,
+                                        "health probe: healthy"
+                                    );
+                                    health.insert(r.id, p);
+                                } else {
+                                    tracing::info!(
+                                        replica_id = %r.id,
+                                        job_id = %r.slurm_job_id,
+                                        port_base = r.port_base,
+                                        port_span = cfg.port_span,
+                                        "health probe: not yet healthy"
+                                    );
+                                }
                             }
                         }
                     }
@@ -146,13 +161,18 @@ async fn tick(
             }
         }
 
+        let live_port_bases: Vec<i64> = replicas.iter()
+            .filter(|r| r.state != "lost" && r.state != "draining")
+            .map(|r| r.port_base)
+            .collect();
+
         let view = plan::ManagedSpecView {
             target_replicas: spec.target_replicas,
             max_job_failures: spec.max_job_failures,
         };
-        let actions = plan::plan(&view, &replicas, &jobs, &health, spec.serving_port, cfg.lost_retention_secs);
+        let actions = plan::plan(&view, &replicas, &jobs, &health, cfg.lost_retention_secs);
         for action in &actions {
-            if let Err(e) = executor::apply(action, spec.model_id, &model_name, Some(spec), &cfg.job_name_prefix, slurm, obleth).await {
+            if let Err(e) = executor::apply(action, spec.model_id, &model_name, Some(spec), &cfg.job_name_prefix, cfg.port_span, &live_port_bases, slurm, obleth).await {
                 tracing::warn!(?action, error = %e, "action failed; continuing");
             }
         }
@@ -166,9 +186,9 @@ async fn tick(
         let model_name = obleth.model_name(model_id).await.unwrap_or_default();
         tracing::info!(%model_id, replicas = replicas.len(), "draining replicas for unmanaged model");
         let view = plan::ManagedSpecView { target_replicas: 0, max_job_failures: 0 };
-        let actions = plan::plan(&view, &replicas, &jobs, &HashMap::new(), 0, cfg.lost_retention_secs);
+        let actions = plan::plan(&view, &replicas, &jobs, &HashMap::new(), cfg.lost_retention_secs);
         for action in &actions {
-            if let Err(e) = executor::apply(action, model_id, &model_name, None, &cfg.job_name_prefix, slurm, obleth).await {
+            if let Err(e) = executor::apply(action, model_id, &model_name, None, &cfg.job_name_prefix, cfg.port_span, &[], slurm, obleth).await {
                 tracing::warn!(?action, error = %e, "drain action failed; continuing");
             }
         }

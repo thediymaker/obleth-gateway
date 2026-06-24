@@ -411,6 +411,7 @@ mod tests {
             serving_port: 8000,
             health_path: "/health".into(),
             target_replicas: 2,
+            min_replicas: 1,
             max_job_failures: 0,
             launcher_spec: None,
             created_at: chrono::Utc::now(),
