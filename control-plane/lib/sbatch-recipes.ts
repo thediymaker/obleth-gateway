@@ -216,26 +216,28 @@ function overrideString(override: string | undefined, recipeValue: string | unde
   return trimmed === "" ? undefined : trimmed;
 }
 
-/** Replace declared {{name}} tokens with their resolved values. Only declared
- *  names are touched; undeclared {{...}} and all shell ${...}/$(...) pass through.
- *  Throws when a required variable has neither a submitted value nor a default. */
+/** Replace declared {{name}} tokens with their resolved values in a single pass.
+ *  Only declared names are touched; undeclared {{...}} and all shell ${...}/$(...)
+ *  pass through, and substituted text is never re-scanned. Throws when a required
+ *  variable has neither a submitted value nor a default. */
 function substituteVariables(
   body: string,
   declared: RecipeVariable[] | undefined,
   values: Record<string, string> | undefined,
 ): string {
   if (!declared || declared.length === 0) return body;
-  let out = body;
+  const resolved = new Map<string, string>();
   for (const v of declared) {
-    const submitted = values?.[v.name]?.trim();
-    const resolved = submitted || v.default;
-    if (resolved === undefined || resolved === "") {
+    const value = values?.[v.name]?.trim() || v.default;
+    if (value === undefined || value === "") {
       if (v.required) throw new Error(`required variable "${v.name}" has no value`);
-      continue; // optional + unset: leave the token in place
+      continue; // optional + unset: leave the {{token}} in place
     }
-    out = out.split(`{{${v.name}}}`).join(resolved);
+    resolved.set(v.name, value);
   }
-  return out;
+  return body.replace(/\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}/g, (match, name) =>
+    resolved.has(name) ? (resolved.get(name) as string) : match,
+  );
 }
 
 /** If the recipe declares --chdir, guard the script with a `cd` after the shebang. */

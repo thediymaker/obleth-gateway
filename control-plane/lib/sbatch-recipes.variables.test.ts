@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseRecipe } from "./sbatch-recipes";
+import { parseRecipe, buildManagedFromRecipe } from "./sbatch-recipes";
 
 const withVars = (varsYaml: string) =>
   [
@@ -55,8 +55,6 @@ describe("recipe variables parsing", () => {
   });
 });
 
-import { buildManagedFromRecipe } from "./sbatch-recipes";
-
 const recipeWithBody = (body: string) =>
   parseRecipe(
     "t",
@@ -87,5 +85,26 @@ describe("recipe variable substitution", () => {
   it("throws when a required variable has no value and no default", () => {
     const r = recipeWithBody("run {{tag}}");
     expect(() => buildManagedFromRecipe(r, { variables: {} })).toThrow(/required/i);
+  });
+
+  it("does not re-expand a substituted value that contains another token", () => {
+    const r = recipeWithBody("run {{image}} {{tag}}");
+    const p = buildManagedFromRecipe(r, { variables: { image: "/x {{tag}}", tag: "q4" } });
+    // {{tag}} inside the image value must stay literal, not become q4
+    expect(p.managedBody.script_body).toContain("run /x {{tag}} q4");
+  });
+
+  it("leaves an optional variable's token in place when unset and undefaulted", () => {
+    const r = parseRecipe(
+      "t",
+      [
+        "---", "name: T", "engine: ollama", "model_type: chat",
+        "api_model_name: m", "port: 8000",
+        "variables:", "  - name: opt",
+        "---", "run {{opt}}",
+      ].join("\n"),
+    );
+    const p = buildManagedFromRecipe(r, { variables: {} });
+    expect(p.managedBody.script_body).toContain("run {{opt}}");
   });
 });
