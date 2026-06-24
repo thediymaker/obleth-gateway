@@ -170,6 +170,18 @@ function RecipeStatus({ recipe }: { recipe: RecipeCard }) {
   );
 }
 
+/** Split a `---`-fenced recipe document into its frontmatter and script body.
+ *  Mirrors the server splitter; kept inline so this client file never imports
+ *  the fs-touching loader. */
+function splitDoc(text: string): { header: string; body: string } | null {
+  const norm = text.replace(/\r\n/g, "\n");
+  if (!norm.startsWith("---\n")) return null;
+  const m = norm.slice(4).match(/\n---(?:\n|$)/);
+  if (!m || m.index === undefined) return null;
+  const fenceStart = 4 + m.index;
+  return { header: norm.slice(4, fenceStart), body: norm.slice(fenceStart + m[0].length) };
+}
+
 export function RecipeList({
   recipes,
   onDeployed,
@@ -181,6 +193,7 @@ export function RecipeList({
   const [selected, setSelected] = useState<RecipeCard | null>(null);
   const [overrides, setOverrides] = useState({ qos: "", partition: "", timeLimit: "", replicas: "" });
   const [vars, setVars] = useState<Record<string, string>>({});
+  const [scriptDraft, setScriptDraft] = useState("");
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
 
@@ -237,6 +250,17 @@ export function RecipeList({
     const seeded: Record<string, string> = {};
     for (const v of recipe.preview?.variables ?? []) seeded[v.name] = v.default ?? "";
     setVars(seeded);
+    setScriptDraft(recipe.preview?.rawBody ?? "");
+  }
+
+  function saveAsTemplate() {
+    if (!selected) return;
+    const split = selected.body ? splitDoc(selected.body) : null;
+    const header = split ? split.header : "";
+    const doc = `---\n${header}\n---\n${scriptDraft}`;
+    setSelected(null);
+    setEditorInitial({ name: `${selected.name ?? selected.id} (copy)`, body: doc });
+    setEditorOpen(true);
   }
 
   function confirmDeploy() {
@@ -252,6 +276,7 @@ export function RecipeList({
         time_limit: overrides.timeLimit,
         partition: overrides.partition,
         variables: vars,
+        script_body: scriptDraft,
       });
       if (res.ok) {
         setSelected(null);
@@ -590,16 +615,22 @@ export function RecipeList({
                         <p className="mt-0.5 text-xs text-muted-foreground">
                           Body submitted to slurmrestd as shown; placement comes from the fields on the
                           left (slurmrestd ignores <code className="font-mono">#SBATCH</code> lines).
+                          Edits here apply to this launch; declared variables are still substituted.
                         </p>
                       </div>
                       <Badge className="gap-1.5 bg-background text-[10px]">
                         <Clock className="h-3 w-3" />
-                        {scriptLineCount(preview.scriptBody)} lines
+                        {scriptLineCount(scriptDraft)} lines
                       </Badge>
                     </div>
-                    <pre className="mt-3 max-h-[42vh] overflow-auto rounded-lg border border-border/70 bg-background/70 p-4 font-mono text-xs leading-relaxed shadow-inner">
-                      {preview.scriptBody}
-                    </pre>
+                    <textarea
+                      value={scriptDraft}
+                      onChange={(e) => setScriptDraft(e.target.value)}
+                      disabled={pending}
+                      spellCheck={false}
+                      rows={18}
+                      className="mt-3 w-full resize-y rounded-lg border border-border/70 bg-background/70 p-4 font-mono text-xs leading-relaxed shadow-inner focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50"
+                    />
                   </section>
                 </div>
               </div>
@@ -607,6 +638,9 @@ export function RecipeList({
               <DialogFooter className="border-t border-border/70 bg-background/35 px-6 py-3">
                 <Button type="button" variant="ghost" onClick={() => setSelected(null)} disabled={pending}>
                   Cancel
+                </Button>
+                <Button type="button" variant="outline" onClick={saveAsTemplate} disabled={pending}>
+                  Save as template
                 </Button>
                 <Button type="button" onClick={confirmDeploy} disabled={pending}>
                   <Rocket className="h-4 w-4" />
