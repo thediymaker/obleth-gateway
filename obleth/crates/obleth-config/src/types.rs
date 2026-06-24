@@ -549,6 +549,8 @@ pub struct ManagedModelSpec {
     pub serving_port: i64,
     pub health_path: String,
     pub target_replicas: i64,
+    #[serde(default = "default_min_replicas")]
+    pub min_replicas: i64,
     /// Stop resubmitting when this many lost replicas are visible (0 = no limit).
     pub max_job_failures: i64,
     /// Serialized launcher panel state (backend id + knob values + envelope) used to
@@ -558,6 +560,9 @@ pub struct ManagedModelSpec {
     pub launcher_spec: Option<serde_json::Value>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+fn default_min_replicas() -> i64 {
+    1
 }
 
 /// One known Slurm-backed replica of a managed model. Stored in `model_replicas`.
@@ -574,6 +579,8 @@ pub struct ModelReplica {
     /// One of: pending, starting, healthy, draining, lost.
     pub state: String,
     pub last_message: Option<String>,
+    #[serde(default)]
+    pub port_base: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }

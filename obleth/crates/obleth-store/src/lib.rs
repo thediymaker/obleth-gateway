@@ -103,6 +103,7 @@ pub struct UpsertManagedModel {
     pub serving_port: i64,
     pub health_path: String,
     pub target_replicas: i64,
+    pub min_replicas: i64,
     pub max_job_failures: i64,
     pub launcher_spec: Option<serde_json::Value>,
 }
@@ -1576,7 +1577,7 @@ impl Store {
             "select model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
              qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
              script_body, serving_port, \
-             health_path, target_replicas, max_job_failures, launcher_spec, created_at, updated_at \
+             health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, created_at, updated_at \
              from managed_models where model_id = $1",
         )
         .bind(model_id)
@@ -1590,7 +1591,7 @@ impl Store {
             "select model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
              qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
              script_body, serving_port, \
-             health_path, target_replicas, max_job_failures, launcher_spec, created_at, updated_at \
+             health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, created_at, updated_at \
              from managed_models order by model_id",
         )
         .fetch_all(&self.pool)
@@ -1604,8 +1605,8 @@ impl Store {
                 (model_id, enabled, partition, gres, nodes, constraints, exclude,
                  account, qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir,
                  launch_command, script_body,
-                 serving_port, health_path, target_replicas, max_job_failures, launcher_spec)
-             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22)
+                 serving_port, health_path, target_replicas, min_replicas, max_job_failures, launcher_spec)
+             values ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23)
              on conflict (model_id) do update set
                 enabled = excluded.enabled, partition = excluded.partition,
                 gres = excluded.gres, nodes = excluded.nodes,
@@ -1617,12 +1618,13 @@ impl Store {
                 launch_command = excluded.launch_command, script_body = excluded.script_body,
                 serving_port = excluded.serving_port, health_path = excluded.health_path,
                 target_replicas = excluded.target_replicas,
+                min_replicas = excluded.min_replicas,
                 max_job_failures = excluded.max_job_failures,
                 launcher_spec = excluded.launcher_spec, updated_at = now()
              returning model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
              qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
              script_body, serving_port, \
-             health_path, target_replicas, max_job_failures, launcher_spec, created_at, updated_at",
+             health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, created_at, updated_at",
         )
         .bind(m.model_id)
         .bind(m.enabled)
@@ -1644,6 +1646,7 @@ impl Store {
         .bind(m.serving_port)
         .bind(&m.health_path)
         .bind(m.target_replicas.max(1))
+        .bind(m.min_replicas.max(1))
         .bind(m.max_job_failures.max(0))
         .bind(m.launcher_spec.as_ref().map(sqlx::types::Json))
         .fetch_one(&self.pool)
@@ -1697,19 +1700,25 @@ impl Store {
         Ok(())
     }
 
-    pub async fn create_replica(&self, model_id: Uuid, slurm_job_id: &str) -> Result<ModelReplica> {
+    pub async fn create_replica(
+        &self,
+        model_id: Uuid,
+        slurm_job_id: &str,
+        port_base: Option<i64>,
+    ) -> Result<ModelReplica> {
         // Idempotent: a retried insert for the same (model_id, slurm_job_id)
         // returns the existing row instead of erroring on the unique index.
         let row = sqlx::query(
-            "insert into model_replicas (id, model_id, slurm_job_id)
-             values ($1, $2, $3)
+            "insert into model_replicas (id, model_id, slurm_job_id, port_base)
+             values ($1, $2, $3, $4)
              on conflict (model_id, slurm_job_id) do update set updated_at = now()
              returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                       last_message, created_at, updated_at",
+                       last_message, port_base, created_at, updated_at",
         )
         .bind(Uuid::new_v4())
         .bind(model_id)
         .bind(slurm_job_id)
+        .bind(port_base)
         .fetch_one(&self.pool)
         .await?;
         replica_from_row(&row)
@@ -1718,7 +1727,7 @@ impl Store {
     pub async fn list_replicas(&self, model_id: Uuid) -> Result<Vec<ModelReplica>> {
         let rows = sqlx::query(
             "select id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                    last_message, created_at, updated_at
+                    last_message, port_base, created_at, updated_at
              from model_replicas where model_id = $1 order by created_at",
         )
         .bind(model_id)
@@ -1730,7 +1739,7 @@ impl Store {
     pub async fn all_replicas(&self) -> Result<Vec<ModelReplica>> {
         let rows = sqlx::query(
             "select id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                    last_message, created_at, updated_at
+                    last_message, port_base, created_at, updated_at
              from model_replicas order by model_id, created_at",
         )
         .fetch_all(&self.pool)
@@ -1748,7 +1757,7 @@ impl Store {
             "update model_replicas set state = $2, last_message = $3, updated_at = now()
              where id = $1
              returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                       last_message, created_at, updated_at",
+                       last_message, port_base, created_at, updated_at",
         )
         .bind(id)
         .bind(state)
@@ -1775,7 +1784,7 @@ impl Store {
                     endpoint_id = coalesce($3, endpoint_id), updated_at = now()
              where id = $1
              returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                       last_message, created_at, updated_at",
+                       last_message, port_base, created_at, updated_at",
         )
         .bind(id)
         .bind(nodes)
@@ -1790,7 +1799,7 @@ impl Store {
     pub async fn get_replica(&self, id: Uuid) -> Result<Option<ModelReplica>> {
         let row = sqlx::query(
             "select id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                    last_message, created_at, updated_at
+                    last_message, port_base, created_at, updated_at
              from model_replicas where id = $1",
         )
         .bind(id)
@@ -1805,6 +1814,12 @@ impl Store {
             .execute(&self.pool)
             .await?;
         Ok(())
+    }
+
+    pub async fn delete_lost_replicas(&self, model_id: Uuid) -> Result<u64> {
+        let r = sqlx::query("delete from model_replicas where model_id = $1 and state = 'lost'")
+            .bind(model_id).execute(&self.pool).await?;
+        Ok(r.rows_affected())
     }
 
     /// Record the outcome of a per-endpoint health check. Mirrors
@@ -2732,6 +2747,7 @@ fn managed_model_from_row(row: &PgRow) -> Result<ManagedModelSpec> {
         serving_port: row.try_get("serving_port")?,
         health_path: row.try_get("health_path")?,
         target_replicas: row.try_get("target_replicas")?,
+        min_replicas: row.try_get("min_replicas")?,
         max_job_failures: row.try_get("max_job_failures")?,
         launcher_spec: launcher_spec.map(|j| j.0),
         created_at: row.try_get("created_at")?,
@@ -2748,6 +2764,7 @@ fn replica_from_row(row: &PgRow) -> Result<ModelReplica> {
         endpoint_id: row.try_get("endpoint_id")?,
         state: row.try_get("state")?,
         last_message: row.try_get("last_message")?,
+        port_base: row.try_get("port_base")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -3226,12 +3243,14 @@ mod tests {
                 serving_port: 8000,
                 health_path: "/health".into(),
                 target_replicas: 2,
+                min_replicas: 1,
                 max_job_failures: 0,
                 launcher_spec: Some(serde_json::json!({"backendId":"llamacpp"})),
             })
             .await
             .expect("upsert");
         assert_eq!(spec.target_replicas, 2);
+        assert_eq!(spec.min_replicas, 1);
         assert_eq!(spec.partition, "gpu-preempt");
         assert_eq!(spec.launcher_spec, Some(serde_json::json!({"backendId":"llamacpp"})));
 
@@ -3268,7 +3287,7 @@ mod tests {
             .expect("create model");
 
         let r = store
-            .create_replica(model.id, "job-123")
+            .create_replica(model.id, "job-123", None)
             .await
             .expect("create replica");
         assert_eq!(r.state, "pending");
@@ -3277,7 +3296,7 @@ mod tests {
         // Idempotent: re-creating the same (model_id, slurm_job_id) returns the
         // same row rather than spawning a duplicate.
         let again = store
-            .create_replica(model.id, "job-123")
+            .create_replica(model.id, "job-123", None)
             .await
             .expect("create replica again");
         assert_eq!(again.id, r.id, "duplicate create must return the same row");
@@ -3412,5 +3431,57 @@ mod tests {
             );
             assert_ne!(stored_jwt, settings.slurm_jwt);
         }
+    }
+
+    #[tokio::test]
+    async fn delete_lost_replicas_test() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        let model_name = format!("m-{}", Uuid::new_v4());
+        let args = default_test_model(&model_name);
+        let model = store
+            .create_model(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
+                &args.19, &args.20, &args.21,
+            )
+            .await
+            .expect("create model");
+
+        // Insert two replicas.
+        let r1 = store
+            .create_replica(model.id, "job-loss-1", None)
+            .await
+            .expect("create replica 1");
+        let r2 = store
+            .create_replica(model.id, "job-loss-2", None)
+            .await
+            .expect("create replica 2");
+
+        // Mark one as lost.
+        store
+            .update_replica_state(r1.id, "lost", Some("node gone"))
+            .await
+            .expect("mark lost");
+
+        // delete_lost_replicas must remove only the lost one.
+        let deleted = store
+            .delete_lost_replicas(model.id)
+            .await
+            .expect("delete_lost_replicas");
+        assert_eq!(deleted, 1, "exactly one lost replica deleted");
+
+        let remaining = store.list_replicas(model.id).await.expect("list");
+        assert_eq!(remaining.len(), 1, "one replica remains");
+        assert_eq!(remaining[0].id, r2.id, "the non-lost replica survives");
+
+        // Clean up.
+        store.delete_replica(r2.id).await.expect("delete r2");
     }
 }

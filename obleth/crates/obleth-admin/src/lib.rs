@@ -709,6 +709,8 @@ pub(crate) struct PutManagedModel {
     health_path: String,
     #[serde(default = "two")]
     target_replicas: i64,
+    #[serde(default = "one")]
+    min_replicas: i64,
     #[serde(default)]
     max_job_failures: i64,
     #[serde(default)]
@@ -3235,6 +3237,7 @@ async fn put_managed_model(
             serving_port: body.serving_port,
             health_path: body.health_path,
             target_replicas: body.target_replicas,
+            min_replicas: body.min_replicas,
             max_job_failures: body.max_job_failures,
             launcher_spec: body.launcher_spec,
         })
@@ -3297,7 +3300,7 @@ async fn create_replica(
     Path(id): Path<Uuid>,
     Json(body): Json<CreateReplica>,
 ) -> Result<Json<ModelReplica>> {
-    let r = state.store.create_replica(id, &body.slurm_job_id).await?;
+    let r = state.store.create_replica(id, &body.slurm_job_id, None).await?;
     state
         .store
         .record_audit(
