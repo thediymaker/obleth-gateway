@@ -54,6 +54,7 @@ pub struct ReplicaView {
     pub state: String, // pending|starting|healthy|draining|lost
     pub endpoint_id: Option<Uuid>,
     pub age_secs: i64, // now - created_at, for GC + cancel ordering
+    pub port_base: i64,
 }
 
 /// Live, version-agnostic snapshot of what the configured Slurm cluster offers.

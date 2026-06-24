@@ -14,6 +14,7 @@ pub struct ProvisionerConfig {
     pub interval_secs: u64,
     pub health_timeout_secs: u64,
     pub lost_retention_secs: i64,
+    pub port_span: i64,
     /// Job-name prefix used to tag and later find this gateway's jobs.
     pub job_name_prefix: String,
 }
@@ -32,6 +33,7 @@ impl ProvisionerConfig {
             interval_secs: opt("OBLETH_PROVISIONER_INTERVAL_SECS", "15").parse()?,
             health_timeout_secs: opt("OBLETH_PROVISIONER_HEALTH_TIMEOUT_SECS", "5").parse()?,
             lost_retention_secs: opt("OBLETH_PROVISIONER_LOST_RETENTION_SECS", "900").parse()?,
+            port_span: opt("OBLETH_PORT_SPAN", "8").parse()?,
             job_name_prefix: opt("OBLETH_PROVISIONER_JOB_PREFIX", "obleth-"),
         })
     }
