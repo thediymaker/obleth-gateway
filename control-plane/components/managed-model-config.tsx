@@ -82,6 +82,10 @@ export function ManagedModelConfig({ modelId }: { modelId: string }) {
   if (isLoading || !data) return null;
   const d = data;
 
+  const isRecipe =
+    (d.launcher_spec as { source?: string } | null)?.source === "recipe" ||
+    (!!d.script_body && d.script_body.trim() !== "");
+
   return (
     <form onSubmit={onSubmit} className="space-y-5">
       <div>
@@ -163,32 +167,43 @@ export function ManagedModelConfig({ modelId }: { modelId: string }) {
         </div>
       </div>
 
-      <details className="rounded-md border border-border/70 bg-background/35 p-3">
-        <summary className="cursor-pointer text-sm text-muted-foreground">Advanced</summary>
-        <div className="mt-3 grid gap-3 sm:grid-cols-2">
-          <div className="space-y-1.5">
-            <Label htmlFor="slurm_image">Apptainer image</Label>
-            <Input id="slurm_image" name="slurm_image" defaultValue={d.image ?? ""} className="font-mono" />
+      {!isRecipe && (
+        <details className="rounded-md border border-border/70 bg-background/35 p-3">
+          <summary className="cursor-pointer text-sm text-muted-foreground">Advanced</summary>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="slurm_image">Apptainer image</Label>
+              <Input id="slurm_image" name="slurm_image" defaultValue={d.image ?? ""} className="font-mono" />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="slurm_log_output_dir">Log output dir</Label>
+              <Input id="slurm_log_output_dir" name="slurm_log_output_dir" defaultValue={d.log_output_dir ?? ""} className="font-mono" />
+            </div>
+            <div className="space-y-1.5 sm:col-span-2">
+              <Label htmlFor="slurm_preamble">Extra preamble</Label>
+              <textarea
+                id="slurm_preamble"
+                name="slurm_preamble"
+                defaultValue={d.preamble ?? ""}
+                rows={3}
+                className="w-full rounded-md border border-border bg-background p-2 font-mono text-xs"
+              />
+            </div>
+            <input type="hidden" name="slurm_launch_command" value={d.launch_command ?? ""} readOnly />
           </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="slurm_log_output_dir">Log output dir</Label>
-            <Input id="slurm_log_output_dir" name="slurm_log_output_dir" defaultValue={d.log_output_dir ?? ""} className="font-mono" />
-          </div>
-          <div className="space-y-1.5 sm:col-span-2">
-            <Label htmlFor="slurm_preamble">Extra preamble</Label>
-            <textarea
-              id="slurm_preamble"
-              name="slurm_preamble"
-              defaultValue={d.preamble ?? ""}
-              rows={3}
-              className="w-full rounded-md border border-border bg-background p-2 font-mono text-xs"
-            />
-          </div>
-          <input type="hidden" name="slurm_launch_command" value={d.launch_command ?? ""} readOnly />
-        </div>
-      </details>
+        </details>
+      )}
 
       {msg && <p className="text-sm text-muted-foreground">{msg}</p>}
+
+      {isRecipe && (
+        <>
+          <input type="hidden" name="slurm_image" value={d.image ?? ""} readOnly />
+          <input type="hidden" name="slurm_preamble" value={d.preamble ?? ""} readOnly />
+          <input type="hidden" name="slurm_log_output_dir" value={d.log_output_dir ?? ""} readOnly />
+          <input type="hidden" name="slurm_launch_command" value={d.launch_command ?? ""} readOnly />
+        </>
+      )}
 
       <div className="flex gap-2">
         <Button type="submit">Save</Button>
