@@ -43,6 +43,7 @@ export interface RecipeCard {
   preview?: RecipeDeployPreview;
   source: "file" | "db";
   recipeId?: string; // DB row id, when source === "db"
+  body?: string; // raw recipe text, for pre-filling Edit / Clone-to-edit
 }
 
 export function toRecipeCards(parsed: ParsedRecipe[]): RecipeCard[] {

@@ -6,16 +6,21 @@ import {
   CheckCircle2,
   ChevronRight,
   Clock,
+  Copy,
   Cpu,
   FileText,
   HardDrive,
   Layers,
+  Pencil,
+  Plus,
   Rocket,
   Server,
   SlidersHorizontal,
   Terminal,
+  Trash2,
 } from "lucide-react";
-import { deployRecipeAction } from "@/app/actions";
+import { deployRecipeAction, deleteTemplateAction } from "@/app/actions";
+import { TemplateEditor } from "./template-editor";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
@@ -165,6 +170,44 @@ export function RecipeList({
   const [pending, startTransition] = useTransition();
   const [error, setError] = useState<string | null>(null);
 
+  // Template editor state
+  const [editorOpen, setEditorOpen] = useState(false);
+  const [editorInitial, setEditorInitial] = useState<{ id?: string; name: string; body: string } | undefined>(
+    undefined,
+  );
+  const [deletePending, startDeleteTransition] = useTransition();
+
+  function openNewEditor() {
+    setEditorInitial(undefined);
+    setEditorOpen(true);
+  }
+
+  function openEditEditor(recipe: RecipeCard) {
+    setEditorInitial({
+      id: recipe.recipeId,
+      name: recipe.name ?? recipe.id,
+      body: recipe.body ?? "",
+    });
+    setEditorOpen(true);
+  }
+
+  function openCloneEditor(recipe: RecipeCard) {
+    setEditorInitial({
+      // no id — Save will create a new DB row
+      name: `${recipe.name ?? recipe.id} (copy)`,
+      body: recipe.body ?? "",
+    });
+    setEditorOpen(true);
+  }
+
+  function handleDelete(recipe: RecipeCard) {
+    const id = recipe.recipeId;
+    if (!id) return;
+    startDeleteTransition(async () => {
+      await deleteTemplateAction(id);
+    });
+  }
+
   // Open a recipe and seed the editable override fields from its deploy preview.
   function openRecipe(recipe: RecipeCard) {
     setError(null);
@@ -206,14 +249,28 @@ export function RecipeList({
 
   if (recipes.length === 0) {
     return (
-      <div className="rounded-lg border border-dashed border-border/70 bg-background/30 px-6 py-10 text-center">
-        <FileText className="mx-auto h-8 w-8 text-muted-foreground/70" />
-        <p className="mt-3 text-sm font-medium">No recipes found</p>
-        <p className="mx-auto mt-1 max-w-md text-sm leading-relaxed text-muted-foreground">
-          Drop a <code className="rounded bg-secondary px-1 py-0.5 text-xs">*.recipe</code> file into
-          the recipes directory, then refresh this page.
-        </p>
-      </div>
+      <>
+        <div className="flex justify-end">
+          <Button type="button" size="sm" variant="outline" onClick={openNewEditor} className="gap-1.5">
+            <Plus className="h-3.5 w-3.5" />
+            New template
+          </Button>
+        </div>
+        <div className="rounded-lg border border-dashed border-border/70 bg-background/30 px-6 py-10 text-center">
+          <FileText className="mx-auto h-8 w-8 text-muted-foreground/70" />
+          <p className="mt-3 text-sm font-medium">No recipes found</p>
+          <p className="mx-auto mt-1 max-w-md text-sm leading-relaxed text-muted-foreground">
+            Drop a <code className="rounded bg-secondary px-1 py-0.5 text-xs">*.recipe</code> file into
+            the recipes directory, or create a template above.
+          </p>
+        </div>
+        <TemplateEditor
+          open={editorOpen}
+          onOpenChange={setEditorOpen}
+          initial={editorInitial}
+          onSaved={() => onDeployed?.()}
+        />
+      </>
     );
   }
 
@@ -221,6 +278,12 @@ export function RecipeList({
 
   return (
     <>
+      <div className="flex justify-end mb-3">
+        <Button type="button" size="sm" variant="outline" onClick={openNewEditor} className="gap-1.5">
+          <Plus className="h-3.5 w-3.5" />
+          New template
+        </Button>
+      </div>
       <div className="overflow-hidden rounded-lg border border-border/70 bg-card/45">
         <div className="hidden grid-cols-[minmax(0,1fr)_8.5rem_8rem_minmax(14rem,0.7fr)_2.75rem] border-b border-border/70 bg-background/35 px-4 py-2.5 text-xs font-medium text-muted-foreground md:grid">
           <div>Recipe</div>
@@ -238,27 +301,43 @@ export function RecipeList({
               : recipe.targetReplicas
                 ? plural(recipe.targetReplicas, "replica")
                 : "Not set";
+            const isDb = recipe.source === "db";
 
             return (
-              <button
+              <div
                 key={recipe.id}
-                type="button"
-                disabled={!deployable}
-                onClick={() => openRecipe(recipe)}
                 className={cn(
-                  "group grid w-full gap-3 px-4 py-4 text-left transition-colors md:grid-cols-[minmax(0,1fr)_8.5rem_8rem_minmax(14rem,0.7fr)_2.75rem] md:items-center",
-                  deployable
-                    ? "bg-card/30 hover:bg-muted/20 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                    : "cursor-not-allowed bg-background/30 opacity-75",
+                  "group relative grid gap-3 px-4 py-4 md:grid-cols-[minmax(0,1fr)_8.5rem_8rem_minmax(14rem,0.7fr)_auto] md:items-center",
+                  deployable ? "bg-card/30" : "bg-background/30 opacity-75",
                 )}
-                aria-label={`Deploy recipe ${recipe.name ?? recipe.id}`}
               >
-                <div className="min-w-0">
+                {/* Main clickable area — spans most columns */}
+                <button
+                  type="button"
+                  disabled={!deployable}
+                  onClick={() => openRecipe(recipe)}
+                  className={cn(
+                    "absolute inset-0 text-left transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring focus-visible:ring-inset",
+                    deployable ? "hover:bg-muted/20 cursor-pointer" : "cursor-not-allowed",
+                  )}
+                  aria-label={`Deploy recipe ${recipe.name ?? recipe.id}`}
+                />
+
+                {/* Content — positioned above the invisible button */}
+                <div className="relative min-w-0 pointer-events-none">
                   <div className="flex min-w-0 flex-wrap items-center gap-2">
                     <span className="truncate text-sm font-semibold" title={recipe.name ?? recipe.id}>
                       {recipe.name ?? recipe.id}
                     </span>
                     <RecipeStatus recipe={recipe} />
+                    <Badge className={cn(
+                      "text-[10px] border",
+                      isDb
+                        ? "border-blue-500/30 bg-blue-500/10 text-blue-300"
+                        : "border-border/60 bg-background/60 text-muted-foreground",
+                    )}>
+                      {isDb ? "Custom" : "File"}
+                    </Badge>
                   </div>
                   {meta && (
                     <p className="mt-1 truncate font-mono text-[11px] text-muted-foreground" title={meta}>
@@ -281,14 +360,14 @@ export function RecipeList({
                   </div>
                 </div>
 
-                <div className="hidden min-w-0 md:block">
+                <div className="relative hidden min-w-0 pointer-events-none md:block">
                   <p className="truncate text-sm font-medium" title={recipe.engine || "Not set"}>
                     {recipe.engine || "Not set"}
                   </p>
                   {recipe.modelType && <p className="mt-0.5 text-[11px] text-muted-foreground">{recipe.modelType}</p>}
                 </div>
 
-                <div className="hidden min-w-0 md:block">
+                <div className="relative hidden min-w-0 pointer-events-none md:block">
                   <p className="text-sm font-medium tabular-nums">{replicaLabel}</p>
                   {recipe.preview && (
                     <p className="mt-0.5 text-[11px] text-muted-foreground">
@@ -297,23 +376,52 @@ export function RecipeList({
                   )}
                 </div>
 
-                <div className="hidden min-w-0 md:block">
+                <div className="relative hidden min-w-0 pointer-events-none md:block">
                   <p className="truncate text-sm text-muted-foreground" title={shortPlacement(recipe.preview)}>
                     {shortPlacement(recipe.preview)}
                   </p>
                 </div>
 
-                <div className="hidden justify-end md:flex">
-                  <span
-                    className={cn(
-                      "flex h-8 w-8 items-center justify-center rounded-md border border-border/70 bg-background/45 text-muted-foreground transition-colors",
-                      deployable && "group-hover:border-border group-hover:text-foreground",
-                    )}
-                  >
-                    <ChevronRight className="h-4 w-4" />
-                  </span>
+                {/* Per-card action buttons — above the invisible deploy button */}
+                <div className="relative hidden items-center justify-end gap-1 md:flex">
+                  {isDb ? (
+                    <>
+                      <button
+                        type="button"
+                        title="Edit template"
+                        onClick={() => openEditEditor(recipe)}
+                        disabled={deletePending}
+                        className="flex h-7 w-7 items-center justify-center rounded-md border border-border/70 bg-background/45 text-muted-foreground transition-colors hover:border-border hover:text-foreground disabled:opacity-50"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        title="Delete template"
+                        onClick={() => handleDelete(recipe)}
+                        disabled={deletePending}
+                        className="flex h-7 w-7 items-center justify-center rounded-md border border-destructive/40 bg-background/45 text-destructive/70 transition-colors hover:border-destructive hover:text-destructive disabled:opacity-50"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      type="button"
+                      title="Clone to edit"
+                      onClick={() => openCloneEditor(recipe)}
+                      className="flex h-7 w-7 items-center justify-center rounded-md border border-border/70 bg-background/45 text-muted-foreground transition-colors hover:border-border hover:text-foreground"
+                    >
+                      <Copy className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                  {deployable && (
+                    <span className="flex h-7 w-7 items-center justify-center rounded-md border border-border/70 bg-background/45 text-muted-foreground transition-colors group-hover:border-border group-hover:text-foreground pointer-events-none">
+                      <ChevronRight className="h-4 w-4" />
+                    </span>
+                  )}
                 </div>
-              </button>
+              </div>
             );
           })}
         </div>
@@ -492,6 +600,13 @@ export function RecipeList({
           )}
         </DialogContent>
       </Dialog>
+
+      <TemplateEditor
+        open={editorOpen}
+        onOpenChange={setEditorOpen}
+        initial={editorInitial}
+        onSaved={() => onDeployed?.()}
+      />
     </>
   );
 }

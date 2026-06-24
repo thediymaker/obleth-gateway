@@ -20,7 +20,7 @@ import type {
   SlurmHealthView,
 } from "@/lib/obleth";
 import { requireSession } from "@/lib/auth/session";
-import { getRecipe, buildManagedFromRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
+import { getRecipe, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
 
@@ -1615,6 +1615,33 @@ function coerceBool(v: unknown): boolean | undefined {
   if (v === "true") return true;
   if (v === "false") return false;
   return undefined;
+}
+
+export async function saveTemplateAction(
+  input: { id?: string; name: string; body: string },
+): Promise<ActionResult> {
+  await requireSession();
+  const parsed = parseRecipe(input.id ?? "new", input.body);
+  if (!parsed.valid) return { ok: false, error: parsed.error ?? "invalid recipe" };
+  try {
+    if (input.id) await obleth.updateRecipe(input.id, { name: input.name, body: input.body });
+    else await obleth.createRecipe({ name: input.name, body: input.body });
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/recipes");
+  return { ok: true };
+}
+
+export async function deleteTemplateAction(id: string): Promise<ActionResult> {
+  await requireSession();
+  try {
+    await obleth.deleteRecipe(id);
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/recipes");
+  return { ok: true };
 }
 
 export async function deployRecipeAction(

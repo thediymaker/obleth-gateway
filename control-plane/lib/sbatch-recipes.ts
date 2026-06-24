@@ -355,7 +355,7 @@ export function buildDeployPreview(recipe: ParsedRecipe): RecipeDeployPreview | 
 export async function loadRecipeCards(): Promise<RecipeCard[]> {
   const parsed = listRecipes();
   const cards = toRecipeCards(parsed);
-  const fileCards = cards.map((c, i) => ({ ...c, preview: buildDeployPreview(parsed[i]) }));
+  const fileCards = cards.map((c, i) => ({ ...c, preview: buildDeployPreview(parsed[i]), body: parsed[i].body }));
 
   let dbCards: RecipeCard[] = [];
   try {
@@ -369,6 +369,7 @@ export async function loadRecipeCards(): Promise<RecipeCard[]> {
         recipeId: row.id,
         name: card.name ?? row.name,
         preview: buildDeployPreview(parsedRecipe),
+        body: row.body,
       };
     });
   } catch {
