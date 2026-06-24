@@ -2011,6 +2011,7 @@ function ReliabilityPanel({
               >
                 <option value="failover">failover (priority order)</option>
                 <option value="load_balance">load_balance (weighted)</option>
+                <option value="session_hash">session_hash (sticky by session)</option>
               </select>
             </div>
           </div>
