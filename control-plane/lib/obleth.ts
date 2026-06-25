@@ -160,6 +160,8 @@ export interface ManagedModelSpec {
   target_replicas: number;
   max_job_failures: number;
   launcher_spec?: Record<string, unknown> | null;
+  last_provision_error?: string | null;
+  last_provision_error_at?: string | null;
   created_at: string;
   updated_at: string;
 }

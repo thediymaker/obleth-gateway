@@ -57,6 +57,7 @@ import { ChartShell, axisTick, chartGrid, compactAxis, tip, timeCursor } from "@
 import { ModelMetricsDetail } from "@/components/model-metrics-detail";
 import { ManagedModelConfig } from "@/components/managed-model-config";
 import { ReplicaPanel } from "@/components/replica-panel";
+import { ProvisionErrorBanner } from "@/components/provision-error-banner";
 import { Badge } from "@/components/ui/badge";
 import { Button, buttonVariants } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -1268,7 +1269,10 @@ function ModelDetailPanel({
             <div className="min-h-0 lg:overflow-y-auto lg:pr-1">
               <ManagedModelConfig modelId={model.id} />
             </div>
-            <ReplicaPanel modelId={model.id} />
+            <div className="space-y-3">
+              <ProvisionErrorBanner modelId={model.id} />
+              <ReplicaPanel modelId={model.id} />
+            </div>
           </div>
         </TabsContent>
       )}
