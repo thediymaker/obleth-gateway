@@ -198,6 +198,26 @@ export function getRecipe(id: string): ParsedRecipe | null {
   }
 }
 
+/** Resolve a recipe by id across both sources, mirroring `loadRecipeCards`:
+ *  file recipes (filename stem) first, then DB templates (UUID id) fetched from
+ *  the admin API. Saved templates live only in the database, so callers that
+ *  deploy by id (e.g. `deployRecipeAction`) must use this rather than `getRecipe`
+ *  alone — otherwise a DB recipe's UUID never matches a `*.recipe` file and the
+ *  deploy fails with "recipe not found". Returns null when neither source has it
+ *  (the DB lookup is wrapped so an unreachable admin API yields null, not throw). */
+export async function resolveRecipeById(id: string): Promise<ParsedRecipe | null> {
+  const fileRecipe = getRecipe(id);
+  if (fileRecipe) return fileRecipe;
+  try {
+    const rows = await obleth.listRecipes();
+    const row = rows.find((r) => r.id === id);
+    if (row) return parseRecipe(row.id, row.body);
+  } catch {
+    // admin API unavailable — fall through to null
+  }
+  return null;
+}
+
 export interface DeployOverrides {
   api_model_name?: string;
   target_replicas?: number;
@@ -394,7 +414,10 @@ export async function loadRecipeCards(): Promise<RecipeCard[]> {
         ...card,
         source: "db" as const,
         recipeId: row.id,
-        name: card.name ?? row.name,
+        // The saved Template name (row.name) is what the operator typed in the
+        // editor and expects to see; it wins over the recipe's frontmatter
+        // `name:`. Fall back to the frontmatter name only if the row name is blank.
+        name: row.name || card.name,
         preview: buildDeployPreview(parsedRecipe),
         body: row.body,
       };

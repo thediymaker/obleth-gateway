@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useTransition, type ComponentType, type ReactNode } from "react";
+import { useRouter } from "next/navigation";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -178,6 +179,7 @@ export function RecipeList({
   recipes: RecipeCard[];
   onDeployed?: () => void;
 }) {
+  const router = useRouter();
   const cluster = useClusterResources();
   const [selected, setSelected] = useState<RecipeCard | null>(null);
   const [overrides, setOverrides] = useState({ qos: "", partition: "", timeLimit: "", replicas: "" });
@@ -196,6 +198,14 @@ export function RecipeList({
   function openNewEditor() {
     setEditorInitial(undefined);
     setEditorOpen(true);
+  }
+
+  // A template save is NOT a deploy: keep the surrounding add-model wizard open
+  // and just refresh the server-provided recipe cards so the new/edited template
+  // appears in the list, ready to select and deploy. (The TemplateEditor closes
+  // itself on success.) Calling onDeployed here would tear down the whole wizard.
+  function handleTemplateSaved() {
+    router.refresh();
   }
 
   function openEditEditor(recipe: RecipeCard) {
@@ -300,7 +310,7 @@ export function RecipeList({
           open={editorOpen}
           onOpenChange={setEditorOpen}
           initial={editorInitial}
-          onSaved={() => onDeployed?.()}
+          onSaved={handleTemplateSaved}
         />
       </>
     );
@@ -648,7 +658,7 @@ export function RecipeList({
         open={editorOpen}
         onOpenChange={setEditorOpen}
         initial={editorInitial}
-        onSaved={() => onDeployed?.()}
+        onSaved={handleTemplateSaved}
       />
     </>
   );
