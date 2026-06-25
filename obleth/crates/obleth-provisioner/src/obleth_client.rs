@@ -132,8 +132,12 @@ impl OblethClient for HttpObleth {
         let v: serde_json::Value = self
             .req(reqwest::Method::POST, &format!("/models/{model_id}/replicas"))
             .json(&serde_json::json!({ "slurm_job_id": slurm_job_id, "port_base": port_base }))
-            .send().await?.json().await?;
-        Ok(v.get("id").and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).unwrap_or_default())
+            .send().await?.error_for_status()?.json().await?;
+        // A successful POST must return a parseable id. Returning a nil UUID on a
+        // missing/unparseable id (the old `unwrap_or_default`) silently strands
+        // the caller with an invalid reference, so surface it as an error instead.
+        v.get("id").and_then(|x| x.as_str()).and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("create_replica: response missing a valid id: {v}"))
     }
 
     async fn patch_replica(
@@ -160,8 +164,12 @@ impl OblethClient for HttpObleth {
         let v: serde_json::Value = self
             .req(reqwest::Method::POST, &format!("/models/{model_id}/endpoints"))
             .json(&serde_json::json!({ "name": name, "api_base": api_base, "enabled": true }))
-            .send().await?.json().await?;
-        Ok(v.get("id").and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).unwrap_or_default())
+            .send().await?.error_for_status()?.json().await?;
+        // Must return a parseable id; a nil fallback would be written onto the
+        // replica as endpoint_id and fail the subsequent patch with an FK error,
+        // stranding the replica as a phantom "healthy" with no endpoint.
+        v.get("id").and_then(|x| x.as_str()).and_then(|s| s.parse().ok())
+            .ok_or_else(|| anyhow::anyhow!("create_endpoint: response missing a valid id: {v}"))
     }
 
     async fn list_endpoints(&self, model_id: Uuid) -> anyhow::Result<Vec<(Uuid, String)>> {
