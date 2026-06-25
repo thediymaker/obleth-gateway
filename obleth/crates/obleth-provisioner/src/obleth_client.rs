@@ -26,6 +26,9 @@ pub trait OblethClient: Send + Sync {
     /// List this model's endpoints as (endpoint_id, name) pairs.
     async fn list_endpoints(&self, model_id: Uuid) -> anyhow::Result<Vec<(Uuid, String)>>;
     async fn delete_endpoint(&self, model_id: Uuid, endpoint_id: Uuid) -> anyhow::Result<()>;
+    /// Record (or clear with `None`) the provisioner's last submit error for a
+    /// model, so the dashboard can show it.
+    async fn set_provision_error(&self, model_id: Uuid, error: Option<&str>) -> anyhow::Result<()>;
 }
 
 /// Map a JSON array of replica rows (`ModelReplica`) into `ReplicaView`s. Rows
@@ -62,6 +65,7 @@ fn replica_views_from_json(rows: &serde_json::Value) -> Vec<ReplicaView> {
             endpoint_id: r.get("endpoint_id").and_then(|x| x.as_str()).and_then(|s| s.parse().ok()),
             age_secs: (now - created).num_seconds(),
             port_base: r.get("port_base").and_then(|x| x.as_i64()).unwrap_or(0),
+            last_message: r.get("last_message").and_then(|x| x.as_str()).map(str::to_string),
         });
     }
     out
@@ -178,6 +182,13 @@ impl OblethClient for HttpObleth {
             .send().await?.error_for_status()?;
         Ok(())
     }
+
+    async fn set_provision_error(&self, model_id: Uuid, error: Option<&str>) -> anyhow::Result<()> {
+        self.req(reqwest::Method::PATCH, &format!("/models/{model_id}/managed/provision-error"))
+            .json(&serde_json::json!({ "error": error }))
+            .send().await?.error_for_status()?;
+        Ok(())
+    }
 }
 
 /// In-memory fake for executor/loop tests — no network. Records every mutating
@@ -193,6 +204,7 @@ pub struct MockObleth {
     pub deleted_endpoints: std::sync::Mutex<Vec<Uuid>>,
     pub deleted_replicas: std::sync::Mutex<Vec<Uuid>>,
     pub patched: std::sync::Mutex<Vec<(Uuid, Option<String>)>>, // (replica_id, state)
+    pub provision_errors: std::sync::Mutex<Vec<(Uuid, Option<String>)>>,
     /// When set, `create_replica` returns an error — drives the compensating
     /// "cancel the orphan job" path in the Submit executor.
     pub fail_create_replica: std::sync::atomic::AtomicBool,
@@ -242,6 +254,10 @@ impl OblethClient for MockObleth {
     }
     async fn delete_endpoint(&self, _model_id: Uuid, endpoint_id: Uuid) -> anyhow::Result<()> {
         self.deleted_endpoints.lock().unwrap().push(endpoint_id);
+        Ok(())
+    }
+    async fn set_provision_error(&self, model_id: Uuid, error: Option<&str>) -> anyhow::Result<()> {
+        self.provision_errors.lock().unwrap().push((model_id, error.map(str::to_string)));
         Ok(())
     }
 }

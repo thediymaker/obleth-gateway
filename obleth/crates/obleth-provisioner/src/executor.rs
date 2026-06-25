@@ -112,7 +112,7 @@ mod tests {
             let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.submitted.lock().unwrap().push(job.clone());
             let job_id = format!("job-{id}");
-            self.jobs.lock().unwrap().push(JobInfo { job_id: job_id.clone(), state: JobState::Pending, nodes: vec![] });
+            self.jobs.lock().unwrap().push(JobInfo { job_id: job_id.clone(), state: JobState::Pending, nodes: vec![], raw_state: "PENDING".into(), reason: None });
             Ok(job_id)
         }
         async fn cancel(&self, job_id: &str) -> anyhow::Result<()> {
@@ -149,6 +149,8 @@ mod tests {
             min_replicas: 1,
             max_job_failures: 0,
             launcher_spec: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

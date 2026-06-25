@@ -173,6 +173,8 @@ struct JobRecord {
     job_state: serde_json::Value,
     #[serde(default)]
     nodes: String,
+    #[serde(default)]
+    state_reason: serde_json::Value,
 }
 
 fn job_id_to_string(v: &serde_json::Value) -> String {
@@ -203,10 +205,14 @@ fn parse_job(body: &[u8]) -> Option<JobInfo> {
     if job_id.is_empty() {
         return None;
     }
+    let raw_state = job_state_to_string(&j.job_state);
+    let reason = j.state_reason.as_str().map(str::to_string).filter(|r| !r.is_empty());
     Some(JobInfo {
         job_id,
-        state: map_job_state(&job_state_to_string(&j.job_state)),
+        state: map_job_state(&raw_state),
         nodes: expand_nodelist(&j.nodes),
+        raw_state,
+        reason,
     })
 }
 
@@ -216,6 +222,17 @@ pub fn map_job_state(s: &str) -> JobState {
         "PENDING" | "CONFIGURING" | "SUSPENDED" => JobState::Pending,
         "RUNNING" | "COMPLETING" => JobState::Running,
         _ => JobState::Gone, // COMPLETED/FAILED/CANCELLED/PREEMPTED/TIMEOUT/NODE_FAIL/...
+    }
+}
+
+/// Human status line for a replica's Slurm job, e.g. "PENDING — Resources" or
+/// "RUNNING". A missing or "None" reason collapses to just the state.
+pub fn job_status_message(raw_state: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(r) if !r.trim().is_empty() && !r.eq_ignore_ascii_case("none") => {
+            format!("{raw_state} — {r}")
+        }
+        _ => raw_state.to_string(),
     }
 }
 
@@ -467,6 +484,8 @@ mod tests {
             min_replicas: 1,
             max_job_failures: 0,
             launcher_spec: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -579,14 +598,22 @@ mod tests {
     }
 
     #[test]
+    fn job_status_message_formats_state_and_reason() {
+        assert_eq!(job_status_message("PENDING", Some("Resources")), "PENDING — Resources");
+        assert_eq!(job_status_message("RUNNING", None), "RUNNING");
+        assert_eq!(job_status_message("RUNNING", Some("None")), "RUNNING");
+        assert_eq!(job_status_message("PENDING", Some("  ")), "PENDING");
+    }
+
+    #[test]
     fn parse_job_tolerates_int_id_and_array_state() {
         let body = serde_json::to_vec(&serde_json::json!({ "jobs": [
-            { "job_id": 123, "job_state": ["RUNNING"], "nodes": "gpu01" },
+            { "job_id": 123, "job_state": ["PENDING"], "nodes": "", "state_reason": "Resources" },
         ] })).unwrap();
         let j = parse_job(&body).expect("job");
         assert_eq!(j.job_id, "123");
-        assert_eq!(j.state, JobState::Running);
-        assert_eq!(j.nodes, vec!["gpu01"]);
+        assert_eq!(j.raw_state, "PENDING");
+        assert_eq!(j.reason.as_deref(), Some("Resources"));
     }
 
     #[test]

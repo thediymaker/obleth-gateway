@@ -119,10 +119,10 @@ mod tests {
     use super::*;
 
     fn rv(state: &str, job: &str, ep: Option<Uuid>, age: i64) -> ReplicaView {
-        ReplicaView { id: Uuid::new_v4(), model_id: Uuid::new_v4(), slurm_job_id: job.into(), state: state.into(), endpoint_id: ep, age_secs: age, port_base: 0 }
+        ReplicaView { id: Uuid::new_v4(), model_id: Uuid::new_v4(), slurm_job_id: job.into(), state: state.into(), endpoint_id: ep, age_secs: age, port_base: 0, last_message: None }
     }
     fn job(id: &str, st: JobState, nodes: &[&str]) -> (String, JobInfo) {
-        (id.into(), JobInfo { job_id: id.into(), state: st, nodes: nodes.iter().map(|s| s.to_string()).collect() })
+        (id.into(), JobInfo { job_id: id.into(), state: st, nodes: nodes.iter().map(|s| s.to_string()).collect(), raw_state: String::new(), reason: None })
     }
     fn spec(target: i64) -> ManagedSpecView { ManagedSpecView { target_replicas: target, max_job_failures: 0 } }
     fn spec_with_limit(target: i64, limit: i64) -> ManagedSpecView { ManagedSpecView { target_replicas: target, max_job_failures: limit } }
