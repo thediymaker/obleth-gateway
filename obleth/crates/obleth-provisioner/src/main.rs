@@ -106,6 +106,23 @@ async fn tick(
         }
     }
 
+    // Annotate each replica with its live Slurm status so the dashboard shows why
+    // a job is pending or what state it is in. Only non-terminal jobs (terminal
+    // ones get the planner's MarkLost message) and only when the message changed,
+    // so we don't write every tick.
+    for r in &all_replicas {
+        if let Some(job) = jobs.get(&r.slurm_job_id) {
+            if matches!(job.state, domain::JobState::Pending | domain::JobState::Running) {
+                let msg = slurm::job_status_message(&job.raw_state, job.reason.as_deref());
+                if r.last_message.as_deref() != Some(msg.as_str()) {
+                    if let Err(e) = obleth.patch_replica(r.id, None, None, None, Some(&msg)).await {
+                        tracing::warn!(replica_id = %r.id, error = %e, "failed to annotate replica status");
+                    }
+                }
+            }
+        }
+    }
+
     // Group every known replica by model so we can both reconcile the enabled
     // models and drain whatever rows belong to models that have left the set.
     let mut by_model: HashMap<uuid::Uuid, Vec<domain::ReplicaView>> = HashMap::new();
