@@ -558,6 +558,12 @@ pub struct ManagedModelSpec {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub launcher_spec: Option<serde_json::Value>,
+    /// Last provisioner submit failure (e.g. a Slurm account/partition rejection).
+    /// `None` once a submit succeeds. Drives the dashboard's provisioning banner.
+    #[serde(default)]
+    pub last_provision_error: Option<String>,
+    #[serde(default)]
+    pub last_provision_error_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
