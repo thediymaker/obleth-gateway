@@ -3349,22 +3349,29 @@ async fn patch_replica(
     Path(id): Path<Uuid>,
     Json(body): Json<PatchReplica>,
 ) -> Result<Json<ModelReplica>> {
+    // Validate up front so an invalid state can't partially apply runtime changes.
     if let Some(state_val) = body.state.as_deref() {
         if !obleth_config::REPLICA_STATES.contains(&state_val) {
             return Err(AdminError::BadRequest("invalid replica state".into()));
         }
+    }
+    // Apply runtime (nodes/endpoint) BEFORE flipping state. If linking the
+    // endpoint fails (e.g. an invalid endpoint_id), we must not have already
+    // marked the replica healthy — that would strand it as "healthy" with no
+    // endpoint, which the planner never re-promotes.
+    if body.nodes.is_some() || body.endpoint_id.is_some() {
+        state
+            .store
+            .set_replica_runtime(id, body.nodes.as_deref(), body.endpoint_id)
+            .await?;
+    }
+    if let Some(state_val) = body.state.as_deref() {
         state
             .store
             .update_replica_state(id, state_val, body.message.as_deref())
             .await?;
     } else if let Some(msg) = body.message.as_deref() {
         state.store.set_replica_message(id, msg).await?;
-    }
-    if body.nodes.is_some() || body.endpoint_id.is_some() {
-        state
-            .store
-            .set_replica_runtime(id, body.nodes.as_deref(), body.endpoint_id)
-            .await?;
     }
     let current = state
         .store
