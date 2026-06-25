@@ -621,6 +621,10 @@ export interface SlurmSettingsView {
   slurm_user: string;
   jwt_set: boolean;
   jwt_last4: string | null;
+  // Seconds since the provisioner last polled, or null if never seen since the
+  // gateway started. provisioner_running is true within the freshness window.
+  provisioner_last_seen_secs: number | null;
+  provisioner_running: boolean;
 }
 
 export interface UpdateSlurmSettings {

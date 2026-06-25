@@ -38,6 +38,10 @@ const BUDGET_PREFIX: &str = "obleth:budget:";
 const TERM_USAGE_PREFIX: &str = "obleth:term_usage:";
 const CACHE_PREFIX: &str = "obleth:cache:";
 const INVALIDATE_CHANNEL: &str = "obleth:invalidate";
+/// Single shared key holding the provisioner's last-seen epoch seconds. Shared
+/// via Redis (not per-pod memory) so the dashboard reads a consistent value no
+/// matter which gateway pod served the provisioner's poll vs. the settings read.
+const PROVISIONER_HEARTBEAT_KEY: &str = "obleth:provisioner:heartbeat";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RedisError {
@@ -96,6 +100,26 @@ impl RedisStore {
     }
     fn term_usage_key(tenant: &Uuid) -> String {
         format!("{TERM_USAGE_PREFIX}{tenant}")
+    }
+
+    /// Record the provisioner heartbeat: the given epoch seconds, kept for
+    /// `ttl_secs` then expired. Stored in Redis so any gateway pod can read a
+    /// consistent value (the provisioner's poll and the dashboard's read may land
+    /// on different pods behind a Service).
+    pub async fn set_provisioner_heartbeat(&self, epoch_secs: i64, ttl_secs: u64) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let _: () = conn
+            .set_ex(PROVISIONER_HEARTBEAT_KEY, epoch_secs, ttl_secs)
+            .await?;
+        Ok(())
+    }
+
+    /// The provisioner's last-seen epoch seconds, or `None` when it hasn't polled
+    /// within the heartbeat TTL (key expired) or has never polled.
+    pub async fn get_provisioner_heartbeat(&self) -> Result<Option<i64>> {
+        let mut conn = self.conn.clone();
+        let v: Option<i64> = conn.get(PROVISIONER_HEARTBEAT_KEY).await?;
+        Ok(v)
     }
 
     /// Hot-path lookup of a resolved key by its hash.

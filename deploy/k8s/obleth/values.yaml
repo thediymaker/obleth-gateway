@@ -2,6 +2,7 @@ image:
   obleth: ghcr.io/thediymaker/obleth-gateway/obleth
   benchmarkBackend: ghcr.io/thediymaker/obleth-gateway/benchmark-backend
   controlPlane: ghcr.io/thediymaker/obleth-gateway/control-plane
+  provisioner: ghcr.io/thediymaker/obleth-gateway/obleth-provisioner
   # Empty -> v{appVersion} from Chart.yaml, so each chart release pins its own
   # images. Override to test a specific tag (e.g. "main" for edge builds).
   tag: ""
@@ -179,6 +180,21 @@ benchmarkBackend:
   ttftMs: 20
   tokenMs: 3
   concurrency: 256
+
+# Optional Slurm provisioner plugin. Off by default — enable only when serving
+# models on a Slurm cluster. It keeps enabled managed models at their target
+# replica count via slurmrestd. slurmrestd connection details and the master
+# enable switch are configured at runtime in the dashboard (Settings -> Slurm),
+# not here; this only controls whether the reconciler process is deployed.
+# Runs as a singleton (replicas:1, Recreate) — do not scale it.
+provisioner:
+  enabled: false
+  # Reconcile cadence. Lower = faster reaction, more slurmrestd/API traffic.
+  intervalSecs: 15
+  logLevel: "info,obleth_provisioner=debug"
+  resources:
+    requests: { cpu: "50m", memory: "64Mi" }
+    limits: { cpu: "500m", memory: "256Mi" }
 
 controlPlane:
   enabled: true

@@ -775,6 +775,15 @@ export function CharoSettingsForm({ settings }: { settings: CharoSettingsView | 
   );
 }
 
+/** Human-readable "time ago" for the provisioner's last-seen heartbeat. */
+function formatLastSeen(secs: number | null): string {
+  if (secs == null) return "never";
+  if (secs < 0) return "just now";
+  if (secs < 60) return `${secs}s ago`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+  return `${Math.floor(secs / 3600)}h ago`;
+}
+
 export function SlurmSettingsForm({ settings }: { settings: SlurmSettingsView | null }) {
   const [pending, start] = useTransition();
   const [testing, startTest] = useTransition();
@@ -847,6 +856,42 @@ export function SlurmSettingsForm({ settings }: { settings: SlurmSettingsView | 
           />
           Enable Slurm provisioning
         </label>
+
+        {settings?.enabled && (
+          <div
+            className={
+              settings.provisioner_running
+                ? "flex items-start gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
+                : "flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:text-amber-400"
+            }
+          >
+            <span
+              className={
+                settings.provisioner_running
+                  ? "mt-1 inline-block h-2 w-2 shrink-0 rounded-full bg-emerald-500"
+                  : "mt-1 inline-block h-2 w-2 shrink-0 rounded-full bg-amber-500"
+              }
+            />
+            <span>
+              {settings.provisioner_running ? (
+                <>
+                  <span className="font-medium">Provisioner running</span> — last polled{" "}
+                  {formatLastSeen(settings.provisioner_last_seen_secs)}.
+                </>
+              ) : (
+                <>
+                  <span className="font-medium">Provisioner not detected</span>{" "}
+                  (last polled {formatLastSeen(settings.provisioner_last_seen_secs)}). Enabling
+                  Slurm only stores these connection details — the separate{" "}
+                  <code>obleth-provisioner</code> process must be running for replicas to launch.
+                  In Kubernetes set <code>provisioner.enabled=true</code>; in Docker add{" "}
+                  <code>slurm</code> to <code>COMPOSE_PROFILES</code>.
+                </>
+              )}
+            </span>
+          </div>
+        )}
+
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-1.5">
             <Label htmlFor="slurmrestd_url">slurmrestd URL</Label>

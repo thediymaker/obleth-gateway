@@ -27,7 +27,7 @@ jobs:
     needs: verify
     strategy:
       matrix:
-        component: [obleth, control-plane, benchmark-backend]
+        component: [obleth, obleth-provisioner, control-plane, benchmark-backend]
         # Native runners for both arches — never QEMU (Rust under emulation
         # takes 30-60 min per image).
         runner: [ubuntu-latest, ubuntu-24.04-arm]
@@ -37,6 +37,10 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: arm64
           - component: obleth
+            context: .
+          # The provisioner Dockerfile expects the repo root as its build context
+          # (same as obleth) so it can COPY schema/ and obleth/.
+          - component: obleth-provisioner
             context: .
           - component: control-plane
             context: ./control-plane
@@ -76,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        component: [obleth, control-plane, benchmark-backend]
+        component: [obleth, obleth-provisioner, control-plane, benchmark-backend]
     steps:
       - uses: docker/login-action@v3
         with:

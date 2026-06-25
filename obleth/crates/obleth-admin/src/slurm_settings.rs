@@ -29,6 +29,13 @@ pub struct SlurmSettingsView {
     pub slurm_user: String,
     pub jwt_set: bool,
     pub jwt_last4: Option<String>,
+    /// Seconds since the provisioner last polled the gateway, or null if it has
+    /// not been seen since this gateway process started. The provisioner is a
+    /// separate plugin process — when it isn't running, Slurm can be "enabled"
+    /// here yet nothing ever launches, so the dashboard surfaces this.
+    pub provisioner_last_seen_secs: Option<i64>,
+    /// True when the provisioner has polled within the freshness window.
+    pub provisioner_running: bool,
 }
 
 impl SlurmSettingsView {
@@ -46,8 +53,33 @@ impl SlurmSettingsView {
             slurm_user: s.slurm_user.clone(),
             jwt_set: !jwt.is_empty(),
             jwt_last4,
+            // Filled in by the GET handler, which has the heartbeat; the masked
+            // view itself only knows the persisted settings.
+            provisioner_last_seen_secs: None,
+            provisioner_running: false,
         }
     }
+}
+
+/// How recently the provisioner must have polled to count as "running". The
+/// provisioner polls every `OBLETH_PROVISIONER_INTERVAL_SECS` (default 15s);
+/// this window allows several missed ticks before we report it as down.
+const PROVISIONER_FRESH_SECS: i64 = 60;
+
+/// TTL for the stored heartbeat. Longer than the freshness window so the
+/// dashboard can still show "last polled 5m ago" for a recently-stopped
+/// provisioner, while a truly-gone one eventually drops to "never".
+const PROVISIONER_HEARTBEAT_TTL_SECS: u64 = 3600;
+
+/// Derive the provisioner status from its last-seen heartbeat. Returns
+/// `(seconds_since_last_seen, running)`. A non-positive `last_seen` epoch means
+/// "never seen since startup" → `(None, false)`.
+fn provisioner_status(last_seen: i64, now: i64, fresh_secs: i64) -> (Option<i64>, bool) {
+    if last_seen <= 0 {
+        return (None, false);
+    }
+    let secs = now - last_seen;
+    (Some(secs), secs <= fresh_secs)
 }
 
 /// Update payload. `slurm_jwt` is write-only: omit/empty to keep the stored JWT,
@@ -199,7 +231,21 @@ pub async fn get_slurm_settings(
     State(state): State<AdminState>,
 ) -> Result<Json<SlurmSettingsView>> {
     let settings = state.store.get_slurm_settings().await?.unwrap_or_default();
-    Ok(Json(SlurmSettingsView::from_settings(&settings)))
+    let mut view = SlurmSettingsView::from_settings(&settings);
+    // Best-effort: a Redis hiccup shouldn't fail the settings page, just leave
+    // the status unknown (rendered as "never"/"not detected").
+    let last_seen = state
+        .redis
+        .get_provisioner_heartbeat()
+        .await
+        .ok()
+        .flatten()
+        .unwrap_or(0);
+    let (secs, running) =
+        provisioner_status(last_seen, Utc::now().timestamp(), PROVISIONER_FRESH_SECS);
+    view.provisioner_last_seen_secs = secs;
+    view.provisioner_running = running;
+    Ok(Json(view))
 }
 
 #[utoipa::path(
@@ -310,6 +356,18 @@ pub async fn get_slurm_settings_resolved(
     // Provisioner-facing: returns the decrypted JWT in full. Still behind the
     // admin token, which already grants full read/write — so this exposes nothing
     // a holder couldn't otherwise obtain; it just keeps the UI GET secret-free.
+    //
+    // This route is hit only by the provisioner, once per reconcile tick, so we
+    // treat each call as a heartbeat: record the time so the dashboard can show
+    // whether the provisioner process is actually running. Best-effort — a Redis
+    // error must not stop the provisioner from fetching its settings.
+    if let Err(e) = state
+        .redis
+        .set_provisioner_heartbeat(Utc::now().timestamp(), PROVISIONER_HEARTBEAT_TTL_SECS)
+        .await
+    {
+        tracing::warn!(error = %e, "failed to record provisioner heartbeat");
+    }
     let settings = state.store.get_slurm_settings().await?.unwrap_or_default();
     Ok(Json(settings))
 }
@@ -372,5 +430,35 @@ mod tests {
         assert!(h.set);
         assert!(!h.expired);
         assert!(h.expires_in_secs.unwrap() > 0);
+    }
+
+    #[test]
+    fn provisioner_never_seen_is_not_running() {
+        let (secs, running) = provisioner_status(0, 1_000, 60);
+        assert_eq!(secs, None);
+        assert!(!running);
+    }
+
+    #[test]
+    fn provisioner_seen_recently_is_running() {
+        // last seen 10s ago, 60s window -> running
+        let (secs, running) = provisioner_status(990, 1_000, 60);
+        assert_eq!(secs, Some(10));
+        assert!(running);
+    }
+
+    #[test]
+    fn provisioner_stale_is_not_running() {
+        // last seen 120s ago, 60s window -> seen but not running
+        let (secs, running) = provisioner_status(880, 1_000, 60);
+        assert_eq!(secs, Some(120));
+        assert!(!running);
+    }
+
+    #[test]
+    fn provisioner_exactly_at_window_is_running() {
+        let (secs, running) = provisioner_status(940, 1_000, 60);
+        assert_eq!(secs, Some(60));
+        assert!(running);
     }
 }

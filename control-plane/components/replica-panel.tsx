@@ -56,7 +56,9 @@ export function ReplicaPanel({ modelId }: { modelId: string }) {
       <CardContent className="min-h-0 flex flex-1 flex-col">
         {replicas.length === 0 ? (
           <p className="text-sm text-muted-foreground">
-            No replicas. Enable provisioning to launch some.
+            No replicas yet. The Slurm provisioner launches them on its next tick.
+            If none appear, confirm the provisioner is running under{" "}
+            <span className="font-medium">Settings → Slurm provisioning</span>.
           </p>
         ) : (
           <div className="min-h-0 flex-1 overflow-y-auto max-h-[calc(100dvh-22rem)] lg:max-h-none">
