@@ -1,0 +1,21 @@
+---
+name: Deploy Ollama
+description: "Serve any Ollama model from an Apptainer image (sample: Qwen2.5 0.5B). Edit the image path and api_model_name for your cluster/model."
+engine: ollama
+model_type: chat
+api_model_name: qwen2.5:0.5b
+port: 8000
+health_path: /api/tags
+target_replicas: 1
+max_job_failures: 0
+---
+#!/bin/bash -l
+# Partition / QoS / time limit are set at deploy (Deploy overrides) — left out
+# here so the recipe stays cluster-agnostic.
+#SBATCH --nodes=1
+#SBATCH --output=logs/qwen2.5-0.5b-%j.out
+# Recipes submit this script verbatim; ollama lives in the apptainer image, so
+# wrap the launch in `apptainer exec`.
+# EDIT FOR YOUR CLUSTER: path to the Ollama Apptainer image.
+apptainer exec --nv /path/to/ollama.sif \
+  sh -c "OLLAMA_HOST=0.0.0.0:${OBLETH_SERVING_PORT} ollama serve & sleep 5 && OLLAMA_HOST=0.0.0.0:${OBLETH_SERVING_PORT} ollama pull qwen2.5:0.5b && wait"

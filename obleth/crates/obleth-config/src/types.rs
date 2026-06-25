@@ -549,6 +549,8 @@ pub struct ManagedModelSpec {
     pub serving_port: i64,
     pub health_path: String,
     pub target_replicas: i64,
+    #[serde(default = "default_min_replicas")]
+    pub min_replicas: i64,
     /// Stop resubmitting when this many lost replicas are visible (0 = no limit).
     pub max_job_failures: i64,
     /// Serialized launcher panel state (backend id + knob values + envelope) used to
@@ -558,6 +560,9 @@ pub struct ManagedModelSpec {
     pub launcher_spec: Option<serde_json::Value>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+fn default_min_replicas() -> i64 {
+    1
 }
 
 /// One known Slurm-backed replica of a managed model. Stored in `model_replicas`.
@@ -574,6 +579,8 @@ pub struct ModelReplica {
     /// One of: pending, starting, healthy, draining, lost.
     pub state: String,
     pub last_message: Option<String>,
+    #[serde(default)]
+    pub port_base: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -880,8 +887,10 @@ pub fn normalize_capacity_mode(mode: &str) -> String {
 
 /// Fixed vocabulary of endpoint-selection modes. `failover` tries a model's
 /// endpoints in priority order; `load_balance` spreads requests across them by
-/// weight. Skipping unhealthy/disabled endpoints applies in both modes.
-pub const ENDPOINT_SELECTION_MODES: &[&str] = &["failover", "load_balance"];
+/// weight; `session_hash` pins a session to one endpoint (by a consistent hash
+/// of its session/user key) for cache warmth, with the rest kept for failover.
+/// Skipping unhealthy/disabled endpoints applies in all modes.
+pub const ENDPOINT_SELECTION_MODES: &[&str] = &["failover", "load_balance", "session_hash"];
 
 /// The default endpoint-selection mode assigned to a model when none is set.
 pub const DEFAULT_ENDPOINT_SELECTION_MODE: &str = "failover";

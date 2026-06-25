@@ -15,6 +15,33 @@ pub trait SlurmClient: Send + Sync {
     async fn discover_resources(&self) -> anyhow::Result<ClusterResources>;
 }
 
+/// Insert a bash block that binds the first free port in the replica's window
+/// and exports `OBLETH_SERVING_PORT`. Inserted after the shebang line if one
+/// is present, otherwise prepended.
+fn inject_port_preamble(script: &str, port_base: i64, span: i64) -> String {
+    let span = span.max(1);
+    // Pure-bash: a C-style range loop (no `seq`) and a /dev/tcp probe in a
+    // subshell (no `timeout`) so the block survives minimal images that ship
+    // neither coreutils tool. A successful connect means the port is already
+    // taken; the first one we *cannot* connect to is free. localhost connects
+    // resolve immediately, so no timeout guard is needed.
+    let block = format!(
+        "# obleth: bind the first free port in this replica's window\n\
+         for ((__p={base}; __p<={last}; __p++)); do\n\
+         \x20 if ! (exec 3<>/dev/tcp/127.0.0.1/$__p) 2>/dev/null; then export OBLETH_SERVING_PORT=$__p; break; fi\n\
+         done\n\
+         export OBLETH_SERVING_PORT=${{OBLETH_SERVING_PORT:-{base}}}\n",
+        base = port_base, last = port_base + span - 1,
+    );
+    // Insert after the first line if it is a shebang, else prepend.
+    if let Some(nl) = script.find('\n') {
+        if script.starts_with("#!") {
+            return format!("{}\n{}{}", &script[..nl], block, &script[nl + 1..]);
+        }
+    }
+    format!("{block}{script}")
+}
+
 /// Build a version-agnostic JobSubmit from a model's spec. The job is named
 /// `{prefix}{model_name}` so we can find our own jobs. The script runs the
 /// operator's launch command inside their apptainer image — or, when `image`
@@ -24,6 +51,8 @@ pub fn job_submit_from_spec(
     spec: &ManagedModelSpec,
     model_name: &str,
     name_prefix: &str,
+    port_base: i64,
+    span: i64,
 ) -> JobSubmit {
     let preamble = spec.preamble.trim();
     let preamble_block = if preamble.is_empty() {
@@ -54,7 +83,7 @@ pub fn job_submit_from_spec(
     // A non-empty `script_body` is the rendered recipe output and wins: it is
     // submitted verbatim so the recipe author has full control of the job
     // script. Otherwise fall back to the legacy preamble/exec assembly.
-    let script = if spec.script_body.trim().is_empty() {
+    let assembled = if spec.script_body.trim().is_empty() {
         format!("#!/bin/bash\nset -euo pipefail\n{preamble_block}{exec_line}\n")
     } else {
         let body = &spec.script_body;
@@ -65,6 +94,7 @@ pub fn job_submit_from_spec(
             format!("#!/bin/bash\nset -euo pipefail\n{body}\n")
         }
     };
+    let script = inject_port_preamble(&assembled, port_base, span);
     JobSubmit {
         name: format!("{name_prefix}{model_name}"),
         partition: spec.partition.clone(),
@@ -386,6 +416,7 @@ mod tests {
             serving_port: 8000,
             health_path: "/health".into(),
             target_replicas: 2,
+            min_replicas: 1,
             max_job_failures: 0,
             launcher_spec: None,
             created_at: chrono::Utc::now(),
@@ -395,7 +426,7 @@ mod tests {
 
     #[test]
     fn builder_is_generic_and_tags_name() {
-        let j = job_submit_from_spec(&spec(), "nemotron", "obleth-");
+        let j = job_submit_from_spec(&spec(), "nemotron", "obleth-", 8000, 8);
         assert_eq!(j.name, "obleth-nemotron");
         assert_eq!(j.partition, "gpu-preempt");
         assert!(j.script.contains("apptainer exec --nv 'vllm.sif' vllm serve nemotron"));
@@ -405,17 +436,17 @@ mod tests {
     fn preamble_injected_before_apptainer_when_set() {
         let mut s = spec();
         s.preamble = "module load apptainer/1.3.4".into();
-        let j = job_submit_from_spec(&s, "nemotron", "obleth-");
+        let j = job_submit_from_spec(&s, "nemotron", "obleth-", 8000, 8);
         let lines: Vec<&str> = j.script.lines().collect();
         let apptainer_idx = lines.iter().position(|l| l.contains("apptainer exec")).unwrap();
-        let module_idx = lines.iter().position(|l| l.contains("module load")).unwrap();
+        let module_idx = lines.iter().position(|l| l.contains("module load apptainer")).unwrap();
         assert!(module_idx < apptainer_idx, "preamble must come before apptainer exec");
     }
 
     #[test]
     fn empty_preamble_produces_no_extra_line() {
-        let j = job_submit_from_spec(&spec(), "nemotron", "obleth-");
-        assert!(!j.script.contains("module"), "no preamble lines when preamble is empty");
+        let j = job_submit_from_spec(&spec(), "nemotron", "obleth-", 8000, 8);
+        assert!(!j.script.contains("module load"), "no preamble lines when preamble is empty");
         assert!(j.script.contains("apptainer exec --nv 'vllm.sif' vllm serve nemotron"));
     }
 
@@ -423,7 +454,7 @@ mod tests {
     fn image_with_shell_metacharacters_is_quoted() {
         let mut s = spec();
         s.image = "weird'$(rm -rf /); image.sif".into();
-        let j = job_submit_from_spec(&s, "nemotron", "obleth-");
+        let j = job_submit_from_spec(&s, "nemotron", "obleth-", 8000, 8);
         assert!(j.script.contains("apptainer exec --nv 'weird'\\''$(rm -rf /); image.sif'"));
     }
 
@@ -433,7 +464,7 @@ mod tests {
         s.image = "  ".into();
         s.preamble = "module load cuda".into();
         s.launch_command = "llama-server -m model.gguf --port 8000".into();
-        let j = job_submit_from_spec(&s, "glm", "obleth-");
+        let j = job_submit_from_spec(&s, "glm", "obleth-", 8000, 8);
         assert!(!j.script.contains("apptainer"), "no container wrap when image is blank");
         assert!(j.script.contains("module load cuda"));
         assert!(j.script.contains("llama-server -m model.gguf --port 8000"));
@@ -444,7 +475,7 @@ mod tests {
         let mut s = spec();
         s.cpus_per_task = Some(72);
         s.mem = Some("560G".into());
-        let j = job_submit_from_spec(&s, "glm", "obleth-");
+        let j = job_submit_from_spec(&s, "glm", "obleth-", 8000, 8);
         assert_eq!(j.cpus_per_task, Some(72));
         assert_eq!(j.mem_mb, Some(560 * 1024));
     }
@@ -453,7 +484,7 @@ mod tests {
     fn zero_cpus_is_treated_as_unset() {
         let mut s = spec();
         s.cpus_per_task = Some(0);
-        let j = job_submit_from_spec(&s, "glm", "obleth-");
+        let j = job_submit_from_spec(&s, "glm", "obleth-", 8000, 8);
         assert_eq!(j.cpus_per_task, None);
     }
 
@@ -471,21 +502,32 @@ mod tests {
     }
 
     #[test]
-    fn script_body_is_submitted_verbatim_with_shebang() {
+    fn script_body_with_shebang_gets_preamble_injected() {
         let mut s = spec();
         s.script_body = "#!/bin/bash\nset -e\nllama-server --port 8000\n".into();
-        let j = job_submit_from_spec(&s, "glm", "obleth-");
-        assert_eq!(j.script, "#!/bin/bash\nset -e\nllama-server --port 8000\n");
+        let j = job_submit_from_spec(&s, "glm", "obleth-", 8000, 8);
+        // Port preamble is injected after the shebang; script_body wins over legacy assembly.
+        assert!(j.script.starts_with("#!/bin/bash\n"), "shebang retained as first line");
+        assert!(j.script.contains("OBLETH_SERVING_PORT"), "port preamble injected");
+        assert!(j.script.contains("llama-server --port 8000"));
         assert!(!j.script.contains("apptainer"), "script_body overrides legacy assembly");
     }
 
     #[test]
-    fn script_body_without_shebang_gets_wrapped() {
+    fn script_body_without_shebang_gets_wrapped_and_preamble_injected() {
         let mut s = spec();
         s.script_body = "llama-server --port 8000".into();
-        let j = job_submit_from_spec(&s, "glm", "obleth-");
-        assert!(j.script.starts_with("#!/bin/bash\nset -euo pipefail\n"));
+        let j = job_submit_from_spec(&s, "glm", "obleth-", 8000, 8);
+        assert!(j.script.starts_with("#!/bin/bash\n"), "shebang added");
+        assert!(j.script.contains("OBLETH_SERVING_PORT"), "port preamble injected");
         assert!(j.script.contains("llama-server --port 8000"));
+    }
+
+    #[test]
+    fn port_preamble_uses_correct_window() {
+        let j = job_submit_from_spec(&spec(), "nemotron", "obleth-", 8016, 8);
+        assert!(j.script.contains("__p=8016; __p<=8023"), "window base and last computed correctly");
+        assert!(j.script.contains("OBLETH_SERVING_PORT:-8016"), "fallback to window base");
     }
 
     #[test]
@@ -546,35 +588,5 @@ mod tests {
         assert!(parse_partitions(&empty).is_empty());
         assert!(parse_nodes(&empty).is_empty());
         assert_eq!(parse_associations(&empty), (vec![], vec![]));
-    }
-}
-
-/// In-memory fake for executor/loop tests — no network.
-#[cfg(test)]
-pub struct MockSlurm {
-    pub jobs: std::sync::Mutex<Vec<JobInfo>>,
-    pub submitted: std::sync::Mutex<Vec<JobSubmit>>,
-    pub cancelled: std::sync::Mutex<Vec<String>>,
-    pub next_id: std::sync::atomic::AtomicU64,
-}
-#[cfg(test)]
-#[async_trait]
-impl SlurmClient for MockSlurm {
-    async fn submit(&self, job: &JobSubmit) -> anyhow::Result<String> {
-        let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.submitted.lock().unwrap().push(job.clone());
-        let job_id = format!("job-{id}");
-        self.jobs.lock().unwrap().push(JobInfo { job_id: job_id.clone(), state: JobState::Pending, nodes: vec![] });
-        Ok(job_id)
-    }
-    async fn cancel(&self, job_id: &str) -> anyhow::Result<()> {
-        self.cancelled.lock().unwrap().push(job_id.to_string());
-        Ok(())
-    }
-    async fn list_owned_jobs(&self, _prefix: &str) -> anyhow::Result<Vec<JobInfo>> {
-        Ok(self.jobs.lock().unwrap().clone())
-    }
-    async fn discover_resources(&self) -> anyhow::Result<ClusterResources> {
-        Ok(ClusterResources::default())
     }
 }

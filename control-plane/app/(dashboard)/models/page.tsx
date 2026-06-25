@@ -8,7 +8,7 @@ import {
   type ModelHealthSummary,
 } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
-import { loadRecipes } from "@/lib/recipe-files";
+import { loadRecipeCards } from "@/lib/sbatch-recipes";
 
 export const dynamic = "force-dynamic";
 
@@ -48,8 +48,9 @@ export default async function ModelsPage() {
     perModel.map(([id, , , spec]) => [id, spec !== null]),
   );
 
-  // Admin-authored launch recipes (YAML files); falls back to built-ins.
-  const recipes = loadRecipes();
+  // Admin-authored *.recipe files and editable DB templates, mapped to flat cards
+  // for the create gallery.
+  const recipeCards = await loadRecipeCards();
 
   return (
     <div className="space-y-6">
@@ -69,7 +70,7 @@ export default async function ModelsPage() {
         mcpServers={mcpServers}
         managed={managed}
         slurmEnabled={slurm?.enabled ?? false}
-        recipes={recipes}
+        recipeCards={recipeCards}
       />
     </div>
   );

@@ -15,7 +15,7 @@ pub trait OblethClient: Send + Sync {
     /// Every replica row across all models — used to reconcile orphans and drain
     /// models that have left the managed set.
     async fn list_all_replicas(&self) -> anyhow::Result<Vec<ReplicaView>>;
-    async fn create_replica(&self, model_id: Uuid, slurm_job_id: &str) -> anyhow::Result<Uuid>;
+    async fn create_replica(&self, model_id: Uuid, slurm_job_id: &str, port_base: i64) -> anyhow::Result<Uuid>;
     async fn patch_replica(
         &self, replica_id: Uuid, state: Option<&str>, nodes: Option<&str>,
         endpoint_id: Option<Uuid>, message: Option<&str>,
@@ -61,6 +61,7 @@ fn replica_views_from_json(rows: &serde_json::Value) -> Vec<ReplicaView> {
             state: r.get("state").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
             endpoint_id: r.get("endpoint_id").and_then(|x| x.as_str()).and_then(|s| s.parse().ok()),
             age_secs: (now - created).num_seconds(),
+            port_base: r.get("port_base").and_then(|x| x.as_i64()).unwrap_or(0),
         });
     }
     out
@@ -123,10 +124,10 @@ impl OblethClient for HttpObleth {
         Ok(replica_views_from_json(&rows))
     }
 
-    async fn create_replica(&self, model_id: Uuid, slurm_job_id: &str) -> anyhow::Result<Uuid> {
+    async fn create_replica(&self, model_id: Uuid, slurm_job_id: &str, port_base: i64) -> anyhow::Result<Uuid> {
         let v: serde_json::Value = self
             .req(reqwest::Method::POST, &format!("/models/{model_id}/replicas"))
-            .json(&serde_json::json!({ "slurm_job_id": slurm_job_id }))
+            .json(&serde_json::json!({ "slurm_job_id": slurm_job_id, "port_base": port_base }))
             .send().await?.json().await?;
         Ok(v.get("id").and_then(|x| x.as_str()).and_then(|s| s.parse().ok()).unwrap_or_default())
     }
@@ -187,7 +188,7 @@ pub struct MockObleth {
     pub managed: std::sync::Mutex<Vec<ManagedModelSpec>>,
     pub slurm: std::sync::Mutex<Option<SlurmSettings>>,
     pub replicas: std::sync::Mutex<Vec<ReplicaView>>,
-    pub created_replicas: std::sync::Mutex<Vec<(Uuid, String)>>, // (model_id, slurm_job_id)
+    pub created_replicas: std::sync::Mutex<Vec<(Uuid, String, i64)>>, // (model_id, slurm_job_id, port_base)
     pub created_endpoints: std::sync::Mutex<Vec<(Uuid, String, String)>>, // (model_id, name, api_base)
     pub deleted_endpoints: std::sync::Mutex<Vec<Uuid>>,
     pub deleted_replicas: std::sync::Mutex<Vec<Uuid>>,
@@ -209,8 +210,8 @@ impl OblethClient for MockObleth {
     async fn list_all_replicas(&self) -> anyhow::Result<Vec<ReplicaView>> {
         Ok(self.replicas.lock().unwrap().clone())
     }
-    async fn create_replica(&self, model_id: Uuid, slurm_job_id: &str) -> anyhow::Result<Uuid> {
-        self.created_replicas.lock().unwrap().push((model_id, slurm_job_id.to_string()));
+    async fn create_replica(&self, model_id: Uuid, slurm_job_id: &str, port_base: i64) -> anyhow::Result<Uuid> {
+        self.created_replicas.lock().unwrap().push((model_id, slurm_job_id.to_string(), port_base));
         Ok(Uuid::new_v4())
     }
     async fn patch_replica(

@@ -14,6 +14,7 @@ import { cn } from "@/lib/utils";
 import type { ModelRoute } from "@/lib/obleth";
 import { TraceCard } from "./trace-card";
 import type { useCharoStream } from "./use-charo-stream";
+import type { CharoState } from "./sprite";
 
 type Stream = ReturnType<typeof useCharoStream>;
 
@@ -66,14 +67,24 @@ function configuredBoons(m: ModelRoute | undefined): string[] {
   return [...b];
 }
 
+const MASCOT: Record<CharoState, string> = {
+  idle: "/charo/charo-dark-idle.png",
+  held: "/charo/charo-dark-idle.png",
+  thinking: "/charo/charo-dark-thinking.png",
+  result: "/charo/charo-dark-result.png",
+  error: "/charo/charo-dark-error.png",
+};
+
 export function CharoPanel({
   open,
   onClose,
   stream,
+  mascotState,
 }: {
   open: boolean;
   onClose: () => void;
   stream: Stream;
+  mascotState: CharoState;
 }) {
   const { messages, busy, send, reset } = stream;
   const [models, setModels] = useState<ModelRoute[]>([]);
@@ -138,39 +149,103 @@ export function CharoPanel({
 
   const boons = configuredBoons(selected);
   const presets = presetsFor(selected);
+  const mascot = MASCOT[mascotState];
 
   return (
-    <div
-      className="fixed bottom-8 right-8 z-[60] flex h-[34rem] max-h-[80vh] w-[26rem] max-w-[calc(100vw-2rem)] flex-col rounded-xl border-2 border-primary/50 bg-card shadow-2xl ring-1 ring-primary/10"
-      role="dialog"
-      aria-label="Charo model tester"
-    >
-      {/* header */}
-      <div className="flex items-center justify-between border-b border-border px-4 py-3">
-        <div>
-          <div className="text-sm font-semibold">Charo · model tester</div>
-          <div className="text-xs text-muted-foreground">
-            Chats hit the real gateway as the internal tenant.
+    <div className="charo-panel-frame fixed bottom-4 right-4 isolate z-[60] h-[34rem] max-h-[80vh] w-[27rem] max-w-[calc(100vw-1rem)] sm:bottom-8 sm:right-8">
+      <style>{`
+        @keyframes charo-border-glow {
+          to { --charo-border-angle: 360deg; }
+        }
+        @keyframes charo-panel-aura {
+          0%, 100% { background-position: 0% 50%, 100% 50%; opacity: .2; }
+          50% { background-position: 100% 50%, 0% 50%; opacity: .32; }
+        }
+        @property --charo-border-angle {
+          syntax: "<angle>";
+          initial-value: 0deg;
+          inherits: false;
+        }
+        .charo-panel-shell::before {
+          content: "";
+          position: absolute;
+          inset: 0;
+          pointer-events: none;
+          background:
+            radial-gradient(circle at 82% 0%, hsl(267 86% 70% / .14), transparent 42%),
+            linear-gradient(135deg, hsl(267 86% 68% / .05), transparent 34%, hsl(189 82% 55% / .04));
+          background-size: 140% 140%, 180% 180%;
+          animation: charo-panel-aura 9s ease-in-out infinite;
+        }
+        .charo-panel-shell::after {
+          content: "";
+          position: absolute;
+          inset: 0;
+          z-index: 2;
+          pointer-events: none;
+          border-radius: inherit;
+          padding: 1px;
+          background:
+            conic-gradient(
+              from var(--charo-border-angle),
+              transparent 0deg,
+              transparent 64deg,
+              hsl(267 86% 70% / .18) 88deg,
+              hsl(267 86% 74% / .76) 112deg,
+              hsl(188 86% 62% / .5) 132deg,
+              transparent 162deg,
+              transparent 360deg
+            );
+          mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          mask-composite: exclude;
+          -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          -webkit-mask-composite: xor;
+          animation: charo-border-glow 7s linear infinite;
+        }
+        .charo-panel-shell > * {
+          position: relative;
+          z-index: 3;
+        }
+      `}</style>
+      {/* eslint-disable-next-line @next/next/no-img-element */}
+      <img
+        src={mascot}
+        alt=""
+        draggable={false}
+        className="pointer-events-none absolute -top-32 -right-4 z-[5] hidden h-44 w-auto select-none drop-shadow-2xl sm:block lg:-top-36 lg:-right-5 lg:h-48"
+      />
+
+      <div
+        className="charo-panel-shell relative z-10 flex h-full flex-col overflow-hidden rounded-lg border border-violet-300/15 bg-card shadow-[0_18px_56px_hsl(267_86%_12%/0.28)] ring-1 ring-violet-200/10"
+        role="dialog"
+        aria-label="Charo model tester"
+      >
+        {/* header */}
+        <div className="flex items-center justify-between gap-3 border-b border-border bg-secondary/20 px-4 py-3">
+          <div className="min-w-0">
+            <div className="truncate text-sm font-semibold">Charo - model tester</div>
+            <div className="text-xs text-muted-foreground">
+              Chats hit the real gateway as the internal tenant.
+            </div>
+          </div>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              title="Clear conversation"
+              onClick={reset}
+              disabled={busy}
+            >
+              <RotateCcw className="h-4 w-4" />
+            </Button>
+            <Button variant="ghost" size="icon" title="Close" onClick={onClose}>
+              <X className="h-4 w-4" />
+            </Button>
           </div>
         </div>
-        <div className="flex items-center gap-1">
-          <Button
-            variant="ghost"
-            size="icon"
-            title="Clear conversation"
-            onClick={reset}
-            disabled={busy}
-          >
-            <RotateCcw className="h-4 w-4" />
-          </Button>
-          <Button variant="ghost" size="icon" title="Close" onClick={onClose}>
-            <X className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
 
-      {/* model + boons */}
-      <div className="space-y-2 border-b border-border px-4 py-3">
+        {/* model + boons */}
+        <div className="space-y-2 border-b border-border px-4 py-3">
         <DropdownMenu>
           <DropdownMenuTrigger asChild>
             <button
@@ -216,7 +291,7 @@ export function CharoPanel({
         {messages.length === 0 && (
           <p className="text-center text-xs text-muted-foreground">
             Pick a model and send a message to test it. Charo runs it through the
-            gateway so every boon fires for real — the trace shows what happened.
+            gateway so every boon fires for real - the trace shows what happened.
           </p>
         )}
         {messages.map((m) => (
@@ -228,8 +303,8 @@ export function CharoPanel({
               className={cn(
                 "max-w-[88%] whitespace-pre-wrap rounded-lg px-3 py-2 text-sm",
                 m.role === "user"
-                  ? "bg-primary text-primary-foreground"
-                  : "bg-muted text-foreground",
+                  ? "rounded-br-sm bg-primary text-primary-foreground"
+                  : "rounded-tl-sm bg-muted text-foreground",
               )}
             >
               {m.image && (
@@ -240,7 +315,7 @@ export function CharoPanel({
                   className="mb-1 max-h-40 rounded-md"
                 />
               )}
-              {m.content || (m.streaming ? "…" : "")}
+              {m.content || (m.streaming ? "..." : "")}
               {m.error && <span className="text-destructive">{m.error}</span>}
             </div>
             {m.role === "assistant" && (m.trace !== undefined || m.tracePending) && (
@@ -300,7 +375,7 @@ export function CharoPanel({
               }
             }}
             rows={2}
-            placeholder={selected ? `Message ${selected.model_name}…` : "Select a model…"}
+            placeholder={selected ? `Message ${selected.model_name}...` : "Select a model..."}
             disabled={busy || !selected}
             className="flex-1 resize-none rounded-md border border-border bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50"
           />
@@ -335,6 +410,7 @@ export function CharoPanel({
             </Button>
           </div>
         </div>
+      </div>
       </div>
     </div>
   );

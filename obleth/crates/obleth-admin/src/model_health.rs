@@ -282,7 +282,16 @@ async fn run_model_health_check(
         // No static api_base (Slurm-provisioned / dynamic endpoints): the model
         // is only as healthy as its live endpoint pool. Probing the empty base
         // would always report "unreachable" and flap the model to "down".
-        aggregate_endpoint_health(&endpoint_results)
+        // Use min_replicas from the managed spec as the health floor; fall back
+        // to 1 when the spec is absent (e.g. a transient race or data gap).
+        let min_replicas = state
+            .store
+            .get_managed_min_replicas(model.id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or(1);
+        aggregate_endpoint_health(&endpoint_results, min_replicas)
     } else {
         liveness_probe(state, &model).await
     };
@@ -541,10 +550,11 @@ async fn probe_endpoints(state: &AdminState, model: &ModelRoute) -> Vec<ProbeRes
 /// is the correct signal here. Both `healthy` and `degraded` endpoint results
 /// are therefore treated as "serving" for the model-level aggregate.
 ///
-/// Model status is then determined by capacity: if all registered endpoints are
-/// serving the model is healthy; if some (but not all) are serving it is
-/// degraded (partial capacity); if none are reachable it is unhealthy.
-fn aggregate_endpoint_health(results: &[ProbeResult]) -> ProbeResult {
+/// Model status is then determined by capacity relative to `min_replicas`:
+/// - `serving >= min_replicas` → healthy (the configured health floor is met)
+/// - `0 < serving < min_replicas` → degraded (partial capacity, below the floor)
+/// - `serving == 0` → unhealthy
+fn aggregate_endpoint_health(results: &[ProbeResult], min_replicas: i64) -> ProbeResult {
     let live: Vec<&ProbeResult> = results.iter().filter(|r| r.status != "disabled").collect();
     let total = live.len();
     if total == 0 {
@@ -560,7 +570,8 @@ fn aggregate_endpoint_health(results: &[ProbeResult]) -> ProbeResult {
         .iter()
         .filter(|r| r.status == "healthy" || r.status == "degraded")
         .count();
-    if serving == total {
+    let floor = min_replicas.max(1) as usize;
+    if serving >= floor {
         return ProbeResult::healthy(
             None,
             None,
@@ -571,7 +582,7 @@ fn aggregate_endpoint_health(results: &[ProbeResult]) -> ProbeResult {
         return ProbeResult::degraded(
             None,
             None,
-            format!("{serving} of {total} endpoint(s) serving"),
+            format!("{serving} of {total} endpoint(s) serving (below min_replicas {floor})"),
         );
     }
     ProbeResult::unhealthy(None, None, format!("all {total} endpoint(s) unreachable"))
@@ -748,7 +759,7 @@ mod tests {
 
     #[test]
     fn aggregate_empty_pool_is_unhealthy() {
-        let agg = aggregate_endpoint_health(&[]);
+        let agg = aggregate_endpoint_health(&[], 1);
         assert_eq!(agg.status, "unhealthy");
     }
 
@@ -759,7 +770,7 @@ mod tests {
             ProbeResult::healthy(None, None, "up".into()),
             ProbeResult::degraded(None, None, "model-id-mismatch".into()),
         ];
-        assert_eq!(aggregate_endpoint_health(&results).status, "healthy");
+        assert_eq!(aggregate_endpoint_health(&results, 1).status, "healthy");
     }
 
     #[test]
@@ -769,7 +780,7 @@ mod tests {
             ProbeResult::unhealthy(None, None, "down".into()),
             ProbeResult::degraded(None, None, "model-id-mismatch".into()),
         ];
-        assert_eq!(aggregate_endpoint_health(&results).status, "degraded");
+        assert_eq!(aggregate_endpoint_health(&results, 2).status, "degraded");
     }
 
     #[test]
@@ -778,7 +789,7 @@ mod tests {
             ProbeResult::unhealthy(None, None, "down".into()),
             ProbeResult::unhealthy(None, None, "down".into()),
         ];
-        assert_eq!(aggregate_endpoint_health(&results).status, "unhealthy");
+        assert_eq!(aggregate_endpoint_health(&results, 1).status, "unhealthy");
     }
 
     #[test]
@@ -791,7 +802,50 @@ mod tests {
             response_excerpt: None,
         };
         // Only a disabled endpoint -> treated as no live endpoints -> unhealthy.
-        assert_eq!(aggregate_endpoint_health(&[disabled]).status, "unhealthy");
+        assert_eq!(aggregate_endpoint_health(&[disabled], 1).status, "unhealthy");
+    }
+
+    // --- min_replicas floor tests ---
+
+    #[test]
+    fn min_replicas_floor_zero_healthy_is_down() {
+        // 0 serving, min_replicas=2 → unhealthy
+        let results = vec![
+            ProbeResult::unhealthy(None, None, "down".into()),
+            ProbeResult::unhealthy(None, None, "down".into()),
+        ];
+        assert_eq!(aggregate_endpoint_health(&results, 2).status, "unhealthy");
+    }
+
+    #[test]
+    fn min_replicas_floor_below_threshold_is_degraded() {
+        // 1 serving, min_replicas=2 → degraded (below the healthy floor)
+        let results = vec![
+            ProbeResult::healthy(None, None, "up".into()),
+            ProbeResult::unhealthy(None, None, "down".into()),
+        ];
+        assert_eq!(aggregate_endpoint_health(&results, 2).status, "degraded");
+    }
+
+    #[test]
+    fn min_replicas_floor_at_threshold_is_healthy() {
+        // 2 serving, min_replicas=2 → healthy (at the floor)
+        let results = vec![
+            ProbeResult::healthy(None, None, "up".into()),
+            ProbeResult::healthy(None, None, "up".into()),
+        ];
+        assert_eq!(aggregate_endpoint_health(&results, 2).status, "healthy");
+    }
+
+    #[test]
+    fn min_replicas_floor_above_threshold_is_healthy() {
+        // 3 serving, min_replicas=2 → healthy (above the floor)
+        let results = vec![
+            ProbeResult::healthy(None, None, "up".into()),
+            ProbeResult::healthy(None, None, "up".into()),
+            ProbeResult::healthy(None, None, "up".into()),
+        ];
+        assert_eq!(aggregate_endpoint_health(&results, 2).status, "healthy");
     }
 
     #[test]

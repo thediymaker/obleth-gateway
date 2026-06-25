@@ -12,7 +12,7 @@ mod backup;
 mod error;
 pub mod model_health;
 mod openapi;
-pub mod saved_recipes;
+pub mod recipes;
 pub mod slurm_resources;
 pub mod slurm_settings;
 pub mod ssrf;
@@ -170,8 +170,8 @@ pub fn router(state: AdminState) -> Router {
         )
         .route("/api/v1/models/:id/cache", put(set_model_cache))
         .route("/api/v1/models/:id/reliability", put(set_model_reliability))
-        .route("/api/v1/recipes", get(saved_recipes::list_recipes).post(saved_recipes::create_recipe))
-        .route("/api/v1/recipes/:id", put(saved_recipes::update_recipe).delete(saved_recipes::delete_recipe))
+        .route("/api/v1/recipes", get(recipes::list_recipes).post(recipes::create_recipe))
+        .route("/api/v1/recipes/:id", put(recipes::update_recipe).delete(recipes::delete_recipe))
         .route("/api/v1/managed", get(list_managed_models))
         .route(
             "/api/v1/models/:id/managed",
@@ -187,6 +187,10 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/api/v1/models/:id/replicas",
             get(list_replicas).post(create_replica),
+        )
+        .route(
+            "/api/v1/models/:id/replicas/clear-lost",
+            post(clear_lost_replicas),
         )
         .route(
             "/api/v1/models/:id/endpoints",
@@ -709,6 +713,8 @@ pub(crate) struct PutManagedModel {
     health_path: String,
     #[serde(default = "two")]
     target_replicas: i64,
+    #[serde(default = "one")]
+    min_replicas: i64,
     #[serde(default)]
     max_job_failures: i64,
     #[serde(default)]
@@ -727,6 +733,8 @@ fn default_health_path() -> String {
 #[derive(Debug, Deserialize, ToSchema)]
 pub(crate) struct CreateReplica {
     slurm_job_id: String,
+    #[serde(default)]
+    port_base: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -3235,6 +3243,7 @@ async fn put_managed_model(
             serving_port: body.serving_port,
             health_path: body.health_path,
             target_replicas: body.target_replicas,
+            min_replicas: body.min_replicas,
             max_job_failures: body.max_job_failures,
             launcher_spec: body.launcher_spec,
         })
@@ -3297,7 +3306,7 @@ async fn create_replica(
     Path(id): Path<Uuid>,
     Json(body): Json<CreateReplica>,
 ) -> Result<Json<ModelReplica>> {
-    let r = state.store.create_replica(id, &body.slurm_job_id).await?;
+    let r = state.store.create_replica(id, &body.slurm_job_id, body.port_base).await?;
     state
         .store
         .record_audit(
@@ -3370,6 +3379,15 @@ async fn delete_replica(
         )
         .await?;
     Ok(Json(serde_json::json!({"deleted": true})))
+}
+
+#[utoipa::path(post, path = "/api/v1/models/{id}/replicas/clear-lost",
+    responses((status = 200, body = serde_json::Value)))]
+pub async fn clear_lost_replicas(
+    State(state): State<AdminState>, Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>> {
+    let n = state.store.delete_lost_replicas(id).await?;
+    Ok(Json(serde_json::json!({ "deleted": n })))
 }
 
 #[utoipa::path(

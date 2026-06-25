@@ -1,7 +1,10 @@
 "use client";
 
+import { useTransition } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { clearLostReplicasAction } from "@/app/actions";
 import type { ModelReplica } from "@/lib/obleth";
 
 const STATE_COLOR: Record<string, string> = {
@@ -13,6 +16,7 @@ const STATE_COLOR: Record<string, string> = {
 };
 
 export function ReplicaPanel({ modelId }: { modelId: string }) {
+  const [isPending, startTransition] = useTransition();
   const { data } = useQuery({
     queryKey: ["replicas", modelId],
     refetchInterval: 5000,
@@ -25,16 +29,29 @@ export function ReplicaPanel({ modelId }: { modelId: string }) {
 
   const replicas = data ?? [];
   const healthy = replicas.filter((r) => r.state === "healthy").length;
+  const hasLost = replicas.some((r) => r.state === "lost");
 
   return (
     <Card className="flex h-full min-h-0 flex-col">
-      <CardHeader>
+      <CardHeader className="flex flex-row items-center justify-between">
         <CardTitle>
           Replicas{" "}
           <span className="text-sm text-muted-foreground">
             ({healthy} healthy)
           </span>
         </CardTitle>
+        {hasLost && (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={isPending}
+            onClick={() =>
+              startTransition(async () => { await clearLostReplicasAction(modelId); })
+            }
+          >
+            Retry failed
+          </Button>
+        )}
       </CardHeader>
       <CardContent className="min-h-0 flex flex-1 flex-col">
         {replicas.length === 0 ? (

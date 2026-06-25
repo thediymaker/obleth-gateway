@@ -1,0 +1,38 @@
+---
+name: Deploy llama.cpp (multi-user)
+description: "Serve any GGUF model with llama-server (sample: GLM-5.2 on GH200). Edit the model, image/build, and GH200 sizing for your hardware."
+engine: llamacpp
+model_type: chat
+api_model_name: glm-5.2
+port: 8000
+target_replicas: 2
+max_job_failures: 3
+---
+#!/bin/bash -l
+# Partition / QoS / time limit are set at deploy (Deploy overrides) — left out
+# here so the recipe stays cluster-agnostic.
+#SBATCH --gres=gpu:1                 # one GH200 superchip
+#SBATCH --cpus-per-task=72
+#SBATCH --mem=560G
+#SBATCH --output=logs/serve-%j.out
+set -euo pipefail
+# EDIT FOR YOUR CLUSTER: node-local scratch path for weight caching.
+export LLAMA_CACHE=/path/to/job_tmp/glm52
+# Let GPU allocations overflow into the Grace CPU's coherent LPDDR (GH200 only).
+export GGML_CUDA_ENABLE_UNIFIED_MEMORY=1
+# This assumes `llama-server` is on $PATH — built for your GPU (GH200 = arm64+CUDA)
+# or provided by a `module load`. On GH200 a native build is the most reliable path.
+# CONTAINER ALTERNATIVE: if you have no native build, wrap the launch in Apptainer
+# (like the Qwen recipe). You must supply an arm64+CUDA llama.cpp image — the public
+# ghcr.io/ggml-org/llama.cpp CUDA images are x86 — e.g. build one and cache the .sif:
+#   apptainer exec --nv /path/to/llamacpp-cuda.sif \
+#     llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M \
+#       --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" --alias glm-5.2 ... (same flags as below)
+llama-server -hf unsloth/GLM-5.2-GGUF:UD-IQ2_M \
+  --host 0.0.0.0 --port "$OBLETH_SERVING_PORT" --alias glm-5.2 \
+  -ngl 99 --ctx-size 1048576 --parallel 4 --threads "$(nproc)" \
+  --n-cpu-moe 68 \
+  --batch-size 2048 --ubatch-size 512 \
+  --cache-type-k q8_0 --cache-type-v q8_0 \
+  --temp 1.0 --top-p 0.95 --min-p 0.01 \
+  --cont-batching --flash-attn on --jinja

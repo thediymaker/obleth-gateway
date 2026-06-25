@@ -753,7 +753,7 @@ async fn proxy_handler_inner(
     // endpoints we route across the healthy/enabled ones (priority order for
     // failover, weighted order for load_balance); otherwise we fall back to the
     // legacy single api_base/api_key on the model (or the global default).
-    let targets = build_targets(route.as_deref(), &state.upstream_base, selection_mode);
+    let targets = build_targets(route.as_deref(), &state.upstream_base, selection_mode, &req_meta.session_id);
 
     // The JSON body is rebuilt once and replayed on each attempt/endpoint.
     // Multipart bodies cannot be replayed, so they get a single attempt against
@@ -2073,13 +2073,16 @@ struct Target {
 /// When the model defines explicit endpoints we route across the ones that are
 /// both `enabled` and `healthy`. `failover` orders them by ascending priority
 /// (lowest first); `load_balance` orders them by a weighted random shuffle so
-/// traffic spreads across clusters in proportion to their weights. When no
-/// usable endpoints exist we fall back to the model's own `api_base`/`api_key`
-/// (or the global default base), preserving the legacy single-upstream path.
+/// traffic spreads across clusters in proportion to their weights; `session_hash`
+/// pins a session to one endpoint via rendezvous hashing of the session key,
+/// with the rest following for failover. When no usable endpoints exist we fall
+/// back to the model's own `api_base`/`api_key` (or the global default base),
+/// preserving the legacy single-upstream path.
 fn build_targets(
     route: Option<&ResolvedModel>,
     default_base: &str,
     selection_mode: &str,
+    session_key: &str,
 ) -> Vec<Target> {
     let mut targets: Vec<Target> = Vec::new();
     if let Some(r) = route {
@@ -2089,10 +2092,10 @@ fn build_targets(
             .filter(|e| e.enabled && e.healthy)
             .collect();
         if !eligible.is_empty() {
-            if selection_mode == "load_balance" {
-                eligible = weighted_order(eligible);
-            } else {
-                eligible.sort_by_key(|e| e.priority);
+            match selection_mode {
+                "load_balance" => eligible = weighted_order(eligible),
+                "session_hash" => eligible = session_hash_order(eligible, session_key),
+                _ => eligible.sort_by_key(|e| e.priority), // failover (default)
             }
             for e in eligible {
                 targets.push(Target {
@@ -2139,6 +2142,45 @@ fn weighted_order(items: Vec<&ResolvedEndpoint>) -> Vec<&ResolvedEndpoint> {
         .collect();
     keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
     keyed.into_iter().map(|(_, e)| e).collect()
+}
+
+/// FNV-1a over `session_key\0endpoint_id` — a small, dependency-free, stable
+/// hash. Stability matters: the same key must score an endpoint identically on
+/// every request so a session keeps landing on the same replica.
+fn rendezvous_score(session_key: &str, endpoint_id: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in session_key
+        .bytes()
+        .chain(std::iter::once(0u8))
+        .chain(endpoint_id.bytes())
+    {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Order endpoints so a session sticks to one replica: rendezvous (highest-
+/// random-weight) hashing scores each endpoint by `hash(session_key, id)`; the
+/// highest score is the session's home and goes first, the rest follow for
+/// failover. Deterministic for a given key; adding/removing an endpoint
+/// reshuffles only minimally. With no session key, falls back to weighted order.
+fn session_hash_order<'a>(items: Vec<&'a ResolvedEndpoint>, session_key: &str) -> Vec<&'a ResolvedEndpoint> {
+    if session_key.is_empty() {
+        // No session key on the request, so stickiness is impossible: this falls
+        // back to weighted_order, i.e. session_hash behaves like load_balance.
+        // Logged (debug, not warn — keyless requests are common and expected) so
+        // operators can see why a session_hash model isn't actually sticking.
+        tracing::debug!("session_hash selected but request has no session key; falling back to weighted order");
+        return weighted_order(items);
+    }
+    let mut scored: Vec<(u64, &ResolvedEndpoint)> = items
+        .into_iter()
+        .map(|e| (rendezvous_score(session_key, &e.id), e))
+        .collect();
+    // Highest score first; tie-break on id for a fully deterministic order.
+    scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.id.cmp(&b.1.id)));
+    scored.into_iter().map(|(_, e)| e).collect()
 }
 
 /// Whether an upstream HTTP status is worth retrying or failing over for.
@@ -2430,7 +2472,7 @@ fn now_ms() -> i64 {
 mod tests {
     use super::{
         backoff_for, build_targets, build_upstream_url, has_path_traversal, is_retryable_status,
-        prepare_upstream_body, tenant_active_now, weighted_order,
+        prepare_upstream_body, session_hash_order, tenant_active_now, weighted_order,
     };
     use chrono::{DateTime, TimeZone, Utc};
     use obleth_config::{ResolvedEndpoint, ResolvedKey, WeeklyWindow};
@@ -2712,7 +2754,7 @@ mod tests {
     #[test]
     fn no_endpoints_falls_back_to_model_base() {
         let model = model_with(Vec::new());
-        let targets = build_targets(Some(&model), "http://global/v1", "failover");
+        let targets = build_targets(Some(&model), "http://global/v1", "failover", "");
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].base, "http://primary/v1");
         assert_eq!(targets[0].api_key.as_deref(), Some("model-key"));
@@ -2720,7 +2762,7 @@ mod tests {
 
     #[test]
     fn none_route_uses_global_default() {
-        let targets = build_targets(None, "http://global/v1", "failover");
+        let targets = build_targets(None, "http://global/v1", "failover", "");
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].base, "http://global/v1");
         assert!(targets[0].api_key.is_none());
@@ -2735,7 +2777,7 @@ mod tests {
             endpoint("unhealthy", "http://y", 1, 100, true, false),
             endpoint("b", "http://b", 20, 100, true, true),
         ]);
-        let targets = build_targets(Some(&model), "http://global/v1", "failover");
+        let targets = build_targets(Some(&model), "http://global/v1", "failover", "");
         let bases: Vec<&str> = targets.iter().map(|t| t.base.as_str()).collect();
         assert_eq!(bases, vec!["http://a", "http://b", "http://c"]);
     }
@@ -2745,7 +2787,7 @@ mod tests {
         let mut ep = endpoint("a", "http://a", 10, 100, true, true);
         ep.api_key = None;
         let model = model_with(vec![ep]);
-        let targets = build_targets(Some(&model), "http://global/v1", "failover");
+        let targets = build_targets(Some(&model), "http://global/v1", "failover", "");
         assert_eq!(targets[0].api_key.as_deref(), Some("model-key"));
     }
 
@@ -2847,5 +2889,49 @@ mod tests {
         let mut ids: Vec<&str> = ordered.iter().map(|e| e.id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn session_hash_is_deterministic_for_a_key() {
+        let eps = [
+            endpoint("a", "http://a", 10, 100, true, true),
+            endpoint("b", "http://b", 20, 100, true, true),
+            endpoint("c", "http://c", 30, 100, true, true),
+        ];
+        let refs: Vec<&ResolvedEndpoint> = eps.iter().collect();
+        let first = session_hash_order(refs.clone(), "session-xyz");
+        let second = session_hash_order(refs.clone(), "session-xyz");
+        let firsts: Vec<&str> = first.iter().map(|e| e.id.as_str()).collect();
+        let seconds: Vec<&str> = second.iter().map(|e| e.id.as_str()).collect();
+        // Same key ⇒ identical ordering (so the session sticks to one replica).
+        assert_eq!(firsts, seconds);
+        // All members retained for failover.
+        assert_eq!(first.len(), 3);
+    }
+
+    #[test]
+    fn session_hash_distributes_across_keys() {
+        let eps = [
+            endpoint("a", "http://a", 10, 100, true, true),
+            endpoint("b", "http://b", 20, 100, true, true),
+            endpoint("c", "http://c", 30, 100, true, true),
+        ];
+        let refs: Vec<&ResolvedEndpoint> = eps.iter().collect();
+        // Different keys should not all land on the same home endpoint.
+        let homes: std::collections::HashSet<String> = (0..40)
+            .map(|i| session_hash_order(refs.clone(), &format!("k{i}"))[0].id.clone())
+            .collect();
+        assert!(homes.len() > 1, "session_hash should spread homes across keys");
+    }
+
+    #[test]
+    fn session_hash_empty_key_keeps_membership() {
+        let eps = [
+            endpoint("a", "http://a", 10, 100, true, true),
+            endpoint("b", "http://b", 20, 100, true, true),
+        ];
+        let refs: Vec<&ResolvedEndpoint> = eps.iter().collect();
+        let ordered = session_hash_order(refs, "");
+        assert_eq!(ordered.len(), 2);
     }
 }

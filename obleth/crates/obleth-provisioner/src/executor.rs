@@ -9,23 +9,30 @@ use obleth_config::ManagedModelSpec;
 /// partition/image/launch details). Drain actions (`Cancel`/`MarkLost`/`Delete`)
 /// and `Promote` only need `model_id`, so they still run for a model whose spec
 /// has been disabled or deleted while replicas are being torn down.
+///
+/// `port_span` is the per-replica port window width (from config). `port_base` is
+/// the disjoint window base reserved for this `Submit` by the caller — reserving
+/// it in `main.rs` (rather than recomputing here) keeps multiple `Submit`s in the
+/// same tick from all landing on the same base. Ignored for non-`Submit` actions.
 pub async fn apply(
     action: &Action,
     model_id: uuid::Uuid,
     model_name: &str,
     submit_spec: Option<&ManagedModelSpec>,
     job_prefix: &str,
+    port_span: i64,
+    port_base: i64,
     slurm: &dyn SlurmClient,
     obleth: &dyn OblethClient,
 ) -> anyhow::Result<()> {
     match action {
         Action::Submit => {
             let spec = submit_spec.ok_or_else(|| {
-                anyhow::anyhow!("Submit requires a managed spec but none was provided (model {model_id})")
+                anyhow::anyhow!("Submit requires a managed spec (model {model_id})")
             })?;
-            let job = job_submit_from_spec(spec, model_name, job_prefix);
+            let job = job_submit_from_spec(spec, model_name, job_prefix, port_base, port_span);
             let job_id = slurm.submit(&job).await?;
-            obleth.create_replica(model_id, &job_id).await?;
+            obleth.create_replica(model_id, &job_id, port_base).await?;
         }
         Action::Promote { replica_id, api_base } => {
             tracing::info!(%replica_id, %api_base, model = model_name, "promoting replica to healthy");
@@ -77,9 +84,36 @@ fn host_from_api_base(api_base: &str) -> String {
 mod tests {
     use super::*;
     use crate::obleth_client::MockObleth;
-    use crate::slurm::MockSlurm;
     use std::sync::{atomic::AtomicU64, Mutex};
     use uuid::Uuid;
+
+    /// In-memory fake for executor/loop tests — no network.
+    struct MockSlurm {
+        jobs: Mutex<Vec<JobInfo>>,
+        submitted: Mutex<Vec<JobSubmit>>,
+        cancelled: Mutex<Vec<String>>,
+        next_id: AtomicU64,
+    }
+    #[async_trait::async_trait]
+    impl SlurmClient for MockSlurm {
+        async fn submit(&self, job: &JobSubmit) -> anyhow::Result<String> {
+            let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.submitted.lock().unwrap().push(job.clone());
+            let job_id = format!("job-{id}");
+            self.jobs.lock().unwrap().push(JobInfo { job_id: job_id.clone(), state: JobState::Pending, nodes: vec![] });
+            Ok(job_id)
+        }
+        async fn cancel(&self, job_id: &str) -> anyhow::Result<()> {
+            self.cancelled.lock().unwrap().push(job_id.to_string());
+            Ok(())
+        }
+        async fn list_owned_jobs(&self, _prefix: &str) -> anyhow::Result<Vec<JobInfo>> {
+            Ok(self.jobs.lock().unwrap().clone())
+        }
+        async fn discover_resources(&self) -> anyhow::Result<ClusterResources> {
+            Ok(ClusterResources::default())
+        }
+    }
 
     fn spec() -> ManagedModelSpec {
         ManagedModelSpec {
@@ -100,6 +134,7 @@ mod tests {
             serving_port: 8000,
             health_path: "/health".into(),
             target_replicas: 2,
+            min_replicas: 1,
             max_job_failures: 0,
             launcher_spec: None,
             created_at: chrono::Utc::now(),
@@ -116,7 +151,7 @@ mod tests {
         let slurm = mock_slurm();
         let obleth = MockObleth::default();
         let s = spec();
-        apply(&Action::Submit, s.model_id, "nemotron", Some(&s), "obleth-", &slurm, &obleth).await.unwrap();
+        apply(&Action::Submit, s.model_id, "nemotron", Some(&s), "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
         assert_eq!(slurm.submitted.lock().unwrap().len(), 1);
         assert_eq!(obleth.created_replicas.lock().unwrap().len(), 1);
     }
@@ -125,7 +160,7 @@ mod tests {
     async fn submit_without_spec_errors() {
         let slurm = mock_slurm();
         let obleth = MockObleth::default();
-        let err = apply(&Action::Submit, Uuid::new_v4(), "nemotron", None, "obleth-", &slurm, &obleth).await;
+        let err = apply(&Action::Submit, Uuid::new_v4(), "nemotron", None, "obleth-", 8, 8000, &slurm, &obleth).await;
         assert!(err.is_err(), "Submit must fail without a spec");
         assert_eq!(slurm.submitted.lock().unwrap().len(), 0);
     }
@@ -137,7 +172,7 @@ mod tests {
         let s = spec();
         let rid = Uuid::new_v4();
         apply(&Action::Promote { replica_id: rid, api_base: "http://gpu7:8000".into() },
-              s.model_id, "nemotron", Some(&s), "obleth-", &slurm, &obleth).await.unwrap();
+              s.model_id, "nemotron", Some(&s), "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
         assert_eq!(obleth.created_endpoints.lock().unwrap().len(), 1);
         let patched = obleth.patched.lock().unwrap();
         assert!(patched.iter().any(|p| p.0 == rid && p.1.as_deref() == Some("healthy")));
@@ -159,7 +194,7 @@ mod tests {
         let ep = Uuid::new_v4();
         // No spec needed for drain actions (drives the disabled/deleted path).
         apply(&Action::MarkLost { replica_id: rid, endpoint_id: Some(ep) },
-              Uuid::new_v4(), "nemotron", None, "obleth-", &slurm, &obleth).await.unwrap();
+              Uuid::new_v4(), "nemotron", None, "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
         assert!(obleth.deleted_endpoints.lock().unwrap().contains(&ep));
         let patched = obleth.patched.lock().unwrap();
         assert!(patched.iter().any(|p| p.0 == rid && p.1.as_deref() == Some("lost")));
@@ -172,7 +207,7 @@ mod tests {
         let rid = Uuid::new_v4();
         // No spec needed for drain actions.
         apply(&Action::Cancel { replica_id: rid, job_id: "j9".into() },
-              Uuid::new_v4(), "nemotron", None, "obleth-", &slurm, &obleth).await.unwrap();
+              Uuid::new_v4(), "nemotron", None, "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
         assert!(slurm.cancelled.lock().unwrap().contains(&"j9".to_string()));
         let patched = obleth.patched.lock().unwrap();
         assert!(patched.iter().any(|p| p.0 == rid && p.1.as_deref() == Some("draining")));

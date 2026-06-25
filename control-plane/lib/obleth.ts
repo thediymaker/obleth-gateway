@@ -156,6 +156,7 @@ export interface ManagedModelSpec {
   script_body: string;
   serving_port: number;
   health_path: string;
+  min_replicas: number;
   target_replicas: number;
   max_job_failures: number;
   launcher_spec?: Record<string, unknown> | null;
@@ -182,6 +183,7 @@ export interface PutManagedModel {
   script_body?: string;
   serving_port: number;
   health_path?: string;
+  min_replicas?: number;
   target_replicas?: number;
   max_job_failures?: number;
   launcher_spec?: Record<string, unknown> | null;
@@ -752,13 +754,12 @@ export interface TestAlertResult {
   results: ChannelResult[];
 }
 
-export type SavedRecipe = {
+export interface Recipe {
   id: string;
   name: string;
-  backend: string;
+  body: string;
   author: string;
-  spec: Record<string, unknown>;
-};
+}
 
 /// Error thrown when the management API responds with a non-2xx status. Carries
 /// the parsed `error` message so the UI can display something actionable.
@@ -1078,15 +1079,17 @@ export const obleth = {
   deleteManagedModel: (id: string) =>
     api<void>(`/models/${id}/managed`, { method: "DELETE" }),
   slurmResources: () => api<ClusterResources>(`/slurm/resources`),
-  listRecipes: () => api<SavedRecipe[]>(`/recipes`),
-  createRecipe: (body: Omit<SavedRecipe, "id">) =>
-    api<SavedRecipe>(`/recipes`, { method: "POST", body: JSON.stringify(body) }),
-  updateRecipe: (id: string, body: Omit<SavedRecipe, "id">) =>
-    api<SavedRecipe>(`/recipes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  listRecipes: () => api<Recipe[]>(`/recipes`),
+  createRecipe: (body: { name: string; body: string; author?: string }) =>
+    api<Recipe>(`/recipes`, { method: "POST", body: JSON.stringify(body) }),
+  updateRecipe: (id: string, body: { name: string; body: string; author?: string }) =>
+    api<Recipe>(`/recipes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteRecipe: (id: string) =>
     api<void>(`/recipes/${id}`, { method: "DELETE" }),
   listReplicas: (id: string) =>
     api<ModelReplica[]>(`/models/${id}/replicas`),
+  clearLostReplicas: (id: string) =>
+    api<{ deleted: number }>(`/models/${id}/replicas/clear-lost`, { method: "POST" }),
   createModelEndpoint: (
     id: string,
     body: {
