@@ -206,7 +206,11 @@ fn parse_job(body: &[u8]) -> Option<JobInfo> {
         return None;
     }
     let raw_state = job_state_to_string(&j.job_state);
-    let reason = j.state_reason.as_str().map(str::to_string).filter(|r| !r.is_empty());
+    let reason = j
+        .state_reason
+        .as_str()
+        .map(str::to_string)
+        .filter(|r| !r.trim().is_empty() && !r.eq_ignore_ascii_case("none"));
     Some(JobInfo {
         job_id,
         state: map_job_state(&raw_state),
@@ -613,6 +617,8 @@ mod tests {
         let j = parse_job(&body).expect("job");
         assert_eq!(j.job_id, "123");
         assert_eq!(j.raw_state, "PENDING");
+        assert_eq!(j.state, JobState::Pending);
+        assert_eq!(j.nodes, Vec::<String>::new());
         assert_eq!(j.reason.as_deref(), Some("Resources"));
     }
 
@@ -633,6 +639,34 @@ mod tests {
         assert!(parse_job(&empty).is_none());
         let no_id = serde_json::to_vec(&serde_json::json!({ "jobs": [ { "job_state": "RUNNING" } ] })).unwrap();
         assert!(parse_job(&no_id).is_none());
+    }
+
+    #[test]
+    fn parse_job_collapses_none_reason_at_parse_time() {
+        // Literal "None" and whitespace-only reasons collapse to None
+        let none_literal = serde_json::to_vec(&serde_json::json!({ "jobs": [
+            { "job_id": 1, "job_state": "PENDING", "state_reason": "None" },
+        ] })).unwrap();
+        let j = parse_job(&none_literal).expect("job");
+        assert_eq!(j.reason, None, "literal 'None' reason should collapse to None");
+
+        let none_mixed_case = serde_json::to_vec(&serde_json::json!({ "jobs": [
+            { "job_id": 2, "job_state": "PENDING", "state_reason": "nOnE" },
+        ] })).unwrap();
+        let j = parse_job(&none_mixed_case).expect("job");
+        assert_eq!(j.reason, None, "case-insensitive 'None' should collapse");
+
+        let whitespace_only = serde_json::to_vec(&serde_json::json!({ "jobs": [
+            { "job_id": 3, "job_state": "PENDING", "state_reason": "   " },
+        ] })).unwrap();
+        let j = parse_job(&whitespace_only).expect("job");
+        assert_eq!(j.reason, None, "whitespace-only reason should collapse");
+
+        let valid_reason = serde_json::to_vec(&serde_json::json!({ "jobs": [
+            { "job_id": 4, "job_state": "PENDING", "state_reason": "Resources" },
+        ] })).unwrap();
+        let j = parse_job(&valid_reason).expect("job");
+        assert_eq!(j.reason, Some("Resources".to_string()), "valid reasons preserved");
     }
 
     #[test]
