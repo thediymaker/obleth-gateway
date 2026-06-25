@@ -32,7 +32,19 @@ pub async fn apply(
             })?;
             let job = job_submit_from_spec(spec, model_name, job_prefix, port_base, port_span);
             let job_id = slurm.submit(&job).await?;
-            obleth.create_replica(model_id, &job_id, port_base).await?;
+            // Record the replica that tracks this job. If recording fails, the job
+            // is already running on Slurm with nothing pointing at it — and we no
+            // longer scan the cluster to find such orphans — so cancel it right
+            // here (compensating action) to avoid leaking a GPU allocation.
+            if let Err(e) = obleth.create_replica(model_id, &job_id, port_base).await {
+                match slurm.cancel(&job_id).await {
+                    Ok(()) => tracing::warn!(%job_id, model = model_name,
+                        "cancelled just-submitted job after replica record failed"),
+                    Err(ce) => tracing::error!(%job_id, model = model_name, error = %ce,
+                        "replica record failed AND orphan cancel failed; manual cleanup may be needed"),
+                }
+                return Err(e);
+            }
         }
         Action::Promote { replica_id, api_base } => {
             tracing::info!(%replica_id, %api_base, model = model_name, "promoting replica to healthy");
@@ -107,8 +119,8 @@ mod tests {
             self.cancelled.lock().unwrap().push(job_id.to_string());
             Ok(())
         }
-        async fn list_owned_jobs(&self, _prefix: &str) -> anyhow::Result<Vec<JobInfo>> {
-            Ok(self.jobs.lock().unwrap().clone())
+        async fn get_job(&self, job_id: &str) -> anyhow::Result<Option<JobInfo>> {
+            Ok(self.jobs.lock().unwrap().iter().find(|j| j.job_id == job_id).cloned())
         }
         async fn discover_resources(&self) -> anyhow::Result<ClusterResources> {
             Ok(ClusterResources::default())
@@ -154,6 +166,23 @@ mod tests {
         apply(&Action::Submit, s.model_id, "nemotron", Some(&s), "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
         assert_eq!(slurm.submitted.lock().unwrap().len(), 1);
         assert_eq!(obleth.created_replicas.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn submit_cancels_job_when_replica_record_fails() {
+        // The job submits, but recording its replica fails — the executor must
+        // cancel the just-submitted job so it doesn't leak, and surface the error.
+        let slurm = mock_slurm();
+        let obleth = MockObleth::default();
+        obleth.fail_create_replica.store(true, std::sync::atomic::Ordering::SeqCst);
+        let s = spec();
+        let err = apply(&Action::Submit, s.model_id, "nemotron", Some(&s), "obleth-", 8, 8000, &slurm, &obleth).await;
+        assert!(err.is_err(), "Submit must propagate the record failure");
+        let submitted = slurm.submitted.lock().unwrap();
+        let cancelled = slurm.cancelled.lock().unwrap();
+        assert_eq!(submitted.len(), 1, "the job was submitted");
+        assert_eq!(cancelled.len(), 1, "the orphan job was cancelled");
+        assert_eq!(obleth.created_replicas.lock().unwrap().len(), 0);
     }
 
     #[tokio::test]

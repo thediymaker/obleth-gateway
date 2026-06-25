@@ -193,6 +193,9 @@ pub struct MockObleth {
     pub deleted_endpoints: std::sync::Mutex<Vec<Uuid>>,
     pub deleted_replicas: std::sync::Mutex<Vec<Uuid>>,
     pub patched: std::sync::Mutex<Vec<(Uuid, Option<String>)>>, // (replica_id, state)
+    /// When set, `create_replica` returns an error — drives the compensating
+    /// "cancel the orphan job" path in the Submit executor.
+    pub fail_create_replica: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -211,6 +214,9 @@ impl OblethClient for MockObleth {
         Ok(self.replicas.lock().unwrap().clone())
     }
     async fn create_replica(&self, model_id: Uuid, slurm_job_id: &str, port_base: i64) -> anyhow::Result<Uuid> {
+        if self.fail_create_replica.load(std::sync::atomic::Ordering::SeqCst) {
+            anyhow::bail!("simulated create_replica failure");
+        }
         self.created_replicas.lock().unwrap().push((model_id, slurm_job_id.to_string(), port_base));
         Ok(Uuid::new_v4())
     }

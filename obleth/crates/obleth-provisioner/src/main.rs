@@ -6,7 +6,7 @@ mod config; mod plan; mod obleth_client; mod probe; mod executor;
 // discovery code into the binary too, where it is unused (dead-code warnings).
 pub(crate) use obleth_provisioner::{domain, slurm};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::time::Duration;
 use config::ProvisionerConfig;
 use obleth_client::{HttpObleth, OblethClient};
@@ -87,10 +87,24 @@ async fn tick(
     http: &reqwest::Client,
 ) -> anyhow::Result<()> {
     let specs = obleth.list_managed_models().await?;          // obleth down -> bail (held). enabled only.
-    let owned = slurm.list_owned_jobs(&cfg.job_name_prefix).await?; // slurm down -> bail (held)
-    let all_replicas = obleth.list_all_replicas().await?;
-    let jobs: HashMap<String, domain::JobInfo> =
-        owned.iter().map(|j| (j.job_id.clone(), j.clone())).collect();
+    let all_replicas = obleth.list_all_replicas().await?;     // obleth down -> bail (held)
+
+    // Look up Slurm state for just the jobs we track, by id — never the whole
+    // controller (which on a busy cluster is huge and OOM-kills us). A clean
+    // "not found" leaves a job out of the map, which the planner reads as gone;
+    // a transport/HTTP error bails the whole tick so an unreachable Slurm is
+    // never mistaken for a fleet of dead jobs (no destructive action while held).
+    let mut jobs: HashMap<String, domain::JobInfo> = HashMap::new();
+    for id in all_replicas.iter().map(|r| &r.slurm_job_id) {
+        if id.is_empty() || jobs.contains_key(id) {
+            continue;
+        }
+        match slurm.get_job(id).await {
+            Ok(Some(info)) => { jobs.insert(id.clone(), info); }
+            Ok(None) => {} // gone/purged -> absent from map -> planner reconciles it away
+            Err(e) => return Err(e.context("slurm job lookup failed; holding tick")),
+        }
+    }
 
     // Group every known replica by model so we can both reconcile the enabled
     // models and drain whatever rows belong to models that have left the set.
@@ -233,18 +247,8 @@ async fn tick(
         }
     }
 
-    // 3. Cancel orphan jobs: ours by name, but with no replica row tracking them.
-    //    This happens when a prior tick submitted a job but failed to record the
-    //    replica row, so the planner never sees the job and would otherwise leak
-    //    it (a live GPU allocation) until its time limit.
-    let known: HashSet<&str> = all_replicas.iter().map(|r| r.slurm_job_id.as_str()).collect();
-    for j in &owned {
-        if !known.contains(j.job_id.as_str()) {
-            match slurm.cancel(&j.job_id).await {
-                Ok(()) => tracing::warn!(job_id = %j.job_id, "cancelled orphan slurm job (no replica row)"),
-                Err(e) => tracing::warn!(job_id = %j.job_id, error = %e, "failed to cancel orphan job; continuing"),
-            }
-        }
-    }
+    // Orphan jobs (submitted but never recorded) are prevented at the source:
+    // the Submit executor cancels a job if recording its replica fails. So there
+    // is no periodic cluster-wide scan here — we never list the whole controller.
     Ok(())
 }
