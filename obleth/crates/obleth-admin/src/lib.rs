@@ -179,6 +179,10 @@ pub fn router(state: AdminState) -> Router {
                 .put(put_managed_model)
                 .delete(delete_managed_model),
         )
+        .route(
+            "/api/v1/models/:id/managed/provision-error",
+            patch(set_provision_error),
+        )
         .route("/api/v1/replicas", get(list_all_replicas))
         .route(
             "/api/v1/replicas/:id",
@@ -3279,6 +3283,23 @@ async fn delete_managed_model(
         )
         .await?;
     Ok(Json(serde_json::json!({"deleted": true})))
+}
+
+#[derive(serde::Deserialize)]
+struct ProvisionErrorBody {
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[utoipa::path(patch, path = "/api/v1/models/{id}/managed/provision-error",
+    responses((status = 200)))]
+async fn set_provision_error(
+    State(state): State<AdminState>,
+    Path(id): Path<uuid::Uuid>,
+    Json(body): Json<ProvisionErrorBody>,
+) -> Result<Json<serde_json::Value>> {
+    state.store.set_provision_error(id, body.error.as_deref()).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 // ---- replica registry ----------------------------------------------------
