@@ -3357,6 +3357,8 @@ async fn patch_replica(
             .store
             .update_replica_state(id, state_val, body.message.as_deref())
             .await?;
+    } else if let Some(msg) = body.message.as_deref() {
+        state.store.set_replica_message(id, msg).await?;
     }
     if body.nodes.is_some() || body.endpoint_id.is_some() {
         state

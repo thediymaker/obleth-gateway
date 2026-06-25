@@ -1834,6 +1834,23 @@ impl Store {
         replica_from_row(&row)
     }
 
+    /// Update just a replica's last_message (used by the provisioner's live-status
+    /// annotation, which carries no state/runtime change). Returns the updated row.
+    pub async fn set_replica_message(&self, id: Uuid, message: &str) -> Result<ModelReplica> {
+        let row = sqlx::query(
+            "update model_replicas set last_message = $2, updated_at = now()
+             where id = $1
+             returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
+                       last_message, port_base, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(message)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        replica_from_row(&row)
+    }
+
     /// Fetch a single replica by id. Returns `None` if no row exists.
     pub async fn get_replica(&self, id: Uuid) -> Result<Option<ModelReplica>> {
         let row = sqlx::query(
@@ -3584,5 +3601,47 @@ mod tests {
 
         // Clean up.
         store.delete_replica(r2.id).await.expect("delete r2");
+    }
+
+    #[tokio::test]
+    async fn set_replica_message_test() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        let model_name = format!("m-{}", Uuid::new_v4());
+        let args = default_test_model(&model_name);
+        let model = store
+            .create_model(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
+                &args.19, &args.20, &args.21,
+            )
+            .await
+            .expect("create model");
+
+        let replica = store
+            .create_replica(model.id, "job-msg-1", None)
+            .await
+            .expect("create replica");
+
+        // A message-only update must persist without touching state.
+        let updated = store
+            .set_replica_message(replica.id, "provisioning: waiting for allocation")
+            .await
+            .expect("set_replica_message");
+        assert_eq!(
+            updated.last_message.as_deref(),
+            Some("provisioning: waiting for allocation"),
+            "last_message must be persisted"
+        );
+        assert_eq!(updated.state, replica.state, "state must be unchanged");
+
+        // Clean up.
+        store.delete_replica(replica.id).await.expect("delete replica");
     }
 }
