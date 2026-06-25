@@ -31,11 +31,18 @@ pub async fn apply(
                 anyhow::anyhow!("Submit requires a managed spec (model {model_id})")
             })?;
             let job = job_submit_from_spec(spec, model_name, job_prefix, port_base, port_span);
-            let job_id = slurm.submit(&job).await?;
+            let job_id = match slurm.submit(&job).await {
+                Ok(id) => id,
+                Err(e) => {
+                    // Slurm rejected the submit (e.g. bad account/partition/qos).
+                    // Surface it in the dashboard, best-effort, then propagate.
+                    let _ = obleth.set_provision_error(model_id, Some(&e.to_string())).await;
+                    return Err(e);
+                }
+            };
             // Record the replica that tracks this job. If recording fails, the job
-            // is already running on Slurm with nothing pointing at it — and we no
-            // longer scan the cluster to find such orphans — so cancel it right
-            // here (compensating action) to avoid leaking a GPU allocation.
+            // is already running with nothing pointing at it — and we no longer
+            // scan the cluster for orphans — so cancel it (compensating action).
             if let Err(e) = obleth.create_replica(model_id, &job_id, port_base).await {
                 match slurm.cancel(&job_id).await {
                     Ok(()) => tracing::warn!(%job_id, model = model_name,
@@ -45,6 +52,8 @@ pub async fn apply(
                 }
                 return Err(e);
             }
+            // Submitted and recorded: clear any prior provisioning error.
+            let _ = obleth.set_provision_error(model_id, None).await;
         }
         Action::Promote { replica_id, api_base } => {
             tracing::info!(%replica_id, %api_base, model = model_name, "promoting replica to healthy");
@@ -105,10 +114,14 @@ mod tests {
         submitted: Mutex<Vec<JobSubmit>>,
         cancelled: Mutex<Vec<String>>,
         next_id: AtomicU64,
+        fail_submit: std::sync::atomic::AtomicBool,
     }
     #[async_trait::async_trait]
     impl SlurmClient for MockSlurm {
         async fn submit(&self, job: &JobSubmit) -> anyhow::Result<String> {
+            if self.fail_submit.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("simulated submit rejection (error 2045)");
+            }
             let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.submitted.lock().unwrap().push(job.clone());
             let job_id = format!("job-{id}");
@@ -157,7 +170,7 @@ mod tests {
     }
 
     fn mock_slurm() -> MockSlurm {
-        MockSlurm { jobs: Mutex::new(vec![]), submitted: Mutex::new(vec![]), cancelled: Mutex::new(vec![]), next_id: AtomicU64::new(1) }
+        MockSlurm { jobs: Mutex::new(vec![]), submitted: Mutex::new(vec![]), cancelled: Mutex::new(vec![]), next_id: AtomicU64::new(1), fail_submit: std::sync::atomic::AtomicBool::new(false) }
     }
 
     #[tokio::test]
@@ -242,5 +255,30 @@ mod tests {
         assert!(slurm.cancelled.lock().unwrap().contains(&"j9".to_string()));
         let patched = obleth.patched.lock().unwrap();
         assert!(patched.iter().any(|p| p.0 == rid && p.1.as_deref() == Some("draining")));
+    }
+
+    #[tokio::test]
+    async fn submit_records_provision_error_on_rejection() {
+        let slurm = mock_slurm();
+        slurm.fail_submit.store(true, std::sync::atomic::Ordering::SeqCst);
+        let obleth = MockObleth::default();
+        let s = spec();
+        let err = apply(&Action::Submit, s.model_id, "nemotron", Some(&s), "obleth-", 8, 8000, &slurm, &obleth).await;
+        assert!(err.is_err(), "submit rejection propagates");
+        let perr = obleth.provision_errors.lock().unwrap();
+        assert_eq!(perr.len(), 1);
+        assert_eq!(perr[0].0, s.model_id);
+        assert!(perr[0].1.as_deref().unwrap().contains("2045"));
+        assert_eq!(obleth.created_replicas.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn submit_clears_provision_error_on_success() {
+        let slurm = mock_slurm();
+        let obleth = MockObleth::default();
+        let s = spec();
+        apply(&Action::Submit, s.model_id, "nemotron", Some(&s), "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
+        let perr = obleth.provision_errors.lock().unwrap();
+        assert!(perr.iter().any(|(id, e)| *id == s.model_id && e.is_none()), "clears on success");
     }
 }
