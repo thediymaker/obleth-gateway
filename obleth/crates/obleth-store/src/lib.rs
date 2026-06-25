@@ -1586,6 +1586,19 @@ impl Store {
         row.as_ref().map(managed_model_from_row).transpose()
     }
 
+    /// Just the health floor for a managed model. Used on the health-check hot
+    /// path so it doesn't fetch + deserialize the full spec (script_body,
+    /// launcher_spec JSON, ...) only to read one scalar.
+    pub async fn get_managed_min_replicas(&self, model_id: Uuid) -> Result<Option<i64>> {
+        let v = sqlx::query_scalar::<_, i64>(
+            "select min_replicas from managed_models where model_id = $1",
+        )
+        .bind(model_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(v)
+    }
+
     pub async fn list_managed_models(&self) -> Result<Vec<ManagedModelSpec>> {
         let rows = sqlx::query(
             "select model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
@@ -1646,7 +1659,10 @@ impl Store {
         .bind(m.serving_port)
         .bind(&m.health_path)
         .bind(m.target_replicas.max(1))
-        .bind(m.min_replicas.max(1))
+        // The health floor cannot exceed the count the reconciler submits toward;
+        // otherwise the model could never reach `min_replicas` healthy and would
+        // be wedged below its floor forever. Clamp to [1, target_replicas].
+        .bind(m.min_replicas.clamp(1, m.target_replicas.max(1)))
         .bind(m.max_job_failures.max(0))
         .bind(m.launcher_spec.as_ref().map(sqlx::types::Json))
         .fetch_one(&self.pool)

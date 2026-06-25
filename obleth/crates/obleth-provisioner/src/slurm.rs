@@ -20,10 +20,15 @@ pub trait SlurmClient: Send + Sync {
 /// is present, otherwise prepended.
 fn inject_port_preamble(script: &str, port_base: i64, span: i64) -> String {
     let span = span.max(1);
+    // Pure-bash: a C-style range loop (no `seq`) and a /dev/tcp probe in a
+    // subshell (no `timeout`) so the block survives minimal images that ship
+    // neither coreutils tool. A successful connect means the port is already
+    // taken; the first one we *cannot* connect to is free. localhost connects
+    // resolve immediately, so no timeout guard is needed.
     let block = format!(
         "# obleth: bind the first free port in this replica's window\n\
-         for __p in $(seq {base} {last}); do\n\
-         \x20 if ! timeout 1 bash -c \"exec 3<>/dev/tcp/127.0.0.1/$__p\" 2>/dev/null; then export OBLETH_SERVING_PORT=$__p; break; fi\n\
+         for ((__p={base}; __p<={last}; __p++)); do\n\
+         \x20 if ! (exec 3<>/dev/tcp/127.0.0.1/$__p) 2>/dev/null; then export OBLETH_SERVING_PORT=$__p; break; fi\n\
          done\n\
          export OBLETH_SERVING_PORT=${{OBLETH_SERVING_PORT:-{base}}}\n",
         base = port_base, last = port_base + span - 1,
@@ -521,7 +526,7 @@ mod tests {
     #[test]
     fn port_preamble_uses_correct_window() {
         let j = job_submit_from_spec(&spec(), "nemotron", "obleth-", 8016, 8);
-        assert!(j.script.contains("seq 8016 8023"), "window base and last computed correctly");
+        assert!(j.script.contains("__p=8016; __p<=8023"), "window base and last computed correctly");
         assert!(j.script.contains("OBLETH_SERVING_PORT:-8016"), "fallback to window base");
     }
 

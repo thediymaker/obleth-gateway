@@ -8,6 +8,19 @@
 alter table model_replicas add column if not exists port_base bigint;
 alter table model_replicas alter column port_base type bigint;
 
+-- Backfill replicas that predate this column: a NULL port_base decodes to 0 in
+-- the provisioner, which would make it probe ports 0..span and never rediscover
+-- a running replica. Seed it from the model's configured serving_port (the
+-- window base the provisioner would now assign). Idempotent: only touches NULLs.
+update model_replicas r
+   set port_base = m.serving_port
+  from managed_models m
+ where r.model_id = m.model_id
+   and r.port_base is null;
+-- Any replica with no managed_models row (orphan) still falls back to its
+-- model's serving port via the join above; remaining NULLs (none expected) stay
+-- NULL and are handled by the decode fallback.
+
 -- Health floor, distinct from target_replicas (the count the reconciler submits
 -- toward). A model is healthy when at least min_replicas replicas are healthy.
 -- bigint to match target_replicas (also bigint) and the Rust i64 mapping.

@@ -2167,6 +2167,11 @@ fn rendezvous_score(session_key: &str, endpoint_id: &str) -> u64 {
 /// reshuffles only minimally. With no session key, falls back to weighted order.
 fn session_hash_order<'a>(items: Vec<&'a ResolvedEndpoint>, session_key: &str) -> Vec<&'a ResolvedEndpoint> {
     if session_key.is_empty() {
+        // No session key on the request, so stickiness is impossible: this falls
+        // back to weighted_order, i.e. session_hash behaves like load_balance.
+        // Logged (debug, not warn — keyless requests are common and expected) so
+        // operators can see why a session_hash model isn't actually sticking.
+        tracing::debug!("session_hash selected but request has no session key; falling back to weighted order");
         return weighted_order(items);
     }
     let mut scored: Vec<(u64, &ResolvedEndpoint)> = items

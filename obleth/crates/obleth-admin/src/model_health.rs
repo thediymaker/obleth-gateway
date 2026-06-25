@@ -286,11 +286,10 @@ async fn run_model_health_check(
         // to 1 when the spec is absent (e.g. a transient race or data gap).
         let min_replicas = state
             .store
-            .get_managed_model(model.id)
+            .get_managed_min_replicas(model.id)
             .await
             .ok()
             .flatten()
-            .map(|s| s.min_replicas)
             .unwrap_or(1);
         aggregate_endpoint_health(&endpoint_results, min_replicas)
     } else {

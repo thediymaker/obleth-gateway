@@ -135,12 +135,34 @@ async fn tick(
                                 );
                             }
                             Some(node) => {
-                                let mut found: Option<u16> = None;
+                                // Probe the whole window concurrently rather than
+                                // sequentially: a not-yet-up replica otherwise costs
+                                // port_span * health_timeout of serial waits every
+                                // tick (8 * 5s = 40s with the defaults), which can
+                                // exceed the tick interval and stall the loop.
+                                let mut set = tokio::task::JoinSet::new();
                                 for p in r.port_base..(r.port_base + cfg.port_span) {
-                                    let api_base = format!("http://{node}:{p}");
-                                    if probe::is_healthy(http, &api_base, &spec.health_path, cfg.health_timeout_secs).await {
-                                        found = Some(p as u16);
-                                        break;
+                                    // Skip ports outside the valid TCP range so a high
+                                    // serving_port + window can't wrap on the u16 cast.
+                                    if p <= 0 || p > u16::MAX as i64 {
+                                        continue;
+                                    }
+                                    let http = http.clone();
+                                    let node = node.clone();
+                                    let health_path = spec.health_path.clone();
+                                    let timeout = cfg.health_timeout_secs;
+                                    set.spawn(async move {
+                                        let api_base = format!("http://{node}:{p}");
+                                        (p, probe::is_healthy(&http, &api_base, &health_path, timeout).await)
+                                    });
+                                }
+                                // The bound port is whichever responds healthy; pick
+                                // the lowest for a stable, deterministic choice.
+                                let mut found: Option<u16> = None;
+                                while let Some(res) = set.join_next().await {
+                                    if let Ok((p, true)) = res {
+                                        let p = p as u16;
+                                        found = Some(found.map_or(p, |cur| cur.min(p)));
                                     }
                                 }
                                 if let Some(p) = found {
@@ -167,7 +189,7 @@ async fn tick(
             }
         }
 
-        let live_port_bases: Vec<i64> = replicas.iter()
+        let mut live_port_bases: Vec<i64> = replicas.iter()
             .filter(|r| r.state != "lost" && r.state != "draining")
             .map(|r| r.port_base)
             .collect();
@@ -178,7 +200,17 @@ async fn tick(
         };
         let actions = plan::plan(&view, &replicas, &jobs, &health, cfg.lost_retention_secs);
         for action in &actions {
-            if let Err(e) = executor::apply(action, spec.model_id, &model_name, Some(spec), &cfg.job_name_prefix, cfg.port_span, &live_port_bases, slurm, obleth).await {
+            // Reserve a distinct window per Submit *before* applying, so several
+            // Submits in one tick don't all collapse onto the same port_base
+            // (live_port_bases is recomputed per tick, not per action otherwise).
+            let port_base = if matches!(action, domain::Action::Submit) {
+                let b = plan::next_free_window_base(spec.serving_port, cfg.port_span, &live_port_bases);
+                live_port_bases.push(b);
+                b
+            } else {
+                0
+            };
+            if let Err(e) = executor::apply(action, spec.model_id, &model_name, Some(spec), &cfg.job_name_prefix, cfg.port_span, port_base, slurm, obleth).await {
                 tracing::warn!(?action, error = %e, "action failed; continuing");
             }
         }
@@ -194,7 +226,8 @@ async fn tick(
         let view = plan::ManagedSpecView { target_replicas: 0, max_job_failures: 0 };
         let actions = plan::plan(&view, &replicas, &jobs, &HashMap::new(), cfg.lost_retention_secs);
         for action in &actions {
-            if let Err(e) = executor::apply(action, model_id, &model_name, None, &cfg.job_name_prefix, cfg.port_span, &[], slurm, obleth).await {
+            // Drain reconciles toward target 0, so no Submit fires; port_base is unused.
+            if let Err(e) = executor::apply(action, model_id, &model_name, None, &cfg.job_name_prefix, cfg.port_span, 0, slurm, obleth).await {
                 tracing::warn!(?action, error = %e, "drain action failed; continuing");
             }
         }

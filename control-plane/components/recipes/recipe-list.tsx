@@ -35,6 +35,7 @@ import {
 } from "@/components/ui/dialog";
 import { cn } from "@/lib/utils";
 import { useClusterResources } from "@/lib/use-cluster-resources";
+import { splitFrontmatter } from "@/lib/recipe-frontmatter";
 import type { RecipeCard, RecipeDeployPreview } from "./recipe-card";
 
 function compactJoin(parts: Array<string | number | null | undefined>): string {
@@ -170,18 +171,6 @@ function RecipeStatus({ recipe }: { recipe: RecipeCard }) {
   );
 }
 
-/** Split a `---`-fenced recipe document into its frontmatter and script body.
- *  Mirrors the server splitter; kept inline so this client file never imports
- *  the fs-touching loader. */
-function splitDoc(text: string): { header: string; body: string } | null {
-  const norm = text.replace(/\r\n/g, "\n");
-  if (!norm.startsWith("---\n")) return null;
-  const m = norm.slice(4).match(/\n---(?:\n|$)/);
-  if (!m || m.index === undefined) return null;
-  const fenceStart = 4 + m.index;
-  return { header: norm.slice(4, fenceStart), body: norm.slice(fenceStart + m[0].length) };
-}
-
 export function RecipeList({
   recipes,
   onDeployed,
@@ -255,8 +244,7 @@ export function RecipeList({
 
   function saveAsTemplate() {
     if (!selected) return;
-    const split = selected.body ? splitDoc(selected.body) : null;
-    const header = split ? split.header : "";
+    const header = (selected.body ? splitFrontmatter(selected.body) : null)?.header ?? "";
     const doc = `---\n${header}\n---\n${scriptDraft}`;
     setSelected(null);
     setEditorInitial({ name: `${selected.name ?? selected.id} (copy)`, body: doc });
@@ -276,7 +264,11 @@ export function RecipeList({
         time_limit: overrides.timeLimit,
         partition: overrides.partition,
         variables: vars,
-        script_body: scriptDraft,
+        // Only override the recipe's body when the user actually has content in
+        // the editor; an empty string is NOT nullish and would otherwise replace
+        // the real recipe body with a blank launch script (buildManagedFromRecipe
+        // uses `overrides.script_body ?? recipe.body`).
+        script_body: scriptDraft.trim() ? scriptDraft : undefined,
       });
       if (res.ok) {
         setSelected(null);

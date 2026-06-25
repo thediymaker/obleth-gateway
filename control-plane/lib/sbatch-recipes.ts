@@ -13,6 +13,7 @@ import { z } from "zod";
 import type { RecipeCard, RecipeDeployPreview } from "@/components/recipes/recipe-card";
 import { toRecipeCards } from "@/components/recipes/recipe-card";
 import { parseSbatchDirectives, type ParsedDirectives } from "./sbatch-directives";
+import { splitFrontmatter } from "./recipe-frontmatter";
 import type { PutManagedModel } from "@/lib/obleth";
 import { obleth } from "@/lib/obleth";
 
@@ -106,19 +107,6 @@ const HeaderSchema = z
   })
   .strip();
 
-/** Split a Jekyll-style `---`\n header \n`---`\n body document. */
-function splitFrontmatter(text: string): { header: string; body: string } | null {
-  const norm = text.replace(/\r\n/g, "\n");
-  if (!norm.startsWith("---\n")) return null;
-  // Match a closing fence: exactly "---" on its own line
-  const m = norm.slice(4).match(/\n---(?:\r?\n|$)/);
-  if (!m || m.index === undefined) return null;
-  const fenceStart = 4 + m.index;          // index of the "\n" before "---"
-  const header = norm.slice(4, fenceStart);
-  const body = norm.slice(fenceStart + m[0].length); // skip past "\n---\n"
-  return { header, body };
-}
-
 export function parseRecipe(id: string, text: string): ParsedRecipe {
   const split = splitFrontmatter(text);
   if (!split) {
@@ -152,8 +140,10 @@ export function recipesDir(): string {
   return path.join(process.cwd(), "recipes");
 }
 
-/** Every `*.recipe` in the directory, valid and invalid, sorted by id. Never throws. */
-export function listRecipes(): ParsedRecipe[] {
+/** `{ id }` for every `*.recipe` file in the directory, sorted by id. Never
+ *  throws (a missing/unreadable directory yields []). Shared scan so the two
+ *  public listers below can't drift in ordering or directory handling. */
+function recipeFileIds(): { id: string; name: string }[] {
   const dir = recipesDir();
   let entries: string[];
   try {
@@ -162,9 +152,17 @@ export function listRecipes(): ParsedRecipe[] {
   } catch {
     return [];
   }
+  return entries
+    .filter((f) => f.endsWith(".recipe"))
+    .sort()
+    .map((name) => ({ id: name.slice(0, -".recipe".length), name }));
+}
+
+/** Every `*.recipe` in the directory, valid and invalid, sorted by id. Never throws. */
+export function listRecipes(): ParsedRecipe[] {
+  const dir = recipesDir();
   const out: ParsedRecipe[] = [];
-  for (const name of entries.filter((f) => f.endsWith(".recipe")).sort()) {
-    const id = name.slice(0, -".recipe".length);
+  for (const { id, name } of recipeFileIds()) {
     try {
       out.push(parseRecipe(id, readFileSync(path.join(dir, name), "utf8")));
     } catch (e) {
@@ -179,16 +177,8 @@ export function listRecipes(): ParsedRecipe[] {
  *  skipped, never throws. */
 export function listRecipeDocs(): { id: string; text: string }[] {
   const dir = recipesDir();
-  let entries: string[];
-  try {
-    if (!statSync(dir).isDirectory()) return [];
-    entries = readdirSync(dir);
-  } catch {
-    return [];
-  }
   const out: { id: string; text: string }[] = [];
-  for (const name of entries.filter((f) => f.endsWith(".recipe")).sort()) {
-    const id = name.slice(0, -".recipe".length);
+  for (const { id, name } of recipeFileIds()) {
     try {
       out.push({ id, text: readFileSync(path.join(dir, name), "utf8") });
     } catch {
