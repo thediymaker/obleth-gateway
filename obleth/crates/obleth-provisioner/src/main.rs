@@ -153,7 +153,13 @@ async fn tick(
         // (there is no separate MarkStarting step), so we must probe both states.
         let mut health: HashMap<uuid::Uuid, u16> = HashMap::new();
         for r in &replicas {
-            if r.state == "starting" || r.state == "pending" {
+            // Probe replicas awaiting promotion, plus any stranded "healthy" row
+            // with no endpoint linked (a prior promote whose endpoint write
+            // failed) so the planner can re-promote and re-link it.
+            if r.state == "starting"
+                || r.state == "pending"
+                || (r.state == "healthy" && r.endpoint_id.is_none())
+            {
                 if let Some(j) = jobs.get(&r.slurm_job_id) {
                     if j.state == domain::JobState::Running {
                         match j.nodes.first() {
