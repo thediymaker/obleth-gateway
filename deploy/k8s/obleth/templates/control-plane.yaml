@@ -31,6 +31,7 @@ spec:
           securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
           env:
             - { name: OBLETH_ADMIN_BASE_URL, value: "http://{{ include "obleth.fullname" . }}:9180" }
+            - { name: OBLETH_PROXY_BASE_URL, value: "http://{{ include "obleth.fullname" . }}:8080" }
             - name: OBLETH_ADMIN_TOKEN
               valueFrom:
                 secretKeyRef:
