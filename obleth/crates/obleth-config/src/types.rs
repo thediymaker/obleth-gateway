@@ -587,6 +587,10 @@ pub struct ModelReplica {
     pub last_message: Option<String>,
     #[serde(default)]
     pub port_base: Option<i64>,
+    /// Operator requested this replica be restarted: the provisioner cancels its
+    /// Slurm job and the resubmit-to-target then launches a fresh one.
+    #[serde(default)]
+    pub cancel_requested: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }

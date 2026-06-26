@@ -188,6 +188,7 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/replicas/:id",
             patch(patch_replica).delete(delete_replica),
         )
+        .route("/api/v1/replicas/:id/restart", post(restart_replica))
         .route(
             "/api/v1/models/:id/replicas",
             get(list_replicas).post(create_replica),
@@ -3389,6 +3390,26 @@ async fn patch_replica(
         )
         .await?;
     Ok(Json(current))
+}
+
+#[utoipa::path(post, path = "/api/v1/replicas/{id}/restart",
+    responses((status = 200)))]
+async fn restart_replica(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<serde_json::Value>> {
+    state.store.request_replica_cancel(id).await?;
+    state
+        .store
+        .record_audit(
+            "admin",
+            "restart_replica",
+            "model_replica",
+            &id.to_string(),
+            serde_json::json!({}),
+        )
+        .await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 #[utoipa::path(delete, path = "/api/v1/replicas/{id}",
