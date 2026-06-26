@@ -4,6 +4,14 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.4.12
+Steadier health status and cleaner replica teardown.
+
+- **Health status stops flapping to "down"** on a single failed probe. The model badge now only reads unhealthy once it crosses the configured failure threshold — matching when an alert actually fires — instead of flipping on the latest check. The active probe also makes one extra attempt with a short backoff, so brief blips (common on cold Slurm nodes) don't register at all.
+- **Deleting a managed model no longer strands its Slurm jobs.** A model's replicas now drain properly after the model is deleted — the provisioner cancels their jobs and cleans up — instead of the jobs being left running on the cluster with nothing tracking them.
+- **Replicas no longer get stuck "draining."** Once a cancelled replica's Slurm job ends, its row is removed instead of lingering in the panel indefinitely.
+- **Provisioning tab refresh:** the settings form and replica list are restyled with clearer per-replica status, and saving provisioning settings now shows inline confirmation.
+
 ## v0.4.11
 Restart a replica from the dashboard.
 
