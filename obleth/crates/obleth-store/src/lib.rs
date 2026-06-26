@@ -3328,8 +3328,10 @@ mod tests {
         assert_eq!(spec.partition, "gpu-preempt");
         assert_eq!(spec.launcher_spec, Some(serde_json::json!({"backendId":"llamacpp"})));
 
+        // Assert membership, not a global count — other tests share this DB and
+        // may have their own managed models, so an exact count is flaky in CI.
         let listed = store.list_managed_models().await.expect("list");
-        assert_eq!(listed.len(), 1);
+        assert!(listed.iter().any(|m| m.model_id == model.id));
 
         store.delete_managed_model(model.id).await.expect("delete");
         assert!(store
@@ -3397,6 +3399,9 @@ mod tests {
         let m = store.get_managed_model(model.id).await.expect("get").expect("some");
         assert_eq!(m.last_provision_error, None);
         assert!(m.last_provision_error_at.is_none());
+
+        // Clean up so the shared test DB doesn't accumulate managed models.
+        store.delete_managed_model(model.id).await.expect("delete");
     }
 
     #[tokio::test]
