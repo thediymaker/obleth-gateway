@@ -1267,14 +1267,14 @@ function ModelDetailPanel({
 
       {isManaged && (
         <TabsContent value="provisioning" className="min-h-0">
-          <div className="grid gap-4 lg:h-[calc(100dvh-18rem)] lg:grid-cols-[minmax(0,1fr)_minmax(320px,420px)] lg:overflow-hidden">
-            <div className="min-h-0 lg:overflow-y-auto lg:pr-1">
-              <ManagedModelConfig modelId={model.id} />
+          <div className="grid gap-4 lg:grid-cols-[minmax(0,1fr)_minmax(250px,310px)]">
+            <div className="min-w-0">
+              <ManagedModelConfig modelId={model.id} onSaved={flashSaved} />
             </div>
-            <div className="space-y-3">
+            <aside className="min-w-0 space-y-3 lg:self-start">
               <ProvisionErrorBanner modelId={model.id} />
               <ReplicaPanel modelId={model.id} />
-            </div>
+            </aside>
           </div>
         </TabsContent>
       )}

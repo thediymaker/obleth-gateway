@@ -2,17 +2,28 @@
 
 import { useTransition } from "react";
 import { useQuery } from "@tanstack/react-query";
+import { RefreshCw } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { clearLostReplicasAction } from "@/app/actions";
 import type { ModelReplica } from "@/lib/obleth";
+import { cn } from "@/lib/utils";
+import { timeAgo } from "@/lib/relative-time";
 
-const STATE_COLOR: Record<string, string> = {
-  healthy: "text-emerald-500",
-  starting: "text-amber-500",
-  pending: "text-amber-500",
-  draining: "text-muted-foreground",
-  lost: "text-destructive",
+const STATE_STYLE: Record<string, string> = {
+  healthy: "border-emerald-500/30 bg-emerald-500/10 text-emerald-400",
+  starting: "border-amber-500/30 bg-amber-500/10 text-amber-400",
+  pending: "border-amber-500/30 bg-amber-500/10 text-amber-400",
+  draining: "border-border bg-muted/25 text-muted-foreground",
+  lost: "border-destructive/35 bg-destructive/10 text-destructive",
+};
+
+const DOT_STYLE: Record<string, string> = {
+  healthy: "bg-emerald-400",
+  starting: "bg-amber-400",
+  pending: "bg-amber-400",
+  draining: "bg-muted-foreground/55",
+  lost: "bg-destructive",
 };
 
 export function ReplicaPanel({ modelId }: { modelId: string }) {
@@ -32,59 +43,92 @@ export function ReplicaPanel({ modelId }: { modelId: string }) {
   const hasLost = replicas.some((r) => r.state === "lost");
 
   return (
-    <Card className="flex h-full min-h-0 flex-col">
-      <CardHeader className="flex flex-row items-center justify-between">
-        <CardTitle>
-          Replicas{" "}
-          <span className="text-sm text-muted-foreground">
-            ({healthy} healthy)
-          </span>
-        </CardTitle>
+    <Card className="overflow-hidden border-border bg-card/45 shadow-sm">
+      <CardHeader className="flex flex-row items-center justify-between gap-3 space-y-0 border-b border-border/60 bg-background/35 px-4 py-3">
+        <div className="min-w-0">
+          <CardTitle>Replicas</CardTitle>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            {healthy} healthy / {replicas.length} total
+          </p>
+        </div>
         {hasLost && (
           <Button
             size="sm"
             variant="outline"
             disabled={isPending}
             onClick={() =>
-              startTransition(async () => { await clearLostReplicasAction(modelId); })
+              startTransition(async () => {
+                await clearLostReplicasAction(modelId);
+              })
             }
           >
-            Retry failed
+            <RefreshCw className={cn("h-3.5 w-3.5", isPending && "animate-spin")} aria-hidden />
+            Retry
           </Button>
         )}
       </CardHeader>
-      <CardContent className="min-h-0 flex flex-1 flex-col">
+      <CardContent className="px-0 py-0">
         {replicas.length === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            No replicas yet. The Slurm provisioner launches them on its next tick.
-            If none appear, confirm the provisioner is running under{" "}
-            <span className="font-medium">Settings → Slurm provisioning</span>.
+          <p className="m-4 rounded-md border border-dashed border-border/70 bg-background/25 px-3 py-4 text-sm text-muted-foreground">
+            No attempts yet.
           </p>
         ) : (
-          <div className="min-h-0 flex-1 overflow-y-auto max-h-[calc(100dvh-22rem)] lg:max-h-none">
-            <table className="w-full text-sm">
-              <thead className="sticky top-0 bg-card">
-                <tr className="text-left text-muted-foreground">
-                  <th className="py-1">Job</th>
-                  <th>Nodes</th>
-                  <th>State</th>
-                  <th>Message</th>
-                </tr>
-              </thead>
-              <tbody>
-                {replicas.map((r) => (
-                  <tr key={r.id} className="border-t border-border/50">
-                    <td className="py-1 font-mono">{r.slurm_job_id}</td>
-                    <td className="font-mono">{r.nodes ?? "-"}</td>
-                    <td className={STATE_COLOR[r.state] ?? ""}>{r.state}</td>
-                    <td className="text-muted-foreground">{r.last_message ?? ""}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <ul className="divide-y divide-border/50">
+            {replicas.map((replica) => (
+              <AttemptRow key={replica.id} replica={replica} />
+            ))}
+          </ul>
         )}
       </CardContent>
     </Card>
   );
+}
+
+function AttemptRow({ replica }: { replica: ModelReplica }) {
+  const node = replica.nodes || "";
+  const lastSeen = timeAgo(replica.updated_at) || "-";
+  const message = replica.state === "lost" ? replica.last_message?.trim() : "";
+
+  return (
+    <li className="grid grid-cols-[minmax(0,1fr)_auto] gap-3 px-4 py-3">
+      <div className="min-w-0">
+        <div className="flex min-w-0 items-center gap-2">
+          <span className={cn("h-1.5 w-1.5 shrink-0 rounded-full", DOT_STYLE[replica.state] ?? "bg-muted-foreground/55")} aria-hidden />
+          <span className="truncate font-mono text-xs text-foreground" title={replica.slurm_job_id}>
+            job {replica.slurm_job_id}
+          </span>
+          <span className="min-w-0 truncate text-[11px] text-muted-foreground" title={node || "No node assigned yet"}>
+            {node ? (
+              <>
+                on <span className="font-mono text-foreground/90">{node}</span>
+              </>
+            ) : (
+              "waiting for node"
+            )}
+          </span>
+        </div>
+        <p className="mt-1 truncate pl-3.5 text-[11px] text-muted-foreground">
+          seen {lastSeen}
+          {message ? ` / ${message}` : ""}
+        </p>
+      </div>
+      <StatePill state={replica.state} />
+    </li>
+  );
+}
+
+function StatePill({ state }: { state: string }) {
+  return (
+    <span className={cn("self-start rounded-sm border px-2 py-0.5 text-[10px] font-medium", STATE_STYLE[state] ?? "border-border bg-muted/25 text-muted-foreground")}>
+      {formatState(state)}
+    </span>
+  );
+}
+
+function formatState(state: string) {
+  return state
+    .split(/[_\s-]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
 }
