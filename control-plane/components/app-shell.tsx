@@ -19,6 +19,7 @@ import {
   Radio,
   ScrollText,
   Settings,
+  UserCog,
   Users,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -43,6 +44,7 @@ const nav = [
   { href: "/fairshare", label: "Fairshare", icon: Gauge },
   { href: "/models", label: "Models", icon: Boxes },
   { href: "/recipes", label: "Recipes", icon: BookText },
+  { href: "/users", label: "Users", icon: UserCog },
   { href: "/mcp", label: "MCP Servers", icon: Plug },
   { href: "/tenants", label: "Tenants", icon: Users },
   { href: "/keys", label: "API Keys", icon: KeyRound },
