@@ -79,7 +79,16 @@ pub async fn apply(
             }
             obleth.patch_replica(*replica_id, Some("lost"), None, None, Some("job gone")).await?;
         }
-        Action::Cancel { replica_id, job_id } => {
+        Action::Cancel { replica_id, job_id, endpoint_id } => {
+            // Deregister the endpoint first so the proxy stops routing to this
+            // backend immediately — otherwise it lingers in rotation (still
+            // "healthy") until the job goes fully Gone a tick later, and requests
+            // hit the dying backend (502). Best-effort: a missing endpoint is fine.
+            if let Some(ep) = endpoint_id {
+                if let Err(e) = obleth.delete_endpoint(model_id, *ep).await {
+                    tracing::warn!(endpoint_id = %ep, error = %e, "failed to deregister endpoint on cancel");
+                }
+            }
             slurm.cancel(job_id).await?;
             obleth.patch_replica(*replica_id, Some("draining"), None, None, Some("scaled down")).await?;
         }
@@ -245,16 +254,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancel_cancels_job_then_marks_draining() {
+    async fn cancel_deregisters_endpoint_then_cancels_job_and_drains() {
         let slurm = mock_slurm();
         let obleth = MockObleth::default();
         let rid = Uuid::new_v4();
+        let ep = Uuid::new_v4();
         // No spec needed for drain actions.
-        apply(&Action::Cancel { replica_id: rid, job_id: "j9".into() },
+        apply(&Action::Cancel { replica_id: rid, job_id: "j9".into(), endpoint_id: Some(ep) },
               Uuid::new_v4(), "nemotron", None, "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
+        // Endpoint removed from rotation BEFORE the job is cancelled (502 guard).
+        assert!(obleth.deleted_endpoints.lock().unwrap().contains(&ep));
         assert!(slurm.cancelled.lock().unwrap().contains(&"j9".to_string()));
         let patched = obleth.patched.lock().unwrap();
         assert!(patched.iter().any(|p| p.0 == rid && p.1.as_deref() == Some("draining")));
+    }
+
+    #[tokio::test]
+    async fn cancel_without_endpoint_still_cancels_and_drains() {
+        let slurm = mock_slurm();
+        let obleth = MockObleth::default();
+        let rid = Uuid::new_v4();
+        apply(&Action::Cancel { replica_id: rid, job_id: "j9".into(), endpoint_id: None },
+              Uuid::new_v4(), "nemotron", None, "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
+        assert!(obleth.deleted_endpoints.lock().unwrap().is_empty());
+        assert!(slurm.cancelled.lock().unwrap().contains(&"j9".to_string()));
     }
 
     #[tokio::test]

@@ -28,8 +28,8 @@ pub fn plan(
     let mut actions = Vec::new();
     let mut alive = 0i64;
     // Replicas with a live job, eligible to be cancelled if we're over target.
-    // (replica_id, job_id, rank, age) where lower rank = cancel first.
-    let mut cancellable: Vec<(Uuid, String, u8, i64)> = Vec::new();
+    // (replica_id, job_id, endpoint_id, rank, age) where lower rank = cancel first.
+    let mut cancellable: Vec<(Uuid, String, Option<Uuid>, u8, i64)> = Vec::new();
 
     for r in replicas {
         // GC dead rows past retention; they don't count as alive.
@@ -54,7 +54,7 @@ pub fn plan(
             }
             Some(JobState::Pending) => {
                 alive += 1;
-                cancellable.push((r.id, r.slurm_job_id.clone(), 0, r.age_secs)); // cancel pending first
+                cancellable.push((r.id, r.slurm_job_id.clone(), r.endpoint_id, 0, r.age_secs)); // cancel pending first
             }
             Some(JobState::Running) => {
                 alive += 1;
@@ -73,9 +73,9 @@ pub fn plan(
                         let node = jobs.get(&r.slurm_job_id).and_then(|j| j.nodes.first().cloned()).unwrap_or_default();
                         actions.push(Action::Promote { replica_id: r.id, api_base: endpoint_api_base(&node, port as i64) });
                     }
-                    cancellable.push((r.id, r.slurm_job_id.clone(), 1, r.age_secs));
+                    cancellable.push((r.id, r.slurm_job_id.clone(), r.endpoint_id, 1, r.age_secs));
                 } else {
-                    cancellable.push((r.id, r.slurm_job_id.clone(), 2, r.age_secs)); // healthy: cancel last
+                    cancellable.push((r.id, r.slurm_job_id.clone(), r.endpoint_id, 2, r.age_secs)); // healthy: cancel last
                 }
             }
         }
@@ -90,9 +90,9 @@ pub fn plan(
         }
     } else if alive > target {
         // cancel excess: pending first, then starting, then healthy; oldest first within a rank.
-        cancellable.sort_by(|a, b| a.2.cmp(&b.2).then(b.3.cmp(&a.3)));
-        for (id, job_id, _, _) in cancellable.into_iter().take((alive - target) as usize) {
-            actions.push(Action::Cancel { replica_id: id, job_id });
+        cancellable.sort_by(|a, b| a.3.cmp(&b.3).then(b.4.cmp(&a.4)));
+        for (id, job_id, endpoint_id, _, _) in cancellable.into_iter().take((alive - target) as usize) {
+            actions.push(Action::Cancel { replica_id: id, job_id, endpoint_id });
         }
     }
 
@@ -224,7 +224,18 @@ mod tests {
         let pid = pending.id;
         let jobs = HashMap::from([job("j1", JobState::Running, &["n1"]), job("j2", JobState::Pending, &["",])]);
         let actions = plan(&spec(1), &[healthy, pending], &jobs, &HashMap::new(), 900);
-        assert_eq!(actions, vec![Action::Cancel { replica_id: pid, job_id: "j2".into() }]);
+        assert_eq!(actions, vec![Action::Cancel { replica_id: pid, job_id: "j2".into(), endpoint_id: None }]);
+    }
+
+    #[test]
+    fn cancel_carries_the_replicas_endpoint_id() {
+        let ep = Uuid::new_v4();
+        let h1 = rv("healthy", "j1", Some(ep), 1000); // oldest -> cancelled first within rank
+        let h1id = h1.id;
+        let h2 = rv("healthy", "j2", Some(Uuid::new_v4()), 500);
+        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"]), job("j2", JobState::Running, &["n2"])]);
+        let actions = plan(&spec(1), &[h1, h2], &jobs, &HashMap::new(), 900);
+        assert_eq!(actions, vec![Action::Cancel { replica_id: h1id, job_id: "j1".into(), endpoint_id: Some(ep) }]);
     }
 
     #[test]
