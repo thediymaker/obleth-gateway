@@ -34,6 +34,11 @@ function createAuth() {
       additionalFields: {
         role: { type: "string", defaultValue: "user", input: false },
         status: { type: "string", defaultValue: "pending", input: false },
+        // additionalFields only supports "string" | "number" | "boolean" | "date",
+        // so tenantId is "string" here while db/auth-schema.sql enforces uuid + a FK
+        // to tenants(id). better-auth does no coercion, so the app layer must always
+        // supply a valid UUID string (or null); admin assignment writes this column
+        // directly via getDb() (a later task), not through better-auth's adapter.
         tenantId: { type: "string", required: false, input: false },
       },
     },
