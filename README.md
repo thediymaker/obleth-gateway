@@ -59,11 +59,15 @@ Once the containers are healthy:
 
 | Service | URL | Default login |
 | --- | --- | --- |
-| Dashboard | <http://localhost:3002> | `admin` / `obleth` |
+| Dashboard | <http://localhost:3002> | `admin@example.com` / `obleth-admin` |
 | Gateway (via HAProxy) | <http://localhost> | — |
 | Grafana | <http://localhost:3001> | `admin` / `obleth` |
 | Prometheus | <http://localhost:9090> | — |
 | Jaeger traces | <http://localhost:16686> | — |
+
+The dashboard login email and password come from `DASHBOARD_ADMIN_EMAIL` and `DASHBOARD_PASSWORD` in your `.env`. The dashboard also supports OIDC SSO via Globus, CILogon, or any discovery-capable provider — see [obleth.com](https://obleth.com) for setup.
+
+> **⚠️ Upgrading from the username login?** The dashboard now uses an **email + password** sign-in form — a bare username like `admin` is no longer accepted, and `DASHBOARD_USERNAME` is no longer used (you can delete it). Set `DASHBOARD_ADMIN_EMAIL` to a real email address and ensure `DASHBOARD_PASSWORD` is at least 8 characters; the admin account is created from those values on first boot after the upgrade. Skip this and you will be locked out. See the [Dashboard SSO guide](https://obleth.com/docs/guides/dashboard-sso) for full upgrade steps.
 
 Log in to the dashboard to register models, create tenants and API keys, configure fairshare weights, and monitor usage. The benchmark fixture backend is pre-registered as the default upstream so you can explore the UI immediately without a real GPU endpoint.
 

@@ -4,6 +4,18 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.5.0
+Dashboard single sign-on (OIDC) and a break-glass admin — with an email-based login that needs a one-time config change.
+
+> **⚠️ Required action when upgrading.** The dashboard now signs in with an **email address**, not a username. Before you upgrade, set `DASHBOARD_ADMIN_EMAIL` to a real email address and make sure `DASHBOARD_PASSWORD` is at least 8 characters. If you don't, the admin account is not created on first boot and **you will be locked out of the dashboard**. The old `DASHBOARD_USERNAME` setting is no longer used and can be deleted.
+
+- **OIDC single sign-on** for the dashboard: sign in with Globus, CILogon, or any discovery-capable identity provider. Configure providers via `OIDC_PROVIDERS`; leave it empty to keep SSO off.
+- **Break-glass local admin.** A local email + password admin is seeded on first boot from `DASHBOARD_ADMIN_EMAIL` / `DASHBOARD_PASSWORD` and keeps working even when the identity provider is unreachable.
+- **Approval flow for new users.** People who sign in via SSO start with no access until an admin assigns them a role and a tenant on the dashboard's **Users** screen. Users with the `user` role get a self-service portal (model list, their own API keys and usage) instead of the full dashboard.
+- **Email-based sign-in** replaces the old username form (see the required action above).
+
+Setup, a local test identity provider, user management, and Kubernetes configuration are covered in the [Dashboard SSO guide](https://obleth.com/docs/guides/dashboard-sso).
+
 ## v0.4.12
 Steadier health status and cleaner replica teardown.
 

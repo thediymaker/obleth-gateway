@@ -184,12 +184,38 @@ services:
       # Data plane (model-test console): reach the gateway's /v1 endpoint in-cluster.
       OBLETH_PROXY_BASE_URL: http://obleth:8080
       OBLETH_ADMIN_TOKEN: ${OBLETH_ADMIN_TOKEN:?set OBLETH_ADMIN_TOKEN in deploy/docker/.env (copy from .env.example)}
-      DASHBOARD_USERNAME: ${DASHBOARD_USERNAME:?set DASHBOARD_USERNAME in deploy/docker/.env}
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?set DASHBOARD_PASSWORD (or DASHBOARD_PASSWORD_HASH) in deploy/docker/.env}
       DASHBOARD_SESSION_SECRET: ${DASHBOARD_SESSION_SECRET:?set DASHBOARD_SESSION_SECRET (>=32 chars) in deploy/docker/.env}
+      # Auth DB + OIDC env (better-auth / SSO)
+      DATABASE_URL: postgres://${POSTGRES_USER:-obleth}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-obleth}
+      BETTER_AUTH_SECRET: ${DASHBOARD_SESSION_SECRET:?set DASHBOARD_SESSION_SECRET (>=32 chars)}
+      BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3002}
+      DASHBOARD_ADMIN_EMAIL: ${DASHBOARD_ADMIN_EMAIL:-admin@example.com}
+      OIDC_PROVIDERS: ${OIDC_PROVIDERS:-}
     ports: ["3002:3000"]
     depends_on:
       obleth: { condition: service_started }
+      postgres: { condition: service_healthy }
+
+  # Local OIDC identity provider for dashboard SSO development. Gated behind
+  # the `sso-dev` profile so it never starts in production stacks.
+  #
+  # The OIDC issuer (host.docker.internal:5556/dex) must resolve to Dex from BOTH
+  # the browser AND the control-plane container. The `host.docker.internal`
+  # network alias below makes in-network containers resolve that name directly to
+  # this Dex container (container-to-container), while the browser resolves it to
+  # the host via Docker Desktop's host entry. Dex is also published on host :5556.
+  dex:
+    profiles: ["sso-dev"]
+    image: dexidp/dex:v2.41.1
+    command: ["dex", "serve", "/etc/dex/config.docker.yaml"]
+    volumes:
+      - ./dex/config.docker.yaml:/etc/dex/config.docker.yaml:ro
+    ports: ["5556:5556"]
+    networks:
+      default:
+        aliases:
+          - host.docker.internal
 
   haproxy:
     profiles: ["edge"]

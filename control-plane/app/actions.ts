@@ -19,7 +19,7 @@ import type {
   UpdateSlurmSettings,
   SlurmHealthView,
 } from "@/lib/obleth";
-import { requireSession } from "@/lib/auth/session";
+import { requireAdmin } from "@/lib/auth/roles";
 import { resolveRecipeById, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
@@ -220,7 +220,7 @@ function parseWeeklyWindows(value: FormDataEntryValue | null) {
 }
 
 export async function createTenantAction(formData: FormData): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   const parsed = tenantCreateSchema.safeParse({
     name: formData.get("name"),
     description: formData.get("description"),
@@ -318,7 +318,7 @@ export async function createTenantAction(formData: FormData): Promise<ActionResu
 }
 
 export async function updateTenantAction(formData: FormData) {
-  await requireSession();
+  await requireAdmin();
   const parsed = tenantUpdateSchema.safeParse({
     id: formData.get("id"),
     name: formData.get("name"),
@@ -340,7 +340,7 @@ export async function updateTenantAction(formData: FormData) {
 }
 
 export async function setTenantStatusAction(id: string, status: string) {
-  await requireSession();
+  await requireAdmin();
   if (!id) return;
   await obleth.setTenantStatus(id, status);
   updateTag(CACHE_TAGS.tenants);
@@ -360,7 +360,7 @@ export async function setTenantScheduleAction(
       | null;
   },
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   if (!id) return { ok: false, error: "Missing tenant id" };
   try {
     await obleth.setTenantSchedule(id, body);
@@ -383,7 +383,7 @@ export async function setTenantBudgetAction(
     budget_started_at?: string | null;
   },
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   if (!id) return { ok: false, error: "Missing tenant id" };
   try {
     await obleth.setTenantBudget(id, body);
@@ -400,7 +400,7 @@ export async function setTenantAllowlistAction(
   id: string,
   allowed_models: string[],
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   if (!id) return { ok: false, error: "Missing tenant id" };
   try {
     await obleth.setTenantAllowlist(id, allowed_models);
@@ -417,7 +417,7 @@ export async function setTenantGuardrailsAction(
   id: string,
   policy: GuardrailsPolicy | null,
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   if (!id) return { ok: false, error: "Missing tenant id" };
   try {
     await obleth.setTenantGuardrails(id, policy);
@@ -431,7 +431,7 @@ export async function setTenantGuardrailsAction(
 }
 
 export async function deleteTenantAction(id: string) {
-  await requireSession();
+  await requireAdmin();
   if (!id) return;
   await obleth.deleteTenant(id);
   updateTag(CACHE_TAGS.tenants);
@@ -443,7 +443,7 @@ export async function deleteTenantAction(id: string) {
 }
 
 export async function setWeightAction(id: string, weight: number) {
-  await requireSession();
+  await requireAdmin();
   await obleth.setWeight(id, weight);
   updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
@@ -452,7 +452,7 @@ export async function setWeightAction(id: string, weight: number) {
 }
 
 export async function setQuotaAction(formData: FormData) {
-  await requireSession();
+  await requireAdmin();
   const id = String(formData.get("id"));
   const tpm = numOrUndef(formData.get("tokens_per_minute")) ?? 0;
   const mif = numOrNull(formData.get("max_in_flight"));
@@ -466,7 +466,7 @@ export async function setQuotaAction(formData: FormData) {
 export async function createKeyAction(
   formData: FormData,
 ): Promise<ActionResult & { secret?: string }> {
-  await requireSession();
+  await requireAdmin();
   const parsed = keyCreateSchema.safeParse({
     tenant_id: formData.get("tenant_id"),
     name: formData.get("name"),
@@ -500,7 +500,7 @@ export async function createKeyAction(
 export async function updateKeyAction(
   formData: FormData,
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   const parsed = keyUpdateSchema.safeParse({
     id: formData.get("id"),
     name: formData.get("name"),
@@ -533,28 +533,28 @@ export async function updateKeyAction(
 }
 
 export async function toggleKeyAction(id: string, disabled: boolean) {
-  await requireSession();
+  await requireAdmin();
   await obleth.setKeyDisabled(id, disabled);
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
 }
 
 export async function toggleKeyTracingAction(id: string, tracing_enabled: boolean) {
-  await requireSession();
+  await requireAdmin();
   await obleth.setKeyTracing(id, tracing_enabled);
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
 }
 
 export async function toggleTenantTracingAction(id: string, tracing_enabled: boolean) {
-  await requireSession();
+  await requireAdmin();
   await obleth.setTenantTracing(id, tracing_enabled);
   updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
 }
 
 export async function deleteKeyAction(id: string) {
-  await requireSession();
+  await requireAdmin();
   await obleth.deleteKey(id);
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
@@ -564,7 +564,7 @@ export async function deleteKeyAction(id: string) {
 export async function deleteKeysAction(
   ids: string[],
 ): Promise<{ deleted: number; failed: number }> {
-  await requireSession();
+  await requireAdmin();
   const uniqueIds = [...new Set(ids.map((id) => String(id)).filter(Boolean))];
   const result = await deleteKeys(uniqueIds);
   updateTag(CACHE_TAGS.keys);
@@ -579,7 +579,7 @@ export async function deleteFilteredKeysAction(filters: {
   status?: "all" | "active" | "disabled";
   budget?: "all" | "budgeted" | "unlimited";
 }): Promise<{ deleted: number; failed: number; matched: number }> {
-  await requireSession();
+  await requireAdmin();
   const query = String(filters.query ?? "")
     .trim()
     .toLowerCase();
@@ -624,7 +624,7 @@ export async function deleteFilteredKeysAction(filters: {
 }
 
 export async function setCapacityAction(max: number) {
-  await requireSession();
+  await requireAdmin();
   await obleth.setCapacity(max);
   revalidatePath("/");
   revalidatePath("/fairshare");
@@ -633,7 +633,7 @@ export async function setCapacityAction(max: number) {
 export async function createModelAction(
   formData: FormData,
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   const parsed = modelCreateSchema.safeParse({
     model_name: formData.get("model_name"),
     description: formData.get("description"),
@@ -725,7 +725,7 @@ export async function setModelCapacityAction(
   id: string,
   max_in_flight: number | null,
 ) {
-  await requireSession();
+  await requireAdmin();
   await obleth.setModelCapacity(id, max_in_flight);
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
@@ -736,7 +736,7 @@ export async function setModelCapacityModeAction(
   id: string,
   capacityMode: string,
 ) {
-  await requireSession();
+  await requireAdmin();
   await obleth.setModelCapacityMode(id, capacityMode);
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
@@ -751,7 +751,7 @@ export async function autotuneModelAction(
     replicas?: number;
   },
 ): Promise<AutotuneReport> {
-  await requireSession();
+  await requireAdmin();
   // Recommend-only: drives a live probe against the upstream and returns the
   // suggested capacity. Nothing is persisted here.
   return obleth.autotuneModel(id, opts);
@@ -761,7 +761,7 @@ export async function applyAutotuneCapacityAction(
   id: string,
   max_in_flight: number,
 ) {
-  await requireSession();
+  await requireAdmin();
   await obleth.applyAutotuneCapacity(id, max_in_flight);
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
@@ -772,7 +772,7 @@ export async function setModelWeightAction(
   id: string,
   admission_weight: number,
 ) {
-  await requireSession();
+  await requireAdmin();
   await obleth.setModelWeight(id, admission_weight);
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
@@ -780,7 +780,7 @@ export async function setModelWeightAction(
 }
 
 export async function deleteModelAction(id: string) {
-  await requireSession();
+  await requireAdmin();
   await obleth.deleteModel(id);
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
@@ -791,7 +791,7 @@ export async function setModelCacheAction(
   enabled: boolean,
   ttlSecs?: number,
 ) {
-  await requireSession();
+  await requireAdmin();
   await obleth.setModelCache(id, enabled, ttlSecs);
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
@@ -806,7 +806,7 @@ export async function setModelReliabilityAction(
     endpoint_selection_mode: string;
   },
 ) {
-  await requireSession();
+  await requireAdmin();
   await obleth.setModelReliability(id, body);
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
@@ -816,7 +816,7 @@ export async function createModelEndpointAction(
   id: string,
   formData: FormData,
 ) {
-  await requireSession();
+  await requireAdmin();
   await obleth.createModelEndpoint(id, {
     name: String(formData.get("name") ?? "").trim(),
     api_base: String(formData.get("api_base") ?? "").trim(),
@@ -840,7 +840,7 @@ export async function updateModelEndpointAction(
     enabled?: boolean;
   },
 ) {
-  await requireSession();
+  await requireAdmin();
   await obleth.updateModelEndpoint(id, endpointId, body);
   revalidatePath("/models");
 }
@@ -849,7 +849,7 @@ export async function deleteModelEndpointAction(
   id: string,
   endpointId: string,
 ) {
-  await requireSession();
+  await requireAdmin();
   await obleth.deleteModelEndpoint(id, endpointId);
   revalidatePath("/models");
 }
@@ -904,7 +904,7 @@ export async function updateModelConnectionAction(
   _prev: ModelActionState | null,
   formData: FormData,
 ): Promise<ModelActionState> {
-  await requireSession();
+  await requireAdmin();
   const id = String(formData.get("id") ?? "");
   if (!id) return { ok: false, error: "Missing model id." };
   const current = await loadModel(id);
@@ -941,7 +941,7 @@ export async function updateModelCapabilitiesAction(
   _prev: ModelActionState | null,
   formData: FormData,
 ): Promise<ModelActionState> {
-  await requireSession();
+  await requireAdmin();
   const id = String(formData.get("id") ?? "");
   if (!id) return { ok: false, error: "Missing model id." };
   const current = await loadModel(id);
@@ -971,13 +971,13 @@ export async function updateModelCapabilitiesAction(
 }
 
 export async function checkModelHealthAction(id: string) {
-  await requireSession();
+  await requireAdmin();
   await obleth.checkModelHealth(id);
   revalidatePath("/models");
 }
 
 export async function checkAllModelHealthAction() {
-  await requireSession();
+  await requireAdmin();
   await obleth.checkAllModelHealth();
   revalidatePath("/models");
 }
@@ -1010,7 +1010,7 @@ export type ImportPlanResult =
 export async function planModelImportAction(
   text: string,
 ): Promise<ImportPlanResult> {
-  await requireSession();
+  await requireAdmin();
   const read = readModelInputs(text);
   if (read.error) return { ok: false, error: read.error };
 
@@ -1042,7 +1042,7 @@ export async function planModelImportAction(
 export async function importModelsAction(
   text: string,
 ): Promise<ImportModelsResult> {
-  await requireSession();
+  await requireAdmin();
   const read = readModelInputs(text);
   if (read.error) return { ok: false, error: read.error };
   const inputs = read.inputs;
@@ -1171,7 +1171,7 @@ export type RestoreBackupResult =
 export async function restoreBackupAction(
   text: string,
 ): Promise<RestoreBackupResult> {
-  await requireSession();
+  await requireAdmin();
 
   let parsed: ConfigBackup;
   try {
@@ -1203,7 +1203,7 @@ export async function restoreBackupAction(
 }
 
 export async function setModelHealthConfigAction(formData: FormData) {
-  await requireSession();
+  await requireAdmin();
   const id = String(formData.get("id") ?? "");
   if (!id) return;
   await obleth.setModelHealthConfig(id, {
@@ -1220,7 +1220,7 @@ export async function setModelHealthConfigAction(formData: FormData) {
 export async function createMcpServerAction(
   formData: FormData,
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   const parsed = mcpCreateSchema.safeParse({
     name: formData.get("name"),
     upstream_url: formData.get("upstream_url"),
@@ -1244,13 +1244,13 @@ export async function toggleMcpServerAction(
   upstreamUrl: string,
   enabled: boolean,
 ) {
-  await requireSession();
+  await requireAdmin();
   await obleth.updateMcpServer(id, { upstream_url: upstreamUrl, enabled });
   revalidatePath("/mcp");
 }
 
 export async function deleteMcpServerAction(id: string) {
-  await requireSession();
+  await requireAdmin();
   await obleth.deleteMcpServer(id);
   revalidatePath("/mcp");
 }
@@ -1258,7 +1258,7 @@ export async function deleteMcpServerAction(id: string) {
 export async function setAlertSettingsAction(
   body: UpdateAlertSettings,
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   try {
     await obleth.setAlertSettings(body);
   } catch (e) {
@@ -1271,7 +1271,7 @@ export async function setAlertSettingsAction(
 export async function setAutoRouterSettingsAction(
   body: UpdateAutoRouterSettings,
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   try {
     await obleth.setAutoRouterSettings(body);
   } catch (e) {
@@ -1284,7 +1284,7 @@ export async function setAutoRouterSettingsAction(
 export async function setBoonSettingsAction(
   body: UpdateBoonSettings,
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   try {
     await obleth.setBoonSettings(body);
   } catch (e) {
@@ -1297,7 +1297,7 @@ export async function setBoonSettingsAction(
 export async function setCharoSettingsAction(
   enabled: boolean,
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   try {
     await obleth.setCharoSettings({ enabled });
   } catch (e) {
@@ -1311,7 +1311,7 @@ export async function setCharoSettingsAction(
 export async function setSlurmSettingsAction(
   body: UpdateSlurmSettings,
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   try {
     await obleth.setSlurmSettings(body);
   } catch (e) {
@@ -1326,7 +1326,7 @@ export async function setSlurmSettingsAction(
 export async function testSlurmConnectionAction(): Promise<
   (ActionResult & { health?: SlurmHealthView })
 > {
-  await requireSession();
+  await requireAdmin();
   try {
     const health = await obleth.testSlurmConnection();
     return { ok: true, health };
@@ -1338,7 +1338,7 @@ export async function testSlurmConnectionAction(): Promise<
 export async function setUsageRetentionAction(
   days: number,
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   if (!Number.isFinite(days) || days < 1) {
     return { ok: false, error: "Retention must be at least 1 day" };
   }
@@ -1354,7 +1354,7 @@ export async function setUsageRetentionAction(
 export async function compactUsageAction(): Promise<
   ActionResult & { partitionsDropped?: number; retentionDays?: number }
 > {
-  await requireSession();
+  await requireAdmin();
   try {
     const res = await obleth.compactUsage();
     return {
@@ -1372,7 +1372,7 @@ export async function testAlertAction(): Promise<
     results?: { channel: string; ok: boolean; detail: string }[];
   }
 > {
-  await requireSession();
+  await requireAdmin();
   try {
     const res = await obleth.testAlert();
     return { ok: true, results: res.results };
@@ -1618,7 +1618,7 @@ function coerceBool(v: unknown): boolean | undefined {
 }
 
 export async function clearLostReplicasAction(modelId: string): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   try { await obleth.clearLostReplicas(modelId); }
   catch (e) { return actionError(e); }
   updateTag(CACHE_TAGS.models);
@@ -1627,7 +1627,7 @@ export async function clearLostReplicasAction(modelId: string): Promise<ActionRe
 }
 
 export async function restartReplicaAction(replicaId: string): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   try { await obleth.restartReplica(replicaId); }
   catch (e) { return actionError(e); }
   return { ok: true };
@@ -1636,7 +1636,7 @@ export async function restartReplicaAction(replicaId: string): Promise<ActionRes
 export async function saveTemplateAction(
   input: { id?: string; name: string; body: string },
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   const parsed = parseRecipe(input.id ?? "new", input.body);
   if (!parsed.valid) return { ok: false, error: parsed.error ?? "invalid recipe" };
   try {
@@ -1650,7 +1650,7 @@ export async function saveTemplateAction(
 }
 
 export async function deleteTemplateAction(id: string): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   try {
     await obleth.deleteRecipe(id);
   } catch (e) {
@@ -1664,7 +1664,7 @@ export async function deployRecipeAction(
   id: string,
   overrides?: DeployOverrides,
 ): Promise<ActionResult> {
-  await requireSession();
+  await requireAdmin();
   const recipe = await resolveRecipeById(id);
   if (!recipe) return { ok: false, error: `recipe "${id}" not found` };
   if (!recipe.valid) return { ok: false, error: recipe.error ?? "recipe is invalid" };

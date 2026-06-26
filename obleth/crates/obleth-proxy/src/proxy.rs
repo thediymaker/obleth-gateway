@@ -33,6 +33,11 @@ const CACHE_MAX_BYTES: usize = 512 * 1024;
 /// Largest upstream completion a response-transforming boon will rewrite.
 /// Bigger bodies pass through verbatim (fail-open).
 const BOON_BUFFER_MAX: usize = 4 * 1024 * 1024;
+/// Cap on the upstream error body recorded into a request trace. The body is
+/// captured to explain *why* a backend rejected a request, but it can echo a
+/// slice of the request and traces are retained, so the stored snippet is
+/// bounded. The client still receives the full, untruncated body.
+const ERROR_BODY_TRACE_CAP: usize = 4 * 1024;
 /// Floor for the per-request upstream timeout when a response-transforming
 /// boon is active: the upstream call is forced non-streaming, so the timeout
 /// bounds the whole generation instead of time-to-first-byte.
@@ -885,24 +890,7 @@ async fn proxy_handler_inner(
     let url = last_url;
     let dispatch_ms = (crate::tracer::now_ms() - dispatch_start) as u32;
     let upstream = match upstream_resp {
-        Some(r) => {
-            if let Some(ref mut t) = tracer {
-                t.record(
-                    "upstream",
-                    "proxy_request",
-                    dispatch_start,
-                    dispatch_ms,
-                    "ok",
-                    serde_json::json!({
-                        "model": model,
-                        "url": url.as_str(),
-                        "status": r.status().as_u16(),
-                        "targets": total_targets,
-                    }),
-                );
-            }
-            r
-        }
+        Some(r) => r,
         None => {
             if let Some(mut t) = tracer.take() {
                 t.record(
@@ -982,6 +970,122 @@ async fn proxy_handler_inner(
         .to_str()
         .unwrap_or("application/json")
         .to_string();
+
+    // An upstream error (4xx/5xx) is a small, non-streaming JSON body, so buffer
+    // it and fold it into the trace's `upstream` span — otherwise the tracer only
+    // ever sees a bare status code and operators can't tell *why* a backend
+    // rejected the request (e.g. vLLM's "model `x` does not exist" or a
+    // context-length 400). The body is then replayed to the client verbatim.
+    // (4xx never reaches the streaming/boon paths below — they short-circuit
+    // here — so the only behaviour change is the captured body + buffered reply.)
+    if status_code >= 400 {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut ttft_ms = 0u32;
+        let mut byte_stream = upstream.bytes_stream();
+        while let Some(item) = byte_stream.next().await {
+            match item {
+                Ok(chunk) => {
+                    if buf.is_empty() && !chunk.is_empty() {
+                        ttft_ms = upstream_start.elapsed().as_millis() as u32;
+                    }
+                    let room = BODY_LIMIT.saturating_sub(buf.len());
+                    if chunk.len() > room {
+                        buf.extend_from_slice(&chunk[..room]);
+                        break;
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "upstream read failed reading error body");
+                    break;
+                }
+            }
+        }
+        drop(permit);
+
+        if let Some(ref mut t) = tracer {
+            let body = String::from_utf8_lossy(&buf);
+            let snippet: String = body.chars().take(ERROR_BODY_TRACE_CAP).collect();
+            t.record(
+                "upstream",
+                "proxy_request",
+                dispatch_start,
+                dispatch_ms,
+                "error",
+                serde_json::json!({
+                    "model": model,
+                    "url": url.as_str(),
+                    "status": status_code,
+                    "targets": total_targets,
+                    "body": snippet,
+                }),
+            );
+        }
+
+        // Mirror the streaming pass-through's accounting for a non-200: usage is
+        // whatever the (error) body reports, falling back to the admission
+        // estimate. Errors are never cached.
+        let (input_tokens, output_tokens) = extract_usage(&String::from_utf8_lossy(&buf))
+            .unwrap_or((est.input_tokens, est.estimated_output_tokens));
+        let total_ms = request_start.elapsed().as_millis() as u32;
+        settle_request(
+            &state,
+            request_id,
+            &resolved,
+            &req_meta,
+            &model,
+            admission,
+            est,
+            input_tokens,
+            output_tokens,
+            queue_wait_ms,
+            ttft_ms,
+            total_ms,
+            status_code,
+            cache_status_label,
+            capacity,
+            term_period.as_deref(),
+            key_term_period.as_deref(),
+            in_cost_rate,
+            out_cost_rate,
+            modality_cost,
+            None,
+        )
+        .await;
+        if let Some(t) = tracer.take() {
+            t.finish("error");
+        }
+
+        let mut builder = Response::builder()
+            .status(status_code)
+            .header(header::CONTENT_TYPE, content_type)
+            .header("x-obleth-request-id", request_id.to_string())
+            .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
+        if !boons_applied.is_empty() {
+            builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
+        }
+        return builder.body(Body::from(buf)).unwrap_or_else(|_| {
+            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+        });
+    }
+
+    // Success: record the `upstream` span here (the error path above records its
+    // own, enriched with the body).
+    if let Some(ref mut t) = tracer {
+        t.record(
+            "upstream",
+            "proxy_request",
+            dispatch_start,
+            dispatch_ms,
+            "ok",
+            serde_json::json!({
+                "model": model,
+                "url": url.as_str(),
+                "status": status_code,
+                "targets": total_targets,
+            }),
+        );
+    }
 
     // Cache only successful responses.
     let store_in_cache = cache_key.clone();

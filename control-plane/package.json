@@ -1,6 +1,6 @@
 {
   "name": "obleth-control-plane",
-  "version": "0.4.12",
+  "version": "0.5.0",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000",
@@ -22,6 +22,7 @@
     "@radix-ui/react-tooltip": "^1.1.6",
     "@tanstack/react-query": "^5.62.8",
     "bcryptjs": "^2.4.3",
+    "better-auth": "^1.6.21",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "date-fns": "^4.4.0",
@@ -29,6 +30,7 @@
     "jose": "^5.9.6",
     "lucide-react": "^0.469.0",
     "next": "^16.2.6",
+    "pg": "^8.22.0",
     "react": "^19.2.6",
     "react-day-picker": "^9.14.0",
     "react-dom": "^19.2.6",
@@ -40,6 +42,7 @@
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
     "@types/node": "^22.10.0",
+    "@types/pg": "^8.20.0",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
     "@vitejs/plugin-react": "^6.0.2",

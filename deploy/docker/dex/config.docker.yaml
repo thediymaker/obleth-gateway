@@ -1,0 +1,42 @@
+# Dex static config for local dashboard SSO development.
+#
+# SPLIT-HORIZON NOTE: the issuer URL must be reachable identically by BOTH the
+# browser AND the control-plane server (discovery + token exchange). `localhost`
+# cannot satisfy both when the control plane runs in Docker, because inside that
+# container `localhost` is the container itself, not this Dex container.
+#
+# We use `host.docker.internal`, which resolves to the Docker host from BOTH the
+# browser (via Docker Desktop's host entry) and any container (declared via
+# `extra_hosts: host-gateway` on the control-plane service). Dex is published on
+# the host at :5556, so http://host.docker.internal:5556/dex reaches it from
+# either side. The discoveryUrl in OIDC_PROVIDERS must use this same host.
+#
+# redirectURIs target the browser-facing dashboard URL. The control-plane
+# container publishes on host port 3002 (ports: "3002:3000"), so the callback
+# is http://localhost:3002/... — keep this in sync with BETTER_AUTH_URL.
+
+issuer: http://host.docker.internal:5556/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+staticClients:
+  - id: obleth-control-plane
+    name: obleth
+    secret: dev-dex-secret
+    redirectURIs:
+      - http://localhost:3002/api/auth/oauth2/callback/dex
+
+enablePasswordDB: true
+
+staticPasswords:
+  # Test user: email=researcher@example.edu  password=password
+  # Hash generated with: node -e "console.log(require('bcryptjs').hashSync('password',10))"
+  # Regenerate: htpasswd -bnBC 10 "" password | tr -d ':\n'
+  - email: "researcher@example.edu"
+    hash: "$2y$10$XwCTmdN9AFBdNY8Cr6IECOCQRW6aFl93TrQ0E/KyHZaVs/zbsvvbC"
+    username: "researcher"
+    userID: "researcher-1"

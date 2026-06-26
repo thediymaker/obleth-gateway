@@ -7,9 +7,14 @@ metadata:
   labels: {{- include "obleth.labels" . | nindent 4 }}
 type: Opaque
 stringData:
-  DASHBOARD_USERNAME: {{ required "controlPlane.dashboardUsername is required" .Values.controlPlane.dashboardUsername | quote }}
   DASHBOARD_PASSWORD: {{ required "controlPlane.dashboardPassword is required (set via --set or an external Secret; do not commit a real value)" .Values.controlPlane.dashboardPassword | quote }}
   DASHBOARD_SESSION_SECRET: {{ required "controlPlane.dashboardSessionSecret is required and must be >=32 chars" .Values.controlPlane.dashboardSessionSecret | quote }}
+  # Auth DB + OIDC (better-auth / SSO). BETTER_AUTH_SECRET reuses dashboardSessionSecret.
+  DATABASE_URL: {{ .Values.controlPlane.databaseUrl | default (include "obleth.databaseUrl" .) | quote }}
+  BETTER_AUTH_SECRET: {{ required "controlPlane.dashboardSessionSecret is required and must be >=32 chars" .Values.controlPlane.dashboardSessionSecret | quote }}
+  BETTER_AUTH_URL: {{ .Values.controlPlane.betterAuthUrl | default "" | quote }}
+  DASHBOARD_ADMIN_EMAIL: {{ .Values.controlPlane.dashboardAdminEmail | default "admin@example.com" | quote }}
+  OIDC_PROVIDERS: {{ .Values.controlPlane.oidcProviders | default "" | quote }}
 ---
 {{- end }}
 apiVersion: apps/v1
