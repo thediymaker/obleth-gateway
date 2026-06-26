@@ -186,7 +186,7 @@ export function UsersManager({ users, tenants }: Props) {
           </div>
         ) : (
           sorted.map((user) => (
-            <UserRow key={user.id} user={user} tenants={tenants} />
+            <UserRow key={`${user.id}-${user.role}-${user.tenantId ?? "none"}`} user={user} tenants={tenants} />
           ))
         )}
       </CardContent>
