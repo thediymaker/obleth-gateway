@@ -368,4 +368,17 @@ mod tests {
             "draining replica with a live job must be left alone; got {actions:?}"
         );
     }
+
+    #[test]
+    fn draining_replica_with_pending_job_is_left_alone() {
+        // Cancel sent but the job is still queued (Pending) -> wait, don't delete.
+        let r = rv("draining", "j1", None, 10);
+        let id = r.id;
+        let jobs = HashMap::from([job("j1", JobState::Pending, &[""])]);
+        let actions = plan(&spec(0), &[r], &jobs, &HashMap::new(), 900);
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Delete { replica_id } if *replica_id == id)),
+            "draining replica with a pending job must be left alone; got {actions:?}"
+        );
+    }
 }
