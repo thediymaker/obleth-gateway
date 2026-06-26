@@ -21,4 +21,9 @@ describe("role guards", () => {
     const { requireTenant } = await import("./roles");
     await expect(requireTenant()).rejects.toThrow(/tenant/i);
   });
+  it("requireUser rejects a pending user", async () => {
+    mockSession({ id: "u", email: "pending@example.com", role: "user", status: "pending", tenantId: null });
+    const { requireUser } = await import("./roles");
+    await expect(requireUser()).rejects.toThrow(/Unauthorized/);
+  });
 });
