@@ -59,6 +59,7 @@ const SCHEMA_V6: &str = include_str!("../../../../schema/postgres/0006_recipes.s
 const SCHEMA_V7: &str = include_str!("../../../../schema/postgres/0007_replica_port_and_min_replicas.sql");
 const SCHEMA_V8: &str = include_str!("../../../../schema/postgres/0008_managed_provision_error.sql");
 const SCHEMA_V9: &str = include_str!("../../../../schema/postgres/0009_replica_cancel_requested.sql");
+const SCHEMA_V10: &str = include_str!("../../../../schema/postgres/0010_drop_replica_model_cascade.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -155,6 +156,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V7).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V8).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V9).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V10).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -3664,5 +3666,69 @@ mod tests {
 
         // Clean up.
         store.delete_replica(replica.id).await.expect("delete replica");
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Deleting a model must NOT delete its replica rows — the provisioner needs
+    /// them to drain the Slurm jobs they represent.
+    #[tokio::test]
+    async fn deleting_model_leaves_replica_rows() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        // Same positional create_model call as `tenant_key_audit_roundtrip`.
+        let model = store
+            .create_model(
+                &format!("m-{}", Uuid::new_v4()),
+                "replica-survival test model",
+                "upstream-model",
+                "http://127.0.0.1:8081",
+                None,
+                "chat",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                8192,
+                100,
+                None,
+                false,
+                true,
+                false,
+                false,
+                false,
+                &[],
+                &[],
+                &[],
+            )
+            .await
+            .expect("create model");
+
+        let replica = store
+            .create_replica(model.id, "slurm-job-12345", Some(8000))
+            .await
+            .expect("create replica");
+
+        // Hard-delete the model. Before the cascade was dropped this also deleted
+        // the replica row; now the row must survive.
+        store.delete_model(model.id).await.expect("delete model");
+
+        // The model is gone...
+        assert!(
+            matches!(store.get_model(model.id).await, Err(StoreError::NotFound)),
+            "model row should be deleted"
+        );
+        // ...but its replica row survives for the provisioner to drain.
+        let replicas = store.list_replicas(model.id).await.expect("list replicas");
+        assert!(
+            replicas.iter().any(|r| r.id == replica.id),
+            "replica row must outlive the model delete"
+        );
     }
 }
