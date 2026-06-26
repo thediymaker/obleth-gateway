@@ -35,9 +35,9 @@ const WORKER_CLAIM_LIMIT: i64 = 4;
 const WORKER_SLEEP_SECS: u64 = 30;
 /// Window of real traffic that counts as a passive health signal.
 const PASSIVE_WINDOW_SECS: i64 = 300;
-/// Total liveness-probe attempts (one initial try plus one retry) before a
-/// transient network failure is recorded.
-const LIVENESS_MAX_ATTEMPTS: u32 = 2;
+/// Total liveness-probe attempts (one initial try plus up to two retries)
+/// before a transient network failure is recorded.
+const LIVENESS_MAX_ATTEMPTS: u32 = 3;
 
 pub trait AlertSink: Send + Sync + 'static {
     fn issue(&self, key: String, title: String, detail: String);
@@ -415,6 +415,7 @@ async fn probe_target(
                 // record anything.
                 let retryable = code == 408 || code == 429 || status.is_server_error();
                 if retryable && attempt < LIVENESS_MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(attempt - 1))).await;
                     continue;
                 }
                 if status.is_success() {
@@ -464,6 +465,7 @@ async fn probe_target(
             Err(error) => {
                 let retryable = error.is_timeout() || error.is_connect() || error.is_request();
                 if retryable && attempt < LIVENESS_MAX_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(attempt - 1))).await;
                     continue;
                 }
                 return ProbeResult::unhealthy(

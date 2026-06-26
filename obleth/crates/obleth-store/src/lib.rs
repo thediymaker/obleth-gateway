@@ -2102,7 +2102,7 @@ impl Store {
         let current = sqlx::query(
             "select health_alerts_enabled, health_failure_threshold,
                     health_maintenance_until, health_consecutive_failures,
-                    health_alert_state
+                    health_alert_state, health_status
              from models where id = $1 for update",
         )
         .bind(model_id)
@@ -2175,6 +2175,18 @@ impl Store {
             None
         };
 
+        let previous_status: String = current.try_get("health_status")?;
+        // The displayed badge is threshold-gated, matching the alerting logic: a
+        // sub-threshold failure streak holds the last stable badge instead of
+        // flapping to "down". Healthy/disabled/transient outcomes display as-is.
+        let displayed_status = if status == "healthy" || status == "disabled" || transient {
+            status
+        } else if new_failures >= failure_threshold.max(1) {
+            status // confirmed down
+        } else {
+            previous_status.as_str() // hold last stable badge
+        };
+
         let summary_row = sqlx::query(
             "update models set
                 health_status = $2,
@@ -2197,7 +2209,7 @@ impl Store {
                        health_last_message, updated_at",
         )
         .bind(model_id)
-        .bind(status)
+        .bind(displayed_status)
         .bind(new_failures)
         .bind(new_alert_state)
         .bind(next_check_at)
@@ -3123,6 +3135,104 @@ mod tests {
             store.delete_tenant(tenant.id).await,
             Err(StoreError::NotFound)
         ));
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// A single sub-threshold failure must NOT flip the displayed badge.
+    #[tokio::test]
+    async fn health_status_badge_holds_below_threshold() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        // Same positional create_model call as `tenant_key_audit_roundtrip`.
+        let model = store
+            .create_model(
+                &format!("m-{}", Uuid::new_v4()),
+                "hysteresis test model",
+                "upstream-model",
+                "http://127.0.0.1:8081",
+                None,
+                "chat",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                8192,
+                100,
+                None,
+                false,
+                true,
+                false,
+                false,
+                false,
+                &[],
+                &[],
+                &[],
+            )
+            .await
+            .expect("create model");
+
+        store
+            .update_model_health_config(
+                model.id,
+                ModelHealthConfigUpdate {
+                    checks_enabled: true,
+                    alerts_enabled: true,
+                    check_interval_secs: 60,
+                    failure_threshold: 2,
+                    maintenance_until: None,
+                    maintenance_note: None,
+                },
+            )
+            .await
+            .expect("update health config");
+
+        let next = Utc::now() + chrono::Duration::seconds(60);
+
+        // First failure: streak = 1 < threshold 2 -> badge must NOT move to unhealthy.
+        let first = store
+            .record_model_health_check(
+                model.id, "manual", "unhealthy", Some(12), Some(500), Some("blip"), None, next,
+            )
+            .await
+            .expect("record first failure");
+        assert_eq!(first.summary.consecutive_failures, 1);
+        assert_ne!(first.summary.status, "unhealthy", "single blip must not flip the badge");
+        assert_eq!(first.alert_event, None, "no alert below threshold");
+
+        // Second consecutive failure: streak = 2 >= threshold -> badge flips, alert fires.
+        let second = store
+            .record_model_health_check(
+                model.id, "manual", "unhealthy", Some(13), Some(500), Some("still down"), None, next,
+            )
+            .await
+            .expect("record second failure");
+        assert_eq!(second.summary.consecutive_failures, 2);
+        assert_eq!(second.summary.status, "unhealthy");
+        assert_eq!(second.alert_event, Some(ModelHealthAlertEvent::Down));
+
+        // Single healthy check: immediate recovery of badge and streak.
+        let recovered = store
+            .record_model_health_check(
+                model.id, "manual", "healthy", Some(8), Some(200), Some("ok"), None, next,
+            )
+            .await
+            .expect("record recovery");
+        assert_eq!(recovered.summary.consecutive_failures, 0);
+        assert_eq!(recovered.summary.status, "healthy");
+
+        // The raw audit trail must still contain the unhealthy rows.
+        let checks = store.list_model_health_checks(model.id, 10).await.expect("checks");
+        assert!(
+            checks.iter().any(|c| c.status == "unhealthy"),
+            "raw unhealthy checks must remain in the audit trail"
+        );
     }
 
     fn default_test_model(
