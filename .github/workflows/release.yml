@@ -120,8 +120,21 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          args=(--generate-notes --verify-tag)
+          args=(--verify-tag --title "obleth-gateway $GITHUB_REF_NAME")
           case "$GITHUB_REF_NAME" in
             *-*) args+=(--prerelease) ;;
           esac
-          gh release create "$GITHUB_REF_NAME" "${args[@]}"
+          # Prefer the curated CHANGELOG.md section for this version; fall back to
+          # auto-generated notes when there's no matching entry.
+          version="${GITHUB_REF_NAME#v}"
+          notes="$(awk -v v="## v$version" '
+            $0 == v { f = 1; next }
+            /^## v/ { if (f) exit }
+            f { print }
+          ' CHANGELOG.md)"
+          if [ -n "$(printf '%s' "$notes" | tr -d '[:space:]')" ]; then
+            printf '%s\n' "$notes" > "$RUNNER_TEMP/notes.md"
+            gh release create "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md" "${args[@]}"
+          else
+            gh release create "$GITHUB_REF_NAME" --generate-notes "${args[@]}"
+          fi
