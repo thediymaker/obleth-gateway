@@ -3398,7 +3398,9 @@ async fn restart_replica(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
-    state.store.request_replica_cancel(id).await?;
+    if !state.store.request_replica_cancel(id).await? {
+        return Err(AdminError::NotFound);
+    }
     state
         .store
         .record_audit(

@@ -1854,16 +1854,16 @@ impl Store {
     }
 
     /// Flag a replica for restart: the provisioner cancels its Slurm job on the
-    /// next tick and resubmit-to-target launches a fresh one. Idempotent; a no-op
-    /// when the replica doesn't exist.
-    pub async fn request_replica_cancel(&self, id: Uuid) -> Result<()> {
-        sqlx::query(
+    /// next tick and resubmit-to-target launches a fresh one. Returns `false`
+    /// when no replica with that id exists, so the caller can surface a 404.
+    pub async fn request_replica_cancel(&self, id: Uuid) -> Result<bool> {
+        let res = sqlx::query(
             "update model_replicas set cancel_requested = true, updated_at = now() where id = $1",
         )
         .bind(id)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(res.rows_affected() > 0)
     }
 
     /// Fetch a single replica by id. Returns `None` if no row exists.
