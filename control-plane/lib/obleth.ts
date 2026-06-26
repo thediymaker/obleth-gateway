@@ -218,6 +218,7 @@ export interface ModelReplica {
   endpoint_id: string | null;
   state: string; // pending|starting|healthy|draining|lost
   last_message: string | null;
+  cancel_requested?: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -1096,6 +1097,8 @@ export const obleth = {
     api<ModelReplica[]>(`/models/${id}/replicas`),
   clearLostReplicas: (id: string) =>
     api<{ deleted: number }>(`/models/${id}/replicas/clear-lost`, { method: "POST" }),
+  restartReplica: (replicaId: string) =>
+    api<{ ok: boolean }>(`/replicas/${replicaId}/restart`, { method: "POST" }),
   createModelEndpoint: (
     id: string,
     body: {
