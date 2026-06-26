@@ -101,8 +101,10 @@ pub enum Action {
     Promote { replica_id: Uuid, api_base: String },
     /// Job vanished/terminal: deregister endpoint (if any) + mark replica lost.
     MarkLost { replica_id: Uuid, endpoint_id: Option<Uuid> },
-    /// Excess replica: cancel its job + mark draining.
-    Cancel { replica_id: Uuid, job_id: String },
+    /// Excess/restarted replica: deregister its endpoint, cancel its job, mark
+    /// draining. `endpoint_id` is the linked endpoint to remove from rotation up
+    /// front so the proxy stops routing to the dying backend immediately.
+    Cancel { replica_id: Uuid, job_id: String, endpoint_id: Option<Uuid> },
     /// GC a long-dead `lost` replica row.
     Delete { replica_id: Uuid },
 }
