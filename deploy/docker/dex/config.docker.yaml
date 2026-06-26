@@ -1,0 +1,39 @@
+# Dex static config for local dashboard SSO development.
+#
+# SPLIT-HORIZON NOTE: the issuer URL must be reachable identically by BOTH the
+# browser (redirect target) AND the control-plane server (discovery + token
+# exchange). The documented default is to run the control plane on the HOST via
+# `npm run dev` (port 3000) while Dex runs in Docker publishing localhost:5556.
+# Both sides then reach http://localhost:5556/dex without any extra routing.
+#
+# If you run the control plane inside Docker instead, localhost:5556 inside that
+# container will not reach this Dex container. In that case change the issuer
+# and discoveryUrl to use a hostname both sides resolve — for example, add an
+# `extra_hosts` entry mapping a custom hostname to the Docker host IP on the
+# control-plane service, and update redirectURIs to match.
+
+issuer: http://localhost:5556/dex
+
+storage:
+  type: memory
+
+web:
+  http: 0.0.0.0:5556
+
+staticClients:
+  - id: obleth-control-plane
+    name: obleth
+    secret: dev-dex-secret
+    redirectURIs:
+      - http://localhost:3000/api/auth/oauth2/callback/dex
+
+enablePasswordDB: true
+
+staticPasswords:
+  # Test user: email=researcher@example.edu  password=password
+  # Hash generated with: node -e "console.log(require('bcryptjs').hashSync('password',10))"
+  # Regenerate: htpasswd -bnBC 10 "" password | tr -d ':\n'
+  - email: "researcher@example.edu"
+    hash: "$2a$10$B.gCbzWZb7h43Rdr9ncUXeRSjCbaGyJIKQdeKbbWrbgoMxfF3.FKi"
+    username: "researcher"
+    userID: "researcher-1"

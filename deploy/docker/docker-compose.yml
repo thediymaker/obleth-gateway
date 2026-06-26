@@ -191,6 +191,21 @@ services:
     depends_on:
       obleth: { condition: service_started }
 
+  # Local OIDC identity provider for dashboard SSO development. Gated behind
+  # the `sso-dev` profile so it never starts in production stacks.
+  # Run the control plane on the HOST (`npm run dev`, port 3000) so that both
+  # the browser and the Next.js server reach Dex at http://localhost:5556/dex.
+  # If you run the control plane in Docker instead, the server-side fetch hits
+  # the container's localhost, not this container — use a shared hostname
+  # (e.g. extra_hosts + dex alias) so both sides resolve identically.
+  dex:
+    profiles: ["sso-dev"]
+    image: dexidp/dex:v2.41.1
+    command: ["dex", "serve", "/etc/dex/config.docker.yaml"]
+    volumes:
+      - ./dex/config.docker.yaml:/etc/dex/config.docker.yaml:ro
+    ports: ["5556:5556"]
+
   haproxy:
     profiles: ["edge"]
     image: haproxy:2.9
