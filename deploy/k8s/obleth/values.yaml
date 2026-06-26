@@ -228,8 +228,19 @@ controlPlane:
   # PRODUCTION: reference a pre-created Secret instead of inlining the dashboard
   # credentials. When set, the chart does NOT render its own control-plane
   # Secret; the named Secret MUST provide DASHBOARD_USERNAME, DASHBOARD_PASSWORD,
-  # and DASHBOARD_SESSION_SECRET.
+  # DASHBOARD_SESSION_SECRET, and the auth/OIDC keys below.
   existingSecret: ""
+  # Auth DB + OIDC (better-auth / SSO). BETTER_AUTH_SECRET reuses
+  # dashboardSessionSecret — no additional secret required.
+  # databaseUrl: full Postgres URL for the auth tables. Defaults to the bundled
+  # Postgres using the same credentials as the gateway.
+  databaseUrl: ""   # e.g. postgres://obleth:pass@my-pg:5432/obleth
+  # External base URL of the dashboard (used for OIDC redirect URIs).
+  betterAuthUrl: ""   # e.g. https://dashboard.example.com
+  # Break-glass admin email seeded on first boot (paired with dashboardPassword).
+  dashboardAdminEmail: admin@example.com
+  # JSON array of OIDC providers. Empty = SSO off.
+  oidcProviders: ""   # e.g. '[{"providerId":"dex","displayName":"Dev SSO (Dex)","discoveryUrl":"...","clientId":"...","clientSecret":"...","scopes":["openid","email","profile"]}]'
   resources:
     requests: { cpu: "100m", memory: "256Mi" }
     limits: { cpu: "1", memory: "512Mi" }

@@ -25,6 +25,9 @@ COPY --from=builder /app/.next/static ./.next/static
 # standalone build doesn't bundle non-imported files, so copy them explicitly.
 # Override the location at runtime with OBLETH_RECIPES_DIR.
 COPY --from=builder /app/recipes ./recipes
+# Auth schema SQL (db/auth-schema.sql). Read from cwd at boot by applyAuthSchema()
+# in instrumentation.ts; the standalone build doesn't bundle non-imported files.
+COPY --from=builder /app/db ./db
 # The node:22-slim image ships a non-root `node` user (uid 1000). Declare it
 # numerically so Kubernetes `runAsNonRoot: true` can verify the user is non-root
 # without a pinned `runAsUser` — a username can't be checked and is rejected
