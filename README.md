@@ -59,11 +59,13 @@ Once the containers are healthy:
 
 | Service | URL | Default login |
 | --- | --- | --- |
-| Dashboard | <http://localhost:3002> | `admin` / `obleth` |
+| Dashboard | <http://localhost:3002> | `admin@example.com` / `obleth-admin` |
 | Gateway (via HAProxy) | <http://localhost> | — |
 | Grafana | <http://localhost:3001> | `admin` / `obleth` |
 | Prometheus | <http://localhost:9090> | — |
 | Jaeger traces | <http://localhost:16686> | — |
+
+The dashboard login email and password come from `DASHBOARD_ADMIN_EMAIL` and `DASHBOARD_PASSWORD` in your `.env`. The dashboard also supports OIDC SSO via Globus, CILogon, or any discovery-capable provider — see [obleth.com](https://obleth.com) for setup.
 
 Log in to the dashboard to register models, create tenants and API keys, configure fairshare weights, and monitor usage. The benchmark fixture backend is pre-registered as the default upstream so you can explore the UI immediately without a real GPU endpoint.
 
