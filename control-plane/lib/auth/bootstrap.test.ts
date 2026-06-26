@@ -1,6 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-afterEach(() => { vi.resetModules(); });
+afterEach(() => {
+  vi.resetModules();
+  delete process.env.DASHBOARD_ADMIN_EMAIL;
+  delete process.env.DASHBOARD_PASSWORD;
+});
 
 describe("bootstrapAdmin", () => {
   it("does nothing when an admin already exists", async () => {
@@ -28,5 +32,9 @@ describe("bootstrapAdmin", () => {
     const { bootstrapAdmin } = await import("./bootstrap");
     await bootstrapAdmin();
     expect(signUp).toHaveBeenCalledOnce();
+    expect(query).toHaveBeenLastCalledWith(
+      expect.stringContaining("role = 'admin'"),
+      ["u1"],
+    );
   });
 });
