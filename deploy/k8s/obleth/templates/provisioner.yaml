@@ -23,6 +23,15 @@ spec:
     metadata: { labels: { app: {{ .Release.Name }}-provisioner } }
     spec:
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeResolution.hostAliases }}
+      hostAliases: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeResolution.dnsConfig }}
+      dnsConfig: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeResolution.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
       containers:
         - name: provisioner
           image: {{ .Values.image.provisioner }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}
