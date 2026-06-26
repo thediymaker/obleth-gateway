@@ -5,6 +5,44 @@ afterEach(() => {
   vi.resetModules();
 });
 
+describe("oidcProviderLabels", () => {
+  it("returns [] when OIDC_PROVIDERS is unset", async () => {
+    const { oidcProviderLabels } = await import("./providers");
+    expect(oidcProviderLabels()).toEqual([]);
+  });
+
+  it("returns only providerId and displayName — no secrets", async () => {
+    process.env.OIDC_PROVIDERS = JSON.stringify([{
+      providerId: "dex",
+      displayName: "Dev SSO (Dex)",
+      discoveryUrl: "http://dex:5556/.well-known/openid-configuration",
+      clientId: "obleth-gateway",
+      clientSecret: "super-secret",
+      scopes: ["openid", "email", "profile"],
+    }]);
+    const { oidcProviderLabels } = await import("./providers");
+    const labels = oidcProviderLabels();
+    expect(labels).toHaveLength(1);
+    expect(labels[0]).toEqual({ providerId: "dex", displayName: "Dev SSO (Dex)" });
+    // Security: no secret or sensitive fields must leak
+    expect(labels[0]).not.toHaveProperty("clientSecret");
+    expect(labels[0]).not.toHaveProperty("clientId");
+    expect(labels[0]).not.toHaveProperty("discoveryUrl");
+  });
+
+  it("returns multiple labels in order", async () => {
+    process.env.OIDC_PROVIDERS = JSON.stringify([
+      { providerId: "a", displayName: "Provider A", discoveryUrl: "https://a.example/", clientId: "cid-a", clientSecret: "s1" },
+      { providerId: "b", displayName: "Provider B", discoveryUrl: "https://b.example/", clientId: "cid-b", clientSecret: "s2" },
+    ]);
+    const { oidcProviderLabels } = await import("./providers");
+    const labels = oidcProviderLabels();
+    expect(labels).toHaveLength(2);
+    expect(labels[0].providerId).toBe("a");
+    expect(labels[1].providerId).toBe("b");
+  });
+});
+
 describe("oidcProviders", () => {
   it("returns [] when OIDC_PROVIDERS is unset", async () => {
     const { oidcProviders } = await import("./providers");
