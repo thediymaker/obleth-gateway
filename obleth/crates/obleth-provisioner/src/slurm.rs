@@ -7,8 +7,13 @@ pub trait SlurmClient: Send + Sync {
     /// Submit a job; return its Slurm job id.
     async fn submit(&self, job: &JobSubmit) -> anyhow::Result<String>;
     async fn cancel(&self, job_id: &str) -> anyhow::Result<()>;
-    /// All jobs whose name starts with the gateway's prefix.
-    async fn list_owned_jobs(&self, name_prefix: &str) -> anyhow::Result<Vec<JobInfo>>;
+    /// Current state of a single job by id. `Ok(None)` means the controller has
+    /// no such job (finished and purged, or never existed) — the planner reads
+    /// that as "gone". A transport/HTTP error is returned as `Err` so the caller
+    /// can hold the tick rather than mistake an unreachable Slurm for dead jobs.
+    /// We look our jobs up by id (recorded on replica rows at submit) rather than
+    /// listing the whole controller, which on a busy cluster is huge.
+    async fn get_job(&self, job_id: &str) -> anyhow::Result<Option<JobInfo>>;
     /// Best-effort read of cluster partitions, nodes, and the caller's
     /// accounts/QoS. Individual sub-reads that fail are logged and skipped so a
     /// partial cluster view still powers the launcher dropdowns.
@@ -145,12 +150,93 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Minimal projection of a slurmrestd job record: only the fields the reconcile
+/// loop reads. Deserializing into this (rather than `serde_json::Value`) makes
+/// serde *skip* every other field instead of allocating a dynamic tree for it,
+/// keeping memory proportional to "fields we use" rather than "every field of
+/// the record".
+#[derive(serde::Deserialize)]
+struct JobsResponse {
+    #[serde(default)]
+    jobs: Vec<JobRecord>,
+}
+
+#[derive(serde::Deserialize)]
+struct JobRecord {
+    /// int or string depending on slurmrestd version — kept as a small scalar
+    /// Value and normalized below. (Per-field Value for a scalar is cheap; the
+    /// memory blowup came from materializing *whole records*.)
+    #[serde(default)]
+    job_id: serde_json::Value,
+    /// string or array-of-strings depending on version.
+    #[serde(default)]
+    job_state: serde_json::Value,
+    #[serde(default)]
+    nodes: String,
+    #[serde(default)]
+    state_reason: serde_json::Value,
+}
+
+fn job_id_to_string(v: &serde_json::Value) -> String {
+    v.as_i64()
+        .map(|n| n.to_string())
+        .or_else(|| v.as_str().map(String::from))
+        .unwrap_or_default()
+}
+
+fn job_state_to_string(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(a) => a.first().and_then(|x| x.as_str()).unwrap_or("").to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Project a slurmrestd single-job response body into our `JobInfo`. The
+/// `GET /job/{id}` route returns `{ "jobs": [ {record} ] }`; we take the first
+/// record. `None` when the array is empty (some versions answer an unknown id
+/// with 200 + empty jobs rather than 404) or the body isn't the expected shape.
+/// Pure (no HTTP) so the version-shape handling is unit-testable, and typed so
+/// the many fields we don't read are skipped rather than allocated.
+fn parse_job(body: &[u8]) -> Option<JobInfo> {
+    let parsed: JobsResponse = serde_json::from_slice(body).ok()?;
+    let j = parsed.jobs.into_iter().next()?;
+    let job_id = job_id_to_string(&j.job_id);
+    if job_id.is_empty() {
+        return None;
+    }
+    let raw_state = job_state_to_string(&j.job_state);
+    let reason = j
+        .state_reason
+        .as_str()
+        .map(str::to_string)
+        .filter(|r| !r.trim().is_empty() && !r.eq_ignore_ascii_case("none"));
+    Some(JobInfo {
+        job_id,
+        state: map_job_state(&raw_state),
+        nodes: expand_nodelist(&j.nodes),
+        raw_state,
+        reason,
+    })
+}
+
 /// Map a Slurm job_state string (any version) onto our coarse JobState.
 pub fn map_job_state(s: &str) -> JobState {
     match s.to_ascii_uppercase().as_str() {
         "PENDING" | "CONFIGURING" | "SUSPENDED" => JobState::Pending,
         "RUNNING" | "COMPLETING" => JobState::Running,
         _ => JobState::Gone, // COMPLETED/FAILED/CANCELLED/PREEMPTED/TIMEOUT/NODE_FAIL/...
+    }
+}
+
+/// Human status line for a replica's Slurm job, e.g. "PENDING — Resources" or
+/// "RUNNING". A missing or "None" reason collapses to just the state.
+pub fn job_status_message(raw_state: &str, reason: Option<&str>) -> String {
+    match reason {
+        Some(r) if !r.trim().is_empty() && !r.eq_ignore_ascii_case("none") => {
+            format!("{raw_state} — {r}")
+        }
+        _ => raw_state.to_string(),
     }
 }
 
@@ -242,38 +328,21 @@ impl SlurmClient for Slurmrestd {
         Ok(())
     }
 
-    async fn list_owned_jobs(&self, name_prefix: &str) -> anyhow::Result<Vec<JobInfo>> {
-        let url = format!("{}/slurm/{}/jobs", self.base, self.version);
+    async fn get_job(&self, job_id: &str) -> anyhow::Result<Option<JobInfo>> {
+        let url = format!("{}/slurm/{}/job/{}", self.base, self.version, job_id);
         let resp = self.auth(self.http.get(&url)).send().await?;
+        // A finished+purged (or unknown) job is reported as 404 by some versions
+        // and as 200 with an empty `jobs` array by others — both mean "gone".
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
         if !resp.status().is_success() {
-            anyhow::bail!("slurmrestd jobs failed: {}", resp.status());
+            anyhow::bail!("slurmrestd job {job_id} failed: {}", resp.status());
         }
-        let v: serde_json::Value = resp.json().await?;
-        let mut out = Vec::new();
-        for j in v.get("jobs").and_then(|x| x.as_array()).cloned().unwrap_or_default() {
-            let name = j.get("name").and_then(|x| x.as_str()).unwrap_or_default();
-            if !name.starts_with(name_prefix) { continue; }
-            let job_id = j.get("job_id")
-                .and_then(|x| x.as_i64().map(|n| n.to_string()).or_else(|| x.as_str().map(String::from)))
-                .unwrap_or_default();
-            if job_id.is_empty() {
-                tracing::warn!(job_name = name, "slurmrestd job missing job_id; skipping");
-                continue;
-            }
-            // job_state may be a string or array of strings depending on version.
-            let state_str = match j.get("job_state") {
-                Some(serde_json::Value::String(s)) => s.clone(),
-                Some(serde_json::Value::Array(a)) => a.first().and_then(|x| x.as_str()).unwrap_or("").to_string(),
-                _ => String::new(),
-            };
-            let nodes = j.get("nodes").and_then(|x| x.as_str()).unwrap_or_default();
-            out.push(JobInfo {
-                job_id,
-                state: map_job_state(&state_str),
-                nodes: expand_nodelist(nodes),
-            });
-        }
-        Ok(out)
+        // Typed projection over the raw body (not `.json::<Value>()`): the
+        // single-job response still carries a full record we mostly ignore.
+        let body = resp.bytes().await?;
+        Ok(parse_job(&body))
     }
 
     async fn discover_resources(&self) -> anyhow::Result<ClusterResources> {
@@ -419,6 +488,8 @@ mod tests {
             min_replicas: 1,
             max_job_failures: 0,
             launcher_spec: None,
+            last_provision_error: None,
+            last_provision_error_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -528,6 +599,74 @@ mod tests {
         let j = job_submit_from_spec(&spec(), "nemotron", "obleth-", 8016, 8);
         assert!(j.script.contains("__p=8016; __p<=8023"), "window base and last computed correctly");
         assert!(j.script.contains("OBLETH_SERVING_PORT:-8016"), "fallback to window base");
+    }
+
+    #[test]
+    fn job_status_message_formats_state_and_reason() {
+        assert_eq!(job_status_message("PENDING", Some("Resources")), "PENDING — Resources");
+        assert_eq!(job_status_message("RUNNING", None), "RUNNING");
+        assert_eq!(job_status_message("RUNNING", Some("None")), "RUNNING");
+        assert_eq!(job_status_message("PENDING", Some("  ")), "PENDING");
+    }
+
+    #[test]
+    fn parse_job_tolerates_int_id_and_array_state() {
+        let body = serde_json::to_vec(&serde_json::json!({ "jobs": [
+            { "job_id": 123, "job_state": ["PENDING"], "nodes": "", "state_reason": "Resources" },
+        ] })).unwrap();
+        let j = parse_job(&body).expect("job");
+        assert_eq!(j.job_id, "123");
+        assert_eq!(j.raw_state, "PENDING");
+        assert_eq!(j.state, JobState::Pending);
+        assert_eq!(j.nodes, Vec::<String>::new());
+        assert_eq!(j.reason.as_deref(), Some("Resources"));
+    }
+
+    #[test]
+    fn parse_job_tolerates_string_id_and_string_state() {
+        let body = serde_json::to_vec(&serde_json::json!({ "jobs": [
+            { "job_id": "456", "job_state": "PENDING", "nodes": "gpu03" },
+        ] })).unwrap();
+        let j = parse_job(&body).expect("job");
+        assert_eq!(j.job_id, "456");
+        assert_eq!(j.state, JobState::Pending);
+    }
+
+    #[test]
+    fn parse_job_returns_none_for_empty_or_unknown() {
+        // 200-with-empty-jobs is how some versions report an unknown id.
+        let empty = serde_json::to_vec(&serde_json::json!({ "jobs": [] })).unwrap();
+        assert!(parse_job(&empty).is_none());
+        let no_id = serde_json::to_vec(&serde_json::json!({ "jobs": [ { "job_state": "RUNNING" } ] })).unwrap();
+        assert!(parse_job(&no_id).is_none());
+    }
+
+    #[test]
+    fn parse_job_collapses_none_reason_at_parse_time() {
+        // Literal "None" and whitespace-only reasons collapse to None
+        let none_literal = serde_json::to_vec(&serde_json::json!({ "jobs": [
+            { "job_id": 1, "job_state": "PENDING", "state_reason": "None" },
+        ] })).unwrap();
+        let j = parse_job(&none_literal).expect("job");
+        assert_eq!(j.reason, None, "literal 'None' reason should collapse to None");
+
+        let none_mixed_case = serde_json::to_vec(&serde_json::json!({ "jobs": [
+            { "job_id": 2, "job_state": "PENDING", "state_reason": "nOnE" },
+        ] })).unwrap();
+        let j = parse_job(&none_mixed_case).expect("job");
+        assert_eq!(j.reason, None, "case-insensitive 'None' should collapse");
+
+        let whitespace_only = serde_json::to_vec(&serde_json::json!({ "jobs": [
+            { "job_id": 3, "job_state": "PENDING", "state_reason": "   " },
+        ] })).unwrap();
+        let j = parse_job(&whitespace_only).expect("job");
+        assert_eq!(j.reason, None, "whitespace-only reason should collapse");
+
+        let valid_reason = serde_json::to_vec(&serde_json::json!({ "jobs": [
+            { "job_id": 4, "job_state": "PENDING", "state_reason": "Resources" },
+        ] })).unwrap();
+        let j = parse_job(&valid_reason).expect("job");
+        assert_eq!(j.reason, Some("Resources".to_string()), "valid reasons preserved");
     }
 
     #[test]

@@ -58,10 +58,17 @@ pub fn plan(
             }
             Some(JobState::Running) => {
                 alive += 1;
-                // "pending" replicas haven't been probed yet (they were waiting for
-                // the job to leave Slurm-PENDING); treat them the same as "starting"
-                // so they get promoted as soon as the health check passes.
-                if r.state == "starting" || r.state == "pending" {
+                // Promote on a passing health check. This covers fresh replicas
+                // ("pending" replicas haven't been probed yet — they were waiting
+                // for the job to leave Slurm-PENDING — so treat them like
+                // "starting") AND self-heals a replica stranded as "healthy" with
+                // no endpoint linked (e.g. a prior promote whose endpoint write
+                // failed): the planner would otherwise never re-promote a
+                // "healthy" row, leaving the model permanently unhealthy.
+                let needs_promote = r.state == "starting"
+                    || r.state == "pending"
+                    || (r.state == "healthy" && r.endpoint_id.is_none());
+                if needs_promote {
                     if let Some(&port) = health.get(&r.id) {
                         let node = jobs.get(&r.slurm_job_id).and_then(|j| j.nodes.first().cloned()).unwrap_or_default();
                         actions.push(Action::Promote { replica_id: r.id, api_base: endpoint_api_base(&node, port as i64) });
@@ -119,10 +126,10 @@ mod tests {
     use super::*;
 
     fn rv(state: &str, job: &str, ep: Option<Uuid>, age: i64) -> ReplicaView {
-        ReplicaView { id: Uuid::new_v4(), model_id: Uuid::new_v4(), slurm_job_id: job.into(), state: state.into(), endpoint_id: ep, age_secs: age, port_base: 0 }
+        ReplicaView { id: Uuid::new_v4(), model_id: Uuid::new_v4(), slurm_job_id: job.into(), state: state.into(), endpoint_id: ep, age_secs: age, port_base: 0, last_message: None }
     }
     fn job(id: &str, st: JobState, nodes: &[&str]) -> (String, JobInfo) {
-        (id.into(), JobInfo { job_id: id.into(), state: st, nodes: nodes.iter().map(|s| s.to_string()).collect() })
+        (id.into(), JobInfo { job_id: id.into(), state: st, nodes: nodes.iter().map(|s| s.to_string()).collect(), raw_state: String::new(), reason: None })
     }
     fn spec(target: i64) -> ManagedSpecView { ManagedSpecView { target_replicas: target, max_job_failures: 0 } }
     fn spec_with_limit(target: i64, limit: i64) -> ManagedSpecView { ManagedSpecView { target_replicas: target, max_job_failures: limit } }
@@ -163,6 +170,30 @@ mod tests {
         let health = HashMap::from([(id, 8000u16)]);
         let actions = plan(&spec(1), &[r], &jobs, &health, 900);
         assert_eq!(actions, vec![Action::Promote { replica_id: id, api_base: "http://gpu7:8000/v1".into() }]);
+    }
+
+    #[test]
+    fn healthy_without_endpoint_is_repromoted() {
+        // Stranded "healthy" with no endpoint linked (a prior promote whose
+        // endpoint write failed) must be re-promoted so it relinks an endpoint.
+        let r = rv("healthy", "j1", None, 300);
+        let id = r.id;
+        let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
+        let health = HashMap::from([(id, 8000u16)]);
+        let actions = plan(&spec(1), &[r], &jobs, &health, 900);
+        assert_eq!(actions, vec![Action::Promote { replica_id: id, api_base: "http://gpu7:8000/v1".into() }]);
+    }
+
+    #[test]
+    fn healthy_with_endpoint_is_not_repromoted() {
+        // A properly-linked healthy replica must NOT be re-promoted, even if a
+        // stale health entry exists for it.
+        let r = rv("healthy", "j1", Some(Uuid::new_v4()), 300);
+        let id = r.id;
+        let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
+        let health = HashMap::from([(id, 8000u16)]);
+        let actions = plan(&spec(1), &[r], &jobs, &health, 900);
+        assert!(actions.is_empty(), "got {actions:?}");
     }
 
     #[test]

@@ -49,7 +49,7 @@ export function CharoLauncher({
       onClick={onOpen}
       aria-label={label}
       className={cn(
-        "group fixed bottom-5 right-5 z-[55] flex h-14 w-14 items-center justify-center rounded-full border bg-card/95 p-0 shadow-2xl ring-1 ring-primary/5 backdrop-blur transition-[border-color,background-color,box-shadow,transform] duration-200 hover:-translate-y-0.5 hover:border-violet-300/55 hover:bg-accent hover:shadow-[0_0_34px_hsl(267_86%_70%/0.38)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-300/70",
+        "group fixed bottom-5 right-8 z-[55] flex h-14 w-14 items-center justify-center rounded-full border bg-card/95 p-0 shadow-2xl ring-1 ring-primary/5 backdrop-blur transition-[border-color,background-color,box-shadow,transform] duration-200 hover:-translate-y-0.5 hover:border-violet-300/55 hover:bg-accent hover:shadow-[0_0_34px_hsl(267_86%_70%/0.38)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-300/70",
         "border-border",
       )}
     >

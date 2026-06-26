@@ -2,6 +2,7 @@ image:
   obleth: ghcr.io/thediymaker/obleth-gateway/obleth
   benchmarkBackend: ghcr.io/thediymaker/obleth-gateway/benchmark-backend
   controlPlane: ghcr.io/thediymaker/obleth-gateway/control-plane
+  provisioner: ghcr.io/thediymaker/obleth-gateway/obleth-provisioner
   # Empty -> v{appVersion} from Chart.yaml, so each chart release pins its own
   # images. Override to test a specific tag (e.g. "main" for edge builds).
   tag: ""
@@ -55,6 +56,27 @@ hpa:
   minReplicas: 3
   maxReplicas: 20
   targetCPUUtilizationPercentage: 70
+
+# Reaching Slurm compute nodes from the gateway and provisioner pods. When the
+# pods can't resolve your cluster's node hostnames (e.g. the gateway runs in
+# Kubernetes and the Slurm nodes live on a separate site DNS), use these to
+# bridge it. Applied to the obleth (data plane / health checks) and provisioner
+# pods only — the control-plane never talks to compute nodes. All empty by
+# default (cluster DNS is used unchanged).
+nodeResolution:
+  # Static /etc/hosts entries — a node->IP map. Example:
+  #   - ip: "10.0.0.25"
+  #     hostnames: ["scgh001", "scgh001.example.edu"]
+  hostAliases: []
+  # Custom resolver injected into the pods. Example:
+  #   nameservers: ["10.0.0.10"]
+  #   searches: ["sol.rc.example.edu"]
+  #   options: [{ name: ndots, value: "2" }]
+  dnsConfig: {}
+  # Override dnsPolicy (e.g. "None" when you fully specify nameservers above).
+  # Empty keeps Kubernetes' default ("ClusterFirst"), which still honors the
+  # extra nameservers in dnsConfig.
+  dnsPolicy: ""
 
 # Pod- and container-level hardening applied to the stateless workloads this
 # chart builds (obleth data plane, control-plane, benchmark-backend). These
@@ -179,6 +201,21 @@ benchmarkBackend:
   ttftMs: 20
   tokenMs: 3
   concurrency: 256
+
+# Optional Slurm provisioner plugin. Off by default — enable only when serving
+# models on a Slurm cluster. It keeps enabled managed models at their target
+# replica count via slurmrestd. slurmrestd connection details and the master
+# enable switch are configured at runtime in the dashboard (Settings -> Slurm),
+# not here; this only controls whether the reconciler process is deployed.
+# Runs as a singleton (replicas:1, Recreate) — do not scale it.
+provisioner:
+  enabled: false
+  # Reconcile cadence. Lower = faster reaction, more slurmrestd/API traffic.
+  intervalSecs: 15
+  logLevel: "info,obleth_provisioner=debug"
+  resources:
+    requests: { cpu: "50m", memory: "64Mi" }
+    limits: { cpu: "500m", memory: "256Mi" }
 
 controlPlane:
   enabled: true

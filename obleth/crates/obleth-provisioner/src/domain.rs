@@ -20,6 +20,10 @@ pub struct JobInfo {
     pub state: JobState,
     /// Allocated node hostnames (first is used for the endpoint URL in v1).
     pub nodes: Vec<String>,
+    /// Raw slurmrestd job_state string (e.g. "RUNNING", "PENDING", "FAILED").
+    pub raw_state: String,
+    /// slurmrestd state_reason (e.g. "Resources", "Priority"); `None`/"None" omitted.
+    pub reason: Option<String>,
 }
 
 /// A version-agnostic job request, built from a ManagedModelSpec. The slurm
@@ -55,6 +59,8 @@ pub struct ReplicaView {
     pub endpoint_id: Option<Uuid>,
     pub age_secs: i64, // now - created_at, for GC + cancel ordering
     pub port_base: i64,
+    /// Current replica message, so the tick can diff before re-patching.
+    pub last_message: Option<String>,
 }
 
 /// Live, version-agnostic snapshot of what the configured Slurm cluster offers.

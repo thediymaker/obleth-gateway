@@ -1,0 +1,50 @@
+{{- if .Values.provisioner.enabled }}
+# Optional Slurm provisioner plugin (mirrors the docker-compose `slurm` profile).
+# Keeps each enabled managed model at its target replica count on a preemptible
+# Slurm cluster via slurmrestd. It makes only outbound calls — to the Management
+# API (this chart's obleth service) and to slurmrestd — so it needs no Service,
+# ports, or probes. slurmrestd connection details + the master enable switch live
+# in system-wide settings (dashboard -> Settings -> Slurm), fetched each tick.
+#
+# Singleton: this is a reconciler, so exactly one replica must run. `Recreate`
+# ensures a rollout tears down the old pod before starting the new one, so two
+# copies never submit Slurm jobs at the same time.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-provisioner
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector: { matchLabels: { app: {{ .Release.Name }}-provisioner } }
+  template:
+    metadata: { labels: { app: {{ .Release.Name }}-provisioner } }
+    spec:
+      securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- with .Values.nodeResolution.hostAliases }}
+      hostAliases: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeResolution.dnsConfig }}
+      dnsConfig: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeResolution.dnsPolicy }}
+      dnsPolicy: {{ . }}
+      {{- end }}
+      containers:
+        - name: provisioner
+          image: {{ .Values.image.provisioner }}:{{ .Values.image.tag | default (printf "v%s" .Chart.AppVersion) }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
+          env:
+            - { name: OBLETH_ADMIN_BASE_URL, value: "http://{{ include "obleth.fullname" . }}:9180" }
+            - name: OBLETH_ADMIN_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "obleth.secretName" . }}
+                  key: OBLETH_ADMIN_TOKEN
+            - { name: OBLETH_PROVISIONER_INTERVAL_SECS, value: {{ .Values.provisioner.intervalSecs | quote }} }
+            - { name: RUST_LOG, value: {{ .Values.provisioner.logLevel | quote }} }
+          resources: {{- toYaml .Values.provisioner.resources | nindent 12 }}
+{{- end }}

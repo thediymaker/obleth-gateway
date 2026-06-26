@@ -17,9 +17,11 @@ jobs:
   edge:
     strategy:
       matrix:
-        component: [obleth, control-plane, benchmark-backend]
+        component: [obleth, obleth-provisioner, control-plane, benchmark-backend]
         include:
           - component: obleth
+            context: .
+          - component: obleth-provisioner
             context: .
           - component: control-plane
             context: ./control-plane

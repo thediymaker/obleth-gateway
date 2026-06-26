@@ -20,7 +20,7 @@ import type {
   SlurmHealthView,
 } from "@/lib/obleth";
 import { requireSession } from "@/lib/auth/session";
-import { getRecipe, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
+import { resolveRecipeById, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
 
@@ -1658,7 +1658,7 @@ export async function deployRecipeAction(
   overrides?: DeployOverrides,
 ): Promise<ActionResult> {
   await requireSession();
-  const recipe = getRecipe(id);
+  const recipe = await resolveRecipeById(id);
   if (!recipe) return { ok: false, error: `recipe "${id}" not found` };
   if (!recipe.valid) return { ok: false, error: recipe.error ?? "recipe is invalid" };
 

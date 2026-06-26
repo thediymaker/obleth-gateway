@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { listRecipes, listRecipeDocs, getRecipe, loadRecipeCards } from "./sbatch-recipes";
+import { listRecipes, listRecipeDocs, getRecipe, loadRecipeCards, resolveRecipeById } from "./sbatch-recipes";
 import { obleth } from "@/lib/obleth";
 
 vi.mock("@/lib/obleth", () => ({
@@ -139,6 +139,69 @@ describe("loadRecipeCards merge (file + DB)", () => {
     expect(dbCard?.preview).toBeDefined();
     expect(dbCard?.preview?.engine).toBe("ollama");
     expect(dbCard?.preview?.port).toBe(11434);
+  });
+
+  it("DB card name uses the saved Template name over the frontmatter name", async () => {
+    // DB_ROW_BODY has frontmatter `name: Qwen2.5`, but the row's Template name
+    // is "Qwen2.5 DB". The saved Template name must win for the card label.
+    const cards = await loadRecipeCards();
+    const dbCard = cards.find((c) => c.recipeId === "db-qwen");
+    expect(dbCard?.name).toBe("Qwen2.5 DB");
+  });
+
+  it("DB card falls back to the frontmatter name when the row name is empty", async () => {
+    vi.mocked(obleth.listRecipes).mockResolvedValue([
+      { id: "db-qwen", name: "", body: DB_ROW_BODY, author: "admin" },
+    ]);
+    const cards = await loadRecipeCards();
+    const dbCard = cards.find((c) => c.recipeId === "db-qwen");
+    expect(dbCard?.name).toBe("Qwen2.5");
+  });
+});
+
+describe("resolveRecipeById (file-first, then DB)", () => {
+  const DB_BODY = [
+    "---",
+    "name: From DB",
+    "engine: vllm",
+    "model_type: chat",
+    "api_model_name: from-db",
+    "port: 8000",
+    "---",
+    "#!/bin/bash -l",
+    "vllm serve",
+  ].join("\n");
+
+  afterEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("resolves a file recipe by id without touching the admin API", async () => {
+    writeFileSync(path.join(dir, "glm.recipe"), VALID);
+    vi.mocked(obleth.listRecipes).mockResolvedValue([]);
+    const r = await resolveRecipeById("glm");
+    expect(r?.valid).toBe(true);
+    expect(r?.header?.api_model_name).toBe("glm");
+    expect(obleth.listRecipes).not.toHaveBeenCalled();
+  });
+
+  it("resolves a DB recipe by UUID id when no file matches", async () => {
+    vi.mocked(obleth.listRecipes).mockResolvedValue([
+      { id: "5ae0a150-32e3-4af9-8630-3a22a905450c", name: "Saved", body: DB_BODY, author: "admin" },
+    ]);
+    const r = await resolveRecipeById("5ae0a150-32e3-4af9-8630-3a22a905450c");
+    expect(r?.valid).toBe(true);
+    expect(r?.header?.api_model_name).toBe("from-db");
+  });
+
+  it("returns null when neither a file nor a DB row matches", async () => {
+    vi.mocked(obleth.listRecipes).mockResolvedValue([]);
+    expect(await resolveRecipeById("nope")).toBeNull();
+  });
+
+  it("returns null (not throw) when the admin API is down and no file matches", async () => {
+    vi.mocked(obleth.listRecipes).mockRejectedValue(new Error("API unavailable"));
+    expect(await resolveRecipeById("nope")).toBeNull();
   });
 
   it("returns file cards when admin API throws", async () => {

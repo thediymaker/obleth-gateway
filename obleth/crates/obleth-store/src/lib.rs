@@ -57,6 +57,7 @@ const SCHEMA_V4: &str = include_str!("../../../../schema/postgres/0004_saved_rec
 const SCHEMA_V5: &str = include_str!("../../../../schema/postgres/0005_managed_launcher_spec.sql");
 const SCHEMA_V6: &str = include_str!("../../../../schema/postgres/0006_recipes.sql");
 const SCHEMA_V7: &str = include_str!("../../../../schema/postgres/0007_replica_port_and_min_replicas.sql");
+const SCHEMA_V8: &str = include_str!("../../../../schema/postgres/0008_managed_provision_error.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -151,6 +152,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V5).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V6).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V7).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V8).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1577,7 +1579,8 @@ impl Store {
             "select model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
              qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
              script_body, serving_port, \
-             health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, created_at, updated_at \
+             health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, \
+             last_provision_error, last_provision_error_at, created_at, updated_at \
              from managed_models where model_id = $1",
         )
         .bind(model_id)
@@ -1604,7 +1607,8 @@ impl Store {
             "select model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
              qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
              script_body, serving_port, \
-             health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, created_at, updated_at \
+             health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, \
+             last_provision_error, last_provision_error_at, created_at, updated_at \
              from managed_models order by model_id",
         )
         .fetch_all(&self.pool)
@@ -1637,7 +1641,8 @@ impl Store {
              returning model_id, enabled, partition, gres, nodes, constraints, exclude, account, \
              qos, time_limit, cpus_per_task, mem, image, preamble, log_output_dir, launch_command, \
              script_body, serving_port, \
-             health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, created_at, updated_at",
+             health_path, target_replicas, min_replicas, max_job_failures, launcher_spec, \
+             last_provision_error, last_provision_error_at, created_at, updated_at",
         )
         .bind(m.model_id)
         .bind(m.enabled)
@@ -1675,6 +1680,24 @@ impl Store {
             .bind(model_id)
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Record (or clear) the provisioner's last submit error for a model. Sets
+    /// the timestamp to now() when storing an error; both columns to NULL when
+    /// clearing. No-op if the model has no managed_models row.
+    pub async fn set_provision_error(&self, model_id: Uuid, error: Option<&str>) -> Result<()> {
+        sqlx::query(
+            "update managed_models \
+             set last_provision_error = $2, \
+                 last_provision_error_at = case when $2 is null then null else now() end, \
+                 updated_at = now() \
+             where model_id = $1",
+        )
+        .bind(model_id)
+        .bind(error)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -1805,6 +1828,23 @@ impl Store {
         .bind(id)
         .bind(nodes)
         .bind(endpoint_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        replica_from_row(&row)
+    }
+
+    /// Update just a replica's last_message (used by the provisioner's live-status
+    /// annotation, which carries no state/runtime change). Returns the updated row.
+    pub async fn set_replica_message(&self, id: Uuid, message: &str) -> Result<ModelReplica> {
+        let row = sqlx::query(
+            "update model_replicas set last_message = $2, updated_at = now()
+             where id = $1
+             returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
+                       last_message, port_base, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(message)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -2766,6 +2806,8 @@ fn managed_model_from_row(row: &PgRow) -> Result<ManagedModelSpec> {
         min_replicas: row.try_get("min_replicas")?,
         max_job_failures: row.try_get("max_job_failures")?,
         launcher_spec: launcher_spec.map(|j| j.0),
+        last_provision_error: row.try_get("last_provision_error")?,
+        last_provision_error_at: row.try_get("last_provision_error_at")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -3282,6 +3324,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn managed_model_provision_error_set_and_clear() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        let model_name = format!("m-{}", Uuid::new_v4());
+        let args = default_test_model(&model_name);
+        let model = store
+            .create_model(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
+                &args.19, &args.20, &args.21,
+            )
+            .await
+            .expect("model");
+        store
+            .upsert_managed_model(UpsertManagedModel {
+                model_id: model.id,
+                enabled: true,
+                partition: "gpu-preempt".into(),
+                gres: "gpu:h100:1".into(),
+                nodes: 1,
+                constraints: None,
+                exclude: None,
+                account: None,
+                qos: None,
+                time_limit: None,
+                cpus_per_task: None,
+                mem: None,
+                image: "vllm.sif".into(),
+                preamble: String::new(),
+                log_output_dir: String::new(),
+                launch_command: "vllm serve perr-model".into(),
+                script_body: String::new(),
+                serving_port: 8000,
+                health_path: "/health".into(),
+                target_replicas: 1,
+                min_replicas: 1,
+                max_job_failures: 0,
+                launcher_spec: None,
+            })
+            .await
+            .expect("managed");
+
+        store.set_provision_error(model.id, Some("error 2045")).await.expect("set");
+        let m = store.get_managed_model(model.id).await.expect("get").expect("some");
+        assert_eq!(m.last_provision_error.as_deref(), Some("error 2045"));
+        assert!(m.last_provision_error_at.is_some());
+
+        store.set_provision_error(model.id, None).await.expect("clear");
+        let m = store.get_managed_model(model.id).await.expect("get").expect("some");
+        assert_eq!(m.last_provision_error, None);
+        assert!(m.last_provision_error_at.is_none());
+    }
+
+    #[tokio::test]
     async fn model_replica_roundtrip() {
         let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
@@ -3499,5 +3601,47 @@ mod tests {
 
         // Clean up.
         store.delete_replica(r2.id).await.expect("delete r2");
+    }
+
+    #[tokio::test]
+    async fn set_replica_message_test() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        let model_name = format!("m-{}", Uuid::new_v4());
+        let args = default_test_model(&model_name);
+        let model = store
+            .create_model(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
+                &args.19, &args.20, &args.21,
+            )
+            .await
+            .expect("create model");
+
+        let replica = store
+            .create_replica(model.id, "job-msg-1", None)
+            .await
+            .expect("create replica");
+
+        // A message-only update must persist without touching state.
+        let updated = store
+            .set_replica_message(replica.id, "provisioning: waiting for allocation")
+            .await
+            .expect("set_replica_message");
+        assert_eq!(
+            updated.last_message.as_deref(),
+            Some("provisioning: waiting for allocation"),
+            "last_message must be persisted"
+        );
+        assert_eq!(updated.state, replica.state, "state must be unchanged");
+
+        // Clean up.
+        store.delete_replica(replica.id).await.expect("delete replica");
     }
 }

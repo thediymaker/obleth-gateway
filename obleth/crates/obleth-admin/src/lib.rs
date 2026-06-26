@@ -179,6 +179,10 @@ pub fn router(state: AdminState) -> Router {
                 .put(put_managed_model)
                 .delete(delete_managed_model),
         )
+        .route(
+            "/api/v1/models/:id/managed/provision-error",
+            patch(set_provision_error),
+        )
         .route("/api/v1/replicas", get(list_all_replicas))
         .route(
             "/api/v1/replicas/:id",
@@ -3281,6 +3285,23 @@ async fn delete_managed_model(
     Ok(Json(serde_json::json!({"deleted": true})))
 }
 
+#[derive(serde::Deserialize)]
+struct ProvisionErrorBody {
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[utoipa::path(patch, path = "/api/v1/models/{id}/managed/provision-error",
+    responses((status = 200)))]
+async fn set_provision_error(
+    State(state): State<AdminState>,
+    Path(id): Path<uuid::Uuid>,
+    Json(body): Json<ProvisionErrorBody>,
+) -> Result<Json<serde_json::Value>> {
+    state.store.set_provision_error(id, body.error.as_deref()).await?;
+    Ok(Json(serde_json::json!({ "ok": true })))
+}
+
 // ---- replica registry ----------------------------------------------------
 
 #[utoipa::path(get, path = "/api/v1/models/{id}/replicas",
@@ -3328,20 +3349,29 @@ async fn patch_replica(
     Path(id): Path<Uuid>,
     Json(body): Json<PatchReplica>,
 ) -> Result<Json<ModelReplica>> {
+    // Validate up front so an invalid state can't partially apply runtime changes.
     if let Some(state_val) = body.state.as_deref() {
         if !obleth_config::REPLICA_STATES.contains(&state_val) {
             return Err(AdminError::BadRequest("invalid replica state".into()));
         }
-        state
-            .store
-            .update_replica_state(id, state_val, body.message.as_deref())
-            .await?;
     }
+    // Apply runtime (nodes/endpoint) BEFORE flipping state. If linking the
+    // endpoint fails (e.g. an invalid endpoint_id), we must not have already
+    // marked the replica healthy — that would strand it as "healthy" with no
+    // endpoint, which the planner never re-promotes.
     if body.nodes.is_some() || body.endpoint_id.is_some() {
         state
             .store
             .set_replica_runtime(id, body.nodes.as_deref(), body.endpoint_id)
             .await?;
+    }
+    if let Some(state_val) = body.state.as_deref() {
+        state
+            .store
+            .update_replica_state(id, state_val, body.message.as_deref())
+            .await?;
+    } else if let Some(msg) = body.message.as_deref() {
+        state.store.set_replica_message(id, msg).await?;
     }
     let current = state
         .store
