@@ -2,6 +2,7 @@
 
 import Link from "next/link";
 import { usePathname, useRouter } from "next/navigation";
+import { authClient } from "@/lib/auth/client";
 import { useEffect, useMemo, useState } from "react";
 import {
   BookText,
@@ -129,7 +130,7 @@ export function AppShell({
   }
 
   async function logout() {
-    await fetch("/api/auth/logout", { method: "POST" });
+    await authClient.signOut();
     router.push("/login");
     router.refresh();
   }
