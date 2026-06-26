@@ -44,6 +44,21 @@ pub fn plan(
             continue;
         }
 
+        // Operator-requested restart: cancel this replica's job now (regardless
+        // of target) so the resubmit-to-target below launches a fresh one. Don't
+        // count it as alive. After cancel it becomes "draining" (skipped above)
+        // until its job goes Gone and the row is GC'd, which clears the flag.
+        if r.cancel_requested
+            && matches!(jobs.get(&r.slurm_job_id).map(|j| j.state), Some(JobState::Pending | JobState::Running))
+        {
+            actions.push(Action::Cancel {
+                replica_id: r.id,
+                job_id: r.slurm_job_id.clone(),
+                endpoint_id: r.endpoint_id,
+            });
+            continue;
+        }
+
         match jobs.get(&r.slurm_job_id).map(|j| j.state) {
             None | Some(JobState::Gone) => {
                 actions.push(Action::MarkLost {
@@ -126,7 +141,7 @@ mod tests {
     use super::*;
 
     fn rv(state: &str, job: &str, ep: Option<Uuid>, age: i64) -> ReplicaView {
-        ReplicaView { id: Uuid::new_v4(), model_id: Uuid::new_v4(), slurm_job_id: job.into(), state: state.into(), endpoint_id: ep, age_secs: age, port_base: 0, last_message: None }
+        ReplicaView { id: Uuid::new_v4(), model_id: Uuid::new_v4(), slurm_job_id: job.into(), state: state.into(), endpoint_id: ep, age_secs: age, port_base: 0, last_message: None, cancel_requested: false }
     }
     fn job(id: &str, st: JobState, nodes: &[&str]) -> (String, JobInfo) {
         (id.into(), JobInfo { job_id: id.into(), state: st, nodes: nodes.iter().map(|s| s.to_string()).collect(), raw_state: String::new(), reason: None })
@@ -225,6 +240,20 @@ mod tests {
         let jobs = HashMap::from([job("j1", JobState::Running, &["n1"]), job("j2", JobState::Pending, &["",])]);
         let actions = plan(&spec(1), &[healthy, pending], &jobs, &HashMap::new(), 900);
         assert_eq!(actions, vec![Action::Cancel { replica_id: pid, job_id: "j2".into(), endpoint_id: None }]);
+    }
+
+    #[test]
+    fn cancel_requested_replica_is_cancelled_and_replaced() {
+        let ep = Uuid::new_v4();
+        let mut r = rv("healthy", "j1", Some(ep), 100);
+        r.cancel_requested = true;
+        let id = r.id;
+        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
+        let actions = plan(&spec(1), &[r], &jobs, &HashMap::new(), 900);
+        // Cancelled (with its endpoint) regardless of target, and a fresh replica
+        // submitted to refill — i.e. a restart.
+        assert!(actions.contains(&Action::Cancel { replica_id: id, job_id: "j1".into(), endpoint_id: Some(ep) }));
+        assert!(actions.contains(&Action::Submit));
     }
 
     #[test]
