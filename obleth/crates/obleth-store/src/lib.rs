@@ -3730,5 +3730,9 @@ mod tests {
             replicas.iter().any(|r| r.id == replica.id),
             "replica row must outlive the model delete"
         );
+
+        // Clean up the now-orphaned replica row, matching the teardown discipline
+        // of the other replica integration tests.
+        store.delete_replica(replica.id).await.ok();
     }
 }
