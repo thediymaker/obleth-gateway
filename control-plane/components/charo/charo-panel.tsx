@@ -371,12 +371,15 @@ export function CharoPanel({
             onKeyDown={(e) => {
               if (e.key === "Enter" && !e.shiftKey) {
                 e.preventDefault();
-                onSend();
+                if (!busy) onSend();
               }
             }}
             rows={2}
             placeholder={selected ? `Message ${selected.model_name}...` : "Select a model..."}
-            disabled={busy || !selected}
+            // Stay enabled while a response streams (only require a selected
+            // model) so the input keeps focus after Enter; Enter is ignored
+            // mid-stream via the guard above, and the Send button is disabled.
+            disabled={!selected}
             className="flex-1 resize-none rounded-md border border-border bg-background px-3 py-2 text-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:opacity-50"
           />
           <div className="flex flex-col gap-1">
