@@ -66,6 +66,7 @@ fn replica_views_from_json(rows: &serde_json::Value) -> Vec<ReplicaView> {
             age_secs: (now - created).num_seconds(),
             port_base: r.get("port_base").and_then(|x| x.as_i64()).unwrap_or(0),
             last_message: r.get("last_message").and_then(|x| x.as_str()).map(str::to_string),
+            cancel_requested: r.get("cancel_requested").and_then(|x| x.as_bool()).unwrap_or(false),
         });
     }
     out

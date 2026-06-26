@@ -1,6 +1,7 @@
 ﻿"use client";
 
 import { createContext, useActionState, useContext, useEffect, useMemo, useRef, useState, useTransition, type ChangeEvent, type ReactNode } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
   Check,
@@ -44,6 +45,7 @@ import {
   setModelCapacityAction,
   setModelCapacityModeAction,
   setModelHealthConfigAction,
+  restartReplicaAction,
   setModelReliabilityAction,
   setModelWeightAction,
   updateModelConnectionAction,
@@ -87,7 +89,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { AutotuneReport, AutotuneWorkload, CacheStats, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
+import type { AutotuneReport, AutotuneWorkload, CacheStats, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelReplica, ModelRoute } from "@/lib/obleth";
 import { providerForModel } from "@/lib/model-providers";
 import { RecipeList } from "@/components/recipes/recipe-list";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
@@ -1963,6 +1965,25 @@ function ReliabilityPanel({
   const disabled = pending || busy;
   const addFormRef = useRef<HTMLFormElement>(null);
 
+  // Map each endpoint to its backing Slurm replica (if any) so a Slurm-managed
+  // endpoint can be restarted — Restart cancels the replica's job and the
+  // provisioner launches a fresh one. Static endpoints have no replica → no
+  // Restart. Shares the ["replicas", id] query key with the provisioning panel.
+  const { data: replicaData } = useQuery({
+    queryKey: ["replicas", model.id],
+    refetchInterval: 5000,
+    queryFn: async (): Promise<ModelReplica[]> => {
+      const r = await fetch(`/api/live/models/${model.id}/replicas`);
+      if (!r.ok) throw new Error("failed to load replicas");
+      return r.json();
+    },
+  });
+  const replicaByEndpoint = new Map(
+    (replicaData ?? [])
+      .filter((r) => r.endpoint_id)
+      .map((r) => [r.endpoint_id as string, r]),
+  );
+
   function saveReliability(formData: FormData) {
     const rawTimeout = String(formData.get("request_timeout_secs") ?? "").trim();
     const body = {
@@ -2058,6 +2079,22 @@ function ReliabilityPanel({
                     </td>
                     <td className="py-2 pr-4">
                       <div className="flex items-center justify-end gap-1.5">
+                        {replicaByEndpoint.has(ep.id) && (
+                          <Button
+                            type="button"
+                            size="sm"
+                            variant="ghost"
+                            disabled={disabled}
+                            title="Cancel this replica's Slurm job; the provisioner launches a fresh one"
+                            onClick={() =>
+                              start(async () => {
+                                await restartReplicaAction(replicaByEndpoint.get(ep.id)!.id);
+                              })
+                            }
+                          >
+                            Restart
+                          </Button>
+                        )}
                         <Button
                           type="button"
                           size="sm"

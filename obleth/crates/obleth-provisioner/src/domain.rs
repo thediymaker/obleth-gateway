@@ -61,6 +61,9 @@ pub struct ReplicaView {
     pub port_base: i64,
     /// Current replica message, so the tick can diff before re-patching.
     pub last_message: Option<String>,
+    /// Operator requested a restart: cancel this replica's job (regardless of
+    /// target) so the resubmit-to-target launches a fresh one.
+    pub cancel_requested: bool,
 }
 
 /// Live, version-agnostic snapshot of what the configured Slurm cluster offers.

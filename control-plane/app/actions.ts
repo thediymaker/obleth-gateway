@@ -1626,6 +1626,13 @@ export async function clearLostReplicasAction(modelId: string): Promise<ActionRe
   return { ok: true };
 }
 
+export async function restartReplicaAction(replicaId: string): Promise<ActionResult> {
+  await requireSession();
+  try { await obleth.restartReplica(replicaId); }
+  catch (e) { return actionError(e); }
+  return { ok: true };
+}
+
 export async function saveTemplateAction(
   input: { id?: string; name: string; body: string },
 ): Promise<ActionResult> {

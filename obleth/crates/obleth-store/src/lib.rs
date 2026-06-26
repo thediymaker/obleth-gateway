@@ -58,6 +58,7 @@ const SCHEMA_V5: &str = include_str!("../../../../schema/postgres/0005_managed_l
 const SCHEMA_V6: &str = include_str!("../../../../schema/postgres/0006_recipes.sql");
 const SCHEMA_V7: &str = include_str!("../../../../schema/postgres/0007_replica_port_and_min_replicas.sql");
 const SCHEMA_V8: &str = include_str!("../../../../schema/postgres/0008_managed_provision_error.sql");
+const SCHEMA_V9: &str = include_str!("../../../../schema/postgres/0009_replica_cancel_requested.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -153,6 +154,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V6).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V7).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V8).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V9).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1752,7 +1754,7 @@ impl Store {
              values ($1, $2, $3, $4)
              on conflict (model_id, slurm_job_id) do update set updated_at = now()
              returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                       last_message, port_base, created_at, updated_at",
+                       last_message, port_base, cancel_requested, created_at, updated_at",
         )
         .bind(Uuid::new_v4())
         .bind(model_id)
@@ -1766,7 +1768,7 @@ impl Store {
     pub async fn list_replicas(&self, model_id: Uuid) -> Result<Vec<ModelReplica>> {
         let rows = sqlx::query(
             "select id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                    last_message, port_base, created_at, updated_at
+                    last_message, port_base, cancel_requested, created_at, updated_at
              from model_replicas where model_id = $1 order by created_at",
         )
         .bind(model_id)
@@ -1778,7 +1780,7 @@ impl Store {
     pub async fn all_replicas(&self) -> Result<Vec<ModelReplica>> {
         let rows = sqlx::query(
             "select id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                    last_message, port_base, created_at, updated_at
+                    last_message, port_base, cancel_requested, created_at, updated_at
              from model_replicas order by model_id, created_at",
         )
         .fetch_all(&self.pool)
@@ -1796,7 +1798,7 @@ impl Store {
             "update model_replicas set state = $2, last_message = $3, updated_at = now()
              where id = $1
              returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                       last_message, port_base, created_at, updated_at",
+                       last_message, port_base, cancel_requested, created_at, updated_at",
         )
         .bind(id)
         .bind(state)
@@ -1823,7 +1825,7 @@ impl Store {
                     endpoint_id = coalesce($3, endpoint_id), updated_at = now()
              where id = $1
              returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                       last_message, port_base, created_at, updated_at",
+                       last_message, port_base, cancel_requested, created_at, updated_at",
         )
         .bind(id)
         .bind(nodes)
@@ -1841,7 +1843,7 @@ impl Store {
             "update model_replicas set last_message = $2, updated_at = now()
              where id = $1
              returning id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                       last_message, port_base, created_at, updated_at",
+                       last_message, port_base, cancel_requested, created_at, updated_at",
         )
         .bind(id)
         .bind(message)
@@ -1851,11 +1853,24 @@ impl Store {
         replica_from_row(&row)
     }
 
+    /// Flag a replica for restart: the provisioner cancels its Slurm job on the
+    /// next tick and resubmit-to-target launches a fresh one. Returns `false`
+    /// when no replica with that id exists, so the caller can surface a 404.
+    pub async fn request_replica_cancel(&self, id: Uuid) -> Result<bool> {
+        let res = sqlx::query(
+            "update model_replicas set cancel_requested = true, updated_at = now() where id = $1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
     /// Fetch a single replica by id. Returns `None` if no row exists.
     pub async fn get_replica(&self, id: Uuid) -> Result<Option<ModelReplica>> {
         let row = sqlx::query(
             "select id, model_id, slurm_job_id, nodes, endpoint_id, state,
-                    last_message, port_base, created_at, updated_at
+                    last_message, port_base, cancel_requested, created_at, updated_at
              from model_replicas where id = $1",
         )
         .bind(id)
@@ -2823,6 +2838,7 @@ fn replica_from_row(row: &PgRow) -> Result<ModelReplica> {
         state: row.try_get("state")?,
         last_message: row.try_get("last_message")?,
         port_base: row.try_get("port_base")?,
+        cancel_requested: row.try_get("cancel_requested")?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -3312,8 +3328,10 @@ mod tests {
         assert_eq!(spec.partition, "gpu-preempt");
         assert_eq!(spec.launcher_spec, Some(serde_json::json!({"backendId":"llamacpp"})));
 
+        // Assert membership, not a global count — other tests share this DB and
+        // may have their own managed models, so an exact count is flaky in CI.
         let listed = store.list_managed_models().await.expect("list");
-        assert_eq!(listed.len(), 1);
+        assert!(listed.iter().any(|m| m.model_id == model.id));
 
         store.delete_managed_model(model.id).await.expect("delete");
         assert!(store
@@ -3381,6 +3399,9 @@ mod tests {
         let m = store.get_managed_model(model.id).await.expect("get").expect("some");
         assert_eq!(m.last_provision_error, None);
         assert!(m.last_provision_error_at.is_none());
+
+        // Clean up so the shared test DB doesn't accumulate managed models.
+        store.delete_managed_model(model.id).await.expect("delete");
     }
 
     #[tokio::test]
