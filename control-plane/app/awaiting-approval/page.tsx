@@ -1,6 +1,7 @@
 import { getSession } from "@/lib/auth/session";
 import { redirect } from "next/navigation";
 import type { SessionUser } from "@/lib/auth/session";
+import { SignOutButton } from "./sign-out-button";
 
 export const dynamic = "force-dynamic";
 
@@ -37,7 +38,7 @@ export default async function AwaitingApprovalPage() {
 
   return (
     <div className="flex min-h-screen items-center justify-center bg-background px-4 text-center">
-      <div className="max-w-sm space-y-3">
+      <div className="flex max-w-sm flex-col items-center space-y-3">
         {isActiveMissingTenant ? (
           <>
             <h1 className="text-xl font-semibold">No tenant assigned</h1>
@@ -55,6 +56,7 @@ export default async function AwaitingApprovalPage() {
             </p>
           </>
         )}
+        <SignOutButton />
       </div>
     </div>
   );

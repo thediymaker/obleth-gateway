@@ -1,40 +1,28 @@
+import { PortalModels } from "@/components/portal/portal-models";
 import { requireUser } from "@/lib/auth/roles";
-import { obleth } from "@/lib/obleth";
+import { obleth, type ModelRoute, type Tenant } from "@/lib/obleth";
+import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
 
 export default async function PortalModelsPage() {
-  await requireUser();
-  const models = await obleth.listModels();
-  const visible = models.filter((m) => m.enabled);
+  const session = await requireUser();
+  const [models, tenants] = await Promise.all([
+    safe(obleth.listModels(), [] as ModelRoute[]),
+    safe(obleth.listTenants(), [] as Tenant[]),
+  ]);
+  const tenant = tenants.find((row) => row.id === session.tenantId) ?? null;
+  const allowed = tenant?.allowed_models?.filter(Boolean) ?? [];
+  const visible = models
+    .filter((model) => model.enabled)
+    .filter((model) => allowed.length === 0 || allowed.includes(model.model_name))
+    .sort((a, b) => a.model_name.localeCompare(b.model_name));
 
   return (
-    <div className="space-y-4">
-      <div>
-        <h1 className="text-lg font-semibold">Available models</h1>
-        <p className="text-sm text-muted-foreground">
-          Models available to your tenant. Contact your administrator to request
-          access to additional models.
-        </p>
-      </div>
-      {visible.length === 0 ? (
-        <div className="rounded-md border border-dashed border-border px-6 py-10 text-center text-sm text-muted-foreground">
-          No models are currently available.
-        </div>
-      ) : (
-        <ul className="divide-y rounded-md border">
-          {visible.map((m) => (
-            <li key={m.id} className="p-3">
-              <div className="font-medium">{m.model_name}</div>
-              {m.description && (
-                <div className="text-sm text-muted-foreground">
-                  {m.description}
-                </div>
-              )}
-            </li>
-          ))}
-        </ul>
-      )}
-    </div>
+    <PortalModels
+      models={visible}
+      tenant={tenant}
+      gatewayBase={process.env.OBLETH_PROXY_BASE_URL ?? "http://localhost:8080"}
+    />
   );
 }

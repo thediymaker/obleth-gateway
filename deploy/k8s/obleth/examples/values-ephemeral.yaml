@@ -52,6 +52,5 @@ hpa:
 
 controlPlane:
   enabled: true
-  dashboardUsername: admin
-  dashboardPassword: ""        # REQUIRED
+  dashboardPassword: ""        # REQUIRED (break-glass admin password, >= 8 chars)
   dashboardSessionSecret: ""   # REQUIRED — >= 32 chars

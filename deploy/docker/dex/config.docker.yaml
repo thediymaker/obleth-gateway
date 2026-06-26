@@ -1,18 +1,21 @@
 # Dex static config for local dashboard SSO development.
 #
 # SPLIT-HORIZON NOTE: the issuer URL must be reachable identically by BOTH the
-# browser (redirect target) AND the control-plane server (discovery + token
-# exchange). The documented default is to run the control plane on the HOST via
-# `npm run dev` (port 3000) while Dex runs in Docker publishing localhost:5556.
-# Both sides then reach http://localhost:5556/dex without any extra routing.
+# browser AND the control-plane server (discovery + token exchange). `localhost`
+# cannot satisfy both when the control plane runs in Docker, because inside that
+# container `localhost` is the container itself, not this Dex container.
 #
-# If you run the control plane inside Docker instead, localhost:5556 inside that
-# container will not reach this Dex container. In that case change the issuer
-# and discoveryUrl to use a hostname both sides resolve — for example, add an
-# `extra_hosts` entry mapping a custom hostname to the Docker host IP on the
-# control-plane service, and update redirectURIs to match.
+# We use `host.docker.internal`, which resolves to the Docker host from BOTH the
+# browser (via Docker Desktop's host entry) and any container (declared via
+# `extra_hosts: host-gateway` on the control-plane service). Dex is published on
+# the host at :5556, so http://host.docker.internal:5556/dex reaches it from
+# either side. The discoveryUrl in OIDC_PROVIDERS must use this same host.
+#
+# redirectURIs target the browser-facing dashboard URL. The control-plane
+# container publishes on host port 3002 (ports: "3002:3000"), so the callback
+# is http://localhost:3002/... — keep this in sync with BETTER_AUTH_URL.
 
-issuer: http://localhost:5556/dex
+issuer: http://host.docker.internal:5556/dex
 
 storage:
   type: memory
@@ -25,7 +28,7 @@ staticClients:
     name: obleth
     secret: dev-dex-secret
     redirectURIs:
-      - http://localhost:3000/api/auth/oauth2/callback/dex
+      - http://localhost:3002/api/auth/oauth2/callback/dex
 
 enablePasswordDB: true
 
@@ -34,6 +37,6 @@ staticPasswords:
   # Hash generated with: node -e "console.log(require('bcryptjs').hashSync('password',10))"
   # Regenerate: htpasswd -bnBC 10 "" password | tr -d ':\n'
   - email: "researcher@example.edu"
-    hash: "$2a$10$B.gCbzWZb7h43Rdr9ncUXeRSjCbaGyJIKQdeKbbWrbgoMxfF3.FKi"
+    hash: "$2y$10$XwCTmdN9AFBdNY8Cr6IECOCQRW6aFl93TrQ0E/KyHZaVs/zbsvvbC"
     username: "researcher"
     userID: "researcher-1"

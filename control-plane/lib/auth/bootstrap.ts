@@ -7,7 +7,7 @@ import { getDb } from "@/lib/db";
  * admin exists, so it is safe to run on every boot.
  */
 export async function bootstrapAdmin(): Promise<void> {
-  const email = process.env.DASHBOARD_ADMIN_EMAIL ?? process.env.DASHBOARD_USERNAME;
+  const email = process.env.DASHBOARD_ADMIN_EMAIL;
   const password = process.env.DASHBOARD_PASSWORD;
   if (!email || !password) return; // nothing to seed (e.g. SSO-only deploy)
 

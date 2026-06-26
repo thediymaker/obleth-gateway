@@ -58,9 +58,10 @@ benchmarkBackend:
 
 controlPlane:
   enabled: true
-  dashboardUsername: admin
-  dashboardPassword: ""        # REQUIRED
+  dashboardPassword: ""        # REQUIRED (break-glass admin password, >= 8 chars)
   dashboardSessionSecret: ""   # REQUIRED — >= 32 chars
+  # dashboardAdminEmail: admin@example.com   # break-glass admin login (email-based)
+  # oidcProviders: ""          # JSON array to enable OIDC SSO; empty = break-glass only
 
 # Expose the data plane through your ingress controller.
 ingress:

@@ -27,10 +27,17 @@
 #      --from-literal=OBLETH_API_KEY_PEPPER="$(openssl rand -hex 32)" \
 #      --from-literal=OBLETH_SLACK_WEBHOOK_URL=""
 #
+#    With existingSecret set, the chart renders NO control-plane Secret, so this
+#    Secret MUST carry every key the dashboard needs — including the auth DB and
+#    SSO keys. DASHBOARD_SESSION_SECRET doubles as BETTER_AUTH_SECRET if the
+#    latter is omitted. Leave OIDC_PROVIDERS out (or empty) to run break-glass-only.
 #    kubectl create secret generic obleth-control-plane -n obleth \
-#      --from-literal=DASHBOARD_USERNAME="admin" \
+#      --from-literal=DASHBOARD_ADMIN_EMAIL="admin@your-org.example" \
 #      --from-literal=DASHBOARD_PASSWORD="$(openssl rand -hex 16)" \
-#      --from-literal=DASHBOARD_SESSION_SECRET="$(openssl rand -hex 32)"
+#      --from-literal=DASHBOARD_SESSION_SECRET="$(openssl rand -hex 32)" \
+#      --from-literal=DATABASE_URL="postgres://obleth:PASS@pg-rw.db.svc:5432/obleth" \
+#      --from-literal=BETTER_AUTH_URL="https://dashboard.example.com" \
+#      --from-literal=OIDC_PROVIDERS='[{"providerId":"globus","displayName":"Globus","discoveryUrl":"https://auth.globus.org/.well-known/openid-configuration","clientId":"ID","clientSecret":"SECRET","scopes":["openid","email","profile"]}]'
 #
 # 2. Install:
 #    helm install obleth ./deploy/k8s/obleth -n obleth --create-namespace \

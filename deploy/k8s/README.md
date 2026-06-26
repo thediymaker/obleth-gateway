@@ -137,8 +137,9 @@ toggles in `values.yaml`, on by sensible defaults.
   `--set`/CLI history. `obleth.existingSecret` must carry `OBLETH_ADMIN_TOKEN`,
   `OBLETH_DATABASE_URL`, `OBLETH_CLICKHOUSE_PASSWORD`, `OBLETH_ENCRYPTION_KEY`,
   `OBLETH_API_KEY_PEPPER`, `OBLETH_SLACK_WEBHOOK_URL`;
-  `controlPlane.existingSecret` must carry `DASHBOARD_USERNAME`,
-  `DASHBOARD_PASSWORD`, `DASHBOARD_SESSION_SECRET`. See
+  `controlPlane.existingSecret` must carry `DASHBOARD_PASSWORD`,
+  `DASHBOARD_SESSION_SECRET`, `DATABASE_URL`, and (for the break-glass admin and
+  SSO) `DASHBOARD_ADMIN_EMAIL`, `BETTER_AUTH_URL`, `OIDC_PROVIDERS`. See
   [`values-production.yaml`](obleth/examples/values-production.yaml).
 - **Spread + disruption protection.** `affinity.antiAffinity` (`soft`/`hard`)
   spreads obleth replicas across nodes; `podDisruptionBudget` keeps a minimum
@@ -228,6 +229,60 @@ curl -s http://localhost:8080/v1/chat/completions \
 ```
 
 Port-forward `svc/obleth` on `:8080`, or use your Ingress on `ingress.servicePort`.
+
+## Dashboard login & SSO
+
+The dashboard signs in with an **email address and password**. A local
+"break-glass" admin is seeded on first boot and always works, even when an
+identity provider is unreachable. OIDC single sign-on is optional and layered on
+top.
+
+### Break-glass admin (required)
+
+| Value | Maps to | Notes |
+| --- | --- | --- |
+| `controlPlane.dashboardAdminEmail` | `DASHBOARD_ADMIN_EMAIL` | Must be a real email address — a bare username is rejected. Defaults to `admin@example.com`. |
+| `controlPlane.dashboardPassword` | `DASHBOARD_PASSWORD` | At least 8 characters, or the admin is not seeded. |
+
+The account is created only on first boot when no admin exists yet. If you set an
+invalid email or a too-short password, **no admin is created and you cannot log
+in** — fix the values and reinstall/restart.
+
+### OIDC single sign-on (optional)
+
+```yaml
+controlPlane:
+  # External, browser-facing dashboard URL — used to build OIDC redirect URIs.
+  betterAuthUrl: "https://dashboard.example.com"
+  oidcProviders: |
+    [{"providerId":"globus","displayName":"Globus","discoveryUrl":"https://auth.globus.org/.well-known/openid-configuration","clientId":"ID","clientSecret":"SECRET","scopes":["openid","email","profile"]}]
+```
+
+Register this redirect URI with your identity provider (one per `providerId`):
+
+```
+https://<betterAuthUrl host>/api/auth/oauth2/callback/<providerId>
+```
+
+### New users start pending
+
+When someone signs in via SSO for the first time, their account is created with
+**no access**. An admin grants access on the dashboard's **Users** screen by
+assigning a role (`admin` or `user`) and a tenant. Users with the `user` role
+get a self-service portal (model list, their own API keys and usage); admins get
+the full dashboard.
+
+### Production (`existingSecret`)
+
+With `controlPlane.existingSecret` set, the chart renders **no** control-plane
+Secret, so the pre-created Secret must carry every key: `DASHBOARD_PASSWORD`,
+`DASHBOARD_SESSION_SECRET`, `DATABASE_URL`, `DASHBOARD_ADMIN_EMAIL`,
+`BETTER_AUTH_URL`, and `OIDC_PROVIDERS`. `DASHBOARD_SESSION_SECRET` is reused as
+`BETTER_AUTH_SECRET` when the latter is absent. See
+[`values-production.yaml`](obleth/examples/values-production.yaml).
+
+Full configuration reference and screenshots: the
+[Dashboard SSO guide](https://obleth.com/docs/guides/dashboard-sso).
 
 ## Common gotchas
 
