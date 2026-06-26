@@ -40,7 +40,16 @@ pub fn plan(
             continue;
         }
         if r.state == "draining" {
-            // already on its way out; ignore (next tick its job goes Gone).
+            // Cancelled on purpose. Once the job is actually gone, delete the row
+            // directly. Not MarkLost -- "lost" counts toward the failure limit,
+            // and a drain is not a failure. While the job is still pending/running
+            // the cancel is in flight, so wait for it to terminate.
+            if matches!(
+                jobs.get(&r.slurm_job_id).map(|j| j.state),
+                None | Some(JobState::Gone)
+            ) {
+                actions.push(Action::Delete { replica_id: r.id });
+            }
             continue;
         }
 
@@ -319,5 +328,57 @@ mod tests {
         let lost: Vec<ReplicaView> = (0..100).map(|i| rv("lost", &format!("j{i}"), None, 60)).collect();
         let actions = plan(&spec(2), &lost, &HashMap::new(), &HashMap::new(), 900);
         assert!(actions.iter().any(|a| *a == Action::Submit));
+    }
+
+    #[test]
+    fn draining_replica_with_gone_job_is_deleted() {
+        // Job already terminated (Gone) -> the stuck draining row must be deleted.
+        let r = rv("draining", "j1", None, 120);
+        let id = r.id;
+        let jobs = HashMap::from([job("j1", JobState::Gone, &[])]);
+        let actions = plan(&spec(1), &[r], &jobs, &HashMap::new(), 900);
+        assert!(
+            actions.contains(&Action::Delete { replica_id: id }),
+            "got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn draining_replica_with_absent_job_is_deleted() {
+        // Job purged from Slurm entirely (absent from the map) -> delete the row.
+        let r = rv("draining", "j1", None, 120);
+        let id = r.id;
+        let actions = plan(&spec(1), &[r], &HashMap::new(), &HashMap::new(), 900);
+        assert!(
+            actions.contains(&Action::Delete { replica_id: id }),
+            "got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn draining_replica_with_running_job_is_left_alone() {
+        // Cancel still in flight (job not yet gone) -> no action for this replica.
+        let r = rv("draining", "j1", None, 10);
+        let id = r.id;
+        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
+        // spec target 0 so the only possible action would concern this replica.
+        let actions = plan(&spec(0), &[r], &jobs, &HashMap::new(), 900);
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Delete { replica_id } if *replica_id == id)),
+            "draining replica with a live job must be left alone; got {actions:?}"
+        );
+    }
+
+    #[test]
+    fn draining_replica_with_pending_job_is_left_alone() {
+        // Cancel sent but the job is still queued (Pending) -> wait, don't delete.
+        let r = rv("draining", "j1", None, 10);
+        let id = r.id;
+        let jobs = HashMap::from([job("j1", JobState::Pending, &[""])]);
+        let actions = plan(&spec(0), &[r], &jobs, &HashMap::new(), 900);
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Delete { replica_id } if *replica_id == id)),
+            "draining replica with a pending job must be left alone; got {actions:?}"
+        );
     }
 }
