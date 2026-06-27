@@ -4,6 +4,16 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.5.1
+Conversations stay together — for routing and for tracing — with nothing extra from callers.
+
+- **Automatic conversation grouping.** The gateway derives a stable conversation id from each request (or uses a client-supplied `x-session-id` header, or a `session_id` / `metadata.session_id` body field, when present) — no client changes required. The dashboard request log now shows the id, tagged **client** (caller-supplied) or **derived** (inferred).
+- **`session_hash` routing actually sticks now.** With a conversation id available, the `session_hash` endpoint-selection mode pins a conversation to the same upstream replica for cache warmth, instead of silently falling back to load-balancing.
+- **Conversation id in traces and usage.** The id is recorded on usage rows and spans and exported as the `session.id` attribute on OpenTelemetry/Jaeger traces, so a whole conversation's spend and spans can be grouped — not just a single request.
+- **Fixed: the "Endpoint selection" setting could crash the model page.** Choosing `session_hash` (and saving the timeout / retry fields alongside it) failed against an outdated database constraint; the setting now saves correctly.
+- **Fixed: endpoints stuck "unhealthy" after a Slurm replica restarted.** A reachable endpoint now clears a stale unhealthy state on its own, and the gateway re-checks health immediately when a replica is added or removed — so a restarted replica returns to rotation without a manual health check.
+- **Endpoint health reason on the Reliability tab.** Each endpoint row shows its latest health-check message, so a degraded or unhealthy endpoint explains itself at a glance.
+
 ## v0.5.0
 Dashboard single sign-on (OIDC) and a break-glass admin — with an email-based login that needs a one-time config change.
 
