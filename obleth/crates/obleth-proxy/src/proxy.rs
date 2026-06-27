@@ -2456,13 +2456,44 @@ fn request_type_for_path(path: &str) -> &'static str {
     }
 }
 
-/// Resolve a session id for request-log grouping. An explicit header wins, then
-/// common request-body conventions. The value is trimmed and length-capped so a
-/// hostile client cannot bloat the ledger row.
-fn extract_session_id(headers: &HeaderMap, json: &serde_json::Value) -> String {
+/// Provenance of a resolved conversation id.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SessionSource {
+    Client,
+    Derived,
+    None,
+}
+
+impl SessionSource {
+    fn as_str(self) -> &'static str {
+        match self {
+            SessionSource::Client => "client",
+            SessionSource::Derived => "derived",
+            SessionSource::None => "none",
+        }
+    }
+}
+
+/// A resolved conversation grouping key plus how it was obtained.
+struct Conversation {
+    value: String,
+    source: SessionSource,
+}
+
+/// Resolve a conversation id. Precedence: explicit client signal (header or
+/// body) > deterministic hash of the conversation seed > none. Total: never
+/// errors. The OpenAI `user` field is intentionally NOT a session source (it
+/// identifies an end-user, not a conversation).
+fn resolve_conversation(
+    headers: &HeaderMap,
+    json: &serde_json::Value,
+    tenant_id: Uuid,
+    derivation_enabled: bool,
+) -> Conversation {
     const MAX: usize = 200;
     let capped = |s: &str| -> String { s.trim().chars().take(MAX).collect() };
 
+    // 1. Explicit client id: header wins, then body conventions.
     if let Some(s) = headers
         .get("x-obleth-session-id")
         .or_else(|| headers.get("x-session-id"))
@@ -2470,24 +2501,100 @@ fn extract_session_id(headers: &HeaderMap, json: &serde_json::Value) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return capped(s);
+        return Conversation { value: capped(s), source: SessionSource::Client };
     }
-
-    // Body conventions: litellm uses `metadata.session_id`; some clients send a
-    // top-level `session_id`, and the OpenAI `user` field is a useful fallback.
-    let candidates = [
+    let body_ids = [
         json.get("session_id").and_then(|v| v.as_str()),
-        json.get("metadata")
-            .and_then(|m| m.get("session_id"))
-            .and_then(|v| v.as_str()),
-        json.get("user").and_then(|v| v.as_str()),
+        json.get("metadata").and_then(|m| m.get("session_id")).and_then(|v| v.as_str()),
     ];
-    for c in candidates.into_iter().flatten() {
+    for c in body_ids.into_iter().flatten() {
         if !c.trim().is_empty() {
-            return capped(c);
+            return Conversation { value: capped(c), source: SessionSource::Client };
         }
     }
-    String::new()
+
+    // 2. Derived: hash the conversation seed (tenant + leading system/developer
+    //    + first user message). Stable across turns.
+    if derivation_enabled {
+        if let Some(seed) = conversation_seed(json) {
+            let h = fnv1a_continue(fnv1a(tenant_id.as_bytes()), seed.as_bytes());
+            return Conversation { value: format!("{h:016x}"), source: SessionSource::Derived };
+        }
+    }
+
+    // 3. Nothing to go on.
+    Conversation { value: String::new(), source: SessionSource::None }
+}
+
+/// Maximum seed text hashed; bounds work on huge system prompts. The same
+/// leading bytes are replayed every turn, so capping stays stable.
+const SEED_CAP: usize = 8 * 1024;
+
+/// Build the stable conversation seed: leading system/developer message text up
+/// to and including the first user message. `None` when there are no messages
+/// or no text to hash (e.g. embeddings, image-only first turn with no system).
+fn conversation_seed(json: &serde_json::Value) -> Option<String> {
+    let messages = json.get("messages")?.as_array()?;
+    let mut seed = String::new();
+    for msg in messages {
+        let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        match role {
+            "system" | "developer" => push_capped(&mut seed, &message_text(msg.get("content"))),
+            "user" => {
+                push_capped(&mut seed, &message_text(msg.get("content")));
+                break; // first user turn closes the seed
+            }
+            _ => {}
+        }
+        if seed.len() >= SEED_CAP {
+            break;
+        }
+    }
+    if seed.trim().is_empty() {
+        None
+    } else {
+        Some(seed)
+    }
+}
+
+/// Append up to the seed cap, with a separator so adjacent messages can't merge
+/// into a colliding blob.
+fn push_capped(seed: &mut String, text: &str) {
+    if seed.len() >= SEED_CAP || text.is_empty() {
+        return;
+    }
+    if !seed.is_empty() {
+        seed.push('\u{1f}'); // unit separator
+    }
+    let room = SEED_CAP - seed.len();
+    if text.len() <= room {
+        seed.push_str(text);
+    } else {
+        let mut end = room;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        seed.push_str(&text[..end]);
+    }
+}
+
+/// FNV-1a 64-bit (same family as `rendezvous_score`): fixed-seed, deterministic
+/// across processes. Not for cryptographic use.
+fn fnv1a(bytes: &[u8]) -> u64 {
+    fnv1a_continue(0xcbf2_9ce4_8422_2325, bytes)
+}
+
+fn fnv1a_continue(mut hash: u64, bytes: &[u8]) -> u64 {
+    for &b in bytes {
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
+/// Thin shim for existing callers until Task 2 migrates them to `resolve_conversation`.
+fn extract_session_id(headers: &HeaderMap, json: &serde_json::Value) -> String {
+    resolve_conversation(headers, json, Uuid::nil(), false).value
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2576,8 +2683,10 @@ fn now_ms() -> i64 {
 mod tests {
     use super::{
         backoff_for, build_targets, build_upstream_url, has_path_traversal, is_retryable_status,
-        prepare_upstream_body, session_hash_order, tenant_active_now, weighted_order,
+        prepare_upstream_body, resolve_conversation, session_hash_order, tenant_active_now,
+        weighted_order,
     };
+    use axum::http::HeaderMap;
     use chrono::{DateTime, TimeZone, Utc};
     use obleth_config::{ResolvedEndpoint, ResolvedKey, WeeklyWindow};
     use std::time::Duration;
@@ -3037,5 +3146,113 @@ mod tests {
         let refs: Vec<&ResolvedEndpoint> = eps.iter().collect();
         let ordered = session_hash_order(refs, "");
         assert_eq!(ordered.len(), 2);
+    }
+
+    // --- conversation resolver tests ---
+
+    #[test]
+    fn resolve_prefers_explicit_header() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-session-id", "sess-abc".parse().unwrap());
+        let json = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
+        let c = resolve_conversation(&headers, &json, Uuid::nil(), true);
+        assert_eq!(c.value, "sess-abc");
+        assert_eq!(c.source.as_str(), "client");
+    }
+
+    #[test]
+    fn resolve_prefers_body_session_id_over_derivation() {
+        let json = serde_json::json!({
+            "session_id": "body-1",
+            "messages":[{"role":"user","content":"hi"}]
+        });
+        let c = resolve_conversation(&HeaderMap::new(), &json, Uuid::nil(), true);
+        assert_eq!(c.value, "body-1");
+        assert_eq!(c.source.as_str(), "client");
+    }
+
+    #[test]
+    fn resolve_reads_metadata_session_id() {
+        let json = serde_json::json!({
+            "metadata": {"session_id": "meta-9"},
+            "messages":[{"role":"user","content":"hi"}]
+        });
+        let c = resolve_conversation(&HeaderMap::new(), &json, Uuid::nil(), true);
+        assert_eq!(c.value, "meta-9");
+        assert_eq!(c.source.as_str(), "client");
+    }
+
+    #[test]
+    fn resolve_ignores_user_field() {
+        // The OpenAI `user` field must NOT be treated as a session source.
+        let json = serde_json::json!({
+            "user": "user-123",
+            "messages":[{"role":"user","content":"hi"}]
+        });
+        let c = resolve_conversation(&HeaderMap::new(), &json, Uuid::nil(), true);
+        assert_eq!(c.source.as_str(), "derived");
+        assert_ne!(c.value, "user-123");
+    }
+
+    #[test]
+    fn derived_is_stable_across_turns() {
+        let tid = Uuid::nil();
+        let turn1 = serde_json::json!({"messages":[
+            {"role":"system","content":"You are helpful."},
+            {"role":"user","content":"What is Rust?"}
+        ]});
+        let turn3 = serde_json::json!({"messages":[
+            {"role":"system","content":"You are helpful."},
+            {"role":"user","content":"What is Rust?"},
+            {"role":"assistant","content":"A language."},
+            {"role":"user","content":"And Go?"}
+        ]});
+        let a = resolve_conversation(&HeaderMap::new(), &turn1, tid, true);
+        let b = resolve_conversation(&HeaderMap::new(), &turn3, tid, true);
+        assert_eq!(a.source.as_str(), "derived");
+        assert_eq!(a.value, b.value, "same seed across turns must hash equal");
+    }
+
+    #[test]
+    fn derived_differs_by_opening_and_tenant() {
+        let t1 = Uuid::from_u128(1);
+        let t2 = Uuid::from_u128(2);
+        let q1 = serde_json::json!({"messages":[{"role":"user","content":"alpha"}]});
+        let q2 = serde_json::json!({"messages":[{"role":"user","content":"beta"}]});
+        let a = resolve_conversation(&HeaderMap::new(), &q1, t1, true);
+        let b = resolve_conversation(&HeaderMap::new(), &q2, t1, true);
+        let c = resolve_conversation(&HeaderMap::new(), &q1, t2, true);
+        assert_ne!(a.value, b.value, "different opener -> different id");
+        assert_ne!(a.value, c.value, "different tenant -> different id");
+        assert_eq!(a.value.len(), 16, "16 hex chars");
+    }
+
+    #[test]
+    fn derivation_disabled_yields_none() {
+        let json = serde_json::json!({"messages":[{"role":"user","content":"hi"}]});
+        let c = resolve_conversation(&HeaderMap::new(), &json, Uuid::nil(), false);
+        assert_eq!(c.source.as_str(), "none");
+        assert!(c.value.is_empty());
+    }
+
+    #[test]
+    fn no_messages_yields_none() {
+        let json = serde_json::json!({"input": "embed me"});
+        let c = resolve_conversation(&HeaderMap::new(), &json, Uuid::nil(), true);
+        assert_eq!(c.source.as_str(), "none");
+        assert!(c.value.is_empty());
+    }
+
+    #[test]
+    fn multimodal_first_user_uses_text_parts() {
+        let json = serde_json::json!({"messages":[
+            {"role":"user","content":[
+                {"type":"text","text":"describe"},
+                {"type":"image_url","image_url":{"url":"data:..."}}
+            ]}
+        ]});
+        let c = resolve_conversation(&HeaderMap::new(), &json, Uuid::nil(), true);
+        assert_eq!(c.source.as_str(), "derived");
+        assert_eq!(c.value.len(), 16);
     }
 }
