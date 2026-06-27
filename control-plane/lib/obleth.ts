@@ -410,6 +410,7 @@ export interface UsageLogEntry {
   model: string;
   request_type: string;
   session_id: string;
+  session_id_source: string;
   admission: string;
   status_code: number;
   input_tokens: number;

@@ -23,6 +23,7 @@ const log: UsageLogEntry = {
   model: "llama-3",
   request_type: "chat",
   session_id: "",
+  session_id_source: "",
   admission: "ok",
   status_code: 200,
   input_tokens: 12,
