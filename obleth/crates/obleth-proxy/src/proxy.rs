@@ -211,6 +211,9 @@ async fn proxy_handler_inner(
     // grouping (the field is declared Empty on the #[instrument] below).
     tracing::Span::current().record("session.id", req_meta.session_id.as_str());
     tracing::Span::current().record("session.id.source", req_meta.session_id_source);
+    if let Some(t) = tracer.as_mut() {
+        t.set_conversation(&req_meta.session_id, req_meta.session_id_source);
+    }
 
     // Cost estimate, computed once per request body. Re-estimated below only
     // when a boon actually rewrites the body; the later upstream model-name

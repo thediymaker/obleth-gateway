@@ -93,6 +93,8 @@ pub struct SpanRecord {
     pub duration_ms: u32,
     pub status: String,
     pub attributes: String,
+    pub session_id: String,
+    pub session_id_source: String,
 }
 
 /// Borrowed ClickHouse row mirror of [`SpanRecord`] for batch insert.
@@ -106,6 +108,8 @@ struct SpanRow<'a> {
     duration_ms: u32,
     status: &'a str,
     attributes: &'a str,
+    session_id: &'a str,
+    session_id_source: &'a str,
 }
 
 impl<'a> From<&'a SpanRecord> for SpanRow<'a> {
@@ -118,6 +122,8 @@ impl<'a> From<&'a SpanRecord> for SpanRow<'a> {
             duration_ms: r.duration_ms,
             status: &r.status,
             attributes: &r.attributes,
+            session_id: &r.session_id,
+            session_id_source: &r.session_id_source,
         }
     }
 }
@@ -495,17 +501,32 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
     client
         .query(&format!(
             "CREATE TABLE IF NOT EXISTS {database}.spans (
-                request_id  UUID,
-                span_name   LowCardinality(String),
-                parent_span String DEFAULT '',
-                start_ms    Int64,
-                duration_ms UInt32,
-                status      LowCardinality(String) DEFAULT 'ok',
-                attributes  String DEFAULT ''
+                request_id        UUID,
+                span_name         LowCardinality(String),
+                parent_span       String DEFAULT '',
+                start_ms          Int64,
+                duration_ms       UInt32,
+                status            LowCardinality(String) DEFAULT 'ok',
+                attributes        String DEFAULT '',
+                session_id        String DEFAULT '',
+                session_id_source LowCardinality(String) DEFAULT ''
             ) ENGINE = MergeTree()
             PARTITION BY toYYYYMMDD(fromUnixTimestamp64Milli(start_ms))
             ORDER BY (request_id, start_ms)
             TTL toDate(fromUnixTimestamp64Milli(start_ms)) + INTERVAL 14 DAY DELETE"
+        ))
+        .execute()
+        .await?;
+    // Idempotent adds for spans tables created before conversation id was tracked.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.spans ADD COLUMN IF NOT EXISTS session_id String DEFAULT ''"
+        ))
+        .execute()
+        .await?;
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.spans ADD COLUMN IF NOT EXISTS session_id_source LowCardinality(String) DEFAULT ''"
         ))
         .execute()
         .await?;

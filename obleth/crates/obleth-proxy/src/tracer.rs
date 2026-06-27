@@ -4,6 +4,8 @@ use uuid::Uuid;
 pub struct SpanRecorder {
     request_id: Uuid,
     request_start_ms: i64,
+    session_id: String,
+    session_id_source: String,
     spans: Vec<SpanRecord>,
     sink: TelemetrySink,
 }
@@ -13,9 +15,18 @@ impl SpanRecorder {
         SpanRecorder {
             request_id,
             request_start_ms,
+            session_id: String::new(),
+            session_id_source: "none".to_string(),
             spans: Vec::with_capacity(16),
             sink,
         }
+    }
+
+    /// Stamp the conversation id onto every span this recorder emits. Called once
+    /// after the id is resolved; safe to call before any spans are recorded.
+    pub fn set_conversation(&mut self, session_id: &str, source: &str) {
+        self.session_id = session_id.to_string();
+        self.session_id_source = source.to_string();
     }
 
     pub fn record(
@@ -35,6 +46,8 @@ impl SpanRecorder {
             duration_ms,
             status: status.to_string(),
             attributes: attributes.to_string(),
+            session_id: self.session_id.clone(),
+            session_id_source: self.session_id_source.clone(),
         });
     }
 
@@ -62,6 +75,8 @@ impl SpanRecorder {
             duration_ms,
             status: status.to_string(),
             attributes: "{}".to_string(),
+            session_id: self.session_id.clone(),
+            session_id_source: self.session_id_source.clone(),
         });
         let sink = self.sink;
         for span in self.spans {
