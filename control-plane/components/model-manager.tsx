@@ -2070,7 +2070,17 @@ function ReliabilityPanel({
               <tbody>
                 {endpoints.map((ep) => (
                   <tr key={ep.id} className="border-b border-border/40 last:border-b-0">
-                    <td className="py-2 pl-4 pr-3 font-medium">{ep.name}</td>
+                    <td className="py-2 pl-4 pr-3 font-medium">
+                      {ep.name}
+                      {ep.last_message && ep.health_status !== "healthy" && (
+                        <span
+                          className="mt-0.5 block max-w-[32ch] truncate text-[10px] font-normal text-muted-foreground"
+                          title={ep.last_message}
+                        >
+                          {ep.last_message}
+                        </span>
+                      )}
+                    </td>
                     <td className="py-2 pr-3 font-mono text-[11px] text-muted-foreground">{ep.api_base}</td>
                     <td className="py-2 pr-3 tabular-nums">{ep.priority}</td>
                     <td className="py-2 pr-3 tabular-nums">{ep.weight}</td>
