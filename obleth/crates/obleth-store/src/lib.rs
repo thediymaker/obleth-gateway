@@ -60,6 +60,7 @@ const SCHEMA_V7: &str = include_str!("../../../../schema/postgres/0007_replica_p
 const SCHEMA_V8: &str = include_str!("../../../../schema/postgres/0008_managed_provision_error.sql");
 const SCHEMA_V9: &str = include_str!("../../../../schema/postgres/0009_replica_cancel_requested.sql");
 const SCHEMA_V10: &str = include_str!("../../../../schema/postgres/0010_drop_replica_model_cascade.sql");
+const SCHEMA_V11: &str = include_str!("../../../../schema/postgres/0011_endpoint_selection_session_hash.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -157,6 +158,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V8).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V9).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V10).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V11).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1504,7 +1506,29 @@ impl Store {
         .bind(enabled)
         .fetch_one(&self.pool)
         .await?;
+        // A new endpoint starts as `unknown` and is only ever health-checked as a
+        // side effect of the model-level probe, which is gated by the model's
+        // `health_next_check_at` (up to a full interval away). Make the model due
+        // now so the health worker re-syncs the routing projection within a tick
+        // instead of leaving a freshly-promoted replica mis-rated for minutes.
+        self.mark_model_health_due(model_id).await;
         endpoint_from_row(&row)
+    }
+
+    /// Best-effort: bring a model's next health check forward to now so the
+    /// worker re-probes its endpoints promptly after a topology change. Failures
+    /// are logged, not propagated — the caller's mutation already succeeded and
+    /// the worst case is waiting the normal interval.
+    async fn mark_model_health_due(&self, model_id: Uuid) {
+        if let Err(error) = sqlx::query(
+            "update models set health_next_check_at = now() where id = $1",
+        )
+        .bind(model_id)
+        .execute(&self.pool)
+        .await
+        {
+            tracing::warn!(%error, %model_id, "failed to mark model health due after endpoint change");
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1573,7 +1597,11 @@ impl Store {
             .fetch_optional(&self.pool)
             .await?
             .ok_or(StoreError::NotFound)?;
-        Ok(row.try_get("model_id")?)
+        let model_id: Uuid = row.try_get("model_id")?;
+        // Removing an endpoint changes the model's live pool; re-probe promptly so
+        // the model-level aggregate doesn't lag a full interval behind.
+        self.mark_model_health_due(model_id).await;
+        Ok(model_id)
     }
 
     // ---- managed_models (Slurm provisioning specs) -----------------------
@@ -1912,9 +1940,20 @@ impl Store {
             "degraded" | "skipped" => -1, // sentinel: leave counter as-is
             _ => 1,
         };
+        // `skipped` is "we didn't really probe" -> never touch the stored status.
+        // `degraded` is "reachable, but couldn't confirm the model id" -> it's a
+        // real liveness signal, and the router treats degraded as routable. So a
+        // degraded probe must lift a stale `unhealthy` (otherwise a steady-state
+        // degraded endpoint — e.g. an id-format mismatch in /v1/models — can never
+        // recover after one transient unhealthy read, and stays out of rotation
+        // until a manual check). It still must not downgrade a confirmed `healthy`.
         let row = sqlx::query(
             "update model_endpoints set
-                health_status = case when $2 in ('degraded','skipped') then health_status else $2 end,
+                health_status = case
+                    when $2 = 'skipped' then health_status
+                    when $2 = 'degraded' then
+                        case when health_status = 'unhealthy' then 'degraded' else health_status end
+                    else $2 end,
                 consecutive_failures = case
                     when $3 = 0 then 0
                     when $3 < 0 then consecutive_failures
@@ -3234,6 +3273,75 @@ mod tests {
         assert!(
             checks.iter().any(|c| c.status == "unhealthy"),
             "raw unhealthy checks must remain in the audit trail"
+        );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// A `degraded` probe (reachable, model id unconfirmed) must lift a stale
+    /// `unhealthy` so a recovered endpoint returns to rotation — but it must not
+    /// downgrade a confirmed `healthy`. Regression for endpoints stuck unhealthy
+    /// after a Slurm replica restart until a manual check.
+    #[tokio::test]
+    async fn endpoint_degraded_clears_unhealthy_but_not_healthy() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        // Same positional create_model call as the other health tests.
+        let model = store
+            .create_model(
+                &format!("m-{}", Uuid::new_v4()),
+                "endpoint health test model",
+                "upstream-model",
+                "http://127.0.0.1:8081",
+                None,
+                "chat",
+                0.0, 0.0, 0.0, 0.0, 0.0,
+                8192, 100, None,
+                false, true, false, false, false,
+                &[], &[], &[],
+            )
+            .await
+            .expect("create model");
+
+        let ep = store
+            .create_model_endpoint(model.id, "primary", "http://127.0.0.1:8082", None, 0, 1, true)
+            .await
+            .expect("create endpoint");
+
+        // Stale unhealthy from a startup-window probe.
+        let down = store
+            .record_endpoint_health(ep.id, "unhealthy", None, Some(503), Some("loading"))
+            .await
+            .expect("record unhealthy");
+        assert_eq!(down.health_status, "unhealthy");
+
+        // A later degraded probe (reachable, id mismatch) must lift it to routable.
+        let recovered = store
+            .record_endpoint_health(ep.id, "degraded", Some(5), Some(200), Some("id mismatch"))
+            .await
+            .expect("record degraded");
+        assert_eq!(
+            recovered.health_status, "degraded",
+            "degraded must clear a stale unhealthy"
+        );
+
+        // From healthy, a degraded probe must NOT downgrade the badge.
+        store
+            .record_endpoint_health(ep.id, "healthy", Some(4), Some(200), Some("ok"))
+            .await
+            .expect("record healthy");
+        let still_healthy = store
+            .record_endpoint_health(ep.id, "degraded", Some(6), Some(200), Some("id mismatch"))
+            .await
+            .expect("record degraded after healthy");
+        assert_eq!(
+            still_healthy.health_status, "healthy",
+            "degraded must not downgrade a confirmed healthy"
         );
     }
 
