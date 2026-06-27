@@ -470,8 +470,8 @@ function LogRow({
       <td className="px-3 py-1.5">
         <span className="block max-w-[13rem] truncate font-mono text-xs">{row.model}</span>
       </td>
-      <td className="hidden px-3 py-1.5 font-mono text-xs text-muted-foreground 2xl:table-cell">
-        {truncateId(row.session_id) || <span className="text-muted-foreground/50">--</span>}
+      <td className="hidden px-3 py-1.5 2xl:table-cell">
+        <SessionCell entry={row} />
       </td>
       <td className="px-3 py-1.5 font-mono text-xs text-muted-foreground" title={row.request_id}>
         <span className="inline-flex items-center gap-1.5">
@@ -556,6 +556,24 @@ function LogCard({
         </div>
       </button>
     </div>
+  );
+}
+
+export function SessionCell({ entry }: { entry: Pick<UsageLogEntry, "session_id" | "session_id_source"> }) {
+  if (!entry.session_id) {
+    return <span className="text-muted-foreground/50">--</span>;
+  }
+  const source = entry.session_id_source;
+  return (
+    <span className="inline-flex items-center gap-1">
+      <span className="font-mono text-[11px]" title={entry.session_id}>{truncateId(entry.session_id)}</span>
+      {source === "client" && (
+        <Badge className="border-primary/40 bg-primary/10 text-primary">client</Badge>
+      )}
+      {source === "derived" && (
+        <Badge className="border-border bg-muted/60 text-muted-foreground">derived</Badge>
+      )}
+    </span>
   );
 }
 

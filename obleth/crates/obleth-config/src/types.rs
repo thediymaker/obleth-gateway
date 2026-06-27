@@ -670,6 +670,12 @@ pub struct UsageRecord {
     /// replayable.
     #[serde(default)]
     pub session_id: String,
+    /// How the session_id was obtained: `client` (caller supplied it),
+    /// `derived` (proxy generated it from request fingerprint), or `none`
+    /// (no session grouping). `#[serde(default)]` keeps older WAL records
+    /// replayable.
+    #[serde(default)]
+    pub session_id_source: String,
     /// Coarse request class derived from the request path (e.g. `chat`,
     /// `embedding`, `audio`, `image`, `completion`, `responses`, `rerank`,
     /// `other`). Surfaced as the "Type" column in the request log.

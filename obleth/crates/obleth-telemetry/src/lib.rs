@@ -53,6 +53,7 @@ struct UsageRow<'a> {
     cost_usd: f64,
     ts_ms: i64,
     session_id: &'a str,
+    session_id_source: &'a str,
     request_type: &'a str,
 }
 
@@ -76,6 +77,7 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             cost_usd: r.cost_usd,
             ts_ms: r.ts_ms,
             session_id: &r.session_id,
+            session_id_source: &r.session_id_source,
             request_type: &r.request_type,
         }
     }
@@ -91,6 +93,8 @@ pub struct SpanRecord {
     pub duration_ms: u32,
     pub status: String,
     pub attributes: String,
+    pub session_id: String,
+    pub session_id_source: String,
 }
 
 /// Borrowed ClickHouse row mirror of [`SpanRecord`] for batch insert.
@@ -104,6 +108,8 @@ struct SpanRow<'a> {
     duration_ms: u32,
     status: &'a str,
     attributes: &'a str,
+    session_id: &'a str,
+    session_id_source: &'a str,
 }
 
 impl<'a> From<&'a SpanRecord> for SpanRow<'a> {
@@ -116,6 +122,8 @@ impl<'a> From<&'a SpanRecord> for SpanRow<'a> {
             duration_ms: r.duration_ms,
             status: &r.status,
             attributes: &r.attributes,
+            session_id: &r.session_id,
+            session_id_source: &r.session_id_source,
         }
     }
 }
@@ -359,6 +367,37 @@ impl SpansFlusher {
     }
 }
 
+#[cfg(test)]
+mod conv_tests {
+    use super::*;
+    #[test]
+    fn usage_row_mirrors_session_source() {
+        let rec = UsageRecord {
+            request_id: uuid::Uuid::nil(),
+            tenant_id: uuid::Uuid::nil(),
+            key_id: uuid::Uuid::nil(),
+            model: "m".into(),
+            admission: "ok".into(),
+            weight: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_tokens: 0,
+            queue_wait_ms: 0,
+            ttft_ms: 0,
+            total_ms: 0,
+            status_code: 200,
+            cache_status: "off".into(),
+            cost_usd: 0.0,
+            ts_ms: 0,
+            session_id: "abc".into(),
+            session_id_source: "derived".into(),
+            request_type: "chat".into(),
+        };
+        let row = UsageRow::from(&rec);
+        assert_eq!(row.session_id_source, "derived");
+    }
+}
+
 /// True when `name` is a safe bare SQL identifier (letters, digits, underscore,
 /// not starting with a digit). Used to guard identifiers that must be string-
 /// interpolated into ClickHouse DDL.
@@ -403,6 +442,7 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             cost_usd Float64 DEFAULT 0,
             ts_ms Int64,
             session_id String DEFAULT '',
+            session_id_source LowCardinality(String) DEFAULT '',
             request_type LowCardinality(String) DEFAULT '',
             ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms),
             INDEX idx_ts_ms ts_ms TYPE minmax GRANULARITY 4
@@ -447,6 +487,12 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
         .await?;
     client
         .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS session_id_source LowCardinality(String) DEFAULT ''"
+        ))
+        .execute()
+        .await?;
+    client
+        .query(&format!(
             "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS request_type LowCardinality(String) DEFAULT ''"
         ))
         .execute()
@@ -455,17 +501,32 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
     client
         .query(&format!(
             "CREATE TABLE IF NOT EXISTS {database}.spans (
-                request_id  UUID,
-                span_name   LowCardinality(String),
-                parent_span String DEFAULT '',
-                start_ms    Int64,
-                duration_ms UInt32,
-                status      LowCardinality(String) DEFAULT 'ok',
-                attributes  String DEFAULT ''
+                request_id        UUID,
+                span_name         LowCardinality(String),
+                parent_span       String DEFAULT '',
+                start_ms          Int64,
+                duration_ms       UInt32,
+                status            LowCardinality(String) DEFAULT 'ok',
+                attributes        String DEFAULT '',
+                session_id        String DEFAULT '',
+                session_id_source LowCardinality(String) DEFAULT ''
             ) ENGINE = MergeTree()
             PARTITION BY toYYYYMMDD(fromUnixTimestamp64Milli(start_ms))
             ORDER BY (request_id, start_ms)
             TTL toDate(fromUnixTimestamp64Milli(start_ms)) + INTERVAL 14 DAY DELETE"
+        ))
+        .execute()
+        .await?;
+    // Idempotent adds for spans tables created before conversation id was tracked.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.spans ADD COLUMN IF NOT EXISTS session_id String DEFAULT ''"
+        ))
+        .execute()
+        .await?;
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.spans ADD COLUMN IF NOT EXISTS session_id_source LowCardinality(String) DEFAULT ''"
         ))
         .execute()
         .await?;
