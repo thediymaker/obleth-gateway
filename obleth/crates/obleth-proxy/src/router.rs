@@ -168,8 +168,7 @@ pub fn select_model(
     // models, so the hard filters must not exclude them. Function calling and
     // tool choice are native capabilities only — no boon emulates them.
     let schema_via_boon = |c: &Candidate| {
-        grants.structured_active
-            && c.model.boons.iter().any(|b| b == "structured_output")
+        grants.structured_active && c.model.boons.iter().any(|b| b == "structured_output")
     };
 
     // ---- stage 1: hard filters ----
@@ -412,7 +411,14 @@ mod tests {
 
     #[test]
     fn empty_registry_returns_none() {
-        let chosen = select_model(&[], &RequestFeatures::default(), &HashMap::new(), None, &[], BoonGrants::default());
+        let chosen = select_model(
+            &[],
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+        );
         assert!(chosen.is_none());
     }
 
@@ -428,7 +434,15 @@ mod tests {
             max_tokens: 2_000,
             ..Default::default()
         };
-        let chosen = select_model(&candidates, &features, &HashMap::new(), None, &[], BoonGrants::default()).unwrap();
+        let chosen = select_model(
+            &candidates,
+            &features,
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+        )
+        .unwrap();
         assert_eq!(chosen.model_name, "large");
     }
 
@@ -442,7 +456,15 @@ mod tests {
             max_tokens: 2_000,
             ..Default::default()
         };
-        assert!(select_model(&candidates, &features, &HashMap::new(), None, &[], BoonGrants::default()).is_none());
+        assert!(select_model(
+            &candidates,
+            &features,
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default()
+        )
+        .is_none());
     }
 
     #[test]
@@ -456,7 +478,15 @@ mod tests {
             needs_function_calling: true,
             ..Default::default()
         };
-        let chosen = select_model(&candidates, &features, &HashMap::new(), None, &[], BoonGrants::default()).unwrap();
+        let chosen = select_model(
+            &candidates,
+            &features,
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+        )
+        .unwrap();
         assert_eq!(chosen.model_name, "tools");
     }
 

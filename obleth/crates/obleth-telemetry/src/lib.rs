@@ -175,7 +175,11 @@ impl TelemetrySink {
         };
         tokio::spawn(flusher.run(rx));
         tokio::spawn(spans_flusher.run(rx_spans));
-        Ok(TelemetrySink { tx, tx_spans, stats })
+        Ok(TelemetrySink {
+            tx,
+            tx_spans,
+            stats,
+        })
     }
 
     pub fn stats(&self) -> Arc<TelemetryStats> {

@@ -84,10 +84,17 @@ impl LoadClient {
 
         let resp = match send {
             Ok(r) => r,
-            Err(e) => return RequestOutcome {
-                status: 0, ttfb_ms: 0, total_ms: start.elapsed().as_millis() as u64,
-                in_tokens: 0, out_tokens: 0, usage_estimated: false,
-            }.with_error(&e.to_string()),
+            Err(e) => {
+                return RequestOutcome {
+                    status: 0,
+                    ttfb_ms: 0,
+                    total_ms: start.elapsed().as_millis() as u64,
+                    in_tokens: 0,
+                    out_tokens: 0,
+                    usage_estimated: false,
+                }
+                .with_error(&e.to_string())
+            }
         };
 
         let status = resp.status().as_u16();
@@ -96,14 +103,24 @@ impl LoadClient {
         let total_ms = start.elapsed().as_millis() as u64;
 
         if status != 200 {
-            return RequestOutcome { status, ttfb_ms, total_ms, in_tokens: 0, out_tokens: 0, usage_estimated: false };
+            return RequestOutcome {
+                status,
+                ttfb_ms,
+                total_ms,
+                in_tokens: 0,
+                out_tokens: 0,
+                usage_estimated: false,
+            };
         }
 
         // Parse `usage.prompt_tokens` from the embeddings response.
         let (prompt_tokens, estimated) = parse_embed_usage(&text, req.input_tokens);
         RequestOutcome {
-            status, ttfb_ms, total_ms,
-            in_tokens: prompt_tokens, out_tokens: 0,
+            status,
+            ttfb_ms,
+            total_ms,
+            in_tokens: prompt_tokens,
+            out_tokens: 0,
             usage_estimated: estimated,
         }
     }
@@ -135,10 +152,17 @@ impl LoadClient {
 
         let resp = match send {
             Ok(r) => r,
-            Err(e) => return RequestOutcome {
-                status: 0, ttfb_ms: 0, total_ms: start.elapsed().as_millis() as u64,
-                in_tokens: 0, out_tokens: 0, usage_estimated: false,
-            }.with_error(&e.to_string()),
+            Err(e) => {
+                return RequestOutcome {
+                    status: 0,
+                    ttfb_ms: 0,
+                    total_ms: start.elapsed().as_millis() as u64,
+                    in_tokens: 0,
+                    out_tokens: 0,
+                    usage_estimated: false,
+                }
+                .with_error(&e.to_string())
+            }
         };
 
         let status = resp.status().as_u16();
@@ -148,27 +172,45 @@ impl LoadClient {
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
-                    if ttfb_ms == 0 { ttfb_ms = start.elapsed().as_millis() as u64; }
+                    if ttfb_ms == 0 {
+                        ttfb_ms = start.elapsed().as_millis() as u64;
+                    }
                     text.push_str(&String::from_utf8_lossy(&bytes));
                 }
                 Err(_) => break,
             }
         }
         let total_ms = start.elapsed().as_millis() as u64;
-        if ttfb_ms == 0 { ttfb_ms = total_ms; }
-
-        if status != 200 {
-            return RequestOutcome { status, ttfb_ms, total_ms, in_tokens: 0, out_tokens: 0, usage_estimated: false };
+        if ttfb_ms == 0 {
+            ttfb_ms = total_ms;
         }
 
-        let parsed = if req.stream { usage::from_sse(&text) } else { usage::from_json(&text) };
+        if status != 200 {
+            return RequestOutcome {
+                status,
+                ttfb_ms,
+                total_ms,
+                in_tokens: 0,
+                out_tokens: 0,
+                usage_estimated: false,
+            };
+        }
+
+        let parsed = if req.stream {
+            usage::from_sse(&text)
+        } else {
+            usage::from_json(&text)
+        };
         let (u, estimated) = match parsed {
             Some(u) => (u, false),
             None => (usage::estimate(req.input_tokens, text.len()), true),
         };
         RequestOutcome {
-            status, ttfb_ms, total_ms,
-            in_tokens: u.prompt_tokens, out_tokens: u.completion_tokens,
+            status,
+            ttfb_ms,
+            total_ms,
+            in_tokens: u.prompt_tokens,
+            out_tokens: u.completion_tokens,
             usage_estimated: estimated,
         }
     }
@@ -185,9 +227,14 @@ impl RequestOutcome {
 /// Returns `(prompt_tokens, estimated)`. Falls back to `input_tokens` if parsing fails.
 fn parse_embed_usage(body: &str, input_tokens: u32) -> (u64, bool) {
     #[derive(serde::Deserialize)]
-    struct EmbedUsage { #[serde(default)] prompt_tokens: u64 }
+    struct EmbedUsage {
+        #[serde(default)]
+        prompt_tokens: u64,
+    }
     #[derive(serde::Deserialize)]
-    struct EmbedEnv { usage: Option<EmbedUsage> }
+    struct EmbedEnv {
+        usage: Option<EmbedUsage>,
+    }
     if let Ok(env) = serde_json::from_str::<EmbedEnv>(body) {
         if let Some(u) = env.usage {
             if u.prompt_tokens > 0 {
@@ -210,7 +257,11 @@ pub async fn run_closed_loop<F>(
     let make_req = Arc::new(make_req);
     let started = Instant::now();
     let warmup = Duration::from_secs(cfg.warmup_s);
-    let deadline = if cfg.duration_s == 0 { None } else { Some(Duration::from_secs(cfg.duration_s + cfg.warmup_s)) };
+    let deadline = if cfg.duration_s == 0 {
+        None
+    } else {
+        Some(Duration::from_secs(cfg.duration_s + cfg.warmup_s))
+    };
 
     let mut handles = Vec::new();
     for _ in 0..cfg.conc {
@@ -220,8 +271,14 @@ pub async fn run_closed_loop<F>(
         let stats = stats.clone();
         handles.push(tokio::spawn(async move {
             loop {
-                if stop.load(Ordering::Relaxed) { break; }
-                if let Some(d) = deadline { if started.elapsed() >= d { break; } }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Some(d) = deadline {
+                    if started.elapsed() >= d {
+                        break;
+                    }
+                }
                 let req = make_req();
                 let outcome = client.dispatch(&req).await;
                 if started.elapsed() >= warmup {
@@ -230,7 +287,9 @@ pub async fn run_closed_loop<F>(
             }
         }));
     }
-    for h in handles { let _ = h.await; }
+    for h in handles {
+        let _ = h.await;
+    }
 }
 
 #[cfg(test)]

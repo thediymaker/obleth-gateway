@@ -39,10 +39,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: obleth
+      - name: fmt
+        working-directory: obleth
+        run: cargo fmt --check
       - name: clippy
         working-directory: obleth
         run: cargo clippy --workspace --all-targets
@@ -55,9 +58,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: benchmark-backend
+      - name: fmt
+        working-directory: benchmark-backend
+        run: cargo fmt --check
       - working-directory: benchmark-backend
         run: cargo build --release
 
@@ -66,9 +74,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: obench
+      - name: fmt
+        working-directory: obench
+        run: cargo fmt --check
       - working-directory: obench
         run: cargo test
       - working-directory: obench

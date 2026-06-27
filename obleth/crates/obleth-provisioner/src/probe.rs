@@ -9,7 +9,12 @@ pub async fn is_healthy(
     timeout_secs: u64,
 ) -> bool {
     let url = format!("{}{}", api_base.trim_end_matches('/'), health_path);
-    match http.get(&url).timeout(Duration::from_secs(timeout_secs)).send().await {
+    match http
+        .get(&url)
+        .timeout(Duration::from_secs(timeout_secs))
+        .send()
+        .await
+    {
         Ok(r) => r.status().is_success(),
         Err(_) => false,
     }

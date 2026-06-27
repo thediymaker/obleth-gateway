@@ -22,23 +22,29 @@ pub struct SeededRun {
     pub teardown: Teardown,
 }
 
-pub async fn seed_fixture(admin: &AdminClient, fixture_api_base: &str, scope: &Scope) -> Result<SeededRun> {
+pub async fn seed_fixture(
+    admin: &AdminClient,
+    fixture_api_base: &str,
+    scope: &Scope,
+) -> Result<SeededRun> {
     let models: Vec<&str> = match scope {
         Scope::Single(name) => vec![name.as_str()],
         Scope::All => fleet::FIXTURE_MODELS.to_vec(),
     };
     let mut teardown = Teardown::default();
     for name in &models {
-        let (id, created) = admin.ensure_model(&ModelSpec {
-            model_name: name.to_string(),
-            upstream_model: name.to_string(),
-            api_base: fixture_api_base.to_string(),
-            api_key: None,
-            input_cost_per_token: 0.0,
-            output_cost_per_token: 0.0,
-            context_window: 8192,
-            admission_weight: 100,
-        }).await?;
+        let (id, created) = admin
+            .ensure_model(&ModelSpec {
+                model_name: name.to_string(),
+                upstream_model: name.to_string(),
+                api_base: fixture_api_base.to_string(),
+                api_key: None,
+                input_cost_per_token: 0.0,
+                output_cost_per_token: 0.0,
+                context_window: 8192,
+                admission_weight: 100,
+            })
+            .await?;
         if created {
             teardown.model_ids.push(id);
         }
@@ -57,9 +63,17 @@ pub async fn seed_fixture(admin: &AdminClient, fixture_api_base: &str, scope: &S
         }
         let (key_id, secret) = admin.ensure_key(&id, "obench").await?;
         teardown.key_ids.push(key_id);
-        tenants.push(SeededTenant { name: name.to_string(), traffic_share: *share, key: secret });
+        tenants.push(SeededTenant {
+            name: name.to_string(),
+            traffic_share: *share,
+            key: secret,
+        });
     }
-    Ok(SeededRun { tenants, models: models.iter().map(|m| m.to_string()).collect(), teardown })
+    Ok(SeededRun {
+        tenants,
+        models: models.iter().map(|m| m.to_string()).collect(),
+        teardown,
+    })
 }
 
 /// Build a `SeededRun` for a *remote* live gateway without any admin access.
@@ -89,5 +103,9 @@ pub fn live_run_from_config(cfg: &LiveConfig, scope: &Scope) -> Result<SeededRun
             key: k.secret.clone(),
         })
         .collect();
-    Ok(SeededRun { tenants, models, teardown: Teardown::default() })
+    Ok(SeededRun {
+        tenants,
+        models,
+        teardown: Teardown::default(),
+    })
 }

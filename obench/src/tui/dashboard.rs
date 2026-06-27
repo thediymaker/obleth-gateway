@@ -57,7 +57,10 @@ fn draw_strip(f: &mut Frame, area: Rect, s: &Summary) {
     let est = if s.any_estimated { " ~" } else { "" };
     let strip = Paragraph::new(Line::from(vec![
         Span::styled("tokens ", Style::default().fg(theme::MUTED)),
-        Span::styled(format!("in {}", s.in_tokens), Style::default().fg(theme::FG)),
+        Span::styled(
+            format!("in {}", s.in_tokens),
+            Style::default().fg(theme::FG),
+        ),
         Span::styled(
             format!(" · out {}{est}   ", s.out_tokens),
             Style::default().fg(theme::FG),
@@ -87,22 +90,32 @@ fn draw_header(f: &mut Frame, area: Rect, d: &DashFrame) {
     f.render_widget(block, area);
 
     let cols = Layout::horizontal([Constraint::Min(10), Constraint::Length(16)]).split(inner);
-    let scope = if d.gateway_observable { "local demo" } else { "remote live" };
+    let scope = if d.gateway_observable {
+        "local demo"
+    } else {
+        "remote live"
+    };
     let mut left_spans = vec![
         Span::styled(
             "obench ",
-            Style::default().fg(theme::MUTED).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::MUTED)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             d.title.to_string(),
-            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(format!("  ·  {scope}"), Style::default().fg(theme::MUTED)),
     ];
     if d.complete {
         left_spans.push(Span::styled(
             "  ·  ✓ complete",
-            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
         ));
     }
     let left = Paragraph::new(Line::from(left_spans));
@@ -129,8 +142,16 @@ fn draw_kpis(f: &mut Frame, area: Rect, s: &Summary) {
     ])
     .split(area);
 
-    let err_color = if s.error_rate > 0.0 { theme::ALERT } else { theme::ACCENT };
-    let rej_color = if s.rejected > 0 { theme::FG } else { theme::MUTED };
+    let err_color = if s.error_rate > 0.0 {
+        theme::ALERT
+    } else {
+        theme::ACCENT
+    };
+    let rej_color = if s.rejected > 0 {
+        theme::FG
+    } else {
+        theme::MUTED
+    };
 
     let tiles = [
         ("req/s", format!("{:.0}", s.req_per_s), theme::ACCENT),
@@ -163,7 +184,10 @@ fn draw_sparkline(f: &mut Frame, area: Rect, history: &[u64], cur_rps: f64) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::MUTED))
-        .title(Span::styled(" throughput (req/s) ", Style::default().fg(theme::MUTED)));
+        .title(Span::styled(
+            " throughput (req/s) ",
+            Style::default().fg(theme::MUTED),
+        ));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
@@ -203,7 +227,9 @@ fn draw_sparkline(f: &mut Frame, area: Rect, history: &[u64], cur_rps: f64) {
         Line::from(vec![Span::styled("now", Style::default().fg(theme::MUTED))]),
         Line::from(vec![Span::styled(
             format!("{cur_rps:.0}/s"),
-            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
         )]),
         Line::from(vec![Span::styled(
             format!("peak {peak}"),
@@ -267,7 +293,11 @@ fn draw_gauge(f: &mut Frame, area: Rect, d: &DashFrame) {
         } else {
             0.0
         };
-        let color = if ratio >= 0.95 { theme::ALERT } else { theme::ACCENT };
+        let color = if ratio >= 0.95 {
+            theme::ALERT
+        } else {
+            theme::ACCENT
+        };
         let gauge = Gauge::default()
             .block(
                 Block::default()
@@ -308,7 +338,11 @@ fn draw_footer(f: &mut Frame, area: Rect, ui_base: &str, complete: bool) {
     } else {
         "[q] quit & drain"
     };
-    let quit_color = if complete { theme::ACCENT } else { theme::MUTED };
+    let quit_color = if complete {
+        theme::ACCENT
+    } else {
+        theme::MUTED
+    };
     let ptr = Paragraph::new(vec![
         Line::from(Span::styled(
             "watch in the control plane:",
@@ -316,16 +350,19 @@ fn draw_footer(f: &mut Frame, area: Rect, ui_base: &str, complete: bool) {
         )),
         Line::from(vec![
             Span::styled("  fairshare   ", Style::default().fg(theme::MUTED)),
-            Span::styled(format!("{ui_base}/fairshare"), Style::default().fg(theme::ACCENT)),
+            Span::styled(
+                format!("{ui_base}/fairshare"),
+                Style::default().fg(theme::ACCENT),
+            ),
         ]),
         Line::from(vec![
             Span::styled("  accounting  ", Style::default().fg(theme::MUTED)),
-            Span::styled(format!("{ui_base}/usage"), Style::default().fg(theme::ACCENT)),
+            Span::styled(
+                format!("{ui_base}/usage"),
+                Style::default().fg(theme::ACCENT),
+            ),
         ]),
-        Line::from(Span::styled(
-            quit_hint,
-            Style::default().fg(quit_color),
-        )),
+        Line::from(Span::styled(quit_hint, Style::default().fg(quit_color))),
     ]);
     f.render_widget(ptr, area);
 }

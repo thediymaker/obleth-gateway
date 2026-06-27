@@ -184,7 +184,12 @@ async fn main() -> anyhow::Result<()> {
         fail_open: cfg.fail_open,
         alerts: alerts.clone(),
         session_id_derivation: std::env::var("OBLETH_SESSION_ID_DERIVATION")
-            .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off"
+                )
+            })
             .unwrap_or(true),
     };
 

@@ -1,4 +1,8 @@
-mod config; mod plan; mod obleth_client; mod probe; mod executor;
+mod config;
+mod executor;
+mod obleth_client;
+mod plan;
+mod probe;
 
 // `domain` and `slurm` live in the crate's library half (lib.rs) so obleth-admin
 // can call `discover_resources()`. Re-export them here rather than re-declaring
@@ -6,11 +10,11 @@ mod config; mod plan; mod obleth_client; mod probe; mod executor;
 // discovery code into the binary too, where it is unused (dead-code warnings).
 pub(crate) use obleth_provisioner::{domain, slurm};
 
-use std::collections::HashMap;
-use std::time::Duration;
 use config::ProvisionerConfig;
 use obleth_client::{HttpObleth, OblethClient};
 use obleth_provisioner::slurm::{SlurmClient, Slurmrestd};
+use std::collections::HashMap;
+use std::time::Duration;
 
 /// Outcome of one loop iteration, so the loop can log idle/active transitions
 /// without spamming a line every tick.
@@ -86,8 +90,8 @@ async fn tick(
     obleth: &dyn OblethClient,
     http: &reqwest::Client,
 ) -> anyhow::Result<()> {
-    let specs = obleth.list_managed_models().await?;          // obleth down -> bail (held). enabled only.
-    let all_replicas = obleth.list_all_replicas().await?;     // obleth down -> bail (held)
+    let specs = obleth.list_managed_models().await?; // obleth down -> bail (held). enabled only.
+    let all_replicas = obleth.list_all_replicas().await?; // obleth down -> bail (held)
 
     // Look up Slurm state for just the jobs we track, by id — never the whole
     // controller (which on a busy cluster is huge and OOM-kills us). A clean
@@ -100,7 +104,9 @@ async fn tick(
             continue;
         }
         match slurm.get_job(id).await {
-            Ok(Some(info)) => { jobs.insert(id.clone(), info); }
+            Ok(Some(info)) => {
+                jobs.insert(id.clone(), info);
+            }
             Ok(None) => {} // gone/purged -> absent from map -> planner reconciles it away
             Err(e) => return Err(e.context("slurm job lookup failed; holding tick")),
         }
@@ -112,10 +118,16 @@ async fn tick(
     // so we don't write every tick.
     for r in &all_replicas {
         if let Some(job) = jobs.get(&r.slurm_job_id) {
-            if matches!(job.state, domain::JobState::Pending | domain::JobState::Running) {
+            if matches!(
+                job.state,
+                domain::JobState::Pending | domain::JobState::Running
+            ) {
                 let msg = slurm::job_status_message(&job.raw_state, job.reason.as_deref());
                 if r.last_message.as_deref() != Some(msg.as_str()) {
-                    if let Err(e) = obleth.patch_replica(r.id, None, None, None, Some(&msg)).await {
+                    if let Err(e) = obleth
+                        .patch_replica(r.id, None, None, None, Some(&msg))
+                        .await
+                    {
                         tracing::warn!(replica_id = %r.id, error = %e, "failed to annotate replica status");
                     }
                 }
@@ -190,7 +202,16 @@ async fn tick(
                                     let timeout = cfg.health_timeout_secs;
                                     set.spawn(async move {
                                         let api_base = format!("http://{node}:{p}");
-                                        (p, probe::is_healthy(&http, &api_base, &health_path, timeout).await)
+                                        (
+                                            p,
+                                            probe::is_healthy(
+                                                &http,
+                                                &api_base,
+                                                &health_path,
+                                                timeout,
+                                            )
+                                            .await,
+                                        )
                                     });
                                 }
                                 // The bound port is whichever responds healthy; pick
@@ -226,7 +247,8 @@ async fn tick(
             }
         }
 
-        let mut live_port_bases: Vec<i64> = replicas.iter()
+        let mut live_port_bases: Vec<i64> = replicas
+            .iter()
             .filter(|r| r.state != "lost" && r.state != "draining")
             .map(|r| r.port_base)
             .collect();
@@ -241,13 +263,26 @@ async fn tick(
             // Submits in one tick don't all collapse onto the same port_base
             // (live_port_bases is recomputed per tick, not per action otherwise).
             let port_base = if matches!(action, domain::Action::Submit) {
-                let b = plan::next_free_window_base(spec.serving_port, cfg.port_span, &live_port_bases);
+                let b =
+                    plan::next_free_window_base(spec.serving_port, cfg.port_span, &live_port_bases);
                 live_port_bases.push(b);
                 b
             } else {
                 0
             };
-            if let Err(e) = executor::apply(action, spec.model_id, &model_name, Some(spec), &cfg.job_name_prefix, cfg.port_span, port_base, slurm, obleth).await {
+            if let Err(e) = executor::apply(
+                action,
+                spec.model_id,
+                &model_name,
+                Some(spec),
+                &cfg.job_name_prefix,
+                cfg.port_span,
+                port_base,
+                slurm,
+                obleth,
+            )
+            .await
+            {
                 tracing::warn!(?action, error = %e, "action failed; continuing");
             }
         }
@@ -260,11 +295,32 @@ async fn tick(
     for (model_id, replicas) in by_model {
         let model_name = obleth.model_name(model_id).await.unwrap_or_default();
         tracing::info!(%model_id, replicas = replicas.len(), "draining replicas for unmanaged model");
-        let view = plan::ManagedSpecView { target_replicas: 0, max_job_failures: 0 };
-        let actions = plan::plan(&view, &replicas, &jobs, &HashMap::new(), cfg.lost_retention_secs);
+        let view = plan::ManagedSpecView {
+            target_replicas: 0,
+            max_job_failures: 0,
+        };
+        let actions = plan::plan(
+            &view,
+            &replicas,
+            &jobs,
+            &HashMap::new(),
+            cfg.lost_retention_secs,
+        );
         for action in &actions {
             // Drain reconciles toward target 0, so no Submit fires; port_base is unused.
-            if let Err(e) = executor::apply(action, model_id, &model_name, None, &cfg.job_name_prefix, cfg.port_span, 0, slurm, obleth).await {
+            if let Err(e) = executor::apply(
+                action,
+                model_id,
+                &model_name,
+                None,
+                &cfg.job_name_prefix,
+                cfg.port_span,
+                0,
+                slurm,
+                obleth,
+            )
+            .await
+            {
                 tracing::warn!(?action, error = %e, "drain action failed; continuing");
             }
         }

@@ -56,11 +56,16 @@ const SCHEMA_V3: &str = include_str!("../../../../schema/postgres/0003_guardrail
 const SCHEMA_V4: &str = include_str!("../../../../schema/postgres/0004_saved_recipes.sql");
 const SCHEMA_V5: &str = include_str!("../../../../schema/postgres/0005_managed_launcher_spec.sql");
 const SCHEMA_V6: &str = include_str!("../../../../schema/postgres/0006_recipes.sql");
-const SCHEMA_V7: &str = include_str!("../../../../schema/postgres/0007_replica_port_and_min_replicas.sql");
-const SCHEMA_V8: &str = include_str!("../../../../schema/postgres/0008_managed_provision_error.sql");
-const SCHEMA_V9: &str = include_str!("../../../../schema/postgres/0009_replica_cancel_requested.sql");
-const SCHEMA_V10: &str = include_str!("../../../../schema/postgres/0010_drop_replica_model_cascade.sql");
-const SCHEMA_V11: &str = include_str!("../../../../schema/postgres/0011_endpoint_selection_session_hash.sql");
+const SCHEMA_V7: &str =
+    include_str!("../../../../schema/postgres/0007_replica_port_and_min_replicas.sql");
+const SCHEMA_V8: &str =
+    include_str!("../../../../schema/postgres/0008_managed_provision_error.sql");
+const SCHEMA_V9: &str =
+    include_str!("../../../../schema/postgres/0009_replica_cancel_requested.sql");
+const SCHEMA_V10: &str =
+    include_str!("../../../../schema/postgres/0010_drop_replica_model_cascade.sql");
+const SCHEMA_V11: &str =
+    include_str!("../../../../schema/postgres/0011_endpoint_selection_session_hash.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -782,11 +787,7 @@ impl Store {
         Ok((hash, resolved))
     }
 
-    pub async fn set_tenant_tracing(
-        &self,
-        id: Uuid,
-        tracing_enabled: bool,
-    ) -> Result<()> {
+    pub async fn set_tenant_tracing(&self, id: Uuid, tracing_enabled: bool) -> Result<()> {
         Self::guard_reserved_tenant(id)?;
         sqlx::query(
             "update tenants set tracing_enabled = $2, updated_at = now() where id = $1 returning id",
@@ -1520,12 +1521,11 @@ impl Store {
     /// are logged, not propagated — the caller's mutation already succeeded and
     /// the worst case is waiting the normal interval.
     async fn mark_model_health_due(&self, model_id: Uuid) {
-        if let Err(error) = sqlx::query(
-            "update models set health_next_check_at = now() where id = $1",
-        )
-        .bind(model_id)
-        .execute(&self.pool)
-        .await
+        if let Err(error) =
+            sqlx::query("update models set health_next_check_at = now() where id = $1")
+                .bind(model_id)
+                .execute(&self.pool)
+                .await
         {
             tracing::warn!(%error, %model_id, "failed to mark model health due after endpoint change");
         }
@@ -1738,16 +1738,21 @@ impl Store {
     pub async fn list_recipes(&self) -> Result<Vec<Recipe>> {
         let rows = sqlx::query(
             "select id, name, body, author, created_at, updated_at
-             from recipes order by updated_at desc")
-            .fetch_all(&self.pool).await?;
+             from recipes order by updated_at desc",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         rows.iter().map(recipe_from_row).collect()
     }
 
     pub async fn get_recipe(&self, id: Uuid) -> Result<Option<Recipe>> {
         let row = sqlx::query(
             "select id, name, body, author, created_at, updated_at
-             from recipes where id = $1")
-            .bind(id).fetch_optional(&self.pool).await?;
+             from recipes where id = $1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
         row.as_ref().map(recipe_from_row).transpose()
     }
 
@@ -1759,15 +1764,22 @@ impl Store {
              on conflict (id) do update set
                name=excluded.name, body=excluded.body,
                author=excluded.author, updated_at=now()
-             returning id, name, body, author, created_at, updated_at")
-            .bind(id).bind(&r.name).bind(&r.body).bind(&r.author)
-            .fetch_one(&self.pool).await?;
+             returning id, name, body, author, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(&r.name)
+        .bind(&r.body)
+        .bind(&r.author)
+        .fetch_one(&self.pool)
+        .await?;
         recipe_from_row(&row)
     }
 
     pub async fn delete_recipe(&self, id: Uuid) -> Result<()> {
         sqlx::query("delete from recipes where id = $1")
-            .bind(id).execute(&self.pool).await?;
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -1919,7 +1931,9 @@ impl Store {
 
     pub async fn delete_lost_replicas(&self, model_id: Uuid) -> Result<u64> {
         let r = sqlx::query("delete from model_replicas where model_id = $1 and state = 'lost'")
-            .bind(model_id).execute(&self.pool).await?;
+            .bind(model_id)
+            .execute(&self.pool)
+            .await?;
         Ok(r.rows_affected())
     }
 
@@ -2849,7 +2863,8 @@ fn recipe_from_row(row: &PgRow) -> Result<Recipe> {
 }
 
 fn managed_model_from_row(row: &PgRow) -> Result<ManagedModelSpec> {
-    let launcher_spec: Option<sqlx::types::Json<serde_json::Value>> = row.try_get("launcher_spec")?;
+    let launcher_spec: Option<sqlx::types::Json<serde_json::Value>> =
+        row.try_get("launcher_spec")?;
     Ok(ManagedModelSpec {
         model_id: row.try_get("model_id")?,
         enabled: row.try_get("enabled")?,
@@ -3239,18 +3254,35 @@ mod tests {
         // First failure: streak = 1 < threshold 2 -> badge must NOT move to unhealthy.
         let first = store
             .record_model_health_check(
-                model.id, "manual", "unhealthy", Some(12), Some(500), Some("blip"), None, next,
+                model.id,
+                "manual",
+                "unhealthy",
+                Some(12),
+                Some(500),
+                Some("blip"),
+                None,
+                next,
             )
             .await
             .expect("record first failure");
         assert_eq!(first.summary.consecutive_failures, 1);
-        assert_ne!(first.summary.status, "unhealthy", "single blip must not flip the badge");
+        assert_ne!(
+            first.summary.status, "unhealthy",
+            "single blip must not flip the badge"
+        );
         assert_eq!(first.alert_event, None, "no alert below threshold");
 
         // Second consecutive failure: streak = 2 >= threshold -> badge flips, alert fires.
         let second = store
             .record_model_health_check(
-                model.id, "manual", "unhealthy", Some(13), Some(500), Some("still down"), None, next,
+                model.id,
+                "manual",
+                "unhealthy",
+                Some(13),
+                Some(500),
+                Some("still down"),
+                None,
+                next,
             )
             .await
             .expect("record second failure");
@@ -3261,7 +3293,14 @@ mod tests {
         // Single healthy check: immediate recovery of badge and streak.
         let recovered = store
             .record_model_health_check(
-                model.id, "manual", "healthy", Some(8), Some(200), Some("ok"), None, next,
+                model.id,
+                "manual",
+                "healthy",
+                Some(8),
+                Some(200),
+                Some("ok"),
+                None,
+                next,
             )
             .await
             .expect("record recovery");
@@ -3269,7 +3308,10 @@ mod tests {
         assert_eq!(recovered.summary.status, "healthy");
 
         // The raw audit trail must still contain the unhealthy rows.
-        let checks = store.list_model_health_checks(model.id, 10).await.expect("checks");
+        let checks = store
+            .list_model_health_checks(model.id, 10)
+            .await
+            .expect("checks");
         assert!(
             checks.iter().any(|c| c.status == "unhealthy"),
             "raw unhealthy checks must remain in the audit trail"
@@ -3300,16 +3342,36 @@ mod tests {
                 "http://127.0.0.1:8081",
                 None,
                 "chat",
-                0.0, 0.0, 0.0, 0.0, 0.0,
-                8192, 100, None,
-                false, true, false, false, false,
-                &[], &[], &[],
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                8192,
+                100,
+                None,
+                false,
+                true,
+                false,
+                false,
+                false,
+                &[],
+                &[],
+                &[],
             )
             .await
             .expect("create model");
 
         let ep = store
-            .create_model_endpoint(model.id, "primary", "http://127.0.0.1:8082", None, 0, 1, true)
+            .create_model_endpoint(
+                model.id,
+                "primary",
+                "http://127.0.0.1:8082",
+                None,
+                0,
+                1,
+                true,
+            )
             .await
             .expect("create endpoint");
 
@@ -3546,7 +3608,10 @@ mod tests {
         assert_eq!(spec.target_replicas, 2);
         assert_eq!(spec.min_replicas, 1);
         assert_eq!(spec.partition, "gpu-preempt");
-        assert_eq!(spec.launcher_spec, Some(serde_json::json!({"backendId":"llamacpp"})));
+        assert_eq!(
+            spec.launcher_spec,
+            Some(serde_json::json!({"backendId":"llamacpp"}))
+        );
 
         // Assert membership, not a global count — other tests share this DB and
         // may have their own managed models, so an exact count is flaky in CI.
@@ -3610,13 +3675,27 @@ mod tests {
             .await
             .expect("managed");
 
-        store.set_provision_error(model.id, Some("error 2045")).await.expect("set");
-        let m = store.get_managed_model(model.id).await.expect("get").expect("some");
+        store
+            .set_provision_error(model.id, Some("error 2045"))
+            .await
+            .expect("set");
+        let m = store
+            .get_managed_model(model.id)
+            .await
+            .expect("get")
+            .expect("some");
         assert_eq!(m.last_provision_error.as_deref(), Some("error 2045"));
         assert!(m.last_provision_error_at.is_some());
 
-        store.set_provision_error(model.id, None).await.expect("clear");
-        let m = store.get_managed_model(model.id).await.expect("get").expect("some");
+        store
+            .set_provision_error(model.id, None)
+            .await
+            .expect("clear");
+        let m = store
+            .get_managed_model(model.id)
+            .await
+            .expect("get")
+            .expect("some");
         assert_eq!(m.last_provision_error, None);
         assert!(m.last_provision_error_at.is_none());
 
@@ -3721,20 +3800,40 @@ mod tests {
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
 
-        let saved = store.upsert_recipe(UpsertRecipe {
-            id: None, name: "GLM".into(),
-            body: "---\nname: GLM\n---\nllama-server".into(), author: "you".into(),
-        }).await.expect("insert");
-        assert!(store.list_recipes().await.expect("list").iter().any(|r| r.id == saved.id));
+        let saved = store
+            .upsert_recipe(UpsertRecipe {
+                id: None,
+                name: "GLM".into(),
+                body: "---\nname: GLM\n---\nllama-server".into(),
+                author: "you".into(),
+            })
+            .await
+            .expect("insert");
+        assert!(store
+            .list_recipes()
+            .await
+            .expect("list")
+            .iter()
+            .any(|r| r.id == saved.id));
 
-        let updated = store.upsert_recipe(UpsertRecipe {
-            id: Some(saved.id), name: "GLM v2".into(),
-            body: saved.body.clone(), author: "you".into(),
-        }).await.expect("update");
+        let updated = store
+            .upsert_recipe(UpsertRecipe {
+                id: Some(saved.id),
+                name: "GLM v2".into(),
+                body: saved.body.clone(),
+                author: "you".into(),
+            })
+            .await
+            .expect("update");
         assert_eq!(updated.name, "GLM v2");
 
         store.delete_recipe(saved.id).await.expect("delete");
-        assert!(!store.list_recipes().await.expect("list2").iter().any(|r| r.id == saved.id));
+        assert!(!store
+            .list_recipes()
+            .await
+            .expect("list2")
+            .iter()
+            .any(|r| r.id == saved.id));
     }
 
     #[tokio::test]
@@ -3883,7 +3982,10 @@ mod tests {
         assert_eq!(updated.state, replica.state, "state must be unchanged");
 
         // Clean up.
-        store.delete_replica(replica.id).await.expect("delete replica");
+        store
+            .delete_replica(replica.id)
+            .await
+            .expect("delete replica");
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.

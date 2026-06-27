@@ -36,7 +36,9 @@ pub async fn apply(
                 Err(e) => {
                     // Slurm rejected the submit (e.g. bad account/partition/qos).
                     // Surface it in the dashboard, best-effort, then propagate.
-                    let _ = obleth.set_provision_error(model_id, Some(&e.to_string())).await;
+                    let _ = obleth
+                        .set_provision_error(model_id, Some(&e.to_string()))
+                        .await;
                     return Err(e);
                 }
             };
@@ -55,7 +57,10 @@ pub async fn apply(
             // Submitted and recorded: clear any prior provisioning error.
             let _ = obleth.set_provision_error(model_id, None).await;
         }
-        Action::Promote { replica_id, api_base } => {
+        Action::Promote {
+            replica_id,
+            api_base,
+        } => {
             tracing::info!(%replica_id, %api_base, model = model_name, "promoting replica to healthy");
             let name = format!("{job_prefix}{model_name}-{replica_id}");
             // Idempotent: reuse an existing endpoint with this deterministic name
@@ -67,9 +72,20 @@ pub async fn apply(
                 None => obleth.create_endpoint(model_id, &name, api_base).await?,
             };
             let node = host_from_api_base(api_base);
-            obleth.patch_replica(*replica_id, Some("healthy"), Some(&node), Some(ep), Some("promoted")).await?;
+            obleth
+                .patch_replica(
+                    *replica_id,
+                    Some("healthy"),
+                    Some(&node),
+                    Some(ep),
+                    Some("promoted"),
+                )
+                .await?;
         }
-        Action::MarkLost { replica_id, endpoint_id } => {
+        Action::MarkLost {
+            replica_id,
+            endpoint_id,
+        } => {
             if let Some(ep) = endpoint_id {
                 // best-effort: a missing endpoint is fine, but log real failures so
                 // phantom endpoints don't accumulate unnoticed.
@@ -77,9 +93,15 @@ pub async fn apply(
                     tracing::warn!(endpoint_id = %ep, error = %e, "failed to deregister endpoint on mark-lost");
                 }
             }
-            obleth.patch_replica(*replica_id, Some("lost"), None, None, Some("job gone")).await?;
+            obleth
+                .patch_replica(*replica_id, Some("lost"), None, None, Some("job gone"))
+                .await?;
         }
-        Action::Cancel { replica_id, job_id, endpoint_id } => {
+        Action::Cancel {
+            replica_id,
+            job_id,
+            endpoint_id,
+        } => {
             // Deregister the endpoint first so the proxy stops routing to this
             // backend immediately — otherwise it lingers in rotation (still
             // "healthy") until the job goes fully Gone a tick later, and requests
@@ -90,7 +112,15 @@ pub async fn apply(
                 }
             }
             slurm.cancel(job_id).await?;
-            obleth.patch_replica(*replica_id, Some("draining"), None, None, Some("scaled down")).await?;
+            obleth
+                .patch_replica(
+                    *replica_id,
+                    Some("draining"),
+                    None,
+                    None,
+                    Some("scaled down"),
+                )
+                .await?;
         }
         Action::Delete { replica_id } => {
             obleth.delete_replica(*replica_id).await?;
@@ -131,10 +161,18 @@ mod tests {
             if self.fail_submit.load(std::sync::atomic::Ordering::SeqCst) {
                 anyhow::bail!("simulated submit rejection (error 2045)");
             }
-            let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let id = self
+                .next_id
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.submitted.lock().unwrap().push(job.clone());
             let job_id = format!("job-{id}");
-            self.jobs.lock().unwrap().push(JobInfo { job_id: job_id.clone(), state: JobState::Pending, nodes: vec![], raw_state: "PENDING".into(), reason: None });
+            self.jobs.lock().unwrap().push(JobInfo {
+                job_id: job_id.clone(),
+                state: JobState::Pending,
+                nodes: vec![],
+                raw_state: "PENDING".into(),
+                reason: None,
+            });
             Ok(job_id)
         }
         async fn cancel(&self, job_id: &str) -> anyhow::Result<()> {
@@ -142,7 +180,13 @@ mod tests {
             Ok(())
         }
         async fn get_job(&self, job_id: &str) -> anyhow::Result<Option<JobInfo>> {
-            Ok(self.jobs.lock().unwrap().iter().find(|j| j.job_id == job_id).cloned())
+            Ok(self
+                .jobs
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|j| j.job_id == job_id)
+                .cloned())
         }
         async fn discover_resources(&self) -> anyhow::Result<ClusterResources> {
             Ok(ClusterResources::default())
@@ -156,7 +200,10 @@ mod tests {
             partition: "gpu-preempt".into(),
             gres: "gpu:h100:2".into(),
             nodes: 1,
-            constraints: None, exclude: None, account: None, qos: None,
+            constraints: None,
+            exclude: None,
+            account: None,
+            qos: None,
             time_limit: Some("12:00:00".into()),
             cpus_per_task: None,
             mem: None,
@@ -179,7 +226,13 @@ mod tests {
     }
 
     fn mock_slurm() -> MockSlurm {
-        MockSlurm { jobs: Mutex::new(vec![]), submitted: Mutex::new(vec![]), cancelled: Mutex::new(vec![]), next_id: AtomicU64::new(1), fail_submit: std::sync::atomic::AtomicBool::new(false) }
+        MockSlurm {
+            jobs: Mutex::new(vec![]),
+            submitted: Mutex::new(vec![]),
+            cancelled: Mutex::new(vec![]),
+            next_id: AtomicU64::new(1),
+            fail_submit: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
     #[tokio::test]
@@ -187,7 +240,19 @@ mod tests {
         let slurm = mock_slurm();
         let obleth = MockObleth::default();
         let s = spec();
-        apply(&Action::Submit, s.model_id, "nemotron", Some(&s), "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
+        apply(
+            &Action::Submit,
+            s.model_id,
+            "nemotron",
+            Some(&s),
+            "obleth-",
+            8,
+            8000,
+            &slurm,
+            &obleth,
+        )
+        .await
+        .unwrap();
         assert_eq!(slurm.submitted.lock().unwrap().len(), 1);
         assert_eq!(obleth.created_replicas.lock().unwrap().len(), 1);
     }
@@ -198,9 +263,22 @@ mod tests {
         // cancel the just-submitted job so it doesn't leak, and surface the error.
         let slurm = mock_slurm();
         let obleth = MockObleth::default();
-        obleth.fail_create_replica.store(true, std::sync::atomic::Ordering::SeqCst);
+        obleth
+            .fail_create_replica
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let s = spec();
-        let err = apply(&Action::Submit, s.model_id, "nemotron", Some(&s), "obleth-", 8, 8000, &slurm, &obleth).await;
+        let err = apply(
+            &Action::Submit,
+            s.model_id,
+            "nemotron",
+            Some(&s),
+            "obleth-",
+            8,
+            8000,
+            &slurm,
+            &obleth,
+        )
+        .await;
         assert!(err.is_err(), "Submit must propagate the record failure");
         let submitted = slurm.submitted.lock().unwrap();
         let cancelled = slurm.cancelled.lock().unwrap();
@@ -213,7 +291,18 @@ mod tests {
     async fn submit_without_spec_errors() {
         let slurm = mock_slurm();
         let obleth = MockObleth::default();
-        let err = apply(&Action::Submit, Uuid::new_v4(), "nemotron", None, "obleth-", 8, 8000, &slurm, &obleth).await;
+        let err = apply(
+            &Action::Submit,
+            Uuid::new_v4(),
+            "nemotron",
+            None,
+            "obleth-",
+            8,
+            8000,
+            &slurm,
+            &obleth,
+        )
+        .await;
         assert!(err.is_err(), "Submit must fail without a spec");
         assert_eq!(slurm.submitted.lock().unwrap().len(), 0);
     }
@@ -224,11 +313,27 @@ mod tests {
         let obleth = MockObleth::default();
         let s = spec();
         let rid = Uuid::new_v4();
-        apply(&Action::Promote { replica_id: rid, api_base: "http://gpu7:8000".into() },
-              s.model_id, "nemotron", Some(&s), "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
+        apply(
+            &Action::Promote {
+                replica_id: rid,
+                api_base: "http://gpu7:8000".into(),
+            },
+            s.model_id,
+            "nemotron",
+            Some(&s),
+            "obleth-",
+            8,
+            8000,
+            &slurm,
+            &obleth,
+        )
+        .await
+        .unwrap();
         assert_eq!(obleth.created_endpoints.lock().unwrap().len(), 1);
         let patched = obleth.patched.lock().unwrap();
-        assert!(patched.iter().any(|p| p.0 == rid && p.1.as_deref() == Some("healthy")));
+        assert!(patched
+            .iter()
+            .any(|p| p.0 == rid && p.1.as_deref() == Some("healthy")));
     }
 
     #[test]
@@ -246,11 +351,27 @@ mod tests {
         let rid = Uuid::new_v4();
         let ep = Uuid::new_v4();
         // No spec needed for drain actions (drives the disabled/deleted path).
-        apply(&Action::MarkLost { replica_id: rid, endpoint_id: Some(ep) },
-              Uuid::new_v4(), "nemotron", None, "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
+        apply(
+            &Action::MarkLost {
+                replica_id: rid,
+                endpoint_id: Some(ep),
+            },
+            Uuid::new_v4(),
+            "nemotron",
+            None,
+            "obleth-",
+            8,
+            8000,
+            &slurm,
+            &obleth,
+        )
+        .await
+        .unwrap();
         assert!(obleth.deleted_endpoints.lock().unwrap().contains(&ep));
         let patched = obleth.patched.lock().unwrap();
-        assert!(patched.iter().any(|p| p.0 == rid && p.1.as_deref() == Some("lost")));
+        assert!(patched
+            .iter()
+            .any(|p| p.0 == rid && p.1.as_deref() == Some("lost")));
     }
 
     #[tokio::test]
@@ -260,13 +381,30 @@ mod tests {
         let rid = Uuid::new_v4();
         let ep = Uuid::new_v4();
         // No spec needed for drain actions.
-        apply(&Action::Cancel { replica_id: rid, job_id: "j9".into(), endpoint_id: Some(ep) },
-              Uuid::new_v4(), "nemotron", None, "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
+        apply(
+            &Action::Cancel {
+                replica_id: rid,
+                job_id: "j9".into(),
+                endpoint_id: Some(ep),
+            },
+            Uuid::new_v4(),
+            "nemotron",
+            None,
+            "obleth-",
+            8,
+            8000,
+            &slurm,
+            &obleth,
+        )
+        .await
+        .unwrap();
         // Endpoint removed from rotation BEFORE the job is cancelled (502 guard).
         assert!(obleth.deleted_endpoints.lock().unwrap().contains(&ep));
         assert!(slurm.cancelled.lock().unwrap().contains(&"j9".to_string()));
         let patched = obleth.patched.lock().unwrap();
-        assert!(patched.iter().any(|p| p.0 == rid && p.1.as_deref() == Some("draining")));
+        assert!(patched
+            .iter()
+            .any(|p| p.0 == rid && p.1.as_deref() == Some("draining")));
     }
 
     #[tokio::test]
@@ -274,8 +412,23 @@ mod tests {
         let slurm = mock_slurm();
         let obleth = MockObleth::default();
         let rid = Uuid::new_v4();
-        apply(&Action::Cancel { replica_id: rid, job_id: "j9".into(), endpoint_id: None },
-              Uuid::new_v4(), "nemotron", None, "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
+        apply(
+            &Action::Cancel {
+                replica_id: rid,
+                job_id: "j9".into(),
+                endpoint_id: None,
+            },
+            Uuid::new_v4(),
+            "nemotron",
+            None,
+            "obleth-",
+            8,
+            8000,
+            &slurm,
+            &obleth,
+        )
+        .await
+        .unwrap();
         assert!(obleth.deleted_endpoints.lock().unwrap().is_empty());
         assert!(slurm.cancelled.lock().unwrap().contains(&"j9".to_string()));
     }
@@ -283,10 +436,23 @@ mod tests {
     #[tokio::test]
     async fn submit_records_provision_error_on_rejection() {
         let slurm = mock_slurm();
-        slurm.fail_submit.store(true, std::sync::atomic::Ordering::SeqCst);
+        slurm
+            .fail_submit
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         let obleth = MockObleth::default();
         let s = spec();
-        let err = apply(&Action::Submit, s.model_id, "nemotron", Some(&s), "obleth-", 8, 8000, &slurm, &obleth).await;
+        let err = apply(
+            &Action::Submit,
+            s.model_id,
+            "nemotron",
+            Some(&s),
+            "obleth-",
+            8,
+            8000,
+            &slurm,
+            &obleth,
+        )
+        .await;
         assert!(err.is_err(), "submit rejection propagates");
         let perr = obleth.provision_errors.lock().unwrap();
         assert_eq!(perr.len(), 1);
@@ -300,8 +466,23 @@ mod tests {
         let slurm = mock_slurm();
         let obleth = MockObleth::default();
         let s = spec();
-        apply(&Action::Submit, s.model_id, "nemotron", Some(&s), "obleth-", 8, 8000, &slurm, &obleth).await.unwrap();
+        apply(
+            &Action::Submit,
+            s.model_id,
+            "nemotron",
+            Some(&s),
+            "obleth-",
+            8,
+            8000,
+            &slurm,
+            &obleth,
+        )
+        .await
+        .unwrap();
         let perr = obleth.provision_errors.lock().unwrap();
-        assert!(perr.iter().any(|(id, e)| *id == s.model_id && e.is_none()), "clears on success");
+        assert!(
+            perr.iter().any(|(id, e)| *id == s.model_id && e.is_none()),
+            "clears on success"
+        );
     }
 }

@@ -636,10 +636,7 @@ fn usage_chunk(id: &str, model: &str, created: i64, input: u32, output: u32) -> 
 /// model that combines the last token with `finish_reason` would produce two.
 fn forward_delta(v: &Value) -> Value {
     let mut v = v.clone();
-    if let Some(choice) = v
-        .pointer_mut("/choices/0")
-        .and_then(|c| c.as_object_mut())
-    {
+    if let Some(choice) = v.pointer_mut("/choices/0").and_then(|c| c.as_object_mut()) {
         if let Some(delta) = choice.get_mut("delta").and_then(|d| d.as_object_mut()) {
             delta.remove("tool_calls");
         }
@@ -723,7 +720,10 @@ mod tests {
         assert_eq!(msg["role"], "assistant");
         assert_eq!(msg["content"], "let me check");
         assert_eq!(msg["tool_calls"][0]["function"]["name"], "search");
-        assert_eq!(msg["tool_calls"][0]["function"]["arguments"], "{\"query\":\"x\"}");
+        assert_eq!(
+            msg["tool_calls"][0]["function"]["arguments"],
+            "{\"query\":\"x\"}"
+        );
     }
 
     #[test]
@@ -782,7 +782,10 @@ mod tests {
         let json_part = c.trim_start_matches("data: ").trim_end();
         let v: Value = serde_json::from_str(json_part).unwrap();
         // Marker lands on reasoning_content, never on content.
-        assert_eq!(v["choices"][0]["delta"]["reasoning_content"], "\n\n🔎 Searching\n\n");
+        assert_eq!(
+            v["choices"][0]["delta"]["reasoning_content"],
+            "\n\n🔎 Searching\n\n"
+        );
         assert!(v["choices"][0]["delta"].get("content").is_none());
         assert!(v["choices"][0]["finish_reason"].is_null());
     }

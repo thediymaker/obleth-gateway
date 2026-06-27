@@ -1245,7 +1245,9 @@ pub struct GuardrailsBoonSettings {
 
 impl Default for GuardrailsBoonSettings {
     fn default() -> Self {
-        Self { timeout_ms: default_guardrails_timeout_ms() }
+        Self {
+            timeout_ms: default_guardrails_timeout_ms(),
+        }
     }
 }
 

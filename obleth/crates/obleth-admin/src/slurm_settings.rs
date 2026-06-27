@@ -295,8 +295,7 @@ pub async fn put_slurm_settings(
         });
     if !is_valid_api_version(&api_version) {
         return Err(AdminError::BadRequest(
-            "slurmrestd_api_version must look like 'v0.0.40' (letters, digits, dots only)"
-                .into(),
+            "slurmrestd_api_version must look like 'v0.0.40' (letters, digits, dots only)".into(),
         ));
     }
 
@@ -332,9 +331,7 @@ pub async fn put_slurm_settings(
     post, path = "/api/v1/settings/slurm/test", tag = "settings",
     responses((status = 200, body = SlurmHealthView))
 )]
-pub async fn test_slurm_settings(
-    State(state): State<AdminState>,
-) -> Result<Json<SlurmHealthView>> {
+pub async fn test_slurm_settings(State(state): State<AdminState>) -> Result<Json<SlurmHealthView>> {
     let settings = state.store.get_slurm_settings().await?.unwrap_or_default();
     if settings.slurmrestd_url.trim().is_empty() {
         return Err(AdminError::BadRequest(

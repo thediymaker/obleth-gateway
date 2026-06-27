@@ -804,7 +804,10 @@ mod tests {
             response_excerpt: None,
         };
         // Only a disabled endpoint -> treated as no live endpoints -> unhealthy.
-        assert_eq!(aggregate_endpoint_health(&[disabled], 1).status, "unhealthy");
+        assert_eq!(
+            aggregate_endpoint_health(&[disabled], 1).status,
+            "unhealthy"
+        );
     }
 
     // --- min_replicas floor tests ---

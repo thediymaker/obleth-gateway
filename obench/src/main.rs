@@ -12,7 +12,9 @@ mod tui;
 
 use clap::Parser;
 
-async fn mod_tui_run(args: &cli::Cli) -> anyhow::Result<()> { tui::run(args).await }
+async fn mod_tui_run(args: &cli::Cli) -> anyhow::Result<()> {
+    tui::run(args).await
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

@@ -87,7 +87,12 @@ async fn enforce_schema(
     };
 
     // Repair loop: the configured fixer model, or the request's own model.
-    let fixer = match plan.settings.fixer_model.as_deref().filter(|m| !m.trim().is_empty()) {
+    let fixer = match plan
+        .settings
+        .fixer_model
+        .as_deref()
+        .filter(|m| !m.trim().is_empty())
+    {
         Some(name) => match crate::proxy::resolve_model(state, name).await {
             Some(m) if m.enabled => Some(m),
             _ => {
@@ -203,12 +208,14 @@ pub fn synthesize_sse(completion: &Value, include_usage: bool) -> String {
     // streaming passthrough. The original field name is mirrored back so the
     // client renders it exactly as it would natively.
     let reasoning = message.and_then(|m| {
-        ["reasoning_content", "reasoning"].into_iter().find_map(|field| {
-            m.get(field)
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .map(|s| (field, s.to_string()))
-        })
+        ["reasoning_content", "reasoning"]
+            .into_iter()
+            .find_map(|field| {
+                m.get(field)
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| (field, s.to_string()))
+            })
     });
     let tool_calls = message
         .and_then(|m| m.get("tool_calls"))
