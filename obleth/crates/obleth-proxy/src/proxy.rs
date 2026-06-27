@@ -2561,9 +2561,6 @@ fn conversation_seed(json: &serde_json::Value) -> Option<String> {
             }
             _ => {}
         }
-        if seed.len() >= SEED_CAP {
-            break;
-        }
     }
     if seed.trim().is_empty() {
         None
@@ -2599,6 +2596,7 @@ fn fnv1a(bytes: &[u8]) -> u64 {
     fnv1a_continue(0xcbf2_9ce4_8422_2325, bytes)
 }
 
+/// Continue an FNV-1a 64-bit hash over additional bytes (lets us chain tenant + seed).
 fn fnv1a_continue(mut hash: u64, bytes: &[u8]) -> u64 {
     for &b in bytes {
         hash ^= b as u64;
@@ -2606,7 +2604,6 @@ fn fnv1a_continue(mut hash: u64, bytes: &[u8]) -> u64 {
     }
     hash
 }
-
 
 #[allow(clippy::too_many_arguments)]
 fn finalize(
@@ -3271,7 +3268,9 @@ mod tests {
     #[test]
     fn session_hash_sticks_and_repins_when_endpoint_removed() {
         // Two endpoints; a fixed key picks one deterministically.
-        let m_all = model_with(vec![endpoint("a", "http://a/v1", 100, 100, true, true), endpoint("b", "http://b/v1", 100, 100, true, true)]);
+        let ep_a = "http://a/v1";
+        let ep_b = "http://b/v1";
+        let m_all = model_with(vec![endpoint("a", ep_a, 100, 100, true, true), endpoint("b", ep_b, 100, 100, true, true)]);
         let key = "deadbeefdeadbeef";
         let first = build_targets(Some(&m_all), "http://global/v1", "session_hash", key);
         let again = build_targets(Some(&m_all), "http://global/v1", "session_hash", key);
@@ -3279,11 +3278,12 @@ mod tests {
 
         // Remove whichever endpoint was primary; the survivor must take over.
         let primary = first[0].base.clone();
-        let survivors: Vec<_> = vec![endpoint("a", "http://a/v1", 100, 100, true, true), endpoint("b", "http://b/v1", 100, 100, true, true)]
+        let survivor = if primary == ep_a { ep_b } else { ep_a };
+        let survivors: Vec<_> = vec![endpoint("a", ep_a, 100, 100, true, true), endpoint("b", ep_b, 100, 100, true, true)]
             .into_iter().filter(|e| e.api_base != primary).collect();
         let m_one = model_with(survivors);
         let after = build_targets(Some(&m_one), "http://global/v1", "session_hash", key);
         assert_eq!(after.len(), 1);
-        assert_ne!(after[0].base, primary, "re-pinned to the survivor");
+        assert_eq!(after[0].base, survivor, "re-pinned to the survivor, not the global fallback");
     }
 }

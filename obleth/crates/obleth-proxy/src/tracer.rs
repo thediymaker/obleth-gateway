@@ -75,8 +75,8 @@ impl SpanRecorder {
             duration_ms,
             status: status.to_string(),
             attributes: "{}".to_string(),
-            session_id: self.session_id.clone(),
-            session_id_source: self.session_id_source.clone(),
+            session_id: self.session_id,
+            session_id_source: self.session_id_source,
         });
         let sink = self.sink;
         for span in self.spans {
