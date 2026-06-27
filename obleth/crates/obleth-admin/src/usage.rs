@@ -132,6 +132,7 @@ pub struct UsageLogRow {
     pub model: String,
     pub request_type: String,
     pub session_id: String,
+    pub session_id_source: String,
     pub admission: String,
     pub status_code: u16,
     pub input_tokens: u32,
@@ -155,7 +156,7 @@ pub async fn query_usage_logs(
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
 
     let mut sql = String::from(
-        "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, \
+        "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, session_id_source, \
          admission, status_code, input_tokens, output_tokens, \
          toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
          queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd \
