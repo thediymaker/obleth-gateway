@@ -28,6 +28,7 @@ pnpm-debug.log*
 # ---- internal planning (canonical plan lives in .cursor/plans) ----
 /plan.md
 docs/superpowers
+.claude
 .superpowers
 
 # ---- env / secrets ----
