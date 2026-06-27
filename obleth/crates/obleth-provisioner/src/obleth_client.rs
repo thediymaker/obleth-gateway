@@ -129,6 +129,7 @@ impl HttpObleth {
         self.http
             .request(m, format!("{}{path}", self.base))
             .bearer_auth(&self.token)
+            .header("X-Obleth-Audit-Actor", "system")
     }
 }
 
