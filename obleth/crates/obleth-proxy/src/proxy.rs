@@ -2650,6 +2650,7 @@ fn finalize(
         cost_usd,
         ts_ms: now_ms(),
         session_id: meta.session_id.clone(),
+        session_id_source: meta.session_id_source.to_string(),
         request_type: meta.request_type.to_string(),
     });
 }
