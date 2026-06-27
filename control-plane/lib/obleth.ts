@@ -1,6 +1,7 @@
 // Server-side client for the obleth Management API.
 
 const BASE = process.env.OBLETH_ADMIN_BASE_URL ?? "http://localhost:9180";
+const AUDIT_ACTOR_HEADER = "X-Obleth-Audit-Actor";
 
 // Resolve the admin token lazily, at request time. Validating it at module
 // scope would throw while Next.js evaluates server modules during `next build`
@@ -785,6 +786,15 @@ export class OblethApiError extends Error {
 /** Next.js fetch caching options accepted alongside a standard RequestInit. */
 type NextFetchOptions = { revalidate?: number | false; tags?: string[] };
 type ApiInit = RequestInit & { next?: NextFetchOptions };
+interface AuditOptions {
+  auditActor?: string | null;
+}
+
+function auditActorHeaders(options?: AuditOptions): Record<string, string> {
+  const rawActor = options?.auditActor?.trim();
+  const actor = rawActor?.replace(/[\r\n]+/g, " ");
+  return actor ? { [AUDIT_ACTOR_HEADER]: actor } : {};
+}
 
 async function api<T>(path: string, init?: ApiInit): Promise<T> {
   const { next, cache, headers, ...rest } = init ?? {};
@@ -952,9 +962,11 @@ export const obleth = {
       budget_period?: string | null;
       budget_started_at?: string | null;
     },
+    options?: AuditOptions,
   ) =>
     api<CreatedKey>(`/tenants/${tenantId}/keys`, {
       method: "POST",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   updateKey: (
@@ -967,19 +979,23 @@ export const obleth = {
       budget_period?: string | null;
       budget_started_at?: string | null;
     },
+    options?: AuditOptions,
   ) =>
     api<ApiKey>(`/keys/${id}`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  setKeyDisabled: (id: string, disabled: boolean) =>
+  setKeyDisabled: (id: string, disabled: boolean, options?: AuditOptions) =>
     api<void>(`/keys/${id}/disabled`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ disabled }),
     }),
-  setKeyTracing: (id: string, tracing_enabled: boolean) =>
+  setKeyTracing: (id: string, tracing_enabled: boolean, options?: AuditOptions) =>
     api<void>(`/keys/${id}/tracing`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ tracing_enabled }),
     }),
   setTenantTracing: (id: string, tracing_enabled: boolean) =>
@@ -987,7 +1003,11 @@ export const obleth = {
       method: "PUT",
       body: JSON.stringify({ tracing_enabled }),
     }),
-  deleteKey: (id: string) => api<void>(`/keys/${id}`, { method: "DELETE" }),
+  deleteKey: (id: string, options?: AuditOptions) =>
+    api<void>(`/keys/${id}`, {
+      method: "DELETE",
+      headers: auditActorHeaders(options),
+    }),
   listModels: () =>
     api<ModelRoute[]>("/models", {
       next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.models] },

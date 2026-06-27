@@ -22,7 +22,7 @@ pub mod usage_retention;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{header::AUTHORIZATION, Request, StatusCode};
+use axum::http::{header::AUTHORIZATION, HeaderMap, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, patch, post, put};
@@ -50,6 +50,17 @@ pub use model_health::{AlertSink, ModelHealthRuntime};
 pub use openapi::ApiDoc;
 
 type Result<T> = std::result::Result<T, AdminError>;
+const AUDIT_ACTOR_HEADER: &str = "x-obleth-audit-actor";
+
+fn audit_actor(headers: &HeaderMap) -> String {
+    headers
+        .get(AUDIT_ACTOR_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.chars().take(256).collect())
+        .unwrap_or_else(|| "admin".to_string())
+}
 
 /// Shared state for the Management API. All fields are cheap-clone handles.
 #[derive(Clone)]
@@ -102,7 +113,10 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/tenants/:id/weight", patch(patch_weight))
         .route("/api/v1/tenants/:id/quota", put(put_quota))
         .route("/api/v1/tenants/:id/keys", post(create_key))
-        .route("/api/v1/tenants/:id/tracing", put(set_tenant_tracing_handler))
+        .route(
+            "/api/v1/tenants/:id/tracing",
+            put(set_tenant_tracing_handler),
+        )
         .route("/api/v1/keys", get(list_keys))
         .route("/api/v1/keys/:id", put(update_key).delete(delete_key))
         .route("/api/v1/keys/:id/disabled", put(set_key_disabled))
@@ -170,8 +184,14 @@ pub fn router(state: AdminState) -> Router {
         )
         .route("/api/v1/models/:id/cache", put(set_model_cache))
         .route("/api/v1/models/:id/reliability", put(set_model_reliability))
-        .route("/api/v1/recipes", get(recipes::list_recipes).post(recipes::create_recipe))
-        .route("/api/v1/recipes/:id", put(recipes::update_recipe).delete(recipes::delete_recipe))
+        .route(
+            "/api/v1/recipes",
+            get(recipes::list_recipes).post(recipes::create_recipe),
+        )
+        .route(
+            "/api/v1/recipes/:id",
+            put(recipes::update_recipe).delete(recipes::delete_recipe),
+        )
         .route("/api/v1/managed", get(list_managed_models))
         .route(
             "/api/v1/models/:id/managed",
@@ -1127,7 +1147,10 @@ async fn patch_tenant_guardrails(
     Path(id): Path<Uuid>,
     Json(body): Json<SetTenantGuardrails>,
 ) -> Result<Json<Tenant>> {
-    let tenant = state.store.update_tenant_guardrails_policy(id, body.policy).await?;
+    let tenant = state
+        .store
+        .update_tenant_guardrails_policy(id, body.policy)
+        .await?;
     // Guardrails gate data-plane behaviour; refresh the cached keys.
     sync_tenant_keys(&state, id).await?;
     state
@@ -1756,6 +1779,7 @@ async fn put_quota(
 async fn create_key(
     State(state): State<AdminState>,
     Path(tenant_id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<CreateKey>,
 ) -> Result<Json<CreatedKey>> {
     // The reserved control-plane tenant is system-owned and not user-manageable.
@@ -1797,7 +1821,7 @@ async fn create_key(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "create_key",
             "api_key",
             &key.id.to_string(),
@@ -1857,6 +1881,7 @@ async fn get_control_plane_key(
 async fn update_key(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<UpdateKey>,
 ) -> Result<Json<ApiKey>> {
     let name = body.name.trim().to_string();
@@ -1889,7 +1914,7 @@ async fn update_key(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "update_key",
             "api_key",
             &id.to_string(),
@@ -1911,14 +1936,18 @@ async fn update_key(
     params(("id" = Uuid, Path, description = "API key id")),
     responses((status = 204), (status = 404))
 )]
-async fn delete_key(State(state): State<AdminState>, Path(id): Path<Uuid>) -> Result<StatusCode> {
+async fn delete_key(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode> {
     let hash = state.store.delete_key(id).await?;
     let _ = state.redis.delete_resolved_key(&hash).await;
     let _ = state.redis.publish_invalidation(&hash).await;
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "delete_key",
             "api_key",
             &id.to_string(),
@@ -1937,6 +1966,7 @@ async fn delete_key(State(state): State<AdminState>, Path(id): Path<Uuid>) -> Re
 async fn set_key_disabled(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<SetDisabled>,
 ) -> Result<StatusCode> {
     let (hash, resolved) = state.store.set_key_disabled(id, body.disabled).await?;
@@ -1944,7 +1974,7 @@ async fn set_key_disabled(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             if body.disabled {
                 "disable_key"
             } else {
@@ -1961,14 +1991,18 @@ async fn set_key_disabled(
 async fn set_key_tracing_handler(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<SetKeyTracing>,
 ) -> Result<StatusCode> {
-    let (hash, resolved) = state.store.set_key_tracing(id, body.tracing_enabled).await?;
+    let (hash, resolved) = state
+        .store
+        .set_key_tracing(id, body.tracing_enabled)
+        .await?;
     push_key(&state, &hash, &resolved).await?;
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             if body.tracing_enabled {
                 "enable_key_tracing"
             } else {
@@ -1987,7 +2021,10 @@ async fn set_tenant_tracing_handler(
     Path(id): Path<Uuid>,
     Json(body): Json<SetKeyTracing>,
 ) -> Result<StatusCode> {
-    state.store.set_tenant_tracing(id, body.tracing_enabled).await?;
+    state
+        .store
+        .set_tenant_tracing(id, body.tracing_enabled)
+        .await?;
     sync_tenant_keys(&state, id).await?;
     state
         .store
@@ -3299,7 +3336,10 @@ async fn set_provision_error(
     Path(id): Path<uuid::Uuid>,
     Json(body): Json<ProvisionErrorBody>,
 ) -> Result<Json<serde_json::Value>> {
-    state.store.set_provision_error(id, body.error.as_deref()).await?;
+    state
+        .store
+        .set_provision_error(id, body.error.as_deref())
+        .await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -3328,7 +3368,10 @@ async fn create_replica(
     Path(id): Path<Uuid>,
     Json(body): Json<CreateReplica>,
 ) -> Result<Json<ModelReplica>> {
-    let r = state.store.create_replica(id, &body.slurm_job_id, body.port_base).await?;
+    let r = state
+        .store
+        .create_replica(id, &body.slurm_job_id, body.port_base)
+        .await?;
     state
         .store
         .record_audit(
@@ -3437,7 +3480,8 @@ async fn delete_replica(
 #[utoipa::path(post, path = "/api/v1/models/{id}/replicas/clear-lost",
     responses((status = 200, body = serde_json::Value)))]
 pub async fn clear_lost_replicas(
-    State(state): State<AdminState>, Path(id): Path<Uuid>,
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
 ) -> Result<Json<serde_json::Value>> {
     let n = state.store.delete_lost_replicas(id).await?;
     Ok(Json(serde_json::json!({ "deleted": n })))

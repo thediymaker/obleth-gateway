@@ -1,8 +1,20 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 afterEach(() => vi.resetModules());
 
+function mockPortalUser() {
+  vi.doMock("@/lib/auth/roles", () => ({
+    requireUser: async () => ({
+      id: "user-A",
+      email: "user-a@example.com",
+      role: "user",
+      status: "active",
+      tenantId: "tenant-A",
+    }),
+  }));
+}
+
 it("deletePortalKey refuses a key that belongs to another tenant", async () => {
-  vi.doMock("@/lib/auth/roles", () => ({ requireTenant: async () => "tenant-A" }));
+  mockPortalUser();
   vi.doMock("@/lib/obleth", () => ({
     obleth: {
       listKeys: async (tid: string) => (tid === "tenant-A" ? [{ id: "k-A" }] : []),
@@ -17,7 +29,7 @@ it("deletePortalKey refuses a key that belongs to another tenant", async () => {
 
 it("deletePortalKey does NOT call obleth.deleteKey when ownership check fails", async () => {
   const deleteKeyMock = vi.fn();
-  vi.doMock("@/lib/auth/roles", () => ({ requireTenant: async () => "tenant-A" }));
+  mockPortalUser();
   vi.doMock("@/lib/obleth", () => ({
     obleth: {
       listKeys: async (tid: string) => (tid === "tenant-A" ? [{ id: "k-A" }] : []),
@@ -32,7 +44,7 @@ it("deletePortalKey does NOT call obleth.deleteKey when ownership check fails", 
 
 it("disablePortalKey refuses a key that belongs to another tenant", async () => {
   const setKeyDisabledMock = vi.fn();
-  vi.doMock("@/lib/auth/roles", () => ({ requireTenant: async () => "tenant-A" }));
+  mockPortalUser();
   vi.doMock("@/lib/obleth", () => ({
     obleth: {
       listKeys: async (tid: string) => (tid === "tenant-A" ? [{ id: "k-A" }] : []),
@@ -47,7 +59,7 @@ it("disablePortalKey refuses a key that belongs to another tenant", async () => 
 });
 
 it("deletePortalKey succeeds for an owned key", async () => {
-  vi.doMock("@/lib/auth/roles", () => ({ requireTenant: async () => "tenant-A" }));
+  mockPortalUser();
   vi.doMock("@/lib/obleth", () => ({
     obleth: {
       listKeys: async (tid: string) => (tid === "tenant-A" ? [{ id: "k-A" }] : []),
@@ -62,10 +74,11 @@ it("deletePortalKey succeeds for an owned key", async () => {
 });
 
 it("createPortalKey returns the secret on success", async () => {
-  vi.doMock("@/lib/auth/roles", () => ({ requireTenant: async () => "tenant-A" }));
+  const createKeyMock = vi.fn().mockResolvedValue({ key: { id: "k-new" }, secret: "sk-supersecret" });
+  mockPortalUser();
   vi.doMock("@/lib/obleth", () => ({
     obleth: {
-      createKey: vi.fn().mockResolvedValue({ key: { id: "k-new" }, secret: "sk-supersecret" }),
+      createKey: createKeyMock,
     },
   }));
   vi.doMock("next/cache", () => ({ revalidatePath: vi.fn() }));
@@ -74,10 +87,15 @@ it("createPortalKey returns the secret on success", async () => {
   const res = await createPortalKey(fd);
   expect(res.ok).toBe(true);
   if (res.ok) expect(res.secret).toBe("sk-supersecret");
+  expect(createKeyMock).toHaveBeenCalledWith(
+    "tenant-A",
+    { name: "My Key" },
+    { auditActor: "user-a@example.com" },
+  );
 });
 
 it("createPortalKey rejects a blank name", async () => {
-  vi.doMock("@/lib/auth/roles", () => ({ requireTenant: async () => "tenant-A" }));
+  mockPortalUser();
   vi.doMock("@/lib/obleth", () => ({ obleth: { createKey: vi.fn() } }));
   const { createPortalKey } = await import("./portal-actions");
   const fd = new FormData(); fd.set("name", "   ");

@@ -466,7 +466,7 @@ export async function setQuotaAction(formData: FormData) {
 export async function createKeyAction(
   formData: FormData,
 ): Promise<ActionResult & { secret?: string }> {
-  await requireAdmin();
+  const session = await requireAdmin();
   const parsed = keyCreateSchema.safeParse({
     tenant_id: formData.get("tenant_id"),
     name: formData.get("name"),
@@ -481,14 +481,18 @@ export async function createKeyAction(
   const hasBudget =
     data.budget_tokens != null || data.budget_cost_usd != null;
   try {
-    const created = await obleth.createKey(data.tenant_id, {
-      name: data.name,
-      description: data.description,
-      budget_tokens: data.budget_tokens ?? null,
-      budget_cost_usd: data.budget_cost_usd ?? null,
-      budget_period: hasBudget ? data.budget_period : null,
-      budget_started_at: hasBudget ? data.budget_started_at : null,
-    });
+    const created = await obleth.createKey(
+      data.tenant_id,
+      {
+        name: data.name,
+        description: data.description,
+        budget_tokens: data.budget_tokens ?? null,
+        budget_cost_usd: data.budget_cost_usd ?? null,
+        budget_period: hasBudget ? data.budget_period : null,
+        budget_started_at: hasBudget ? data.budget_started_at : null,
+      },
+      { auditActor: session.email },
+    );
     updateTag(CACHE_TAGS.keys);
     revalidatePath("/keys");
     return { ok: true, secret: created.secret };
@@ -500,7 +504,7 @@ export async function createKeyAction(
 export async function updateKeyAction(
   formData: FormData,
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   const parsed = keyUpdateSchema.safeParse({
     id: formData.get("id"),
     name: formData.get("name"),
@@ -515,14 +519,18 @@ export async function updateKeyAction(
   const hasBudget =
     data.budget_tokens != null || data.budget_cost_usd != null;
   try {
-    await obleth.updateKey(id, {
-      name: data.name,
-      description: data.description,
-      budget_tokens: data.budget_tokens ?? null,
-      budget_cost_usd: data.budget_cost_usd ?? null,
-      budget_period: hasBudget ? data.budget_period : null,
-      budget_started_at: hasBudget ? data.budget_started_at : null,
-    });
+    await obleth.updateKey(
+      id,
+      {
+        name: data.name,
+        description: data.description,
+        budget_tokens: data.budget_tokens ?? null,
+        budget_cost_usd: data.budget_cost_usd ?? null,
+        budget_period: hasBudget ? data.budget_period : null,
+        budget_started_at: hasBudget ? data.budget_started_at : null,
+      },
+      { auditActor: session.email },
+    );
   } catch (e) {
     return actionError(e);
   }
@@ -533,15 +541,15 @@ export async function updateKeyAction(
 }
 
 export async function toggleKeyAction(id: string, disabled: boolean) {
-  await requireAdmin();
-  await obleth.setKeyDisabled(id, disabled);
+  const session = await requireAdmin();
+  await obleth.setKeyDisabled(id, disabled, { auditActor: session.email });
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
 }
 
 export async function toggleKeyTracingAction(id: string, tracing_enabled: boolean) {
-  await requireAdmin();
-  await obleth.setKeyTracing(id, tracing_enabled);
+  const session = await requireAdmin();
+  await obleth.setKeyTracing(id, tracing_enabled, { auditActor: session.email });
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
 }
@@ -554,8 +562,8 @@ export async function toggleTenantTracingAction(id: string, tracing_enabled: boo
 }
 
 export async function deleteKeyAction(id: string) {
-  await requireAdmin();
-  await obleth.deleteKey(id);
+  const session = await requireAdmin();
+  await obleth.deleteKey(id, { auditActor: session.email });
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
   revalidatePath("/");
@@ -564,9 +572,9 @@ export async function deleteKeyAction(id: string) {
 export async function deleteKeysAction(
   ids: string[],
 ): Promise<{ deleted: number; failed: number }> {
-  await requireAdmin();
+  const session = await requireAdmin();
   const uniqueIds = [...new Set(ids.map((id) => String(id)).filter(Boolean))];
-  const result = await deleteKeys(uniqueIds);
+  const result = await deleteKeys(uniqueIds, session.email);
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
   revalidatePath("/");
@@ -579,7 +587,7 @@ export async function deleteFilteredKeysAction(filters: {
   status?: "all" | "active" | "disabled";
   budget?: "all" | "budgeted" | "unlimited";
 }): Promise<{ deleted: number; failed: number; matched: number }> {
-  await requireAdmin();
+  const session = await requireAdmin();
   const query = String(filters.query ?? "")
     .trim()
     .toLowerCase();
@@ -616,7 +624,7 @@ export async function deleteFilteredKeysAction(filters: {
     );
   });
 
-  const result = await deleteKeys(matched.map((key) => key.id));
+  const result = await deleteKeys(matched.map((key) => key.id), session.email);
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
   revalidatePath("/");
@@ -1383,6 +1391,7 @@ export async function testAlertAction(): Promise<
 
 async function deleteKeys(
   ids: string[],
+  auditActor: string,
 ): Promise<{ deleted: number; failed: number }> {
   let deleted = 0;
   let failed = 0;
@@ -1390,7 +1399,7 @@ async function deleteKeys(
   for (let i = 0; i < ids.length; i += chunkSize) {
     const chunk = ids.slice(i, i + chunkSize);
     const results = await Promise.allSettled(
-      chunk.map((id) => obleth.deleteKey(id)),
+      chunk.map((id) => obleth.deleteKey(id, { auditActor })),
     );
     for (const result of results) {
       if (result.status === "fulfilled") deleted += 1;
