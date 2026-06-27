@@ -15,6 +15,43 @@ via `--set`, a local untracked file, or a secrets manager.
 
 Full value reference: [obleth.com — Helm Values](https://obleth.com/docs/reference/helm-values).
 
+## Upgrading an existing release
+
+To apply chart or values changes to a release that already exists, use `helm
+upgrade --install` — **not** `helm install`. A plain `helm install` against a
+live release fails with `cannot re-use a name that is still in use`.
+
+```bash
+helm upgrade --install obleth deploy/k8s/obleth \
+  --namespace obleth \
+  -f my-values.yaml \
+  --wait
+```
+
+Point it at the **same chart source you installed from**. The command above uses
+the local chart path; to track a published release instead, use the OCI chart
+pinned to a version:
+
+```bash
+helm upgrade --install obleth oci://ghcr.io/thediymaker/charts/obleth \
+  --version 0.5.0 \
+  --namespace obleth \
+  -f my-values.yaml \
+  --wait
+```
+
+The two sources are not interchangeable: editing the chart's own
+`deploy/k8s/obleth/values.yaml` only changes the **local** path — the OCI
+artifact carries the values published with that version. Keep per-deployment
+settings in your own `-f` values file so they apply regardless of source.
+`--wait` blocks until the rolled resources report Ready.
+
+> Values that render into the obleth Secret (`adminToken`, the database URL,
+> `clickhouse.password`, `encryptionKey`, `apiKeyPepper`) update the Secret but
+> do **not** restart running pods on their own. After changing one, force a
+> rollout: `kubectl rollout restart deployment/obleth -n obleth` (and
+> `deployment/obleth-control-plane` if its `DATABASE_URL` changed).
+
 ## Pick a storage scenario
 
 The bundled Postgres, Redis, and ClickHouse support three storage models. Ready-
