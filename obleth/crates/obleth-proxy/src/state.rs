@@ -50,4 +50,6 @@ pub struct AppState {
     pub metrics: Arc<Metrics>,
     pub fail_open: bool,
     pub alerts: obleth_admin::AlertDispatcher,
+    /// When false, never derive a conversation id from content (client ids only).
+    pub session_id_derivation: bool,
 }

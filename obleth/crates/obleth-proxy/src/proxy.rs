@@ -63,7 +63,11 @@ pub async fn proxy_handler(state: State<AppState>, req: Request<Body>) -> Respon
     resp
 }
 
-#[tracing::instrument(skip_all, name = "proxy_request")]
+#[tracing::instrument(
+    skip_all,
+    name = "proxy_request",
+    fields(session.id = tracing::field::Empty, session.id.source = tracing::field::Empty)
+)]
 async fn proxy_handler_inner(
     State(state): State<AppState>,
     req: Request<Body>,
@@ -197,10 +201,16 @@ async fn proxy_handler_inner(
     // Request-log metadata, captured once so every `finalize` path (cache hit,
     // rejection, upstream error, streamed success) records the same session and
     // request class.
+    let conversation = resolve_conversation(&headers, &json, resolved.tenant_id, state.session_id_derivation);
     let req_meta = RequestMeta {
-        session_id: extract_session_id(&headers, &json),
+        session_id: conversation.value,
+        session_id_source: conversation.source.as_str(),
         request_type: request_type_for_path(&path),
     };
+    // Surface the conversation id on the OTLP/Jaeger root span for cross-request
+    // grouping (the field is declared Empty on the #[instrument] below).
+    tracing::Span::current().record("session.id", req_meta.session_id.as_str());
+    tracing::Span::current().record("session.id.source", req_meta.session_id_source);
 
     // Cost estimate, computed once per request body. Re-estimated below only
     // when a boon actually rewrites the body; the later upstream model-name
@@ -2425,8 +2435,10 @@ fn find_int_after(haystack: &str, key: &str) -> Option<u32> {
 /// streamed success). Cheap to clone for the response-stream closure.
 #[derive(Clone)]
 struct RequestMeta {
-    /// Client-supplied session id grouping related requests, or empty.
+    /// Conversation grouping id (client-supplied or derived), or empty.
     session_id: String,
+    /// How `session_id` was obtained: "client" | "derived" | "none".
+    session_id_source: &'static str,
     /// Coarse request class derived from the request path.
     request_type: &'static str,
 }
@@ -2592,10 +2604,6 @@ fn fnv1a_continue(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Thin shim for existing callers until Task 2 migrates them to `resolve_conversation`.
-fn extract_session_id(headers: &HeaderMap, json: &serde_json::Value) -> String {
-    resolve_conversation(headers, json, Uuid::nil(), false).value
-}
 
 #[allow(clippy::too_many_arguments)]
 fn finalize(
@@ -3254,5 +3262,24 @@ mod tests {
         let c = resolve_conversation(&HeaderMap::new(), &json, Uuid::nil(), true);
         assert_eq!(c.source.as_str(), "derived");
         assert_eq!(c.value.len(), 16);
+    }
+
+    #[test]
+    fn session_hash_sticks_and_repins_when_endpoint_removed() {
+        // Two endpoints; a fixed key picks one deterministically.
+        let m_all = model_with(vec![endpoint("a", "http://a/v1", 100, 100, true, true), endpoint("b", "http://b/v1", 100, 100, true, true)]);
+        let key = "deadbeefdeadbeef";
+        let first = build_targets(Some(&m_all), "http://global/v1", "session_hash", key);
+        let again = build_targets(Some(&m_all), "http://global/v1", "session_hash", key);
+        assert_eq!(first[0].base, again[0].base, "same key -> same primary");
+
+        // Remove whichever endpoint was primary; the survivor must take over.
+        let primary = first[0].base.clone();
+        let survivors: Vec<_> = vec![endpoint("a", "http://a/v1", 100, 100, true, true), endpoint("b", "http://b/v1", 100, 100, true, true)]
+            .into_iter().filter(|e| e.api_base != primary).collect();
+        let m_one = model_with(survivors);
+        let after = build_targets(Some(&m_one), "http://global/v1", "session_hash", key);
+        assert_eq!(after.len(), 1);
+        assert_ne!(after[0].base, primary, "re-pinned to the survivor");
     }
 }
