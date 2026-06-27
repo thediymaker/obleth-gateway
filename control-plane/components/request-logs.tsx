@@ -563,19 +563,16 @@ export function SessionCell({ entry }: { entry: Pick<UsageLogEntry, "session_id"
   if (!entry.session_id) {
     return <span className="text-muted-foreground/50">--</span>;
   }
-  const isClient = entry.session_id_source === "client";
+  const source = entry.session_id_source;
   return (
     <span className="inline-flex items-center gap-1">
-      <span className="font-mono text-[11px]">{truncateId(entry.session_id)}</span>
-      <Badge
-        className={
-          isClient
-            ? "border-primary/40 bg-primary/10 text-primary"
-            : "border-border bg-muted/60 text-muted-foreground"
-        }
-      >
-        {isClient ? "client" : "derived"}
-      </Badge>
+      <span className="font-mono text-[11px]" title={entry.session_id}>{truncateId(entry.session_id)}</span>
+      {source === "client" && (
+        <Badge className="border-primary/40 bg-primary/10 text-primary">client</Badge>
+      )}
+      {source === "derived" && (
+        <Badge className="border-border bg-muted/60 text-muted-foreground">derived</Badge>
+      )}
     </span>
   );
 }
