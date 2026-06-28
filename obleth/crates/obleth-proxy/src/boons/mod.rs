@@ -46,6 +46,18 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
+/// Phase A gating: the model was granted the boon AND it is globally active AND
+/// this is a chat completion. (Per-tenant policy gating arrives in Phase B.)
+fn compression_eligible(
+    route: &obleth_config::ResolvedModel,
+    settings: &obleth_config::BoonSettings,
+    is_chat: bool,
+) -> bool {
+    is_chat
+        && settings.compression.active()
+        && route.boons.iter().any(|b| b == "compression")
+}
+
 /// Request header that disables boon processing for a single request when set
 /// to `off`. Also returned on responses listing the boons that were applied.
 pub const BOONS_HEADER: &str = "x-obleth-boons";
@@ -188,6 +200,34 @@ impl BoonEngine {
         if !is_chat {
             return outcome;
         }
+
+        // ---- compression boon (lossless, Phase A) ----
+        if compression_eligible(route, &settings, is_chat) {
+            let comp_start = crate::tracer::now_ms();
+            let stats = compression::apply(&settings.compression, json);
+            if stats.compressed > 0 {
+                outcome.rewritten = true;
+                outcome.applied.push("compression");
+                state
+                    .metrics
+                    .record_compression_saved(stats.tokens_before.saturating_sub(stats.tokens_after));
+            }
+            if let Some(t) = tracer.as_deref_mut() {
+                t.record_elapsed(
+                    "boon:compression",
+                    "proxy_request",
+                    comp_start,
+                    "ok",
+                    serde_json::json!({
+                        "scanned": stats.scanned,
+                        "compressed": stats.compressed,
+                        "tokens_before": stats.tokens_before,
+                        "tokens_after": stats.tokens_after,
+                    }),
+                );
+            }
+        }
+
         // Capture the client's streaming intent before any rewrite; the proxy
         // forces `stream: false` upstream when a response plan is armed.
         let client_stream = json
@@ -490,6 +530,58 @@ pub(crate) fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_route() -> obleth_config::ResolvedModel {
+        obleth_config::ResolvedModel {
+            model_name: "test".to_string(),
+            upstream_model: "test".to_string(),
+            api_base: "http://localhost".to_string(),
+            api_key: None,
+            model_type: "chat".to_string(),
+            admission_weight: 1,
+            max_in_flight: None,
+            enabled: true,
+            cache_enabled: false,
+            cache_ttl_secs: 0,
+            input_cost_per_token: 0.0,
+            output_cost_per_token: 0.0,
+            cost_per_image: 0.0,
+            cost_per_audio_second: 0.0,
+            cost_per_character: 0.0,
+            context_window: 0,
+            supports_function_calling: false,
+            supports_system_messages: false,
+            supports_response_schema: false,
+            supports_tool_choice: false,
+            supports_vision: false,
+            tags: vec![],
+            boons: vec![],
+            tool_servers: vec![],
+            request_timeout_secs: None,
+            max_retries: 0,
+            retry_backoff_ms: 200,
+            endpoint_selection_mode: "failover".to_string(),
+            debug_diagnostics: false,
+            endpoints: vec![],
+        }
+    }
+
+    #[test]
+    fn compression_eligible_requires_grant_active_and_chat() {
+        use obleth_config::{BoonSettings, CompressionBoonSettings};
+        let mut settings = BoonSettings::default();
+        settings.compression = CompressionBoonSettings { enabled: true, ..Default::default() };
+
+        let mut route = test_route(); // helper that builds a minimal ResolvedModel
+        route.boons = vec!["compression".to_string()];
+        assert!(compression_eligible(&route, &settings, true));
+
+        // Not chat -> ineligible.
+        assert!(!compression_eligible(&route, &settings, false));
+        // No grant -> ineligible.
+        route.boons.clear();
+        assert!(!compression_eligible(&route, &settings, true));
+    }
 
     #[test]
     fn chat_url_is_normalised() {
