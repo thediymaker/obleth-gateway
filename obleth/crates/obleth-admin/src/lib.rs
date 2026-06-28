@@ -654,6 +654,8 @@ pub struct SetModelReliability {
     pub retry_backoff_ms: i64,
     #[serde(default = "default_selection_mode_dto")]
     pub endpoint_selection_mode: String,
+    #[serde(default)]
+    pub debug_diagnostics: bool,
 }
 
 fn default_retry_backoff_ms_dto() -> i64 {
@@ -3095,6 +3097,7 @@ async fn set_model_reliability(
             body.max_retries,
             body.retry_backoff_ms,
             &body.endpoint_selection_mode,
+            body.debug_diagnostics,
         )
         .await?;
     sync_model(&state, &model).await?;
@@ -3776,6 +3779,7 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         max_retries: model.max_retries,
         retry_backoff_ms: model.retry_backoff_ms,
         endpoint_selection_mode: model.endpoint_selection_mode.clone(),
+        debug_diagnostics: model.debug_diagnostics,
         endpoints,
     };
     if model.enabled {
