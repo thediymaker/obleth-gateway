@@ -4,6 +4,11 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.5.3
+The model page now shows the timeout and retry settings you actually saved.
+
+- **Fixed: the Delivery settings — request timeout, max retries, retry backoff, and endpoint selection — appeared to snap back to defaults after saving.** The values were always stored and applied by the gateway; only the model page was wrong, because it re-read those fields through queries that didn't select them and so always redisplayed defaults. The dashboard now shows the saved values (no action needed — any settings you'd previously "lost" have been in effect all along).
+
 ## v0.5.2
 A redesigned audit log that records who made each change, steadier upstream connections, and provisioner build visibility.
 
