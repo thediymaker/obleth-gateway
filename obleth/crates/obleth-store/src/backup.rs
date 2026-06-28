@@ -673,20 +673,24 @@ mod tests {
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` points at a
     /// throwaway Postgres. Skips silently otherwise so unit runs stay hermetic.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn backup_export_restore_roundtrip() {
+        use crate::test_support::FixtureGuard;
+
         let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
 
         let name = format!("t-{}", uuid::Uuid::new_v4());
         let tenant = store
             .create_tenant(&name, 250, 1000, Some(4), None)
             .await
             .expect("create tenant");
+        fixtures.track_tenant(tenant.id);
         let (key, secret) = store
             .create_api_key(tenant.id, "backup-test", "", None, None, None, None)
             .await
@@ -731,8 +735,5 @@ mod tests {
             .expect("resolve")
             .expect("present");
         assert_eq!(resolved.tenant_id, tenant.id);
-
-        // Clean up: cascade-deletes the API key and clears the resolved-key cache.
-        store.delete_tenant(tenant.id).await.expect("delete tenant");
     }
 }

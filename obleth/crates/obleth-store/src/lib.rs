@@ -3002,43 +3002,47 @@ fn model_health_claim_from_row(row: &PgRow) -> Result<ModelHealthClaim> {
     })
 }
 
+/// Shared integration-test plumbing, available to every test module in the
+/// crate (`lib.rs` `tests` and `backup.rs` `tests`).
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
-    use obleth_config::hash_api_key;
-    use std::sync::OnceLock;
-
-    // Serialise integration tests so DDL from migrate() never races with DML
-    // from a concurrently running test. Each test must hold this guard for its
-    // full duration (including the migrate() call).
-    static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    fn serial() -> &'static tokio::sync::Mutex<()> {
-        SERIAL.get_or_init(tokio::sync::Mutex::default)
-    }
 
     /// Tracks the fixture rows a test creates and deletes them when it drops —
     /// which happens even if the test panics on a failed assertion — so leaked
-    /// `m-…`/`t-…` rows never persist in the target database. Deleting a model
-    /// cascades to its health checks/endpoints/managed row, and deleting a
-    /// tenant cascades to its keys, so model + tenant ids are enough.
+    /// `m-…`/`t-…` rows (and the replica rows they leave behind) never persist
+    /// in the target database. Deleting a model cascades to its health
+    /// checks/endpoints/managed row, and deleting a tenant cascades to its
+    /// keys, so model + tenant ids are enough for those. Replica rows do NOT
+    /// cascade from a model delete (the provisioner needs orphan rows to drain
+    /// Slurm jobs), so they are tracked and deleted separately.
     ///
     /// Cleanup runs async DB deletes from `Drop`, which requires the test to use
     /// the multi-thread runtime flavor (so `block_in_place` is permitted).
-    struct FixtureGuard {
+    pub(crate) struct FixtureGuard {
         store: Store,
         models: Vec<Uuid>,
         tenants: Vec<Uuid>,
+        replicas: Vec<Uuid>,
     }
 
     impl FixtureGuard {
-        fn new(store: &Store) -> Self {
-            Self { store: store.clone(), models: Vec::new(), tenants: Vec::new() }
+        pub(crate) fn new(store: &Store) -> Self {
+            Self {
+                store: store.clone(),
+                models: Vec::new(),
+                tenants: Vec::new(),
+                replicas: Vec::new(),
+            }
         }
-        fn track_model(&mut self, id: Uuid) {
+        pub(crate) fn track_model(&mut self, id: Uuid) {
             self.models.push(id);
         }
-        fn track_tenant(&mut self, id: Uuid) {
+        pub(crate) fn track_tenant(&mut self, id: Uuid) {
             self.tenants.push(id);
+        }
+        pub(crate) fn track_replica(&mut self, id: Uuid) {
+            self.replicas.push(id);
         }
     }
 
@@ -3047,12 +3051,14 @@ mod tests {
             let store = self.store.clone();
             let models = std::mem::take(&mut self.models);
             let tenants = std::mem::take(&mut self.tenants);
-            if models.is_empty() && tenants.is_empty() {
+            let replicas = std::mem::take(&mut self.replicas);
+            if models.is_empty() && tenants.is_empty() && replicas.is_empty() {
                 return;
             }
             // Deletes are best-effort: a row a test already removed returns
-            // NotFound, which we ignore. block_in_place needs the multi-thread
-            // flavor on the test.
+            // NotFound, which we ignore. Replica order vs models is irrelevant
+            // since the model_replicas FK was dropped. block_in_place needs the
+            // multi-thread flavor on the test.
             tokio::task::block_in_place(|| {
                 tokio::runtime::Handle::current().block_on(async {
                     for id in models {
@@ -3061,9 +3067,29 @@ mod tests {
                     for id in tenants {
                         let _ = store.delete_tenant(id).await;
                     }
+                    for id in replicas {
+                        let _ = store.delete_replica(id).await;
+                    }
                 });
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use obleth_config::hash_api_key;
+    use std::sync::OnceLock;
+
+    use super::test_support::FixtureGuard;
+
+    // Serialise integration tests so DDL from migrate() never races with DML
+    // from a concurrently running test. Each test must hold this guard for its
+    // full duration (including the migrate() call).
+    static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    fn serial() -> &'static tokio::sync::Mutex<()> {
+        SERIAL.get_or_init(tokio::sync::Mutex::default)
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` points at a
@@ -3839,6 +3865,7 @@ mod tests {
             .create_replica(model.id, "job-123", None)
             .await
             .expect("create replica");
+        fixtures.track_replica(r.id);
         assert_eq!(r.state, "pending");
         assert_eq!(r.slurm_job_id, "job-123");
 
@@ -4030,10 +4057,12 @@ mod tests {
             .create_replica(model.id, "job-loss-1", None)
             .await
             .expect("create replica 1");
+        fixtures.track_replica(r1.id);
         let r2 = store
             .create_replica(model.id, "job-loss-2", None)
             .await
             .expect("create replica 2");
+        fixtures.track_replica(r2.id);
 
         // Mark one as lost.
         store
@@ -4083,6 +4112,7 @@ mod tests {
             .create_replica(model.id, "job-msg-1", None)
             .await
             .expect("create replica");
+        fixtures.track_replica(replica.id);
 
         // A message-only update must persist without touching state.
         let updated = store
@@ -4151,6 +4181,7 @@ mod tests {
             .create_replica(model.id, "slurm-job-12345", Some(8000))
             .await
             .expect("create replica");
+        fixtures.track_replica(replica.id);
 
         // Hard-delete the model. Before the cascade was dropped this also deleted
         // the replica row; now the row must survive.
