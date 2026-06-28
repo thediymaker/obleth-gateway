@@ -2,7 +2,7 @@
 "use client";
 
 import { useMemo, useState, useTransition } from "react";
-import { Check, Search } from "lucide-react";
+import { Search } from "lucide-react";
 import {
   importModelsAction,
   listUpstreamModelsAction,
