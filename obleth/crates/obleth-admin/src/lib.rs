@@ -1470,6 +1470,9 @@ pub struct BoonSettingsView {
     pub tool_loop_max_turns: u32,
     pub tool_loop_tool_timeout_ms: u64,
     pub tool_loop_nudge: String,
+    pub compression_enabled: bool,
+    pub compression_min_tokens: u32,
+    pub compression_max_segments: u32,
 }
 
 impl BoonSettingsView {
@@ -1488,6 +1491,9 @@ impl BoonSettingsView {
             tool_loop_max_turns: s.tool_loop.max_turns,
             tool_loop_tool_timeout_ms: s.tool_loop.tool_timeout_ms,
             tool_loop_nudge: s.tool_loop.nudge.clone(),
+            compression_enabled: s.compression.enabled,
+            compression_min_tokens: s.compression.min_tokens,
+            compression_max_segments: s.compression.max_segments,
         }
     }
 }
@@ -1525,6 +1531,12 @@ pub struct UpdateBoonSettings {
     /// built-in default; omit the field to leave it unchanged.
     #[serde(default)]
     pub tool_loop_nudge: Option<String>,
+    #[serde(default)]
+    pub compression_enabled: Option<bool>,
+    #[serde(default)]
+    pub compression_min_tokens: Option<u32>,
+    #[serde(default)]
+    pub compression_max_segments: Option<u32>,
 }
 
 #[utoipa::path(
@@ -1611,7 +1623,17 @@ async fn put_boon_settings(
             },
         },
         guardrails: existing.guardrails.clone(),
-        compression: existing.compression.clone(),
+        compression: obleth_config::CompressionBoonSettings {
+            enabled: body.compression_enabled.unwrap_or(existing.compression.enabled),
+            min_tokens: body
+                .compression_min_tokens
+                .filter(|n| *n > 0)
+                .unwrap_or(existing.compression.min_tokens),
+            max_segments: body
+                .compression_max_segments
+                .filter(|n| *n > 0)
+                .unwrap_or(existing.compression.max_segments),
+        },
     };
 
     state.store.put_boon_settings(&settings).await?;
@@ -3826,4 +3848,20 @@ async fn sync_tenant_keys(state: &AdminState, tenant_id: Uuid) -> Result<()> {
         push_key(state, &hash, &resolved).await?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn boon_view_round_trips_compression() {
+        use obleth_config::{BoonSettings, CompressionBoonSettings};
+        let mut s = BoonSettings::default();
+        s.compression = CompressionBoonSettings { enabled: true, min_tokens: 256, max_segments: 8 };
+        let view = BoonSettingsView::from_settings(&s);
+        assert!(view.compression_enabled);
+        assert_eq!(view.compression_min_tokens, 256);
+        assert_eq!(view.compression_max_segments, 8);
+    }
 }
