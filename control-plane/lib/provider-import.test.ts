@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseUpstreamModelList, normalizeBase, classifyDiscovered } from "./provider-import";
+import { parseUpstreamModelList, normalizeBase, classifyDiscovered, buildImportPayload, type BatchDefaults, type RowState } from "./provider-import";
 
 describe("parseUpstreamModelList", () => {
   it("reads the OpenAI list shape", () => {
@@ -72,5 +72,60 @@ describe("classifyDiscovered", () => {
       ownedBy: undefined,
       status: "new",
     });
+  });
+});
+
+const DEFAULTS: BatchDefaults = {
+  model_type: "chat",
+  context_window: 8192,
+  input_cost_per_token: 0,
+  enabled: true,
+};
+
+function row(over: Partial<RowState> = {}): RowState {
+  return { id: "gpt-4o", modelName: "gpt-4o", included: true, overrides: {}, ...over };
+}
+
+describe("buildImportPayload", () => {
+  it("excludes unselected rows", () => {
+    const out = buildImportPayload([row({ included: false })], "https://x/v1", undefined, DEFAULTS);
+    expect(out.models).toEqual([]);
+  });
+
+  it("wires base, upstream id, key, and batch defaults", () => {
+    const out = buildImportPayload([row()], "https://x/v1/", "sk-1", DEFAULTS);
+    expect(out.models[0]).toMatchObject({
+      model_name: "gpt-4o",
+      upstream_model: "gpt-4o",
+      api_base: "https://x/v1",
+      api_key: "sk-1",
+      model_type: "chat",
+      context_window: 8192,
+      enabled: true,
+    });
+  });
+
+  it("omits api_key when none is given", () => {
+    const out = buildImportPayload([row()], "https://x/v1", undefined, DEFAULTS);
+    expect(out.models[0]).not.toHaveProperty("api_key");
+  });
+
+  it("lets a per-row override win over the batch default", () => {
+    const out = buildImportPayload(
+      [row({ overrides: { model_type: "embedding", context_window: 512 } })],
+      "https://x/v1",
+      undefined,
+      DEFAULTS,
+    );
+    expect(out.models[0]).toMatchObject({ model_type: "embedding", context_window: 512 });
+  });
+
+  it("emits the three fields the importer requires for every row", () => {
+    const out = buildImportPayload([row()], "https://x/v1", undefined, DEFAULTS);
+    for (const m of out.models) {
+      expect(m.model_name).toBeTruthy();
+      expect(m.upstream_model).toBeTruthy();
+      expect(m.api_base).toBeTruthy();
+    }
   });
 });

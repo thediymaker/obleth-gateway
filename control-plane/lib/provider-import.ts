@@ -67,3 +67,67 @@ export function classifyDiscovered(
     return { id: m.id, modelName, ownedBy: m.owned_by, status: exists ? "existing" : "new" };
   });
 }
+
+export interface BatchDefaults {
+  model_type: string;
+  context_window?: number;
+  input_cost_per_token?: number;
+  output_cost_per_token?: number;
+  cost_per_image?: number;
+  cost_per_audio_second?: number;
+  cost_per_character?: number;
+  admission_weight?: number;
+  tags?: string[];
+  enabled: boolean;
+  description?: string;
+}
+
+export interface RowState {
+  id: string;
+  modelName: string;
+  included: boolean;
+  overrides: Partial<BatchDefaults>;
+}
+
+function stripUndefined<T extends object>(obj: T): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(obj).filter(([, v]) => v !== undefined),
+  ) as Partial<T>;
+}
+
+// Merges batch defaults with per-row overrides for each included row, producing
+// entries shaped exactly like the obleth models template (field names that
+// `toImportInput` in app/actions.ts already coerces). Serializes to JSON and
+// flows through the existing planModelImportAction / importModelsAction path.
+export function buildImportPayload(
+  rows: RowState[],
+  base: string,
+  apiKey: string | undefined,
+  defaults: BatchDefaults,
+): { models: Record<string, unknown>[] } {
+  const normBase = normalizeBase(base);
+  const models = rows
+    .filter((r) => r.included)
+    .map((r) => {
+      const merged = { ...defaults, ...stripUndefined(r.overrides) };
+      const entry: Record<string, unknown> = {
+        model_name: r.modelName,
+        upstream_model: r.id,
+        api_base: normBase,
+        model_type: merged.model_type,
+        enabled: merged.enabled,
+      };
+      if (apiKey) entry.api_key = apiKey;
+      if (merged.description) entry.description = merged.description;
+      if (merged.context_window != null) entry.context_window = merged.context_window;
+      if (merged.input_cost_per_token != null) entry.input_cost_per_token = merged.input_cost_per_token;
+      if (merged.output_cost_per_token != null) entry.output_cost_per_token = merged.output_cost_per_token;
+      if (merged.cost_per_image != null) entry.cost_per_image = merged.cost_per_image;
+      if (merged.cost_per_audio_second != null) entry.cost_per_audio_second = merged.cost_per_audio_second;
+      if (merged.cost_per_character != null) entry.cost_per_character = merged.cost_per_character;
+      if (merged.admission_weight != null) entry.admission_weight = merged.admission_weight;
+      if (merged.tags && merged.tags.length > 0) entry.tags = merged.tags;
+      return entry;
+    });
+  return { models };
+}
