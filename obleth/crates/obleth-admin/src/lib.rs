@@ -1611,6 +1611,7 @@ async fn put_boon_settings(
             },
         },
         guardrails: existing.guardrails.clone(),
+        compression: existing.compression.clone(),
     };
 
     state.store.put_boon_settings(&settings).await?;

@@ -25,6 +25,7 @@
 //! an [`ArcSwap`] that the periodic model-registry refresh task updates, exactly
 //! like [`crate::classifier::Classifier`].
 
+pub(crate) mod compression;
 pub(crate) mod guardrails;
 pub mod mcp_tools;
 pub mod respond;
