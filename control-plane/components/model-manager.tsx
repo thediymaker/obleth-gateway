@@ -92,6 +92,7 @@ import {
 import type { AutotuneReport, AutotuneWorkload, CacheStats, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelReplica, ModelRoute } from "@/lib/obleth";
 import { providerForModel } from "@/lib/model-providers";
 import { normalizeModelApiNameDraft, normalizeModelApiNameFinal } from "@/lib/model-name";
+import { ProviderImportWizard } from "@/components/provider-import-wizard";
 import { RecipeList } from "@/components/recipes/recipe-list";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
 import { cn, formatNumber } from "@/lib/utils";
@@ -214,6 +215,7 @@ export function ModelManager({
   const flashSaved = (id: string) =>
     setSaveFlash((prev) => ({ id, n: prev?.id === id ? prev.n + 1 : 1 }));
   const [createWizardOpen, setCreateWizardOpen] = useState(false);
+  const [providerImportOpen, setProviderImportOpen] = useState(false);
   const [showBenchmarkRoutes, setShowBenchmarkRoutes] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
@@ -335,6 +337,9 @@ export function ModelManager({
           onSubmit={submitModel}
         />
       )}
+      {providerImportOpen && (
+        <ProviderImportWizard models={models} onClose={() => setProviderImportOpen(false)} />
+      )}
 
       <Card>
         <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -361,6 +366,16 @@ export function ModelManager({
             <Button type="button" size="sm" variant="outline" disabled={pending} onClick={() => importInputRef.current?.click()}>
               <Upload className="h-3.5 w-3.5" />
               Import
+            </Button>
+            <Button
+              type="button"
+              size="sm"
+              variant="outline"
+              disabled={pending}
+              onClick={() => setProviderImportOpen((v) => !v)}
+            >
+              <Download className="h-3.5 w-3.5" />
+              From provider
             </Button>
             <Button type="button" size="sm" variant="outline" disabled={models.length === 0} onClick={exportModels}>
               <Download className="h-3.5 w-3.5" />
@@ -2631,7 +2646,7 @@ function toExportShape(model: ModelRoute) {
   };
 }
 
-function ImportPreview({
+export function ImportPreview({
   plan,
   pending,
   onConfirm,
@@ -2699,7 +2714,7 @@ function ImportPreview({
   );
 }
 
-function ImportResultBanner({
+export function ImportResultBanner({
   result,
   onDismiss,
 }: {
