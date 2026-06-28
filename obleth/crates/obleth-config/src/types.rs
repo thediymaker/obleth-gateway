@@ -1068,6 +1068,10 @@ pub struct BoonSettings {
     /// and an optional registered guard model.
     #[serde(default)]
     pub guardrails: GuardrailsBoonSettings,
+    /// The compression boon: losslessly compact (and, in later phases,
+    /// semantically compress) what the model reads before dispatch.
+    #[serde(default)]
+    pub compression: CompressionBoonSettings,
 }
 
 /// Configuration for the vision boon (image-to-text relay).
@@ -1255,6 +1259,42 @@ impl Default for GuardrailsBoonSettings {
         Self {
             timeout_ms: default_guardrails_timeout_ms(),
         }
+    }
+}
+
+fn default_compression_min_tokens() -> u32 { 512 }
+fn default_compression_max_segments() -> u32 { 64 }
+
+/// Configuration for the compression boon (Phase A: lossless structural
+/// compaction only).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CompressionBoonSettings {
+    /// Master switch. When false, requests pass through unchanged.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Skip any message segment whose estimated token count is below this
+    /// floor (overhead would exceed savings).
+    #[serde(default = "default_compression_min_tokens")]
+    pub min_tokens: u32,
+    /// Cap on how many segments are compacted per request (safety guard).
+    #[serde(default = "default_compression_max_segments")]
+    pub max_segments: u32,
+}
+
+impl Default for CompressionBoonSettings {
+    fn default() -> Self {
+        CompressionBoonSettings {
+            enabled: false,
+            min_tokens: default_compression_min_tokens(),
+            max_segments: default_compression_max_segments(),
+        }
+    }
+}
+
+impl CompressionBoonSettings {
+    /// True when the boon is enabled. (Lossless compaction needs no helper.)
+    pub fn active(&self) -> bool {
+        self.enabled
     }
 }
 
@@ -1647,5 +1687,34 @@ mod tests {
         let json = serde_json::to_string(&policy).unwrap();
         let back: GuardrailsPolicy = serde_json::from_str(&json).unwrap();
         assert_eq!(policy, back);
+    }
+
+    #[test]
+    fn compression_settings_default_is_disabled() {
+        let c = CompressionBoonSettings::default();
+        assert!(!c.enabled);
+        assert!(!c.active());
+        assert_eq!(c.min_tokens, 512);
+        assert_eq!(c.max_segments, 64);
+    }
+
+    #[test]
+    fn compression_settings_active_when_enabled() {
+        let c = CompressionBoonSettings { enabled: true, ..Default::default() };
+        assert!(c.active());
+    }
+
+    #[test]
+    fn boon_settings_default_has_compression() {
+        let b = BoonSettings::default();
+        assert!(!b.compression.active());
+    }
+
+    #[test]
+    fn compression_settings_deserialize_with_missing_fields() {
+        // All fields are #[serde(default)] so an empty object must work.
+        let c: CompressionBoonSettings = serde_json::from_str("{}").unwrap();
+        assert!(!c.enabled);
+        assert_eq!(c.min_tokens, 512);
     }
 }
