@@ -1014,6 +1014,7 @@ impl Store {
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
+                    request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
                     created_at, updated_at
              from models order by model_name",
         )
@@ -1031,6 +1032,7 @@ impl Store {
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
+                    request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
                     created_at, updated_at
              from models where id = $1",
         )
@@ -1050,6 +1052,7 @@ impl Store {
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
+                    request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
                     created_at, updated_at
              from models where model_name = $1",
         )
@@ -3182,6 +3185,29 @@ mod tests {
             resolved_model.endpoints[0].api_base,
             "http://127.0.0.1:8082"
         );
+
+        // Reliability settings must survive the admin read paths: the write
+        // persists them, but `list_models`/`get_model` historically omitted these
+        // columns from their SELECT, so the control plane always re-displayed
+        // defaults. Guard every admin read that feeds the UI.
+        store
+            .update_model_reliability(model.id, Some(600), 3, 300, "load_balance")
+            .await
+            .expect("update reliability");
+        let fetched = store.get_model(model.id).await.expect("get_model");
+        assert_eq!(fetched.request_timeout_secs, Some(600));
+        assert_eq!(fetched.max_retries, 3);
+        assert_eq!(fetched.retry_backoff_ms, 300);
+        assert_eq!(fetched.endpoint_selection_mode, "load_balance");
+        let listed = store.list_models().await.expect("list_models");
+        let listed_model = listed
+            .iter()
+            .find(|m| m.id == model.id)
+            .expect("model listed");
+        assert_eq!(listed_model.request_timeout_secs, Some(600));
+        assert_eq!(listed_model.max_retries, 3);
+        assert_eq!(listed_model.retry_backoff_ms, 300);
+        assert_eq!(listed_model.endpoint_selection_mode, "load_balance");
 
         // tenant delete must report the cascade-deleted key hashes
         let hashes = store.delete_tenant(tenant.id).await.expect("delete tenant");
