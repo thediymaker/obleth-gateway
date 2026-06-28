@@ -10,6 +10,7 @@
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::Json;
 use base64::Engine;
 use chrono::{DateTime, Utc};
@@ -17,7 +18,7 @@ use obleth_config::SlurmSettings;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-use crate::{AdminError, AdminState, Result};
+use crate::{audit_actor, AdminError, AdminState, Result};
 
 /// Masked view of the saved Slurm settings for the dashboard. The JWT is never
 /// returned; its presence and last 4 chars are surfaced instead.
@@ -255,6 +256,7 @@ pub async fn get_slurm_settings(
 )]
 pub async fn put_slurm_settings(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(body): Json<UpdateSlurmSettings>,
 ) -> Result<Json<SlurmSettingsView>> {
     let existing = state.store.get_slurm_settings().await?.unwrap_or_default();
@@ -311,7 +313,7 @@ pub async fn put_slurm_settings(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_slurm_settings",
             "settings",
             "slurm",

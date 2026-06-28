@@ -8,6 +8,7 @@
 //! immediately.
 
 use axum::extract::State;
+use axum::http::HeaderMap;
 use axum::Json;
 use obleth_config::{
     pepper_is_set, BackupData, BackupEncryption, ConfigBackup, RestoreReport, BACKUP_FORMAT,
@@ -15,13 +16,18 @@ use obleth_config::{
 };
 use obleth_store::CryptoError;
 
-use crate::{resync_all_keys, sync_mcp_server, sync_model, AdminError, AdminState, Result};
+use crate::{
+    audit_actor, resync_all_keys, sync_mcp_server, sync_model, AdminError, AdminState, Result,
+};
 
 #[utoipa::path(
     get, path = "/api/v1/backup/export", tag = "backup",
     responses((status = 200, body = ConfigBackup))
 )]
-pub(crate) async fn export_backup(State(state): State<AdminState>) -> Result<Json<ConfigBackup>> {
+pub(crate) async fn export_backup(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<ConfigBackup>> {
     let data = state.store.export_backup_data().await?;
     let backup = ConfigBackup {
         format: BACKUP_FORMAT.to_string(),
@@ -39,7 +45,7 @@ pub(crate) async fn export_backup(State(state): State<AdminState>) -> Result<Jso
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "export_backup",
             "gateway",
             "backup",
@@ -56,6 +62,7 @@ pub(crate) async fn export_backup(State(state): State<AdminState>) -> Result<Jso
 )]
 pub(crate) async fn restore_backup(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(body): Json<ConfigBackup>,
 ) -> Result<Json<RestoreReport>> {
     if body.format != BACKUP_FORMAT {
@@ -145,7 +152,13 @@ pub(crate) async fn restore_backup(
     }
     state
         .store
-        .record_audit("admin", "restore_backup", "gateway", "backup", detail)
+        .record_audit(
+            &audit_actor(&headers),
+            "restore_backup",
+            "gateway",
+            "backup",
+            detail,
+        )
         .await?;
 
     Ok(Json(report))

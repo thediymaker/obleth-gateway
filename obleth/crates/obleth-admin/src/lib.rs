@@ -52,7 +52,7 @@ pub use openapi::ApiDoc;
 type Result<T> = std::result::Result<T, AdminError>;
 const AUDIT_ACTOR_HEADER: &str = "x-obleth-audit-actor";
 
-fn audit_actor(headers: &HeaderMap) -> String {
+pub(crate) fn audit_actor(headers: &HeaderMap) -> String {
     headers
         .get(AUDIT_ACTOR_HEADER)
         .and_then(|v| v.to_str().ok())
@@ -876,6 +876,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
 )]
 async fn create_tenant(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(body): Json<CreateTenant>,
 ) -> Result<Json<Tenant>> {
     let tenant = state
@@ -891,7 +892,7 @@ async fn create_tenant(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "create_tenant",
             "tenant",
             &tenant.id.to_string(),
@@ -927,6 +928,7 @@ async fn get_tenant(State(state): State<AdminState>, Path(id): Path<Uuid>) -> Re
 async fn update_tenant(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<UpdateTenant>,
 ) -> Result<Json<Tenant>> {
     let tenant = state
@@ -944,7 +946,7 @@ async fn update_tenant(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "update_tenant",
             "tenant",
             &id.to_string(),
@@ -962,6 +964,7 @@ async fn update_tenant(
 async fn patch_tenant_status(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<SetTenantStatus>,
 ) -> Result<Json<Tenant>> {
     let status = body.status.trim().to_lowercase();
@@ -976,7 +979,7 @@ async fn patch_tenant_status(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_tenant_status",
             "tenant",
             &id.to_string(),
@@ -994,6 +997,7 @@ async fn patch_tenant_status(
 async fn patch_tenant_schedule(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<SetTenantSchedule>,
 ) -> Result<Json<Tenant>> {
     let timezone = body.timezone.trim();
@@ -1038,7 +1042,7 @@ async fn patch_tenant_schedule(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_tenant_schedule",
             "tenant",
             &id.to_string(),
@@ -1061,6 +1065,7 @@ async fn patch_tenant_schedule(
 async fn patch_tenant_budget(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<SetTenantBudget>,
 ) -> Result<Json<Tenant>> {
     let (period, started_at) = normalize_budget_fields(
@@ -1087,7 +1092,7 @@ async fn patch_tenant_budget(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_tenant_budget",
             "tenant",
             &id.to_string(),
@@ -1110,6 +1115,7 @@ async fn patch_tenant_budget(
 async fn patch_tenant_allowlist(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<SetTenantAllowlist>,
 ) -> Result<Json<Tenant>> {
     // Normalize: trim, drop blanks, de-duplicate while preserving order.
@@ -1127,7 +1133,7 @@ async fn patch_tenant_allowlist(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_tenant_allowlist",
             "tenant",
             &id.to_string(),
@@ -1145,6 +1151,7 @@ async fn patch_tenant_allowlist(
 async fn patch_tenant_guardrails(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<SetTenantGuardrails>,
 ) -> Result<Json<Tenant>> {
     let tenant = state
@@ -1156,7 +1163,7 @@ async fn patch_tenant_guardrails(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_tenant_guardrails",
             "tenant",
             &id.to_string(),
@@ -1265,6 +1272,7 @@ async fn get_alert_settings(State(state): State<AdminState>) -> Result<Json<Aler
 )]
 async fn put_alert_settings(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(body): Json<UpdateAlertSettings>,
 ) -> Result<Json<AlertSettingsView>> {
     let existing = state.store.get_alert_settings().await?.unwrap_or_default();
@@ -1326,7 +1334,7 @@ async fn put_alert_settings(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_alert_settings",
             "settings",
             "alerts",
@@ -1399,6 +1407,7 @@ async fn get_auto_router_settings(
 )]
 async fn put_auto_router_settings(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(body): Json<UpdateAutoRouterSettings>,
 ) -> Result<Json<AutoRouterSettingsView>> {
     let existing = state
@@ -1428,7 +1437,7 @@ async fn put_auto_router_settings(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_auto_router_settings",
             "settings",
             "auto_router",
@@ -1532,6 +1541,7 @@ async fn get_boon_settings(State(state): State<AdminState>) -> Result<Json<BoonS
 )]
 async fn put_boon_settings(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(body): Json<UpdateBoonSettings>,
 ) -> Result<Json<BoonSettingsView>> {
     let existing = state.store.get_boon_settings().await?.unwrap_or_default();
@@ -1605,7 +1615,7 @@ async fn put_boon_settings(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_boon_settings",
             "settings",
             "boons",
@@ -1650,13 +1660,14 @@ async fn get_charo_settings(State(state): State<AdminState>) -> Result<Json<Char
 )]
 async fn put_charo_settings(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(body): Json<CharoSettingsView>,
 ) -> Result<Json<CharoSettingsView>> {
     state.store.set_charo_enabled(body.enabled).await?;
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_charo_settings",
             "settings",
             "charo",
@@ -1694,6 +1705,7 @@ async fn test_alert_settings(State(state): State<AdminState>) -> Result<Json<Tes
 async fn delete_tenant(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<StatusCode> {
     let hashes = state.store.delete_tenant(id).await?;
     // Evict every cascaded key from the data-plane cache.
@@ -1704,7 +1716,7 @@ async fn delete_tenant(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "delete_tenant",
             "tenant",
             &id.to_string(),
@@ -1722,6 +1734,7 @@ async fn delete_tenant(
 async fn patch_weight(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<UpdateWeight>,
 ) -> Result<Json<Tenant>> {
     let tenant = state.store.update_tenant_weight(id, body.weight).await?;
@@ -1729,7 +1742,7 @@ async fn patch_weight(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "update_weight",
             "tenant",
             &id.to_string(),
@@ -1748,6 +1761,7 @@ async fn patch_weight(
 async fn put_quota(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<UpdateQuota>,
 ) -> Result<Json<Tenant>> {
     let tenant = state
@@ -1758,7 +1772,7 @@ async fn put_quota(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "update_quota",
             "tenant",
             &id.to_string(),
@@ -2019,6 +2033,7 @@ async fn set_key_tracing_handler(
 async fn set_tenant_tracing_handler(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<SetKeyTracing>,
 ) -> Result<StatusCode> {
     state
@@ -2029,7 +2044,7 @@ async fn set_tenant_tracing_handler(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             if body.tracing_enabled {
                 "enable_tenant_tracing"
             } else {
@@ -2433,6 +2448,7 @@ async fn get_usage_retention(State(state): State<AdminState>) -> Result<Json<Usa
 )]
 async fn put_usage_retention(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(body): Json<UpdateUsageRetention>,
 ) -> Result<Json<UsageRetentionView>> {
     if body.days < 1 {
@@ -2445,7 +2461,7 @@ async fn put_usage_retention(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_usage_retention",
             "settings",
             "usage_retention",
@@ -2469,12 +2485,15 @@ pub struct CompactUsageResult {
     post, path = "/api/v1/usage/compact", tag = "usage",
     responses((status = 200, body = CompactUsageResult))
 )]
-async fn compact_usage(State(state): State<AdminState>) -> Result<Json<CompactUsageResult>> {
+async fn compact_usage(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<CompactUsageResult>> {
     let result = usage_retention::compact_usage_now(&state).await?;
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "compact_usage",
             "usage",
             "usage",
@@ -2592,6 +2611,7 @@ async fn list_fairshare_groups(
 )]
 async fn create_fairshare_group(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(body): Json<CreateFairshareGroup>,
 ) -> Result<Json<FairshareGroup>> {
     let group = state
@@ -2601,7 +2621,7 @@ async fn create_fairshare_group(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "create_fairshare_group",
             "fairshare_group",
             &group.name,
@@ -2620,6 +2640,7 @@ async fn create_fairshare_group(
 async fn patch_fairshare_group_weight(
     State(state): State<AdminState>,
     Path(name): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<UpdateGroupWeight>,
 ) -> Result<Json<FairshareGroup>> {
     let group = state
@@ -2630,7 +2651,7 @@ async fn patch_fairshare_group_weight(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "update_fairshare_group_weight",
             "fairshare_group",
             &name,
@@ -2649,6 +2670,7 @@ async fn patch_fairshare_group_weight(
 async fn patch_tenant_group(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<UpdateTenantGroup>,
 ) -> Result<Json<Tenant>> {
     let tenant = state
@@ -2659,7 +2681,7 @@ async fn patch_tenant_group(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "update_tenant_group",
             "tenant",
             &id.to_string(),
@@ -2684,6 +2706,7 @@ async fn resync_all_keys(state: &AdminState) -> Result<()> {
 )]
 async fn create_model(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(body): Json<CreateModel>,
 ) -> Result<Json<ModelRoute>> {
     // A blank api_base is allowed: Slurm-provisioned models have no static
@@ -2739,7 +2762,7 @@ async fn create_model(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "create_model",
             "model",
             &model.id.to_string(),
@@ -2778,6 +2801,7 @@ async fn get_model(
 async fn update_model(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<UpdateModel>,
 ) -> Result<Json<ModelRoute>> {
     // Blank api_base allowed for provisioned-only (Slurm) models — see create_model.
@@ -2829,7 +2853,7 @@ async fn update_model(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "update_model",
             "model",
             &id.to_string(),
@@ -2848,6 +2872,7 @@ async fn update_model(
 async fn set_model_capacity(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<SetModelCapacity>,
 ) -> Result<Json<ModelRoute>> {
     let model = state
@@ -2858,7 +2883,7 @@ async fn set_model_capacity(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_model_capacity",
             "model",
             &id.to_string(),
@@ -2878,6 +2903,7 @@ async fn set_model_capacity(
 async fn set_model_capacity_mode(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<SetModelCapacityMode>,
 ) -> Result<Json<ModelRoute>> {
     if !obleth_config::is_valid_capacity_mode(body.capacity_mode.trim()) {
@@ -2894,7 +2920,7 @@ async fn set_model_capacity_mode(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_model_capacity_mode",
             "model",
             &id.to_string(),
@@ -2917,6 +2943,7 @@ async fn set_model_capacity_mode(
 async fn autotune_model(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<autotune::AutotuneRequest>,
 ) -> Result<Json<autotune::AutotuneReport>> {
     let model = state.store.get_model(id).await?;
@@ -2926,7 +2953,7 @@ async fn autotune_model(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "autotune_model",
             "model",
             &id.to_string(),
@@ -2956,6 +2983,7 @@ async fn autotune_model(
 async fn apply_autotune_capacity(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<ApplyAutotuneCapacity>,
 ) -> Result<Json<ModelRoute>> {
     if body.max_in_flight < 1 {
@@ -2971,7 +2999,7 @@ async fn apply_autotune_capacity(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "apply_autotune_capacity",
             "model",
             &id.to_string(),
@@ -2993,6 +3021,7 @@ async fn apply_autotune_capacity(
 async fn set_model_weight(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<SetModelWeight>,
 ) -> Result<Json<ModelRoute>> {
     let model = state
@@ -3003,7 +3032,7 @@ async fn set_model_weight(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_model_weight",
             "model",
             &id.to_string(),
@@ -3022,6 +3051,7 @@ async fn set_model_weight(
 async fn set_model_cache(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<SetModelCache>,
 ) -> Result<Json<ModelRoute>> {
     let model = state
@@ -3032,7 +3062,7 @@ async fn set_model_cache(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_model_cache",
             "model",
             &id.to_string(),
@@ -3054,6 +3084,7 @@ async fn set_model_cache(
 async fn set_model_reliability(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<SetModelReliability>,
 ) -> Result<Json<ModelRoute>> {
     let model = state
@@ -3070,7 +3101,7 @@ async fn set_model_reliability(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_model_reliability",
             "model",
             &id.to_string(),
@@ -3111,6 +3142,7 @@ async fn list_model_endpoints(
 async fn create_model_endpoint(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<CreateModelEndpoint>,
 ) -> Result<Json<ModelEndpoint>> {
     state.ssrf.validate(&body.api_base)?;
@@ -3131,7 +3163,7 @@ async fn create_model_endpoint(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "create_model_endpoint",
             "model_endpoint",
             &endpoint.id.to_string(),
@@ -3157,6 +3189,7 @@ async fn create_model_endpoint(
 async fn update_model_endpoint(
     State(state): State<AdminState>,
     Path((id, endpoint_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
     Json(body): Json<UpdateModelEndpoint>,
 ) -> Result<Json<ModelEndpoint>> {
     state.ssrf.validate(&body.api_base)?;
@@ -3177,7 +3210,7 @@ async fn update_model_endpoint(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "update_model_endpoint",
             "model_endpoint",
             &endpoint.id.to_string(),
@@ -3203,6 +3236,7 @@ async fn update_model_endpoint(
 async fn delete_model_endpoint(
     State(state): State<AdminState>,
     Path((id, endpoint_id)): Path<(Uuid, Uuid)>,
+    headers: HeaderMap,
 ) -> Result<StatusCode> {
     let model = state.store.get_model(id).await?;
     state.store.delete_model_endpoint(endpoint_id).await?;
@@ -3210,7 +3244,7 @@ async fn delete_model_endpoint(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "delete_model_endpoint",
             "model_endpoint",
             &endpoint_id.to_string(),
@@ -3245,6 +3279,7 @@ async fn get_managed_model(
 async fn put_managed_model(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<PutManagedModel>,
 ) -> Result<Json<ManagedModelSpec>> {
     if body.serving_port < 1 || body.serving_port > 65535 {
@@ -3293,7 +3328,7 @@ async fn put_managed_model(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "put_managed_model",
             "managed_model",
             &id.to_string(),
@@ -3308,12 +3343,13 @@ async fn put_managed_model(
 async fn delete_managed_model(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
     state.store.delete_managed_model(id).await?;
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "delete_managed_model",
             "managed_model",
             &id.to_string(),
@@ -3366,6 +3402,7 @@ async fn list_all_replicas(State(state): State<AdminState>) -> Result<Json<Vec<M
 async fn create_replica(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<CreateReplica>,
 ) -> Result<Json<ModelReplica>> {
     let r = state
@@ -3375,7 +3412,7 @@ async fn create_replica(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "create_replica",
             "model_replica",
             &r.id.to_string(),
@@ -3391,6 +3428,7 @@ async fn create_replica(
 async fn patch_replica(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<PatchReplica>,
 ) -> Result<Json<ModelReplica>> {
     // Validate up front so an invalid state can't partially apply runtime changes.
@@ -3425,7 +3463,7 @@ async fn patch_replica(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "patch_replica",
             "model_replica",
             &id.to_string(),
@@ -3440,6 +3478,7 @@ async fn patch_replica(
 async fn restart_replica(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
     if !state.store.request_replica_cancel(id).await? {
         return Err(AdminError::NotFound);
@@ -3447,7 +3486,7 @@ async fn restart_replica(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "restart_replica",
             "model_replica",
             &id.to_string(),
@@ -3462,12 +3501,13 @@ async fn restart_replica(
 async fn delete_replica(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
     state.store.delete_replica(id).await?;
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "delete_replica",
             "model_replica",
             &id.to_string(),
@@ -3492,7 +3532,11 @@ pub async fn clear_lost_replicas(
     params(("id" = Uuid, Path, description = "Model id")),
     responses((status = 204), (status = 404))
 )]
-async fn delete_model(State(state): State<AdminState>, Path(id): Path<Uuid>) -> Result<StatusCode> {
+async fn delete_model(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode> {
     let model = state.store.get_model(id).await?;
     state.store.delete_model(id).await?;
     let _ = state.redis.delete_resolved_model(&model.model_name).await;
@@ -3503,7 +3547,7 @@ async fn delete_model(State(state): State<AdminState>, Path(id): Path<Uuid>) -> 
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "delete_model",
             "model",
             &id.to_string(),
@@ -3522,6 +3566,7 @@ async fn delete_model(State(state): State<AdminState>, Path(id): Path<Uuid>) -> 
 )]
 async fn create_mcp_server(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(body): Json<CreateMcpServer>,
 ) -> Result<Json<McpServer>> {
     state.ssrf.validate(&body.upstream_url)?;
@@ -3533,7 +3578,7 @@ async fn create_mcp_server(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "create_mcp_server",
             "mcp_server",
             &server.id.to_string(),
@@ -3572,6 +3617,7 @@ async fn get_mcp_server(
 async fn update_mcp_server(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<UpdateMcpServer>,
 ) -> Result<Json<McpServer>> {
     state.ssrf.validate(&body.upstream_url)?;
@@ -3593,7 +3639,7 @@ async fn update_mcp_server(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "update_mcp_server",
             "mcp_server",
             &id.to_string(),
@@ -3611,6 +3657,7 @@ async fn update_mcp_server(
 async fn delete_mcp_server(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<StatusCode> {
     let server = state.store.get_mcp_server(id).await?;
     state.store.delete_mcp_server(id).await?;
@@ -3622,7 +3669,7 @@ async fn delete_mcp_server(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "delete_mcp_server",
             "mcp_server",
             &id.to_string(),
@@ -3662,13 +3709,14 @@ async fn get_capacity(State(state): State<AdminState>) -> Json<CapacityView> {
 )]
 async fn set_capacity(
     State(state): State<AdminState>,
+    headers: HeaderMap,
     Json(body): Json<SetCapacity>,
 ) -> Result<Json<CapacityView>> {
     state.capacity.set(body.max_in_flight);
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "set_capacity",
             "gateway",
             "global",
