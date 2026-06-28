@@ -66,6 +66,8 @@ const SCHEMA_V10: &str =
     include_str!("../../../../schema/postgres/0010_drop_replica_model_cascade.sql");
 const SCHEMA_V11: &str =
     include_str!("../../../../schema/postgres/0011_endpoint_selection_session_hash.sql");
+const SCHEMA_V12: &str =
+    include_str!("../../../../schema/postgres/0012_model_debug_diagnostics.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -164,6 +166,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V9).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V10).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V11).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V12).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -973,6 +976,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
+                       debug_diagnostics,
                        created_at, updated_at",
         )
         .bind(Uuid::new_v4())
@@ -1015,6 +1019,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
+                    debug_diagnostics,
                     created_at, updated_at
              from models order by model_name",
         )
@@ -1033,6 +1038,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
+                    debug_diagnostics,
                     created_at, updated_at
              from models where id = $1",
         )
@@ -1053,6 +1059,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
+                    debug_diagnostics,
                     created_at, updated_at
              from models where model_name = $1",
         )
@@ -1111,6 +1118,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
+                       debug_diagnostics,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1170,6 +1178,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
+                       debug_diagnostics,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1198,6 +1207,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
+                       debug_diagnostics,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1227,6 +1237,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
+                       debug_diagnostics,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1252,6 +1263,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
+                       debug_diagnostics,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1269,7 +1281,8 @@ impl Store {
                     cost_per_image, cost_per_audio_second, cost_per_character,
                     context_window, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
-                    request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode
+                    request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
+                    debug_diagnostics
              from models where enabled = true",
         )
         .fetch_all(&self.pool)
@@ -1345,6 +1358,7 @@ impl Store {
                     max_retries: row.try_get("max_retries")?,
                     retry_backoff_ms: row.try_get("retry_backoff_ms")?,
                     endpoint_selection_mode: row.try_get("endpoint_selection_mode")?,
+                    debug_diagnostics: row.try_get("debug_diagnostics").unwrap_or(false),
                     endpoints,
                 },
             ));
@@ -1369,6 +1383,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
+                       debug_diagnostics,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1390,10 +1405,12 @@ impl Store {
         max_retries: i64,
         retry_backoff_ms: i64,
         endpoint_selection_mode: &str,
+        debug_diagnostics: bool,
     ) -> Result<ModelRoute> {
         let row = sqlx::query(
             "update models set request_timeout_secs = $2, max_retries = $3,
-                    retry_backoff_ms = $4, endpoint_selection_mode = $5, updated_at = now()
+                    retry_backoff_ms = $4, endpoint_selection_mode = $5,
+                    debug_diagnostics = $6, updated_at = now()
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, model_type,
                        input_cost_per_token, output_cost_per_token,
@@ -1403,6 +1420,7 @@ impl Store {
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
                        request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
+                       debug_diagnostics,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1412,6 +1430,7 @@ impl Store {
         .bind(obleth_config::normalize_endpoint_selection_mode(
             endpoint_selection_mode,
         ))
+        .bind(debug_diagnostics)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -2834,6 +2853,9 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         endpoint_selection_mode: row
             .try_get::<String, _>("endpoint_selection_mode")
             .unwrap_or_else(|_| obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string()),
+        // Tolerant read: statements that don't select `debug_diagnostics`
+        // degrade to false rather than erroring.
+        debug_diagnostics: row.try_get("debug_diagnostics").unwrap_or(false),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -3191,7 +3213,7 @@ mod tests {
         // columns from their SELECT, so the control plane always re-displayed
         // defaults. Guard every admin read that feeds the UI.
         store
-            .update_model_reliability(model.id, Some(600), 3, 300, "load_balance")
+            .update_model_reliability(model.id, Some(600), 3, 300, "load_balance", false)
             .await
             .expect("update reliability");
         let fetched = store.get_model(model.id).await.expect("get_model");
@@ -4080,5 +4102,76 @@ mod tests {
         // Clean up the now-orphaned replica row, matching the teardown discipline
         // of the other replica integration tests.
         store.delete_replica(replica.id).await.ok();
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Verifies that `debug_diagnostics` round-trips through the store and is
+    /// not silently cleared back to `false` by an unrelated update's RETURNING.
+    #[tokio::test]
+    async fn debug_diagnostics_round_trips_and_survives_unrelated_update() {
+        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        let model = store
+            .create_model(
+                &format!("diag-{}", Uuid::new_v4()),
+                "debug diagnostics test model",
+                "upstream-model",
+                "http://127.0.0.1:8081",
+                None,
+                "chat",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                8192,
+                100,
+                None,
+                false,
+                true,
+                false,
+                false,
+                false,
+                &[],
+                &[],
+                &[],
+            )
+            .await
+            .expect("create model");
+
+        // Enable via the reliability update.
+        let saved = store
+            .update_model_reliability(model.id, None, 2, 200, "failover", true)
+            .await
+            .expect("update reliability");
+        assert!(saved.debug_diagnostics, "reliability update should persist the flag");
+
+        // A read SELECT must report it (not the tolerant default).
+        assert!(
+            store.get_model(model.id).await.unwrap().debug_diagnostics,
+            "get_model must return the persisted flag"
+        );
+        assert!(
+            store.list_models().await.unwrap().iter()
+                .find(|m| m.id == model.id).unwrap().debug_diagnostics,
+            "list_models must return the persisted flag"
+        );
+
+        // An UNRELATED update's RETURNING must not mask it back to false
+        // (this is the sync_model cache-poisoning trap).
+        store
+            .update_model_cache(model.id, true, 60)
+            .await
+            .expect("update_model_cache (unrelated update)");
+        assert!(
+            store.get_model(model.id).await.unwrap().debug_diagnostics,
+            "unrelated update must not clear debug_diagnostics"
+        );
     }
 }

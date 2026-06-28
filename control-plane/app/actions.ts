@@ -812,6 +812,7 @@ export async function setModelReliabilityAction(
     max_retries: number;
     retry_backoff_ms: number;
     endpoint_selection_mode: string;
+    debug_diagnostics: boolean;
   },
 ) {
   const session = await requireAdmin();

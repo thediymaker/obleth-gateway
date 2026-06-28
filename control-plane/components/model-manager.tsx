@@ -1965,6 +1965,23 @@ function ReliabilityPanel({
   const disabled = pending || busy;
   const addFormRef = useRef<HTMLFormElement>(null);
 
+  // React 19 auto-resets uncontrolled form fields once a `<form action>` action
+  // settles. An uncontrolled <select defaultValue> would snap back to the stale
+  // model prop on save and only show the saved value after a full reload, so we
+  // control it: the chosen value sticks through the reset and re-syncs whenever
+  // fresh model data lands.
+  const [selectionMode, setSelectionMode] = useState(model.endpoint_selection_mode);
+  useEffect(() => {
+    setSelectionMode(model.endpoint_selection_mode);
+  }, [model.endpoint_selection_mode]);
+
+  // Controlled for the same reason as the select above: an uncontrolled
+  // checkbox would snap back to the stale model prop on save.
+  const [debugDiag, setDebugDiag] = useState(model.debug_diagnostics);
+  useEffect(() => {
+    setDebugDiag(model.debug_diagnostics);
+  }, [model.debug_diagnostics]);
+
   // Map each endpoint to its backing Slurm replica (if any) so a Slurm-managed
   // endpoint can be restarted — Restart cancels the replica's job and the
   // provisioner launches a fresh one. Static endpoints have no replica → no
@@ -1991,6 +2008,7 @@ function ReliabilityPanel({
       max_retries: Number(formData.get("max_retries") ?? 0),
       retry_backoff_ms: Number(formData.get("retry_backoff_ms") ?? 200),
       endpoint_selection_mode: String(formData.get("endpoint_selection_mode") ?? "failover"),
+      debug_diagnostics: debugDiag,
     };
     start(async () => {
       await setModelReliabilityAction(model.id, body);
@@ -2031,7 +2049,8 @@ function ReliabilityPanel({
               <select
                 id={`selection-${model.id}`}
                 name="endpoint_selection_mode"
-                defaultValue={model.endpoint_selection_mode}
+                value={selectionMode}
+                onChange={(e) => setSelectionMode(e.target.value)}
                 className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
               >
                 <option value="failover">failover (priority order)</option>
@@ -2039,6 +2058,12 @@ function ReliabilityPanel({
                 <option value="session_hash">session_hash (sticky by session)</option>
               </select>
             </div>
+            <ChipCheckbox
+              name="debug_diagnostics"
+              label="Debug upstream failures"
+              checked={debugDiag}
+              onChange={setDebugDiag}
+            />
           </div>
         </PanelCard>
       </form>

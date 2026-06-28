@@ -4,6 +4,12 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.5.4
+Optional upstream-failure diagnostics, per model.
+
+- **Turn on "Debug upstream failures" for a model** (Reliability → Delivery) and whenever a request to it gives up with a 502/504, the gateway runs a quick read-only check of the upstream — does its hostname still resolve in DNS, and is the port reachable — and records the result in the request trace. This turns the intermittent "it's up, but I got a 502" cases into concrete evidence (e.g. a DNS blip) instead of a guess. Off by default; no effect on models without it enabled.
+- **Fixed: the Endpoint selection dropdown snapped back after saving.** The Delivery panel's dropdown briefly reverted to its previous value on save (the saved value reappeared on reload). It now stays on the value you chose.
+
 ## v0.5.3
 The model page now shows the timeout and retry settings you actually saved.
 

@@ -110,6 +110,7 @@ export interface ModelRoute {
   max_retries: number;
   retry_backoff_ms: number;
   endpoint_selection_mode: string;
+  debug_diagnostics: boolean;
   tags: string[];
   boons: string[];
   tool_servers: string[];
@@ -1170,6 +1171,7 @@ export const obleth = {
       max_retries: number;
       retry_backoff_ms: number;
       endpoint_selection_mode: string;
+      debug_diagnostics: boolean;
     },
     options?: AuditOptions,
   ) =>

@@ -334,6 +334,11 @@ pub struct ModelRoute {
     /// (priority order) or `load_balance` (weighted).
     #[serde(default = "default_endpoint_selection_mode")]
     pub endpoint_selection_mode: String,
+    /// When true, a terminal 502/504 against this model triggers read-only
+    /// upstream diagnostics (DNS resolve + TCP connect) recorded as a trace
+    /// span. Opt-in; off by default. Diagnose-only — never changes routing.
+    #[serde(default)]
+    pub debug_diagnostics: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -452,6 +457,8 @@ pub struct ResolvedModel {
     /// How to choose among `endpoints`: `failover` or `load_balance`.
     #[serde(default = "default_endpoint_selection_mode")]
     pub endpoint_selection_mode: String,
+    #[serde(default)]
+    pub debug_diagnostics: bool,
     /// Upstream endpoints for this model. When empty, the data plane falls back
     /// to the legacy single `api_base`/`api_key` pair above (older cached
     /// payloads and un-migrated rows).
