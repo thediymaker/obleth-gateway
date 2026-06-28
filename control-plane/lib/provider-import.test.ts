@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { parseUpstreamModelList, normalizeBase } from "./provider-import";
+import { parseUpstreamModelList, normalizeBase, classifyDiscovered } from "./provider-import";
 
 describe("parseUpstreamModelList", () => {
   it("reads the OpenAI list shape", () => {
@@ -40,5 +40,37 @@ describe("parseUpstreamModelList", () => {
 describe("normalizeBase", () => {
   it("trims and strips trailing slashes", () => {
     expect(normalizeBase("  https://x/v1/  ")).toBe("https://x/v1");
+  });
+});
+
+describe("classifyDiscovered", () => {
+  const existing = [
+    { model_name: "gpt-4o", upstream_model: "gpt-4o", api_base: "https://api.openai.com/v1" },
+    { model_name: "my-llama", upstream_model: "meta/llama", api_base: "https://x/v1" },
+  ];
+
+  it("flags a name collision as existing", () => {
+    const rows = classifyDiscovered([{ id: "GPT-4o" }], existing, "https://other/v1");
+    expect(rows[0]).toEqual({
+      id: "GPT-4o",
+      modelName: "gpt-4o",
+      ownedBy: undefined,
+      status: "existing",
+    });
+  });
+
+  it("flags a same base + upstream pair as existing even when name differs", () => {
+    const rows = classifyDiscovered([{ id: "meta/llama" }], existing, "https://x/v1/");
+    expect(rows[0].status).toBe("existing");
+  });
+
+  it("marks genuinely new models as new", () => {
+    const rows = classifyDiscovered([{ id: "claude-x" }], existing, "https://x/v1");
+    expect(rows[0]).toEqual({
+      id: "claude-x",
+      modelName: "claude-x",
+      ownedBy: undefined,
+      status: "new",
+    });
   });
 });

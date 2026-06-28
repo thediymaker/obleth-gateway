@@ -32,3 +32,38 @@ export function parseUpstreamModelList(json: unknown): UpstreamModel[] {
   out.sort((a, b) => a.id.localeCompare(b.id));
   return out;
 }
+
+export type DiscoveredStatus = "new" | "existing";
+
+export interface DiscoveredRow {
+  id: string;
+  modelName: string;
+  ownedBy?: string;
+  status: DiscoveredStatus;
+}
+
+export interface ExistingRouteRef {
+  model_name: string;
+  upstream_model: string;
+  api_base: string;
+}
+
+// A discovered model is "existing" when an existing route matches by normalized
+// model_name, OR by the same (normalized api_base + upstream_model) pair. NUL
+// joins the pair key so ids containing the separator can't collide.
+export function classifyDiscovered(
+  models: UpstreamModel[],
+  existing: ExistingRouteRef[],
+  base: string,
+): DiscoveredRow[] {
+  const normBase = normalizeBase(base);
+  const names = new Set(existing.map((r) => r.model_name));
+  const pairs = new Set(
+    existing.map((r) => `${normalizeBase(r.api_base)} ${r.upstream_model}`),
+  );
+  return models.map((m) => {
+    const modelName = normalizeModelApiNameFinal(m.id);
+    const exists = names.has(modelName) || pairs.has(`${normBase} ${m.id}`);
+    return { id: m.id, modelName, ownedBy: m.owned_by, status: exists ? "existing" : "new" };
+  });
+}
