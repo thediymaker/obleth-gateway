@@ -211,4 +211,23 @@ mod tests {
         let stats = apply(&cfg, &mut body);
         assert_eq!(stats.compressed, 1);
     }
+
+    #[test]
+    fn apply_compacts_array_parts_message() {
+        let big_array: Vec<i64> = (0..500).collect();
+        let pretty = serde_json::to_string_pretty(&json!({ "rows": big_array })).unwrap();
+        let mut body = json!({
+            "model": "m",
+            "messages": [{
+                "role": "user",
+                "content": [{ "type": "text", "text": pretty }]
+            }]
+        });
+        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64 };
+        let stats = apply(&cfg, &mut body);
+        assert_eq!(stats.compressed, 1);
+        assert!(stats.tokens_after < stats.tokens_before);
+        let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
+        assert!(!text.contains("\n  "));
+    }
 }
