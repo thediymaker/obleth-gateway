@@ -32,6 +32,20 @@ pub(crate) fn classify(text: &str) -> ContentKind {
     ContentKind::Prose
 }
 
+/// Losslessly minify JSON text. Returns `Some(minified)` only when the result
+/// is strictly shorter and re-parses to the same value; otherwise `None`.
+pub(crate) fn compact_json(text: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(text.trim()).ok()?;
+    let compact = serde_json::to_string(&value).ok()?;
+    if compact.len() < text.len() {
+        // `serde_json` round-trips losslessly by construction; the length
+        // guard ensures we only act when there is a real gain.
+        Some(compact)
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -60,5 +74,26 @@ mod tests {
     fn bare_number_is_not_json() {
         // A bare scalar is not worth treating as structured JSON.
         assert_eq!(classify("42"), ContentKind::Prose);
+    }
+
+    #[test]
+    fn compacts_pretty_json() {
+        let pretty = "{\n  \"a\": 1,\n  \"b\": [1, 2, 3]\n}";
+        let out = compact_json(pretty).expect("should compact");
+        assert!(out.len() < pretty.len());
+        // Lossless: re-parses to the same value.
+        let a: serde_json::Value = serde_json::from_str(pretty).unwrap();
+        let b: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn already_compact_json_returns_none() {
+        assert_eq!(compact_json("{\"a\":1}"), None);
+    }
+
+    #[test]
+    fn non_json_returns_none() {
+        assert_eq!(compact_json("just some prose"), None);
     }
 }
