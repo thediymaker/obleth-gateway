@@ -5,8 +5,9 @@ Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
 ## v0.5.4
-Optional upstream-failure diagnostics, per model.
+Optional upstream-failure diagnostics, plus warmup for freshly-started Slurm replicas.
 
+- **Slurm-managed replicas are warmed up the moment they go healthy.** A new replica passes its health check as soon as the inference server answers `/health`, but its very first request can still be slow — the model has to do its first forward pass (graph capture, cache warmup), which on a cold box can take long enough to surface to a user as a 502/504. The provisioner now fires one throwaway request at each replica right after it's promoted, so that cold first-token cost is paid by the gateway instead of by the first real user. On by default; tune or disable with `OBLETH_PROVISIONER_WARMUP_TIMEOUT_SECS` (default 600s, `0` disables).
 - **Turn on "Debug upstream failures" for a model** (Reliability → Delivery) and whenever a request to it gives up with a 502/504, the gateway runs a quick read-only check of the upstream — does its hostname still resolve in DNS, and is the port reachable — and records the result in the request trace. This turns the intermittent "it's up, but I got a 502" cases into concrete evidence (e.g. a DNS blip) instead of a guess. Off by default; no effect on models without it enabled.
 - **Fixed: the Endpoint selection dropdown snapped back after saving.** The Delivery panel's dropdown briefly reverted to its previous value on save (the saved value reappeared on reload). It now stays on the value you chose.
 

@@ -3,6 +3,7 @@ mod executor;
 mod obleth_client;
 mod plan;
 mod probe;
+mod warmup;
 
 // `domain` and `slurm` live in the crate's library half (lib.rs) so obleth-admin
 // can call `discover_resources()`. Re-export them here rather than re-declaring
@@ -270,7 +271,7 @@ async fn tick(
             } else {
                 0
             };
-            if let Err(e) = executor::apply(
+            match executor::apply(
                 action,
                 spec.model_id,
                 &model_name,
@@ -283,7 +284,33 @@ async fn tick(
             )
             .await
             {
-                tracing::warn!(?action, error = %e, "action failed; continuing");
+                Err(e) => tracing::warn!(?action, error = %e, "action failed; continuing"),
+                // A just-promoted replica is healthy by /health but may still be
+                // cold for its first forward pass. Fire a throwaway warmup
+                // inference, detached, so the slow cold first token is paid here
+                // instead of by the first real user — and never stalls the tick.
+                Ok(()) => {
+                    if cfg.warmup_timeout_secs > 0 {
+                        if let domain::Action::Promote { api_base, .. } = action {
+                            let http = http.clone();
+                            let api_base = api_base.clone();
+                            let model_name = model_name.clone();
+                            let budget = Duration::from_secs(cfg.warmup_timeout_secs);
+                            tokio::spawn(async move {
+                                match warmup::warm_up(&http, &api_base, budget).await {
+                                    Ok(()) => tracing::info!(
+                                        model = %model_name, %api_base,
+                                        "warmup inference completed"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        model = %model_name, %api_base, error = %e,
+                                        "warmup inference failed (best-effort)"
+                                    ),
+                                }
+                            });
+                        }
+                    }
+                }
             }
         }
     }

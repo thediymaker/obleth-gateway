@@ -13,6 +13,10 @@ pub struct ProvisionerConfig {
     pub admin_token: String,
     pub interval_secs: u64,
     pub health_timeout_secs: u64,
+    /// Budget for the post-promotion warmup inference (each HTTP call). `0`
+    /// disables warmup entirely. Generous by default: the point is to absorb a
+    /// slow cold first token, which can take many seconds on a fresh replica.
+    pub warmup_timeout_secs: u64,
     pub lost_retention_secs: i64,
     pub port_span: i64,
     /// Job-name prefix used to tag and later find this gateway's jobs.
@@ -32,6 +36,7 @@ impl ProvisionerConfig {
             admin_token: req("OBLETH_ADMIN_TOKEN")?,
             interval_secs: opt("OBLETH_PROVISIONER_INTERVAL_SECS", "15").parse()?,
             health_timeout_secs: opt("OBLETH_PROVISIONER_HEALTH_TIMEOUT_SECS", "5").parse()?,
+            warmup_timeout_secs: opt("OBLETH_PROVISIONER_WARMUP_TIMEOUT_SECS", "600").parse()?,
             lost_retention_secs: opt("OBLETH_PROVISIONER_LOST_RETENTION_SECS", "900").parse()?,
             port_span: opt("OBLETH_PORT_SPAN", "8").parse()?,
             job_name_prefix: opt("OBLETH_PROVISIONER_JOB_PREFIX", "obleth-"),
@@ -50,6 +55,7 @@ mod tests {
         let c = ProvisionerConfig::from_env().expect("config");
         assert_eq!(c.interval_secs, 15);
         assert_eq!(c.health_timeout_secs, 5);
+        assert_eq!(c.warmup_timeout_secs, 600);
         assert_eq!(c.lost_retention_secs, 900);
         assert_eq!(c.job_name_prefix, "obleth-");
     }

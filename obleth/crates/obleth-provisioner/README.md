@@ -41,7 +41,11 @@ Every tick (`OBLETH_PROVISIONER_INTERVAL_SECS`, default 15s):
    - **Reconcile** to `target_replicas`:
      - **Submit** new Slurm jobs when below target.
      - **Promote** a probed-healthy `starting` replica into obleth's model
-       endpoint pool (registers its `api_base`).
+       endpoint pool (registers its `api_base`), then fire a throwaway 1-token
+       **warmup** inference at it (detached) so the slow cold first-token cost —
+       which `/health` returning 200 does *not* cover — is paid here instead of
+       by the first real user. Best-effort; disabled by
+       `OBLETH_PROVISIONER_WARMUP_TIMEOUT_SECS=0`.
      - **Mark lost** replicas whose Slurm job vanished or finished (preempted),
        and detach their endpoint; the next pass resubmits to restore target.
      - **Cancel** excess jobs when above target (pending first, then starting,
@@ -77,6 +81,7 @@ endpoint/token and cadence knobs come from the environment:
 | `OBLETH_ADMIN_BASE_URL` | optional | `http://localhost:9180` | obleth admin API base URL |
 | `OBLETH_PROVISIONER_INTERVAL_SECS` | optional | `15` | reconcile tick interval |
 | `OBLETH_PROVISIONER_HEALTH_TIMEOUT_SECS` | optional | `5` | per-replica health probe timeout |
+| `OBLETH_PROVISIONER_WARMUP_TIMEOUT_SECS` | optional | `600` | budget for the post-promotion warmup inference; `0` disables warmup |
 | `OBLETH_PROVISIONER_LOST_RETENTION_SECS` | optional | `900` | how long `lost` replica rows are kept before GC |
 | `OBLETH_PROVISIONER_JOB_PREFIX` | optional | `obleth-` | job-name prefix used to find this gateway's jobs |
 
