@@ -126,10 +126,23 @@ impl HttpObleth {
         }
     }
     fn req(&self, m: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
-        self.http
+        // Carry the provisioner's build identity on every call. The gateway reads
+        // it off the once-per-tick `/settings/slurm/resolved` poll (its heartbeat)
+        // so the dashboard can show which provisioner build is actually running —
+        // independently of the gateway/control-plane images.
+        let mut req = self
+            .http
             .request(m, format!("{}{path}", self.base))
             .bearer_auth(&self.token)
             .header("X-Obleth-Audit-Actor", "system")
+            .header("X-Obleth-Provisioner-Version", env!("CARGO_PKG_VERSION"));
+        if let Some(sha) = option_env!("OBLETH_BUILD_SHA").filter(|s| !s.is_empty()) {
+            req = req.header("X-Obleth-Provisioner-Sha", sha);
+        }
+        if let Some(built) = option_env!("OBLETH_BUILD_TIMESTAMP").filter(|s| !s.is_empty()) {
+            req = req.header("X-Obleth-Provisioner-Built-At", built);
+        }
+        req
     }
 }
 

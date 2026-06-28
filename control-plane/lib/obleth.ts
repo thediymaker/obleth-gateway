@@ -630,6 +630,11 @@ export interface SlurmSettingsView {
   // gateway started. provisioner_running is true within the freshness window.
   provisioner_last_seen_secs: number | null;
   provisioner_running: boolean;
+  // Build identity the provisioner last reported (it ships as its own image, so
+  // it can drift from the gateway version). Null until it has reported.
+  provisioner_version: string | null;
+  provisioner_git_sha: string | null;
+  provisioner_built_at: string | null;
 }
 
 export interface UpdateSlurmSettings {

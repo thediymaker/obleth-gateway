@@ -37,6 +37,22 @@ pub struct SlurmSettingsView {
     pub provisioner_last_seen_secs: Option<i64>,
     /// True when the provisioner has polled within the freshness window.
     pub provisioner_running: bool,
+    /// Build identity the provisioner last reported on its poll. The provisioner
+    /// is deployed as its own image, so this can drift from the gateway version;
+    /// surfacing it makes a stale provisioner deployment obvious. Null until it
+    /// has reported (or for an older provisioner that doesn't send it).
+    pub provisioner_version: Option<String>,
+    pub provisioner_git_sha: Option<String>,
+    pub provisioner_built_at: Option<String>,
+}
+
+/// Build identity the provisioner reports via request headers, stored as JSON in
+/// Redis alongside the heartbeat and echoed back on the settings view.
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct ProvisionerBuild {
+    pub version: Option<String>,
+    pub git_sha: Option<String>,
+    pub built_at: Option<String>,
 }
 
 impl SlurmSettingsView {
@@ -58,6 +74,9 @@ impl SlurmSettingsView {
             // view itself only knows the persisted settings.
             provisioner_last_seen_secs: None,
             provisioner_running: false,
+            provisioner_version: None,
+            provisioner_git_sha: None,
+            provisioner_built_at: None,
         }
     }
 }
@@ -246,6 +265,18 @@ pub async fn get_slurm_settings(
         provisioner_status(last_seen, Utc::now().timestamp(), PROVISIONER_FRESH_SECS);
     view.provisioner_last_seen_secs = secs;
     view.provisioner_running = running;
+    if let Some(build) = state
+        .redis
+        .get_provisioner_version()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<ProvisionerBuild>(&json).ok())
+    {
+        view.provisioner_version = build.version;
+        view.provisioner_git_sha = build.git_sha;
+        view.provisioner_built_at = build.built_at;
+    }
     Ok(Json(view))
 }
 
@@ -351,6 +382,7 @@ pub async fn test_slurm_settings(State(state): State<AdminState>) -> Result<Json
 )]
 pub async fn get_slurm_settings_resolved(
     State(state): State<AdminState>,
+    headers: HeaderMap,
 ) -> Result<Json<SlurmSettings>> {
     // Provisioner-facing: returns the decrypted JWT in full. Still behind the
     // admin token, which already grants full read/write — so this exposes nothing
@@ -366,6 +398,32 @@ pub async fn get_slurm_settings_resolved(
         .await
     {
         tracing::warn!(error = %e, "failed to record provisioner heartbeat");
+    }
+    // The provisioner reports its build identity via headers; persist it next to
+    // the heartbeat (same TTL) so the Slurm tab can show which provisioner build
+    // is running. Only stored when a version header is present.
+    let header_str = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+    };
+    if let Some(version) = header_str("x-obleth-provisioner-version") {
+        let build = ProvisionerBuild {
+            version: Some(version),
+            git_sha: header_str("x-obleth-provisioner-sha"),
+            built_at: header_str("x-obleth-provisioner-built-at"),
+        };
+        if let Ok(json) = serde_json::to_string(&build) {
+            if let Err(e) = state
+                .redis
+                .set_provisioner_version(&json, PROVISIONER_HEARTBEAT_TTL_SECS)
+                .await
+            {
+                tracing::warn!(error = %e, "failed to record provisioner version");
+            }
+        }
     }
     let settings = state.store.get_slurm_settings().await?.unwrap_or_default();
     Ok(Json(settings))

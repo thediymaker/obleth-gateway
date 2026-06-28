@@ -42,6 +42,11 @@ const INVALIDATE_CHANNEL: &str = "obleth:invalidate";
 /// via Redis (not per-pod memory) so the dashboard reads a consistent value no
 /// matter which gateway pod served the provisioner's poll vs. the settings read.
 const PROVISIONER_HEARTBEAT_KEY: &str = "obleth:provisioner:heartbeat";
+/// Companion to the heartbeat holding the provisioner's reported build identity
+/// (JSON: version/git_sha/built_at). Separate key so the bare-int heartbeat — and
+/// the "running" derivation built on it — is untouched; both share a TTL so they
+/// expire together when the provisioner stops.
+const PROVISIONER_VERSION_KEY: &str = "obleth:provisioner:version";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RedisError {
@@ -119,6 +124,23 @@ impl RedisStore {
     pub async fn get_provisioner_heartbeat(&self) -> Result<Option<i64>> {
         let mut conn = self.conn.clone();
         let v: Option<i64> = conn.get(PROVISIONER_HEARTBEAT_KEY).await?;
+        Ok(v)
+    }
+
+    /// Record the provisioner's reported build identity (an opaque JSON blob)
+    /// alongside the heartbeat, expiring after `ttl_secs`. Stored separately from
+    /// the bare-int heartbeat so the "running" derivation is unaffected.
+    pub async fn set_provisioner_version(&self, json: &str, ttl_secs: u64) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let _: () = conn.set_ex(PROVISIONER_VERSION_KEY, json, ttl_secs).await?;
+        Ok(())
+    }
+
+    /// The provisioner's last-reported build identity (raw JSON), or `None` when
+    /// it hasn't reported within the TTL or never reported one.
+    pub async fn get_provisioner_version(&self) -> Result<Option<String>> {
+        let mut conn = self.conn.clone();
+        let v: Option<String> = conn.get(PROVISIONER_VERSION_KEY).await?;
         Ok(v)
     }
 

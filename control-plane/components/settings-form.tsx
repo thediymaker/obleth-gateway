@@ -877,6 +877,19 @@ export function SlurmSettingsForm({ settings }: { settings: SlurmSettingsView | 
                 <>
                   <span className="font-medium">Provisioner running</span> — last polled{" "}
                   {formatLastSeen(settings.provisioner_last_seen_secs)}.
+                  {settings.provisioner_version && (
+                    <>
+                      {" "}
+                      <span className="font-mono">
+                        v{settings.provisioner_version}
+                        {settings.provisioner_git_sha && (
+                          <span className="ml-1 text-xs opacity-70">
+                            {settings.provisioner_git_sha.slice(0, 7)}
+                          </span>
+                        )}
+                      </span>
+                    </>
+                  )}
                 </>
               ) : (
                 <>
