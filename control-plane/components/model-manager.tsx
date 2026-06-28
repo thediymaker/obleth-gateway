@@ -1975,6 +1975,13 @@ function ReliabilityPanel({
     setSelectionMode(model.endpoint_selection_mode);
   }, [model.endpoint_selection_mode]);
 
+  // Controlled for the same reason as the select above: an uncontrolled
+  // checkbox would snap back to the stale model prop on save.
+  const [debugDiag, setDebugDiag] = useState(model.debug_diagnostics);
+  useEffect(() => {
+    setDebugDiag(model.debug_diagnostics);
+  }, [model.debug_diagnostics]);
+
   // Map each endpoint to its backing Slurm replica (if any) so a Slurm-managed
   // endpoint can be restarted — Restart cancels the replica's job and the
   // provisioner launches a fresh one. Static endpoints have no replica → no
@@ -2001,6 +2008,7 @@ function ReliabilityPanel({
       max_retries: Number(formData.get("max_retries") ?? 0),
       retry_backoff_ms: Number(formData.get("retry_backoff_ms") ?? 200),
       endpoint_selection_mode: String(formData.get("endpoint_selection_mode") ?? "failover"),
+      debug_diagnostics: debugDiag,
     };
     start(async () => {
       await setModelReliabilityAction(model.id, body);
@@ -2050,6 +2058,12 @@ function ReliabilityPanel({
                 <option value="session_hash">session_hash (sticky by session)</option>
               </select>
             </div>
+            <ChipCheckbox
+              name="debug_diagnostics"
+              label="Debug upstream failures"
+              checked={debugDiag}
+              onChange={setDebugDiag}
+            />
           </div>
         </PanelCard>
       </form>
