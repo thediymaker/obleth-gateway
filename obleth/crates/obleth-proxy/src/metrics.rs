@@ -20,6 +20,7 @@ pub struct Metrics {
     telemetry_dropped: IntGauge,
     cache_lookups: IntCounterVec,
     tokens_saved: IntCounter,
+    pub(crate) compression_tokens_saved: IntCounter,
     mcp_requests: IntCounterVec,
     upstream_attempts: IntCounterVec,
 }
@@ -84,6 +85,11 @@ impl Metrics {
             "Tokens served from cache instead of the upstream",
         ))
         .unwrap();
+        let compression_tokens_saved = IntCounter::with_opts(Opts::new(
+            "obleth_compression_tokens_saved_total",
+            "Input tokens saved by the compression boon before upstream dispatch",
+        ))
+        .unwrap();
         let mcp_requests = IntCounterVec::new(
             Opts::new(
                 "obleth_mcp_requests_total",
@@ -113,6 +119,7 @@ impl Metrics {
             .unwrap();
         registry.register(Box::new(cache_lookups.clone())).unwrap();
         registry.register(Box::new(tokens_saved.clone())).unwrap();
+        registry.register(Box::new(compression_tokens_saved.clone())).unwrap();
         registry.register(Box::new(mcp_requests.clone())).unwrap();
         registry
             .register(Box::new(upstream_attempts.clone()))
@@ -130,6 +137,7 @@ impl Metrics {
             telemetry_dropped,
             cache_lookups,
             tokens_saved,
+            compression_tokens_saved,
             mcp_requests,
             upstream_attempts,
         }
@@ -169,6 +177,10 @@ impl Metrics {
         }
     }
 
+    pub fn record_compression_saved(&self, saved: u32) {
+        self.compression_tokens_saved.inc_by(saved as u64);
+    }
+
     pub fn set_gauges(&self, in_flight: i64, queue_depth: i64, telemetry_dropped: u64) {
         self.in_flight.set(in_flight);
         self.queue_depth.set(queue_depth);
@@ -186,5 +198,19 @@ impl Metrics {
 impl Default for Metrics {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn records_compression_savings() {
+        let m = Metrics::new();
+        m.record_compression_saved(120);
+        m.record_compression_saved(30);
+        // Exposed via the gather/encode path; assert the counter value directly.
+        assert_eq!(m.compression_tokens_saved.get(), 150);
     }
 }
