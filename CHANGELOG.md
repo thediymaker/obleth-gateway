@@ -4,6 +4,12 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.5.5
+Import models straight from an OpenAI-compatible provider — no file to hand-write.
+
+- **Import models by pointing obleth at a provider.** On the Models page, **Import from provider** takes any OpenAI-compatible base URL (and an optional API key), lists the models that provider actually serves, and lets you import the ones you don't already have. After fetching you see the discovered models right away — each with an editable name and per-model overrides — on top of batch defaults (type, context window, costs) you set once. The catalog is fetched server-side, so the API key never reaches the browser.
+- **Re-run it any time to see what's new.** Models you've already imported are detected — by name, or by the same provider URL and upstream id — and shown as already-imported instead of being offered again, so running the importer periodically surfaces only genuinely new models. The flow only ever creates new routes; nothing existing is changed.
+
 ## v0.5.4
 Optional upstream-failure diagnostics, plus warmup for freshly-started Slurm replicas.
 
