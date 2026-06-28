@@ -91,6 +91,7 @@ import {
 } from "@/components/ui/tooltip";
 import type { AutotuneReport, AutotuneWorkload, CacheStats, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelReplica, ModelRoute } from "@/lib/obleth";
 import { providerForModel } from "@/lib/model-providers";
+import { normalizeModelApiNameDraft, normalizeModelApiNameFinal } from "@/lib/model-name";
 import { RecipeList } from "@/components/recipes/recipe-list";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
 import { cn, formatNumber } from "@/lib/utils";
@@ -174,19 +175,6 @@ const CREATE_MODEL_STEPS = [
   },
 ] as const;
 
-
-function normalizeModelApiNameDraft(value: string) {
-  return value
-    .toLowerCase()
-    .replace(/[\s_]+/g, "-")
-    .replace(/[^a-z0-9.-]+/g, "-")
-    .replace(/-+/g, "-")
-    .replace(/^\.+/g, "");
-}
-
-function normalizeModelApiNameFinal(value: string) {
-  return normalizeModelApiNameDraft(value).replace(/^[.-]+|[.-]+$/g, "");
-}
 
 export function ModelManager({
   models,
