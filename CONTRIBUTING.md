@@ -19,7 +19,7 @@ The main Rust workspace lives in `obleth/`.
 - Install stable Rust.
 - Start local Postgres and Redis if your change touches integration tests.
 - Set:
-  - `OBLETH_TEST_DATABASE_URL=postgres://obleth:obleth@localhost:5432/obleth`
+  - `OBLETH_TEST_DATABASE_URL=postgres://obleth:obleth@localhost:5432/obleth_test`
   - `OBLETH_TEST_REDIS_URL=redis://localhost:6379`
 
 Common commands:

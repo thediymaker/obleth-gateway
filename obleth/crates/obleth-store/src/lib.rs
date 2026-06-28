@@ -3002,11 +3002,109 @@ fn model_health_claim_from_row(row: &PgRow) -> Result<ModelHealthClaim> {
     })
 }
 
+/// Shared integration-test plumbing, available to every test module in the
+/// crate (`lib.rs` `tests` and `backup.rs` `tests`).
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// Reads OBLETH_TEST_DATABASE_URL for an integration test. Returns None when
+    /// unset (the test skips). Panics if it IS set but the database name doesn't
+    /// contain "test" — refuses to run the integration suite against a possibly
+    /// real/dev database, which is how fixtures previously leaked.
+    pub(crate) fn test_db_url() -> Option<String> {
+        let url = std::env::var("OBLETH_TEST_DATABASE_URL").ok()?;
+        let db = url
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .split('?')
+            .next()
+            .unwrap_or("");
+        assert!(
+            db.contains("test"),
+            "OBLETH_TEST_DATABASE_URL database name {db:?} is not a dedicated test DB \
+             (name must contain \"test\", e.g. obleth_test). Refusing to run integration \
+             tests against a possibly-real database."
+        );
+        Some(url)
+    }
+
+    /// Tracks the fixture rows a test creates and deletes them when it drops —
+    /// which happens even if the test panics on a failed assertion — so leaked
+    /// `m-…`/`t-…` rows (and the replica rows they leave behind) never persist
+    /// in the target database. Deleting a model cascades to its health
+    /// checks/endpoints/managed row, and deleting a tenant cascades to its
+    /// keys, so model + tenant ids are enough for those. Replica rows do NOT
+    /// cascade from a model delete (the provisioner needs orphan rows to drain
+    /// Slurm jobs), so they are tracked and deleted separately.
+    ///
+    /// Cleanup runs async DB deletes from `Drop`, which requires the test to use
+    /// the multi-thread runtime flavor (so `block_in_place` is permitted).
+    pub(crate) struct FixtureGuard {
+        store: Store,
+        models: Vec<Uuid>,
+        tenants: Vec<Uuid>,
+        replicas: Vec<Uuid>,
+    }
+
+    impl FixtureGuard {
+        pub(crate) fn new(store: &Store) -> Self {
+            Self {
+                store: store.clone(),
+                models: Vec::new(),
+                tenants: Vec::new(),
+                replicas: Vec::new(),
+            }
+        }
+        pub(crate) fn track_model(&mut self, id: Uuid) {
+            self.models.push(id);
+        }
+        pub(crate) fn track_tenant(&mut self, id: Uuid) {
+            self.tenants.push(id);
+        }
+        pub(crate) fn track_replica(&mut self, id: Uuid) {
+            self.replicas.push(id);
+        }
+    }
+
+    impl Drop for FixtureGuard {
+        fn drop(&mut self) {
+            let store = self.store.clone();
+            let models = std::mem::take(&mut self.models);
+            let tenants = std::mem::take(&mut self.tenants);
+            let replicas = std::mem::take(&mut self.replicas);
+            if models.is_empty() && tenants.is_empty() && replicas.is_empty() {
+                return;
+            }
+            // Deletes are best-effort: a row a test already removed returns
+            // NotFound, which we ignore. Replica order vs models is irrelevant
+            // since the model_replicas FK was dropped. block_in_place needs the
+            // multi-thread flavor on the test.
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    for id in models {
+                        let _ = store.delete_model(id).await;
+                    }
+                    for id in tenants {
+                        let _ = store.delete_tenant(id).await;
+                    }
+                    for id in replicas {
+                        let _ = store.delete_replica(id).await;
+                    }
+                });
+            });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use obleth_config::hash_api_key;
     use std::sync::OnceLock;
+
+    use super::test_support::FixtureGuard;
 
     // Serialise integration tests so DDL from migrate() never races with DML
     // from a concurrently running test. Each test must hold this guard for its
@@ -3018,21 +3116,23 @@ mod tests {
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` points at a
     /// throwaway Postgres. Skips silently otherwise so unit runs stay hermetic.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn tenant_key_audit_roundtrip() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
         let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
 
         let name = format!("t-{}", Uuid::new_v4());
         let tenant = store
             .create_tenant(&name, 250, 1000, Some(4), None)
             .await
             .expect("create tenant");
+        fixtures.track_tenant(tenant.id);
         assert_eq!(tenant.weight, 250);
 
         let (key, secret) = store
@@ -3097,6 +3197,7 @@ mod tests {
             )
             .await
             .expect("create model");
+        fixtures.track_model(model.id);
         let health = store
             .get_model_health_summary(model.id)
             .await
@@ -3243,15 +3344,16 @@ mod tests {
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     /// A single sub-threshold failure must NOT flip the displayed badge.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn health_status_badge_holds_below_threshold() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
         let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
 
         // Same positional create_model call as `tenant_key_audit_roundtrip`.
         let model = store
@@ -3281,6 +3383,7 @@ mod tests {
             )
             .await
             .expect("create model");
+        fixtures.track_model(model.id);
 
         store
             .update_model_health_config(
@@ -3371,15 +3474,16 @@ mod tests {
     /// `unhealthy` so a recovered endpoint returns to rotation — but it must not
     /// downgrade a confirmed `healthy`. Regression for endpoints stuck unhealthy
     /// after a Slurm replica restart until a manual check.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn endpoint_degraded_clears_unhealthy_but_not_healthy() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
         let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
 
         // Same positional create_model call as the other health tests.
         let model = store
@@ -3409,6 +3513,7 @@ mod tests {
             )
             .await
             .expect("create model");
+        fixtures.track_model(model.id);
 
         let ep = store
             .create_model_endpoint(
@@ -3510,7 +3615,7 @@ mod tests {
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     #[tokio::test]
     async fn control_plane_identity_is_idempotent() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -3556,7 +3661,7 @@ mod tests {
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     #[tokio::test]
     async fn reserved_control_plane_identity_is_protected() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -3597,15 +3702,16 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn managed_model_roundtrip() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
         let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
 
         // a model is required (FK). Reuse create_model with minimal args.
         let model_name = format!("m-{}", Uuid::new_v4());
@@ -3618,6 +3724,7 @@ mod tests {
             )
             .await
             .expect("create model");
+        fixtures.track_model(model.id);
 
         assert!(store
             .get_managed_model(model.id)
@@ -3674,15 +3781,16 @@ mod tests {
             .is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn managed_model_provision_error_set_and_clear() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
         let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("m-{}", Uuid::new_v4());
         let args = default_test_model(&model_name);
@@ -3694,6 +3802,7 @@ mod tests {
             )
             .await
             .expect("model");
+        fixtures.track_model(model.id);
         store
             .upsert_managed_model(UpsertManagedModel {
                 model_id: model.id,
@@ -3751,15 +3860,16 @@ mod tests {
         store.delete_managed_model(model.id).await.expect("delete");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn model_replica_roundtrip() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
         let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("m-{}", Uuid::new_v4());
         let args = default_test_model(&model_name);
@@ -3771,11 +3881,13 @@ mod tests {
             )
             .await
             .expect("create model");
+        fixtures.track_model(model.id);
 
         let r = store
             .create_replica(model.id, "job-123", None)
             .await
             .expect("create replica");
+        fixtures.track_replica(r.id);
         assert_eq!(r.state, "pending");
         assert_eq!(r.slurm_job_id, "job-123");
 
@@ -3840,7 +3952,7 @@ mod tests {
 
     #[tokio::test]
     async fn recipe_roundtrip() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -3886,7 +3998,7 @@ mod tests {
 
     #[tokio::test]
     async fn slurm_settings_roundtrip() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -3939,15 +4051,16 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn delete_lost_replicas_test() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
         let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("m-{}", Uuid::new_v4());
         let args = default_test_model(&model_name);
@@ -3959,16 +4072,19 @@ mod tests {
             )
             .await
             .expect("create model");
+        fixtures.track_model(model.id);
 
         // Insert two replicas.
         let r1 = store
             .create_replica(model.id, "job-loss-1", None)
             .await
             .expect("create replica 1");
+        fixtures.track_replica(r1.id);
         let r2 = store
             .create_replica(model.id, "job-loss-2", None)
             .await
             .expect("create replica 2");
+        fixtures.track_replica(r2.id);
 
         // Mark one as lost.
         store
@@ -3991,15 +4107,16 @@ mod tests {
         store.delete_replica(r2.id).await.expect("delete r2");
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn set_replica_message_test() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
         let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
 
         let model_name = format!("m-{}", Uuid::new_v4());
         let args = default_test_model(&model_name);
@@ -4011,11 +4128,13 @@ mod tests {
             )
             .await
             .expect("create model");
+        fixtures.track_model(model.id);
 
         let replica = store
             .create_replica(model.id, "job-msg-1", None)
             .await
             .expect("create replica");
+        fixtures.track_replica(replica.id);
 
         // A message-only update must persist without touching state.
         let updated = store
@@ -4039,15 +4158,16 @@ mod tests {
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     /// Deleting a model must NOT delete its replica rows — the provisioner needs
     /// them to drain the Slurm jobs they represent.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn deleting_model_leaves_replica_rows() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
         let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
 
         // Same positional create_model call as `tenant_key_audit_roundtrip`.
         let model = store
@@ -4077,11 +4197,13 @@ mod tests {
             )
             .await
             .expect("create model");
+        fixtures.track_model(model.id);
 
         let replica = store
             .create_replica(model.id, "slurm-job-12345", Some(8000))
             .await
             .expect("create replica");
+        fixtures.track_replica(replica.id);
 
         // Hard-delete the model. Before the cascade was dropped this also deleted
         // the replica row; now the row must survive.
@@ -4107,15 +4229,16 @@ mod tests {
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     /// Verifies that `debug_diagnostics` round-trips through the store and is
     /// not silently cleared back to `false` by an unrelated update's RETURNING.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn debug_diagnostics_round_trips_and_survives_unrelated_update() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
         let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
 
         let model = store
             .create_model(
@@ -4144,13 +4267,17 @@ mod tests {
             )
             .await
             .expect("create model");
+        fixtures.track_model(model.id);
 
         // Enable via the reliability update.
         let saved = store
             .update_model_reliability(model.id, None, 2, 200, "failover", true)
             .await
             .expect("update reliability");
-        assert!(saved.debug_diagnostics, "reliability update should persist the flag");
+        assert!(
+            saved.debug_diagnostics,
+            "reliability update should persist the flag"
+        );
 
         // A read SELECT must report it (not the tolerant default).
         assert!(
@@ -4158,8 +4285,14 @@ mod tests {
             "get_model must return the persisted flag"
         );
         assert!(
-            store.list_models().await.unwrap().iter()
-                .find(|m| m.id == model.id).unwrap().debug_diagnostics,
+            store
+                .list_models()
+                .await
+                .unwrap()
+                .iter()
+                .find(|m| m.id == model.id)
+                .unwrap()
+                .debug_diagnostics,
             "list_models must return the persisted flag"
         );
 

@@ -974,7 +974,11 @@ async fn proxy_handler_inner(
                     )
                     .await;
                     let diag_ms = (crate::tracer::now_ms() - diag_start) as u32;
-                    let status = if diag.dns.ok && diag.tcp.ok { "ok" } else { "error" };
+                    let status = if diag.dns.ok && diag.tcp.ok {
+                        "ok"
+                    } else {
+                        "error"
+                    };
                     t.record(
                         "upstream_diagnostics",
                         "proxy_request",
