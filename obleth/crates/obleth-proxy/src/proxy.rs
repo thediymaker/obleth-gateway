@@ -961,6 +961,29 @@ async fn proxy_handler_inner(
                         "error": last_err.clone().unwrap_or_default(),
                     }),
                 );
+                // Opt-in upstream diagnostics: only when this model has the flag
+                // on (and we're already tracing). Bounded, read-only DNS + TCP
+                // probe recorded as its own span before the trace is finished —
+                // it never alters the 502/504 returned below.
+                if route.as_ref().map(|r| r.debug_diagnostics).unwrap_or(false) {
+                    let diag_start = crate::tracer::now_ms();
+                    let diag = crate::diagnostics::probe_upstream(
+                        &url,
+                        &last_err.clone().unwrap_or_default(),
+                        std::time::Duration::from_millis(1500),
+                    )
+                    .await;
+                    let diag_ms = (crate::tracer::now_ms() - diag_start) as u32;
+                    let status = if diag.dns.ok && diag.tcp.ok { "ok" } else { "error" };
+                    t.record(
+                        "upstream_diagnostics",
+                        "proxy_request",
+                        diag_start,
+                        diag_ms,
+                        status,
+                        serde_json::to_value(&diag).unwrap_or_default(),
+                    );
+                }
                 t.finish("error");
             }
             state.metrics.record_upstream_attempt("exhausted");
@@ -3009,6 +3032,7 @@ mod tests {
             max_retries: 0,
             retry_backoff_ms: obleth_config::DEFAULT_RETRY_BACKOFF_MS,
             endpoint_selection_mode: obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
+            debug_diagnostics: false,
             endpoints,
         }
     }

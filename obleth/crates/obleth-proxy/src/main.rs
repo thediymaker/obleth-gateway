@@ -12,6 +12,7 @@ mod state;
 
 mod boons;
 mod classifier;
+mod diagnostics;
 pub mod tracer;
 
 use std::sync::Arc;
