@@ -36,7 +36,7 @@ const MODEL_TYPE_OPTIONS = [
   { value: "image", label: "Image generation" },
 ] as const;
 
-type Step = "connect" | "defaults" | "select" | "review";
+type Step = "connect" | "select" | "review";
 
 export function ProviderImportWizard({
   models,
@@ -111,7 +111,7 @@ export function ProviderImportWizard({
         };
       }
       setRows(initial);
-      setStep("defaults");
+      setStep("select");
     });
   }
 
@@ -230,55 +230,50 @@ export function ProviderImportWizard({
           </section>
         )}
 
-        {!result && step === "defaults" && (
-          <section className="space-y-4">
-            <p className="text-sm text-muted-foreground">
-              Discovered {discovered.length} models ({newRows.length} new, {existingCount} already imported).
-              Set defaults applied to every imported model; override per row next.
-            </p>
-            <div className="grid gap-4 md:grid-cols-2 md:max-w-2xl">
-              <div className="space-y-1.5">
-                <Label>Default type</Label>
-                <Select
-                  value={defaults.model_type}
-                  onChange={(e) => setDefaults((d) => ({ ...d, model_type: e.target.value }))}
-                >
-                  {MODEL_TYPE_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-              <NumberField
-                label="Context window"
-                value={defaults.context_window}
-                onChange={(v) => setDefaults((d) => ({ ...d, context_window: v }))}
-              />
-              <NumberField
-                label="Input cost / token"
-                value={defaults.input_cost_per_token}
-                onChange={(v) => setDefaults((d) => ({ ...d, input_cost_per_token: v }))}
-              />
-              <NumberField
-                label="Output cost / token"
-                value={defaults.output_cost_per_token}
-                onChange={(v) => setDefaults((d) => ({ ...d, output_cost_per_token: v }))}
-              />
-            </div>
-            <div className="flex justify-between">
-              <Button type="button" variant="outline" onClick={() => setStep("connect")}>
-                Back
-              </Button>
-              <Button type="button" onClick={() => setStep("select")}>
-                Next
-              </Button>
-            </div>
-          </section>
-        )}
-
         {!result && step === "select" && (
           <section className="space-y-3">
+            <p className="text-sm text-muted-foreground">
+              Discovered {discovered.length} {discovered.length === 1 ? "model" : "models"} ({newRows.length} new,{" "}
+              {existingCount} already imported).
+              {newRows.length > 0 ? " Pick the ones to import below." : " You already have every model this provider offers."}
+            </p>
+
+            <details className="rounded-md border border-border/70 bg-background/30" open={newRows.length > 0}>
+              <summary className="cursor-pointer select-none px-3 py-2 text-xs font-medium text-muted-foreground">
+                Defaults applied to every imported model (override per row below)
+              </summary>
+              <div className="grid gap-4 border-t border-border/60 p-3 md:grid-cols-2">
+                <div className="space-y-1.5">
+                  <Label>Default type</Label>
+                  <Select
+                    value={defaults.model_type}
+                    onChange={(e) => setDefaults((d) => ({ ...d, model_type: e.target.value }))}
+                  >
+                    {MODEL_TYPE_OPTIONS.map((o) => (
+                      <option key={o.value} value={o.value}>
+                        {o.label}
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+                <NumberField
+                  label="Context window"
+                  value={defaults.context_window}
+                  onChange={(v) => setDefaults((d) => ({ ...d, context_window: v }))}
+                />
+                <NumberField
+                  label="Input cost / token"
+                  value={defaults.input_cost_per_token}
+                  onChange={(v) => setDefaults((d) => ({ ...d, input_cost_per_token: v }))}
+                />
+                <NumberField
+                  label="Output cost / token"
+                  value={defaults.output_cost_per_token}
+                  onChange={(v) => setDefaults((d) => ({ ...d, output_cost_per_token: v }))}
+                />
+              </div>
+            </details>
+
             <div className="flex flex-wrap items-center gap-2">
               <div className="relative flex-1 min-w-48">
                 <Search className="absolute left-2.5 top-2.5 h-3.5 w-3.5 text-muted-foreground" />
@@ -360,7 +355,7 @@ export function ProviderImportWizard({
             </div>
 
             <div className="flex items-center justify-between">
-              <Button type="button" variant="outline" onClick={() => setStep("defaults")}>
+              <Button type="button" variant="outline" onClick={() => setStep("connect")}>
                 Back
               </Button>
               <div className="flex items-center gap-3">
