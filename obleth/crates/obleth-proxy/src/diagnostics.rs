@@ -110,9 +110,7 @@ pub async fn probe_upstream(
                         ok: first.is_some(),
                         ips,
                         ms: dns_started.elapsed().as_millis() as u64,
-                        err: first
-                            .is_none()
-                            .then(|| "resolved 0 addresses".to_string()),
+                        err: first.is_none().then(|| "resolved 0 addresses".to_string()),
                     },
                     first,
                 )
