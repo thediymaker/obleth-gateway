@@ -675,9 +675,9 @@ mod tests {
     /// throwaway Postgres. Skips silently otherwise so unit runs stay hermetic.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn backup_export_restore_roundtrip() {
-        use crate::test_support::FixtureGuard;
+        use crate::test_support::{test_db_url, FixtureGuard};
 
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };

@@ -3008,6 +3008,28 @@ fn model_health_claim_from_row(row: &PgRow) -> Result<ModelHealthClaim> {
 pub(crate) mod test_support {
     use super::*;
 
+    /// Reads OBLETH_TEST_DATABASE_URL for an integration test. Returns None when
+    /// unset (the test skips). Panics if it IS set but the database name doesn't
+    /// contain "test" — refuses to run the integration suite against a possibly
+    /// real/dev database, which is how fixtures previously leaked.
+    pub(crate) fn test_db_url() -> Option<String> {
+        let url = std::env::var("OBLETH_TEST_DATABASE_URL").ok()?;
+        let db = url
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .split('?')
+            .next()
+            .unwrap_or("");
+        assert!(
+            db.contains("test"),
+            "OBLETH_TEST_DATABASE_URL database name {db:?} is not a dedicated test DB \
+             (name must contain \"test\", e.g. obleth_test). Refusing to run integration \
+             tests against a possibly-real database."
+        );
+        Some(url)
+    }
+
     /// Tracks the fixture rows a test creates and deletes them when it drops —
     /// which happens even if the test panics on a failed assertion — so leaked
     /// `m-…`/`t-…` rows (and the replica rows they leave behind) never persist
@@ -3096,7 +3118,7 @@ mod tests {
     /// throwaway Postgres. Skips silently otherwise so unit runs stay hermetic.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn tenant_key_audit_roundtrip() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -3324,7 +3346,7 @@ mod tests {
     /// A single sub-threshold failure must NOT flip the displayed badge.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn health_status_badge_holds_below_threshold() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -3454,7 +3476,7 @@ mod tests {
     /// after a Slurm replica restart until a manual check.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn endpoint_degraded_clears_unhealthy_but_not_healthy() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -3593,7 +3615,7 @@ mod tests {
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     #[tokio::test]
     async fn control_plane_identity_is_idempotent() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -3639,7 +3661,7 @@ mod tests {
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     #[tokio::test]
     async fn reserved_control_plane_identity_is_protected() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -3682,7 +3704,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn managed_model_roundtrip() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -3761,7 +3783,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn managed_model_provision_error_set_and_clear() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -3840,7 +3862,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn model_replica_roundtrip() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -3930,7 +3952,7 @@ mod tests {
 
     #[tokio::test]
     async fn recipe_roundtrip() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -3976,7 +3998,7 @@ mod tests {
 
     #[tokio::test]
     async fn slurm_settings_roundtrip() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -4031,7 +4053,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn delete_lost_replicas_test() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -4087,7 +4109,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn set_replica_message_test() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -4138,7 +4160,7 @@ mod tests {
     /// them to drain the Slurm jobs they represent.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn deleting_model_leaves_replica_rows() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -4209,7 +4231,7 @@ mod tests {
     /// not silently cleared back to `false` by an unrelated update's RETURNING.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn debug_diagnostics_round_trips_and_survives_unrelated_update() {
-        let Ok(url) = std::env::var("OBLETH_TEST_DATABASE_URL") else {
+        let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
@@ -4252,7 +4274,10 @@ mod tests {
             .update_model_reliability(model.id, None, 2, 200, "failover", true)
             .await
             .expect("update reliability");
-        assert!(saved.debug_diagnostics, "reliability update should persist the flag");
+        assert!(
+            saved.debug_diagnostics,
+            "reliability update should persist the flag"
+        );
 
         // A read SELECT must report it (not the tolerant default).
         assert!(
@@ -4260,8 +4285,14 @@ mod tests {
             "get_model must return the persisted flag"
         );
         assert!(
-            store.list_models().await.unwrap().iter()
-                .find(|m| m.id == model.id).unwrap().debug_diagnostics,
+            store
+                .list_models()
+                .await
+                .unwrap()
+                .iter()
+                .find(|m| m.id == model.id)
+                .unwrap()
+                .debug_diagnostics,
             "list_models must return the persisted flag"
         );
 
