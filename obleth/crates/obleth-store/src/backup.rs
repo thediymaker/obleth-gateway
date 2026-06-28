@@ -731,5 +731,8 @@ mod tests {
             .expect("resolve")
             .expect("present");
         assert_eq!(resolved.tenant_id, tenant.id);
+
+        // Clean up: cascade-deletes the API key and clears the resolved-key cache.
+        store.delete_tenant(tenant.id).await.expect("delete tenant");
     }
 }
