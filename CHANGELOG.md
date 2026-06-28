@@ -4,6 +4,12 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.5.2
+The audit log now records who made each change, in a redesigned, filterable view.
+
+- **Every change is attributed to the person who made it.** Dashboard and self-service portal actions are now recorded in the audit log against the signed-in user's email instead of a generic `admin`; changes made automatically by the provisioner are recorded as `system`. This covers tenants, API keys, models, endpoints, replicas, MCP servers, and settings.
+- **Redesigned audit log.** Filter by actor, action, or target; each event shows an inline summary that expands to full detail; tenant ids resolve to tenant names; and the view adds page-size control, paging, and a mobile layout. Summary cards show event, actor, and target counts plus the latest event.
+
 ## v0.5.1
 Conversations stay together — for routing and for tracing — with nothing extra from callers.
 
