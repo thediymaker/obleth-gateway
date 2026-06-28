@@ -202,6 +202,8 @@ impl BoonEngine {
         }
 
         // ---- compression boon (lossless, Phase A) ----
+        // `is_chat` is always true here (past the earlier `if !is_chat` guard);
+        // the parameter exists so unit tests can exercise the ineligible path.
         if compression_eligible(route, &settings, is_chat) {
             let comp_start = crate::tracer::now_ms();
             let stats = compression::apply(&settings.compression, json);
@@ -580,6 +582,10 @@ mod tests {
         assert!(!compression_eligible(&route, &settings, false));
         // No grant -> ineligible.
         route.boons.clear();
+        assert!(!compression_eligible(&route, &settings, true));
+        // Global setting off -> ineligible (master switch).
+        route.boons = vec!["compression".to_string()];
+        settings.compression.enabled = false;
         assert!(!compression_eligible(&route, &settings, true));
     }
 

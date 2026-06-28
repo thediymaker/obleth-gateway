@@ -35,21 +35,25 @@ pub(crate) fn classify(text: &str) -> ContentKind {
 }
 
 /// Losslessly minify JSON text. Returns `Some(minified)` only when the result
-/// is strictly shorter and re-parses to the same value; otherwise `None`.
+/// is strictly shorter AND re-parses to a value equal to the original; otherwise `None`.
 pub(crate) fn compact_json(text: &str) -> Option<String> {
     let value: Value = serde_json::from_str(text.trim()).ok()?;
     let compact = serde_json::to_string(&value).ok()?;
-    if compact.len() < text.len() {
-        // `serde_json` round-trips losslessly by construction; the length
-        // guard ensures we only act when there is a real gain.
-        Some(compact)
-    } else {
-        None
+    if compact.len() >= text.len() {
+        return None;
     }
+    // Self-enforce the lossless invariant rather than relying on it by construction:
+    // only substitute when the compacted text re-parses to a value equal to the original.
+    if serde_json::from_str::<Value>(&compact).ok()? != value {
+        return None;
+    }
+    Some(compact)
 }
 
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct CompressionStats {
+    /// Number of segments above the `min_tokens` floor that were examined,
+    /// including non-JSON segments that classification subsequently skipped.
     pub scanned: u32,
     pub compressed: u32,
     pub tokens_before: u32,
@@ -159,6 +163,15 @@ mod tests {
     #[test]
     fn already_compact_json_returns_none() {
         assert_eq!(compact_json("{\"a\":1}"), None);
+    }
+
+    #[test]
+    fn compact_json_is_lossless_despite_key_reordering() {
+        let input = "{\n  \"z\": 99,\n  \"a\": 1\n}";
+        let out = compact_json(input).expect("should compact");
+        let before: serde_json::Value = serde_json::from_str(input).unwrap();
+        let after: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(before, after); // Value equality holds even though keys may reorder
     }
 
     #[test]

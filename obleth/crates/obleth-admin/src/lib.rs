@@ -1531,10 +1531,15 @@ pub struct UpdateBoonSettings {
     /// built-in default; omit the field to leave it unchanged.
     #[serde(default)]
     pub tool_loop_nudge: Option<String>,
+    /// Enable or disable the compression boon globally. Omit to leave unchanged.
     #[serde(default)]
     pub compression_enabled: Option<bool>,
+    /// Minimum heuristic token count for a segment to be considered for compaction.
+    /// A value of `0` is a no-op and leaves the existing setting unchanged.
     #[serde(default)]
     pub compression_min_tokens: Option<u32>,
+    /// Maximum number of segments that may be compacted per request.
+    /// A value of `0` is a no-op and leaves the existing setting unchanged.
     #[serde(default)]
     pub compression_max_segments: Option<u32>,
 }
