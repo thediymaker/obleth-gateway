@@ -4,6 +4,8 @@
 //! gated per-model and by global settings. Fail-open like every boon — any
 //! error or absence of gain leaves the request untouched.
 
+use obleth_config::CompressionBoonSettings;
+use obleth_tokenizer::{HeuristicTokenizer, Tokenizer};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,9 +48,76 @@ pub(crate) fn compact_json(text: &str) -> Option<String> {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct CompressionStats {
+    pub scanned: u32,
+    pub compressed: u32,
+    pub tokens_before: u32,
+    pub tokens_after: u32,
+}
+
+/// Compact eligible JSON segments of `messages[]` in place. Phase A is lossless
+/// and deterministic; it never calls a helper model or touches the network.
+pub(super) fn apply(cfg: &CompressionBoonSettings, json: &mut Value) -> CompressionStats {
+    let tk = HeuristicTokenizer::new();
+    let mut stats = CompressionStats::default();
+    let Some(messages) = json.get_mut("messages").and_then(|m| m.as_array_mut()) else {
+        return stats;
+    };
+    for msg in messages.iter_mut() {
+        if stats.compressed >= cfg.max_segments {
+            break;
+        }
+        // Two content shapes: a plain string, or an array of typed parts.
+        match msg.get_mut("content") {
+            Some(Value::String(s)) => {
+                try_compact_string(cfg, &tk, s, &mut stats);
+            }
+            Some(Value::Array(parts)) => {
+                for part in parts.iter_mut() {
+                    if stats.compressed >= cfg.max_segments {
+                        break;
+                    }
+                    if let Some(Value::String(s)) = part.get_mut("text") {
+                        try_compact_string(cfg, &tk, s, &mut stats);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    stats
+}
+
+/// Apply the threshold + classify + compact pipeline to one string segment,
+/// rewriting it in place and updating `stats`.
+fn try_compact_string(
+    cfg: &CompressionBoonSettings,
+    tk: &HeuristicTokenizer,
+    s: &mut String,
+    stats: &mut CompressionStats,
+) {
+    let before = tk.count_text(s);
+    if before < cfg.min_tokens {
+        return;
+    }
+    stats.scanned += 1;
+    if classify(s) != ContentKind::Json {
+        return;
+    }
+    if let Some(compact) = compact_json(s) {
+        let after = tk.count_text(&compact);
+        stats.tokens_before = stats.tokens_before.saturating_add(before);
+        stats.tokens_after = stats.tokens_after.saturating_add(after);
+        stats.compressed += 1;
+        *s = compact;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn classifies_json_object() {
@@ -95,5 +164,51 @@ mod tests {
     #[test]
     fn non_json_returns_none() {
         assert_eq!(compact_json("just some prose"), None);
+    }
+
+    #[test]
+    fn apply_compacts_large_json_message() {
+        let big_array: Vec<i64> = (0..500).collect();
+        let pretty = serde_json::to_string_pretty(&json!({ "rows": big_array })).unwrap();
+        let mut body = json!({
+            "model": "m",
+            "messages": [
+                { "role": "system", "content": "be helpful" },
+                { "role": "tool", "content": pretty }
+            ]
+        });
+        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64 };
+        let stats = apply(&cfg, &mut body);
+        assert_eq!(stats.compressed, 1);
+        assert!(stats.tokens_after < stats.tokens_before);
+        // The tool message is now compact (no newline indentation).
+        let tool = body["messages"][1]["content"].as_str().unwrap();
+        assert!(!tool.contains("\n  "));
+    }
+
+    #[test]
+    fn apply_skips_small_segments() {
+        let mut body = json!({
+            "model": "m",
+            "messages": [ { "role": "tool", "content": "{\"a\": 1}" } ]
+        });
+        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 512, max_segments: 64 };
+        let stats = apply(&cfg, &mut body);
+        assert_eq!(stats.compressed, 0);
+    }
+
+    #[test]
+    fn apply_respects_max_segments() {
+        let big = serde_json::to_string_pretty(&json!({ "rows": (0..500).collect::<Vec<i64>>() })).unwrap();
+        let mut body = json!({
+            "model": "m",
+            "messages": [
+                { "role": "tool", "content": big.clone() },
+                { "role": "tool", "content": big }
+            ]
+        });
+        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 1 };
+        let stats = apply(&cfg, &mut body);
+        assert_eq!(stats.compressed, 1);
     }
 }
