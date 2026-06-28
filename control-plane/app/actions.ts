@@ -220,7 +220,7 @@ function parseWeeklyWindows(value: FormDataEntryValue | null) {
 }
 
 export async function createTenantAction(formData: FormData): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   const parsed = tenantCreateSchema.safeParse({
     name: formData.get("name"),
     description: formData.get("description"),
@@ -262,7 +262,7 @@ export async function createTenantAction(formData: FormData): Promise<ActionResu
       tokens_per_minute: data.tokens_per_minute ?? 0,
       max_in_flight: data.max_in_flight,
       fairshare_group: data.fairshare_group || undefined,
-    });
+    }, { auditActor: session.email });
 
     if (data.description || data.organization || data.contact_email) {
       await obleth.updateTenant(tenant.id, {
@@ -270,11 +270,11 @@ export async function createTenantAction(formData: FormData): Promise<ActionResu
         description: data.description,
         organization: data.organization,
         contact_email: data.contact_email ?? "",
-      });
+      }, { auditActor: session.email });
     }
 
     if (data.status !== "active") {
-      await obleth.setTenantStatus(tenant.id, data.status);
+      await obleth.setTenantStatus(tenant.id, data.status, { auditActor: session.email });
     }
 
     const hasSchedule =
@@ -288,7 +288,7 @@ export async function createTenantAction(formData: FormData): Promise<ActionResu
         active_from: data.active_from ?? null,
         active_until: data.active_until ?? null,
         weekly_windows: windows.data.length ? windows.data : null,
-      });
+      }, { auditActor: session.email });
     }
 
     const hasBudget =
@@ -300,11 +300,11 @@ export async function createTenantAction(formData: FormData): Promise<ActionResu
         budget_tokens: data.budget_tokens ?? null,
         budget_cost_usd: data.budget_cost_usd ?? null,
         budget_period: data.budget_period,
-      });
+      }, { auditActor: session.email });
     }
 
     if (allowed_models.length > 0) {
-      await obleth.setTenantAllowlist(tenant.id, allowed_models);
+      await obleth.setTenantAllowlist(tenant.id, allowed_models, { auditActor: session.email });
     }
   } catch (e) {
     return actionError(e);
@@ -318,7 +318,7 @@ export async function createTenantAction(formData: FormData): Promise<ActionResu
 }
 
 export async function updateTenantAction(formData: FormData) {
-  await requireAdmin();
+  const session = await requireAdmin();
   const parsed = tenantUpdateSchema.safeParse({
     id: formData.get("id"),
     name: formData.get("name"),
@@ -333,16 +333,16 @@ export async function updateTenantAction(formData: FormData) {
     description: rest.description,
     organization: rest.organization,
     contact_email: rest.contact_email ?? "",
-  });
+  }, { auditActor: session.email });
   updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/");
 }
 
 export async function setTenantStatusAction(id: string, status: string) {
-  await requireAdmin();
+  const session = await requireAdmin();
   if (!id) return;
-  await obleth.setTenantStatus(id, status);
+  await obleth.setTenantStatus(id, status, { auditActor: session.email });
   updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/fairshare");
@@ -360,10 +360,10 @@ export async function setTenantScheduleAction(
       | null;
   },
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   if (!id) return { ok: false, error: "Missing tenant id" };
   try {
-    await obleth.setTenantSchedule(id, body);
+    await obleth.setTenantSchedule(id, body, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -383,10 +383,10 @@ export async function setTenantBudgetAction(
     budget_started_at?: string | null;
   },
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   if (!id) return { ok: false, error: "Missing tenant id" };
   try {
-    await obleth.setTenantBudget(id, body);
+    await obleth.setTenantBudget(id, body, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -400,10 +400,10 @@ export async function setTenantAllowlistAction(
   id: string,
   allowed_models: string[],
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   if (!id) return { ok: false, error: "Missing tenant id" };
   try {
-    await obleth.setTenantAllowlist(id, allowed_models);
+    await obleth.setTenantAllowlist(id, allowed_models, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -417,10 +417,10 @@ export async function setTenantGuardrailsAction(
   id: string,
   policy: GuardrailsPolicy | null,
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   if (!id) return { ok: false, error: "Missing tenant id" };
   try {
-    await obleth.setTenantGuardrails(id, policy);
+    await obleth.setTenantGuardrails(id, policy, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -431,9 +431,9 @@ export async function setTenantGuardrailsAction(
 }
 
 export async function deleteTenantAction(id: string) {
-  await requireAdmin();
+  const session = await requireAdmin();
   if (!id) return;
-  await obleth.deleteTenant(id);
+  await obleth.deleteTenant(id, { auditActor: session.email });
   updateTag(CACHE_TAGS.tenants);
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/tenants");
@@ -443,8 +443,8 @@ export async function deleteTenantAction(id: string) {
 }
 
 export async function setWeightAction(id: string, weight: number) {
-  await requireAdmin();
-  await obleth.setWeight(id, weight);
+  const session = await requireAdmin();
+  await obleth.setWeight(id, weight, { auditActor: session.email });
   updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/fairshare");
@@ -452,12 +452,12 @@ export async function setWeightAction(id: string, weight: number) {
 }
 
 export async function setQuotaAction(formData: FormData) {
-  await requireAdmin();
+  const session = await requireAdmin();
   const id = String(formData.get("id"));
   const tpm = numOrUndef(formData.get("tokens_per_minute")) ?? 0;
   const mif = numOrNull(formData.get("max_in_flight"));
   if (!id || tpm < 0 || (mif !== null && mif <= 0)) return;
-  await obleth.setQuota(id, tpm, mif);
+  await obleth.setQuota(id, tpm, mif, { auditActor: session.email });
   updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
   revalidatePath("/");
@@ -555,8 +555,8 @@ export async function toggleKeyTracingAction(id: string, tracing_enabled: boolea
 }
 
 export async function toggleTenantTracingAction(id: string, tracing_enabled: boolean) {
-  await requireAdmin();
-  await obleth.setTenantTracing(id, tracing_enabled);
+  const session = await requireAdmin();
+  await obleth.setTenantTracing(id, tracing_enabled, { auditActor: session.email });
   updateTag(CACHE_TAGS.tenants);
   revalidatePath("/tenants");
 }
@@ -632,8 +632,8 @@ export async function deleteFilteredKeysAction(filters: {
 }
 
 export async function setCapacityAction(max: number) {
-  await requireAdmin();
-  await obleth.setCapacity(max);
+  const session = await requireAdmin();
+  await obleth.setCapacity(max, { auditActor: session.email });
   revalidatePath("/");
   revalidatePath("/fairshare");
 }
@@ -641,7 +641,7 @@ export async function setCapacityAction(max: number) {
 export async function createModelAction(
   formData: FormData,
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   const parsed = modelCreateSchema.safeParse({
     model_name: formData.get("model_name"),
     description: formData.get("description"),
@@ -689,7 +689,7 @@ export async function createModelAction(
       tags,
       boons: boonsFromForm(formData),
       tool_servers: toolServersFromForm(formData),
-    });
+    }, { auditActor: session.email });
 
     if (isSlurm) {
       await obleth.putManagedModel(created.id, {
@@ -719,7 +719,7 @@ export async function createModelAction(
         time_limit: strOrNull(formData.get("slurm_time_limit")) ?? null,
         constraints: strOrNull(formData.get("slurm_constraints")) ?? null,
         exclude: strOrNull(formData.get("slurm_exclude")) ?? null,
-      });
+      }, { auditActor: session.email });
     }
   } catch (e) {
     return actionError(e);
@@ -733,8 +733,8 @@ export async function setModelCapacityAction(
   id: string,
   max_in_flight: number | null,
 ) {
-  await requireAdmin();
-  await obleth.setModelCapacity(id, max_in_flight);
+  const session = await requireAdmin();
+  await obleth.setModelCapacity(id, max_in_flight, { auditActor: session.email });
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
@@ -744,8 +744,8 @@ export async function setModelCapacityModeAction(
   id: string,
   capacityMode: string,
 ) {
-  await requireAdmin();
-  await obleth.setModelCapacityMode(id, capacityMode);
+  const session = await requireAdmin();
+  await obleth.setModelCapacityMode(id, capacityMode, { auditActor: session.email });
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
@@ -759,18 +759,18 @@ export async function autotuneModelAction(
     replicas?: number;
   },
 ): Promise<AutotuneReport> {
-  await requireAdmin();
+  const session = await requireAdmin();
   // Recommend-only: drives a live probe against the upstream and returns the
   // suggested capacity. Nothing is persisted here.
-  return obleth.autotuneModel(id, opts);
+  return obleth.autotuneModel(id, opts, { auditActor: session.email });
 }
 
 export async function applyAutotuneCapacityAction(
   id: string,
   max_in_flight: number,
 ) {
-  await requireAdmin();
-  await obleth.applyAutotuneCapacity(id, max_in_flight);
+  const session = await requireAdmin();
+  await obleth.applyAutotuneCapacity(id, max_in_flight, { auditActor: session.email });
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
@@ -780,16 +780,16 @@ export async function setModelWeightAction(
   id: string,
   admission_weight: number,
 ) {
-  await requireAdmin();
-  await obleth.setModelWeight(id, admission_weight);
+  const session = await requireAdmin();
+  await obleth.setModelWeight(id, admission_weight, { auditActor: session.email });
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
 }
 
 export async function deleteModelAction(id: string) {
-  await requireAdmin();
-  await obleth.deleteModel(id);
+  const session = await requireAdmin();
+  await obleth.deleteModel(id, { auditActor: session.email });
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
 }
@@ -799,8 +799,8 @@ export async function setModelCacheAction(
   enabled: boolean,
   ttlSecs?: number,
 ) {
-  await requireAdmin();
-  await obleth.setModelCache(id, enabled, ttlSecs);
+  const session = await requireAdmin();
+  await obleth.setModelCache(id, enabled, ttlSecs, { auditActor: session.email });
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
 }
@@ -814,8 +814,8 @@ export async function setModelReliabilityAction(
     endpoint_selection_mode: string;
   },
 ) {
-  await requireAdmin();
-  await obleth.setModelReliability(id, body);
+  const session = await requireAdmin();
+  await obleth.setModelReliability(id, body, { auditActor: session.email });
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
 }
@@ -824,7 +824,7 @@ export async function createModelEndpointAction(
   id: string,
   formData: FormData,
 ) {
-  await requireAdmin();
+  const session = await requireAdmin();
   await obleth.createModelEndpoint(id, {
     name: String(formData.get("name") ?? "").trim(),
     api_base: String(formData.get("api_base") ?? "").trim(),
@@ -832,7 +832,7 @@ export async function createModelEndpointAction(
     priority: numOr(formData.get("priority"), 100),
     weight: numOr(formData.get("weight"), 100),
     enabled: formData.get("enabled") !== "off",
-  });
+  }, { auditActor: session.email });
   revalidatePath("/models");
 }
 
@@ -848,8 +848,8 @@ export async function updateModelEndpointAction(
     enabled?: boolean;
   },
 ) {
-  await requireAdmin();
-  await obleth.updateModelEndpoint(id, endpointId, body);
+  const session = await requireAdmin();
+  await obleth.updateModelEndpoint(id, endpointId, body, { auditActor: session.email });
   revalidatePath("/models");
 }
 
@@ -857,8 +857,8 @@ export async function deleteModelEndpointAction(
   id: string,
   endpointId: string,
 ) {
-  await requireAdmin();
-  await obleth.deleteModelEndpoint(id, endpointId);
+  const session = await requireAdmin();
+  await obleth.deleteModelEndpoint(id, endpointId, { auditActor: session.email });
   revalidatePath("/models");
 }
 
@@ -912,7 +912,7 @@ export async function updateModelConnectionAction(
   _prev: ModelActionState | null,
   formData: FormData,
 ): Promise<ModelActionState> {
-  await requireAdmin();
+  const session = await requireAdmin();
   const id = String(formData.get("id") ?? "");
   if (!id) return { ok: false, error: "Missing model id." };
   const current = await loadModel(id);
@@ -933,7 +933,7 @@ export async function updateModelConnectionAction(
       cost_per_character: numOr(formData.get("cost_per_character"), current.cost_per_character),
       cost_per_audio_second: numOr(formData.get("cost_per_audio_second"), current.cost_per_audio_second),
       ...(newKey ? { api_key: newKey } : {}),
-    });
+    }, { auditActor: session.email });
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Save failed." };
   }
@@ -949,7 +949,7 @@ export async function updateModelCapabilitiesAction(
   _prev: ModelActionState | null,
   formData: FormData,
 ): Promise<ModelActionState> {
-  await requireAdmin();
+  const session = await requireAdmin();
   const id = String(formData.get("id") ?? "");
   if (!id) return { ok: false, error: "Missing model id." };
   const current = await loadModel(id);
@@ -968,7 +968,7 @@ export async function updateModelCapabilitiesAction(
       tags,
       boons: boonsFromForm(formData),
       tool_servers: toolServersFromForm(formData),
-    });
+    }, { auditActor: session.email });
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Save failed." };
   }
@@ -1050,7 +1050,7 @@ export async function planModelImportAction(
 export async function importModelsAction(
   text: string,
 ): Promise<ImportModelsResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   const read = readModelInputs(text);
   if (read.error) return { ok: false, error: read.error };
   const inputs = read.inputs;
@@ -1111,7 +1111,7 @@ export async function importModelsAction(
         enabled: input.enabled ?? found.enabled,
         tags: input.tags ?? found.tags,
         boons: input.boons ?? found.boons,
-      });
+      }, { auditActor: session.email });
       return "updated";
     }
     await obleth.createModel({
@@ -1137,7 +1137,7 @@ export async function importModelsAction(
       enabled: input.enabled ?? true,
       tags: input.tags ?? [],
       boons: input.boons ?? [],
-    });
+    }, { auditActor: session.email });
     return "created";
   };
 
@@ -1179,7 +1179,7 @@ export type RestoreBackupResult =
 export async function restoreBackupAction(
   text: string,
 ): Promise<RestoreBackupResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
 
   let parsed: ConfigBackup;
   try {
@@ -1192,7 +1192,7 @@ export async function restoreBackupAction(
   }
 
   try {
-    const report = await obleth.restoreBackup(parsed);
+    const report = await obleth.restoreBackup(parsed, { auditActor: session.email });
     updateTag(CACHE_TAGS.tenants);
     updateTag(CACHE_TAGS.keys);
     updateTag(CACHE_TAGS.models);
@@ -1211,7 +1211,7 @@ export async function restoreBackupAction(
 }
 
 export async function setModelHealthConfigAction(formData: FormData) {
-  await requireAdmin();
+  const session = await requireAdmin();
   const id = String(formData.get("id") ?? "");
   if (!id) return;
   await obleth.setModelHealthConfig(id, {
@@ -1221,14 +1221,14 @@ export async function setModelHealthConfigAction(formData: FormData) {
     failure_threshold: numOr(formData.get("failure_threshold"), 2),
     maintenance_until: datetimeOrNull(formData.get("maintenance_until")),
     maintenance_note: strOrNull(formData.get("maintenance_note")) ?? null,
-  });
+  }, { auditActor: session.email });
   revalidatePath("/models");
 }
 
 export async function createMcpServerAction(
   formData: FormData,
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   const parsed = mcpCreateSchema.safeParse({
     name: formData.get("name"),
     upstream_url: formData.get("upstream_url"),
@@ -1239,7 +1239,7 @@ export async function createMcpServerAction(
       name: parsed.data.name,
       upstream_url: parsed.data.upstream_url,
       auth_header: strOrNull(formData.get("auth_header")),
-    });
+    }, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -1252,23 +1252,23 @@ export async function toggleMcpServerAction(
   upstreamUrl: string,
   enabled: boolean,
 ) {
-  await requireAdmin();
-  await obleth.updateMcpServer(id, { upstream_url: upstreamUrl, enabled });
+  const session = await requireAdmin();
+  await obleth.updateMcpServer(id, { upstream_url: upstreamUrl, enabled }, { auditActor: session.email });
   revalidatePath("/mcp");
 }
 
 export async function deleteMcpServerAction(id: string) {
-  await requireAdmin();
-  await obleth.deleteMcpServer(id);
+  const session = await requireAdmin();
+  await obleth.deleteMcpServer(id, { auditActor: session.email });
   revalidatePath("/mcp");
 }
 
 export async function setAlertSettingsAction(
   body: UpdateAlertSettings,
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   try {
-    await obleth.setAlertSettings(body);
+    await obleth.setAlertSettings(body, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -1279,9 +1279,9 @@ export async function setAlertSettingsAction(
 export async function setAutoRouterSettingsAction(
   body: UpdateAutoRouterSettings,
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   try {
-    await obleth.setAutoRouterSettings(body);
+    await obleth.setAutoRouterSettings(body, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -1292,9 +1292,9 @@ export async function setAutoRouterSettingsAction(
 export async function setBoonSettingsAction(
   body: UpdateBoonSettings,
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   try {
-    await obleth.setBoonSettings(body);
+    await obleth.setBoonSettings(body, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -1305,9 +1305,9 @@ export async function setBoonSettingsAction(
 export async function setCharoSettingsAction(
   enabled: boolean,
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   try {
-    await obleth.setCharoSettings({ enabled });
+    await obleth.setCharoSettings({ enabled }, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -1319,9 +1319,9 @@ export async function setCharoSettingsAction(
 export async function setSlurmSettingsAction(
   body: UpdateSlurmSettings,
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   try {
-    await obleth.setSlurmSettings(body);
+    await obleth.setSlurmSettings(body, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -1346,12 +1346,12 @@ export async function testSlurmConnectionAction(): Promise<
 export async function setUsageRetentionAction(
   days: number,
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   if (!Number.isFinite(days) || days < 1) {
     return { ok: false, error: "Retention must be at least 1 day" };
   }
   try {
-    await obleth.setUsageRetention(Math.floor(days));
+    await obleth.setUsageRetention(Math.floor(days), { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -1362,9 +1362,9 @@ export async function setUsageRetentionAction(
 export async function compactUsageAction(): Promise<
   ActionResult & { partitionsDropped?: number; retentionDays?: number }
 > {
-  await requireAdmin();
+  const session = await requireAdmin();
   try {
-    const res = await obleth.compactUsage();
+    const res = await obleth.compactUsage({ auditActor: session.email });
     return {
       ok: true,
       partitionsDropped: res.partitions_dropped,
@@ -1627,8 +1627,8 @@ function coerceBool(v: unknown): boolean | undefined {
 }
 
 export async function clearLostReplicasAction(modelId: string): Promise<ActionResult> {
-  await requireAdmin();
-  try { await obleth.clearLostReplicas(modelId); }
+  const session = await requireAdmin();
+  try { await obleth.clearLostReplicas(modelId, { auditActor: session.email }); }
   catch (e) { return actionError(e); }
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
@@ -1636,8 +1636,8 @@ export async function clearLostReplicasAction(modelId: string): Promise<ActionRe
 }
 
 export async function restartReplicaAction(replicaId: string): Promise<ActionResult> {
-  await requireAdmin();
-  try { await obleth.restartReplica(replicaId); }
+  const session = await requireAdmin();
+  try { await obleth.restartReplica(replicaId, { auditActor: session.email }); }
   catch (e) { return actionError(e); }
   return { ok: true };
 }
@@ -1645,12 +1645,12 @@ export async function restartReplicaAction(replicaId: string): Promise<ActionRes
 export async function saveTemplateAction(
   input: { id?: string; name: string; body: string },
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   const parsed = parseRecipe(input.id ?? "new", input.body);
   if (!parsed.valid) return { ok: false, error: parsed.error ?? "invalid recipe" };
   try {
-    if (input.id) await obleth.updateRecipe(input.id, { name: input.name, body: input.body });
-    else await obleth.createRecipe({ name: input.name, body: input.body });
+    if (input.id) await obleth.updateRecipe(input.id, { name: input.name, body: input.body }, { auditActor: session.email });
+    else await obleth.createRecipe({ name: input.name, body: input.body }, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -1659,9 +1659,9 @@ export async function saveTemplateAction(
 }
 
 export async function deleteTemplateAction(id: string): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   try {
-    await obleth.deleteRecipe(id);
+    await obleth.deleteRecipe(id, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -1673,7 +1673,7 @@ export async function deployRecipeAction(
   id: string,
   overrides?: DeployOverrides,
 ): Promise<ActionResult> {
-  await requireAdmin();
+  const session = await requireAdmin();
   const recipe = await resolveRecipeById(id);
   if (!recipe) return { ok: false, error: `recipe "${id}" not found` };
   if (!recipe.valid) return { ok: false, error: recipe.error ?? "recipe is invalid" };
@@ -1685,8 +1685,8 @@ export async function deployRecipeAction(
       upstream_model: createBody.upstream_model,
       api_base: createBody.api_base,
       model_type: createBody.model_type,
-    });
-    await obleth.putManagedModel(created.id, managedBody);
+    }, { auditActor: session.email });
+    await obleth.putManagedModel(created.id, managedBody, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
