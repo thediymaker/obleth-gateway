@@ -81,14 +81,30 @@ struct Wizard {
 impl Wizard {
     /// A fresh wizard pre-filled from the last saved run (secrets excluded).
     fn from_saved(cli: &Cli, saved: &crate::persist::SavedSpec) -> Self {
-        let target = if saved.target == "live" { Target::Live } else { Target::Demo };
+        let target = if saved.target == "live" {
+            Target::Live
+        } else {
+            Target::Demo
+        };
         let profile = parse_profile(&saved.profile).unwrap_or(Profile::Smoke);
-        let input_tokens = if saved.input_tokens > 0 { saved.input_tokens } else { cli.input_tokens };
+        let input_tokens = if saved.input_tokens > 0 {
+            saved.input_tokens
+        } else {
+            cli.input_tokens
+        };
         // Seed the throughput knobs from the saved run, falling back to the
         // chosen profile's baseline when unset.
         let base = crate::profiles::plan::base_plan(profile);
-        let conc = if saved.conc > 0 { saved.conc } else { base.conc };
-        let output_tokens = if saved.output_tokens > 0 { saved.output_tokens } else { base.output_tokens };
+        let conc = if saved.conc > 0 {
+            saved.conc
+        } else {
+            base.conc
+        };
+        let output_tokens = if saved.output_tokens > 0 {
+            saved.output_tokens
+        } else {
+            base.output_tokens
+        };
         // Tenant keys are never restored: a saved label without its secret is
         // useless, so the user always re-adds keys for each run.
         Self {
@@ -106,7 +122,11 @@ impl Wizard {
             keys: Vec::new(),
             live_models: saved.live_models.clone(),
             live_selected: vec![false; saved.live_models.len()],
-            fixture_all: if saved.target.is_empty() { true } else { saved.fixture_all },
+            fixture_all: if saved.target.is_empty() {
+                true
+            } else {
+                saved.fixture_all
+            },
             fixture_model: saved.fixture_model.clone(),
             settings_row: 0,
         }
@@ -122,7 +142,10 @@ impl Wizard {
             .map(|(n, _)| n.clone())
             .collect();
         crate::persist::SavedSpec {
-            target: match self.target { Target::Demo => "demo".into(), Target::Live => "live".into() },
+            target: match self.target {
+                Target::Demo => "demo".into(),
+                Target::Live => "live".into(),
+            },
             profile: format!("{:?}", self.profile).to_lowercase(),
             input_tokens: self.input_tokens,
             conc: self.conc,
@@ -168,7 +191,9 @@ impl Wizard {
     /// `extreme` is demo-only, so switching to live moves off it).
     fn clamp_profile(&mut self) {
         let profiles = selectable_profiles(self.target);
-        let ok = profiles.iter().any(|(p, enabled)| *p == self.profile && *enabled);
+        let ok = profiles
+            .iter()
+            .any(|(p, enabled)| *p == self.profile && *enabled);
         if !ok {
             if let Some((p, _)) = profiles.iter().find(|(_, e)| *e) {
                 self.profile = *p;
@@ -216,22 +241,49 @@ fn review_items(w: &Wizard) -> Vec<(String, ReviewAction)> {
         Target::Demo => "demo  (local GPU-free backend)",
         Target::Live => "live  (remote obleth gateway)",
     };
-    v.push((format!("target:    {tname}"), ReviewAction::Goto(Step::PickTarget)));
+    v.push((
+        format!("target:    {tname}"),
+        ReviewAction::Goto(Step::PickTarget),
+    ));
 
     match w.target {
         Target::Live => {
-            let url = if w.live_url.is_empty() { "(not set)".to_string() } else { w.live_url.clone() };
-            v.push((format!("endpoint:  {url}"), ReviewAction::Goto(Step::LiveUrl)));
-            let withsec = w.keys.iter().filter(|k| !k.secret.trim().is_empty()).count();
+            let url = if w.live_url.is_empty() {
+                "(not set)".to_string()
+            } else {
+                w.live_url.clone()
+            };
+            v.push((
+                format!("endpoint:  {url}"),
+                ReviewAction::Goto(Step::LiveUrl),
+            ));
+            let withsec = w
+                .keys
+                .iter()
+                .filter(|k| !k.secret.trim().is_empty())
+                .count();
             let keysum = if w.keys.is_empty() {
                 "(none — press to add)".to_string()
             } else {
-                format!("{} tenant key(s), {withsec} ready this session", w.keys.len())
+                format!(
+                    "{} tenant key(s), {withsec} ready this session",
+                    w.keys.len()
+                )
             };
-            v.push((format!("keys:      {keysum}"), ReviewAction::Goto(Step::KeysList)));
+            v.push((
+                format!("keys:      {keysum}"),
+                ReviewAction::Goto(Step::KeysList),
+            ));
             let models = w.selected_live_models();
-            let msum = if models.is_empty() { "(none selected)".to_string() } else { models.join(", ") };
-            v.push((format!("models:    {msum}"), ReviewAction::Goto(Step::LivePickModels)));
+            let msum = if models.is_empty() {
+                "(none selected)".to_string()
+            } else {
+                models.join(", ")
+            };
+            v.push((
+                format!("models:    {msum}"),
+                ReviewAction::Goto(Step::LivePickModels),
+            ));
         }
         Target::Demo => {
             let scope = if w.fixture_all {
@@ -239,7 +291,10 @@ fn review_items(w: &Wizard) -> Vec<(String, ReviewAction)> {
             } else {
                 format!("single: {}", w.fixture_model)
             };
-            v.push((format!("scope:     {scope}"), ReviewAction::Goto(Step::FixtureScope)));
+            v.push((
+                format!("scope:     {scope}"),
+                ReviewAction::Goto(Step::FixtureScope),
+            ));
         }
     }
 
@@ -260,7 +315,11 @@ fn review_items(w: &Wizard) -> Vec<(String, ReviewAction)> {
 /// Optional advisory note shown under the review rows (e.g. the fairshare hint).
 fn review_note(w: &Wizard) -> Option<String> {
     if w.target == Target::Live {
-        let withsec = w.keys.iter().filter(|k| !k.secret.trim().is_empty()).count();
+        let withsec = w
+            .keys
+            .iter()
+            .filter(|k| !k.secret.trim().is_empty())
+            .count();
         if withsec < 2 {
             return Some(
                 "tip: add 2+ tenant keys to see fairshare contention — one key just measures throughput"
@@ -332,7 +391,10 @@ fn selectable_profiles(target: Target) -> Vec<(Profile, bool)> {
 }
 
 fn fixture_model_list() -> Vec<String> {
-    fleet::FIXTURE_MODELS.iter().map(|s| s.to_string()).collect()
+    fleet::FIXTURE_MODELS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 pub async fn run(cli: &Cli) -> Result<()> {
@@ -404,8 +466,14 @@ async fn run_state_machine(
             }
             Step::FixtureScope => {
                 let scopes: &[(&str, &str)] = &[
-                    ("all models", "drive the whole obench-* demo fleet (5 models)"),
-                    ("single model", "drive one model you pick on the next screen"),
+                    (
+                        "all models",
+                        "drive the whole obench-* demo fleet (5 models)",
+                    ),
+                    (
+                        "single model",
+                        "drive one model you pick on the next screen",
+                    ),
                 ];
                 terminal.draw(|f| draw_pick_scope(f, w.target, scopes, w.cursor))?;
             }
@@ -423,9 +491,7 @@ async fn run_state_machine(
             }
             Step::Settings => {
                 let profiles = selectable_profiles(w.target);
-                terminal.draw(|f| {
-                    draw_settings(f, &w, &profiles)
-                })?;
+                terminal.draw(|f| draw_settings(f, &w, &profiles))?;
             }
             Step::Review => {
                 let items = review_items(&w);
@@ -443,7 +509,9 @@ async fn run_state_machine(
         if !event::poll(Duration::from_millis(200))? {
             continue;
         }
-        let Event::Key(k) = event::read()? else { continue };
+        let Event::Key(k) = event::read()? else {
+            continue;
+        };
         // Windows reports a separate key-release event for every keystroke.
         // Ignore releases so input isn't processed twice (and so a key release
         // can't instantly dismiss the screen its press just navigated to).
@@ -528,7 +596,8 @@ async fn run_state_machine(
                         .map(|k| k.secret.clone())
                         .collect();
                     if usable.is_empty() {
-                        w.error = "add at least one tenant key (press [a]) before continuing".into();
+                        w.error =
+                            "add at least one tenant key (press [a]) before continuing".into();
                         w.return_to = Step::KeysList;
                         w.step = Step::Error;
                     } else {
@@ -568,7 +637,11 @@ async fn run_state_machine(
                     let v = w.input.trim().to_string();
                     if !v.is_empty() {
                         let n = w.keys.len() + 1;
-                        w.keys.push(KeyEntry { label: format!("tenant-{n}"), weight: 100, secret: v });
+                        w.keys.push(KeyEntry {
+                            label: format!("tenant-{n}"),
+                            weight: 100,
+                            secret: v,
+                        });
                         w.cursor = w.keys.len() - 1;
                     }
                     w.input.clear();
@@ -652,7 +725,11 @@ async fn run_state_machine(
                     KeyCode::Esc => {
                         w.step = match w.target {
                             Target::Demo => {
-                                if w.fixture_all { Step::FixtureScope } else { Step::FixtureModel }
+                                if w.fixture_all {
+                                    Step::FixtureScope
+                                } else {
+                                    Step::FixtureModel
+                                }
                             }
                             Target::Live => Step::LivePickModels,
                         };
@@ -766,7 +843,10 @@ async fn run_dashboard(
 ) -> Result<()> {
     let started = Instant::now();
     let mut last_live_refresh = Instant::now();
-    let mut live = crate::admin::FairshareLive { global_in_flight: 0, global_queued: 0 };
+    let mut live = crate::admin::FairshareLive {
+        global_in_flight: 0,
+        global_queued: 0,
+    };
 
     // Destructure so we can move `handle` out after the loop.
     let crate::profiles::RunHandles {
@@ -821,7 +901,10 @@ async fn run_dashboard(
         }
 
         let hist: Vec<u64> = rps_hist.iter().copied().collect();
-        let counts: Vec<u64> = key_counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        let counts: Vec<u64> = key_counts
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
         let frame = dashboard::DashFrame {
             title: &profile_name,
             elapsed_s: started.elapsed().as_secs(),
@@ -866,10 +949,16 @@ async fn run_dashboard(
     if !user_quit {
         let summary = {
             let s = stats.lock().unwrap();
-            s.summarize(started.elapsed().as_secs_f64().max(1.0), plan.max_error_rate)
+            s.summarize(
+                started.elapsed().as_secs_f64().max(1.0),
+                plan.max_error_rate,
+            )
         };
         let hist: Vec<u64> = rps_hist.iter().copied().collect();
-        let counts: Vec<u64> = key_counts.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        let counts: Vec<u64> = key_counts
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
         loop {
             let frame = dashboard::DashFrame {
                 title: &profile_name,
@@ -907,11 +996,7 @@ async fn run_dashboard(
 
 fn draw_pick_target(f: &mut Frame, cursor: usize, snap: &overview::Snapshot) {
     let area = f.area();
-    let outer = Layout::vertical([
-        Constraint::Min(8),
-        Constraint::Length(3),
-    ])
-    .split(area);
+    let outer = Layout::vertical([Constraint::Min(8), Constraint::Length(3)]).split(area);
 
     // Top band splits into a left "controls" column and a right "brand" column.
     let cols = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
@@ -948,7 +1033,11 @@ fn draw_pick_target(f: &mut Frame, cursor: usize, snap: &overview::Snapshot) {
             Style::default().fg(theme::FG),
         )),
         Line::from(Span::styled(
-            format!("{} models · {} tenants registered", snap.models.len(), snap.tenants.len()),
+            format!(
+                "{} models · {} tenants registered",
+                snap.models.len(),
+                snap.tenants.len()
+            ),
             Style::default().fg(theme::MUTED),
         )),
     ])
@@ -978,7 +1067,11 @@ fn draw_pick_target(f: &mut Frame, cursor: usize, snap: &overview::Snapshot) {
         let selected = i == cursor;
         let prefix = if selected { "▶ " } else { "  " };
         let color = if selected { theme::ACCENT } else { theme::FG };
-        let modifier = if selected { Modifier::BOLD } else { Modifier::empty() };
+        let modifier = if selected {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        };
         body.push(Line::from(Span::styled(
             format!("{prefix}{label}"),
             Style::default().fg(color).add_modifier(modifier),
@@ -989,14 +1082,12 @@ fn draw_pick_target(f: &mut Frame, cursor: usize, snap: &overview::Snapshot) {
         )));
         body.push(Line::from(""));
     }
-    let para = Paragraph::new(body)
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("target")
-                .border_style(Style::default().fg(theme::MUTED)),
-        );
+    let para = Paragraph::new(body).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("target")
+            .border_style(Style::default().fg(theme::MUTED)),
+    );
     f.render_widget(para, left[2]);
 
     // Right column: the obleth emblem + wordmark lockup, centred in its panel.
@@ -1014,21 +1105,14 @@ fn draw_pick_target(f: &mut Frame, cursor: usize, snap: &overview::Snapshot) {
     framed.extend(logo);
     // The emblem rows are all equal width, so per-line centring keeps the circle
     // intact while also centring the wordmark + subtitle beneath it.
-    f.render_widget(
-        Paragraph::new(framed).alignment(Alignment::Center),
-        inner,
-    );
+    f.render_widget(Paragraph::new(framed).alignment(Alignment::Center), inner);
 
     let help = Paragraph::new("[↑/↓] move   [Enter] select   [q/Esc] quit")
         .style(Style::default().fg(theme::MUTED));
     f.render_widget(help, outer[1]);
 }
 
-fn draw_settings(
-    f: &mut Frame,
-    w: &Wizard,
-    profiles: &[(Profile, bool)],
-) {
+fn draw_settings(f: &mut Frame, w: &Wizard, profiles: &[(Profile, bool)]) {
     let row = w.settings_row;
     let area = f.area();
     let chunks = Layout::vertical([
@@ -1039,7 +1123,11 @@ fn draw_settings(
     .split(area);
 
     let title = Paragraph::new("obench — settings")
-        .style(Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -1056,7 +1144,9 @@ fn draw_settings(
 
     let row_style = |i: usize| {
         if i == row {
-            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(theme::FG)
         }
@@ -1071,7 +1161,10 @@ fn draw_settings(
             format!("{}load profile  ◄ {pname} ►", caret(0)),
             row_style(0),
         )),
-        muted(format!("    preset baseline · available: {}", enabled.join(", "))),
+        muted(format!(
+            "    preset baseline · available: {}",
+            enabled.join(", ")
+        )),
         Line::from(""),
         Line::from(Span::styled(
             format!("{}concurrency   ◄ {} workers ►", caret(1), w.conc),
@@ -1104,12 +1197,7 @@ fn draw_settings(
     f.render_widget(help, chunks[2]);
 }
 
-fn draw_pick_scope(
-    f: &mut Frame,
-    target: Target,
-    scopes: &[(&str, &str)],
-    cursor: usize,
-) {
+fn draw_pick_scope(f: &mut Frame, target: Target, scopes: &[(&str, &str)], cursor: usize) {
     let area = f.area();
     let chunks = Layout::vertical([
         Constraint::Length(3),
@@ -1136,7 +1224,11 @@ fn draw_pick_scope(
         let selected = i == cursor;
         let prefix = if selected { "▶ " } else { "  " };
         let color = if selected { theme::ACCENT } else { theme::FG };
-        let modifier = if selected { Modifier::BOLD } else { Modifier::empty() };
+        let modifier = if selected {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        };
         body.push(Line::from(Span::styled(
             format!("{prefix}{label}"),
             Style::default().fg(color).add_modifier(modifier),
@@ -1147,14 +1239,12 @@ fn draw_pick_scope(
         )));
         body.push(Line::from(""));
     }
-    let para = Paragraph::new(body)
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("scope")
-                .border_style(Style::default().fg(theme::MUTED)),
-        );
+    let para = Paragraph::new(body).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("scope")
+            .border_style(Style::default().fg(theme::MUTED)),
+    );
     f.render_widget(para, chunks[1]);
 
     let help = Paragraph::new("[↑/↓] move   [Enter] select   [q/Esc] back")
@@ -1204,7 +1294,9 @@ fn draw_text_input(
         Line::from(""),
         Line::from(Span::styled(
             format!("> {shown}_"),
-            Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
         )),
     ];
     let para = Paragraph::new(body).block(
@@ -1260,8 +1352,16 @@ fn draw_multiselect(
             let box_ = if on { "[x]" } else { "[ ]" };
             let selected_row = i == cursor;
             let prefix = if selected_row { "▶ " } else { "  " };
-            let color = if selected_row { theme::ACCENT } else { theme::FG };
-            let modifier = if selected_row { Modifier::BOLD } else { Modifier::empty() };
+            let color = if selected_row {
+                theme::ACCENT
+            } else {
+                theme::FG
+            };
+            let modifier = if selected_row {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            };
             ListItem::new(format!("{prefix}{box_} {name}"))
                 .style(Style::default().fg(color).add_modifier(modifier))
         })
@@ -1280,13 +1380,7 @@ fn draw_multiselect(
 }
 
 /// Single-choice list of model names (fixture single-model scope).
-fn draw_model_picker(
-    f: &mut Frame,
-    title: &str,
-    subtitle: &str,
-    models: &[String],
-    cursor: usize,
-) {
+fn draw_model_picker(f: &mut Frame, title: &str, subtitle: &str, models: &[String], cursor: usize) {
     let area = f.area();
     let chunks = Layout::vertical([
         Constraint::Length(3),
@@ -1316,7 +1410,11 @@ fn draw_model_picker(
             let selected = i == cursor;
             let prefix = if selected { "▶ " } else { "  " };
             let color = if selected { theme::ACCENT } else { theme::FG };
-            let modifier = if selected { Modifier::BOLD } else { Modifier::empty() };
+            let modifier = if selected {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            };
             ListItem::new(format!("{prefix}{name}"))
                 .style(Style::default().fg(color).add_modifier(modifier))
         })
@@ -1345,7 +1443,11 @@ fn draw_keys_list(f: &mut Frame, url: &str, keys: &[KeyEntry], cursor: usize) {
     .split(area);
 
     let title = Paragraph::new(format!("obench — tenant keys  (gateway {url})"))
-        .style(Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -1371,7 +1473,11 @@ fn draw_keys_list(f: &mut Frame, url: &str, keys: &[KeyEntry], cursor: usize) {
                 let sel = i == cursor;
                 let prefix = if sel { "▶ " } else { "  " };
                 let color = if sel { theme::ACCENT } else { theme::FG };
-                let modifier = if sel { Modifier::BOLD } else { Modifier::empty() };
+                let modifier = if sel {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                };
                 let secret = if k.secret.trim().is_empty() {
                     "(secret needed this session)".to_string()
                 } else {
@@ -1392,8 +1498,10 @@ fn draw_keys_list(f: &mut Frame, url: &str, keys: &[KeyEntry], cursor: usize) {
     );
     f.render_widget(para, chunks[1]);
 
-    let help = Paragraph::new("[a] add  [d] delete  [←/→] weight  [↑/↓] move  [Enter] list models  [Esc] back")
-        .style(Style::default().fg(theme::MUTED));
+    let help = Paragraph::new(
+        "[a] add  [d] delete  [←/→] weight  [↑/↓] move  [Enter] list models  [Esc] back",
+    )
+    .style(Style::default().fg(theme::MUTED));
     f.render_widget(help, chunks[2]);
 }
 
@@ -1410,7 +1518,11 @@ fn draw_review(f: &mut Frame, rows: &[String], note: Option<&str>, cursor: usize
     .split(area);
 
     let title = Paragraph::new("obench — review  (edit any row, then run)")
-        .style(Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD))
+        .style(
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        )
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -1428,19 +1540,24 @@ fn draw_review(f: &mut Frame, rows: &[String], note: Option<&str>, cursor: usize
             let prefix = if sel { "▶ " } else { "  " };
             let base = if is_run { theme::ACCENT } else { theme::FG };
             let color = if sel { theme::ACCENT } else { base };
-            let modifier = if sel || is_run { Modifier::BOLD } else { Modifier::empty() };
+            let modifier = if sel || is_run {
+                Modifier::BOLD
+            } else {
+                Modifier::empty()
+            };
             let text = format!("{prefix}{label}");
-            Line::from(Span::styled(text, Style::default().fg(color).add_modifier(modifier)))
+            Line::from(Span::styled(
+                text,
+                Style::default().fg(color).add_modifier(modifier),
+            ))
         })
         .collect();
-    let para = Paragraph::new(body)
-        .wrap(Wrap { trim: true })
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("plan")
-                .border_style(Style::default().fg(theme::MUTED)),
-        );
+    let para = Paragraph::new(body).wrap(Wrap { trim: true }).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title("plan")
+            .border_style(Style::default().fg(theme::MUTED)),
+    );
     f.render_widget(para, chunks[1]);
 
     if let Some(n) = note {
@@ -1485,7 +1602,6 @@ fn draw_message(f: &mut Frame, title: &str, lines: &[String], color: Color) {
     );
     f.render_widget(para, chunks[1]);
 
-    let help = Paragraph::new("[any key] dismiss")
-        .style(Style::default().fg(theme::MUTED));
+    let help = Paragraph::new("[any key] dismiss").style(Style::default().fg(theme::MUTED));
     f.render_widget(help, chunks[2]);
 }

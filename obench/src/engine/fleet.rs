@@ -1,5 +1,9 @@
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum TrafficKind { ChatStream, ChatBuffered, Embed }
+pub enum TrafficKind {
+    ChatStream,
+    ChatBuffered,
+    Embed,
+}
 
 #[derive(Copy, Clone, Debug)]
 pub struct TrafficType {
@@ -11,11 +15,19 @@ pub struct TrafficType {
 
 /// obench-managed fixture fleet. Names carry the latency-profile keyword the
 /// GPU-free benchmark-backend keys off.
-pub const FIXTURE_MODELS: &[&str] =
-    &["obench-turbo", "obench-base", "obench-code", "obench-large", "obench-embed"];
+pub const FIXTURE_MODELS: &[&str] = &[
+    "obench-turbo",
+    "obench-base",
+    "obench-code",
+    "obench-large",
+    "obench-embed",
+];
 
-pub const FIXTURE_GROUPS: &[(&str, u32)] =
-    &[("obench-chatbot", 500), ("obench-api", 50), ("obench-analytics", 100)];
+pub const FIXTURE_GROUPS: &[(&str, u32)] = &[
+    ("obench-chatbot", 500),
+    ("obench-api", 50),
+    ("obench-analytics", 100),
+];
 
 /// (tenant name, group, fairshare weight, traffic share)
 pub const FIXTURE_TENANTS: &[(&str, &str, u32, u32)] = &[
@@ -27,12 +39,42 @@ pub const FIXTURE_TENANTS: &[(&str, &str, u32, u32)] = &[
 ];
 
 pub const FIXTURE_TRAFFIC: &[TrafficType] = &[
-    TrafficType { model: "obench-turbo", kind: TrafficKind::ChatStream,   output_tokens: 64,  weight: 25 },
-    TrafficType { model: "obench-base",  kind: TrafficKind::ChatStream,   output_tokens: 128, weight: 20 },
-    TrafficType { model: "obench-base",  kind: TrafficKind::ChatBuffered, output_tokens: 96,  weight: 10 },
-    TrafficType { model: "obench-large", kind: TrafficKind::ChatStream,   output_tokens: 256, weight: 10 },
-    TrafficType { model: "obench-code",  kind: TrafficKind::ChatStream,   output_tokens: 200, weight: 10 },
-    TrafficType { model: "obench-embed", kind: TrafficKind::Embed,        output_tokens: 0,   weight: 25 },
+    TrafficType {
+        model: "obench-turbo",
+        kind: TrafficKind::ChatStream,
+        output_tokens: 64,
+        weight: 25,
+    },
+    TrafficType {
+        model: "obench-base",
+        kind: TrafficKind::ChatStream,
+        output_tokens: 128,
+        weight: 20,
+    },
+    TrafficType {
+        model: "obench-base",
+        kind: TrafficKind::ChatBuffered,
+        output_tokens: 96,
+        weight: 10,
+    },
+    TrafficType {
+        model: "obench-large",
+        kind: TrafficKind::ChatStream,
+        output_tokens: 256,
+        weight: 10,
+    },
+    TrafficType {
+        model: "obench-code",
+        kind: TrafficKind::ChatStream,
+        output_tokens: 200,
+        weight: 10,
+    },
+    TrafficType {
+        model: "obench-embed",
+        kind: TrafficKind::Embed,
+        output_tokens: 0,
+        weight: 25,
+    },
 ];
 
 /// Pick an index proportional to weights. `r` in [0,1) is supplied by the

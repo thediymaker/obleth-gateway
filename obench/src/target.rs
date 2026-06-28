@@ -29,10 +29,12 @@ fn is_local_url(url: &str) -> bool {
         rest.split(']').next().unwrap_or(rest)
     } else {
         // host or host:port — drop the port if present.
-        authority.rsplit_once(':').map(|(h, _)| h).unwrap_or(authority)
+        authority
+            .rsplit_once(':')
+            .map(|(h, _)| h)
+            .unwrap_or(authority)
     };
-    matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0")
-        || host.ends_with(".localhost")
+    matches!(host, "localhost" | "127.0.0.1" | "::1" | "0.0.0.0") || host.ends_with(".localhost")
 }
 
 /// Derive the control-plane root URL from an upstream endpoint the user typed.
@@ -134,9 +136,21 @@ mod tests {
 
     #[test]
     fn endpoint_root_strips_path() {
-        assert_eq!(endpoint_root("https://gateway.example.com/v1"), "https://gateway.example.com");
-        assert_eq!(endpoint_root("https://gateway.example.com"), "https://gateway.example.com");
-        assert_eq!(endpoint_root("http://localhost:8000/v1/"), "http://localhost:8000");
-        assert_eq!(endpoint_root("https://host:443/v1/chat"), "https://host:443");
+        assert_eq!(
+            endpoint_root("https://gateway.example.com/v1"),
+            "https://gateway.example.com"
+        );
+        assert_eq!(
+            endpoint_root("https://gateway.example.com"),
+            "https://gateway.example.com"
+        );
+        assert_eq!(
+            endpoint_root("http://localhost:8000/v1/"),
+            "http://localhost:8000"
+        );
+        assert_eq!(
+            endpoint_root("https://host:443/v1/chat"),
+            "https://host:443"
+        );
     }
 }

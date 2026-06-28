@@ -25,13 +25,13 @@
 //! an [`ArcSwap`] that the periodic model-registry refresh task updates, exactly
 //! like [`crate::classifier::Classifier`].
 
+pub(crate) mod guardrails;
 pub mod mcp_tools;
 pub mod respond;
-pub mod tool_stream;
 pub mod structured;
 pub mod tool_loop;
+pub mod tool_stream;
 mod vision;
-pub(crate) mod guardrails;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -162,7 +162,8 @@ impl BoonEngine {
             && settings.vision.active()
         {
             let vision_start = crate::tracer::now_ms();
-            let images_described = vision::apply(state, &settings.vision, key, session_id, json).await;
+            let images_described =
+                vision::apply(state, &settings.vision, key, session_id, json).await;
             if let Some(t) = tracer.as_deref_mut() {
                 t.record_elapsed(
                     "boon:vision",
@@ -188,7 +189,10 @@ impl BoonEngine {
         }
         // Capture the client's streaming intent before any rewrite; the proxy
         // forces `stream: false` upstream when a response plan is armed.
-        let client_stream = json.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+        let client_stream = json
+            .get("stream")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let include_usage = json
             .pointer("/stream_options/include_usage")
             .and_then(|v| v.as_bool())
@@ -239,9 +243,7 @@ impl BoonEngine {
             && settings.structured_output.active()
         {
             let structured_start = crate::tracer::now_ms();
-            if let Some(plan) =
-                structured::apply(json, route.supports_system_messages)
-            {
+            if let Some(plan) = structured::apply(json, route.supports_system_messages) {
                 if let Some(t) = tracer.as_deref_mut() {
                     t.record_elapsed(
                         "boon:structured_repair",
@@ -327,7 +329,10 @@ impl BoonEngine {
         }
 
         if structured_plan.is_some() || tool_loop_plan.is_some() {
-            let existing_guardrails = outcome.response_plan.as_mut().and_then(|p| p.guardrails.take());
+            let existing_guardrails = outcome
+                .response_plan
+                .as_mut()
+                .and_then(|p| p.guardrails.take());
             outcome.response_plan = Some(ResponsePlan {
                 structured: structured_plan,
                 tool_loop: tool_loop_plan,

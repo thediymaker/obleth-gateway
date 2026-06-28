@@ -94,7 +94,11 @@ pub fn job_submit_from_spec(
         let body = &spec.script_body;
         if body.starts_with("#!") {
             // already a complete script
-            if body.ends_with('\n') { body.clone() } else { format!("{body}\n") }
+            if body.ends_with('\n') {
+                body.clone()
+            } else {
+                format!("{body}\n")
+            }
         } else {
             format!("#!/bin/bash\nset -euo pipefail\n{body}\n")
         }
@@ -142,7 +146,11 @@ pub fn parse_mem_mb(raw: &str) -> Option<i64> {
         return None;
     }
     let mb = (n * mult).round() as i64;
-    if mb > 0 { Some(mb) } else { None }
+    if mb > 0 {
+        Some(mb)
+    } else {
+        None
+    }
 }
 
 /// POSIX single-quote a value for embedding in the generated bash script.
@@ -290,19 +298,48 @@ impl SlurmClient for Slurmrestd {
             },
         });
         let m = spec.as_object_mut().unwrap();
-        if !job.gres.is_empty() { m.insert("tres_per_node".into(), serde_json::json!(format!("gres/{}", job.gres))); }
-        if let Some(t) = &job.time_limit { m.insert("time_limit".into(), serde_json::json!(t)); }
-        if let Some(a) = &job.account { m.insert("account".into(), serde_json::json!(a)); }
-        if let Some(q) = &job.qos { m.insert("qos".into(), serde_json::json!(q)); }
-        if let Some(c) = &job.constraints { m.insert("constraints".into(), serde_json::json!(c)); }
-        if let Some(e) = &job.exclude { m.insert("excluded_nodes".into(), serde_json::json!(e)); }
-        if let Some(c) = job.cpus_per_task { if c > 0 { m.insert("cpus_per_task".into(), serde_json::json!(c)); } }
+        if !job.gres.is_empty() {
+            m.insert(
+                "tres_per_node".into(),
+                serde_json::json!(format!("gres/{}", job.gres)),
+            );
+        }
+        if let Some(t) = &job.time_limit {
+            m.insert("time_limit".into(), serde_json::json!(t));
+        }
+        if let Some(a) = &job.account {
+            m.insert("account".into(), serde_json::json!(a));
+        }
+        if let Some(q) = &job.qos {
+            m.insert("qos".into(), serde_json::json!(q));
+        }
+        if let Some(c) = &job.constraints {
+            m.insert("constraints".into(), serde_json::json!(c));
+        }
+        if let Some(e) = &job.exclude {
+            m.insert("excluded_nodes".into(), serde_json::json!(e));
+        }
+        if let Some(c) = job.cpus_per_task {
+            if c > 0 {
+                m.insert("cpus_per_task".into(), serde_json::json!(c));
+            }
+        }
         // slurmrestd expects memory_per_node in megabytes (integer).
-        if let Some(mb) = job.mem_mb { if mb > 0 { m.insert("memory_per_node".into(), serde_json::json!(mb)); } }
+        if let Some(mb) = job.mem_mb {
+            if mb > 0 {
+                m.insert("memory_per_node".into(), serde_json::json!(mb));
+            }
+        }
         if !job.log_output_dir.is_empty() {
             let dir = job.log_output_dir.trim_end_matches('/');
-            m.insert("standard_output".into(), serde_json::json!(format!("{dir}/{}-%j.out", job.name)));
-            m.insert("standard_error".into(), serde_json::json!(format!("{dir}/{}-%j.err", job.name)));
+            m.insert(
+                "standard_output".into(),
+                serde_json::json!(format!("{dir}/{}-%j.out", job.name)),
+            );
+            m.insert(
+                "standard_error".into(),
+                serde_json::json!(format!("{dir}/{}-%j.err", job.name)),
+            );
         }
 
         let body = serde_json::json!({ "job": spec, "script": job.script });
@@ -313,8 +350,13 @@ impl SlurmClient for Slurmrestd {
         if !status.is_success() {
             anyhow::bail!("slurmrestd submit failed ({status}): {v}");
         }
-        let job_id = v.get("job_id")
-            .and_then(|j| j.as_i64().map(|n| n.to_string()).or_else(|| j.as_str().map(String::from)))
+        let job_id = v
+            .get("job_id")
+            .and_then(|j| {
+                j.as_i64()
+                    .map(|n| n.to_string())
+                    .or_else(|| j.as_str().map(String::from))
+            })
             .ok_or_else(|| anyhow::anyhow!("no job_id in submit response: {v}"))?;
         Ok(job_id)
     }
@@ -352,35 +394,30 @@ impl SlurmClient for Slurmrestd {
         };
         let mut out = ClusterResources::default();
         match get(format!("slurm/{}/partitions", self.version)).await {
-            Ok(r) if r.status().is_success() => {
-                match r.json::<serde_json::Value>().await {
-                    Ok(v) => out.partitions = parse_partitions(&v),
-                    Err(e) => tracing::warn!(error=%e, "slurm partitions body not JSON"),
-                }
-            }
+            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                Ok(v) => out.partitions = parse_partitions(&v),
+                Err(e) => tracing::warn!(error=%e, "slurm partitions body not JSON"),
+            },
             Ok(r) => tracing::warn!(status=%r.status(), "slurm partitions read failed"),
             Err(e) => tracing::warn!(error=%e, "slurm partitions read errored"),
         }
         match get(format!("slurm/{}/nodes", self.version)).await {
-            Ok(r) if r.status().is_success() => {
-                match r.json::<serde_json::Value>().await {
-                    Ok(v) => out.nodes = parse_nodes(&v),
-                    Err(e) => tracing::warn!(error=%e, "slurm nodes body not JSON"),
-                }
-            }
+            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                Ok(v) => out.nodes = parse_nodes(&v),
+                Err(e) => tracing::warn!(error=%e, "slurm nodes body not JSON"),
+            },
             Ok(r) => tracing::warn!(status=%r.status(), "slurm nodes read failed"),
             Err(e) => tracing::warn!(error=%e, "slurm nodes read errored"),
         }
         match get(format!("slurmdb/{}/associations", self.version)).await {
-            Ok(r) if r.status().is_success() => {
-                match r.json::<serde_json::Value>().await {
-                    Ok(v) => {
-                        let (a, q) = parse_associations(&v);
-                        out.accounts = a; out.qos = q;
-                    }
-                    Err(e) => tracing::warn!(error=%e, "slurm associations body not JSON"),
+            Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
+                Ok(v) => {
+                    let (a, q) = parse_associations(&v);
+                    out.accounts = a;
+                    out.qos = q;
                 }
-            }
+                Err(e) => tracing::warn!(error=%e, "slurm associations body not JSON"),
+            },
             Ok(r) => tracing::warn!(status=%r.status(), "slurm associations read failed"),
             Err(e) => tracing::warn!(error=%e, "slurm associations read errored"),
         }
@@ -393,59 +430,113 @@ impl SlurmClient for Slurmrestd {
 /// single entry (the health probe still works for single-node jobs, which is the
 /// v1 target). Documented limitation; revisit for multi-node fan-out.
 pub fn expand_nodelist(s: &str) -> Vec<String> {
-    if s.is_empty() { return vec![]; }
-    if s.contains('[') { return vec![s.to_string()]; }
-    s.split(',').filter(|x| !x.is_empty()).map(|x| x.to_string()).collect()
+    if s.is_empty() {
+        return vec![];
+    }
+    if s.contains('[') {
+        return vec![s.to_string()];
+    }
+    s.split(',')
+        .filter(|x| !x.is_empty())
+        .map(|x| x.to_string())
+        .collect()
 }
 
 /// Read a slurmrestd time value that may be `{"number":N}` (minutes), a bare
 /// number, or a string. Returns a display string of minutes, or None.
 fn time_minutes(v: &serde_json::Value) -> Option<String> {
-    if let Some(n) = v.get("number").and_then(|x| x.as_i64()) { return Some(n.to_string()); }
-    if let Some(n) = v.as_i64() { return Some(n.to_string()); }
+    if let Some(n) = v.get("number").and_then(|x| x.as_i64()) {
+        return Some(n.to_string());
+    }
+    if let Some(n) = v.as_i64() {
+        return Some(n.to_string());
+    }
     v.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
 }
 
 /// A slurmrestd field that may be a CSV string or an array of strings.
 fn str_list(v: Option<&serde_json::Value>) -> Vec<String> {
     match v {
-        Some(serde_json::Value::String(s)) =>
-            s.split(',').map(|x| x.trim()).filter(|x| !x.is_empty()).map(String::from).collect(),
-        Some(serde_json::Value::Array(a)) =>
-            a.iter().filter_map(|x| x.as_str()).filter(|s| !s.is_empty()).map(String::from).collect(),
+        Some(serde_json::Value::String(s)) => s
+            .split(',')
+            .map(|x| x.trim())
+            .filter(|x| !x.is_empty())
+            .map(String::from)
+            .collect(),
+        Some(serde_json::Value::Array(a)) => a
+            .iter()
+            .filter_map(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
         _ => vec![],
     }
 }
 
 pub fn parse_partitions(v: &serde_json::Value) -> Vec<PartitionInfo> {
-    v.get("partitions").and_then(|x| x.as_array()).map(|arr| arr.iter().filter_map(|p| {
-        let name = p.get("name").and_then(|x| x.as_str())?.to_string();
-        let nodes = p.get("nodes")
-            .and_then(|n| n.get("configured").map(|c| c.clone()).or_else(|| Some(n.clone())))
-            .map(|n| str_list(Some(&n))).unwrap_or_default();
-        Some(PartitionInfo {
-            name,
-            nodes,
-            default_time: p.get("defaults").and_then(|d| d.get("time")).and_then(time_minutes),
-            max_time: p.get("maximums").and_then(|d| d.get("time")).and_then(time_minutes),
+    v.get("partitions")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|p| {
+                    let name = p.get("name").and_then(|x| x.as_str())?.to_string();
+                    let nodes = p
+                        .get("nodes")
+                        .and_then(|n| {
+                            n.get("configured")
+                                .map(|c| c.clone())
+                                .or_else(|| Some(n.clone()))
+                        })
+                        .map(|n| str_list(Some(&n)))
+                        .unwrap_or_default();
+                    Some(PartitionInfo {
+                        name,
+                        nodes,
+                        default_time: p
+                            .get("defaults")
+                            .and_then(|d| d.get("time"))
+                            .and_then(time_minutes),
+                        max_time: p
+                            .get("maximums")
+                            .and_then(|d| d.get("time"))
+                            .and_then(time_minutes),
+                    })
+                })
+                .collect()
         })
-    }).collect()).unwrap_or_default()
+        .unwrap_or_default()
 }
 
 pub fn parse_nodes(v: &serde_json::Value) -> Vec<NodeInfo> {
-    v.get("nodes").and_then(|x| x.as_array()).map(|arr| arr.iter().filter_map(|n| {
-        let name = n.get("name").and_then(|x| x.as_str())?.to_string();
-        let real_memory_mb = n.get("real_memory")
-            .and_then(|m| m.as_i64().or_else(|| m.get("number").and_then(|x| x.as_i64())));
-        Some(NodeInfo {
-            name,
-            partitions: str_list(n.get("partitions")),
-            gres: n.get("gres").and_then(|x| x.as_str()).unwrap_or_default().to_string(),
-            cpus: n.get("cpus").and_then(|m| m.as_i64().or_else(|| m.get("number").and_then(|x| x.as_i64()))),
-            real_memory_mb,
-            features: str_list(n.get("features")),
+    v.get("nodes")
+        .and_then(|x| x.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|n| {
+                    let name = n.get("name").and_then(|x| x.as_str())?.to_string();
+                    let real_memory_mb = n.get("real_memory").and_then(|m| {
+                        m.as_i64()
+                            .or_else(|| m.get("number").and_then(|x| x.as_i64()))
+                    });
+                    Some(NodeInfo {
+                        name,
+                        partitions: str_list(n.get("partitions")),
+                        gres: n
+                            .get("gres")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or_default()
+                            .to_string(),
+                        cpus: n.get("cpus").and_then(|m| {
+                            m.as_i64()
+                                .or_else(|| m.get("number").and_then(|x| x.as_i64()))
+                        }),
+                        real_memory_mb,
+                        features: str_list(n.get("features")),
+                    })
+                })
+                .collect()
         })
-    }).collect()).unwrap_or_default()
+        .unwrap_or_default()
 }
 
 pub fn parse_associations(v: &serde_json::Value) -> (Vec<String>, Vec<String>) {
@@ -454,9 +545,13 @@ pub fn parse_associations(v: &serde_json::Value) -> (Vec<String>, Vec<String>) {
     if let Some(arr) = v.get("associations").and_then(|x| x.as_array()) {
         for a in arr {
             if let Some(acc) = a.get("account").and_then(|x| x.as_str()) {
-                if !acc.is_empty() { accounts.insert(acc.to_string()); }
+                if !acc.is_empty() {
+                    accounts.insert(acc.to_string());
+                }
             }
-            for q in str_list(a.get("qos")) { qos.insert(q); }
+            for q in str_list(a.get("qos")) {
+                qos.insert(q);
+            }
         }
     }
     (accounts.into_iter().collect(), qos.into_iter().collect())
@@ -473,7 +568,10 @@ mod tests {
             partition: "gpu-preempt".into(),
             gres: "gpu:h100:2".into(),
             nodes: 1,
-            constraints: None, exclude: None, account: None, qos: None,
+            constraints: None,
+            exclude: None,
+            account: None,
+            qos: None,
             time_limit: Some("12:00:00".into()),
             cpus_per_task: None,
             mem: None,
@@ -500,7 +598,9 @@ mod tests {
         let j = job_submit_from_spec(&spec(), "nemotron", "obleth-", 8000, 8);
         assert_eq!(j.name, "obleth-nemotron");
         assert_eq!(j.partition, "gpu-preempt");
-        assert!(j.script.contains("apptainer exec --nv 'vllm.sif' vllm serve nemotron"));
+        assert!(j
+            .script
+            .contains("apptainer exec --nv 'vllm.sif' vllm serve nemotron"));
     }
 
     #[test]
@@ -509,16 +609,30 @@ mod tests {
         s.preamble = "module load apptainer/1.3.4".into();
         let j = job_submit_from_spec(&s, "nemotron", "obleth-", 8000, 8);
         let lines: Vec<&str> = j.script.lines().collect();
-        let apptainer_idx = lines.iter().position(|l| l.contains("apptainer exec")).unwrap();
-        let module_idx = lines.iter().position(|l| l.contains("module load apptainer")).unwrap();
-        assert!(module_idx < apptainer_idx, "preamble must come before apptainer exec");
+        let apptainer_idx = lines
+            .iter()
+            .position(|l| l.contains("apptainer exec"))
+            .unwrap();
+        let module_idx = lines
+            .iter()
+            .position(|l| l.contains("module load apptainer"))
+            .unwrap();
+        assert!(
+            module_idx < apptainer_idx,
+            "preamble must come before apptainer exec"
+        );
     }
 
     #[test]
     fn empty_preamble_produces_no_extra_line() {
         let j = job_submit_from_spec(&spec(), "nemotron", "obleth-", 8000, 8);
-        assert!(!j.script.contains("module load"), "no preamble lines when preamble is empty");
-        assert!(j.script.contains("apptainer exec --nv 'vllm.sif' vllm serve nemotron"));
+        assert!(
+            !j.script.contains("module load"),
+            "no preamble lines when preamble is empty"
+        );
+        assert!(j
+            .script
+            .contains("apptainer exec --nv 'vllm.sif' vllm serve nemotron"));
     }
 
     #[test]
@@ -526,7 +640,9 @@ mod tests {
         let mut s = spec();
         s.image = "weird'$(rm -rf /); image.sif".into();
         let j = job_submit_from_spec(&s, "nemotron", "obleth-", 8000, 8);
-        assert!(j.script.contains("apptainer exec --nv 'weird'\\''$(rm -rf /); image.sif'"));
+        assert!(j
+            .script
+            .contains("apptainer exec --nv 'weird'\\''$(rm -rf /); image.sif'"));
     }
 
     #[test]
@@ -536,7 +652,10 @@ mod tests {
         s.preamble = "module load cuda".into();
         s.launch_command = "llama-server -m model.gguf --port 8000".into();
         let j = job_submit_from_spec(&s, "glm", "obleth-", 8000, 8);
-        assert!(!j.script.contains("apptainer"), "no container wrap when image is blank");
+        assert!(
+            !j.script.contains("apptainer"),
+            "no container wrap when image is blank"
+        );
         assert!(j.script.contains("module load cuda"));
         assert!(j.script.contains("llama-server -m model.gguf --port 8000"));
     }
@@ -578,10 +697,19 @@ mod tests {
         s.script_body = "#!/bin/bash\nset -e\nllama-server --port 8000\n".into();
         let j = job_submit_from_spec(&s, "glm", "obleth-", 8000, 8);
         // Port preamble is injected after the shebang; script_body wins over legacy assembly.
-        assert!(j.script.starts_with("#!/bin/bash\n"), "shebang retained as first line");
-        assert!(j.script.contains("OBLETH_SERVING_PORT"), "port preamble injected");
+        assert!(
+            j.script.starts_with("#!/bin/bash\n"),
+            "shebang retained as first line"
+        );
+        assert!(
+            j.script.contains("OBLETH_SERVING_PORT"),
+            "port preamble injected"
+        );
         assert!(j.script.contains("llama-server --port 8000"));
-        assert!(!j.script.contains("apptainer"), "script_body overrides legacy assembly");
+        assert!(
+            !j.script.contains("apptainer"),
+            "script_body overrides legacy assembly"
+        );
     }
 
     #[test]
@@ -590,20 +718,32 @@ mod tests {
         s.script_body = "llama-server --port 8000".into();
         let j = job_submit_from_spec(&s, "glm", "obleth-", 8000, 8);
         assert!(j.script.starts_with("#!/bin/bash\n"), "shebang added");
-        assert!(j.script.contains("OBLETH_SERVING_PORT"), "port preamble injected");
+        assert!(
+            j.script.contains("OBLETH_SERVING_PORT"),
+            "port preamble injected"
+        );
         assert!(j.script.contains("llama-server --port 8000"));
     }
 
     #[test]
     fn port_preamble_uses_correct_window() {
         let j = job_submit_from_spec(&spec(), "nemotron", "obleth-", 8016, 8);
-        assert!(j.script.contains("__p=8016; __p<=8023"), "window base and last computed correctly");
-        assert!(j.script.contains("OBLETH_SERVING_PORT:-8016"), "fallback to window base");
+        assert!(
+            j.script.contains("__p=8016; __p<=8023"),
+            "window base and last computed correctly"
+        );
+        assert!(
+            j.script.contains("OBLETH_SERVING_PORT:-8016"),
+            "fallback to window base"
+        );
     }
 
     #[test]
     fn job_status_message_formats_state_and_reason() {
-        assert_eq!(job_status_message("PENDING", Some("Resources")), "PENDING — Resources");
+        assert_eq!(
+            job_status_message("PENDING", Some("Resources")),
+            "PENDING — Resources"
+        );
         assert_eq!(job_status_message("RUNNING", None), "RUNNING");
         assert_eq!(job_status_message("RUNNING", Some("None")), "RUNNING");
         assert_eq!(job_status_message("PENDING", Some("  ")), "PENDING");
@@ -613,7 +753,8 @@ mod tests {
     fn parse_job_tolerates_int_id_and_array_state() {
         let body = serde_json::to_vec(&serde_json::json!({ "jobs": [
             { "job_id": 123, "job_state": ["PENDING"], "nodes": "", "state_reason": "Resources" },
-        ] })).unwrap();
+        ] }))
+        .unwrap();
         let j = parse_job(&body).expect("job");
         assert_eq!(j.job_id, "123");
         assert_eq!(j.raw_state, "PENDING");
@@ -626,7 +767,8 @@ mod tests {
     fn parse_job_tolerates_string_id_and_string_state() {
         let body = serde_json::to_vec(&serde_json::json!({ "jobs": [
             { "job_id": "456", "job_state": "PENDING", "nodes": "gpu03" },
-        ] })).unwrap();
+        ] }))
+        .unwrap();
         let j = parse_job(&body).expect("job");
         assert_eq!(j.job_id, "456");
         assert_eq!(j.state, JobState::Pending);
@@ -637,7 +779,9 @@ mod tests {
         // 200-with-empty-jobs is how some versions report an unknown id.
         let empty = serde_json::to_vec(&serde_json::json!({ "jobs": [] })).unwrap();
         assert!(parse_job(&empty).is_none());
-        let no_id = serde_json::to_vec(&serde_json::json!({ "jobs": [ { "job_state": "RUNNING" } ] })).unwrap();
+        let no_id =
+            serde_json::to_vec(&serde_json::json!({ "jobs": [ { "job_state": "RUNNING" } ] }))
+                .unwrap();
         assert!(parse_job(&no_id).is_none());
     }
 
@@ -646,27 +790,38 @@ mod tests {
         // Literal "None" and whitespace-only reasons collapse to None
         let none_literal = serde_json::to_vec(&serde_json::json!({ "jobs": [
             { "job_id": 1, "job_state": "PENDING", "state_reason": "None" },
-        ] })).unwrap();
+        ] }))
+        .unwrap();
         let j = parse_job(&none_literal).expect("job");
-        assert_eq!(j.reason, None, "literal 'None' reason should collapse to None");
+        assert_eq!(
+            j.reason, None,
+            "literal 'None' reason should collapse to None"
+        );
 
         let none_mixed_case = serde_json::to_vec(&serde_json::json!({ "jobs": [
             { "job_id": 2, "job_state": "PENDING", "state_reason": "nOnE" },
-        ] })).unwrap();
+        ] }))
+        .unwrap();
         let j = parse_job(&none_mixed_case).expect("job");
         assert_eq!(j.reason, None, "case-insensitive 'None' should collapse");
 
         let whitespace_only = serde_json::to_vec(&serde_json::json!({ "jobs": [
             { "job_id": 3, "job_state": "PENDING", "state_reason": "   " },
-        ] })).unwrap();
+        ] }))
+        .unwrap();
         let j = parse_job(&whitespace_only).expect("job");
         assert_eq!(j.reason, None, "whitespace-only reason should collapse");
 
         let valid_reason = serde_json::to_vec(&serde_json::json!({ "jobs": [
             { "job_id": 4, "job_state": "PENDING", "state_reason": "Resources" },
-        ] })).unwrap();
+        ] }))
+        .unwrap();
         let j = parse_job(&valid_reason).expect("job");
-        assert_eq!(j.reason, Some("Resources".to_string()), "valid reasons preserved");
+        assert_eq!(
+            j.reason,
+            Some("Resources".to_string()),
+            "valid reasons preserved"
+        );
     }
 
     #[test]
@@ -718,7 +873,7 @@ mod tests {
         ]});
         let (accounts, qos) = parse_associations(&v);
         assert_eq!(accounts, vec!["ml-team"]);
-        assert_eq!(qos, vec!["high","normal"]); // sorted+deduped
+        assert_eq!(qos, vec!["high", "normal"]); // sorted+deduped
     }
 
     #[test]

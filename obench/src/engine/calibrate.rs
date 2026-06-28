@@ -23,14 +23,21 @@ pub struct KneeConfig {
 
 impl Default for KneeConfig {
     fn default() -> Self {
-        Self { error_ceiling: 0.01, latency_growth: 1.5, throughput_floor_gain: 1.1 }
+        Self {
+            error_ceiling: 0.01,
+            latency_growth: 1.5,
+            throughput_floor_gain: 1.1,
+        }
     }
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Decision {
     Continue,
-    Stop { last_clean_conc: u32, reason: String },
+    Stop {
+        last_clean_conc: u32,
+        reason: String,
+    },
 }
 
 pub fn evaluate(history: &[StepResult], latest: &StepResult, cfg: &KneeConfig) -> Decision {
@@ -39,12 +46,16 @@ pub fn evaluate(history: &[StepResult], latest: &StepResult, cfg: &KneeConfig) -
     if latest.error_rate > cfg.error_ceiling {
         return Decision::Stop {
             last_clean_conc: prev_clean,
-            reason: format!("error rate {:.2}% crossed the ceiling", latest.error_rate * 100.0),
+            reason: format!(
+                "error rate {:.2}% crossed the ceiling",
+                latest.error_rate * 100.0
+            ),
         };
     }
 
     if let Some(prev) = history.last() {
-        let latency_climb = latest.p99_ttfb_ms as f64 >= prev.p99_ttfb_ms as f64 * cfg.latency_growth;
+        let latency_climb =
+            latest.p99_ttfb_ms as f64 >= prev.p99_ttfb_ms as f64 * cfg.latency_growth;
         let throughput_flat = latest.req_per_s < prev.req_per_s * cfg.throughput_floor_gain;
         if latency_climb && throughput_flat {
             return Decision::Stop {
@@ -62,14 +73,23 @@ mod tests {
     use super::*;
 
     fn step(conc: u32, rps: f64, err: f64, p99: u64) -> StepResult {
-        StepResult { conc, req_per_s: rps, error_rate: err, p99_ttfb_ms: p99, max_queued: 0 }
+        StepResult {
+            conc,
+            req_per_s: rps,
+            error_rate: err,
+            p99_ttfb_ms: p99,
+            max_queued: 0,
+        }
     }
 
     #[test]
     fn continues_while_clean_and_scaling() {
         let hist = vec![step(64, 1000.0, 0.0, 40)];
         let latest = step(128, 1900.0, 0.0, 45);
-        assert_eq!(evaluate(&hist, &latest, &KneeConfig::default()), Decision::Continue);
+        assert_eq!(
+            evaluate(&hist, &latest, &KneeConfig::default()),
+            Decision::Continue
+        );
     }
 
     #[test]
@@ -77,7 +97,9 @@ mod tests {
         let hist = vec![step(128, 1900.0, 0.0, 45)];
         let latest = step(256, 2000.0, 0.05, 60);
         match evaluate(&hist, &latest, &KneeConfig::default()) {
-            Decision::Stop { last_clean_conc, .. } => assert_eq!(last_clean_conc, 128),
+            Decision::Stop {
+                last_clean_conc, ..
+            } => assert_eq!(last_clean_conc, 128),
             _ => panic!("expected stop"),
         }
     }
@@ -87,7 +109,9 @@ mod tests {
         let hist = vec![step(128, 2000.0, 0.0, 50)];
         let latest = step(256, 2050.0, 0.0, 90); // +2.5% rps, +80% p99
         match evaluate(&hist, &latest, &KneeConfig::default()) {
-            Decision::Stop { last_clean_conc, .. } => assert_eq!(last_clean_conc, 128),
+            Decision::Stop {
+                last_clean_conc, ..
+            } => assert_eq!(last_clean_conc, 128),
             _ => panic!("expected stop"),
         }
     }
@@ -95,14 +119,19 @@ mod tests {
     #[test]
     fn first_step_always_continues() {
         let latest = step(64, 1000.0, 0.0, 40);
-        assert_eq!(evaluate(&[], &latest, &KneeConfig::default()), Decision::Continue);
+        assert_eq!(
+            evaluate(&[], &latest, &KneeConfig::default()),
+            Decision::Continue
+        );
     }
 
     #[test]
     fn first_step_errors_reports_zero_as_no_clean_level() {
         let latest = step(64, 100.0, 0.05, 40); // first step already over the 1% ceiling
         match evaluate(&[], &latest, &KneeConfig::default()) {
-            Decision::Stop { last_clean_conc, .. } => assert_eq!(last_clean_conc, 0),
+            Decision::Stop {
+                last_clean_conc, ..
+            } => assert_eq!(last_clean_conc, 0),
             _ => panic!("expected stop at first-step error"),
         }
     }

@@ -22,7 +22,10 @@ struct Envelope {
 fn parse_envelope(json: &str) -> Option<Usage> {
     let env: Envelope = serde_json::from_str(json).ok()?;
     let u = env.usage?;
-    Some(Usage { prompt_tokens: u.prompt_tokens, completion_tokens: u.completion_tokens })
+    Some(Usage {
+        prompt_tokens: u.prompt_tokens,
+        completion_tokens: u.completion_tokens,
+    })
 }
 
 pub fn from_json(body: &str) -> Option<Usage> {
@@ -35,7 +38,9 @@ pub fn from_sse(body: &str) -> Option<Usage> {
     let mut found = None;
     for line in body.lines() {
         let line = line.trim_start();
-        let Some(payload) = line.strip_prefix("data:") else { continue };
+        let Some(payload) = line.strip_prefix("data:") else {
+            continue;
+        };
         let payload = payload.trim();
         if payload == "[DONE]" || payload.is_empty() {
             continue;
@@ -64,7 +69,13 @@ mod tests {
     #[test]
     fn buffered_usage() {
         let body = r#"{"choices":[],"usage":{"prompt_tokens":12,"completion_tokens":34}}"#;
-        assert_eq!(from_json(body), Some(Usage { prompt_tokens: 12, completion_tokens: 34 }));
+        assert_eq!(
+            from_json(body),
+            Some(Usage {
+                prompt_tokens: 12,
+                completion_tokens: 34
+            })
+        );
     }
 
     #[test]
@@ -72,7 +83,13 @@ mod tests {
         let body = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n\n\
                     data: {\"choices\":[],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":7}}\n\n\
                     data: [DONE]\n\n";
-        assert_eq!(from_sse(body), Some(Usage { prompt_tokens: 5, completion_tokens: 7 }));
+        assert_eq!(
+            from_sse(body),
+            Some(Usage {
+                prompt_tokens: 5,
+                completion_tokens: 7
+            })
+        );
     }
 
     #[test]
@@ -83,6 +100,12 @@ mod tests {
 
     #[test]
     fn estimate_rounds_up() {
-        assert_eq!(estimate(256, 9), Usage { prompt_tokens: 256, completion_tokens: 3 });
+        assert_eq!(
+            estimate(256, 9),
+            Usage {
+                prompt_tokens: 256,
+                completion_tokens: 3
+            }
+        );
     }
 }

@@ -1,6 +1,7 @@
 // Server-side client for the obleth Management API.
 
 const BASE = process.env.OBLETH_ADMIN_BASE_URL ?? "http://localhost:9180";
+const AUDIT_ACTOR_HEADER = "X-Obleth-Audit-Actor";
 
 // Resolve the admin token lazily, at request time. Validating it at module
 // scope would throw while Next.js evaluates server modules during `next build`
@@ -629,6 +630,11 @@ export interface SlurmSettingsView {
   // gateway started. provisioner_running is true within the freshness window.
   provisioner_last_seen_secs: number | null;
   provisioner_running: boolean;
+  // Build identity the provisioner last reported (it ships as its own image, so
+  // it can drift from the gateway version). Null until it has reported.
+  provisioner_version: string | null;
+  provisioner_git_sha: string | null;
+  provisioner_built_at: string | null;
 }
 
 export interface UpdateSlurmSettings {
@@ -785,6 +791,15 @@ export class OblethApiError extends Error {
 /** Next.js fetch caching options accepted alongside a standard RequestInit. */
 type NextFetchOptions = { revalidate?: number | false; tags?: string[] };
 type ApiInit = RequestInit & { next?: NextFetchOptions };
+interface AuditOptions {
+  auditActor?: string | null;
+}
+
+function auditActorHeaders(options?: AuditOptions): Record<string, string> {
+  const rawActor = options?.auditActor?.trim();
+  const actor = rawActor?.replace(/[\r\n]+/g, " ");
+  return actor ? { [AUDIT_ACTOR_HEADER]: actor } : {};
+}
 
 async function api<T>(path: string, init?: ApiInit): Promise<T> {
   const { next, cache, headers, ...rest } = init ?? {};
@@ -861,25 +876,36 @@ export const obleth = {
     api<Tenant[]>("/tenants", {
       next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.tenants] },
     }),
-  createTenant: (body: {
-    name: string;
-    weight?: number;
-    tokens_per_minute?: number;
-    max_in_flight?: number | null;
-    fairshare_group?: string;
-  }) => api<Tenant>("/tenants", { method: "POST", body: JSON.stringify(body) }),
-  setWeight: (id: string, weight: number) =>
+  createTenant: (
+    body: {
+      name: string;
+      weight?: number;
+      tokens_per_minute?: number;
+      max_in_flight?: number | null;
+      fairshare_group?: string;
+    },
+    options?: AuditOptions,
+  ) =>
+    api<Tenant>("/tenants", {
+      method: "POST",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  setWeight: (id: string, weight: number, options?: AuditOptions) =>
     api<Tenant>(`/tenants/${id}/weight`, {
       method: "PATCH",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ weight }),
     }),
   setQuota: (
     id: string,
     tokens_per_minute: number,
     max_in_flight: number | null,
+    options?: AuditOptions,
   ) =>
     api<Tenant>(`/tenants/${id}/quota`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ tokens_per_minute, max_in_flight }),
     }),
   updateTenant: (
@@ -890,14 +916,17 @@ export const obleth = {
       organization?: string;
       contact_email?: string;
     },
+    options?: AuditOptions,
   ) =>
     api<Tenant>(`/tenants/${id}`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  setTenantStatus: (id: string, status: string) =>
+  setTenantStatus: (id: string, status: string, options?: AuditOptions) =>
     api<Tenant>(`/tenants/${id}/status`, {
       method: "PATCH",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ status }),
     }),
   setTenantSchedule: (
@@ -908,9 +937,11 @@ export const obleth = {
       active_until?: string | null;
       weekly_windows?: WeeklyWindow[] | null;
     },
+    options?: AuditOptions,
   ) =>
     api<Tenant>(`/tenants/${id}/schedule`, {
       method: "PATCH",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   setTenantBudget: (
@@ -921,23 +952,38 @@ export const obleth = {
       budget_period?: string | null;
       budget_started_at?: string | null;
     },
+    options?: AuditOptions,
   ) =>
     api<Tenant>(`/tenants/${id}/budget`, {
       method: "PATCH",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  setTenantAllowlist: (id: string, allowed_models: string[]) =>
+  setTenantAllowlist: (
+    id: string,
+    allowed_models: string[],
+    options?: AuditOptions,
+  ) =>
     api<Tenant>(`/tenants/${id}/allowlist`, {
       method: "PATCH",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ allowed_models }),
     }),
-  setTenantGuardrails: (id: string, policy: GuardrailsPolicy | null) =>
+  setTenantGuardrails: (
+    id: string,
+    policy: GuardrailsPolicy | null,
+    options?: AuditOptions,
+  ) =>
     api<Tenant>(`/tenants/${id}/guardrails`, {
       method: "PATCH",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ policy }),
     }),
-  deleteTenant: (id: string) =>
-    api<void>(`/tenants/${id}`, { method: "DELETE" }),
+  deleteTenant: (id: string, options?: AuditOptions) =>
+    api<void>(`/tenants/${id}`, {
+      method: "DELETE",
+      headers: auditActorHeaders(options),
+    }),
   listKeys: (tenantId?: string) =>
     api<ApiKey[]>(`/keys${tenantId ? `?tenant_id=${tenantId}` : ""}`, {
       next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.keys] },
@@ -952,9 +998,11 @@ export const obleth = {
       budget_period?: string | null;
       budget_started_at?: string | null;
     },
+    options?: AuditOptions,
   ) =>
     api<CreatedKey>(`/tenants/${tenantId}/keys`, {
       method: "POST",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   updateKey: (
@@ -967,27 +1015,40 @@ export const obleth = {
       budget_period?: string | null;
       budget_started_at?: string | null;
     },
+    options?: AuditOptions,
   ) =>
     api<ApiKey>(`/keys/${id}`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  setKeyDisabled: (id: string, disabled: boolean) =>
+  setKeyDisabled: (id: string, disabled: boolean, options?: AuditOptions) =>
     api<void>(`/keys/${id}/disabled`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ disabled }),
     }),
-  setKeyTracing: (id: string, tracing_enabled: boolean) =>
+  setKeyTracing: (id: string, tracing_enabled: boolean, options?: AuditOptions) =>
     api<void>(`/keys/${id}/tracing`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ tracing_enabled }),
     }),
-  setTenantTracing: (id: string, tracing_enabled: boolean) =>
+  setTenantTracing: (
+    id: string,
+    tracing_enabled: boolean,
+    options?: AuditOptions,
+  ) =>
     api<void>(`/tenants/${id}/tracing`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ tracing_enabled }),
     }),
-  deleteKey: (id: string) => api<void>(`/keys/${id}`, { method: "DELETE" }),
+  deleteKey: (id: string, options?: AuditOptions) =>
+    api<void>(`/keys/${id}`, {
+      method: "DELETE",
+      headers: auditActorHeaders(options),
+    }),
   listModels: () =>
     api<ModelRoute[]>("/models", {
       next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.models] },
@@ -998,17 +1059,28 @@ export const obleth = {
       upstream_model: string;
       api_base: string;
     },
+    options?: AuditOptions,
   ) =>
-    api<ModelRoute>("/models", { method: "POST", body: JSON.stringify(body) }),
+    api<ModelRoute>("/models", {
+      method: "POST",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
   updateModel: (
     id: string,
     body: Partial<ModelRoute> & { upstream_model: string; api_base: string },
+    options?: AuditOptions,
   ) =>
     api<ModelRoute>(`/models/${id}`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  deleteModel: (id: string) => api<void>(`/models/${id}`, { method: "DELETE" }),
+  deleteModel: (id: string, options?: AuditOptions) =>
+    api<void>(`/models/${id}`, {
+      method: "DELETE",
+      headers: auditActorHeaders(options),
+    }),
   modelHealth: () => api<ModelHealthSummary[]>("/models/health"),
   modelHealthDetail: (id: string) =>
     api<ModelHealthDetail>(`/models/${id}/health`),
@@ -1016,24 +1088,44 @@ export const obleth = {
     api<ModelHealthDetail>(`/models/${id}/health/check`, { method: "POST" }),
   checkAllModelHealth: () =>
     api<BulkModelHealthResult>("/models/health/check", { method: "POST" }),
-  setModelHealthConfig: (id: string, body: ModelHealthConfigBody) =>
+  setModelHealthConfig: (
+    id: string,
+    body: ModelHealthConfigBody,
+    options?: AuditOptions,
+  ) =>
     api<ModelHealthSummary>(`/models/${id}/health/config`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  setModelWeight: (id: string, admission_weight: number) =>
+  setModelWeight: (
+    id: string,
+    admission_weight: number,
+    options?: AuditOptions,
+  ) =>
     api<ModelRoute>(`/models/${id}/weight`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ admission_weight }),
     }),
-  setModelCapacity: (id: string, max_in_flight: number | null) =>
+  setModelCapacity: (
+    id: string,
+    max_in_flight: number | null,
+    options?: AuditOptions,
+  ) =>
     api<ModelRoute>(`/models/${id}/capacity`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ max_in_flight }),
     }),
-  setModelCapacityMode: (id: string, capacity_mode: string) =>
+  setModelCapacityMode: (
+    id: string,
+    capacity_mode: string,
+    options?: AuditOptions,
+  ) =>
     api<ModelRoute>(`/models/${id}/capacity-mode`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ capacity_mode }),
     }),
   autotuneModel: (
@@ -1043,23 +1135,32 @@ export const obleth = {
       latency_headroom?: number;
       replicas?: number;
     },
+    options?: AuditOptions,
   ) =>
     api<AutotuneReport>(`/models/${id}/autotune`, {
       method: "POST",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(opts ?? {}),
     }),
-  applyAutotuneCapacity: (id: string, max_in_flight: number) =>
+  applyAutotuneCapacity: (
+    id: string,
+    max_in_flight: number,
+    options?: AuditOptions,
+  ) =>
     api<ModelRoute>(`/models/${id}/autotune/apply`, {
       method: "POST",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ max_in_flight }),
     }),
   setModelCache: (
     id: string,
     cache_enabled: boolean,
     cache_ttl_secs?: number,
+    options?: AuditOptions,
   ) =>
     api<ModelRoute>(`/models/${id}/cache`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ cache_enabled, cache_ttl_secs }),
     }),
   setModelReliability: (
@@ -1070,36 +1171,70 @@ export const obleth = {
       retry_backoff_ms: number;
       endpoint_selection_mode: string;
     },
+    options?: AuditOptions,
   ) =>
     api<ModelRoute>(`/models/${id}/reliability`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   listModelEndpoints: (id: string) =>
     api<ModelEndpoint[]>(`/models/${id}/endpoints`),
   getManagedModel: (id: string) =>
     api<ManagedModelSpec | null>(`/models/${id}/managed`),
-  putManagedModel: (id: string, body: PutManagedModel) =>
+  putManagedModel: (
+    id: string,
+    body: PutManagedModel,
+    options?: AuditOptions,
+  ) =>
     api<ManagedModelSpec>(`/models/${id}/managed`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  deleteManagedModel: (id: string) =>
-    api<void>(`/models/${id}/managed`, { method: "DELETE" }),
+  deleteManagedModel: (id: string, options?: AuditOptions) =>
+    api<void>(`/models/${id}/managed`, {
+      method: "DELETE",
+      headers: auditActorHeaders(options),
+    }),
   slurmResources: () => api<ClusterResources>(`/slurm/resources`),
   listRecipes: () => api<Recipe[]>(`/recipes`),
-  createRecipe: (body: { name: string; body: string; author?: string }) =>
-    api<Recipe>(`/recipes`, { method: "POST", body: JSON.stringify(body) }),
-  updateRecipe: (id: string, body: { name: string; body: string; author?: string }) =>
-    api<Recipe>(`/recipes/${id}`, { method: "PUT", body: JSON.stringify(body) }),
-  deleteRecipe: (id: string) =>
-    api<void>(`/recipes/${id}`, { method: "DELETE" }),
+  createRecipe: (
+    body: { name: string; body: string; author?: string },
+    options?: AuditOptions,
+  ) =>
+    api<Recipe>(`/recipes`, {
+      method: "POST",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  updateRecipe: (
+    id: string,
+    body: { name: string; body: string; author?: string },
+    options?: AuditOptions,
+  ) =>
+    api<Recipe>(`/recipes/${id}`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  deleteRecipe: (id: string, options?: AuditOptions) =>
+    api<void>(`/recipes/${id}`, {
+      method: "DELETE",
+      headers: auditActorHeaders(options),
+    }),
   listReplicas: (id: string) =>
     api<ModelReplica[]>(`/models/${id}/replicas`),
-  clearLostReplicas: (id: string) =>
-    api<{ deleted: number }>(`/models/${id}/replicas/clear-lost`, { method: "POST" }),
-  restartReplica: (replicaId: string) =>
-    api<{ ok: boolean }>(`/replicas/${replicaId}/restart`, { method: "POST" }),
+  clearLostReplicas: (id: string, options?: AuditOptions) =>
+    api<{ deleted: number }>(`/models/${id}/replicas/clear-lost`, {
+      method: "POST",
+      headers: auditActorHeaders(options),
+    }),
+  restartReplica: (replicaId: string, options?: AuditOptions) =>
+    api<{ ok: boolean }>(`/replicas/${replicaId}/restart`, {
+      method: "POST",
+      headers: auditActorHeaders(options),
+    }),
   createModelEndpoint: (
     id: string,
     body: {
@@ -1110,9 +1245,11 @@ export const obleth = {
       weight?: number;
       enabled?: boolean;
     },
+    options?: AuditOptions,
   ) =>
     api<ModelEndpoint>(`/models/${id}/endpoints`, {
       method: "POST",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   updateModelEndpoint: (
@@ -1126,35 +1263,49 @@ export const obleth = {
       weight?: number;
       enabled?: boolean;
     },
+    options?: AuditOptions,
   ) =>
     api<ModelEndpoint>(`/models/${id}/endpoints/${endpointId}`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  deleteModelEndpoint: (id: string, endpointId: string) =>
-    api<void>(`/models/${id}/endpoints/${endpointId}`, { method: "DELETE" }),
+  deleteModelEndpoint: (id: string, endpointId: string, options?: AuditOptions) =>
+    api<void>(`/models/${id}/endpoints/${endpointId}`, {
+      method: "DELETE",
+      headers: auditActorHeaders(options),
+    }),
   cacheStats: (sinceMs?: number) =>
     api<CacheStats>(`/usage/cache${qs({ since_ms: sinceMs })}`),
   listMcpServers: () => api<McpServer[]>("/mcp-servers"),
-  createMcpServer: (body: {
-    name: string;
-    upstream_url: string;
-    auth_header?: string;
-  }) =>
+  createMcpServer: (
+    body: {
+      name: string;
+      upstream_url: string;
+      auth_header?: string;
+    },
+    options?: AuditOptions,
+  ) =>
     api<McpServer>("/mcp-servers", {
       method: "POST",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   updateMcpServer: (
     id: string,
     body: { upstream_url: string; auth_header?: string; enabled?: boolean },
+    options?: AuditOptions,
   ) =>
     api<McpServer>(`/mcp-servers/${id}`, {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  deleteMcpServer: (id: string) =>
-    api<void>(`/mcp-servers/${id}`, { method: "DELETE" }),
+  deleteMcpServer: (id: string, options?: AuditOptions) =>
+    api<void>(`/mcp-servers/${id}`, {
+      method: "DELETE",
+      headers: auditActorHeaders(options),
+    }),
   usage: (sinceMs?: number) =>
     api<UsageAgg[]>(`/usage${qs({ since_ms: sinceMs })}`),
   usageByKey: (sinceMs?: number, limit?: number) =>
@@ -1257,61 +1408,78 @@ export const obleth = {
   controlPlaneKey: () =>
     api<{ secret: string }>("/system/control-plane-key"),
   getUsageRetention: () => api<UsageRetentionView>("/settings/usage-retention"),
-  setUsageRetention: (days: number) =>
+  setUsageRetention: (days: number, options?: AuditOptions) =>
     api<UsageRetentionView>("/settings/usage-retention", {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ days }),
     }),
-  compactUsage: () =>
-    api<CompactUsageResult>("/usage/compact", { method: "POST" }),
+  compactUsage: (options?: AuditOptions) =>
+    api<CompactUsageResult>("/usage/compact", {
+      method: "POST",
+      headers: auditActorHeaders(options),
+    }),
   stats: () => api<LiveStats>("/stats"),
   fairshareLive: () => api<FairshareLiveView>("/fairshare/live"),
   audit: (limit = 100) => api<AuditEntry[]>(`/audit?limit=${limit}`),
   getCapacity: () => api<{ max_in_flight: number }>("/capacity"),
-  setCapacity: (max_in_flight: number) =>
+  setCapacity: (max_in_flight: number, options?: AuditOptions) =>
     api<{ max_in_flight: number }>("/capacity", {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify({ max_in_flight }),
     }),
   getAlertSettings: () => api<AlertSettingsView>("/settings/alerts"),
-  setAlertSettings: (body: UpdateAlertSettings) =>
+  setAlertSettings: (body: UpdateAlertSettings, options?: AuditOptions) =>
     api<AlertSettingsView>("/settings/alerts", {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   testAlert: () =>
     api<TestAlertResult>("/settings/alerts/test", { method: "POST" }),
   getAutoRouterSettings: () =>
     api<AutoRouterSettingsView>("/settings/auto-router"),
-  setAutoRouterSettings: (body: UpdateAutoRouterSettings) =>
+  setAutoRouterSettings: (
+    body: UpdateAutoRouterSettings,
+    options?: AuditOptions,
+  ) =>
     api<AutoRouterSettingsView>("/settings/auto-router", {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   getBoonSettings: () => api<BoonSettingsView>("/settings/boons"),
-  setBoonSettings: (body: UpdateBoonSettings) =>
+  setBoonSettings: (body: UpdateBoonSettings, options?: AuditOptions) =>
     api<BoonSettingsView>("/settings/boons", {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   getCharoSettings: () => api<CharoSettingsView>("/settings/charo"),
-  setCharoSettings: (body: CharoSettingsView) =>
+  setCharoSettings: (body: CharoSettingsView, options?: AuditOptions) =>
     api<CharoSettingsView>("/settings/charo", {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   getSlurmSettings: () => api<SlurmSettingsView>("/settings/slurm"),
-  setSlurmSettings: (body: UpdateSlurmSettings) =>
+  setSlurmSettings: (body: UpdateSlurmSettings, options?: AuditOptions) =>
     api<SlurmSettingsView>("/settings/slurm", {
       method: "PUT",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
   testSlurmConnection: () =>
     api<SlurmHealthView>("/settings/slurm/test", { method: "POST" }),
-  exportBackup: () => api<ConfigBackup>("/backup/export"),
-  restoreBackup: (body: ConfigBackup) =>
+  exportBackup: (options?: AuditOptions) =>
+    api<ConfigBackup>("/backup/export", {
+      headers: auditActorHeaders(options),
+    }),
+  restoreBackup: (body: ConfigBackup, options?: AuditOptions) =>
     api<RestoreReport>("/backup/restore", {
       method: "POST",
+      headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
 };

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use clickhouse::Row;
@@ -27,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::{AdminError, AdminState, Result};
+use crate::{audit_actor, AdminError, AdminState, Result};
 
 pub const HEALTH_GROUP: &str = "model-health";
 const CHECK_LIMIT: i64 = 50;
@@ -149,6 +150,7 @@ pub async fn check_all(State(state): State<AdminState>) -> Result<Json<BulkModel
 pub async fn update_config(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
     Json(body): Json<UpdateModelHealthConfig>,
 ) -> Result<Json<ModelHealthSummary>> {
     let summary = state
@@ -170,7 +172,7 @@ pub async fn update_config(
     state
         .store
         .record_audit(
-            "admin",
+            &audit_actor(&headers),
             "update_model_health_config",
             "model",
             &id.to_string(),
@@ -804,7 +806,10 @@ mod tests {
             response_excerpt: None,
         };
         // Only a disabled endpoint -> treated as no live endpoints -> unhealthy.
-        assert_eq!(aggregate_endpoint_health(&[disabled], 1).status, "unhealthy");
+        assert_eq!(
+            aggregate_endpoint_health(&[disabled], 1).status,
+            "unhealthy"
+        );
     }
 
     // --- min_replicas floor tests ---

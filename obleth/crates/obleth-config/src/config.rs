@@ -23,6 +23,15 @@ pub struct Config {
     pub upstream_base_url: String,
     /// Upstream request timeout.
     pub upstream_timeout: Duration,
+    /// How long an idle upstream keep-alive connection may sit in the pool before
+    /// reqwest drops it. Must be shorter than the upstream's own idle-close
+    /// timeout, or the pool will hand out sockets the server already closed
+    /// (surfacing as random "error sending request" / connection-closed 502s).
+    /// `0` disables idle connection reuse entirely.
+    pub upstream_pool_idle_secs: u64,
+    /// TCP keep-alive probe interval for upstream connections. Keeps NAT/LB state
+    /// warm and surfaces dead peers faster. `0` disables.
+    pub upstream_tcp_keepalive_secs: u64,
 
     pub redis_url: String,
     pub database_url: String,
@@ -98,6 +107,8 @@ impl Config {
             metrics_listen: env_or("OBLETH_METRICS_LISTEN", "0.0.0.0:9091"),
             upstream_base_url: env_or("OBLETH_UPSTREAM_BASE_URL", "http://127.0.0.1:8081"),
             upstream_timeout: Duration::from_secs(parse_or("OBLETH_UPSTREAM_TIMEOUT_SECS", 300)),
+            upstream_pool_idle_secs: parse_or("OBLETH_UPSTREAM_POOL_IDLE_SECS", 15),
+            upstream_tcp_keepalive_secs: parse_or("OBLETH_UPSTREAM_TCP_KEEPALIVE_SECS", 30),
             redis_url: env_or("OBLETH_REDIS_URL", "redis://127.0.0.1:6379"),
             database_url: env_or(
                 "OBLETH_DATABASE_URL",

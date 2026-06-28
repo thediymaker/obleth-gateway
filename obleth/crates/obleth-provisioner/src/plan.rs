@@ -58,7 +58,10 @@ pub fn plan(
         // count it as alive. After cancel it becomes "draining" (skipped above)
         // until its job goes Gone and the row is GC'd, which clears the flag.
         if r.cancel_requested
-            && matches!(jobs.get(&r.slurm_job_id).map(|j| j.state), Some(JobState::Pending | JobState::Running))
+            && matches!(
+                jobs.get(&r.slurm_job_id).map(|j| j.state),
+                Some(JobState::Pending | JobState::Running)
+            )
         {
             actions.push(Action::Cancel {
                 replica_id: r.id,
@@ -78,7 +81,8 @@ pub fn plan(
             }
             Some(JobState::Pending) => {
                 alive += 1;
-                cancellable.push((r.id, r.slurm_job_id.clone(), r.endpoint_id, 0, r.age_secs)); // cancel pending first
+                cancellable.push((r.id, r.slurm_job_id.clone(), r.endpoint_id, 0, r.age_secs));
+                // cancel pending first
             }
             Some(JobState::Running) => {
                 alive += 1;
@@ -94,12 +98,19 @@ pub fn plan(
                     || (r.state == "healthy" && r.endpoint_id.is_none());
                 if needs_promote {
                     if let Some(&port) = health.get(&r.id) {
-                        let node = jobs.get(&r.slurm_job_id).and_then(|j| j.nodes.first().cloned()).unwrap_or_default();
-                        actions.push(Action::Promote { replica_id: r.id, api_base: endpoint_api_base(&node, port as i64) });
+                        let node = jobs
+                            .get(&r.slurm_job_id)
+                            .and_then(|j| j.nodes.first().cloned())
+                            .unwrap_or_default();
+                        actions.push(Action::Promote {
+                            replica_id: r.id,
+                            api_base: endpoint_api_base(&node, port as i64),
+                        });
                     }
                     cancellable.push((r.id, r.slurm_job_id.clone(), r.endpoint_id, 1, r.age_secs));
                 } else {
-                    cancellable.push((r.id, r.slurm_job_id.clone(), r.endpoint_id, 2, r.age_secs)); // healthy: cancel last
+                    cancellable.push((r.id, r.slurm_job_id.clone(), r.endpoint_id, 2, r.age_secs));
+                    // healthy: cancel last
                 }
             }
         }
@@ -115,8 +126,14 @@ pub fn plan(
     } else if alive > target {
         // cancel excess: pending first, then starting, then healthy; oldest first within a rank.
         cancellable.sort_by(|a, b| a.3.cmp(&b.3).then(b.4.cmp(&a.4)));
-        for (id, job_id, endpoint_id, _, _) in cancellable.into_iter().take((alive - target) as usize) {
-            actions.push(Action::Cancel { replica_id: id, job_id, endpoint_id });
+        for (id, job_id, endpoint_id, _, _) in
+            cancellable.into_iter().take((alive - target) as usize)
+        {
+            actions.push(Action::Cancel {
+                replica_id: id,
+                job_id,
+                endpoint_id,
+            });
         }
     }
 
@@ -150,13 +167,42 @@ mod tests {
     use super::*;
 
     fn rv(state: &str, job: &str, ep: Option<Uuid>, age: i64) -> ReplicaView {
-        ReplicaView { id: Uuid::new_v4(), model_id: Uuid::new_v4(), slurm_job_id: job.into(), state: state.into(), endpoint_id: ep, age_secs: age, port_base: 0, last_message: None, cancel_requested: false }
+        ReplicaView {
+            id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            slurm_job_id: job.into(),
+            state: state.into(),
+            endpoint_id: ep,
+            age_secs: age,
+            port_base: 0,
+            last_message: None,
+            cancel_requested: false,
+        }
     }
     fn job(id: &str, st: JobState, nodes: &[&str]) -> (String, JobInfo) {
-        (id.into(), JobInfo { job_id: id.into(), state: st, nodes: nodes.iter().map(|s| s.to_string()).collect(), raw_state: String::new(), reason: None })
+        (
+            id.into(),
+            JobInfo {
+                job_id: id.into(),
+                state: st,
+                nodes: nodes.iter().map(|s| s.to_string()).collect(),
+                raw_state: String::new(),
+                reason: None,
+            },
+        )
     }
-    fn spec(target: i64) -> ManagedSpecView { ManagedSpecView { target_replicas: target, max_job_failures: 0 } }
-    fn spec_with_limit(target: i64, limit: i64) -> ManagedSpecView { ManagedSpecView { target_replicas: target, max_job_failures: limit } }
+    fn spec(target: i64) -> ManagedSpecView {
+        ManagedSpecView {
+            target_replicas: target,
+            max_job_failures: 0,
+        }
+    }
+    fn spec_with_limit(target: i64, limit: i64) -> ManagedSpecView {
+        ManagedSpecView {
+            target_replicas: target,
+            max_job_failures: limit,
+        }
+    }
 
     #[test]
     fn next_free_window_base_empty_returns_serving_port() {
@@ -181,7 +227,10 @@ mod tests {
     fn healthy_at_target_does_nothing() {
         let r1 = rv("healthy", "j1", Some(Uuid::new_v4()), 100);
         let r2 = rv("healthy", "j2", Some(Uuid::new_v4()), 100);
-        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"]), job("j2", JobState::Running, &["n2"])]);
+        let jobs = HashMap::from([
+            job("j1", JobState::Running, &["n1"]),
+            job("j2", JobState::Running, &["n2"]),
+        ]);
         let actions = plan(&spec(2), &[r1, r2], &jobs, &HashMap::new(), 900);
         assert!(actions.is_empty(), "got {actions:?}");
     }
@@ -193,7 +242,13 @@ mod tests {
         let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
         let health = HashMap::from([(id, 8000u16)]);
         let actions = plan(&spec(1), &[r], &jobs, &health, 900);
-        assert_eq!(actions, vec![Action::Promote { replica_id: id, api_base: "http://gpu7:8000/v1".into() }]);
+        assert_eq!(
+            actions,
+            vec![Action::Promote {
+                replica_id: id,
+                api_base: "http://gpu7:8000/v1".into()
+            }]
+        );
     }
 
     #[test]
@@ -205,7 +260,13 @@ mod tests {
         let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
         let health = HashMap::from([(id, 8000u16)]);
         let actions = plan(&spec(1), &[r], &jobs, &health, 900);
-        assert_eq!(actions, vec![Action::Promote { replica_id: id, api_base: "http://gpu7:8000/v1".into() }]);
+        assert_eq!(
+            actions,
+            vec![Action::Promote {
+                replica_id: id,
+                api_base: "http://gpu7:8000/v1".into()
+            }]
+        );
     }
 
     #[test]
@@ -237,7 +298,10 @@ mod tests {
         let id = r.id;
         // job gone from slurm entirely
         let actions = plan(&spec(1), &[r], &HashMap::new(), &HashMap::new(), 900);
-        assert!(actions.contains(&Action::MarkLost { replica_id: id, endpoint_id: Some(ep) }));
+        assert!(actions.contains(&Action::MarkLost {
+            replica_id: id,
+            endpoint_id: Some(ep)
+        }));
         assert!(actions.contains(&Action::Submit));
     }
 
@@ -246,9 +310,19 @@ mod tests {
         let healthy = rv("healthy", "j1", Some(Uuid::new_v4()), 1000);
         let pending = rv("pending", "j2", None, 10);
         let pid = pending.id;
-        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"]), job("j2", JobState::Pending, &["",])]);
+        let jobs = HashMap::from([
+            job("j1", JobState::Running, &["n1"]),
+            job("j2", JobState::Pending, &[""]),
+        ]);
         let actions = plan(&spec(1), &[healthy, pending], &jobs, &HashMap::new(), 900);
-        assert_eq!(actions, vec![Action::Cancel { replica_id: pid, job_id: "j2".into(), endpoint_id: None }]);
+        assert_eq!(
+            actions,
+            vec![Action::Cancel {
+                replica_id: pid,
+                job_id: "j2".into(),
+                endpoint_id: None
+            }]
+        );
     }
 
     #[test]
@@ -261,7 +335,11 @@ mod tests {
         let actions = plan(&spec(1), &[r], &jobs, &HashMap::new(), 900);
         // Cancelled (with its endpoint) regardless of target, and a fresh replica
         // submitted to refill — i.e. a restart.
-        assert!(actions.contains(&Action::Cancel { replica_id: id, job_id: "j1".into(), endpoint_id: Some(ep) }));
+        assert!(actions.contains(&Action::Cancel {
+            replica_id: id,
+            job_id: "j1".into(),
+            endpoint_id: Some(ep)
+        }));
         assert!(actions.contains(&Action::Submit));
     }
 
@@ -271,9 +349,19 @@ mod tests {
         let h1 = rv("healthy", "j1", Some(ep), 1000); // oldest -> cancelled first within rank
         let h1id = h1.id;
         let h2 = rv("healthy", "j2", Some(Uuid::new_v4()), 500);
-        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"]), job("j2", JobState::Running, &["n2"])]);
+        let jobs = HashMap::from([
+            job("j1", JobState::Running, &["n1"]),
+            job("j2", JobState::Running, &["n2"]),
+        ]);
         let actions = plan(&spec(1), &[h1, h2], &jobs, &HashMap::new(), 900);
-        assert_eq!(actions, vec![Action::Cancel { replica_id: h1id, job_id: "j1".into(), endpoint_id: Some(ep) }]);
+        assert_eq!(
+            actions,
+            vec![Action::Cancel {
+                replica_id: h1id,
+                job_id: "j1".into(),
+                endpoint_id: Some(ep)
+            }]
+        );
     }
 
     #[test]
@@ -286,7 +374,13 @@ mod tests {
         let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
         let health = HashMap::from([(id, 8000u16)]);
         let actions = plan(&spec(1), &[r], &jobs, &health, 900);
-        assert_eq!(actions, vec![Action::Promote { replica_id: id, api_base: "http://gpu7:8000/v1".into() }]);
+        assert_eq!(
+            actions,
+            vec![Action::Promote {
+                replica_id: id,
+                api_base: "http://gpu7:8000/v1".into()
+            }]
+        );
     }
 
     #[test]
@@ -309,23 +403,44 @@ mod tests {
     #[test]
     fn failure_limit_suppresses_submit_when_reached() {
         // 3 lost replicas, limit = 3 → no new Submit
-        let lost: Vec<ReplicaView> = (0..3).map(|i| rv("lost", &format!("j{i}"), None, 60)).collect();
-        let actions = plan(&spec_with_limit(2, 3), &lost, &HashMap::new(), &HashMap::new(), 900);
-        assert!(!actions.iter().any(|a| *a == Action::Submit), "submit must be suppressed at limit");
+        let lost: Vec<ReplicaView> = (0..3)
+            .map(|i| rv("lost", &format!("j{i}"), None, 60))
+            .collect();
+        let actions = plan(
+            &spec_with_limit(2, 3),
+            &lost,
+            &HashMap::new(),
+            &HashMap::new(),
+            900,
+        );
+        assert!(
+            !actions.iter().any(|a| *a == Action::Submit),
+            "submit must be suppressed at limit"
+        );
     }
 
     #[test]
     fn failure_limit_allows_submit_below_threshold() {
         // 2 lost replicas, limit = 5 → still submits
-        let lost: Vec<ReplicaView> = (0..2).map(|i| rv("lost", &format!("j{i}"), None, 60)).collect();
-        let actions = plan(&spec_with_limit(2, 5), &lost, &HashMap::new(), &HashMap::new(), 900);
+        let lost: Vec<ReplicaView> = (0..2)
+            .map(|i| rv("lost", &format!("j{i}"), None, 60))
+            .collect();
+        let actions = plan(
+            &spec_with_limit(2, 5),
+            &lost,
+            &HashMap::new(),
+            &HashMap::new(),
+            900,
+        );
         assert!(actions.iter().any(|a| *a == Action::Submit));
     }
 
     #[test]
     fn zero_limit_means_no_cap() {
         // 100 lost replicas, limit = 0 → unlimited, still submits
-        let lost: Vec<ReplicaView> = (0..100).map(|i| rv("lost", &format!("j{i}"), None, 60)).collect();
+        let lost: Vec<ReplicaView> = (0..100)
+            .map(|i| rv("lost", &format!("j{i}"), None, 60))
+            .collect();
         let actions = plan(&spec(2), &lost, &HashMap::new(), &HashMap::new(), 900);
         assert!(actions.iter().any(|a| *a == Action::Submit));
     }
@@ -364,7 +479,9 @@ mod tests {
         // spec target 0 so the only possible action would concern this replica.
         let actions = plan(&spec(0), &[r], &jobs, &HashMap::new(), 900);
         assert!(
-            !actions.iter().any(|a| matches!(a, Action::Delete { replica_id } if *replica_id == id)),
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Delete { replica_id } if *replica_id == id)),
             "draining replica with a live job must be left alone; got {actions:?}"
         );
     }
@@ -377,7 +494,9 @@ mod tests {
         let jobs = HashMap::from([job("j1", JobState::Pending, &[""])]);
         let actions = plan(&spec(0), &[r], &jobs, &HashMap::new(), 900);
         assert!(
-            !actions.iter().any(|a| matches!(a, Action::Delete { replica_id } if *replica_id == id)),
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Delete { replica_id } if *replica_id == id)),
             "draining replica with a pending job must be left alone; got {actions:?}"
         );
     }

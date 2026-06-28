@@ -214,9 +214,7 @@ pub async fn run(
                 .iter()
                 .any(|c| !loop_plan.tool_servers.contains_key(&c.name))
         {
-            tracing::debug!(
-                "tool loop yielding client-owned tool call back to the client"
-            );
+            tracing::debug!("tool loop yielding client-owned tool call back to the client");
             if let Some(t) = tracer {
                 t.record_elapsed(
                     "boon:tool_loop",
@@ -271,9 +269,14 @@ pub async fn run(
         }
         let tool_exec_start = crate::tracer::now_ms();
         for call in &calls {
-            let result_text =
-                execute_call(state, &loop_plan.tool_servers, &mut sessions, call, tool_timeout)
-                    .await;
+            let result_text = execute_call(
+                state,
+                &loop_plan.tool_servers,
+                &mut sessions,
+                call,
+                tool_timeout,
+            )
+            .await;
             tracing::debug!(
                 tool = %call.name,
                 turn,

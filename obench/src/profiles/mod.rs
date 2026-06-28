@@ -104,7 +104,9 @@ async fn seed_and_guard(
         anyhow::bail!("no models to drive — check the target/config (fixture backend reachable? live config has models?)");
     }
     if seeded.tenants.is_empty() {
-        anyhow::bail!("no tenants to drive — check the target/config (live config needs at least one key)");
+        anyhow::bail!(
+            "no tenants to drive — check the target/config (live config needs at least one key)"
+        );
     }
     Ok(seeded)
 }
@@ -171,8 +173,11 @@ async fn build_setup(
             }
         })
         .collect();
-    let key_counts: Arc<Vec<AtomicU64>> =
-        Arc::new((0..seeded.tenants.len()).map(|_| AtomicU64::new(0)).collect());
+    let key_counts: Arc<Vec<AtomicU64>> = Arc::new(
+        (0..seeded.tenants.len())
+            .map(|_| AtomicU64::new(0))
+            .collect(),
+    );
 
     let make_req = {
         let seeded_arc = seeded_arc.clone();
@@ -223,7 +228,11 @@ async fn build_setup(
                     key: tenant.key.clone(),
                     model: tt.model.to_string(),
                     input_tokens,
-                    output_tokens: if tt.output_tokens > 0 { tt.output_tokens } else { plan_out },
+                    output_tokens: if tt.output_tokens > 0 {
+                        tt.output_tokens
+                    } else {
+                        plan_out
+                    },
                     stream: tt.kind == TrafficKind::ChatStream,
                 })
             } else {
@@ -334,7 +343,9 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
             let started = std::time::Instant::now();
             while !stop.load(Ordering::Relaxed) {
                 tokio::time::sleep(Duration::from_secs(10)).await;
-                if stop.load(Ordering::Relaxed) { break; }
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
 
                 // Fairshare timeline sample — only when we own the gateway (demo).
                 // A remote live gateway has no admin token, so we record client
@@ -362,7 +373,12 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
                 }
                 last_completed = current_completed;
 
-                if is_stall(consecutive_zeros, STALL_THRESHOLD, conc, stop.load(Ordering::Relaxed)) {
+                if is_stall(
+                    consecutive_zeros,
+                    STALL_THRESHOLD,
+                    conc,
+                    stop.load(Ordering::Relaxed),
+                ) {
                     stats_w.lock().unwrap().stalled = true;
                     stop.store(true, Ordering::Relaxed);
                     break;
@@ -375,7 +391,11 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
     crate::engine::load::run_closed_loop(
         client,
         make_req,
-        RunConfig { conc: plan.conc, duration_s: plan.duration_s, warmup_s: plan.warmup_s },
+        RunConfig {
+            conc: plan.conc,
+            duration_s: plan.duration_s,
+            warmup_s: plan.warmup_s,
+        },
         stop.clone(),
         stats.clone(),
     )
@@ -389,7 +409,10 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
 
     // Summarize + report.
     let elapsed = started.elapsed().as_secs_f64().max(1.0);
-    let summary = stats.lock().unwrap().summarize(elapsed, plan.max_error_rate);
+    let summary = stats
+        .lock()
+        .unwrap()
+        .summarize(elapsed, plan.max_error_rate);
     println!("\n{}", report::render_summary(&summary, &ui_base));
     report::write_meta(
         &profile_name,
@@ -446,7 +469,11 @@ pub async fn start_run(
         let client = client.clone();
         let stats = stats.clone();
         let stop = stop.clone();
-        let cfg = RunConfig { conc: plan.conc, duration_s: plan.duration_s, warmup_s: plan.warmup_s };
+        let cfg = RunConfig {
+            conc: plan.conc,
+            duration_s: plan.duration_s,
+            warmup_s: plan.warmup_s,
+        };
         tokio::spawn(async move {
             crate::engine::load::run_closed_loop(client, make_req, cfg, stop.clone(), stats).await;
             // Signal natural completion (duration elapsed) so watchers — like the

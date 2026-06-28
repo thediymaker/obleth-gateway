@@ -1078,9 +1078,7 @@ pub async fn batch_has_trace(
         #[serde(with = "clickhouse::serde::uuid")]
         request_id: Uuid,
     }
-    let sql = format!(
-        "SELECT DISTINCT request_id FROM spans WHERE request_id IN ({in_list})"
-    );
+    let sql = format!("SELECT DISTINCT request_id FROM spans WHERE request_id IN ({in_list})");
     match client.query(&sql).fetch_all::<TracedId>().await {
         Ok(rows) => rows.into_iter().map(|r| r.request_id).collect(),
         Err(e) => {

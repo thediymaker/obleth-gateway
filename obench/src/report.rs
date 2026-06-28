@@ -32,7 +32,11 @@ pub fn render_summary(summary: &Summary, ui_base: &str) -> String {
         Verdict::Pass => "PASS — deployment stayed up and served the load".to_string(),
         Verdict::Fail(issues) => format!("FAIL — {}", issues.join("; ")),
     };
-    let est = if summary.any_estimated { "  (some token counts estimated)" } else { "" };
+    let est = if summary.any_estimated {
+        "  (some token counts estimated)"
+    } else {
+        ""
+    };
     format!(
         "verdict: {verdict}\n\
          requests: {} ok / {} attempts  ({:.0} req/s)\n\
@@ -43,11 +47,19 @@ pub fn render_summary(summary: &Summary, ui_base: &str) -> String {
          watch in the control plane:\n\
          \u{20}\u{20}fairshare   {ui_base}/fairshare\n\
          \u{20}\u{20}accounting  {ui_base}/usage",
-        summary.completed, summary.attempts, summary.req_per_s,
-        summary.errors, summary.error_rate * 100.0, summary.rejected,
-        summary.p50_ttfb_ms, summary.p90_ttfb_ms, summary.p99_ttfb_ms,
-        summary.p50_total_ms, summary.p99_total_ms,
-        summary.in_tokens, summary.out_tokens,
+        summary.completed,
+        summary.attempts,
+        summary.req_per_s,
+        summary.errors,
+        summary.error_rate * 100.0,
+        summary.rejected,
+        summary.p50_ttfb_ms,
+        summary.p90_ttfb_ms,
+        summary.p99_ttfb_ms,
+        summary.p50_total_ms,
+        summary.p99_total_ms,
+        summary.in_tokens,
+        summary.out_tokens,
     )
 }
 
@@ -59,7 +71,14 @@ mod tests {
     #[test]
     fn render_includes_verdict_and_pointers() {
         let mut s = Stats::default();
-        s.record(&crate::engine::stats::RequestOutcome { status: 200, ttfb_ms: 10, total_ms: 20, in_tokens: 5, out_tokens: 7, usage_estimated: false });
+        s.record(&crate::engine::stats::RequestOutcome {
+            status: 200,
+            ttfb_ms: 10,
+            total_ms: 20,
+            in_tokens: 5,
+            out_tokens: 7,
+            usage_estimated: false,
+        });
         let sum = s.summarize(1.0, 0.05);
         let out = render_summary(&sum, "http://localhost:3000");
         assert!(out.contains("PASS"));
@@ -69,7 +88,10 @@ mod tests {
 
     #[test]
     fn write_and_append_roundtrip() {
-        std::env::set_var("BENCH_OUT_DIR", std::env::temp_dir().join("obench-test").to_str().unwrap());
+        std::env::set_var(
+            "BENCH_OUT_DIR",
+            std::env::temp_dir().join("obench-test").to_str().unwrap(),
+        );
         let p = write_meta("unit", &serde_json::json!({ "ok": true })).unwrap();
         assert!(p.exists());
         append_timeline("unit", &serde_json::json!({ "t": 1 })).unwrap();

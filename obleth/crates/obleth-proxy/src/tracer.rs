@@ -60,7 +60,14 @@ impl SpanRecorder {
         attributes: serde_json::Value,
     ) {
         let duration_ms = (now_ms() - span_start_ms).max(0) as u32;
-        self.record(span_name, parent_span, span_start_ms, duration_ms, status, attributes);
+        self.record(
+            span_name,
+            parent_span,
+            span_start_ms,
+            duration_ms,
+            status,
+            attributes,
+        );
     }
 
     /// Record the root `proxy_request` span with total request duration, then

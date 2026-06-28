@@ -42,7 +42,11 @@ pub struct FairshareLive {
 
 impl AdminClient {
     pub fn new(base: String, token: String) -> Self {
-        Self { base, token, http: reqwest::Client::new() }
+        Self {
+            base,
+            token,
+            http: reqwest::Client::new(),
+        }
     }
 
     async fn req(&self, method: reqwest::Method, path: &str, body: Option<Value>) -> Result<Value> {
@@ -53,7 +57,10 @@ impl AdminClient {
         if let Some(b) = body {
             rb = rb.json(&b);
         }
-        let res = rb.send().await.with_context(|| format!("{method} {path}"))?;
+        let res = rb
+            .send()
+            .await
+            .with_context(|| format!("{method} {path}"))?;
         let status = res.status();
         let text = res.text().await.unwrap_or_default();
         if !status.is_success() {
@@ -69,18 +76,27 @@ impl AdminClient {
         let models = self.req(reqwest::Method::GET, "/models", None).await?;
         let existing_id = models
             .as_array()
-            .and_then(|arr| arr.iter().find(|m| m["model_name"] == spec.model_name.as_str()))
+            .and_then(|arr| {
+                arr.iter()
+                    .find(|m| m["model_name"] == spec.model_name.as_str())
+            })
             .and_then(|m| m["id"].as_str().map(|s| s.to_string()));
 
         match plan_model(existing_id.as_deref()) {
             ModelAction::Create => {
-                let created = self.req(reqwest::Method::POST, "/models", Some(json!({
-                    "model_name": spec.model_name,
-                    "upstream_model": spec.upstream_model,
-                    "api_base": spec.api_base,
-                    "context_window": spec.context_window,
-                    "admission_weight": spec.admission_weight,
-                }))).await?;
+                let created = self
+                    .req(
+                        reqwest::Method::POST,
+                        "/models",
+                        Some(json!({
+                            "model_name": spec.model_name,
+                            "upstream_model": spec.upstream_model,
+                            "api_base": spec.api_base,
+                            "context_window": spec.context_window,
+                            "admission_weight": spec.admission_weight,
+                        })),
+                    )
+                    .await?;
                 // Some deployments return the created object; fall back to a
                 // follow-up lookup if the POST response omits the id.
                 let id = match created["id"].as_str() {
@@ -89,14 +105,39 @@ impl AdminClient {
                         let models = self.req(reqwest::Method::GET, "/models", None).await?;
                         models
                             .as_array()
-                            .and_then(|arr| arr.iter().find(|m| m["model_name"] == spec.model_name.as_str()))
+                            .and_then(|arr| {
+                                arr.iter()
+                                    .find(|m| m["model_name"] == spec.model_name.as_str())
+                            })
                             .and_then(|m| m["id"].as_str().map(|s| s.to_string()))
                             .context("created model id")?
                     }
                 };
                 // Live models carry the upstream api_key; push it in via update.
                 if spec.api_key.is_some() {
-                    self.req(reqwest::Method::PUT, &format!("/models/{id}"), Some(json!({
+                    self.req(
+                        reqwest::Method::PUT,
+                        &format!("/models/{id}"),
+                        Some(json!({
+                            "upstream_model": spec.upstream_model,
+                            "api_base": spec.api_base,
+                            "api_key": spec.api_key,
+                            "input_cost_per_token": spec.input_cost_per_token,
+                            "output_cost_per_token": spec.output_cost_per_token,
+                            "context_window": spec.context_window,
+                            "admission_weight": spec.admission_weight,
+                            "enabled": true,
+                        })),
+                    )
+                    .await?;
+                }
+                Ok((id, true))
+            }
+            ModelAction::Update(id) => {
+                self.req(
+                    reqwest::Method::PUT,
+                    &format!("/models/{id}"),
+                    Some(json!({
                         "upstream_model": spec.upstream_model,
                         "api_base": spec.api_base,
                         "api_key": spec.api_key,
@@ -104,62 +145,87 @@ impl AdminClient {
                         "output_cost_per_token": spec.output_cost_per_token,
                         "context_window": spec.context_window,
                         "admission_weight": spec.admission_weight,
+                        "supports_function_calling": false,
+                        "supports_system_messages": true,
+                        "supports_response_schema": false,
+                        "supports_tool_choice": false,
                         "enabled": true,
-                    }))).await?;
-                }
-                Ok((id, true))
-            }
-            ModelAction::Update(id) => {
-                self.req(reqwest::Method::PUT, &format!("/models/{id}"), Some(json!({
-                    "upstream_model": spec.upstream_model,
-                    "api_base": spec.api_base,
-                    "api_key": spec.api_key,
-                    "input_cost_per_token": spec.input_cost_per_token,
-                    "output_cost_per_token": spec.output_cost_per_token,
-                    "context_window": spec.context_window,
-                    "admission_weight": spec.admission_weight,
-                    "supports_function_calling": false,
-                    "supports_system_messages": true,
-                    "supports_response_schema": false,
-                    "supports_tool_choice": false,
-                    "enabled": true,
-                }))).await?;
+                    })),
+                )
+                .await?;
                 Ok((id, false))
             }
         }
     }
 
     pub async fn ensure_group(&self, name: &str, weight: u32) -> Result<()> {
-        let groups = self.req(reqwest::Method::GET, "/fairshare/groups", None).await?;
-        let exists = groups.as_array().is_some_and(|a| a.iter().any(|g| g["name"] == name));
+        let groups = self
+            .req(reqwest::Method::GET, "/fairshare/groups", None)
+            .await?;
+        let exists = groups
+            .as_array()
+            .is_some_and(|a| a.iter().any(|g| g["name"] == name));
         if exists {
-            self.req(reqwest::Method::PATCH, &format!("/fairshare/groups/{name}/weight"),
-                     Some(json!({ "weight": weight }))).await?;
+            self.req(
+                reqwest::Method::PATCH,
+                &format!("/fairshare/groups/{name}/weight"),
+                Some(json!({ "weight": weight })),
+            )
+            .await?;
         } else {
-            self.req(reqwest::Method::POST, "/fairshare/groups",
-                     Some(json!({ "name": name, "weight": weight }))).await?;
+            self.req(
+                reqwest::Method::POST,
+                "/fairshare/groups",
+                Some(json!({ "name": name, "weight": weight })),
+            )
+            .await?;
         }
         Ok(())
     }
 
-    pub async fn ensure_tenant(&self, name: &str, weight: u32, tokens_per_minute: u64, group: &str) -> Result<(String, bool)> {
+    pub async fn ensure_tenant(
+        &self,
+        name: &str,
+        weight: u32,
+        tokens_per_minute: u64,
+        group: &str,
+    ) -> Result<(String, bool)> {
         let tenants = self.req(reqwest::Method::GET, "/tenants", None).await?;
-        let existing = tenants.as_array()
+        let existing = tenants
+            .as_array()
             .and_then(|a| a.iter().find(|t| t["name"] == name))
             .cloned();
         if let Some(t) = existing {
             let id = t["id"].as_str().context("tenant id")?.to_string();
-            self.req(reqwest::Method::PATCH, &format!("/tenants/{id}/weight"), Some(json!({ "weight": weight }))).await?;
-            self.req(reqwest::Method::PUT, &format!("/tenants/{id}/quota"),
-                     Some(json!({ "tokens_per_minute": tokens_per_minute, "max_in_flight": Value::Null }))).await?;
-            self.req(reqwest::Method::PATCH, &format!("/tenants/{id}/group"),
-                     Some(json!({ "fairshare_group": group }))).await?;
+            self.req(
+                reqwest::Method::PATCH,
+                &format!("/tenants/{id}/weight"),
+                Some(json!({ "weight": weight })),
+            )
+            .await?;
+            self.req(
+                reqwest::Method::PUT,
+                &format!("/tenants/{id}/quota"),
+                Some(
+                    json!({ "tokens_per_minute": tokens_per_minute, "max_in_flight": Value::Null }),
+                ),
+            )
+            .await?;
+            self.req(
+                reqwest::Method::PATCH,
+                &format!("/tenants/{id}/group"),
+                Some(json!({ "fairshare_group": group })),
+            )
+            .await?;
             Ok((id, false))
         } else {
             let created = self.req(reqwest::Method::POST, "/tenants", Some(json!({
                 "name": name, "weight": weight, "tokens_per_minute": tokens_per_minute, "fairshare_group": group,
             }))).await?;
-            Ok((created["id"].as_str().context("new tenant id")?.to_string(), true))
+            Ok((
+                created["id"].as_str().context("new tenant id")?.to_string(),
+                true,
+            ))
         }
     }
 
@@ -170,28 +236,45 @@ impl AdminClient {
     /// for the duration of the run and the key is deleted during teardown.
     pub async fn ensure_key(&self, tenant_id: &str, key_name: &str) -> Result<(String, String)> {
         let keys = self.req(reqwest::Method::GET, "/keys", None).await?;
-        let inv: Vec<(String, String, String)> = keys.as_array().map(|a| {
-            a.iter().filter_map(|k| Some((
-                k["id"].as_str()?.to_string(),
-                k["tenant_id"].as_str()?.to_string(),
-                k["name"].as_str()?.to_string(),
-            ))).collect()
-        }).unwrap_or_default();
+        let inv: Vec<(String, String, String)> = keys
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|k| {
+                        Some((
+                            k["id"].as_str()?.to_string(),
+                            k["tenant_id"].as_str()?.to_string(),
+                            k["name"].as_str()?.to_string(),
+                        ))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Prune every same-named key for this tenant, then always mint fresh.
         for (id, tid, name) in &inv {
             if tid == tenant_id && name == key_name {
-                let _ = self.req(reqwest::Method::DELETE, &format!("/keys/{id}"), None).await;
+                let _ = self
+                    .req(reqwest::Method::DELETE, &format!("/keys/{id}"), None)
+                    .await;
             }
         }
-        let minted = self.req(reqwest::Method::POST, &format!("/tenants/{tenant_id}/keys"),
-                              Some(json!({ "name": key_name }))).await?;
+        let minted = self
+            .req(
+                reqwest::Method::POST,
+                &format!("/tenants/{tenant_id}/keys"),
+                Some(json!({ "name": key_name })),
+            )
+            .await?;
         // Response shape: { "key": { "id": ..., ... }, "secret": "..." }.
         let id = minted["key"]["id"]
             .as_str()
             .context("minted key id")?
             .to_string();
-        let secret = minted["secret"].as_str().context("minted secret")?.to_string();
+        let secret = minted["secret"]
+            .as_str()
+            .context("minted secret")?
+            .to_string();
         Ok((id, secret))
     }
 
@@ -201,34 +284,65 @@ impl AdminClient {
     /// a failed/interrupted run, and a missing resource is fine.
     pub async fn teardown(&self, td: &Teardown) {
         for id in &td.key_ids {
-            let _ = self.req(reqwest::Method::DELETE, &format!("/keys/{id}"), None).await;
+            let _ = self
+                .req(reqwest::Method::DELETE, &format!("/keys/{id}"), None)
+                .await;
         }
         for id in &td.model_ids {
-            let _ = self.req(reqwest::Method::DELETE, &format!("/models/{id}"), None).await;
+            let _ = self
+                .req(reqwest::Method::DELETE, &format!("/models/{id}"), None)
+                .await;
         }
         for id in &td.tenant_ids {
-            let _ = self.req(reqwest::Method::DELETE, &format!("/tenants/{id}"), None).await;
+            let _ = self
+                .req(reqwest::Method::DELETE, &format!("/tenants/{id}"), None)
+                .await;
         }
     }
 
     pub async fn set_capacity(&self, max_in_flight: u32) -> Result<u32> {
-        let body = self.req(reqwest::Method::PUT, "/capacity", Some(json!({ "max_in_flight": max_in_flight }))).await?;
-        Ok(body["max_in_flight"].as_u64().unwrap_or(max_in_flight as u64) as u32)
+        let body = self
+            .req(
+                reqwest::Method::PUT,
+                "/capacity",
+                Some(json!({ "max_in_flight": max_in_flight })),
+            )
+            .await?;
+        Ok(body["max_in_flight"]
+            .as_u64()
+            .unwrap_or(max_in_flight as u64) as u32)
     }
 
     pub async fn fairshare_live(&self) -> Result<FairshareLive> {
-        let v = self.req(reqwest::Method::GET, "/fairshare/live", None).await?;
-        Ok(serde_json::from_value(v).unwrap_or(FairshareLive { global_in_flight: 0, global_queued: 0 }))
+        let v = self
+            .req(reqwest::Method::GET, "/fairshare/live", None)
+            .await?;
+        Ok(serde_json::from_value(v).unwrap_or(FairshareLive {
+            global_in_flight: 0,
+            global_queued: 0,
+        }))
     }
 
     pub async fn list_model_names(&self) -> anyhow::Result<Vec<String>> {
         let v = self.req(reqwest::Method::GET, "/models", None).await?;
-        Ok(v.as_array().map(|a| a.iter().filter_map(|m| m["model_name"].as_str().map(String::from)).collect()).unwrap_or_default())
+        Ok(v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|m| m["model_name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     pub async fn list_tenant_names(&self) -> anyhow::Result<Vec<String>> {
         let v = self.req(reqwest::Method::GET, "/tenants", None).await?;
-        Ok(v.as_array().map(|a| a.iter().filter_map(|t| t["name"].as_str().map(String::from)).collect()).unwrap_or_default())
+        Ok(v.as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|t| t["name"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     pub async fn get_capacity(&self) -> anyhow::Result<u32> {

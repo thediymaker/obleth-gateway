@@ -34,7 +34,11 @@ fn silhouette() -> &'static Silhouette {
 }
 
 fn build_silhouette() -> Silhouette {
-    let empty = Silhouette { w: 0, h: 0, pix: Vec::new() };
+    let empty = Silhouette {
+        w: 0,
+        h: 0,
+        pix: Vec::new(),
+    };
     let Ok(img) = image::load_from_memory(LOGO_PNG) else {
         return empty;
     };
@@ -168,8 +172,7 @@ pub fn render_mark(max_w: u16, max_h: u16) -> Vec<String> {
     // height of a row. Pick the largest grid that fits and keeps proportions.
     let rows_from_w = (bound_w as f64 * ih / (2.0 * iw)).floor();
     let rows = (bound_h as f64).min(rows_from_w).max(1.0) as usize;
-    let cols = ((2.0 * rows as f64 * iw / ih).round() as usize)
-        .clamp(1, bound_w as usize);
+    let cols = ((2.0 * rows as f64 * iw / ih).round() as usize).clamp(1, bound_w as usize);
 
     // ASCII shading ramp: blank background -> light edge -> solid pillar body.
     const RAMP: [char; 5] = [' ', '.', ':', '+', '#'];
@@ -192,7 +195,11 @@ pub fn render_mark(max_w: u16, max_h: u16) -> Vec<String> {
                     }
                 }
             }
-            let cov = if total == 0 { 0.0 } else { on as f64 / total as f64 };
+            let cov = if total == 0 {
+                0.0
+            } else {
+                on as f64 / total as f64
+            };
             let idx = (cov * (RAMP.len() - 1) as f64).round() as usize;
             line.push(RAMP[idx]);
         }
@@ -206,7 +213,9 @@ pub fn render_mark(max_w: u16, max_h: u16) -> Vec<String> {
 /// Returns styled lines ready for a `Paragraph`; the caller handles centring.
 /// The emblem + name are accent/foreground; the subtitle is muted.
 pub fn lockup_lines(subtitle: &str, max_w: u16, max_h: u16) -> Vec<Line<'static>> {
-    let accent = Style::default().fg(theme::ACCENT).add_modifier(Modifier::BOLD);
+    let accent = Style::default()
+        .fg(theme::ACCENT)
+        .add_modifier(Modifier::BOLD);
     let name = Style::default().fg(theme::FG).add_modifier(Modifier::BOLD);
     let sub = Style::default().fg(theme::MUTED);
 

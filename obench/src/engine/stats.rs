@@ -151,7 +151,14 @@ mod tests {
     use super::*;
 
     fn ok(ttfb: u64, total: u64) -> RequestOutcome {
-        RequestOutcome { status: 200, ttfb_ms: ttfb, total_ms: total, in_tokens: 10, out_tokens: 20, usage_estimated: false }
+        RequestOutcome {
+            status: 200,
+            ttfb_ms: ttfb,
+            total_ms: total,
+            in_tokens: 10,
+            out_tokens: 20,
+            usage_estimated: false,
+        }
     }
 
     #[test]
@@ -165,7 +172,9 @@ mod tests {
     #[test]
     fn clean_run_passes() {
         let mut s = Stats::default();
-        for _ in 0..100 { s.record(&ok(10, 20)); }
+        for _ in 0..100 {
+            s.record(&ok(10, 20));
+        }
         let sum = s.summarize(10.0, 0.05);
         assert_eq!(sum.verdict, Verdict::Pass);
         assert_eq!(sum.completed, 100);
@@ -175,12 +184,24 @@ mod tests {
     #[test]
     fn high_error_rate_fails() {
         let mut s = Stats::default();
-        for _ in 0..90 { s.record(&ok(10, 20)); }
+        for _ in 0..90 {
+            s.record(&ok(10, 20));
+        }
         for _ in 0..10 {
-            s.record(&RequestOutcome { status: 500, ttfb_ms: 0, total_ms: 0, in_tokens: 0, out_tokens: 0, usage_estimated: false });
+            s.record(&RequestOutcome {
+                status: 500,
+                ttfb_ms: 0,
+                total_ms: 0,
+                in_tokens: 0,
+                out_tokens: 0,
+                usage_estimated: false,
+            });
         }
         let sum = s.summarize(10.0, 0.05);
-        match sum.verdict { Verdict::Fail(v) => assert!(v[0].contains("error rate")), _ => panic!("expected fail") }
+        match sum.verdict {
+            Verdict::Fail(v) => assert!(v[0].contains("error rate")),
+            _ => panic!("expected fail"),
+        }
     }
 
     #[test]
@@ -195,7 +216,14 @@ mod tests {
     #[test]
     fn rejected_429_is_not_an_error() {
         let mut s = Stats::default();
-        s.record(&RequestOutcome { status: 429, ttfb_ms: 0, total_ms: 0, in_tokens: 0, out_tokens: 0, usage_estimated: false });
+        s.record(&RequestOutcome {
+            status: 429,
+            ttfb_ms: 0,
+            total_ms: 0,
+            in_tokens: 0,
+            out_tokens: 0,
+            usage_estimated: false,
+        });
         let sum = s.summarize(1.0, 0.0);
         assert_eq!(sum.errors, 0);
         assert_eq!(sum.rejected, 1);

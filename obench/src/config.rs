@@ -34,7 +34,9 @@ pub struct LiveConfig {
     pub keys: Vec<LiveKey>,
 }
 
-fn default_weight() -> u32 { 100 }
+fn default_weight() -> u32 {
+    100
+}
 
 /// Replace every `${VAR}` with its looked-up value. A missing var is a hard
 /// error — never a silent blank.
@@ -144,13 +146,21 @@ mod tests {
 
     #[test]
     fn scope_all_requires_a_model_and_key() {
-        let empty = LiveConfig { proxy_url: "https://x".into(), models: vec![], keys: vec![] };
+        let empty = LiveConfig {
+            proxy_url: "https://x".into(),
+            models: vec![],
+            keys: vec![],
+        };
         assert!(validate_live(&empty, &Scope::All).is_err());
 
         let ok = LiveConfig {
             proxy_url: "https://x".into(),
             models: vec!["gpt-4o".into()],
-            keys: vec![LiveKey { label: "a".into(), weight: 100, secret: "k".into() }],
+            keys: vec![LiveKey {
+                label: "a".into(),
+                weight: 100,
+                secret: "k".into(),
+            }],
         };
         assert!(validate_live(&ok, &Scope::All).is_ok());
     }
@@ -160,7 +170,11 @@ mod tests {
         let cfg = LiveConfig {
             proxy_url: "https://x".into(),
             models: vec![],
-            keys: vec![LiveKey { label: "a".into(), weight: 100, secret: "k".into() }],
+            keys: vec![LiveKey {
+                label: "a".into(),
+                weight: 100,
+                secret: "k".into(),
+            }],
         };
         assert!(validate_live(&cfg, &Scope::Single("missing".into())).is_err());
     }

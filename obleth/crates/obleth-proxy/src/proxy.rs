@@ -47,6 +47,10 @@ const BOON_MIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// instead of in proxy-buffer-sized bursts. Harmless when no such proxy is in
 /// front of the gateway. (HAProxy honours `option http-no-delay` instead.)
 const NO_BUFFER_HEADER: (&str, &str) = ("x-accel-buffering", "no");
+/// Fixed, short delay before the one bonus retry granted to a connection-level
+/// upstream failure (a stale pooled keep-alive socket). Long enough to let a
+/// fresh connection replace the dead one, short enough to stay invisible in TTFT.
+const CONN_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
 pub async fn proxy_handler(state: State<AppState>, req: Request<Body>) -> Response<Body> {
     let request_id = Uuid::new_v4();
@@ -135,7 +139,11 @@ async fn proxy_handler_inner(
     // ---- request flight-recorder tracer ----
     let mut tracer: Option<crate::tracer::SpanRecorder> = if resolved.tracing_enabled {
         tracing::debug!(request_id = %request_id, "tracing enabled — recording spans");
-        Some(crate::tracer::SpanRecorder::new(request_id, proxy_start_ms, state.telemetry.clone()))
+        Some(crate::tracer::SpanRecorder::new(
+            request_id,
+            proxy_start_ms,
+            state.telemetry.clone(),
+        ))
     } else {
         tracing::debug!(request_id = %request_id, "tracing disabled for this key");
         None
@@ -201,7 +209,12 @@ async fn proxy_handler_inner(
     // Request-log metadata, captured once so every `finalize` path (cache hit,
     // rejection, upstream error, streamed success) records the same session and
     // request class.
-    let conversation = resolve_conversation(&headers, &json, resolved.tenant_id, state.session_id_derivation);
+    let conversation = resolve_conversation(
+        &headers,
+        &json,
+        resolved.tenant_id,
+        state.session_id_derivation,
+    );
     let req_meta = RequestMeta {
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
@@ -339,7 +352,9 @@ async fn proxy_handler_inner(
         )
         .await;
     if let Some(block) = boon_outcome.blocked {
-        if let Some(t) = tracer.take() { t.finish("error"); }
+        if let Some(t) = tracer.take() {
+            t.finish("error");
+        }
         return error_json(block.status, block.reason);
     }
     if boon_outcome.rewritten {
@@ -361,23 +376,15 @@ async fn proxy_handler_inner(
     // and only the tool execution between turns pauses the stream. The
     // structured-output transform still needs a fully buffered completion, so it
     // keeps forcing the upstream non-streaming.
-    let stream_tap = response_plan
-        .as_ref()
-        .is_some_and(|p| {
-            p.tool_loop.is_some()
-                && p.structured.is_none()
-                && p.client_stream
-                && p.guardrails
-                    .as_ref()
-                    .map(|g| {
-                        matches!(
-                            g.policy.action,
-                            obleth_config::GuardrailsAction::LogOnly
-                        )
-                    })
-                    .unwrap_or(true)
-        })
-        && route.is_some();
+    let stream_tap = response_plan.as_ref().is_some_and(|p| {
+        p.tool_loop.is_some()
+            && p.structured.is_none()
+            && p.client_stream
+            && p.guardrails
+                .as_ref()
+                .map(|g| matches!(g.policy.action, obleth_config::GuardrailsAction::LogOnly))
+                .unwrap_or(true)
+    }) && route.is_some();
 
     let effective_weight = effective_admission_weight(resolved.weight, route.as_deref());
 
@@ -611,7 +618,9 @@ async fn proxy_handler_inner(
                     cache_status_label,
                     0.0,
                 );
-                if let Some(t) = tracer.take() { t.finish("error"); }
+                if let Some(t) = tracer.take() {
+                    t.finish("error");
+                }
                 return error_json(StatusCode::FORBIDDEN, "api key term budget exhausted");
             }
             Err(e) => {
@@ -626,7 +635,9 @@ async fn proxy_handler_inner(
                             resolved.key_id
                         ),
                     );
-                    if let Some(t) = tracer.take() { t.finish("error"); }
+                    if let Some(t) = tracer.take() {
+                        t.finish("error");
+                    }
                     return error_json(StatusCode::SERVICE_UNAVAILABLE, "key budget check failed");
                 }
                 tracing::warn!(error = %e, "key budget reserve failed; failing open");
@@ -676,7 +687,9 @@ async fn proxy_handler_inner(
                     cache_status_label,
                     0.0,
                 );
-                if let Some(t) = tracer.take() { t.finish("error"); }
+                if let Some(t) = tracer.take() {
+                    t.finish("error");
+                }
                 return error_json(StatusCode::TOO_MANY_REQUESTS, "token budget exceeded");
             }
             Ok(obleth_redis::ReserveOutcome::TermExhausted {
@@ -711,7 +724,9 @@ async fn proxy_handler_inner(
                     cache_status_label,
                     0.0,
                 );
-                if let Some(t) = tracer.take() { t.finish("error"); }
+                if let Some(t) = tracer.take() {
+                    t.finish("error");
+                }
                 return error_json(StatusCode::FORBIDDEN, "tenant term budget exhausted");
             }
             Err(e) => {
@@ -725,7 +740,9 @@ async fn proxy_handler_inner(
                             resolved.tenant_name
                         ),
                     );
-                    if let Some(t) = tracer.take() { t.finish("error"); }
+                    if let Some(t) = tracer.take() {
+                        t.finish("error");
+                    }
                     return error_json(StatusCode::SERVICE_UNAVAILABLE, "budget check failed");
                 }
                 tracing::warn!(error = %e, "budget reserve failed; failing open");
@@ -771,7 +788,12 @@ async fn proxy_handler_inner(
     // endpoints we route across the healthy/enabled ones (priority order for
     // failover, weighted order for load_balance); otherwise we fall back to the
     // legacy single api_base/api_key on the model (or the global default).
-    let targets = build_targets(route.as_deref(), &state.upstream_base, selection_mode, &req_meta.session_id);
+    let targets = build_targets(
+        route.as_deref(),
+        &state.upstream_base,
+        selection_mode,
+        &req_meta.session_id,
+    );
 
     // The JSON body is rebuilt once and replayed on each attempt/endpoint.
     // Multipart bodies cannot be replayed, so they get a single attempt against
@@ -802,13 +824,21 @@ async fn proxy_handler_inner(
     'targets: for (ti, target) in targets.iter().enumerate() {
         let url = build_upstream_url(&target.base, &path, &query);
         last_url = url.clone();
-        let attempts: u32 = if replayable {
+        // Base budget = configured retries + 1. Plus one extra slot reserved for
+        // connection-level failures: a reused keep-alive socket the upstream
+        // already closed surfaces as a send error with no response, so the request
+        // never executed and is safe to retry on a fresh connection even when
+        // max_retries == 0. The bonus slot is only ever consumed by a connection
+        // error — status/timeout failures break out to failover instead.
+        let base_attempts: u32 = if replayable {
             max_retries as u32 + 1
         } else {
             1
         };
+        let attempts: u32 = base_attempts + if replayable { 1 } else { 0 };
         for attempt in 0..attempts {
-            let more_attempts = attempt + 1 < attempts;
+            let configured_left = attempt + 1 < base_attempts;
+            let bonus_left = attempt + 1 < attempts;
             let more_targets = replayable && ti + 1 < total_targets;
 
             let mut fwd_headers = forward_headers(&headers);
@@ -858,9 +888,9 @@ async fn proxy_handler_inner(
             match timeout(req_timeout, send_fut).await {
                 Ok(Ok(resp)) => {
                     let status = resp.status().as_u16();
-                    if is_retryable_status(status) && (more_attempts || more_targets) {
+                    if is_retryable_status(status) && (configured_left || more_targets) {
                         last_err = Some(format!("upstream status {status}"));
-                        if more_attempts {
+                        if configured_left {
                             state.metrics.record_upstream_attempt("retry");
                             tokio::time::sleep(backoff_for(backoff, attempt)).await;
                             continue;
@@ -873,21 +903,33 @@ async fn proxy_handler_inner(
                     break 'targets;
                 }
                 Ok(Err(e)) => {
+                    let connection_error = is_connection_error(&e);
                     last_err = Some(e.to_string());
-                    if more_attempts {
+                    if configured_left {
                         state.metrics.record_upstream_attempt("retry");
                         tokio::time::sleep(backoff_for(backoff, attempt)).await;
                         continue;
                     }
+                    // Configured retries are spent, but a connection-level send
+                    // failure never reached the upstream (e.g. a stale pooled
+                    // keep-alive socket): spend the reserved bonus slot on one
+                    // fresh-connection retry before failing over.
+                    if connection_error && bonus_left {
+                        state.metrics.record_upstream_attempt("conn_retry");
+                        tokio::time::sleep(CONN_RETRY_BACKOFF).await;
+                        continue;
+                    }
+                    break;
                 }
                 Err(_) => {
                     timed_out = true;
                     last_err = Some(format!("timed out after {req_timeout:?}"));
-                    if more_attempts {
+                    if configured_left {
                         state.metrics.record_upstream_attempt("timeout");
                         tokio::time::sleep(backoff_for(backoff, attempt)).await;
                         continue;
                     }
+                    break;
                 }
             }
         }
@@ -2282,13 +2324,18 @@ fn rendezvous_score(session_key: &str, endpoint_id: &str) -> u64 {
 /// highest score is the session's home and goes first, the rest follow for
 /// failover. Deterministic for a given key; adding/removing an endpoint
 /// reshuffles only minimally. With no session key, falls back to weighted order.
-fn session_hash_order<'a>(items: Vec<&'a ResolvedEndpoint>, session_key: &str) -> Vec<&'a ResolvedEndpoint> {
+fn session_hash_order<'a>(
+    items: Vec<&'a ResolvedEndpoint>,
+    session_key: &str,
+) -> Vec<&'a ResolvedEndpoint> {
     if session_key.is_empty() {
         // No session key on the request, so stickiness is impossible: this falls
         // back to weighted_order, i.e. session_hash behaves like load_balance.
         // Logged (debug, not warn — keyless requests are common and expected) so
         // operators can see why a session_hash model isn't actually sticking.
-        tracing::debug!("session_hash selected but request has no session key; falling back to weighted order");
+        tracing::debug!(
+            "session_hash selected but request has no session key; falling back to weighted order"
+        );
         return weighted_order(items);
     }
     let mut scored: Vec<(u64, &ResolvedEndpoint)> = items
@@ -2305,6 +2352,35 @@ fn session_hash_order<'a>(items: Vec<&'a ResolvedEndpoint>, session_key: &str) -
 /// (except 408 request-timeout and 429 too-many-requests).
 fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Whether a reqwest send error means the request never reached the upstream, so
+/// a fresh-connection retry is safe. Covers connection establishment failures and
+/// the "reused a keep-alive socket the server already closed" race — hyper
+/// surfaces the latter as an incomplete/closed/reset error in the source chain
+/// rather than via `is_connect()`, so we also scan the error chain for the
+/// well-known signatures.
+fn is_connection_error(e: &reqwest::Error) -> bool {
+    use std::error::Error;
+    if e.is_connect() || e.is_request() {
+        return true;
+    }
+    let mut source: Option<&dyn Error> = Some(e);
+    while let Some(err) = source {
+        let msg = err.to_string().to_ascii_lowercase();
+        if msg.contains("connection closed")
+            || msg.contains("connection reset")
+            || msg.contains("connection aborted")
+            || msg.contains("broken pipe")
+            || msg.contains("channel closed")
+            || msg.contains("unexpected end of file")
+            || msg.contains("incompletemessage")
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 /// Exponential backoff for retry `attempt` (0-based), capped to avoid overflow.
@@ -2516,15 +2592,23 @@ fn resolve_conversation(
         .map(str::trim)
         .filter(|s| !s.is_empty())
     {
-        return Conversation { value: capped(s), source: SessionSource::Client };
+        return Conversation {
+            value: capped(s),
+            source: SessionSource::Client,
+        };
     }
     let body_ids = [
         json.get("session_id").and_then(|v| v.as_str()),
-        json.get("metadata").and_then(|m| m.get("session_id")).and_then(|v| v.as_str()),
+        json.get("metadata")
+            .and_then(|m| m.get("session_id"))
+            .and_then(|v| v.as_str()),
     ];
     for c in body_ids.into_iter().flatten() {
         if !c.trim().is_empty() {
-            return Conversation { value: capped(c), source: SessionSource::Client };
+            return Conversation {
+                value: capped(c),
+                source: SessionSource::Client,
+            };
         }
     }
 
@@ -2533,12 +2617,18 @@ fn resolve_conversation(
     if derivation_enabled {
         if let Some(seed) = conversation_seed(json) {
             let h = fnv1a_continue(fnv1a(tenant_id.as_bytes()), seed.as_bytes());
-            return Conversation { value: format!("{h:016x}"), source: SessionSource::Derived };
+            return Conversation {
+                value: format!("{h:016x}"),
+                source: SessionSource::Derived,
+            };
         }
     }
 
     // 3. Nothing to go on.
-    Conversation { value: String::new(), source: SessionSource::None }
+    Conversation {
+        value: String::new(),
+        source: SessionSource::None,
+    }
 }
 
 /// Maximum seed text hashed; bounds work on huge system prompts. The same
@@ -3141,9 +3231,16 @@ mod tests {
         let refs: Vec<&ResolvedEndpoint> = eps.iter().collect();
         // Different keys should not all land on the same home endpoint.
         let homes: std::collections::HashSet<String> = (0..40)
-            .map(|i| session_hash_order(refs.clone(), &format!("k{i}"))[0].id.clone())
+            .map(|i| {
+                session_hash_order(refs.clone(), &format!("k{i}"))[0]
+                    .id
+                    .clone()
+            })
             .collect();
-        assert!(homes.len() > 1, "session_hash should spread homes across keys");
+        assert!(
+            homes.len() > 1,
+            "session_hash should spread homes across keys"
+        );
     }
 
     #[test]
@@ -3270,7 +3367,10 @@ mod tests {
         // Two endpoints; a fixed key picks one deterministically.
         let ep_a = "http://a/v1";
         let ep_b = "http://b/v1";
-        let m_all = model_with(vec![endpoint("a", ep_a, 100, 100, true, true), endpoint("b", ep_b, 100, 100, true, true)]);
+        let m_all = model_with(vec![
+            endpoint("a", ep_a, 100, 100, true, true),
+            endpoint("b", ep_b, 100, 100, true, true),
+        ]);
         let key = "deadbeefdeadbeef";
         let first = build_targets(Some(&m_all), "http://global/v1", "session_hash", key);
         let again = build_targets(Some(&m_all), "http://global/v1", "session_hash", key);
@@ -3279,11 +3379,19 @@ mod tests {
         // Remove whichever endpoint was primary; the survivor must take over.
         let primary = first[0].base.clone();
         let survivor = if primary == ep_a { ep_b } else { ep_a };
-        let survivors: Vec<_> = vec![endpoint("a", ep_a, 100, 100, true, true), endpoint("b", ep_b, 100, 100, true, true)]
-            .into_iter().filter(|e| e.api_base != primary).collect();
+        let survivors: Vec<_> = vec![
+            endpoint("a", ep_a, 100, 100, true, true),
+            endpoint("b", ep_b, 100, 100, true, true),
+        ]
+        .into_iter()
+        .filter(|e| e.api_base != primary)
+        .collect();
         let m_one = model_with(survivors);
         let after = build_targets(Some(&m_one), "http://global/v1", "session_hash", key);
         assert_eq!(after.len(), 1);
-        assert_eq!(after[0].base, survivor, "re-pinned to the survivor, not the global fallback");
+        assert_eq!(
+            after[0].base, survivor,
+            "re-pinned to the survivor, not the global fallback"
+        );
     }
 }
