@@ -49,8 +49,8 @@ export interface ExistingRouteRef {
 }
 
 // A discovered model is "existing" when an existing route matches by normalized
-// model_name, OR by the same (normalized api_base + upstream_model) pair. NUL
-// joins the pair key so ids containing the separator can't collide.
+// model_name, OR by the same (normalized api_base + upstream_model) pair. A
+// space joins the pair key fields.
 export function classifyDiscovered(
   models: UpstreamModel[],
   existing: ExistingRouteRef[],
@@ -99,6 +99,10 @@ function stripUndefined<T extends object>(obj: T): Partial<T> {
 // entries shaped exactly like the obleth models template (field names that
 // `toImportInput` in app/actions.ts already coerces). Serializes to JSON and
 // flows through the existing planModelImportAction / importModelsAction path.
+// Note: importModelsAction updates routes whose model_name already exists, so
+// the additive (create-only) guarantee is enforced by the caller — the wizard
+// excludes already-existing models from selection. This builder does not itself
+// prevent updates.
 export function buildImportPayload(
   rows: RowState[],
   base: string,
@@ -111,7 +115,7 @@ export function buildImportPayload(
     .map((r) => {
       const merged = { ...defaults, ...stripUndefined(r.overrides) };
       const entry: Record<string, unknown> = {
-        model_name: r.modelName,
+        model_name: normalizeModelApiNameFinal(r.modelName),
         upstream_model: r.id,
         api_base: normBase,
         model_type: merged.model_type,

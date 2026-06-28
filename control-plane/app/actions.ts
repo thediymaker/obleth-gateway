@@ -1185,6 +1185,15 @@ export async function listUpstreamModelsAction(input: {
   const base = normalizeBase(input.apiBase ?? "");
   if (!base) return { ok: false, error: "Enter the provider API base URL." };
 
+  try {
+    const parsed = new URL(base);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return { ok: false, error: "Provider URL must be http or https." };
+    }
+  } catch {
+    return { ok: false, error: "Enter a valid http(s) URL." };
+  }
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15_000);
   try {

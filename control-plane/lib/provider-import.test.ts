@@ -128,4 +128,9 @@ describe("buildImportPayload", () => {
       expect(m.api_base).toBeTruthy();
     }
   });
+
+  it("normalizes an un-blurred modelName at payload build time", () => {
+    const out = buildImportPayload([row({ modelName: "Foo Bar" })], "https://x/v1", undefined, DEFAULTS);
+    expect(out.models[0].model_name).toBe("foo-bar");
+  });
 });

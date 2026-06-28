@@ -146,6 +146,15 @@ export function ProviderImportWizard({
       setError("Select at least one model to import.");
       return;
     }
+    const seenNames = new Map<string, string>();
+    for (const r of selectedRows) {
+      const normalized = normalizeModelApiNameFinal(r.modelName);
+      if (seenNames.has(normalized)) {
+        setError(`Two selected models map to the same name "${normalized}" — rename one.`);
+        return;
+      }
+      seenNames.set(normalized, r.id);
+    }
     const payload = buildImportPayload(Object.values(rows), base, apiKey || undefined, defaults);
     start(async () => {
       const res = await planModelImportAction(JSON.stringify(payload));
