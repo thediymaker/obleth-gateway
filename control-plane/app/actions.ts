@@ -21,6 +21,7 @@ import type {
 } from "@/lib/obleth";
 import { requireAdmin } from "@/lib/auth/roles";
 import { resolveRecipeById, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
+import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
 
 export type ActionResult = { ok: true } | { ok: false; error: string };
 
@@ -1167,6 +1168,64 @@ export async function importModelsAction(
   revalidatePath("/models");
   revalidatePath("/fairshare");
   return { ok: true, created, updated, failed: errors.length, errors };
+}
+
+export type UpstreamModelsResult =
+  | { ok: true; base: string; models: UpstreamModel[] }
+  | { ok: false; error: string };
+
+// Server-side discovery of a provider's catalog. Fetches GET {base}/models with
+// an optional bearer key (the key never leaves the server). Returns the parsed,
+// deduped, sorted model list, or a message tailored to the failure class.
+export async function listUpstreamModelsAction(input: {
+  apiBase: string;
+  apiKey?: string;
+}): Promise<UpstreamModelsResult> {
+  await requireAdmin();
+  const base = normalizeBase(input.apiBase ?? "");
+  if (!base) return { ok: false, error: "Enter the provider API base URL." };
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15_000);
+  try {
+    const res = await fetch(`${base}/models`, {
+      headers: {
+        Accept: "application/json",
+        ...(input.apiKey ? { Authorization: `Bearer ${input.apiKey}` } : {}),
+      },
+      signal: controller.signal,
+    });
+    if (res.status === 401 || res.status === 403) {
+      return { ok: false, error: `Provider rejected the API key (HTTP ${res.status}).` };
+    }
+    if (res.status === 404) {
+      return {
+        ok: false,
+        error: "No /models endpoint here (HTTP 404). Check whether the base URL should include or drop /v1.",
+      };
+    }
+    if (!res.ok) {
+      return { ok: false, error: `Provider returned HTTP ${res.status}.` };
+    }
+    let json: unknown;
+    try {
+      json = await res.json();
+    } catch {
+      return { ok: false, error: "Provider response was not valid JSON." };
+    }
+    const models = parseUpstreamModelList(json);
+    if (models.length === 0) {
+      return { ok: false, error: "Provider returned no models." };
+    }
+    return { ok: true, base, models };
+  } catch (e) {
+    if (e instanceof Error && e.name === "AbortError") {
+      return { ok: false, error: "Provider did not respond within 15s." };
+    }
+    return { ok: false, error: e instanceof Error ? e.message : "Could not reach the provider." };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export type RestoreBackupResult =
