@@ -111,9 +111,27 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    let http = reqwest::Client::builder()
-        .pool_max_idle_per_host(256)
-        .build()?;
+    // Upstream client. The idle-pool timeout is deliberately short (and
+    // configurable): inference servers (llama.cpp, vLLM, SGLang) and any proxy in
+    // front of them reap idle HTTP connections aggressively, so a long pool TTL
+    // makes reqwest hand out sockets the server has already closed — the classic
+    // "error sending request … connection closed" 502 race. tcp_keepalive keeps
+    // live connections from being dropped by NAT/LBs. The data-plane dispatch
+    // loop additionally retries a connection-level send error once on a fresh
+    // connection (see proxy.rs), which absorbs the residual race.
+    let mut http_builder = reqwest::Client::builder().pool_max_idle_per_host(256);
+    if cfg.upstream_pool_idle_secs > 0 {
+        http_builder =
+            http_builder.pool_idle_timeout(Duration::from_secs(cfg.upstream_pool_idle_secs));
+    } else {
+        // 0 => never reuse an idle connection.
+        http_builder = http_builder.pool_idle_timeout(Duration::ZERO);
+    }
+    if cfg.upstream_tcp_keepalive_secs > 0 {
+        http_builder =
+            http_builder.tcp_keepalive(Duration::from_secs(cfg.upstream_tcp_keepalive_secs));
+    }
+    let http = http_builder.build()?;
 
     // Auto-router classifier settings live in Postgres (app_settings,
     // key='auto_router') and are hot-reloadable. On boot, prefer saved settings;

@@ -47,6 +47,10 @@ const BOON_MIN_TIMEOUT: Duration = Duration::from_secs(120);
 /// instead of in proxy-buffer-sized bursts. Harmless when no such proxy is in
 /// front of the gateway. (HAProxy honours `option http-no-delay` instead.)
 const NO_BUFFER_HEADER: (&str, &str) = ("x-accel-buffering", "no");
+/// Fixed, short delay before the one bonus retry granted to a connection-level
+/// upstream failure (a stale pooled keep-alive socket). Long enough to let a
+/// fresh connection replace the dead one, short enough to stay invisible in TTFT.
+const CONN_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
 pub async fn proxy_handler(state: State<AppState>, req: Request<Body>) -> Response<Body> {
     let request_id = Uuid::new_v4();
@@ -820,13 +824,21 @@ async fn proxy_handler_inner(
     'targets: for (ti, target) in targets.iter().enumerate() {
         let url = build_upstream_url(&target.base, &path, &query);
         last_url = url.clone();
-        let attempts: u32 = if replayable {
+        // Base budget = configured retries + 1. Plus one extra slot reserved for
+        // connection-level failures: a reused keep-alive socket the upstream
+        // already closed surfaces as a send error with no response, so the request
+        // never executed and is safe to retry on a fresh connection even when
+        // max_retries == 0. The bonus slot is only ever consumed by a connection
+        // error — status/timeout failures break out to failover instead.
+        let base_attempts: u32 = if replayable {
             max_retries as u32 + 1
         } else {
             1
         };
+        let attempts: u32 = base_attempts + if replayable { 1 } else { 0 };
         for attempt in 0..attempts {
-            let more_attempts = attempt + 1 < attempts;
+            let configured_left = attempt + 1 < base_attempts;
+            let bonus_left = attempt + 1 < attempts;
             let more_targets = replayable && ti + 1 < total_targets;
 
             let mut fwd_headers = forward_headers(&headers);
@@ -876,9 +888,9 @@ async fn proxy_handler_inner(
             match timeout(req_timeout, send_fut).await {
                 Ok(Ok(resp)) => {
                     let status = resp.status().as_u16();
-                    if is_retryable_status(status) && (more_attempts || more_targets) {
+                    if is_retryable_status(status) && (configured_left || more_targets) {
                         last_err = Some(format!("upstream status {status}"));
-                        if more_attempts {
+                        if configured_left {
                             state.metrics.record_upstream_attempt("retry");
                             tokio::time::sleep(backoff_for(backoff, attempt)).await;
                             continue;
@@ -891,21 +903,33 @@ async fn proxy_handler_inner(
                     break 'targets;
                 }
                 Ok(Err(e)) => {
+                    let connection_error = is_connection_error(&e);
                     last_err = Some(e.to_string());
-                    if more_attempts {
+                    if configured_left {
                         state.metrics.record_upstream_attempt("retry");
                         tokio::time::sleep(backoff_for(backoff, attempt)).await;
                         continue;
                     }
+                    // Configured retries are spent, but a connection-level send
+                    // failure never reached the upstream (e.g. a stale pooled
+                    // keep-alive socket): spend the reserved bonus slot on one
+                    // fresh-connection retry before failing over.
+                    if connection_error && bonus_left {
+                        state.metrics.record_upstream_attempt("conn_retry");
+                        tokio::time::sleep(CONN_RETRY_BACKOFF).await;
+                        continue;
+                    }
+                    break;
                 }
                 Err(_) => {
                     timed_out = true;
                     last_err = Some(format!("timed out after {req_timeout:?}"));
-                    if more_attempts {
+                    if configured_left {
                         state.metrics.record_upstream_attempt("timeout");
                         tokio::time::sleep(backoff_for(backoff, attempt)).await;
                         continue;
                     }
+                    break;
                 }
             }
         }
@@ -2328,6 +2352,35 @@ fn session_hash_order<'a>(
 /// (except 408 request-timeout and 429 too-many-requests).
 fn is_retryable_status(status: u16) -> bool {
     matches!(status, 408 | 429 | 500 | 502 | 503 | 504)
+}
+
+/// Whether a reqwest send error means the request never reached the upstream, so
+/// a fresh-connection retry is safe. Covers connection establishment failures and
+/// the "reused a keep-alive socket the server already closed" race — hyper
+/// surfaces the latter as an incomplete/closed/reset error in the source chain
+/// rather than via `is_connect()`, so we also scan the error chain for the
+/// well-known signatures.
+fn is_connection_error(e: &reqwest::Error) -> bool {
+    use std::error::Error;
+    if e.is_connect() || e.is_request() {
+        return true;
+    }
+    let mut source: Option<&dyn Error> = Some(e);
+    while let Some(err) = source {
+        let msg = err.to_string().to_ascii_lowercase();
+        if msg.contains("connection closed")
+            || msg.contains("connection reset")
+            || msg.contains("connection aborted")
+            || msg.contains("broken pipe")
+            || msg.contains("channel closed")
+            || msg.contains("unexpected end of file")
+            || msg.contains("incompletemessage")
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 /// Exponential backoff for retry `attempt` (0-based), capped to avoid overflow.
