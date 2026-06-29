@@ -1312,6 +1312,10 @@ pub struct CompressionBoonSettings {
     /// distinct from `max_segments`, which caps lossless compaction.
     #[serde(default = "default_compression_max_lossy_segments")]
     pub max_lossy_segments: u32,
+    /// Conservative, opt-in whitespace normalization of fenced code segments
+    /// (strip trailing whitespace, collapse blank-line runs). Off by default.
+    #[serde(default)]
+    pub code_compaction: bool,
 }
 
 impl Default for CompressionBoonSettings {
@@ -1325,6 +1329,7 @@ impl Default for CompressionBoonSettings {
             timeout_ms: default_compression_timeout_ms(),
             original_ttl_secs: default_compression_original_ttl_secs(),
             max_lossy_segments: default_compression_max_lossy_segments(),
+            code_compaction: false,
         }
     }
 }
@@ -1668,6 +1673,12 @@ pub struct RestoreReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compression_code_compaction_defaults_false() {
+        let c: CompressionBoonSettings = serde_json::from_str("{}").unwrap();
+        assert!(!c.code_compaction);
+    }
 
     #[test]
     fn boon_settings_backward_compat_deserialize() {

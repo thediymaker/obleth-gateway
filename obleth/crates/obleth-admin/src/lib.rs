@@ -1518,6 +1518,7 @@ pub struct BoonSettingsView {
     pub compression_timeout_ms: u64,
     pub compression_original_ttl_secs: u64,
     pub compression_max_lossy_segments: u32,
+    pub compression_code_compaction: bool,
 }
 
 impl BoonSettingsView {
@@ -1544,6 +1545,7 @@ impl BoonSettingsView {
             compression_timeout_ms: s.compression.timeout_ms,
             compression_original_ttl_secs: s.compression.original_ttl_secs,
             compression_max_lossy_segments: s.compression.max_lossy_segments,
+            compression_code_compaction: s.compression.code_compaction,
         }
     }
 }
@@ -1608,6 +1610,9 @@ pub struct UpdateBoonSettings {
     /// Lossy segment cap. Omit/zero leaves unchanged.
     #[serde(default)]
     pub compression_max_lossy_segments: Option<u32>,
+    /// Toggle conservative code compaction. Omit to leave unchanged.
+    #[serde(default)]
+    pub compression_code_compaction: Option<bool>,
 }
 
 #[utoipa::path(
@@ -1727,6 +1732,9 @@ async fn put_boon_settings(
                 .compression_max_lossy_segments
                 .filter(|n| *n > 0)
                 .unwrap_or(existing.compression.max_lossy_segments),
+            code_compaction: body
+                .compression_code_compaction
+                .unwrap_or(existing.compression.code_compaction),
         },
     };
 
@@ -3973,6 +3981,15 @@ mod tests {
         assert_eq!(view.compression_timeout_ms, 1234);
         assert_eq!(view.compression_original_ttl_secs, 999);
         assert_eq!(view.compression_max_lossy_segments, 7);
+    }
+
+    #[test]
+    fn boon_view_round_trips_code_compaction() {
+        use obleth_config::{BoonSettings, CompressionBoonSettings};
+        let mut s = BoonSettings::default();
+        s.compression = CompressionBoonSettings { enabled: true, code_compaction: true, ..Default::default() };
+        let view = BoonSettingsView::from_settings(&s);
+        assert!(view.compression_code_compaction);
     }
 
     #[test]
