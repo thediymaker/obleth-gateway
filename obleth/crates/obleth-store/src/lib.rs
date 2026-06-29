@@ -1973,7 +1973,7 @@ impl Store {
     ) -> Result<ModelEndpoint> {
         let failure_delta: i64 = match status {
             "healthy" | "disabled" => 0,
-            "degraded" | "skipped" => -1, // sentinel: leave counter as-is
+            "degraded" | "skipped" | "unknown" => -1, // sentinel: leave counter as-is
             _ => 1,
         };
         // `skipped` is "we didn't really probe" -> never touch the stored status.
@@ -2220,7 +2220,7 @@ impl Store {
         // probe endpoint, a single network blip) must not flap a model to
         // "down": they neither count toward the failure threshold nor reset a
         // streak that is already in progress, and they never fire an alert.
-        let transient = status == "degraded" || status == "skipped";
+        let transient = matches!(status, "degraded" | "skipped" | "unknown");
         let in_maintenance = maintenance_until
             .map(|until| until > checked_at)
             .unwrap_or(false);
@@ -4305,6 +4305,97 @@ mod tests {
         assert!(
             store.get_model(model.id).await.unwrap().debug_diagnostics,
             "unrelated update must not clear debug_diagnostics"
+        );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// An `unknown` health check (e.g. for image/audio model types that are not
+    /// auto-probed) must be non-alerting and must not increment
+    /// `consecutive_failures` — it leaves the counter unchanged, the alert_state
+    /// at "ok", and fires no alert event.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn unknown_health_check_is_non_alerting() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let model_name = format!("m-{}", Uuid::new_v4());
+        let args = default_test_model(&model_name);
+        let model = store
+            .create_model(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
+                &args.19, &args.20, &args.21,
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+
+        store
+            .update_model_health_config(
+                model.id,
+                ModelHealthConfigUpdate {
+                    checks_enabled: true,
+                    alerts_enabled: true,
+                    check_interval_secs: 60,
+                    failure_threshold: 1,
+                    maintenance_until: None,
+                    maintenance_note: None,
+                },
+            )
+            .await
+            .expect("update health config");
+
+        let next = Utc::now() + chrono::Duration::seconds(60);
+
+        // Record a prior unhealthy check so consecutive_failures starts at 1.
+        let prior = store
+            .record_model_health_check(
+                model.id,
+                "manual",
+                "unhealthy",
+                None,
+                None,
+                Some("prior failure"),
+                None,
+                next,
+            )
+            .await
+            .expect("record prior failure");
+        let prior_failures = prior.summary.consecutive_failures;
+
+        // An `unknown` check must leave consecutive_failures unchanged and fire
+        // no alert event, even though alerts are enabled and threshold is 1.
+        let outcome = store
+            .record_model_health_check(
+                model.id,
+                "scheduled",
+                "unknown",
+                None,
+                None,
+                Some("model type `image` is not auto-probed; status unverified"),
+                None,
+                next,
+            )
+            .await
+            .expect("record unknown check");
+
+        assert_eq!(
+            outcome.alert_event, None,
+            "`unknown` must not fire a Down alert"
+        );
+        assert_eq!(
+            outcome.summary.consecutive_failures, prior_failures,
+            "`unknown` must not increment consecutive_failures (was {prior_failures})"
+        );
+        assert_eq!(
+            outcome.summary.status, "unknown",
+            "displayed status for an `unknown` check must be `unknown`"
         );
     }
 }

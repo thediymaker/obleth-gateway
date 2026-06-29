@@ -416,8 +416,9 @@ async fn inference_probe(
 
         match response {
             Ok(res) => {
-                let code = res.status().as_u16();
-                let retryable = code == 408 || code == 429 || res.status().is_server_error();
+                let st = res.status();
+                let code = st.as_u16();
+                let retryable = code == 408 || code == 429 || st.is_server_error();
                 if retryable && attempt < LIVENESS_MAX_ATTEMPTS {
                     tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(attempt - 1))).await;
                     continue;
@@ -601,6 +602,13 @@ fn aggregate_endpoint_health(results: &[ProbeResult], min_replicas: i64) -> Prob
             format!("{serving} of {total} endpoint(s) serving (below min_replicas {floor})"),
         );
     }
+    // If every live endpoint returned `unknown` (e.g. a costly-mode model whose
+    // type is not auto-probed), the pool is unverified rather than confirmed
+    // unreachable — return `unknown` so it is non-alerting.
+    let all_unknown = live.iter().all(|r| r.status == "unknown");
+    if all_unknown {
+        return ProbeResult::unknown(format!("{total} endpoint(s) unverified"));
+    }
     ProbeResult::unhealthy(None, None, format!("all {total} endpoint(s) unreachable"))
 }
 
@@ -704,7 +712,7 @@ fn build_probe_usage(
         tenant_id: health_tenant_id(),
         key_id: Uuid::nil(),
         model: model.model_name.clone(),
-        admission: "health_probe".to_string(),
+        admission: HEALTH_PROBE_REQUEST_TYPE.to_string(),
         weight: 0,
         input_tokens,
         output_tokens,
@@ -848,6 +856,24 @@ mod tests {
             ProbeResult::unhealthy(None, None, "down".into()),
         ];
         assert_eq!(aggregate_endpoint_health(&results, 1).status, "unhealthy");
+    }
+
+    #[test]
+    fn aggregate_all_unknown_endpoints_is_unknown() {
+        // All live endpoints returned `unknown` (e.g. costly-mode model type not
+        // auto-probed) — must aggregate to `unknown`, NOT `unhealthy`, so no
+        // false alert fires.
+        let results = vec![
+            ProbeResult::unknown("model type `image` is not auto-probed; status unverified".into()),
+            ProbeResult::unknown("model type `image` is not auto-probed; status unverified".into()),
+        ];
+        let agg = aggregate_endpoint_health(&results, 1);
+        assert_eq!(agg.status, "unknown");
+        assert!(
+            agg.message.as_deref().unwrap_or("").contains("unverified"),
+            "message should mention unverified: {:?}",
+            agg.message
+        );
     }
 
     #[test]
