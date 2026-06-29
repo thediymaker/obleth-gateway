@@ -276,6 +276,7 @@ async fn main() -> anyhow::Result<()> {
         retention_days: cfg.model_health_retention_days,
         http: http.clone(),
         alerts: Some(Arc::new(alerts.clone()) as Arc<dyn obleth_admin::AlertSink>),
+        telemetry: Some(telemetry.clone()),
     };
     let admin_state = obleth_admin::AdminState {
         store: store.clone(),

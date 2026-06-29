@@ -25,6 +25,7 @@ ipnet.workspace = true
 arc-swap.workspace = true
 lettre.workspace = true
 obleth-config.workspace = true
+obleth-telemetry.workspace = true
 obleth-store.workspace = true
 obleth-redis.workspace = true
 obleth-fairshare.workspace = true

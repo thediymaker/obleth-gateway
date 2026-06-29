@@ -40,6 +40,11 @@ const PASSIVE_WINDOW_SECS: i64 = 300;
 /// before a transient network failure is recorded.
 const LIVENESS_MAX_ATTEMPTS: u32 = 3;
 
+/// `request_type` label for usage records emitted by health probes. Lets the
+/// request log hide probe traffic by default while keeping every token in the
+/// ledger (mirrors the boon pattern, e.g. `guardrails_boon`).
+pub const HEALTH_PROBE_REQUEST_TYPE: &str = "health_probe";
+
 pub trait AlertSink: Send + Sync + 'static {
     fn issue(&self, key: String, title: String, detail: String);
 }
@@ -56,6 +61,8 @@ pub struct ModelHealthRuntime {
     pub retention_days: i64,
     pub http: reqwest::Client,
     pub alerts: Option<Arc<dyn AlertSink>>,
+    /// Sink for emitting `health_probe` usage records. `None` in tests/tools.
+    pub telemetry: Option<obleth_telemetry::TelemetrySink>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
