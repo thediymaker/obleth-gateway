@@ -59,7 +59,7 @@ fn compression_eligible(
     let tenant_opted_in = key
         .compression_policy
         .as_ref()
-        .map_or(true, |p| p.enabled);
+        .is_none_or(|p| p.enabled);
     is_chat
         && !key.internal
         && settings.compression.active()
