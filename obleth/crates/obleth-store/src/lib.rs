@@ -489,8 +489,9 @@ impl Store {
         )
         .bind(id)
         .bind(encoded)
-        .fetch_one(&self.pool)
-        .await?;
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
         tenant_from_row(&row)
     }
 
