@@ -1330,6 +1330,24 @@ pub enum GuardrailsAction {
     LogOnly,
 }
 
+/// Per-tenant compression policy. Stored as JSONB on `tenants.compression_policy`.
+///
+/// A `None` policy on a tenant means "follow the global default" (eligible models
+/// are compressed). A present policy lets a tenant opt out (`enabled = false`) or,
+/// in Phase B2, opt into lossy semantic compression (`allow_lossy`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
+pub struct CompressionPolicy {
+    /// Tenant opt-out switch for the compression boon. When false, no
+    /// compression (lossless or lossy) runs for this tenant's keys, even on
+    /// models that are granted the boon.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Whether the tenant accepts lossy semantic compression. Consumed by the
+    /// lossy compressor in Phase B2; ignored by Phase A/B1 lossless compaction.
+    #[serde(default)]
+    pub allow_lossy: bool,
+}
+
 /// Normalize a list of MCP server names granted to a model: trimmed,
 /// de-duplicated, empties dropped, order-stable by first appearance. Unlike
 /// boons/tags there is no fixed vocabulary — server names are operator-defined.
@@ -1716,5 +1734,21 @@ mod tests {
         let c: CompressionBoonSettings = serde_json::from_str("{}").unwrap();
         assert!(!c.enabled);
         assert_eq!(c.min_tokens, 512);
+    }
+
+    #[test]
+    fn compression_policy_defaults_from_empty_json() {
+        // An empty policy object means "configured, default off, no lossy".
+        let p: CompressionPolicy = serde_json::from_str("{}").unwrap();
+        assert!(!p.enabled);
+        assert!(!p.allow_lossy);
+    }
+
+    #[test]
+    fn compression_policy_round_trips() {
+        let p = CompressionPolicy { enabled: true, allow_lossy: true };
+        let json = serde_json::to_string(&p).unwrap();
+        let back: CompressionPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
     }
 }
