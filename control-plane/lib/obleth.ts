@@ -33,6 +33,13 @@ export interface GuardrailsPolicy {
   fail_open: boolean;
 }
 
+export interface CompressionPolicy {
+  enabled: boolean;
+  code_compaction: boolean;
+  dedup: boolean;
+  allow_lossy: boolean;
+}
+
 export interface Tenant {
   id: string;
   name: string;
@@ -54,6 +61,7 @@ export interface Tenant {
   budget_started_at: string | null;
   allowed_models: string[] | null;
   guardrails_policy: GuardrailsPolicy | null;
+  compression_policy: CompressionPolicy | null;
   tracing_enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -695,6 +703,15 @@ export interface BoonSettingsView {
   tool_loop_max_turns: number;
   tool_loop_tool_timeout_ms: number;
   tool_loop_nudge: string;
+  compression_enabled: boolean;
+  compression_min_tokens: number;
+  compression_max_segments: number;
+  compression_summarizer_model: string | null;
+  compression_summarize_prompt: string;
+  compression_timeout_ms: number;
+  compression_original_ttl_secs: number;
+  compression_max_lossy_segments: number;
+  compression_code_compaction: boolean;
 }
 
 export interface UpdateBoonSettings {
@@ -711,6 +728,15 @@ export interface UpdateBoonSettings {
   tool_loop_max_turns?: number;
   tool_loop_tool_timeout_ms?: number;
   tool_loop_nudge?: string;
+  compression_enabled?: boolean;
+  compression_min_tokens?: number;
+  compression_max_segments?: number;
+  compression_summarizer_model?: string | null;
+  compression_summarize_prompt?: string;
+  compression_timeout_ms?: number;
+  compression_original_ttl_secs?: number;
+  compression_max_lossy_segments?: number;
+  compression_code_compaction?: boolean;
 }
 
 export interface CharoSettingsView {
@@ -978,6 +1004,16 @@ export const obleth = {
     options?: AuditOptions,
   ) =>
     api<Tenant>(`/tenants/${id}/guardrails`, {
+      method: "PATCH",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ policy }),
+    }),
+  setTenantCompression: (
+    id: string,
+    policy: CompressionPolicy | null,
+    options?: AuditOptions,
+  ) =>
+    api<Tenant>(`/tenants/${id}/compression`, {
       method: "PATCH",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ policy }),
