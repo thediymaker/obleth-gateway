@@ -48,9 +48,89 @@ fn csv_parse_line(line: &str) -> Vec<String> {
     fields
 }
 
+const TABLE_MARKER: &str = "OBLETH_TABLE rows=";
+
+/// Encode an array of ≥2 like-keyed objects as the table form, or `None` when it
+/// doesn't qualify. Does NOT check length or validate — the caller does.
+fn try_encode_table(value: &Value) -> Option<String> {
+    let arr = value.as_array()?;
+    if arr.len() < 2 {
+        return None;
+    }
+    // All elements must be objects with an identical key SET.
+    let first = arr[0].as_object()?;
+    if first.is_empty() {
+        return None;
+    }
+    let cols: Vec<&String> = first.keys().collect();
+    // Column names can't contain literal newlines (would break line-splitting).
+    if cols.iter().any(|k| k.contains(['\n', '\r'])) {
+        return None;
+    }
+    for item in arr {
+        let obj = item.as_object()?;
+        if obj.len() != cols.len() || !cols.iter().all(|k| obj.contains_key(*k)) {
+            return None;
+        }
+    }
+
+    let mut out = String::new();
+    out.push_str(TABLE_MARKER);
+    out.push_str(&arr.len().to_string());
+    out.push('\n');
+    // Header: raw column names, CSV-escaped.
+    let header: Vec<String> = cols.iter().map(|k| csv_escape(k)).collect();
+    out.push_str(&header.join(","));
+    out.push('\n');
+    // Rows: each cell is the value's compact JSON, CSV-escaped.
+    for item in arr {
+        let obj = item.as_object().expect("checked above");
+        let row: Vec<String> = cols
+            .iter()
+            .map(|k| csv_escape(&serde_json::to_string(&obj[*k]).unwrap_or_default()))
+            .collect();
+        out.push_str(&row.join(","));
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Reconstruct the JSON array from the table form, or `None` if `text` isn't a
+/// well-formed table this module produced.
+fn reconstruct_table(text: &str) -> Option<Value> {
+    let mut lines = text.lines();
+    let marker = lines.next()?;
+    let n: usize = marker.strip_prefix(TABLE_MARKER)?.trim().parse().ok()?;
+    let cols = csv_parse_line(lines.next()?);
+    if cols.is_empty() {
+        return None;
+    }
+    let mut rows: Vec<Value> = Vec::with_capacity(n);
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let fields = csv_parse_line(line);
+        if fields.len() != cols.len() {
+            return None;
+        }
+        let mut obj = Map::new();
+        for (col, field) in cols.iter().zip(fields.iter()) {
+            let cell: Value = serde_json::from_str(field).ok()?;
+            obj.insert(col.clone(), cell);
+        }
+        rows.push(Value::Object(obj));
+    }
+    if rows.len() != n {
+        return None;
+    }
+    Some(Value::Array(rows))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn csv_escape_leaves_plain_fields() {
@@ -84,5 +164,44 @@ mod tests {
         let line = cells.iter().map(|c| csv_escape(c)).collect::<Vec<_>>().join(",");
         let parsed = csv_parse_line(&line);
         assert_eq!(parsed, cells.iter().map(|c| c.to_string()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn encode_then_reconstruct_is_exact() {
+        let value = json!([
+            {"id": 1, "name": "alice", "active": true},
+            {"id": 2, "name": "bob", "active": false},
+            {"id": 3, "name": "c,d", "active": true}
+        ]);
+        let table = try_encode_table(&value).expect("should encode");
+        // Header line names the columns; marker carries the row count.
+        assert!(table.starts_with("OBLETH_TABLE rows=3\n"));
+        // Columns are sorted (BTreeMap order), so active,id,name
+        assert!(table.contains("active,id,name"));
+        // Round-trips to the exact original Value.
+        assert_eq!(reconstruct_table(&table), Some(value));
+    }
+
+    #[test]
+    fn encode_handles_nested_and_null_cells() {
+        let value = json!([
+            {"k": {"x": 1, "y": 2}, "n": null},
+            {"k": {"x": 3, "y": 4}, "n": 5}
+        ]);
+        let table = try_encode_table(&value).expect("encode");
+        assert_eq!(reconstruct_table(&table), Some(value));
+    }
+
+    #[test]
+    fn encode_rejects_non_uniform_keys() {
+        let value = json!([{"a": 1}, {"b": 2}]);
+        assert_eq!(try_encode_table(&value), None);
+    }
+
+    #[test]
+    fn encode_rejects_non_object_array_and_singletons() {
+        assert_eq!(try_encode_table(&json!([1, 2, 3])), None);
+        assert_eq!(try_encode_table(&json!([{"a": 1}])), None); // <2 rows
+        assert_eq!(try_encode_table(&json!({"a": 1})), None); // not an array
     }
 }
