@@ -1,11 +1,12 @@
 //! Model health checks for registered model routes.
 //!
-//! Checks are deliberately cheap and non-billable. For each model we first look
-//! for a passive signal — recent real client traffic in the ClickHouse usage
-//! ledger — and only fall back to an active probe when a model has seen no
-//! traffic. The active probe is a token-free `GET {api_base}/models` liveness
-//! call (optionally checking that the upstream actually lists the model), not a
-//! real inference request, so probing never consumes a provider budget.
+//! For each model we first look for a passive signal — recent real client
+//! traffic in the ClickHouse usage ledger — and only fall back to an active
+//! probe when a model has seen no traffic. The active probe issues a minimal
+//! real inference request (`POST /chat/completions` or `POST /embeddings` with
+//! `max_tokens: 1`) so the upstream actually executes a forward pass. Probe
+//! tokens are accounted under the internal `health_probe` tenant so they never
+//! appear in client billing.
 //!
 //! Transient conditions (overloaded upstream, an unsupported probe endpoint, a
 //! single network blip) are classified as `degraded` rather than `unhealthy`
@@ -379,97 +380,64 @@ async fn recent_traffic(
     }
 }
 
-/// Token-free liveness probe: `GET {api_base}/models`. A 2xx proves the upstream
-/// is serving; when the response lists models we also confirm the route's
-/// `upstream_model` is actually loaded.
 async fn liveness_probe(state: &AdminState, model: &ModelRoute) -> ProbeResult {
-    probe_target(
-        state,
-        &model.api_base,
-        model.api_key.as_deref(),
-        &model.upstream_model,
-    )
-    .await
+    inference_probe(state, model, &model.api_base, model.api_key.as_deref()).await
 }
 
-/// Reusable liveness probe against an arbitrary `api_base`/`api_key`. Used both
-/// for the model-level probe and for per-endpoint probes.
-async fn probe_target(
+/// Minimal real-inference liveness probe against an arbitrary `api_base`.
+/// Used for both the model-level probe and per-endpoint probes. Emits a
+/// `health_probe` usage record (internal tenant) so probe tokens are accounted.
+async fn inference_probe(
     state: &AdminState,
+    model: &ModelRoute,
     api_base: &str,
     api_key: Option<&str>,
-    upstream_model: &str,
 ) -> ProbeResult {
-    let url = models_list_url(api_base);
+    let Some(req) = build_probe_request(api_base, &model.model_type, &model.upstream_model) else {
+        return ProbeResult::unknown(format!(
+            "model type `{}` is not auto-probed; status unverified",
+            model.model_type
+        ));
+    };
+
     let timeout = Duration::from_secs(state.health.timeout_secs.max(1));
     let client = &state.health.http;
-
     let mut attempt = 0u32;
+
     loop {
         attempt += 1;
-        let mut request = client.get(&url).timeout(timeout);
+        let mut request = client.post(&req.url).timeout(timeout).json(&req.body);
         if let Some(key) = api_key {
             request = request.bearer_auth(key);
         }
         let started = Instant::now();
         let response = request.send().await;
-        let latency_ms = started.elapsed().as_millis().try_into().ok();
+        let latency_ms: Option<i64> = started.elapsed().as_millis().try_into().ok();
 
         match response {
             Ok(res) => {
-                let status = res.status();
-                let code = status.as_u16();
-                let http_status = Some(code as i64);
-                // Overload/throttle states are worth one quiet retry before we
-                // record anything.
-                let retryable = code == 408 || code == 429 || status.is_server_error();
+                let code = res.status().as_u16();
+                let retryable = code == 408 || code == 429 || res.status().is_server_error();
                 if retryable && attempt < LIVENESS_MAX_ATTEMPTS {
                     tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(attempt - 1))).await;
                     continue;
                 }
-                if status.is_success() {
-                    let body = res.text().await.unwrap_or_default();
-                    return match model_in_list(&body, upstream_model) {
-                        ModelPresence::Present => ProbeResult::healthy(
-                            latency_ms,
-                            http_status,
-                            format!("upstream is serving and lists `{upstream_model}`"),
-                        ),
-                        // The upstream is up and answered, but doesn't advertise
-                        // this model in `/v1/models`. Many shared gateways omit
-                        // models from that list (or list slightly different ids),
-                        // so absence is a soft "can't confirm" signal, not an
-                        // outage \u2014 report `degraded` (no alert, no failure count)
-                        // rather than flapping a working model to "down".
-                        ModelPresence::Absent => ProbeResult::degraded(
-                            latency_ms,
-                            http_status,
-                            format!(
-                                "upstream is reachable but does not advertise `{upstream_model}` in /v1/models"
-                            ),
-                        ),
-                        ModelPresence::Unknown => ProbeResult::healthy(
-                            latency_ms,
-                            http_status,
-                            "upstream model-list endpoint responded".to_string(),
-                        ),
-                    };
-                }
-                // Rejected credentials are real and actionable. Everything else
-                // (unsupported endpoint, a lingering 5xx) is inconclusive and
-                // must not flap the model to "down".
-                if code == 401 || code == 403 {
-                    return ProbeResult::unhealthy(
-                        latency_ms,
-                        http_status,
-                        format!("upstream rejected the probe credentials (HTTP {code})"),
-                    );
-                }
-                return ProbeResult::degraded(
+                let body = res.text().await.unwrap_or_default();
+                let (input_tokens, output_tokens) = probe_token_usage(&body);
+                emit_probe_usage(state, model, Some(code), latency_ms, input_tokens, output_tokens);
+                let status = classify_probe(Some(code));
+                let message = match status {
+                    "healthy" => format!("real probe succeeded (HTTP {code})"),
+                    "unhealthy" => format!("real probe rejected by upstream (HTTP {code})"),
+                    _ => format!("real probe inconclusive (HTTP {code})"),
+                };
+                return ProbeResult {
+                    status: status.to_string(),
                     latency_ms,
-                    http_status,
-                    format!("model-list probe was inconclusive (HTTP {code})"),
-                );
+                    http_status: Some(code as i64),
+                    message: Some(normalize_excerpt(&message, 240)),
+                    response_excerpt: None,
+                };
             }
             Err(error) => {
                 let retryable = error.is_timeout() || error.is_connect() || error.is_request();
@@ -477,13 +445,50 @@ async fn probe_target(
                     tokio::time::sleep(Duration::from_millis(100 * 2u64.pow(attempt - 1))).await;
                     continue;
                 }
-                return ProbeResult::unhealthy(
+                emit_probe_usage(state, model, None, latency_ms, 0, 0);
+                return ProbeResult {
+                    status: classify_probe(None).to_string(),
                     latency_ms,
-                    None,
-                    format!("upstream is unreachable: {error}"),
-                );
+                    http_status: None,
+                    message: Some(normalize_excerpt(
+                        &format!("upstream is unreachable: {error}"),
+                        240,
+                    )),
+                    response_excerpt: None,
+                };
             }
         }
+    }
+}
+
+/// Pull `usage.prompt_tokens` / `usage.completion_tokens` from an OpenAI-style
+/// response body; returns (0, 0) when absent.
+fn probe_token_usage(body: &str) -> (u32, u32) {
+    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
+        return (0, 0);
+    };
+    let usage = json.get("usage");
+    let get = |k: &str| {
+        usage
+            .and_then(|u| u.get(k))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32
+    };
+    (get("prompt_tokens"), get("completion_tokens"))
+}
+
+/// Record a probe's token usage in the ledger when a sink is configured.
+fn emit_probe_usage(
+    state: &AdminState,
+    model: &ModelRoute,
+    http_status: Option<u16>,
+    latency_ms: Option<i64>,
+    input_tokens: u32,
+    output_tokens: u32,
+) {
+    if let Some(sink) = state.health.telemetry.as_ref() {
+        let total_ms = latency_ms.unwrap_or(0).max(0) as u32;
+        sink.record(build_probe_usage(model, http_status, total_ms, input_tokens, output_tokens));
     }
 }
 
@@ -529,7 +534,7 @@ async fn probe_endpoints(state: &AdminState, model: &ModelRoute) -> Vec<ProbeRes
                 .get(endpoint.id.to_string().as_str())
                 .copied()
                 .flatten();
-            probe_target(state, &endpoint.api_base, api_key, &model.upstream_model).await
+            inference_probe(state, model, &endpoint.api_base, api_key).await
         };
         if let Err(error) = state
             .store
@@ -625,50 +630,6 @@ fn build_probe_request(api_base: &str, model_type: &str, upstream_model: &str) -
             body: serde_json::json!({ "model": upstream_model, "input": "ping" }),
         }),
         _ => None,
-    }
-}
-
-fn models_list_url(api_base: &str) -> String {
-    let base = api_base.trim_end_matches('/');
-    if base.ends_with("/models") {
-        base.to_string()
-    } else {
-        format!("{base}/models")
-    }
-}
-
-enum ModelPresence {
-    Present,
-    Absent,
-    Unknown,
-}
-
-/// Look for `upstream_model` in an OpenAI-style `{ "data": [{ "id": ... }] }`
-/// model list. `Unknown` means the body wasn't a recognizable, non-empty list,
-/// so membership can't be judged (treated as a soft pass).
-///
-/// A `"*"` id is a wildcard (e.g. LiteLLM advertises every route as a single
-/// `"*"` entry rather than enumerating them), so it matches any model.
-fn model_in_list(body: &str, upstream_model: &str) -> ModelPresence {
-    let Ok(json) = serde_json::from_str::<serde_json::Value>(body) else {
-        return ModelPresence::Unknown;
-    };
-    let Some(data) = json.get("data").and_then(|d| d.as_array()) else {
-        return ModelPresence::Unknown;
-    };
-    if data.is_empty() {
-        return ModelPresence::Unknown;
-    }
-    let present = data.iter().any(|item| {
-        matches!(
-            item.get("id").and_then(|v| v.as_str()),
-            Some(id) if id == "*" || id == upstream_model
-        )
-    });
-    if present {
-        ModelPresence::Present
-    } else {
-        ModelPresence::Absent
     }
 }
 
@@ -805,6 +766,16 @@ impl ProbeResult {
             response_excerpt: None,
         }
     }
+
+    fn unknown(message: String) -> Self {
+        Self {
+            status: "unknown".to_string(),
+            latency_ms: None,
+            http_status: None,
+            message: Some(normalize_excerpt(&message, 240)),
+            response_excerpt: None,
+        }
+    }
 }
 
 fn normalize_excerpt(value: &str, max: usize) -> String {
@@ -936,45 +907,6 @@ mod tests {
             ProbeResult::healthy(None, None, "up".into()),
         ];
         assert_eq!(aggregate_endpoint_health(&results, 2).status, "healthy");
-    }
-
-    #[test]
-    fn wildcard_model_list_matches_any_model() {
-        let body = r#"{"data":[{"id":"*","object":"model"}],"object":"list"}"#;
-        assert!(matches!(
-            model_in_list(body, "qwen3-vl-32b-instruct"),
-            ModelPresence::Present
-        ));
-    }
-
-    #[test]
-    fn exact_model_id_matches() {
-        let body = r#"{"data":[{"id":"qwen35-27b-fp8"},{"id":"other"}]}"#;
-        assert!(matches!(
-            model_in_list(body, "qwen35-27b-fp8"),
-            ModelPresence::Present
-        ));
-    }
-
-    #[test]
-    fn missing_model_id_is_absent() {
-        let body = r#"{"data":[{"id":"other-model"}]}"#;
-        assert!(matches!(
-            model_in_list(body, "qwen35-27b-fp8"),
-            ModelPresence::Absent
-        ));
-    }
-
-    #[test]
-    fn unrecognized_body_is_unknown() {
-        assert!(matches!(
-            model_in_list("not json", "m"),
-            ModelPresence::Unknown
-        ));
-        assert!(matches!(
-            model_in_list(r#"{"data":[]}"#, "m"),
-            ModelPresence::Unknown
-        ));
     }
 
     #[test]
