@@ -10,6 +10,7 @@ import type {
   AutotuneReport,
   AutotuneWorkload,
   ConfigBackup,
+  CompressionPolicy,
   GuardrailsPolicy,
   ModelRoute,
   RestoreReport,
@@ -422,6 +423,23 @@ export async function setTenantGuardrailsAction(
   if (!id) return { ok: false, error: "Missing tenant id" };
   try {
     await obleth.setTenantGuardrails(id, policy, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  updateTag(CACHE_TAGS.tenants);
+  revalidatePath("/tenants");
+  revalidatePath("/");
+  return { ok: true };
+}
+
+export async function setTenantCompressionAction(
+  id: string,
+  policy: CompressionPolicy | null,
+): Promise<ActionResult> {
+  const session = await requireAdmin();
+  if (!id) return { ok: false, error: "Missing tenant id" };
+  try {
+    await obleth.setTenantCompression(id, policy, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
