@@ -90,6 +90,18 @@ fn reversible_compression_eligible(
         && !key.internal
 }
 
+/// Per-tenant code-compaction toggle with the global setting as the no-policy
+/// default: a tenant policy overrides the global `code_compaction` flag.
+fn effective_code_compaction(
+    settings: &obleth_config::BoonSettings,
+    key: &obleth_config::ResolvedKey,
+) -> bool {
+    match &key.compression_policy {
+        Some(policy) => policy.code_compaction,
+        None => settings.compression.code_compaction,
+    }
+}
+
 /// Lossy semantic compression also requires a configured summarizer model.
 /// Used in production to gate [`compression::apply_lossy`] within the
 /// reversible compression block (dedup always runs; lossy is the finer gate).
@@ -250,7 +262,8 @@ impl BoonEngine {
         // the parameter exists so unit tests can exercise the ineligible path.
         if compression_eligible(route, &settings, key, is_chat) {
             let comp_start = crate::tracer::now_ms();
-            let stats = compression::apply(&settings.compression, json);
+            let code_compaction = effective_code_compaction(&settings, key);
+            let stats = compression::apply(&settings.compression, code_compaction, json);
             if stats.compressed > 0 {
                 outcome.rewritten = true;
                 outcome.applied.push("compression");

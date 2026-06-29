@@ -105,7 +105,7 @@ pub(crate) struct CompressionStats {
 
 /// Compact eligible JSON segments of `messages[]` in place. Phase A is lossless
 /// and deterministic; it never calls a helper model or touches the network.
-pub(super) fn apply(cfg: &CompressionBoonSettings, json: &mut Value) -> CompressionStats {
+pub(super) fn apply(cfg: &CompressionBoonSettings, code_compaction: bool, json: &mut Value) -> CompressionStats {
     let tk = HeuristicTokenizer::new();
     let mut stats = CompressionStats::default();
     let Some(messages) = json.get_mut("messages").and_then(|m| m.as_array_mut()) else {
@@ -118,7 +118,7 @@ pub(super) fn apply(cfg: &CompressionBoonSettings, json: &mut Value) -> Compress
         // Two content shapes: a plain string, or an array of typed parts.
         match msg.get_mut("content") {
             Some(Value::String(s)) => {
-                try_compact_string(cfg, &tk, s, &mut stats);
+                try_compact_string(cfg, code_compaction, &tk, s, &mut stats);
             }
             Some(Value::Array(parts)) => {
                 for part in parts.iter_mut() {
@@ -126,7 +126,7 @@ pub(super) fn apply(cfg: &CompressionBoonSettings, json: &mut Value) -> Compress
                         break;
                     }
                     if let Some(Value::String(s)) = part.get_mut("text") {
-                        try_compact_string(cfg, &tk, s, &mut stats);
+                        try_compact_string(cfg, code_compaction, &tk, s, &mut stats);
                     }
                 }
             }
@@ -140,6 +140,7 @@ pub(super) fn apply(cfg: &CompressionBoonSettings, json: &mut Value) -> Compress
 /// rewriting it in place and updating `stats`.
 fn try_compact_string(
     cfg: &CompressionBoonSettings,
+    code_compaction: bool,
     tk: &HeuristicTokenizer,
     s: &mut String,
     stats: &mut CompressionStats,
@@ -159,7 +160,7 @@ fn try_compact_string(
                 *s = compact;
             }
         }
-        ContentKind::Code if cfg.code_compaction => {
+        ContentKind::Code if code_compaction => {
             if let Some(compact) = compact_code(s) {
                 let after = tk.count_text(&compact);
                 stats.tokens_before = stats.tokens_before.saturating_add(before);
@@ -509,7 +510,7 @@ mod tests {
             ]
         });
         let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
-        let stats = apply(&cfg, &mut body);
+        let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 1);
         assert!(stats.tokens_after < stats.tokens_before);
         // The tool message is now compact (no newline indentation).
@@ -524,7 +525,7 @@ mod tests {
             "messages": [ { "role": "tool", "content": "{\"a\": 1}" } ]
         });
         let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 512, max_segments: 64, ..Default::default() };
-        let stats = apply(&cfg, &mut body);
+        let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 0);
     }
 
@@ -539,7 +540,7 @@ mod tests {
             ]
         });
         let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 1, ..Default::default() };
-        let stats = apply(&cfg, &mut body);
+        let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 1);
     }
 
@@ -555,7 +556,7 @@ mod tests {
             }]
         });
         let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
-        let stats = apply(&cfg, &mut body);
+        let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 1);
         assert!(stats.tokens_after < stats.tokens_before);
         let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
@@ -655,9 +656,9 @@ mod tests {
             "messages": [ { "role": "user", "content": big } ]
         });
         let cfg = obleth_config::CompressionBoonSettings {
-            enabled: true, min_tokens: 16, max_segments: 64, code_compaction: true, ..Default::default()
+            enabled: true, min_tokens: 16, max_segments: 64, ..Default::default()
         };
-        let stats = apply(&cfg, &mut body);
+        let stats = apply(&cfg, true, &mut body);
         assert_eq!(stats.compressed, 1);
         assert!(stats.tokens_after < stats.tokens_before);
     }
@@ -670,9 +671,9 @@ mod tests {
             "messages": [ { "role": "user", "content": big } ]
         });
         let cfg = obleth_config::CompressionBoonSettings {
-            enabled: true, min_tokens: 16, max_segments: 64, code_compaction: false, ..Default::default()
+            enabled: true, min_tokens: 16, max_segments: 64, ..Default::default()
         };
-        let stats = apply(&cfg, &mut body);
+        let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 0);
     }
 }
