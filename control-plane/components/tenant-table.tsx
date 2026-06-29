@@ -58,7 +58,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import type { CompressionPolicy, GuardrailsPolicy, Tenant, WeeklyWindow } from "@/lib/obleth";
+import type { GuardrailsPolicy, Tenant, WeeklyWindow } from "@/lib/obleth";
 import { cn, formatNumber } from "@/lib/utils";
 
 const SaveFlashContext = createContext<() => void>(() => {});
