@@ -1678,6 +1678,11 @@ async fn put_boon_settings(
                 .compression_max_segments
                 .filter(|n| *n > 0)
                 .unwrap_or(existing.compression.max_segments),
+            summarizer_model: existing.compression.summarizer_model.clone(),
+            summarize_prompt: existing.compression.summarize_prompt.clone(),
+            timeout_ms: existing.compression.timeout_ms,
+            original_ttl_secs: existing.compression.original_ttl_secs,
+            max_lossy_segments: existing.compression.max_lossy_segments,
         },
     };
 
@@ -3903,7 +3908,7 @@ mod tests {
     fn boon_view_round_trips_compression() {
         use obleth_config::{BoonSettings, CompressionBoonSettings};
         let mut s = BoonSettings::default();
-        s.compression = CompressionBoonSettings { enabled: true, min_tokens: 256, max_segments: 8 };
+        s.compression = CompressionBoonSettings { enabled: true, min_tokens: 256, max_segments: 8, ..Default::default() };
         let view = BoonSettingsView::from_settings(&s);
         assert!(view.compression_enabled);
         assert_eq!(view.compression_min_tokens, 256);

@@ -190,7 +190,7 @@ mod tests {
                 { "role": "tool", "content": pretty }
             ]
         });
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64 };
+        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
         let stats = apply(&cfg, &mut body);
         assert_eq!(stats.compressed, 1);
         assert!(stats.tokens_after < stats.tokens_before);
@@ -205,7 +205,7 @@ mod tests {
             "model": "m",
             "messages": [ { "role": "tool", "content": "{\"a\": 1}" } ]
         });
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 512, max_segments: 64 };
+        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 512, max_segments: 64, ..Default::default() };
         let stats = apply(&cfg, &mut body);
         assert_eq!(stats.compressed, 0);
     }
@@ -220,7 +220,7 @@ mod tests {
                 { "role": "tool", "content": big }
             ]
         });
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 1 };
+        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 1, ..Default::default() };
         let stats = apply(&cfg, &mut body);
         assert_eq!(stats.compressed, 1);
     }
@@ -236,7 +236,7 @@ mod tests {
                 "content": [{ "type": "text", "text": pretty }]
             }]
         });
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64 };
+        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
         let stats = apply(&cfg, &mut body);
         assert_eq!(stats.compressed, 1);
         assert!(stats.tokens_after < stats.tokens_before);

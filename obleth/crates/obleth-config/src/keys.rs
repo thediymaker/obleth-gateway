@@ -81,6 +81,14 @@ pub fn cache_key(model: &str, body: &[u8]) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// SHA-256 hex digest of an arbitrary content string. Used by the compression
+/// boon as the reversibility store key: identical content hashes to one entry.
+pub fn content_hash(content: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(content.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -98,5 +106,12 @@ mod tests {
     fn hash_is_stable_and_distinct() {
         assert_eq!(hash_api_key("a"), hash_api_key("a"));
         assert_ne!(hash_api_key("a"), hash_api_key("b"));
+    }
+
+    #[test]
+    fn content_hash_is_stable_and_distinct() {
+        assert_eq!(content_hash("hello"), content_hash("hello"));
+        assert_ne!(content_hash("hello"), content_hash("world"));
+        assert_eq!(content_hash("hello").len(), 64); // SHA-256 hex
     }
 }
