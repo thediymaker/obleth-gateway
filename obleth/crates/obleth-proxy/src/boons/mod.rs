@@ -91,10 +91,8 @@ fn reversible_compression_eligible(
 }
 
 /// Lossy semantic compression also requires a configured summarizer model.
-/// Production code gates on [`reversible_compression_eligible`] (dedup + lossy);
-/// this finer gate is used in tests to verify the summarizer requirement in
-/// isolation.
-#[cfg(test)]
+/// Used in production to gate [`compression::apply_lossy`] within the
+/// reversible compression block (dedup always runs; lossy is the finer gate).
 fn lossy_eligible(
     route: &obleth_config::ResolvedModel,
     settings: &obleth_config::BoonSettings,
@@ -333,9 +331,14 @@ impl BoonEngine {
             let comp_start = crate::tracer::now_ms();
             // Dedup first: remove exact cross-turn repeats deterministically.
             let dedup = compression::apply_dedup(state, &settings.compression, key, session_id, json).await;
-            // Then lossy summarization of remaining long prose (no-op without a summarizer).
-            let lossy = compression::apply_lossy(state, &settings.compression, key, session_id, json).await;
-            let refs = dedup.refs_created + lossy.refs_created;
+            // Then lossy summarization of remaining long prose, only when a
+            // summarizer is configured and the tenant permits it.
+            let lossy = if lossy_eligible(route, &settings, key) {
+                compression::apply_lossy(state, &settings.compression, key, session_id, json).await
+            } else {
+                compression::LossyStats::default()
+            };
+            let refs = dedup.refs_created.saturating_add(lossy.refs_created);
             if refs > 0 {
                 compression::inject_retrieve_original_tool(json, route.supports_system_messages);
                 tool_loop_servers

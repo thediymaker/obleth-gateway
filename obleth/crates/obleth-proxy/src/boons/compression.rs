@@ -394,10 +394,10 @@ pub(super) async fn apply_dedup(
 
     // Pass 2: stash + replace each duplicate (bounded by max_lossy_segments).
     for (mi, content) in targets {
-        stats.duplicates += 1;
         if stats.refs_created >= cfg.max_lossy_segments {
             break;
         }
+        stats.duplicates += 1;
         let before = tk.count_text(&content);
         let hash = obleth_config::content_hash(&content);
         let marker = dedup_marker(&hash);
