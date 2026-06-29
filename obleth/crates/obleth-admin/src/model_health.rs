@@ -599,6 +599,35 @@ fn aggregate_endpoint_health(results: &[ProbeResult], min_replicas: i64) -> Prob
     ProbeResult::unhealthy(None, None, format!("all {total} endpoint(s) unreachable"))
 }
 
+struct ProbeRequest {
+    url: String,
+    body: serde_json::Value,
+}
+
+/// Build the minimal real inference request used to verify a model actually
+/// serves. `api_base` already includes the `/v1` suffix. Returns `None` for
+/// model types we deliberately do not auto-probe because a "minimal" request
+/// is still costly (image / audio) or the type is unrecognized.
+fn build_probe_request(api_base: &str, model_type: &str, upstream_model: &str) -> Option<ProbeRequest> {
+    let base = api_base.trim_end_matches('/');
+    match model_type {
+        "chat" => Some(ProbeRequest {
+            url: format!("{base}/chat/completions"),
+            body: serde_json::json!({
+                "model": upstream_model,
+                "messages": [{ "role": "user", "content": "ping" }],
+                "max_tokens": 1,
+                "stream": false,
+            }),
+        }),
+        "embedding" => Some(ProbeRequest {
+            url: format!("{base}/embeddings"),
+            body: serde_json::json!({ "model": upstream_model, "input": "ping" }),
+        }),
+        _ => None,
+    }
+}
+
 fn models_list_url(api_base: &str) -> String {
     let base = api_base.trim_end_matches('/');
     if base.ends_with("/models") {
@@ -899,5 +928,31 @@ mod tests {
             model_in_list(r#"{"data":[]}"#, "m"),
             ModelPresence::Unknown
         ));
+    }
+
+    #[test]
+    fn probe_request_chat_is_one_token_completion() {
+        let r = build_probe_request("https://up/v1", "chat", "kimi-k2").expect("chat probe");
+        assert_eq!(r.url, "https://up/v1/chat/completions");
+        assert_eq!(r.body["model"], "kimi-k2");
+        assert_eq!(r.body["max_tokens"], 1);
+        assert_eq!(r.body["stream"], false);
+        assert!(r.body["messages"].is_array());
+    }
+
+    #[test]
+    fn probe_request_embedding_uses_embeddings_endpoint() {
+        let r = build_probe_request("https://up/v1/", "embedding", "qwen4-embedding").expect("embed");
+        assert_eq!(r.url, "https://up/v1/embeddings");
+        assert_eq!(r.body["model"], "qwen4-embedding");
+        assert_eq!(r.body["input"], "ping");
+    }
+
+    #[test]
+    fn probe_request_costly_and_unknown_modes_are_none() {
+        assert!(build_probe_request("https://up/v1", "image", "m").is_none());
+        assert!(build_probe_request("https://up/v1", "audio_transcription", "m").is_none());
+        assert!(build_probe_request("https://up/v1", "audio_speech", "m").is_none());
+        assert!(build_probe_request("https://up/v1", "something-else", "m").is_none());
     }
 }
