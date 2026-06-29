@@ -28,6 +28,7 @@ import {
   deleteTenantAction,
   setTenantAllowlistAction,
   setTenantBudgetAction,
+  setTenantCompressionAction,
   setTenantGuardrailsAction,
   setTenantScheduleAction,
   setTenantStatusAction,
@@ -57,7 +58,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
-import type { GuardrailsPolicy, Tenant, WeeklyWindow } from "@/lib/obleth";
+import type { CompressionPolicy, GuardrailsPolicy, Tenant, WeeklyWindow } from "@/lib/obleth";
 import { cn, formatNumber } from "@/lib/utils";
 
 const SaveFlashContext = createContext<() => void>(() => {});
@@ -425,6 +426,7 @@ function TenantDetailPanel({
           <TabsTrigger value="budget">Budgets</TabsTrigger>
           <TabsTrigger value="models">Models</TabsTrigger>
           <TabsTrigger value="guardrails">Guardrails</TabsTrigger>
+          <TabsTrigger value="compression">Compression</TabsTrigger>
           <TabsTrigger value="lifecycle">Lifecycle</TabsTrigger>
         </TabsList>
         <p className="text-[11px] tabular-nums text-muted-foreground">
@@ -548,6 +550,10 @@ function TenantDetailPanel({
 
       <TabsContent value="guardrails">
         <GuardrailsEditor tenant={tenant} models={models} />
+      </TabsContent>
+
+      <TabsContent value="compression">
+        <CompressionEditor tenant={tenant} />
       </TabsContent>
 
       <TabsContent value="lifecycle">
@@ -1522,6 +1528,109 @@ function GuardrailsEditor({ tenant, models }: { tenant: Tenant; models: string[]
         )}
 
         <StatusMessage error={error} saved={saved} savedText="Guardrails saved." />
+      </div>
+    </PanelCard>
+  );
+}
+
+function CompressionEditor({ tenant }: { tenant: Tenant }) {
+  const flashSaved = useContext(SaveFlashContext);
+  const [pending, start] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+  const [saved, setSaved] = useState(false);
+
+  const policy = tenant.compression_policy;
+  const [enabled, setEnabled] = useState(policy?.enabled ?? false);
+  const [codeCompaction, setCodeCompaction] = useState(policy?.code_compaction ?? false);
+  const [dedup, setDedup] = useState(policy?.dedup ?? false);
+  const [allowLossy, setAllowLossy] = useState(policy?.allow_lossy ?? false);
+
+  function save() {
+    setError(null);
+    setSaved(false);
+    start(async () => {
+      const res = await setTenantCompressionAction(tenant.id, {
+        enabled,
+        code_compaction: codeCompaction,
+        dedup,
+        allow_lossy: allowLossy,
+      });
+      if (res.ok) {
+        setSaved(true);
+        flashSaved();
+      } else {
+        setError(res.error);
+      }
+    });
+  }
+
+  function clearPolicy() {
+    setError(null);
+    setSaved(false);
+    start(async () => {
+      const res = await setTenantCompressionAction(tenant.id, null);
+      if (res.ok) {
+        setSaved(true);
+        flashSaved();
+      } else {
+        setError(res.error);
+      }
+    });
+  }
+
+  return (
+    <PanelCard
+      title="Compression"
+      description="Control context-compression pieces applied to this tenant's requests."
+      actions={<SaveButton type="button" pending={pending} onClick={save} idleLabel="Save compression" />}
+    >
+      <div className="divide-y divide-border/60">
+        <div className="flex items-center justify-between gap-4 px-4 py-3">
+          <div className="min-w-0">
+            <p className="text-sm font-medium">Enabled</p>
+            <p className="text-[11px] leading-snug text-muted-foreground">
+              Master switch for compression on this tenant.
+            </p>
+          </div>
+          <ToggleSwitch checked={enabled} disabled={pending} onChange={() => setEnabled((v) => !v)} />
+        </div>
+        <div className="flex items-center justify-between gap-4 px-4 py-3">
+          <div className="min-w-0">
+            <p className="text-sm font-medium">Code compaction</p>
+            <p className="text-[11px] leading-snug text-muted-foreground">
+              Conservative whitespace stripping of fenced code.
+            </p>
+          </div>
+          <ToggleSwitch checked={codeCompaction} disabled={pending} onChange={() => setCodeCompaction((v) => !v)} />
+        </div>
+        <div className="flex items-center justify-between gap-4 px-4 py-3">
+          <div className="min-w-0">
+            <p className="text-sm font-medium">Cross-turn dedup</p>
+            <p className="text-[11px] leading-snug text-muted-foreground">
+              Replace repeated blocks with a reference (reversible).
+            </p>
+          </div>
+          <ToggleSwitch checked={dedup} disabled={pending} onChange={() => setDedup((v) => !v)} />
+        </div>
+        <div className="flex items-center justify-between gap-4 px-4 py-3">
+          <div className="min-w-0">
+            <p className="text-sm font-medium">Allow lossy</p>
+            <p className="text-[11px] leading-snug text-muted-foreground">
+              Summarize long prose with a helper model (reversible).
+            </p>
+          </div>
+          <ToggleSwitch checked={allowLossy} disabled={pending} onChange={() => setAllowLossy((v) => !v)} />
+        </div>
+        <div className="space-y-3 px-4 py-3">
+          <p className="text-[11px] leading-snug text-muted-foreground">
+            No policy = follow the global default (lossless JSON on; dedup/lossy off). Lossy and dedup also require
+            the model to support function calling and the tool loop to be enabled.
+          </p>
+          <Button type="button" size="sm" variant="secondary" disabled={pending} onClick={clearPolicy}>
+            Clear policy
+          </Button>
+          <StatusMessage error={error} saved={saved} savedText="Compression policy saved." />
+        </div>
       </div>
     </PanelCard>
   );
