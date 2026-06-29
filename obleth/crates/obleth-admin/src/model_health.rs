@@ -787,6 +787,21 @@ fn normalize_excerpt(value: &str, max: usize) -> String {
     format!("{}...", &normalized[..end])
 }
 
+/// Map a probe's final HTTP status to a health status. A clear model/route or
+/// auth error is actionable (`unhealthy`, alertable); transient/overload and
+/// other inconclusive codes stay `degraded` so a working model never flaps to
+/// down on a single blip. `None` = transport failure after retries.
+fn classify_probe(http: Option<u16>) -> &'static str {
+    match http {
+        Some(c) if (200..300).contains(&c) => "healthy",
+        Some(400) | Some(401) | Some(403) | Some(404) | Some(422) => "unhealthy",
+        Some(408) | Some(429) => "degraded",
+        Some(c) if c >= 500 => "degraded",
+        Some(_) => "degraded",
+        None => "unhealthy",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -954,5 +969,35 @@ mod tests {
         assert!(build_probe_request("https://up/v1", "audio_transcription", "m").is_none());
         assert!(build_probe_request("https://up/v1", "audio_speech", "m").is_none());
         assert!(build_probe_request("https://up/v1", "something-else", "m").is_none());
+    }
+
+    #[test]
+    fn classify_probe_success_is_healthy() {
+        assert_eq!(classify_probe(Some(200)), "healthy");
+        assert_eq!(classify_probe(Some(201)), "healthy");
+    }
+
+    #[test]
+    fn classify_probe_model_and_auth_errors_are_unhealthy() {
+        // model removed upstream → LiteLLM returns 400/404; bad creds → 401/403.
+        assert_eq!(classify_probe(Some(400)), "unhealthy");
+        assert_eq!(classify_probe(Some(404)), "unhealthy");
+        assert_eq!(classify_probe(Some(422)), "unhealthy");
+        assert_eq!(classify_probe(Some(401)), "unhealthy");
+        assert_eq!(classify_probe(Some(403)), "unhealthy");
+    }
+
+    #[test]
+    fn classify_probe_transient_is_degraded() {
+        assert_eq!(classify_probe(Some(408)), "degraded");
+        assert_eq!(classify_probe(Some(429)), "degraded");
+        assert_eq!(classify_probe(Some(500)), "degraded");
+        assert_eq!(classify_probe(Some(503)), "degraded");
+        assert_eq!(classify_probe(Some(418)), "degraded"); // other 4xx: inconclusive
+    }
+
+    #[test]
+    fn classify_probe_transport_error_is_unhealthy() {
+        assert_eq!(classify_probe(None), "unhealthy");
     }
 }
