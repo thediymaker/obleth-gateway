@@ -67,6 +67,27 @@ fn compression_eligible(
         && route.boons.iter().any(|b| b == "compression")
 }
 
+/// Phase B2 lossy gating: compression is eligible for this model/tenant AND the
+/// summarizer is configured AND the request is reversible (the model can call
+/// functions and the tool loop is active, so `retrieve_original` is callable) AND
+/// the tenant explicitly opted into lossy. No tenant policy => no lossy.
+fn lossy_eligible(
+    route: &obleth_config::ResolvedModel,
+    settings: &obleth_config::BoonSettings,
+    key: &obleth_config::ResolvedKey,
+) -> bool {
+    let reversible = route.supports_function_calling && settings.tool_loop.active();
+    let tenant_allows_lossy = key
+        .compression_policy
+        .as_ref()
+        .is_some_and(|p| p.allow_lossy);
+    settings.compression.lossy_active()
+        && reversible
+        && tenant_allows_lossy
+        && route.boons.iter().any(|b| b == "compression")
+        && !key.internal
+}
+
 /// Request header that disables boon processing for a single request when set
 /// to `off`. Also returned on responses listing the boons that were applied.
 pub const BOONS_HEADER: &str = "x-obleth-boons";
@@ -285,6 +306,47 @@ impl BoonEngine {
                     "model is granted MCP tool servers but is not flagged \
                      supports_function_calling; no tools will be injected. \
                      Enable function calling on this model to use the tool loop."
+                );
+            }
+        }
+
+        // ---- compression boon: lossy semantic pass (Phase B2) ----
+        // Runs after tool-loop injection so it can add `retrieve_original` to the
+        // same loop. Only when reversible + tenant opted into lossy.
+        if lossy_eligible(route, &settings, key) {
+            let lossy_start = crate::tracer::now_ms();
+            let lossy = compression::apply_lossy(state, &settings.compression, key, session_id, json).await;
+            if lossy.refs_created > 0 {
+                // Inject the tool + nudge, and register it as gateway-owned in the
+                // loop map so the loop executes it (and never passes it through to
+                // a client). Create the map if no MCP servers were granted.
+                compression::inject_retrieve_original_tool(json, route.supports_system_messages);
+                tool_loop_servers
+                    .get_or_insert_with(std::collections::HashMap::new)
+                    .insert(
+                        tool_loop::RETRIEVE_ORIGINAL_TOOL.to_string(),
+                        tool_loop::COMPRESSION_SYNTHETIC_SERVER.to_string(),
+                    );
+                outcome.rewritten = true;
+                if !outcome.applied.contains(&"compression") {
+                    outcome.applied.push("compression");
+                }
+                state
+                    .metrics
+                    .record_compression_saved(lossy.tokens_before.saturating_sub(lossy.tokens_after));
+            }
+            if let Some(t) = tracer.as_deref_mut() {
+                t.record_elapsed(
+                    "boon:compression:lossy",
+                    "proxy_request",
+                    lossy_start,
+                    "ok",
+                    serde_json::json!({
+                        "segments": lossy.segments,
+                        "refs": lossy.refs_created,
+                        "tokens_before": lossy.tokens_before,
+                        "tokens_after": lossy.tokens_after,
+                    }),
                 );
             }
         }
@@ -577,6 +639,42 @@ mod tests {
         }
     }
 
+    fn test_key_with_policy(
+        policy: Option<obleth_config::CompressionPolicy>,
+    ) -> obleth_config::ResolvedKey {
+        let mut k = obleth_config::ResolvedKey {
+            key_id: uuid::Uuid::nil(),
+            tenant_id: uuid::Uuid::nil(),
+            tenant_name: "t".into(),
+            fairshare_group: "default".into(),
+            group_weight: 100,
+            weight: 1,
+            tokens_per_minute: 0,
+            max_in_flight: None,
+            disabled: false,
+            status: "active".into(),
+            timezone: "UTC".into(),
+            active_from: None,
+            active_until: None,
+            weekly_windows: None,
+            budget_tokens: None,
+            budget_cost_usd: None,
+            budget_period: None,
+            budget_started_at: None,
+            key_budget_tokens: None,
+            key_budget_cost_usd: None,
+            key_budget_period: None,
+            key_budget_started_at: None,
+            allowed_models: None,
+            internal: false,
+            tracing_enabled: false,
+            guardrails_policy: None,
+            compression_policy: None,
+        };
+        k.compression_policy = policy;
+        k
+    }
+
     #[test]
     fn compression_eligible_requires_grant_active_chat_and_tenant_optin() {
         use obleth_config::{BoonSettings, CompressionBoonSettings, CompressionPolicy};
@@ -650,6 +748,51 @@ mod tests {
         // Tenant policy enabled -> eligible again.
         key.compression_policy = Some(CompressionPolicy { enabled: true, allow_lossy: false });
         assert!(compression_eligible(&route, &settings, &key, true));
+    }
+
+    #[test]
+    fn lossy_eligible_requires_reversible_and_tenant_allow_lossy() {
+        use obleth_config::{BoonSettings, CompressionBoonSettings, CompressionPolicy, ToolLoopSettings};
+        let mut settings = BoonSettings::default();
+        settings.compression = CompressionBoonSettings {
+            enabled: true,
+            summarizer_model: Some("sum".into()),
+            ..Default::default()
+        };
+        settings.tool_loop = ToolLoopSettings { enabled: true, ..Default::default() };
+
+        let mut route = test_route();
+        route.boons = vec!["compression".to_string()];
+        route.supports_function_calling = true;
+
+        // Reuse the Task-5(B1) inline key builder.
+        let mut key = test_key_with_policy(Some(CompressionPolicy { enabled: true, allow_lossy: true }));
+
+        // All conditions met -> eligible.
+        assert!(lossy_eligible(&route, &settings, &key));
+
+        // No tenant allow_lossy (policy present but false) -> ineligible.
+        key.compression_policy = Some(CompressionPolicy { enabled: true, allow_lossy: false });
+        assert!(!lossy_eligible(&route, &settings, &key));
+
+        // No policy at all -> ineligible (conservative default).
+        key.compression_policy = None;
+        assert!(!lossy_eligible(&route, &settings, &key));
+
+        // Policy ok but model can't call functions -> not reversible -> ineligible.
+        key.compression_policy = Some(CompressionPolicy { enabled: true, allow_lossy: true });
+        route.supports_function_calling = false;
+        assert!(!lossy_eligible(&route, &settings, &key));
+        route.supports_function_calling = true;
+
+        // Tool loop globally off -> not reversible -> ineligible.
+        settings.tool_loop.enabled = false;
+        assert!(!lossy_eligible(&route, &settings, &key));
+        settings.tool_loop.enabled = true;
+
+        // Summarizer not configured -> lossy_active false -> ineligible.
+        settings.compression.summarizer_model = None;
+        assert!(!lossy_eligible(&route, &settings, &key));
     }
 
     #[test]

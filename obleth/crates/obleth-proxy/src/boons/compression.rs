@@ -144,7 +144,7 @@ const RETRIEVE_NUDGE: &str = "Some long content in this conversation was replace
 
 /// Inject the `retrieve_original` tool definition (merging into any existing
 /// `tools`) and a one-time system nudge describing the [ref:HASH] mechanism.
-fn inject_retrieve_original_tool(json: &mut Value, supports_system: bool) {
+pub(super) fn inject_retrieve_original_tool(json: &mut Value, supports_system: bool) {
     if let Some(obj) = json.as_object_mut() {
         match obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
             Some(existing) => existing.push(retrieve_original_tool_def()),
