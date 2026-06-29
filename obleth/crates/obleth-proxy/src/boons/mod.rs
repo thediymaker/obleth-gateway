@@ -46,15 +46,24 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
-/// Phase A gating: the model was granted the boon AND it is globally active AND
-/// this is a chat completion. (Per-tenant policy gating arrives in Phase B.)
+/// Phase A/B1 gating: the model was granted the boon AND it is globally active
+/// AND this is a chat completion AND the key's tenant has not opted out. Internal
+/// probe keys are exempt (mirrors guardrails). A `None` tenant policy follows the
+/// global default (eligible).
 fn compression_eligible(
     route: &obleth_config::ResolvedModel,
     settings: &obleth_config::BoonSettings,
+    key: &obleth_config::ResolvedKey,
     is_chat: bool,
 ) -> bool {
+    let tenant_opted_in = key
+        .compression_policy
+        .as_ref()
+        .map_or(true, |p| p.enabled);
     is_chat
+        && !key.internal
         && settings.compression.active()
+        && tenant_opted_in
         && route.boons.iter().any(|b| b == "compression")
 }
 
@@ -204,7 +213,7 @@ impl BoonEngine {
         // ---- compression boon (lossless, Phase A) ----
         // `is_chat` is always true here (past the earlier `if !is_chat` guard);
         // the parameter exists so unit tests can exercise the ineligible path.
-        if compression_eligible(route, &settings, is_chat) {
+        if compression_eligible(route, &settings, key, is_chat) {
             let comp_start = crate::tracer::now_ms();
             let stats = compression::apply(&settings.compression, json);
             if stats.compressed > 0 {
@@ -569,24 +578,78 @@ mod tests {
     }
 
     #[test]
-    fn compression_eligible_requires_grant_active_and_chat() {
-        use obleth_config::{BoonSettings, CompressionBoonSettings};
+    fn compression_eligible_requires_grant_active_chat_and_tenant_optin() {
+        use obleth_config::{BoonSettings, CompressionBoonSettings, CompressionPolicy};
+
+        fn test_key() -> obleth_config::ResolvedKey {
+            // Build via the redis crate's test-shaped literal is not accessible here;
+            // construct the minimal key inline.
+            obleth_config::ResolvedKey {
+                key_id: uuid::Uuid::nil(),
+                tenant_id: uuid::Uuid::nil(),
+                tenant_name: "t".into(),
+                fairshare_group: "default".into(),
+                group_weight: 100,
+                weight: 1,
+                tokens_per_minute: 0,
+                max_in_flight: None,
+                disabled: false,
+                status: "active".into(),
+                timezone: "UTC".into(),
+                active_from: None,
+                active_until: None,
+                weekly_windows: None,
+                budget_tokens: None,
+                budget_cost_usd: None,
+                budget_period: None,
+                budget_started_at: None,
+                key_budget_tokens: None,
+                key_budget_cost_usd: None,
+                key_budget_period: None,
+                key_budget_started_at: None,
+                allowed_models: None,
+                internal: false,
+                tracing_enabled: false,
+                guardrails_policy: None,
+                compression_policy: None,
+            }
+        }
+
         let mut settings = BoonSettings::default();
         settings.compression = CompressionBoonSettings { enabled: true, ..Default::default() };
 
-        let mut route = test_route(); // helper that builds a minimal ResolvedModel
+        let mut route = test_route();
         route.boons = vec!["compression".to_string()];
-        assert!(compression_eligible(&route, &settings, true));
+        let mut key = test_key();
+
+        // Granted + active + chat + no tenant policy -> eligible.
+        assert!(compression_eligible(&route, &settings, &key, true));
 
         // Not chat -> ineligible.
-        assert!(!compression_eligible(&route, &settings, false));
+        assert!(!compression_eligible(&route, &settings, &key, false));
+
         // No grant -> ineligible.
         route.boons.clear();
-        assert!(!compression_eligible(&route, &settings, true));
-        // Global setting off -> ineligible (master switch).
+        assert!(!compression_eligible(&route, &settings, &key, true));
         route.boons = vec!["compression".to_string()];
+
+        // Global master switch off -> ineligible.
         settings.compression.enabled = false;
-        assert!(!compression_eligible(&route, &settings, true));
+        assert!(!compression_eligible(&route, &settings, &key, true));
+        settings.compression.enabled = true;
+
+        // Internal probe keys are exempt.
+        key.internal = true;
+        assert!(!compression_eligible(&route, &settings, &key, true));
+        key.internal = false;
+
+        // Tenant opt-out policy (enabled = false) -> ineligible.
+        key.compression_policy = Some(CompressionPolicy { enabled: false, allow_lossy: false });
+        assert!(!compression_eligible(&route, &settings, &key, true));
+
+        // Tenant policy enabled -> eligible again.
+        key.compression_policy = Some(CompressionPolicy { enabled: true, allow_lossy: false });
+        assert!(compression_eligible(&route, &settings, &key, true));
     }
 
     #[test]
