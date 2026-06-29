@@ -59,6 +59,40 @@ pub(crate) fn compact_json(text: &str) -> Option<String> {
     Some(compact)
 }
 
+/// Conservative, lossless-leaning whitespace normalization of code text: strip
+/// trailing whitespace from each line and collapse runs of 2+ blank lines to a
+/// single blank line. Returns `Some` only when strictly shorter. Opt-in
+/// (`code_compaction`): a fenced block containing a multi-line string literal
+/// with intentional trailing spaces or consecutive blank lines is the one case
+/// this could alter, which is why it is off by default.
+pub(crate) fn compact_code(text: &str) -> Option<String> {
+    let mut out = String::with_capacity(text.len());
+    let mut blank_run = 0u32;
+    for line in text.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue; // collapse consecutive blank lines
+            }
+        } else {
+            blank_run = 0;
+        }
+        out.push_str(trimmed);
+        out.push('\n');
+    }
+    // Drop a single trailing newline we may have added past the original's end.
+    if !text.ends_with('\n') {
+        while out.ends_with('\n') {
+            out.pop();
+        }
+    }
+    if out.len() >= text.len() {
+        return None;
+    }
+    Some(out)
+}
+
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct CompressionStats {
     /// Number of segments above the `min_tokens` floor that were examined,
@@ -115,15 +149,26 @@ fn try_compact_string(
         return;
     }
     stats.scanned += 1;
-    if classify(s) != ContentKind::Json {
-        return;
-    }
-    if let Some(compact) = compact_json(s) {
-        let after = tk.count_text(&compact);
-        stats.tokens_before = stats.tokens_before.saturating_add(before);
-        stats.tokens_after = stats.tokens_after.saturating_add(after);
-        stats.compressed += 1;
-        *s = compact;
+    match classify(s) {
+        ContentKind::Json => {
+            if let Some(compact) = compact_json(s) {
+                let after = tk.count_text(&compact);
+                stats.tokens_before = stats.tokens_before.saturating_add(before);
+                stats.tokens_after = stats.tokens_after.saturating_add(after);
+                stats.compressed += 1;
+                *s = compact;
+            }
+        }
+        ContentKind::Code if cfg.code_compaction => {
+            if let Some(compact) = compact_code(s) {
+                let after = tk.count_text(&compact);
+                stats.tokens_before = stats.tokens_before.saturating_add(before);
+                stats.tokens_after = stats.tokens_after.saturating_add(after);
+                stats.compressed += 1;
+                *s = compact;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -443,5 +488,50 @@ mod tests {
         assert_eq!(body["model"], "llama3:8b");
         assert_eq!(body["messages"][0]["content"], "summarize");
         assert_eq!(body["messages"][1]["content"], "long text here");
+    }
+
+    #[test]
+    fn compact_code_strips_trailing_ws_and_collapses_blank_runs() {
+        let input = "```py\nx = 1   \n\n\n\ny = 2\t\n```";
+        let out = compact_code(input).expect("should compact");
+        assert!(out.len() < input.len());
+        assert!(!out.contains("   \n")); // no trailing whitespace before newline
+        assert!(!out.contains("\n\n\n")); // blank runs collapsed to a single blank line
+        assert!(out.contains("x = 1"));
+        assert!(out.contains("y = 2"));
+    }
+
+    #[test]
+    fn compact_code_returns_none_when_already_tight() {
+        assert_eq!(compact_code("```py\nx = 1\ny = 2\n```"), None);
+    }
+
+    #[test]
+    fn apply_compacts_code_when_enabled() {
+        let big = format!("```py\n{}\n```", "x = 1   \n\n\n".repeat(60));
+        let mut body = json!({
+            "model": "m",
+            "messages": [ { "role": "user", "content": big } ]
+        });
+        let cfg = obleth_config::CompressionBoonSettings {
+            enabled: true, min_tokens: 16, max_segments: 64, code_compaction: true, ..Default::default()
+        };
+        let stats = apply(&cfg, &mut body);
+        assert_eq!(stats.compressed, 1);
+        assert!(stats.tokens_after < stats.tokens_before);
+    }
+
+    #[test]
+    fn apply_leaves_code_when_disabled() {
+        let big = format!("```py\n{}\n```", "x = 1   \n\n\n".repeat(60));
+        let mut body = json!({
+            "model": "m",
+            "messages": [ { "role": "user", "content": big } ]
+        });
+        let cfg = obleth_config::CompressionBoonSettings {
+            enabled: true, min_tokens: 16, max_segments: 64, code_compaction: false, ..Default::default()
+        };
+        let stats = apply(&cfg, &mut body);
+        assert_eq!(stats.compressed, 0);
     }
 }
