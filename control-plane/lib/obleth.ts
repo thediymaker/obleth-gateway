@@ -458,6 +458,8 @@ export interface UsageLogParams {
   limit?: number;
   /** When true, only return log entries that have a recorded trace. */
   tracedOnly?: boolean;
+  /** When true, include internal traffic (e.g. health probes) hidden by default. */
+  includeInternal?: boolean;
 }
 
 export interface UsageRetentionView {
@@ -1401,6 +1403,7 @@ export const obleth = {
         before_request_id: params.beforeRequestId,
         limit: params.limit,
         traced_only: params.tracedOnly ? "true" : undefined,
+        include_internal: params.includeInternal ? "true" : undefined,
       })}`,
     ),
   getRequestSpans: (requestId: string) =>

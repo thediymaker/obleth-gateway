@@ -112,6 +112,9 @@ pub struct UsageLogQuery {
     /// When `true`, return only requests that have at least one span in
     /// ClickHouse (i.e. were traced).
     pub traced_only: Option<bool>,
+    /// When true, include internal traffic (e.g. health probes) that is hidden
+    /// from the request log by default.
+    pub include_internal: Option<bool>,
 }
 
 /// A single request as stored in the `usage` ledger, returned newest-first for
@@ -179,6 +182,13 @@ pub async fn query_usage_logs(
     }
     if q.session_id.is_some() {
         sql.push_str(" and session_id = ?");
+    }
+    if q.include_internal != Some(true) {
+        // `health_probe` is a literal constant, no bind needed / no injection surface.
+        sql.push_str(&format!(
+            " and request_type != '{}'",
+            obleth_admin_health_probe_label()
+        ));
     }
     match q.status.as_deref() {
         Some("success") => sql.push_str(" and status_code >= 200 and status_code < 400"),
@@ -993,6 +1003,10 @@ pub async fn drop_usage_partition(
     }
     let sql = format!("alter table usage drop partition id '{partition}'");
     client.query(&sql).execute().await
+}
+
+fn obleth_admin_health_probe_label() -> &'static str {
+    crate::model_health::HEALTH_PROBE_REQUEST_TYPE
 }
 
 fn default_start_day() -> String {

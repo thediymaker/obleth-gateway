@@ -28,6 +28,7 @@ export async function GET(req: NextRequest) {
     beforeMs: num("before_ms"),
     beforeRequestId: str("before_request_id"),
     limit: num("limit"),
+    includeInternal: sp.get("include_internal") === "true" ? true : undefined,
   };
 
   try {

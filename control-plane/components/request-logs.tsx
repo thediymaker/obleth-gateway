@@ -45,6 +45,7 @@ interface Filters {
   status: string;
   requestId: string;
   tracedOnly: boolean;
+  includeInternal: boolean;
 }
 
 const DEFAULT_FILTERS: Filters = {
@@ -55,6 +56,7 @@ const DEFAULT_FILTERS: Filters = {
   status: "",
   requestId: "",
   tracedOnly: false,
+  includeInternal: false,
 };
 
 const REQUEST_TYPES = [
@@ -121,6 +123,7 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
       if (filters.status) params.set("status", filters.status);
       if (filters.requestId) params.set("request_id", filters.requestId);
       if (filters.tracedOnly) params.set("traced_only", "true");
+      if (filters.includeInternal) params.set("include_internal", "true");
       if (!liveTail && cursor) {
         params.set("before_ms", String(cursor.beforeMs));
         params.set("before_request_id", cursor.beforeRequestId);
@@ -187,7 +190,8 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
       filters.status ||
       filters.requestId ||
       filters.windowMs !== DEFAULT_FILTERS.windowMs ||
-      filters.tracedOnly,
+      filters.tracedOnly ||
+      filters.includeInternal,
   );
 
   return (
@@ -321,6 +325,19 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
           >
             <span className="h-1.5 w-1.5 rounded-full border border-current" />
             Traced only
+          </button>
+          <button
+            type="button"
+            onClick={() => patchFilters({ includeInternal: !filters.includeInternal })}
+            className={cn(
+              "inline-flex h-8 items-center justify-center gap-1.5 rounded-md border px-2.5 text-[11px] transition-colors",
+              filters.includeInternal
+                ? "border-amber-700/60 bg-amber-950/40 text-amber-400"
+                : "border-border bg-muted/30 text-muted-foreground hover:text-foreground",
+            )}
+          >
+            <span className="h-1.5 w-1.5 rounded-full border border-current" />
+            Show health/internal traffic
           </button>
           {filtersActive && (
             <Button
