@@ -40,6 +40,53 @@ use crate::state::AppState;
 /// Cap on a single tool result fed back to the model (bounds context growth).
 const TOOL_RESULT_MAX_CHARS: usize = 16_000;
 
+/// Name of the gateway-executed tool the compression boon injects so a model can
+/// pull back content that was lossily summarized.
+pub(super) const RETRIEVE_ORIGINAL_TOOL: &str = "retrieve_original";
+/// Synthetic "server" name registered in the tool map for `retrieve_original`,
+/// so the loop recognizes the tool as gateway-owned (not a client tool to pass
+/// through). The value is never used as a real MCP server; `execute_call`
+/// short-circuits the call by name before any server lookup.
+pub(super) const COMPRESSION_SYNTHETIC_SERVER: &str = "__compression__";
+
+/// The OpenAI function-tool definition for `retrieve_original`.
+pub(super) fn retrieve_original_tool_def() -> Value {
+    json!({
+        "type": "function",
+        "function": {
+            "name": RETRIEVE_ORIGINAL_TOOL,
+            "description": "Retrieve the full original text of content that was \
+                summarized to save space. Pass the exact hash shown in a \
+                [ref:HASH] marker.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "ref": {
+                        "type": "string",
+                        "description": "The hash from a [ref:HASH] marker."
+                    }
+                },
+                "required": ["ref"]
+            }
+        }
+    })
+}
+
+/// Format a `retrieve_original` result for the model. `reference` is the ref the
+/// model passed (None when it omitted the argument); `content` is the Redis
+/// lookup result (None = miss/expired). Fail-soft: a miss or missing ref returns
+/// a readable message, never an error that breaks the loop.
+fn format_retrieve_result(reference: Option<&str>, content: Option<String>) -> String {
+    match (reference, content) {
+        (None, _) => "Error: retrieve_original requires a `ref` argument (the hash \
+                      from a [ref:HASH] marker).".to_string(),
+        (Some(_), Some(original)) => original,
+        (Some(r), None) => format!(
+            "The original content for ref {r} is no longer available (it may have expired)."
+        ),
+    }
+}
+
 /// Response-side state for the tool loop, armed at request enrichment.
 pub struct ToolLoopPlan {
     /// Tool name -> MCP server name, for executing calls.
@@ -478,6 +525,22 @@ pub(super) async fn execute_call(
     call: &PendingCall,
     timeout: Duration,
 ) -> String {
+    // Gateway-executed compression tool: resolve from Redis, never an MCP server.
+    if call.name == RETRIEVE_ORIGINAL_TOOL {
+        let reference = call.arguments.get("ref").and_then(|v| v.as_str());
+        let content = match reference {
+            Some(r) => match state.redis.compress_get(r).await {
+                Ok(found) => found,
+                Err(e) => {
+                    tracing::warn!(error = %e, "compress_get failed for retrieve_original");
+                    None
+                }
+            },
+            None => None,
+        };
+        return format_retrieve_result(reference, content);
+    }
+
     let Some(server_name) = tool_servers.get(&call.name) else {
         return format!("Error: tool `{}` is not available.", call.name);
     };
@@ -576,5 +639,36 @@ mod tests {
         });
         let calls = extract_tool_calls(&body);
         assert_eq!(calls[0].arguments, json!({}));
+    }
+
+    #[test]
+    fn retrieve_original_tool_def_shape() {
+        let def = retrieve_original_tool_def();
+        assert_eq!(def["type"], "function");
+        assert_eq!(def["function"]["name"], RETRIEVE_ORIGINAL_TOOL);
+        assert_eq!(def["function"]["parameters"]["properties"]["ref"]["type"], "string");
+        assert_eq!(def["function"]["parameters"]["required"][0], "ref");
+    }
+
+    #[test]
+    fn retrieve_original_missing_ref_is_clear_error() {
+        // The pure formatter rejects a missing/blank ref without panicking.
+        assert!(format_retrieve_result(None, None).contains("ref"));
+    }
+
+    #[test]
+    fn retrieve_original_miss_is_not_an_error() {
+        // A miss (ref known, content gone) reads as unavailable, not an error.
+        let out = format_retrieve_result(Some("abc123"), None);
+        assert!(out.to_lowercase().contains("no longer available"));
+        assert!(out.contains("abc123"));
+    }
+
+    #[test]
+    fn retrieve_original_hit_returns_content() {
+        assert_eq!(
+            format_retrieve_result(Some("abc123"), Some("the original".to_string())),
+            "the original"
+        );
     }
 }
