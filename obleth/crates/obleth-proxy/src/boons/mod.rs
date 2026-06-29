@@ -766,11 +766,11 @@ mod tests {
         key.internal = false;
 
         // Tenant opt-out policy (enabled = false) -> ineligible.
-        key.compression_policy = Some(CompressionPolicy { enabled: false, allow_lossy: false });
+        key.compression_policy = Some(CompressionPolicy { enabled: false, code_compaction: false, dedup: false, allow_lossy: false });
         assert!(!compression_eligible(&route, &settings, &key, true));
 
         // Tenant policy enabled -> eligible again.
-        key.compression_policy = Some(CompressionPolicy { enabled: true, allow_lossy: false });
+        key.compression_policy = Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: false, allow_lossy: false });
         assert!(compression_eligible(&route, &settings, &key, true));
     }
 
@@ -786,7 +786,7 @@ mod tests {
         route.boons = vec!["compression".to_string()];
         route.supports_function_calling = true;
 
-        let mut key = test_key_with_policy(Some(CompressionPolicy { enabled: true, allow_lossy: true }));
+        let mut key = test_key_with_policy(Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: false, allow_lossy: true }));
 
         // Dedup gate: eligible without a summarizer.
         assert!(reversible_compression_eligible(&route, &settings, &key));
@@ -794,11 +794,11 @@ mod tests {
         assert!(!lossy_eligible(&route, &settings, &key));
 
         // No allow_lossy -> not reversible-eligible.
-        key.compression_policy = Some(CompressionPolicy { enabled: true, allow_lossy: false });
+        key.compression_policy = Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: false, allow_lossy: false });
         assert!(!reversible_compression_eligible(&route, &settings, &key));
 
         // Tool loop off -> not reversible.
-        key.compression_policy = Some(CompressionPolicy { enabled: true, allow_lossy: true });
+        key.compression_policy = Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: false, allow_lossy: true });
         settings.tool_loop.enabled = false;
         assert!(!reversible_compression_eligible(&route, &settings, &key));
     }
@@ -819,13 +819,13 @@ mod tests {
         route.supports_function_calling = true;
 
         // Reuse the Task-5(B1) inline key builder.
-        let mut key = test_key_with_policy(Some(CompressionPolicy { enabled: true, allow_lossy: true }));
+        let mut key = test_key_with_policy(Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: false, allow_lossy: true }));
 
         // All conditions met -> eligible.
         assert!(lossy_eligible(&route, &settings, &key));
 
         // No tenant allow_lossy (policy present but false) -> ineligible.
-        key.compression_policy = Some(CompressionPolicy { enabled: true, allow_lossy: false });
+        key.compression_policy = Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: false, allow_lossy: false });
         assert!(!lossy_eligible(&route, &settings, &key));
 
         // No policy at all -> ineligible (conservative default).
@@ -833,7 +833,7 @@ mod tests {
         assert!(!lossy_eligible(&route, &settings, &key));
 
         // Policy ok but model can't call functions -> not reversible -> ineligible.
-        key.compression_policy = Some(CompressionPolicy { enabled: true, allow_lossy: true });
+        key.compression_policy = Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: false, allow_lossy: true });
         route.supports_function_calling = false;
         assert!(!lossy_eligible(&route, &settings, &key));
         route.supports_function_calling = true;

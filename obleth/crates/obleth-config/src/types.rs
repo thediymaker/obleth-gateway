@@ -1391,6 +1391,12 @@ pub struct CompressionPolicy {
     /// models that are granted the boon.
     #[serde(default)]
     pub enabled: bool,
+    /// Tenant toggle for conservative code-whitespace compaction (lossless-ish).
+    #[serde(default)]
+    pub code_compaction: bool,
+    /// Tenant toggle for cross-turn exact-duplicate dedup (reversible).
+    #[serde(default)]
+    pub dedup: bool,
     /// Whether the tenant accepts lossy semantic compression. Consumed by the
     /// lossy compressor in Phase B2; ignored by Phase A/B1 lossless compaction.
     #[serde(default)]
@@ -1823,9 +1829,26 @@ mod tests {
 
     #[test]
     fn compression_policy_round_trips() {
-        let p = CompressionPolicy { enabled: true, allow_lossy: true };
+        let p = CompressionPolicy { enabled: true, code_compaction: false, dedup: false, allow_lossy: true };
         let json = serde_json::to_string(&p).unwrap();
         let back: CompressionPolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(p, back);
+    }
+
+    #[test]
+    fn compression_policy_new_fields_default_false() {
+        // Old 2-field shape still deserializes; new piece-flags default off.
+        let p: CompressionPolicy = serde_json::from_str(r#"{"enabled":true,"allow_lossy":true}"#).unwrap();
+        assert!(p.enabled);
+        assert!(p.allow_lossy);
+        assert!(!p.code_compaction);
+        assert!(!p.dedup);
+    }
+
+    #[test]
+    fn compression_policy_full_round_trips() {
+        let p = CompressionPolicy { enabled: true, code_compaction: true, dedup: true, allow_lossy: false };
+        let back: CompressionPolicy = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(p, back);
     }
 }

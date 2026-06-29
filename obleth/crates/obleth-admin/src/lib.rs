@@ -4006,4 +4006,13 @@ mod tests {
         assert!(p.enabled);
         assert!(!p.allow_lossy);
     }
+
+    #[test]
+    fn set_tenant_compression_carries_per_piece_flags() {
+        let set: SetTenantCompression = serde_json::from_str(
+            r#"{"policy":{"enabled":true,"code_compaction":true,"dedup":true,"allow_lossy":true}}"#,
+        ).unwrap();
+        let p = set.policy.expect("policy present");
+        assert!(p.enabled && p.code_compaction && p.dedup && p.allow_lossy);
+    }
 }
