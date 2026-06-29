@@ -37,6 +37,9 @@ const MCP_PREFIX: &str = "obleth:mcp:";
 const BUDGET_PREFIX: &str = "obleth:budget:";
 const TERM_USAGE_PREFIX: &str = "obleth:term_usage:";
 const CACHE_PREFIX: &str = "obleth:cache:";
+/// Namespace for compression-boon originals stashed for reversibility. Distinct
+/// from the response cache so the two never collide.
+const COMPRESS_PREFIX: &str = "obleth:compress:";
 const INVALIDATE_CHANNEL: &str = "obleth:invalidate";
 /// Single shared key holding the provisioner's last-seen epoch seconds. Shared
 /// via Redis (not per-pod memory) so the dashboard reads a consistent value no
@@ -250,6 +253,32 @@ impl RedisStore {
             let _: () = conn.set(redis_key, json).await?;
         }
         Ok(())
+    }
+
+    fn compress_key(hash: &str) -> String {
+        format!("{COMPRESS_PREFIX}{hash}")
+    }
+
+    /// Stash an original content segment under its content hash for later
+    /// reversibility, expiring after `ttl_secs`. A `ttl_secs` of 0 stores it
+    /// without expiry (callers should always pass a positive session-scoped TTL).
+    pub async fn compress_put(&self, hash: &str, content: &str, ttl_secs: u64) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let redis_key = Self::compress_key(hash);
+        if ttl_secs > 0 {
+            let _: () = conn.set_ex(redis_key, content, ttl_secs).await?;
+        } else {
+            let _: () = conn.set(redis_key, content).await?;
+        }
+        Ok(())
+    }
+
+    /// Fetch a stashed original by its content hash, or `None` when it has
+    /// expired or was never stored.
+    pub async fn compress_get(&self, hash: &str) -> Result<Option<String>> {
+        let mut conn = self.conn.clone();
+        let v: Option<String> = conn.get(Self::compress_key(hash)).await?;
+        Ok(v)
     }
 
     /// Publish invalidation for a key hash, model name (`model:<name>`), or `*`.
@@ -604,5 +633,29 @@ mod tests {
         assert_eq!(got, key);
         store.delete_resolved_key(&hash).await.unwrap();
         assert!(store.get_resolved_key(&hash).await.unwrap().is_none());
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn compress_store_roundtrip_and_miss() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let store = RedisStore::connect(&url).await.expect("connect");
+        let hash = format!("h-{}", Uuid::new_v4());
+
+        // Miss before write.
+        assert!(store.compress_get(&hash).await.unwrap().is_none());
+
+        // Round-trip with a TTL.
+        store
+            .compress_put(&hash, "the original content", 60)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.compress_get(&hash).await.unwrap().as_deref(),
+            Some("the original content")
+        );
     }
 }
