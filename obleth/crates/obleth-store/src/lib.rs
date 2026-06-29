@@ -1961,8 +1961,8 @@ impl Store {
 
     /// Record the outcome of a per-endpoint health check. Mirrors
     /// `record_model_health_check`: `healthy`/`disabled` reset the failure
-    /// counter; `degraded`/`skipped` are transient (left untouched); anything
-    /// else increments `consecutive_failures`.
+    /// counter; `degraded`/`skipped`/`unknown` are transient (left untouched);
+    /// anything else increments `consecutive_failures`.
     pub async fn record_endpoint_health(
         &self,
         id: Uuid,
