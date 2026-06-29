@@ -2870,6 +2870,7 @@ mod tests {
             internal: false,
             tracing_enabled: false,
             guardrails_policy: None,
+            compression_policy: None,
         }
     }
 

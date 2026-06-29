@@ -68,6 +68,8 @@ const SCHEMA_V11: &str =
     include_str!("../../../../schema/postgres/0011_endpoint_selection_session_hash.sql");
 const SCHEMA_V12: &str =
     include_str!("../../../../schema/postgres/0012_model_debug_diagnostics.sql");
+const SCHEMA_V13: &str =
+    include_str!("../../../../schema/postgres/0013_compression_policy.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -167,6 +169,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V10).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V11).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V12).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V13).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -228,7 +231,7 @@ impl Store {
         Self::guard_reserved_tenant(id)?;
         let row = sqlx::query(
             "update tenants set fairshare_group = $2, updated_at = now() where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
         )
         .bind(id)
         .bind(fairshare_group)
@@ -252,7 +255,7 @@ impl Store {
         let row = sqlx::query(
             "insert into tenants (id, name, fairshare_group, weight, tokens_per_minute, max_in_flight)
              values ($1, $2, $3, $4, $5, $6)
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
         )
         .bind(Uuid::new_v4())
         .bind(name)
@@ -267,7 +270,7 @@ impl Store {
 
     pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
         let rows = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, tracing_enabled, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, created_at, updated_at
              from tenants order by created_at",
         )
         .fetch_all(&self.pool)
@@ -277,7 +280,7 @@ impl Store {
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Tenant> {
         let row = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, tracing_enabled, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, created_at, updated_at
              from tenants where id = $1",
         )
         .bind(id)
@@ -291,7 +294,7 @@ impl Store {
         Self::guard_reserved_tenant(id)?;
         let row = sqlx::query(
             "update tenants set weight = $2, updated_at = now() where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
         )
         .bind(id)
         .bind(weight.max(1))
@@ -311,7 +314,7 @@ impl Store {
         let row = sqlx::query(
             "update tenants set tokens_per_minute = $2, max_in_flight = $3, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
         )
         .bind(id)
         .bind(tokens_per_minute.max(0))
@@ -337,7 +340,7 @@ impl Store {
             "update tenants set name = $2, description = $3, organization = $4,
                     contact_email = $5, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
         )
         .bind(id)
         .bind(name)
@@ -355,7 +358,7 @@ impl Store {
         Self::guard_reserved_tenant(id)?;
         let row = sqlx::query(
             "update tenants set status = $2, updated_at = now() where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
         )
         .bind(id)
         .bind(status)
@@ -384,7 +387,7 @@ impl Store {
             "update tenants set timezone = $2, active_from = $3, active_until = $4,
                     weekly_windows = $5, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
         )
         .bind(id)
         .bind(timezone)
@@ -413,7 +416,7 @@ impl Store {
             "update tenants set budget_tokens = $2, budget_cost_usd = $3, budget_period = $4,
                     budget_started_at = $5, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
         )
         .bind(id)
         .bind(budget_tokens)
@@ -440,7 +443,7 @@ impl Store {
         let row = sqlx::query(
             "update tenants set allowed_models = $2, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
         )
         .bind(id)
         .bind(allowed)
@@ -461,13 +464,33 @@ impl Store {
         let row = sqlx::query(
             "update tenants set guardrails_policy = $2, updated_at = now()
              where id = $1
-             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, created_at, updated_at",
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
         )
         .bind(id)
         .bind(encoded)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
+        tenant_from_row(&row)
+    }
+
+    /// Set or clear a tenant's compression policy. `None` removes the policy.
+    pub async fn update_tenant_compression_policy(
+        &self,
+        id: Uuid,
+        policy: Option<obleth_config::CompressionPolicy>,
+    ) -> Result<Tenant> {
+        Self::guard_reserved_tenant(id)?;
+        let encoded = policy.map(sqlx::types::Json);
+        let row = sqlx::query(
+            "update tenants set compression_policy = $2, updated_at = now()
+             where id = $1
+             returning id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(encoded)
+        .fetch_one(&self.pool)
+        .await?;
         tenant_from_row(&row)
     }
 
@@ -827,7 +850,8 @@ impl Store {
                     k.budget_started_at as key_budget_started_at,
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
-                    t.guardrails_policy
+                    t.guardrails_policy,
+                    t.compression_policy
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group
@@ -853,7 +877,8 @@ impl Store {
                     k.budget_started_at as key_budget_started_at,
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
-                    t.guardrails_policy
+                    t.guardrails_policy,
+                    t.compression_policy
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group",
@@ -883,7 +908,8 @@ impl Store {
                     k.budget_started_at as key_budget_started_at,
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
-                    t.guardrails_policy
+                    t.guardrails_policy,
+                    t.compression_policy
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group
@@ -2669,6 +2695,7 @@ fn tenant_from_row(row: &PgRow) -> Result<Tenant> {
         allowed_models: allowed_models_from_row(row)?,
         tracing_enabled: row.try_get("tracing_enabled").unwrap_or(false),
         guardrails_policy: guardrails_policy_from_row(row)?,
+        compression_policy: compression_policy_from_row(row)?,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -2699,6 +2726,21 @@ fn guardrails_policy_from_row(row: &PgRow) -> Result<Option<obleth_config::Guard
         Ok(json) => Ok(json.map(|j| j.0)),
         Err(e) => {
             tracing::warn!(error = %e, "failed to decode guardrails_policy; treating as none");
+            Ok(None)
+        }
+    }
+}
+
+/// Decode the optional `compression_policy` jsonb column. A decode failure is
+/// logged and treated as no policy rather than failing the whole row —
+/// consistent with the boon's fail-open posture.
+fn compression_policy_from_row(row: &PgRow) -> Result<Option<obleth_config::CompressionPolicy>> {
+    match row.try_get::<Option<sqlx::types::Json<obleth_config::CompressionPolicy>>, _>(
+        "compression_policy",
+    ) {
+        Ok(json) => Ok(json.map(|j| j.0)),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to decode compression_policy; treating as none");
             Ok(None)
         }
     }
@@ -2759,6 +2801,7 @@ fn resolved_from_row(row: &PgRow) -> Result<ResolvedKey> {
         internal: false,
         tracing_enabled: row.try_get::<bool, _>("tracing_enabled").unwrap_or(false),
         guardrails_policy: guardrails_policy_from_row(row)?,
+        compression_policy: compression_policy_from_row(row)?,
     })
 }
 

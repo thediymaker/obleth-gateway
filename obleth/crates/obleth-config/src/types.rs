@@ -99,6 +99,9 @@ pub struct Tenant {
     /// Per-tenant guardrails policy. `None` means no guardrails are applied.
     #[serde(default)]
     pub guardrails_policy: Option<GuardrailsPolicy>,
+    /// Per-tenant compression policy. `None` means follow the global default.
+    #[serde(default)]
+    pub compression_policy: Option<CompressionPolicy>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -218,6 +221,10 @@ pub struct ResolvedKey {
     /// Per-tenant content policy, if configured. `None` means no guardrails.
     #[serde(default)]
     pub guardrails_policy: Option<GuardrailsPolicy>,
+    /// Per-tenant compression policy, if configured. `None` means follow the
+    /// global default for eligible models.
+    #[serde(default)]
+    pub compression_policy: Option<CompressionPolicy>,
 }
 
 /// Outcome of admission for a single request, recorded in telemetry.
