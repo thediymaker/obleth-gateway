@@ -1382,8 +1382,10 @@ pub enum GuardrailsAction {
 /// Per-tenant compression policy. Stored as JSONB on `tenants.compression_policy`.
 ///
 /// A `None` policy on a tenant means "follow the global default" (eligible models
-/// are compressed). A present policy lets a tenant opt out (`enabled = false`) or,
-/// in Phase B2, opt into lossy semantic compression (`allow_lossy`).
+/// are compressed). Each field independently toggles a compression piece for the tenant:
+/// `enabled` (master on/off; lossless JSON compaction is the safe baseline under it),
+/// `code_compaction` (conservative code whitespace), `dedup` (cross-turn exact-duplicate dedup),
+/// `allow_lossy` (lossy semantic summarization).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct CompressionPolicy {
     /// Tenant opt-out switch for the compression boon. When false, no
