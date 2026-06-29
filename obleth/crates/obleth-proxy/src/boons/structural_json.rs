@@ -95,6 +95,20 @@ fn try_encode_table(value: &Value) -> Option<String> {
     Some(out)
 }
 
+/// Compact a JSON text segment. Prefers the table form for arrays of like-keyed
+/// objects (validated by exact reconstruction and a strict length win); otherwise
+/// falls back to the existing lossless minify; otherwise `None`.
+pub(super) fn compact(text: &str) -> Option<String> {
+    if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
+        if let Some(table) = try_encode_table(&value) {
+            if table.len() < text.len() && reconstruct_table(&table).as_ref() == Some(&value) {
+                return Some(table);
+            }
+        }
+    }
+    super::compression::compact_json(text)
+}
+
 /// Reconstruct the JSON array from the table form, or `None` if `text` isn't a
 /// well-formed table this module produced.
 fn reconstruct_table(text: &str) -> Option<Value> {
@@ -203,5 +217,36 @@ mod tests {
         assert_eq!(try_encode_table(&json!([1, 2, 3])), None);
         assert_eq!(try_encode_table(&json!([{"a": 1}])), None); // <2 rows
         assert_eq!(try_encode_table(&json!({"a": 1})), None); // not an array
+    }
+
+    #[test]
+    fn compact_uses_table_for_object_arrays() {
+        // Pretty-printed array of like objects → table form, exact round-trip, shorter.
+        let value = json!([
+            {"id": 1, "name": "alice", "role": "admin", "active": true},
+            {"id": 2, "name": "bob", "role": "user", "active": false}
+        ]);
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+        let out = compact(&pretty).expect("should compact");
+        assert!(out.starts_with("OBLETH_TABLE rows=2\n"));
+        assert!(out.len() < pretty.len());
+        assert_eq!(reconstruct_table(&out), Some(value));
+    }
+
+    #[test]
+    fn compact_falls_back_to_minify_for_non_tabular() {
+        // A single object isn't tabular → falls back to lossless minify.
+        let pretty = "{\n  \"a\": 1,\n  \"b\": [1, 2, 3]\n}";
+        let out = compact(pretty).expect("should minify");
+        assert!(!out.starts_with("OBLETH_TABLE"));
+        let a: Value = serde_json::from_str(pretty).unwrap();
+        let b: Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(a, b);
+        assert!(out.len() < pretty.len());
+    }
+
+    #[test]
+    fn compact_returns_none_when_no_gain() {
+        assert_eq!(compact("{\"a\":1}"), None); // already minimal, not tabular
     }
 }
