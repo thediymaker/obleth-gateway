@@ -729,6 +729,38 @@ fn jittered_next_check_at(interval_secs: i64) -> DateTime<Utc> {
     Utc::now() + chrono::Duration::seconds(base + jitter)
 }
 
+fn build_probe_usage(
+    model: &ModelRoute,
+    http_status: Option<u16>,
+    total_ms: u32,
+    input_tokens: u32,
+    output_tokens: u32,
+) -> obleth_config::UsageRecord {
+    let cost_usd = input_tokens as f64 * model.input_cost_per_token
+        + output_tokens as f64 * model.output_cost_per_token;
+    obleth_config::UsageRecord {
+        request_id: Uuid::new_v4(),
+        tenant_id: health_tenant_id(),
+        key_id: Uuid::nil(),
+        model: model.model_name.clone(),
+        admission: "health_probe".to_string(),
+        weight: 0,
+        input_tokens,
+        output_tokens,
+        estimated_tokens: input_tokens,
+        queue_wait_ms: 0,
+        ttft_ms: 0,
+        total_ms,
+        status_code: http_status.unwrap_or(0),
+        cache_status: "off".to_string(),
+        cost_usd,
+        ts_ms: Utc::now().timestamp_millis(),
+        session_id: String::new(),
+        session_id_source: "none".to_string(),
+        request_type: HEALTH_PROBE_REQUEST_TYPE.to_string(),
+    }
+}
+
 fn clean_optional_text(value: &str) -> Option<String> {
     let value = normalize_excerpt(value, 240);
     (!value.is_empty()).then_some(value)
@@ -999,5 +1031,38 @@ mod tests {
     #[test]
     fn classify_probe_transport_error_is_unhealthy() {
         assert_eq!(classify_probe(None), "unhealthy");
+    }
+
+    fn sample_model() -> ModelRoute {
+        serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::nil(),
+            "model_name": "m", "description": "", "upstream_model": "m",
+            "api_base": "https://up/v1", "api_key": null, "model_type": "chat",
+            "input_cost_per_token": 0.0, "output_cost_per_token": 0.0,
+            "context_window": 8192, "admission_weight": 100, "max_in_flight": null,
+            "supports_function_calling": false, "supports_system_messages": true,
+            "supports_response_schema": false, "supports_tool_choice": false,
+            "enabled": true, "cache_enabled": false, "cache_ttl_secs": 300,
+            "created_at": "2024-01-01T00:00:00Z",
+            "updated_at": "2024-01-01T00:00:00Z",
+        })).expect("sample model")
+    }
+
+    #[test]
+    fn probe_usage_is_internal_and_tagged() {
+        let mut model = sample_model();
+        model.model_name = "kimi-k2".into();
+        model.input_cost_per_token = 0.001;
+        model.output_cost_per_token = 0.002;
+        let rec = build_probe_usage(&model, Some(200), 42, 3, 1);
+        assert_eq!(rec.tenant_id, health_tenant_id());
+        assert_eq!(rec.key_id, uuid::Uuid::nil());
+        assert_eq!(rec.request_type, HEALTH_PROBE_REQUEST_TYPE);
+        assert_eq!(rec.model, "kimi-k2");
+        assert_eq!(rec.status_code, 200);
+        assert_eq!(rec.input_tokens, 3);
+        assert_eq!(rec.output_tokens, 1);
+        // cost = 3*0.001 + 1*0.002
+        assert!((rec.cost_usd - 0.005).abs() < 1e-9);
     }
 }
