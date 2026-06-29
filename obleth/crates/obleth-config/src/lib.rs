@@ -8,5 +8,5 @@ pub mod keys;
 pub mod types;
 
 pub use config::{Config, SlackAlertConfig};
-pub use keys::{cache_key, generate_api_key, hash_api_key, pepper_is_set, GeneratedKey};
+pub use keys::{cache_key, content_hash, generate_api_key, hash_api_key, pepper_is_set, GeneratedKey};
 pub use types::*;
