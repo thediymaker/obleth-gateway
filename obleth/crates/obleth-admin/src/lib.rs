@@ -110,6 +110,10 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/tenants/:id/guardrails",
             patch(patch_tenant_guardrails),
         )
+        .route(
+            "/api/v1/tenants/:id/compression",
+            patch(patch_tenant_compression),
+        )
         .route("/api/v1/tenants/:id/weight", patch(patch_weight))
         .route("/api/v1/tenants/:id/quota", put(put_quota))
         .route("/api/v1/tenants/:id/keys", post(create_key))
@@ -380,6 +384,12 @@ pub struct SetTenantAllowlist {
 pub struct SetTenantGuardrails {
     /// `null` clears the guardrails policy (no scanning for this tenant).
     pub policy: Option<obleth_config::GuardrailsPolicy>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetTenantCompression {
+    /// `null` clears the compression policy (tenant follows the global default).
+    pub policy: Option<obleth_config::CompressionPolicy>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1170,6 +1180,36 @@ async fn patch_tenant_guardrails(
             "tenant",
             &id.to_string(),
             serde_json::json!({ "guardrails_policy": tenant.guardrails_policy }),
+        )
+        .await?;
+    Ok(Json(tenant))
+}
+
+#[utoipa::path(
+    patch, path = "/api/v1/tenants/{id}/compression", tag = "tenants",
+    request_body = SetTenantCompression,
+    responses((status = 200, body = Tenant))
+)]
+async fn patch_tenant_compression(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetTenantCompression>,
+) -> Result<Json<Tenant>> {
+    let tenant = state
+        .store
+        .update_tenant_compression_policy(id, body.policy)
+        .await?;
+    // Compression gating reads the cached key; refresh it.
+    sync_tenant_keys(&state, id).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_tenant_compression",
+            "tenant",
+            &id.to_string(),
+            serde_json::json!({ "compression_policy": tenant.compression_policy }),
         )
         .await?;
     Ok(Json(tenant))
@@ -3868,5 +3908,20 @@ mod tests {
         assert!(view.compression_enabled);
         assert_eq!(view.compression_min_tokens, 256);
         assert_eq!(view.compression_max_segments, 8);
+    }
+
+    #[test]
+    fn set_tenant_compression_deserializes_null_and_policy() {
+        // null clears the policy.
+        let cleared: SetTenantCompression =
+            serde_json::from_str(r#"{"policy": null}"#).unwrap();
+        assert!(cleared.policy.is_none());
+
+        // A present policy round-trips.
+        let set: SetTenantCompression =
+            serde_json::from_str(r#"{"policy": {"enabled": true, "allow_lossy": false}}"#).unwrap();
+        let p = set.policy.expect("policy present");
+        assert!(p.enabled);
+        assert!(!p.allow_lossy);
     }
 }
