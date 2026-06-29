@@ -3,10 +3,19 @@
 //! Phase A: lossless structural compaction of JSON content in chat messages,
 //! gated per-model and by global settings. Fail-open like every boon — any
 //! error or absence of gain leaves the request untouched.
+//!
+//! Phase B2: lossy semantic compression — summarize long prose segments via a
+//! helper model, stash each original in Redis for reversibility, and replace
+//! the segment with `summary + [ref:HASH]`.
 
-use obleth_config::CompressionBoonSettings;
+use std::time::Duration;
+
+use obleth_config::{CompressionBoonSettings, ResolvedKey};
 use obleth_tokenizer::{HeuristicTokenizer, Tokenizer};
-use serde_json::Value;
+use serde_json::{json, Value};
+
+use crate::state::AppState;
+use super::tool_loop::{retrieve_original_tool_def, RETRIEVE_ORIGINAL_TOOL};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContentKind {
@@ -116,6 +125,157 @@ fn try_compact_string(
         stats.compressed += 1;
         *s = compact;
     }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase B2: lossy semantic compressor
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Replace a summarized segment's text with the summary plus a retrieval marker.
+fn lossy_marker(summary: &str, hash: &str) -> String {
+    format!("{}\n[ref:{hash}]", summary.trim())
+}
+
+/// System nudge telling the model how to recover summarized content.
+const RETRIEVE_NUDGE: &str = "Some long content in this conversation was replaced \
+    with a shorter summary followed by a marker like [ref:HASH]. If you need the \
+    exact original text of a summarized section, call the retrieve_original tool \
+    with that hash.";
+
+/// Inject the `retrieve_original` tool definition (merging into any existing
+/// `tools`) and a one-time system nudge describing the [ref:HASH] mechanism.
+fn inject_retrieve_original_tool(json: &mut Value, supports_system: bool) {
+    if let Some(obj) = json.as_object_mut() {
+        match obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
+            Some(existing) => existing.push(retrieve_original_tool_def()),
+            None => {
+                obj.insert("tools".into(), Value::Array(vec![retrieve_original_tool_def()]));
+            }
+        }
+    }
+    super::structured::inject_prompt_section(json, RETRIEVE_NUDGE, supports_system);
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct LossyStats {
+    /// Prose segments above the floor that were sent to the summarizer.
+    pub segments: u32,
+    /// Segments actually replaced with a summary + ref (a stored original exists).
+    pub refs_created: u32,
+    pub tokens_before: u32,
+    pub tokens_after: u32,
+}
+
+/// Lossy semantic compression: summarize long prose segments with the configured
+/// helper model, stash each original in Redis for reversibility, and replace the
+/// segment with `summary + [ref:HASH]`. Caller guarantees lossy is permitted
+/// (reversible + tenant allow_lossy + lossy_active). Fail-open per segment: any
+/// resolve/helper/Redis failure leaves that segment verbatim.
+pub(super) async fn apply_lossy(
+    state: &AppState,
+    cfg: &CompressionBoonSettings,
+    key: &ResolvedKey,
+    session_id: &str,
+    json: &mut Value,
+) -> LossyStats {
+    let mut stats = LossyStats::default();
+    let Some(model_name) = cfg.summarizer_model.as_deref() else {
+        return stats;
+    };
+    let Some(summarizer) = crate::proxy::resolve_model(state, model_name).await else {
+        tracing::warn!(model = %model_name, "compression summarizer is not registered; skipping lossy");
+        return stats;
+    };
+    if !summarizer.enabled {
+        tracing::warn!(model = %model_name, "compression summarizer is disabled; skipping lossy");
+        return stats;
+    }
+    let tk = HeuristicTokenizer::new();
+    let timeout = Duration::from_millis(cfg.timeout_ms.max(1));
+
+    // Pass 1: pick eligible prose segments (string content only), bounded by the
+    // lossy cap. Record (message index, original text, token count).
+    let mut targets: Vec<(usize, String, u32)> = Vec::new();
+    {
+        let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
+            return stats;
+        };
+        for (mi, msg) in messages.iter().enumerate() {
+            if targets.len() >= cfg.max_lossy_segments as usize {
+                break;
+            }
+            let Some(text) = msg.get("content").and_then(|c| c.as_str()) else {
+                continue; // array-parts shapes are left to lossless compaction
+            };
+            let before = tk.count_text(text);
+            if before < cfg.min_tokens {
+                continue;
+            }
+            if classify(text) != ContentKind::Prose {
+                continue; // JSON handled losslessly; code is never lossily summarized
+            }
+            targets.push((mi, text.to_string(), before));
+        }
+    }
+    if targets.is_empty() {
+        return stats;
+    }
+
+    // Pass 2: summarize concurrently (bounded by max_lossy_segments).
+    let outcomes = futures_util::future::join_all(targets.iter().map(|(_, text, _)| {
+        super::chat_call(state, &summarizer, summarize_request(&summarizer.upstream_model, &cfg.summarize_prompt, text), timeout)
+    }))
+    .await;
+
+    // Pass 3: stash original + replace with marker for each success.
+    for ((mi, original, before), outcome) in targets.into_iter().zip(outcomes) {
+        stats.segments += 1;
+        let Ok(result) = outcome else {
+            tracing::warn!(model = %summarizer.model_name, "summarizer call failed; leaving segment verbatim");
+            continue;
+        };
+        let hash = obleth_config::content_hash(&original);
+        // Reversibility is mandatory before replacing: if the stash fails, do NOT
+        // drop the original (fail-open).
+        if let Err(e) = state.redis.compress_put(&hash, &original, cfg.original_ttl_secs).await {
+            tracing::warn!(error = %e, "compress_put failed; leaving segment verbatim");
+            continue;
+        }
+        let marker = lossy_marker(result.text.trim(), &hash);
+        let after = tk.count_text(&marker);
+        // Only replace when it actually saves tokens.
+        if after >= before {
+            continue;
+        }
+        if let Some(content) = json
+            .get_mut("messages")
+            .and_then(|m| m.as_array_mut())
+            .and_then(|m| m.get_mut(mi))
+            .and_then(|msg| msg.get_mut("content"))
+        {
+            *content = Value::String(marker);
+            stats.refs_created += 1;
+            stats.tokens_before = stats.tokens_before.saturating_add(before);
+            stats.tokens_after = stats.tokens_after.saturating_add(after);
+            super::bill_helper_call(
+                state, &summarizer, key, session_id, "compression_boon",
+                result.input_tokens, result.output_tokens,
+            );
+        }
+    }
+    stats
+}
+
+/// The chat-completions body sent to the summarizer for one segment.
+fn summarize_request(upstream_model: &str, prompt: &str, content: &str) -> Value {
+    json!({
+        "model": upstream_model,
+        "messages": [
+            { "role": "system", "content": prompt },
+            { "role": "user", "content": content },
+        ],
+        "temperature": 0.2,
+    })
 }
 
 #[cfg(test)]
@@ -242,5 +402,46 @@ mod tests {
         assert!(stats.tokens_after < stats.tokens_before);
         let text = body["messages"][0]["content"][0]["text"].as_str().unwrap();
         assert!(!text.contains("\n  "));
+    }
+
+    #[test]
+    fn lossy_marker_carries_summary_and_ref() {
+        let m = lossy_marker("short summary", "deadbeef");
+        assert!(m.contains("short summary"));
+        assert!(m.contains("[ref:deadbeef]"));
+    }
+
+    #[test]
+    fn inject_retrieve_original_tool_merges_and_nudges() {
+        let mut body = json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "hi" }],
+            "tools": [{ "type": "function", "function": { "name": "existing" } }]
+        });
+        inject_retrieve_original_tool(&mut body, true);
+        let tools = body["tools"].as_array().unwrap();
+        // Existing tool preserved, retrieve_original appended.
+        assert_eq!(tools.len(), 2);
+        assert!(tools.iter().any(|t| t["function"]["name"] == "retrieve_original"));
+        // A system nudge mentioning the marker mechanism was injected.
+        let has_nudge = body["messages"].as_array().unwrap().iter().any(|msg| {
+            msg["content"].as_str().is_some_and(|c| c.contains("[ref:"))
+        });
+        assert!(has_nudge);
+    }
+
+    #[test]
+    fn inject_retrieve_original_tool_creates_tools_array_when_absent() {
+        let mut body = json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] });
+        inject_retrieve_original_tool(&mut body, false);
+        assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn summarize_request_shape() {
+        let body = summarize_request("llama3:8b", "summarize", "long text here");
+        assert_eq!(body["model"], "llama3:8b");
+        assert_eq!(body["messages"][0]["content"], "summarize");
+        assert_eq!(body["messages"][1]["content"], "long text here");
     }
 }
