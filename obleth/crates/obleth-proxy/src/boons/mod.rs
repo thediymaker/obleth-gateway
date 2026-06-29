@@ -67,27 +67,43 @@ fn compression_eligible(
         && route.boons.iter().any(|b| b == "compression")
 }
 
-/// Phase B2/C gate for the reversible compression passes (dedup + lossy): the
-/// model is granted the boon AND the request is reversible (`retrieve_original`
-/// callable: native function calling + tool loop active) AND the tenant opted
-/// into lossy AND the key is not internal. Dedup runs under this gate; lossy adds
-/// the summarizer requirement on top (see `lossy_eligible`). No tenant policy =>
-/// no reversible compression (conservative).
-fn reversible_compression_eligible(
+/// Shared base for the reversible compression passes (dedup + lossy): the model
+/// is granted the boon, the global boon is active, the request is reversible
+/// (`retrieve_original` callable), and the key is not internal. Per-piece tenant
+/// flags are AND-ed on top by `dedup_eligible` / `lossy_eligible`.
+fn reversible_compression_base(
     route: &obleth_config::ResolvedModel,
     settings: &obleth_config::BoonSettings,
     key: &obleth_config::ResolvedKey,
 ) -> bool {
     let reversible = route.supports_function_calling && settings.tool_loop.active();
-    let tenant_allows_lossy = key
-        .compression_policy
-        .as_ref()
-        .is_some_and(|p| p.allow_lossy);
     settings.compression.active()
         && reversible
-        && tenant_allows_lossy
         && route.boons.iter().any(|b| b == "compression")
         && !key.internal
+}
+
+/// Cross-turn dedup is eligible when the base holds and the tenant enabled the
+/// `dedup` piece. No tenant policy => no dedup.
+fn dedup_eligible(
+    route: &obleth_config::ResolvedModel,
+    settings: &obleth_config::BoonSettings,
+    key: &obleth_config::ResolvedKey,
+) -> bool {
+    reversible_compression_base(route, settings, key)
+        && key.compression_policy.as_ref().is_some_and(|p| p.dedup)
+}
+
+/// Lossy semantic compression is eligible when the base holds, the tenant enabled
+/// the `allow_lossy` piece, and a summarizer model is configured.
+fn lossy_eligible(
+    route: &obleth_config::ResolvedModel,
+    settings: &obleth_config::BoonSettings,
+    key: &obleth_config::ResolvedKey,
+) -> bool {
+    reversible_compression_base(route, settings, key)
+        && key.compression_policy.as_ref().is_some_and(|p| p.allow_lossy)
+        && settings.compression.summarizer_model.is_some()
 }
 
 /// Per-tenant code-compaction toggle with the global setting as the no-policy
@@ -100,18 +116,6 @@ fn effective_code_compaction(
         Some(policy) => policy.code_compaction,
         None => settings.compression.code_compaction,
     }
-}
-
-/// Lossy semantic compression also requires a configured summarizer model.
-/// Used in production to gate [`compression::apply_lossy`] within the
-/// reversible compression block (dedup always runs; lossy is the finer gate).
-fn lossy_eligible(
-    route: &obleth_config::ResolvedModel,
-    settings: &obleth_config::BoonSettings,
-    key: &obleth_config::ResolvedKey,
-) -> bool {
-    reversible_compression_eligible(route, settings, key)
-        && settings.compression.summarizer_model.is_some()
 }
 
 /// Request header that disables boon processing for a single request when set
@@ -337,15 +341,14 @@ impl BoonEngine {
             }
         }
 
-        // ---- compression boon: reversible passes (dedup + lossy, Phase B2/C) ----
-        // Runs after tool-loop injection so it can add `retrieve_original` to the
-        // same loop. Dedup needs only reversibility; lossy also needs a summarizer.
-        if reversible_compression_eligible(route, &settings, key) {
+        // ---- compression boon: reversible passes (dedup + lossy), per-piece ----
+        if dedup_eligible(route, &settings, key) || lossy_eligible(route, &settings, key) {
             let comp_start = crate::tracer::now_ms();
-            // Dedup first: remove exact cross-turn repeats deterministically.
-            let dedup = compression::apply_dedup(state, &settings.compression, key, session_id, json).await;
-            // Then lossy summarization of remaining long prose, only when a
-            // summarizer is configured and the tenant permits it.
+            let dedup = if dedup_eligible(route, &settings, key) {
+                compression::apply_dedup(state, &settings.compression, key, session_id, json).await
+            } else {
+                compression::DedupStats::default()
+            };
             let lossy = if lossy_eligible(route, &settings, key) {
                 compression::apply_lossy(state, &settings.compression, key, session_id, json).await
             } else {
@@ -788,7 +791,7 @@ mod tests {
     }
 
     #[test]
-    fn reversible_compression_eligible_does_not_require_summarizer() {
+    fn dedup_eligible_does_not_require_summarizer() {
         use obleth_config::{BoonSettings, CompressionBoonSettings, CompressionPolicy, ToolLoopSettings};
         let mut settings = BoonSettings::default();
         // Enabled + NO summarizer (dedup needs reversibility, not a helper model).
@@ -799,21 +802,21 @@ mod tests {
         route.boons = vec!["compression".to_string()];
         route.supports_function_calling = true;
 
-        let mut key = test_key_with_policy(Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: false, allow_lossy: true }));
+        let mut key = test_key_with_policy(Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: true, allow_lossy: false }));
 
         // Dedup gate: eligible without a summarizer.
-        assert!(reversible_compression_eligible(&route, &settings, &key));
-        // But lossy needs a summarizer -> not lossy-eligible here.
+        assert!(dedup_eligible(&route, &settings, &key));
+        // Lossy needs a summarizer -> not lossy-eligible here.
         assert!(!lossy_eligible(&route, &settings, &key));
 
-        // No allow_lossy -> not reversible-eligible.
+        // No dedup -> not dedup-eligible.
         key.compression_policy = Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: false, allow_lossy: false });
-        assert!(!reversible_compression_eligible(&route, &settings, &key));
+        assert!(!dedup_eligible(&route, &settings, &key));
 
-        // Tool loop off -> not reversible.
-        key.compression_policy = Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: false, allow_lossy: true });
+        // Tool loop off -> not reversible -> not dedup-eligible.
+        key.compression_policy = Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: true, allow_lossy: false });
         settings.tool_loop.enabled = false;
-        assert!(!reversible_compression_eligible(&route, &settings, &key));
+        assert!(!dedup_eligible(&route, &settings, &key));
     }
 
     #[test]
@@ -858,6 +861,47 @@ mod tests {
 
         // Summarizer not configured -> lossy_active false -> ineligible.
         settings.compression.summarizer_model = None;
+        assert!(!lossy_eligible(&route, &settings, &key));
+    }
+
+    #[test]
+    fn dedup_and_lossy_gate_independently_per_tenant() {
+        use obleth_config::{BoonSettings, CompressionBoonSettings, CompressionPolicy, ToolLoopSettings};
+        let mut settings = BoonSettings::default();
+        settings.compression = CompressionBoonSettings {
+            enabled: true, summarizer_model: Some("sum".into()), ..Default::default()
+        };
+        settings.tool_loop = ToolLoopSettings { enabled: true, ..Default::default() };
+
+        let mut route = test_route();
+        route.boons = vec!["compression".to_string()];
+        route.supports_function_calling = true;
+
+        // dedup only (allow_lossy off)
+        let mut key = test_key_with_policy(Some(CompressionPolicy {
+            enabled: true, code_compaction: false, dedup: true, allow_lossy: false,
+        }));
+        assert!(dedup_eligible(&route, &settings, &key));
+        assert!(!lossy_eligible(&route, &settings, &key));
+
+        // lossy only (dedup off)
+        key.compression_policy = Some(CompressionPolicy {
+            enabled: true, code_compaction: false, dedup: false, allow_lossy: true,
+        });
+        assert!(!dedup_eligible(&route, &settings, &key));
+        assert!(lossy_eligible(&route, &settings, &key));
+
+        // no policy => neither
+        key.compression_policy = None;
+        assert!(!dedup_eligible(&route, &settings, &key));
+        assert!(!lossy_eligible(&route, &settings, &key));
+
+        // not reversible (tool loop off) => neither, even with both flags on
+        key.compression_policy = Some(CompressionPolicy {
+            enabled: true, code_compaction: false, dedup: true, allow_lossy: true,
+        });
+        settings.tool_loop.enabled = false;
+        assert!(!dedup_eligible(&route, &settings, &key));
         assert!(!lossy_eligible(&route, &settings, &key));
     }
 
