@@ -7,10 +7,10 @@
 
 use serde_json::{Map, Value};
 
-/// RFC-4180 field escape: quote the field iff it contains a comma, CR, or
+/// RFC-4180 field escape: quote the field iff it contains a comma, quote, CR, or
 /// LF; double any inner quotes.
 fn csv_escape(field: &str) -> String {
-    if field.contains([',', '\n', '\r']) {
+    if field.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", field.replace('"', "\"\""))
     } else {
         field.to_string()
@@ -56,12 +56,14 @@ mod tests {
     fn csv_escape_leaves_plain_fields() {
         assert_eq!(csv_escape("42"), "42");
         assert_eq!(csv_escape("true"), "true");
-        assert_eq!(csv_escape("\"alice\""), "\"alice\""); // a JSON string cell, no comma → unchanged
+        assert_eq!(csv_escape("null"), "null");
     }
 
     #[test]
-    fn csv_escape_quotes_and_doubles() {
-        // A JSON string value containing a comma: serde gives `"a,b"`, which must be CSV-quoted.
+    fn csv_escape_quotes_fields_with_quotes_or_commas() {
+        // A JSON string cell like `"alice"` MUST be CSV-quoted so it round-trips.
+        assert_eq!(csv_escape("\"alice\""), "\"\"\"alice\"\"\"");
+        // A JSON string with a comma, too.
         assert_eq!(csv_escape("\"a,b\""), "\"\"\"a,b\"\"\"");
     }
 
@@ -74,5 +76,13 @@ mod tests {
     #[test]
     fn csv_parse_plain_line() {
         assert_eq!(csv_parse_line("1,alice,true"), vec!["1", "alice", "true"]);
+    }
+
+    #[test]
+    fn csv_escape_parse_roundtrips_json_cells() {
+        let cells = ["1", "\"alice\"", "\"a,b\"", "true", "null"];
+        let line = cells.iter().map(|c| csv_escape(c)).collect::<Vec<_>>().join(",");
+        let parsed = csv_parse_line(&line);
+        assert_eq!(parsed, cells.iter().map(|c| c.to_string()).collect::<Vec<_>>());
     }
 }
