@@ -15,7 +15,7 @@ use obleth_tokenizer::{HeuristicTokenizer, Tokenizer};
 use serde_json::{json, Value};
 
 use crate::state::AppState;
-use super::tool_loop::{retrieve_original_tool_def, RETRIEVE_ORIGINAL_TOOL};
+use super::tool_loop::retrieve_original_tool_def;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContentKind {
@@ -235,16 +235,16 @@ pub(super) async fn apply_lossy(
             continue;
         };
         let hash = obleth_config::content_hash(&original);
-        // Reversibility is mandatory before replacing: if the stash fails, do NOT
-        // drop the original (fail-open).
-        if let Err(e) = state.redis.compress_put(&hash, &original, cfg.original_ttl_secs).await {
-            tracing::warn!(error = %e, "compress_put failed; leaving segment verbatim");
-            continue;
-        }
         let marker = lossy_marker(result.text.trim(), &hash);
         let after = tk.count_text(&marker);
-        // Only replace when it actually saves tokens.
+        // No token gain: skip BEFORE writing to Redis (avoid orphaned originals).
         if after >= before {
+            continue;
+        }
+        // Reversibility: stash the original BEFORE replacing the content. If the
+        // stash fails, leave the segment verbatim (fail-open).
+        if let Err(e) = state.redis.compress_put(&hash, &original, cfg.original_ttl_secs).await {
+            tracing::warn!(error = %e, "compress_put failed; leaving segment verbatim");
             continue;
         }
         if let Some(content) = json
