@@ -503,11 +503,11 @@ export function BoonsSettingsForm({
       compression_enabled: compressionEnabled,
       compression_code_compaction: compressionCodeCompaction,
       compression_summarizer_model: compressionSummarizerModel.trim() === "" ? null : compressionSummarizerModel.trim(),
-      compression_min_tokens: Number(compressionMinTokens),
-      compression_max_segments: Number(compressionMaxSegments),
-      compression_max_lossy_segments: Number(compressionMaxLossy),
-      compression_timeout_ms: Number(compressionTimeout),
-      compression_original_ttl_secs: Number(compressionTtl),
+      compression_min_tokens: Number(compressionMinTokens) || 512,
+      compression_max_segments: Number(compressionMaxSegments) || 64,
+      compression_max_lossy_segments: Number(compressionMaxLossy) || 4,
+      compression_timeout_ms: Number(compressionTimeout) || 5000,
+      compression_original_ttl_secs: Number(compressionTtl) || 3600,
       compression_summarize_prompt: compressionSummarizePrompt,
     };
     start(async () => {
