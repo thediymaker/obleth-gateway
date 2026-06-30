@@ -866,14 +866,13 @@ mod tests {
     fn apply_lossy_compacts_prose_in_latest_user_message() {
         // Build a long prose user message (the latest turn) + a short follow-up question.
         let big: String = (0..60).map(|i| format!("This is line number {i} of some pasted notes.\n")).collect();
-        let mut body = json!({
+        let body = json!({
             "model": "m",
             "messages": [
                 { "role": "user", "content": big },
                 { "role": "user", "content": "summarize the notes above" }
             ]
         });
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_lossy_segments: 8, ..Default::default() };
         // No AppState/Redis in a unit test → call the pure helper path via a thin wrapper is not possible;
         // instead assert extract_prose drives the change through a small synchronous shim:
         let q: std::collections::HashSet<String> = ["summarize", "notes"].iter().map(|s| s.to_string()).collect();

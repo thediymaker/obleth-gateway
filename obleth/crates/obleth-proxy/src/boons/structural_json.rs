@@ -229,6 +229,20 @@ fn reconstruct_blocks(text: &str) -> Option<Value> {
     Some(skeleton)
 }
 
+/// Test-only inverse of [`compact`]: decode either structural form — the
+/// top-level `OBLETH_TABLE rows=` table OR the skeleton+appended-blocks document
+/// — back to the original `Value`, so verification harnesses can prove that a
+/// compacted segment round-trips exactly (losslessness, demonstrated not assumed).
+#[cfg(test)]
+pub(super) fn decode_for_verification(text: &str) -> Option<Value> {
+    let trimmed = text.trim_start();
+    if trimmed.starts_with(TABLE_MARKER) {
+        reconstruct_table(trimmed)
+    } else {
+        reconstruct_blocks(trimmed)
+    }
+}
+
 /// Replace every `<<OBLETH_TABLE:N>>` string value with reconstructed block N.
 fn splice_placeholders(value: &mut Value, tables: &[Vec<Value>]) -> Option<()> {
     match value {
