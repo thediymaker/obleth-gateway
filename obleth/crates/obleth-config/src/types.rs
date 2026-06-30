@@ -843,9 +843,10 @@ pub fn is_valid_tag(tag: &str) -> bool {
 /// natively; the data plane applies a model's enabled boons before dispatch.
 /// `vision` relays image parts to a configured describer model.
 /// `structured_output` enforces `response_format` JSON schemas with gateway-side
-/// validation and repair. Operators opt each model into a subset of these;
-/// nothing is granted by default.
-pub const MODEL_BOONS: &[&str] = &["vision", "structured_output"];
+/// validation and repair. `compression` reduces the input tokens a model reads
+/// (JSON/code compaction, cross-turn dedup, lossy summarization) before dispatch.
+/// Operators opt each model into a subset of these; nothing is granted by default.
+pub const MODEL_BOONS: &[&str] = &["vision", "structured_output", "compression"];
 
 /// True when `boon` is part of the fixed [`MODEL_BOONS`] vocabulary.
 pub fn is_valid_boon(boon: &str) -> bool {
@@ -1705,9 +1706,10 @@ mod tests {
 
     #[test]
     fn normalize_boons_accepts_new_vocabulary() {
-        // The retired `tools` boon is dropped along with any other unknown value.
-        let boons = normalize_boons([" structured_output ", "vision", "bogus", "tools"]);
-        assert_eq!(boons, vec!["structured_output", "vision"]);
+        // The retired `tools` boon is dropped along with any other unknown value;
+        // `compression` is part of the vocabulary and is kept.
+        let boons = normalize_boons([" structured_output ", "vision", "compression", "bogus", "tools"]);
+        assert_eq!(boons, vec!["structured_output", "vision", "compression"]);
     }
 
     #[test]
