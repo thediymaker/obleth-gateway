@@ -181,6 +181,19 @@ mod tests {
     }
 
     #[test]
+    fn compact_handles_compact_pasted_array() {
+        // Exactly what a user pastes: a COMPACT (single-line) array of uniform
+        // objects. Must table-ify and shrink.
+        let rows: Vec<String> = (0..80)
+            .map(|i| format!("{{\"id\":{i},\"name\":\"user{i}\",\"email\":\"u{i}@x.com\",\"role\":\"member\",\"active\":true,\"score\":{}}}", i * 3))
+            .collect();
+        let arr = format!("[{}]", rows.join(","));
+        let out = compact(&arr).expect("compact pasted array should table-ify");
+        assert!(out.starts_with("OBLETH_TABLE rows=80\n"), "got: {}", &out[..out.len().min(40)]);
+        assert!(out.len() < arr.len());
+    }
+
+    #[test]
     fn encode_then_reconstruct_is_exact() {
         let value = json!([
             {"id": 1, "name": "alice", "active": true},
