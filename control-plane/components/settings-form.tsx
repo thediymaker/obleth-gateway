@@ -1,7 +1,20 @@
 "use client";
 
-import { useState, useTransition } from "react";
-import { Send, Database, Trash2, Server } from "lucide-react";
+import { useState, useTransition, type ReactNode } from "react";
+import {
+  Archive,
+  Braces,
+  ChevronDown,
+  Database,
+  Eye,
+  Save,
+  Send,
+  Server,
+  Sparkles,
+  Trash2,
+  Wrench,
+} from "lucide-react";
+import type { LucideIcon } from "lucide-react";
 import {
   setAlertSettingsAction,
   setAutoRouterSettingsAction,
@@ -14,10 +27,12 @@ import {
   compactUsageAction,
 } from "@/app/actions";
 import { Button } from "@/components/ui/button";
+import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { DestructiveConfirm } from "@/components/ui/destructive-confirm";
+import { cn } from "@/lib/utils";
 import type {
   AlertSettingsView,
   AutoRouterSettingsView,
@@ -442,6 +457,156 @@ export function AutoRouterSettingsForm({
   );
 }
 
+type BoonSectionKey = "vision" | "structured" | "tool_loop" | "compression";
+
+function ToggleSwitch({
+  checked,
+  onChange,
+  disabled,
+  label,
+}: {
+  checked: boolean;
+  onChange: () => void;
+  disabled?: boolean;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      disabled={disabled}
+      onClick={onChange}
+      className={cn(
+        "inline-flex h-6 w-11 shrink-0 items-center rounded-full border transition-colors",
+        checked ? "border-primary/60 bg-primary/40" : "border-input bg-muted",
+        disabled && "cursor-not-allowed opacity-50",
+      )}
+    >
+      <span
+        className={cn(
+          "ml-0.5 h-5 w-5 rounded-full bg-foreground shadow transition-transform",
+          checked && "translate-x-5",
+        )}
+      />
+    </button>
+  );
+}
+
+function BoonStatusBadge({ enabled }: { enabled: boolean }) {
+  return (
+    <Badge
+      className={cn(
+        "text-[10px]",
+        enabled
+          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+          : "border-border bg-muted/30 text-muted-foreground",
+      )}
+    >
+      {enabled ? "enabled" : "disabled"}
+    </Badge>
+  );
+}
+
+function BoonPanel({
+  title,
+  description,
+  icon: Icon,
+  enabled,
+  expanded,
+  onToggle,
+  summary,
+  children,
+}: {
+  title: string;
+  description: string;
+  icon: LucideIcon;
+  enabled: boolean;
+  expanded: boolean;
+  onToggle: () => void;
+  summary: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section
+      className={cn(
+        "overflow-hidden rounded-lg border shadow-sm transition-colors",
+        expanded
+          ? "border-primary/35 bg-muted/25 ring-1 ring-primary/15"
+          : "border-border/70 bg-card/35 hover:border-border hover:bg-muted/15",
+      )}
+    >
+      <div className="grid gap-3 p-4 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-start">
+        <button
+          type="button"
+          onClick={onToggle}
+          aria-expanded={expanded}
+          className="flex min-w-0 gap-3 text-left"
+        >
+          <span
+            className={cn(
+              "mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-md border",
+              enabled
+                ? "border-primary/35 bg-primary/10 text-primary"
+                : "border-border bg-background text-muted-foreground",
+            )}
+          >
+            <Icon className="h-4 w-4" />
+          </span>
+          <span className="min-w-0">
+            <span className="block text-sm font-medium">{title}</span>
+            <span className="mt-0.5 block max-w-3xl text-xs leading-snug text-muted-foreground">
+              {description}
+            </span>
+            <span className="mt-2 flex flex-wrap items-center gap-1.5">
+              <BoonStatusBadge enabled={enabled} />
+              {summary}
+            </span>
+          </span>
+        </button>
+        <Button
+          type="button"
+          size="icon"
+          variant="ghost"
+          className="h-8 w-8 justify-self-end text-muted-foreground hover:text-foreground"
+          onClick={onToggle}
+          aria-expanded={expanded}
+          title={expanded ? "Collapse" : "Expand"}
+        >
+          <ChevronDown
+            className={cn("h-4 w-4 transition-transform duration-200", expanded && "rotate-180")}
+          />
+        </Button>
+      </div>
+
+      {expanded && <div className="border-t border-border/60 bg-muted/10 p-4">{children}</div>}
+    </section>
+  );
+}
+
+function ToggleRow({
+  label,
+  hint,
+  checked,
+  onChange,
+}: {
+  label: string;
+  hint?: string;
+  checked: boolean;
+  onChange: () => void;
+}) {
+  return (
+    <div className="flex items-center justify-between gap-4 rounded-lg border border-border/70 bg-background/35 px-4 py-3">
+      <div className="min-w-0">
+        <p className="text-sm font-medium">{label}</p>
+        {hint && <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">{hint}</p>}
+      </div>
+      <ToggleSwitch checked={checked} onChange={onChange} label={label} />
+    </div>
+  );
+}
+
 export function BoonsSettingsForm({
   settings,
   models,
@@ -483,6 +648,18 @@ export function BoonsSettingsForm({
   const [compressionTimeout, setCompressionTimeout] = useState(String(settings?.compression_timeout_ms ?? 5000));
   const [compressionTtl, setCompressionTtl] = useState(String(settings?.compression_original_ttl_secs ?? 3600));
   const [compressionSummarizePrompt, setCompressionSummarizePrompt] = useState(settings?.compression_summarize_prompt ?? "");
+  const [expanded, setExpanded] = useState<BoonSectionKey | null>(null);
+
+  const visionModels = models.filter(
+    (m) => m.model_name !== "auto" && (m.supports_vision || (m.tags?.includes("vision") ?? false)),
+  );
+  const chatModels = models.filter(
+    (m) => m.model_name !== "auto" && (m.model_type ?? "chat") === "chat",
+  );
+
+  function toggleSection(section: BoonSectionKey) {
+    setExpanded((current) => (current === section ? null : section));
+  }
 
   function save() {
     setStatus(null);
@@ -523,149 +700,200 @@ export function BoonsSettingsForm({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Model boons</CardTitle>
+        <CardTitle className="flex items-center gap-2">
+          <Sparkles className="h-4 w-4" />
+          Model boons
+        </CardTitle>
         <CardDescription>
-          Gateway-granted capabilities for models that lack them natively. The{" "}
-          <strong>vision</strong> boon relays images to a describer model and rewrites them as
-          text. The <strong>structured output</strong> boon validates and repairs{" "}
-          <code>response_format</code> JSON at the gateway. Each boon applies only to models that
-          opted in and lack the native capability. Fail-open: if a helper is unavailable the
-          request passes through unchanged.
+          Gateway-granted capabilities for models that lack them natively. Configure the global
+          helpers here, then opt specific models into each boon from the Models page. If a helper
+          is unavailable, requests pass through unchanged.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => setEnabled(e.target.checked)}
-            className="h-4 w-4"
-          />
-          Enable vision boon
-        </label>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="space-y-1">
-            <Label htmlFor="vision_fallback_model">Describer model</Label>
-            <select
-              id="vision_fallback_model"
-              value={model}
-              onChange={(e) => setModel(e.target.value)}
-              className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
-            >
-              <option value="">None</option>
-              {models
-                .filter(
-                  (m) =>
-                    m.model_name !== "auto" &&
-                    (m.supports_vision || (m.tags?.includes("vision") ?? false)),
-                )
-                .map((m) => (
-                  <option key={m.id} value={m.model_name}>
-                    {m.model_name}
-                  </option>
-                ))}
-            </select>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="vision_max_images">Max images per request</Label>
-            <Input
-              id="vision_max_images"
-              type="number"
-              value={maxImages}
-              onChange={(e) => setMaxImages(e.target.value)}
-            />
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="vision_timeout_ms">Describe timeout (ms)</Label>
-            <Input
-              id="vision_timeout_ms"
-              type="number"
-              value={timeout}
-              onChange={(e) => setTimeoutMs(e.target.value)}
-            />
-          </div>
-        </div>
-        <div className="space-y-1">
-          <Label htmlFor="vision_describe_prompt">Describe prompt</Label>
-          <textarea
-            id="vision_describe_prompt"
-            value={prompt}
-            onChange={(e) => setPrompt(e.target.value)}
-            rows={3}
-            className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-            placeholder="Describe this image in detail..."
-          />
-        </div>
-
-        <div className="border-t pt-4 space-y-4">
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={structuredEnabled}
-              onChange={(e) => setStructuredEnabled(e.target.checked)}
-              className="h-4 w-4"
-            />
-            Enable structured output boon (JSON schema enforcement)
-          </label>
-          <p className="text-sm text-muted-foreground">
-            <code>response_format</code> requests to an opted-in model are validated at the
-            gateway; invalid JSON is repaired by the fixer model (or by re-prompting the same
-            model). On final failure the original reply passes through with a warning header.
-          </p>
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-1">
-              <Label htmlFor="structured_output_fixer_model">Fixer model</Label>
-              <select
-                id="structured_output_fixer_model"
-                value={fixerModel}
-                onChange={(e) => setFixerModel(e.target.value)}
-                className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
-              >
-                <option value="">Same model (re-prompt)</option>
-                {models
-                  .filter((m) => m.model_name !== "auto" && (m.model_type ?? "chat") === "chat")
-                  .map((m) => (
-                    <option key={m.id} value={m.model_name}>
-                      {m.model_name}
-                    </option>
-                  ))}
-              </select>
-            </div>
-            <div className="space-y-1">
-              <Label htmlFor="structured_output_max_repair_attempts">
-                Max repair attempts (0-3)
-              </Label>
-              <Input
-                id="structured_output_max_repair_attempts"
-                type="number"
-                min={0}
-                max={3}
-                value={repairAttempts}
-                onChange={(e) => setRepairAttempts(e.target.value)}
+        <div className="space-y-3">
+          <BoonPanel
+            title="Vision"
+            description="Relays image inputs to a describer model and rewrites them as text."
+            icon={Eye}
+            enabled={enabled}
+            expanded={expanded === "vision"}
+            onToggle={() => toggleSection("vision")}
+            summary={
+              <>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {model || "no describer"}
+                </Badge>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {maxImages || "6"} images
+                </Badge>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {timeout || "30000"} ms
+                </Badge>
+              </>
+            }
+          >
+            <div className="space-y-4">
+              <ToggleRow
+                label="Enable vision boon"
+                hint="Only opted-in models that lack native vision use this relay."
+                checked={enabled}
+                onChange={() => setEnabled((value) => !value)}
               />
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <div className="space-y-1">
+                  <Label htmlFor="vision_fallback_model">Describer model</Label>
+                  <select
+                    id="vision_fallback_model"
+                    value={model}
+                    onChange={(e) => setModel(e.target.value)}
+                    className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
+                  >
+                    <option value="">None</option>
+                    {visionModels.map((m) => (
+                      <option key={m.id} value={m.model_name}>
+                        {m.model_name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="vision_max_images">Max images per request</Label>
+                  <Input
+                    id="vision_max_images"
+                    type="number"
+                    value={maxImages}
+                    onChange={(e) => setMaxImages(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="vision_timeout_ms">Describe timeout (ms)</Label>
+                  <Input
+                    id="vision_timeout_ms"
+                    type="number"
+                    value={timeout}
+                    onChange={(e) => setTimeoutMs(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="vision_describe_prompt">Describe prompt</Label>
+                <textarea
+                  id="vision_describe_prompt"
+                  value={prompt}
+                  onChange={(e) => setPrompt(e.target.value)}
+                  rows={3}
+                  className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  placeholder="Describe this image in detail..."
+                />
+              </div>
             </div>
-            <div className="space-y-1">
-              <Label htmlFor="structured_output_timeout_ms">Repair timeout (ms)</Label>
-              <Input
-                id="structured_output_timeout_ms"
-                type="number"
-                value={repairTimeout}
-                onChange={(e) => setRepairTimeout(e.target.value)}
-              />
-            </div>
-          </div>
-        </div>
+          </BoonPanel>
 
-        <div className="border-t pt-4 space-y-4">
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={toolLoopEnabled}
-              onChange={(e) => setToolLoopEnabled(e.target.checked)}
-              className="h-4 w-4"
-            />
-            Enable gateway tool loop (MCP tools)
-          </label>
+          <BoonPanel
+            title="Structured output"
+            description="Validates response_format JSON and repairs invalid replies."
+            icon={Braces}
+            enabled={structuredEnabled}
+            expanded={expanded === "structured"}
+            onToggle={() => toggleSection("structured")}
+            summary={
+              <>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {fixerModel || "same model"}
+                </Badge>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {repairAttempts || "1"} repairs
+                </Badge>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {repairTimeout || "30000"} ms
+                </Badge>
+              </>
+            }
+          >
+            <div className="space-y-4">
+              <ToggleRow
+                label="Enable structured output boon"
+                hint="Applies to opted-in models that lack native response schema support."
+                checked={structuredEnabled}
+                onChange={() => setStructuredEnabled((value) => !value)}
+              />
+              <p className="text-sm text-muted-foreground">
+                <code>response_format</code> requests are validated at the gateway; invalid JSON is
+                repaired by the fixer model or by re-prompting the same model. On final failure the
+                original reply passes through with a warning header.
+              </p>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <div className="space-y-1">
+                  <Label htmlFor="structured_output_fixer_model">Fixer model</Label>
+                  <select
+                    id="structured_output_fixer_model"
+                    value={fixerModel}
+                    onChange={(e) => setFixerModel(e.target.value)}
+                    className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
+                  >
+                    <option value="">Same model (re-prompt)</option>
+                    {chatModels.map((m) => (
+                      <option key={m.id} value={m.model_name}>
+                        {m.model_name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="structured_output_max_repair_attempts">
+                    Max repair attempts (0-3)
+                  </Label>
+                  <Input
+                    id="structured_output_max_repair_attempts"
+                    type="number"
+                    min={0}
+                    max={3}
+                    value={repairAttempts}
+                    onChange={(e) => setRepairAttempts(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="structured_output_timeout_ms">Repair timeout (ms)</Label>
+                  <Input
+                    id="structured_output_timeout_ms"
+                    type="number"
+                    value={repairTimeout}
+                    onChange={(e) => setRepairTimeout(e.target.value)}
+                  />
+                </div>
+              </div>
+            </div>
+          </BoonPanel>
+
+          <BoonPanel
+            title="MCP tool loop"
+            description="Injects granted MCP tools and runs tool calls between model turns."
+            icon={Wrench}
+            enabled={toolLoopEnabled}
+            expanded={expanded === "tool_loop"}
+            onToggle={() => toggleSection("tool_loop")}
+            summary={
+              <>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {toolLoopMaxTurns || "4"} turns
+                </Badge>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {toolLoopTimeout || "30000"} ms
+                </Badge>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {toolLoopNudge.trim() ? "custom nudge" : "default nudge"}
+                </Badge>
+              </>
+            }
+          >
+            <div className="space-y-4">
+              <ToggleRow
+                label="Enable gateway tool loop"
+                hint="Models need native function calling and a per-model tool grant."
+                checked={toolLoopEnabled}
+                onChange={() => setToolLoopEnabled((value) => !value)}
+              />
           <p className="text-sm text-muted-foreground">
             Models granted access to registered MCP servers (per model, in the model&apos;s{" "}
             <strong>Tools</strong> section) get those tools injected into plain chat requests;
@@ -714,33 +942,49 @@ export function BoonsSettingsForm({
               left untouched. Blank resets to the built-in default.
             </p>
           </div>
-        </div>
+            </div>
+          </BoonPanel>
 
-        <div className="border-t pt-4 space-y-4">
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={compressionEnabled}
-              onChange={(e) => setCompressionEnabled(e.target.checked)}
-              className="h-4 w-4"
-            />
-            Enable compression boon
-          </label>
+          <BoonPanel
+            title="Compression"
+            description="Compacts long conversation history before dispatch."
+            icon={Archive}
+            enabled={compressionEnabled}
+            expanded={expanded === "compression"}
+            onToggle={() => toggleSection("compression")}
+            summary={
+              <>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {compressionSummarizerModel.trim() || "lossless only"}
+                </Badge>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {compressionMinTokens || "512"} min tokens
+                </Badge>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  code {compressionCodeCompaction ? "on" : "off"}
+                </Badge>
+              </>
+            }
+          >
+            <div className="space-y-4">
+              <ToggleRow
+                label="Enable compression boon"
+                hint="Requires a per-tenant compression policy for dedup or lossy summarization."
+                checked={compressionEnabled}
+                onChange={() => setCompressionEnabled((value) => !value)}
+              />
           <p className="text-sm text-muted-foreground">
             Long conversation histories are summarized and compacted at the gateway before being
             sent upstream, reducing token costs and latency for supported models. Lossy
             summarization requires a summarizer model; leave it blank to use lossless compaction
             only. Fail-open: if summarization fails the original context passes through unchanged.
           </p>
-          <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={compressionCodeCompaction}
-              onChange={(e) => setCompressionCodeCompaction(e.target.checked)}
-              className="h-4 w-4"
-            />
-            Enable code compaction by default
-          </label>
+              <ToggleRow
+                label="Code compaction by default"
+                hint="Conservative whitespace stripping for fenced code blocks."
+                checked={compressionCodeCompaction}
+                onChange={() => setCompressionCodeCompaction((value) => !value)}
+              />
           <div className="grid gap-4 sm:grid-cols-2">
             <div className="space-y-1">
               <Label htmlFor="compression_summarizer_model">Summarizer model</Label>
@@ -813,22 +1057,27 @@ export function BoonsSettingsForm({
               Blank resets to the built-in default.
             </p>
           </div>
+            </div>
+          </BoonPanel>
         </div>
 
-        <Button onClick={save} disabled={pending}>
-          {pending ? "Saving..." : "Save boons"}
-        </Button>
-        {status && (
-          <p
-            className={
-              status.ok
-                ? "rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
-                : "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-            }
-          >
-            {status.message}
-          </p>
-        )}
+        <div className="flex flex-wrap items-center gap-3 border-t border-border/60 pt-4">
+          <Button onClick={save} disabled={pending}>
+            <Save className="h-4 w-4" />
+            {pending ? "Saving..." : "Save boons"}
+          </Button>
+          {status && (
+            <p
+              className={
+                status.ok
+                  ? "rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
+                  : "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              }
+            >
+              {status.message}
+            </p>
+          )}
+        </div>
       </CardContent>
     </Card>
   );
