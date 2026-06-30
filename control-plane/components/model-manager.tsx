@@ -132,6 +132,12 @@ const MODEL_BOONS = [
     description:
       "Enforce response_format JSON schemas at the gateway: the schema is rendered into the prompt and the reply is validated, with invalid JSON repaired by the configured fixer model. Applies only when the model lacks the Response schema capability. Configure in Settings → Boons.",
   },
+  {
+    value: "compression",
+    label: "Compression",
+    description:
+      "Reduce the input tokens this model reads before dispatch: lossless JSON/code compaction always; cross-turn dedup and lossy summarization when the tenant opts in and the model supports function calling with the gateway tool loop enabled. Configure globally in Settings → Boons and per tenant on the tenant's Compression tab.",
+  },
 ] as const;
 
 // Model modality vocabulary; mirrors obleth-config `MODEL_TYPES`. The type
