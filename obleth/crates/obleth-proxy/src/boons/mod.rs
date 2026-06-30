@@ -28,6 +28,8 @@
 pub(crate) mod compression;
 pub(crate) mod structural_json;
 pub(crate) mod embedded_json;
+#[cfg(test)]
+mod compression_verify;
 pub(crate) mod guardrails;
 pub mod mcp_tools;
 pub mod respond;
