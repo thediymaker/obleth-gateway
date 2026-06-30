@@ -706,9 +706,6 @@ export interface BoonSettingsView {
   compression_enabled: boolean;
   compression_min_tokens: number;
   compression_max_segments: number;
-  compression_summarizer_model: string | null;
-  compression_summarize_prompt: string;
-  compression_timeout_ms: number;
   compression_original_ttl_secs: number;
   compression_max_lossy_segments: number;
   compression_code_compaction: boolean;
@@ -731,9 +728,6 @@ export interface UpdateBoonSettings {
   compression_enabled?: boolean;
   compression_min_tokens?: number;
   compression_max_segments?: number;
-  compression_summarizer_model?: string | null;
-  compression_summarize_prompt?: string;
-  compression_timeout_ms?: number;
   compression_original_ttl_secs?: number;
   compression_max_lossy_segments?: number;
   compression_code_compaction?: boolean;

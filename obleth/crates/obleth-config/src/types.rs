@@ -1272,18 +1272,11 @@ impl Default for GuardrailsBoonSettings {
 
 fn default_compression_min_tokens() -> u32 { 512 }
 fn default_compression_max_segments() -> u32 { 64 }
-fn default_compression_timeout_ms() -> u64 { 5_000 }
 fn default_compression_original_ttl_secs() -> u64 { 3_600 }
 fn default_compression_max_lossy_segments() -> u32 { 4 }
-fn default_compression_summarize_prompt() -> String {
-    "Summarize the following content faithfully and concisely, preserving all \
-     facts, names, numbers, and identifiers a reader would need. Output only the \
-     summary."
-        .to_string()
-}
 
-/// Configuration for the compression boon (Phase A: lossless structural
-/// compaction only; Phase B2: lossy semantic compression via summarizer).
+/// Configuration for the compression boon: lossless structural/code compaction
+/// plus deterministic (model-free) lossy text compaction.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CompressionBoonSettings {
     /// Master switch. When false, requests pass through unchanged.
@@ -1296,16 +1289,6 @@ pub struct CompressionBoonSettings {
     /// Cap on how many segments are compacted per request (safety guard).
     #[serde(default = "default_compression_max_segments")]
     pub max_segments: u32,
-    /// Registered model name used to summarize long prose for lossy compression.
-    /// `None` disables lossy compression (lossless compaction still runs).
-    #[serde(default)]
-    pub summarizer_model: Option<String>,
-    /// Instruction sent to the summarizer model.
-    #[serde(default = "default_compression_summarize_prompt")]
-    pub summarize_prompt: String,
-    /// Per summarizer-call timeout, in milliseconds.
-    #[serde(default = "default_compression_timeout_ms")]
-    pub timeout_ms: u64,
     /// Redis TTL for stashed originals (seconds); tuned to a session lifetime.
     #[serde(default = "default_compression_original_ttl_secs")]
     pub original_ttl_secs: u64,
@@ -1325,9 +1308,6 @@ impl Default for CompressionBoonSettings {
             enabled: false,
             min_tokens: default_compression_min_tokens(),
             max_segments: default_compression_max_segments(),
-            summarizer_model: None,
-            summarize_prompt: default_compression_summarize_prompt(),
-            timeout_ms: default_compression_timeout_ms(),
             original_ttl_secs: default_compression_original_ttl_secs(),
             max_lossy_segments: default_compression_max_lossy_segments(),
             code_compaction: false,
@@ -1798,11 +1778,8 @@ mod tests {
     #[test]
     fn compression_settings_lossy_defaults() {
         let c: CompressionBoonSettings = serde_json::from_str("{}").unwrap();
-        assert!(c.summarizer_model.is_none());
-        assert_eq!(c.timeout_ms, 5_000);
         assert_eq!(c.original_ttl_secs, 3_600);
         assert_eq!(c.max_lossy_segments, 4);
-        assert!(!c.summarize_prompt.is_empty());
     }
 
     #[test]
