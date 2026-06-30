@@ -10,7 +10,7 @@
 
 use obleth_config::{CompressionBoonSettings, ResolvedKey};
 use obleth_tokenizer::{HeuristicTokenizer, Tokenizer};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::state::AppState;
 use super::tool_loop::retrieve_original_tool_def;
