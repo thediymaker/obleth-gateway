@@ -6,6 +6,7 @@
 //! strictly shorter; otherwise falls back to lossless minify. Fail-open.
 
 use serde_json::{Map, Value};
+use std::collections::BTreeSet;
 
 /// RFC-4180 field escape: quote the field iff it contains a comma, quote, CR, or
 /// LF; double any inner quotes.
@@ -50,48 +51,94 @@ fn csv_parse_line(line: &str) -> Vec<String> {
 
 const TABLE_MARKER: &str = "OBLETH_TABLE rows=";
 
-/// Encode an array of ≥2 like-keyed objects as the table form, or `None` when it
-/// doesn't qualify. Does NOT check length or validate — the caller does.
-fn try_encode_table(value: &Value) -> Option<String> {
-    let arr = value.as_array()?;
+/// Encode an array of >=2 non-empty objects as `header\nrow\nrow...` using the
+/// UNION of keys (sorted). A key absent from an object yields an empty cell; a
+/// present value (including JSON null) yields its compact JSON, CSV-escaped.
+/// Returns `(row_count, body)` or `None` when the array doesn't qualify.
+fn encode_table_body(arr: &[Value]) -> Option<(usize, String)> {
     if arr.len() < 2 {
         return None;
     }
-    // All elements must be objects with an identical key SET.
-    let first = arr[0].as_object()?;
-    if first.is_empty() {
-        return None;
-    }
-    let cols: Vec<&String> = first.keys().collect();
-    // Column names can't contain literal newlines (would break line-splitting).
-    if cols.iter().any(|k| k.contains(['\n', '\r'])) {
-        return None;
-    }
+    let mut col_set: BTreeSet<&str> = BTreeSet::new();
     for item in arr {
         let obj = item.as_object()?;
-        if obj.len() != cols.len() || !cols.iter().all(|k| obj.contains_key(*k)) {
+        if obj.is_empty() {
             return None;
         }
+        for k in obj.keys() {
+            if k.contains(['\n', '\r']) {
+                return None; // column names can't contain newlines
+            }
+            col_set.insert(k.as_str());
+        }
     }
-
+    let cols: Vec<&str> = col_set.into_iter().collect();
     let mut out = String::new();
-    out.push_str(TABLE_MARKER);
-    out.push_str(&arr.len().to_string());
-    out.push('\n');
-    // Header: raw column names, CSV-escaped.
     let header: Vec<String> = cols.iter().map(|k| csv_escape(k)).collect();
     out.push_str(&header.join(","));
     out.push('\n');
-    // Rows: each cell is the value's compact JSON, CSV-escaped.
     for item in arr {
         let obj = item.as_object().expect("checked above");
         let row: Vec<String> = cols
             .iter()
-            .map(|k| csv_escape(&serde_json::to_string(&obj[*k]).unwrap_or_default()))
+            .map(|k| match obj.get(*k) {
+                Some(v) => csv_escape(&serde_json::to_string(v).unwrap_or_default()),
+                None => String::new(), // absent key -> empty cell
+            })
             .collect();
         out.push_str(&row.join(","));
         out.push('\n');
     }
+    Some((arr.len(), out))
+}
+
+/// Parse a `header\nrows...` table body (no marker line) into `n` objects. An
+/// empty field means the key is ABSENT; a non-empty field is the cell's JSON.
+fn parse_table_body(body: &str, n: usize) -> Option<Vec<Value>> {
+    let mut lines = body.lines();
+    let cols = csv_parse_line(lines.next()?);
+    if cols.is_empty() {
+        return None;
+    }
+    let mut rows: Vec<Value> = Vec::with_capacity(n);
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        let fields = csv_parse_line(line);
+        if fields.len() != cols.len() {
+            return None;
+        }
+        let mut obj = Map::new();
+        for (col, field) in cols.iter().zip(fields.iter()) {
+            if field.is_empty() {
+                continue; // absent key
+            }
+            let cell: Value = serde_json::from_str(field).ok()?;
+            obj.insert(col.clone(), cell);
+        }
+        rows.push(Value::Object(obj));
+    }
+    if rows.len() != n {
+        return None;
+    }
+    Some(rows)
+}
+
+/// Whether `arr` qualifies as a table (>=2 non-empty objects, encodable).
+pub(super) fn is_qualifying_array(arr: &[Value]) -> bool {
+    encode_table_body(arr).is_some()
+}
+
+/// Encode an array as the top-level table form (`OBLETH_TABLE rows=N` + body).
+fn try_encode_table(value: &Value) -> Option<String> {
+    let arr = value.as_array()?;
+    let (n, body) = encode_table_body(arr)?;
+    let mut out = String::with_capacity(body.len() + TABLE_MARKER.len() + 8);
+    out.push_str(TABLE_MARKER);
+    out.push_str(&n.to_string());
+    out.push('\n');
+    out.push_str(&body);
     Some(out)
 }
 
@@ -109,36 +156,11 @@ pub(super) fn compact(text: &str) -> Option<String> {
     super::compression::compact_json(text)
 }
 
-/// Reconstruct the JSON array from the table form, or `None` if `text` isn't a
-/// well-formed table this module produced.
+/// Reconstruct the JSON array from the top-level table form.
 fn reconstruct_table(text: &str) -> Option<Value> {
-    let mut lines = text.lines();
-    let marker = lines.next()?;
-    let n: usize = marker.strip_prefix(TABLE_MARKER)?.trim().parse().ok()?;
-    let cols = csv_parse_line(lines.next()?);
-    if cols.is_empty() {
-        return None;
-    }
-    let mut rows: Vec<Value> = Vec::with_capacity(n);
-    for line in lines {
-        if line.is_empty() {
-            continue;
-        }
-        let fields = csv_parse_line(line);
-        if fields.len() != cols.len() {
-            return None;
-        }
-        let mut obj = Map::new();
-        for (col, field) in cols.iter().zip(fields.iter()) {
-            let cell: Value = serde_json::from_str(field).ok()?;
-            obj.insert(col.clone(), cell);
-        }
-        rows.push(Value::Object(obj));
-    }
-    if rows.len() != n {
-        return None;
-    }
-    Some(Value::Array(rows))
+    let nl = text.find('\n')?;
+    let n: usize = text[..nl].strip_prefix(TABLE_MARKER)?.trim().parse().ok()?;
+    Some(Value::Array(parse_table_body(&text[nl + 1..], n)?))
 }
 
 #[cfg(test)]
@@ -220,9 +242,49 @@ mod tests {
     }
 
     #[test]
-    fn encode_rejects_non_uniform_keys() {
+    fn encode_supports_non_uniform_keys() {
         let value = json!([{"a": 1}, {"b": 2}]);
-        assert_eq!(try_encode_table(&value), None);
+        let table = try_encode_table(&value).expect("now encodes via union keys");
+        assert_eq!(reconstruct_table(&table), Some(value));
+    }
+
+    #[test]
+    fn encode_table_body_handles_sparse_keys() {
+        // Objects with differing key sets -> union columns, empty cell for absent.
+        let value = json!([
+            {"id": 1, "name": "alice"},
+            {"id": 2, "email": "b@x"}
+        ]);
+        let arr = value.as_array().unwrap();
+        let (n, body) = encode_table_body(arr).expect("sparse encodes");
+        assert_eq!(n, 2);
+        // Union columns sorted: email,id,name
+        assert!(body.starts_with("email,id,name\n"), "body was: {body:?}");
+        // Round-trips exactly, distinguishing absent from present.
+        assert_eq!(parse_table_body(&body, n), Some(value.as_array().unwrap().clone()));
+    }
+
+    #[test]
+    fn parse_table_body_distinguishes_absent_from_null() {
+        // present null vs absent key must round-trip differently.
+        let value = json!([
+            {"a": null, "b": 1},
+            {"b": 2}
+        ]);
+        let arr = value.as_array().unwrap();
+        let (n, body) = encode_table_body(arr).expect("encodes");
+        let back = parse_table_body(&body, n).expect("parses");
+        assert_eq!(back, *arr);
+        // First object HAS key "a" (null); second does NOT.
+        assert!(back[0].as_object().unwrap().contains_key("a"));
+        assert!(!back[1].as_object().unwrap().contains_key("a"));
+    }
+
+    #[test]
+    fn is_qualifying_array_rejects_non_objects_and_singletons() {
+        assert!(!is_qualifying_array(json!([1, 2, 3]).as_array().unwrap()));
+        assert!(!is_qualifying_array(json!([{"a": 1}]).as_array().unwrap())); // <2
+        assert!(is_qualifying_array(json!([{"a": 1}, {"b": 2}]).as_array().unwrap()));
     }
 
     #[test]
