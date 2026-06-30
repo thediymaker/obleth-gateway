@@ -21,6 +21,7 @@ use super::tool_loop::retrieve_original_tool_def;
 pub(crate) enum ContentKind {
     Json,
     Code,
+    Log,
     Prose,
 }
 
@@ -38,6 +39,23 @@ pub(crate) fn classify(text: &str) -> ContentKind {
             if v.is_object() || v.is_array() {
                 return ContentKind::Json;
             }
+        }
+    }
+    // Log-shaped: many lines, a majority beginning with a timestamp or a level token.
+    let lines: Vec<&str> = trimmed.lines().collect();
+    if lines.len() >= 8 {
+        let log_like = lines
+            .iter()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with(|c: char| c.is_ascii_digit()) // timestamp-ish
+                    || ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]
+                        .iter()
+                        .any(|lvl| t.starts_with(lvl) || t.contains(&format!(" {lvl} ")))
+            })
+            .count();
+        if log_like * 2 >= lines.len() {
+            return ContentKind::Log;
         }
     }
     ContentKind::Prose
@@ -844,5 +862,17 @@ mod tests {
         assert!(out.len() < text.len());
         assert!(out.contains("(×")); // collapsed repeat marker
         assert!(out.contains("ERROR disk full")); // error line preserved verbatim
+    }
+
+    #[test]
+    fn classifies_log_shaped_text() {
+        let mut text = String::new();
+        for i in 0..20 { text.push_str(&format!("2026-06-29T10:00:0{} INFO did thing {}\n", i % 10, i)); }
+        assert_eq!(classify(&text), ContentKind::Log);
+    }
+
+    #[test]
+    fn classifies_plain_paragraph_as_prose() {
+        assert_eq!(classify("The quick brown fox jumps over the lazy dog. It was a fine day."), ContentKind::Prose);
     }
 }
