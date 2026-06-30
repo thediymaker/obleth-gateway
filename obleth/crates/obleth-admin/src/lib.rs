@@ -1513,9 +1513,6 @@ pub struct BoonSettingsView {
     pub compression_enabled: bool,
     pub compression_min_tokens: u32,
     pub compression_max_segments: u32,
-    pub compression_summarizer_model: Option<String>,
-    pub compression_summarize_prompt: String,
-    pub compression_timeout_ms: u64,
     pub compression_original_ttl_secs: u64,
     pub compression_max_lossy_segments: u32,
     pub compression_code_compaction: bool,
@@ -1540,9 +1537,6 @@ impl BoonSettingsView {
             compression_enabled: s.compression.enabled,
             compression_min_tokens: s.compression.min_tokens,
             compression_max_segments: s.compression.max_segments,
-            compression_summarizer_model: s.compression.summarizer_model.clone(),
-            compression_summarize_prompt: s.compression.summarize_prompt.clone(),
-            compression_timeout_ms: s.compression.timeout_ms,
             compression_original_ttl_secs: s.compression.original_ttl_secs,
             compression_max_lossy_segments: s.compression.max_lossy_segments,
             compression_code_compaction: s.compression.code_compaction,
@@ -1594,16 +1588,6 @@ pub struct UpdateBoonSettings {
     /// A value of `0` is a no-op and leaves the existing setting unchanged.
     #[serde(default)]
     pub compression_max_segments: Option<u32>,
-    /// Summarizer model for lossy compression. Omit to leave unchanged. Send an
-    /// empty string to clear it (disables lossy).
-    #[serde(default)]
-    pub compression_summarizer_model: Option<String>,
-    /// Summarizer instruction. Omit to leave unchanged.
-    #[serde(default)]
-    pub compression_summarize_prompt: Option<String>,
-    /// Per summarizer-call timeout (ms). Omit/zero leaves unchanged.
-    #[serde(default)]
-    pub compression_timeout_ms: Option<u64>,
     /// Redis TTL for stashed originals (secs). Omit/zero leaves unchanged.
     #[serde(default)]
     pub compression_original_ttl_secs: Option<u64>,
@@ -1709,21 +1693,6 @@ async fn put_boon_settings(
                 .compression_max_segments
                 .filter(|n| *n > 0)
                 .unwrap_or(existing.compression.max_segments),
-            summarizer_model: body
-                .compression_summarizer_model
-                .clone()
-                .map(|s| s.trim().to_string())
-                .map(|s| if s.is_empty() { None } else { Some(s) })
-                .unwrap_or_else(|| existing.compression.summarizer_model.clone()),
-            summarize_prompt: body
-                .compression_summarize_prompt
-                .clone()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or_else(|| existing.compression.summarize_prompt.clone()),
-            timeout_ms: body
-                .compression_timeout_ms
-                .filter(|n| *n > 0)
-                .unwrap_or(existing.compression.timeout_ms),
             original_ttl_secs: body
                 .compression_original_ttl_secs
                 .filter(|n| *n > 0)
@@ -3972,13 +3941,9 @@ mod tests {
         use obleth_config::BoonSettings;
         let mut s = BoonSettings::default();
         s.compression.enabled = true;
-        s.compression.summarizer_model = Some("summarizer".into());
-        s.compression.timeout_ms = 1234;
         s.compression.original_ttl_secs = 999;
         s.compression.max_lossy_segments = 7;
         let view = BoonSettingsView::from_settings(&s);
-        assert_eq!(view.compression_summarizer_model.as_deref(), Some("summarizer"));
-        assert_eq!(view.compression_timeout_ms, 1234);
         assert_eq!(view.compression_original_ttl_secs, 999);
         assert_eq!(view.compression_max_lossy_segments, 7);
     }

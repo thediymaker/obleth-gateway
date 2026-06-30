@@ -641,13 +641,10 @@ export function BoonsSettingsForm({
   const [toolLoopNudge, setToolLoopNudge] = useState(settings?.tool_loop_nudge ?? "");
   const [compressionEnabled, setCompressionEnabled] = useState(settings?.compression_enabled ?? false);
   const [compressionCodeCompaction, setCompressionCodeCompaction] = useState(settings?.compression_code_compaction ?? false);
-  const [compressionSummarizerModel, setCompressionSummarizerModel] = useState(settings?.compression_summarizer_model ?? "");
   const [compressionMinTokens, setCompressionMinTokens] = useState(String(settings?.compression_min_tokens ?? 512));
   const [compressionMaxSegments, setCompressionMaxSegments] = useState(String(settings?.compression_max_segments ?? 64));
   const [compressionMaxLossy, setCompressionMaxLossy] = useState(String(settings?.compression_max_lossy_segments ?? 4));
-  const [compressionTimeout, setCompressionTimeout] = useState(String(settings?.compression_timeout_ms ?? 5000));
   const [compressionTtl, setCompressionTtl] = useState(String(settings?.compression_original_ttl_secs ?? 3600));
-  const [compressionSummarizePrompt, setCompressionSummarizePrompt] = useState(settings?.compression_summarize_prompt ?? "");
   const [expanded, setExpanded] = useState<BoonSectionKey | null>(null);
 
   const visionModels = models.filter(
@@ -679,13 +676,10 @@ export function BoonsSettingsForm({
       tool_loop_nudge: toolLoopNudge,
       compression_enabled: compressionEnabled,
       compression_code_compaction: compressionCodeCompaction,
-      compression_summarizer_model: compressionSummarizerModel.trim() === "" ? null : compressionSummarizerModel.trim(),
       compression_min_tokens: Number(compressionMinTokens) || 512,
       compression_max_segments: Number(compressionMaxSegments) || 64,
       compression_max_lossy_segments: Number(compressionMaxLossy) || 4,
-      compression_timeout_ms: Number(compressionTimeout) || 5000,
       compression_original_ttl_secs: Number(compressionTtl) || 3600,
-      compression_summarize_prompt: compressionSummarizePrompt,
     };
     start(async () => {
       const result = await setBoonSettingsAction(body);
@@ -955,10 +949,10 @@ export function BoonsSettingsForm({
             summary={
               <>
                 <Badge className="border-border bg-background text-[10px] text-muted-foreground">
-                  {compressionSummarizerModel.trim() || "lossless only"}
+                  {compressionMinTokens || "512"} min tokens
                 </Badge>
                 <Badge className="border-border bg-background text-[10px] text-muted-foreground">
-                  {compressionMinTokens || "512"} min tokens
+                  {compressionMaxLossy || "4"} max lossy
                 </Badge>
                 <Badge className="border-border bg-background text-[10px] text-muted-foreground">
                   code {compressionCodeCompaction ? "on" : "off"}
@@ -974,10 +968,10 @@ export function BoonsSettingsForm({
                 onChange={() => setCompressionEnabled((value) => !value)}
               />
           <p className="text-sm text-muted-foreground">
-            Long conversation histories are summarized and compacted at the gateway before being
-            sent upstream, reducing token costs and latency for supported models. Lossy
-            summarization requires a summarizer model; leave it blank to use lossless compaction
-            only. Fail-open: if summarization fails the original context passes through unchanged.
+            Long content is compacted at the gateway before being sent upstream — lossless
+            structural JSON/code compaction always, plus deterministic dedup and lossy text
+            compaction (no model needed) when a tenant opts in via its compression policy.
+            Fail-open: if a segment can&apos;t be safely shrunk, it passes through unchanged.
           </p>
               <ToggleRow
                 label="Code compaction by default"
@@ -986,16 +980,6 @@ export function BoonsSettingsForm({
                 onChange={() => setCompressionCodeCompaction((value) => !value)}
               />
           <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-1">
-              <Label htmlFor="compression_summarizer_model">Summarizer model</Label>
-              <Input
-                id="compression_summarizer_model"
-                type="text"
-                value={compressionSummarizerModel}
-                onChange={(e) => setCompressionSummarizerModel(e.target.value)}
-                placeholder="Leave blank to disable lossy summarization"
-              />
-            </div>
             <div className="space-y-1">
               <Label htmlFor="compression_min_tokens">Min tokens to compress</Label>
               <Input
@@ -1024,15 +1008,6 @@ export function BoonsSettingsForm({
               />
             </div>
             <div className="space-y-1">
-              <Label htmlFor="compression_timeout_ms">Summarization timeout (ms)</Label>
-              <Input
-                id="compression_timeout_ms"
-                type="number"
-                value={compressionTimeout}
-                onChange={(e) => setCompressionTimeout(e.target.value)}
-              />
-            </div>
-            <div className="space-y-1">
               <Label htmlFor="compression_original_ttl_secs">Original context TTL (secs)</Label>
               <Input
                 id="compression_original_ttl_secs"
@@ -1041,21 +1016,6 @@ export function BoonsSettingsForm({
                 onChange={(e) => setCompressionTtl(e.target.value)}
               />
             </div>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="compression_summarize_prompt">Summarize prompt</Label>
-            <textarea
-              id="compression_summarize_prompt"
-              value={compressionSummarizePrompt}
-              onChange={(e) => setCompressionSummarizePrompt(e.target.value)}
-              rows={4}
-              className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-              placeholder="Leave blank to reset to the built-in default..."
-            />
-            <p className="text-xs text-muted-foreground">
-              Instruction used when asking the summarizer model to compress a conversation segment.
-              Blank resets to the built-in default.
-            </p>
           </div>
             </div>
           </BoonPanel>
