@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::http::{header, HeaderMap, Request, Response, StatusCode};
+use axum::http::{header, HeaderMap, Method, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use futures_util::StreamExt;
 use obleth_config::{
@@ -205,6 +205,16 @@ async fn proxy_handler_inner(
             .unwrap_or("unknown")
             .to_string()
     };
+
+    // ---- model listing (OpenAI `GET /v1/models`) ----
+    // Answer the plain list call from the gateway's own registry so every
+    // registered model — including Slurm-hosted ones on their own endpoints — is
+    // listed, not just whatever a single upstream reports. A request that names a
+    // model (the non-standard `{"model": …}` detail probe) falls through and is
+    // forwarded upstream untouched, as does `GET /v1/models/{id}`.
+    if method == Method::GET && path == "/v1/models" && model == "unknown" {
+        return models_list_response(&state).await;
+    }
 
     // Request-log metadata, captured once so every `finalize` path (cache hit,
     // rejection, upstream error, streamed success) records the same session and
@@ -2082,6 +2092,120 @@ fn maybe_alert_key_budget(
     }
 }
 
+/// Serve `GET /v1/models` by aggregating what the upstreams actually report.
+///
+/// The single default upstream only lists its own models (e.g. the litellm or
+/// aibrix gateway), so Slurm-hosted models on their own endpoints never show up.
+/// We instead ask every distinct upstream that backs a registered model (the
+/// default base plus each model's endpoints) for its own `/v1/models` and union
+/// the entries **verbatim** — each model keeps the real `id` and `owned_by` its
+/// serving engine reports (litellm `openai`, vLLM `vllm`, llama.cpp `llamacpp`,
+/// Ollama `library`, …). Nothing is synthesized. Lookups are best-effort and
+/// concurrent, so a slow or down upstream is simply skipped.
+async fn models_list_response(state: &AppState) -> Response<Body> {
+    let candidates = state.model_registry.load();
+
+    // Each registered model's effective upstream target(s), paired with the key
+    // needed to reach them. Most upstreams (litellm / aibrix / openai-compatible)
+    // require auth on `/v1/models`, so an unauthenticated probe 401s and the
+    // model silently drops out. Deduped by base; a base that carries a key wins
+    // over one that doesn't. Only models with neither endpoints nor an api_base
+    // fall back to the global default base.
+    let mut by_base: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    for c in candidates.iter() {
+        let targets: Vec<(String, Option<String>)> = if !c.model.endpoints.is_empty() {
+            c.model
+                .endpoints
+                .iter()
+                .filter(|e| e.enabled)
+                .map(|e| {
+                    (
+                        e.api_base.clone(),
+                        e.api_key.clone().or_else(|| c.model.api_key.clone()),
+                    )
+                })
+                .collect()
+        } else if !c.model.api_base.is_empty() {
+            vec![(c.model.api_base.clone(), c.model.api_key.clone())]
+        } else {
+            vec![(state.upstream_base.clone(), None)]
+        };
+        for (base, key) in targets {
+            if base.is_empty() {
+                continue;
+            }
+            let slot = by_base.entry(base).or_insert(None);
+            if slot.is_none() {
+                *slot = key;
+            }
+        }
+    }
+
+    // Fan out concurrently (authenticating each probe), then union verbatim.
+    let results = futures_util::future::join_all(
+        by_base
+            .iter()
+            .map(|(base, key)| fetch_upstream_models(state, base, key.as_deref())),
+    )
+    .await;
+    (StatusCode::OK, axum::Json(merge_upstream_models(results))).into_response()
+}
+
+/// Union upstream `/v1/models` entries into one OpenAI `{object:"list", data:[…]}`
+/// payload, keeping each entry exactly as its upstream reported it (real `id`,
+/// real `owned_by`) and de-duping by `id` — the first upstream to report an id
+/// wins. Sorted by id for stable output. Pure so it can be unit-tested without
+/// the network fan-out.
+fn merge_upstream_models(
+    lists: impl IntoIterator<Item = Vec<serde_json::Value>>,
+) -> serde_json::Value {
+    let mut seen = std::collections::HashSet::new();
+    let mut data: Vec<serde_json::Value> = Vec::new();
+    for entry in lists.into_iter().flatten() {
+        let Some(id) = entry.get("id").and_then(|i| i.as_str()) else {
+            continue;
+        };
+        if seen.insert(id.to_string()) {
+            data.push(entry);
+        }
+    }
+    data.sort_by(|a, b| {
+        a.get("id")
+            .and_then(|i| i.as_str())
+            .cmp(&b.get("id").and_then(|i| i.as_str()))
+    });
+    serde_json::json!({ "object": "list", "data": data })
+}
+
+/// Best-effort `GET {base}/v1/models`, returning the upstream's `data` entries
+/// verbatim. Any timeout/error/parse failure yields an empty list so one bad
+/// upstream never breaks or stalls the aggregate listing.
+async fn fetch_upstream_models(
+    state: &AppState,
+    base: &str,
+    api_key: Option<&str>,
+) -> Vec<serde_json::Value> {
+    async fn inner(
+        state: &AppState,
+        base: &str,
+        api_key: Option<&str>,
+    ) -> Option<Vec<serde_json::Value>> {
+        let url = build_upstream_url(base, "/v1/models", "");
+        let mut req = state.http.get(&url);
+        if let Some(key) = api_key {
+            req = req.bearer_auth(key);
+        }
+        let resp = timeout(Duration::from_secs(4), req.send()).await.ok()?.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let v: serde_json::Value = resp.json().await.ok()?;
+        Some(v.get("data")?.as_array()?.clone())
+    }
+    inner(state, base, api_key).await.unwrap_or_default()
+}
+
 fn requires_registered_model(path: &str) -> bool {
     matches!(
         path,
@@ -3005,6 +3129,38 @@ mod tests {
             }]),
         );
         assert!(tenant_active_now(&key, now).is_ok());
+    }
+
+    #[test]
+    fn merge_models_unions_upstreams_verbatim_and_dedups() {
+        use super::merge_upstream_models;
+        // litellm front (its models reported as "openai") and a Slurm/Ollama
+        // endpoint (reported as "library"); ids overlap on gemma.
+        let litellm = vec![
+            serde_json::json!({"id": "gemma4-31b-it", "object": "model", "owned_by": "openai"}),
+            serde_json::json!({"id": "minimax-m2-7-fast", "object": "model", "owned_by": "openai"}),
+        ];
+        let ollama = vec![
+            serde_json::json!({"id": "glm-5.2", "object": "model", "owned_by": "library"}),
+            // duplicate id already seen from litellm — first upstream wins.
+            serde_json::json!({"id": "gemma4-31b-it", "object": "model", "owned_by": "library"}),
+        ];
+
+        let payload = merge_upstream_models(vec![litellm, ollama]);
+        assert_eq!(payload["object"], "list");
+        let data = payload["data"].as_array().unwrap();
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        // Sorted union, deduped by id.
+        assert_eq!(ids, vec!["gemma4-31b-it", "glm-5.2", "minimax-m2-7-fast"]);
+        let owner_of = |id: &str| {
+            data.iter().find(|m| m["id"] == id).unwrap()["owned_by"]
+                .as_str()
+                .unwrap()
+        };
+        // Owners are verbatim from upstream; nothing synthesized.
+        assert_eq!(owner_of("gemma4-31b-it"), "openai"); // first upstream wins over the dup
+        assert_eq!(owner_of("glm-5.2"), "library");
+        assert_eq!(owner_of("minimax-m2-7-fast"), "openai");
     }
 
     fn model_with(endpoints: Vec<ResolvedEndpoint>) -> obleth_config::ResolvedModel {
