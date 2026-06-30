@@ -1543,6 +1543,7 @@ function CompressionEditor({ tenant }: { tenant: Tenant }) {
   const [enabled, setEnabled] = useState(policy?.enabled ?? false);
   const [codeCompaction, setCodeCompaction] = useState(policy?.code_compaction ?? false);
   const [dedup, setDedup] = useState(policy?.dedup ?? false);
+  const [compactLogs, setCompactLogs] = useState(policy?.compact_logs ?? false);
   const [allowLossy, setAllowLossy] = useState(policy?.allow_lossy ?? false);
 
   function save() {
@@ -1553,6 +1554,7 @@ function CompressionEditor({ tenant }: { tenant: Tenant }) {
         enabled,
         code_compaction: codeCompaction,
         dedup,
+        compact_logs: compactLogs,
         allow_lossy: allowLossy,
       });
       if (res.ok) {
@@ -1611,6 +1613,15 @@ function CompressionEditor({ tenant }: { tenant: Tenant }) {
             </p>
           </div>
           <ToggleSwitch checked={dedup} disabled={pending} onChange={() => setDedup((v) => !v)} />
+        </div>
+        <div className="flex items-center justify-between gap-4 px-4 py-3">
+          <div className="min-w-0">
+            <p className="text-sm font-medium">Log compaction</p>
+            <p className="text-[11px] leading-snug text-muted-foreground">
+              Collapse repeated log lines, keep errors/warns (reversible).
+            </p>
+          </div>
+          <ToggleSwitch checked={compactLogs} disabled={pending} onChange={() => setCompactLogs((v) => !v)} />
         </div>
         <div className="flex items-center justify-between gap-4 px-4 py-3">
           <div className="min-w-0">

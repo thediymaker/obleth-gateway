@@ -296,9 +296,10 @@ pub(super) async fn apply_lossy(
             continue;
         }
         let compacted = match classify(&original) {
-            ContentKind::Log => compact_log(&original),
             ContentKind::Prose => extract_prose(&original, &query_terms, 0.4),
-            _ => None, // JSON/Code handled by the lossless pass
+            // Log segments are handled by the separate, safer `compact_logs` opt-in
+            // (apply_log_compaction); JSON/Code are handled by the lossless pass.
+            _ => None,
         };
         let Some(compacted) = compacted else { continue };
         stats.segments += 1;
@@ -482,6 +483,110 @@ pub(super) fn dedup_rewrite(cfg: &CompressionBoonSettings, json: &mut Value) -> 
             stats.tokens_before = stats.tokens_before.saturating_add(before);
             stats.tokens_after = stats.tokens_after.saturating_add(after);
             stash.push((hash, content));
+        }
+    }
+    (stats, stash)
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// Phase B3: near-lossless log template-collapse (separate opt-in from lossy)
+// ────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct LogStats {
+    /// Log-classified segments above the floor that were examined.
+    pub segments: u32,
+    /// Segments actually collapsed (a stored original exists for retrieval).
+    pub refs_created: u32,
+    pub tokens_before: u32,
+    pub tokens_after: u32,
+}
+
+/// Near-lossless log compaction: collapse repeated, structurally-identical log
+/// lines (via `compact_log`) in Log-classified segments, keeping error/warn lines
+/// verbatim. Reversible — each collapsed original is stashed for
+/// `retrieve_original`. A SEPARATE opt-in from `allow_lossy` because it removes
+/// only provably-repeated structure, never heuristically-selected prose.
+pub(super) async fn apply_log_compaction(
+    state: &AppState,
+    cfg: &CompressionBoonSettings,
+    _key: &ResolvedKey,
+    _session_id: &str,
+    json: &mut Value,
+) -> LogStats {
+    let (stats, stash) = log_rewrite(cfg, json);
+    for (hash, original) in stash {
+        let _ = state.redis.compress_put(&hash, &original, cfg.original_ttl_secs).await;
+    }
+    stats
+}
+
+/// Pure core of log compaction: rewrite Log-classified segments in place via
+/// `compact_log`, returning stats + the `(hash, original)` pairs to stash. No I/O,
+/// so it is directly testable. Skips a trailing assistant message (active turn)
+/// and any segment the lossless pass already turned into a table.
+pub(super) fn log_rewrite(cfg: &CompressionBoonSettings, json: &mut Value) -> (LogStats, Vec<(String, String)>) {
+    let mut stats = LogStats::default();
+    let mut stash: Vec<(String, String)> = Vec::new();
+    let tk = HeuristicTokenizer::new();
+
+    let targets: Vec<(usize, Option<usize>, String)> = {
+        let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
+            return (stats, stash);
+        };
+        let n = messages.len();
+        let skip_last_assistant = n > 0
+            && messages[n - 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
+        let mut out = Vec::new();
+        for (mi, msg) in messages.iter().enumerate() {
+            if skip_last_assistant && mi + 1 == n {
+                continue;
+            }
+            match msg.get("content") {
+                Some(Value::String(s)) if tk.count_text(s) >= cfg.min_tokens => {
+                    out.push((mi, None, s.clone()));
+                }
+                Some(Value::Array(parts)) => {
+                    for (pi, part) in parts.iter().enumerate() {
+                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                            if tk.count_text(t) >= cfg.min_tokens {
+                                out.push((mi, Some(pi), t.to_string()));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    };
+
+    for (mi, pi, original) in targets {
+        if stats.refs_created >= cfg.max_lossy_segments {
+            break;
+        }
+        // Never collapse a segment the lossless structural pass produced (a table
+        // classifies as Log but must survive verbatim).
+        if original.contains("OBLETH_TABLE") {
+            continue;
+        }
+        if !matches!(classify(&original), ContentKind::Log) {
+            continue;
+        }
+        stats.segments += 1;
+        let Some(compacted) = compact_log(&original) else { continue };
+        let before = tk.count_text(&original);
+        let hash = obleth_config::content_hash(&original);
+        let marker = lossy_marker(&compacted, &hash);
+        let after = tk.count_text(&marker);
+        if after >= before {
+            continue;
+        }
+        if set_segment_text(json, mi, pi, marker) {
+            stats.refs_created += 1;
+            stats.tokens_before = stats.tokens_before.saturating_add(before);
+            stats.tokens_after = stats.tokens_after.saturating_add(after);
+            stash.push((hash, original));
         }
     }
     (stats, stash)
