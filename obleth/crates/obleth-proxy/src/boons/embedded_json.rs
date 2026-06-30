@@ -168,4 +168,16 @@ mod tests {
         // A small/non-tabular object is not worth extracting.
         assert_eq!(extract("config is {\"a\": 1} today"), None);
     }
+
+    #[test]
+    fn handles_multibyte_prose_around_span() {
+        // Non-ASCII characters immediately adjacent to the JSON span on both sides.
+        // Guards against mid-codepoint slicing / byte-vs-char-boundary panics.
+        let text = format!("Données: {} résumé ✅", rows(50));
+        let out = extract(&text).expect("compacts despite multibyte neighbors");
+        assert!(out.starts_with("Données: "));
+        assert!(out.contains("OBLETH_TABLE rows=50"));
+        assert!(out.ends_with(" résumé ✅"));
+        assert!(out.len() < text.len());
+    }
 }
