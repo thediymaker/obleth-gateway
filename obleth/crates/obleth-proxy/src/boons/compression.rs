@@ -410,11 +410,27 @@ pub(super) async fn apply_dedup(
     _session_id: &str,
     json: &mut Value,
 ) -> DedupStats {
+    let (stats, stash) = dedup_rewrite(cfg, json);
+    // Best-effort stash of each replaced original for `retrieve_original`; never
+    // fail the request on a Redis error.
+    for (hash, original) in stash {
+        let _ = state.redis.compress_put(&hash, &original, cfg.original_ttl_secs).await;
+    }
+    stats
+}
+
+/// Pure core of cross-turn dedup: rewrite each later exact-duplicate large block
+/// to a `[ref:HASH]` marker in place, returning the stats plus the
+/// `(hash, original)` pairs the caller should stash for retrieval. No I/O, so it
+/// is directly testable and measurable. The first occurrence of each distinct
+/// block is kept verbatim; a trailing assistant message (active turn) is skipped.
+pub(super) fn dedup_rewrite(cfg: &CompressionBoonSettings, json: &mut Value) -> (DedupStats, Vec<(String, String)>) {
     let mut stats = DedupStats::default();
+    let mut stash: Vec<(String, String)> = Vec::new();
     let tk = HeuristicTokenizer::new();
     let targets: Vec<(usize, Option<usize>, String)> = {
         let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
-            return stats;
+            return (stats, stash);
         };
         let n = messages.len();
         let skip_last_assistant = n > 0
@@ -461,14 +477,14 @@ pub(super) async fn apply_dedup(
         if after >= before {
             continue;
         }
-        let _ = state.redis.compress_put(&hash, &content, cfg.original_ttl_secs).await;
         if set_segment_text(json, mi, pi, marker) {
             stats.refs_created += 1;
             stats.tokens_before = stats.tokens_before.saturating_add(before);
             stats.tokens_after = stats.tokens_after.saturating_add(after);
+            stash.push((hash, content));
         }
     }
-    stats
+    (stats, stash)
 }
 
 /// Normalize a line for near-duplicate detection: trim + lowercase + collapse digits.
