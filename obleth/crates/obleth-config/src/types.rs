@@ -1374,6 +1374,13 @@ pub struct CompressionPolicy {
     /// Tenant toggle for cross-turn exact-duplicate dedup (reversible).
     #[serde(default)]
     pub dedup: bool,
+    /// Tenant toggle for log template-collapse: repeated, structurally-identical
+    /// log lines are collapsed to a single representative `(×N)`, while error and
+    /// warning lines are kept verbatim. Reversible (the original is stashed for
+    /// `retrieve_original`) and far safer than general prose summarization, so it
+    /// is a separate opt-in from `allow_lossy`.
+    #[serde(default)]
+    pub compact_logs: bool,
     /// Whether the tenant accepts lossy semantic compression. Consumed by the
     /// lossy compressor in Phase B2; ignored by Phase A/B1 lossless compaction.
     #[serde(default)]
@@ -1792,7 +1799,7 @@ mod tests {
 
     #[test]
     fn compression_policy_round_trips() {
-        let p = CompressionPolicy { enabled: true, code_compaction: false, dedup: false, allow_lossy: true };
+        let p = CompressionPolicy { enabled: true, code_compaction: false, dedup: false, compact_logs: false, allow_lossy: true };
         let json = serde_json::to_string(&p).unwrap();
         let back: CompressionPolicy = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back);
@@ -1810,7 +1817,7 @@ mod tests {
 
     #[test]
     fn compression_policy_full_round_trips() {
-        let p = CompressionPolicy { enabled: true, code_compaction: true, dedup: true, allow_lossy: false };
+        let p = CompressionPolicy { enabled: true, code_compaction: true, dedup: true, compact_logs: true, allow_lossy: false };
         let back: CompressionPolicy = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(p, back);
     }

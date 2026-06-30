@@ -37,6 +37,7 @@ export interface CompressionPolicy {
   enabled: boolean;
   code_compaction: boolean;
   dedup: boolean;
+  compact_logs: boolean;
   allow_lossy: boolean;
 }
 

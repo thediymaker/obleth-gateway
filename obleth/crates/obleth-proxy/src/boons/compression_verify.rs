@@ -516,7 +516,7 @@ fn print_other_content_report() {
     let rows: Vec<(&str, String, String, &str, &str)> = vec![
         ("code_messy (trailing ws/blanks)", code_messy_in.clone(), run_code(&code_messy_in), "lossless", "opt-in: code_compaction"),
         ("code_clean (well-formatted)", code_clean_in.clone(), run_code(&code_clean_in), "lossless", "opt-in: code_compaction"),
-        ("repetitive_log (templated)", log_in.clone(), compression::compact_log(&log_in).unwrap_or_else(|| log_in.clone()), "lossy*", "opt-in: allow_lossy"),
+        ("repetitive_log (templated)", log_in.clone(), compression::compact_log(&log_in).unwrap_or_else(|| log_in.clone()), "lossy*", "opt-in: compact_logs"),
         ("redundant_chat (verbose turn)", chat_in.clone(), compression::extract_prose(&chat_in, &q, 0.4).unwrap_or_else(|| chat_in.clone()), "lossy", "opt-in: allow_lossy"),
     ];
 
@@ -642,6 +642,37 @@ fn cross_turn_dedup_removes_repeated_blocks_losslessly() {
     // Reversibility: the stash holds the exact original behind every ref.
     assert_eq!(stash.len(), 2);
     assert!(stash.iter().all(|(_, original)| original.contains("Section 0:")));
+}
+
+#[test]
+fn log_rewrite_collapses_and_is_reversible() {
+    let cfg = CompressionBoonSettings { enabled: true, min_tokens: 16, ..Default::default() };
+    let log = repetitive_log();
+    let mut body = json!({"model": "verify", "messages": [{"role": "user", "content": log}]});
+    let (stats, stash) = compression::log_rewrite(&cfg, &mut body);
+
+    assert_eq!(stats.refs_created, 1, "the repetitive log segment should collapse");
+    let out = body["messages"][0]["content"].as_str().unwrap();
+    assert!(out.contains("[ref:"), "collapsed segment carries a retrieval marker");
+    assert!(out.contains("ERROR upstream timeout"), "error lines must be kept verbatim");
+    // Reversible: the full original is stashed for retrieve_original.
+    assert_eq!(stash.len(), 1);
+    assert!(stash[0].1.contains("request handled"));
+}
+
+#[test]
+fn log_rewrite_skips_structural_tables() {
+    // A structurally-compacted table classifies as Log but must NOT be collapsed.
+    let cfg = CompressionBoonSettings { enabled: true, min_tokens: 16, ..Default::default() };
+    let mut table = String::from("OBLETH_TABLE rows=60\nid,name,active\n");
+    for i in 0..60 {
+        table.push_str(&format!("{i},user{i},true\n"));
+    }
+    let snapshot = table.clone();
+    let mut body = json!({"model": "verify", "messages": [{"role": "user", "content": table}]});
+    let (stats, _) = compression::log_rewrite(&cfg, &mut body);
+    assert_eq!(stats.refs_created, 0, "structural table must be left alone by the log pass");
+    assert_eq!(body["messages"][0]["content"].as_str().unwrap(), snapshot);
 }
 
 #[test]
