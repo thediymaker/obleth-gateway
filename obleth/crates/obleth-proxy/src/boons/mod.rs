@@ -258,32 +258,26 @@ impl BoonEngine {
             return outcome;
         }
 
-        // ---- compression boon (lossless, Phase A) ----
-        // `is_chat` is always true here (past the earlier `if !is_chat` guard);
-        // the parameter exists so unit tests can exercise the ineligible path.
+        // ---- compression boon ----
+        // All compression passes report under ONE `boon:compression` span: the
+        // lossless structural/code pass here, then the reversible dedup + lossy
+        // text passes after tool-loop injection. Stats accumulate across both and
+        // the single span is recorded once, below.
+        let comp_start = crate::tracer::now_ms();
+        let mut lossless = compression::CompressionStats::default();
+        let mut dedup = compression::DedupStats::default();
+        let mut lossy = compression::LossyStats::default();
+
+        // Lossless structural/code compaction: `is_chat` is always true here; the
+        // parameter exists so unit tests can exercise the ineligible path.
         if compression_eligible(route, &settings, key, is_chat) {
-            let comp_start = crate::tracer::now_ms();
             let code_compaction = effective_code_compaction(&settings, key);
-            let stats = compression::apply(&settings.compression, code_compaction, json);
-            if stats.compressed > 0 {
+            lossless = compression::apply(&settings.compression, code_compaction, json);
+            if lossless.compressed > 0 {
                 outcome.rewritten = true;
                 outcome.applied.push("compression");
-                state
-                    .metrics
-                    .record_compression_saved(stats.tokens_before.saturating_sub(stats.tokens_after));
-            }
-            if let Some(t) = tracer.as_deref_mut() {
-                t.record_elapsed(
-                    "boon:compression",
-                    "proxy_request",
-                    comp_start,
-                    "ok",
-                    serde_json::json!({
-                        "scanned": stats.scanned,
-                        "compressed": stats.compressed,
-                        "tokens_before": stats.tokens_before,
-                        "tokens_after": stats.tokens_after,
-                    }),
+                state.metrics.record_compression_saved(
+                    lossless.tokens_before.saturating_sub(lossless.tokens_after),
                 );
             }
         }
@@ -338,19 +332,15 @@ impl BoonEngine {
             }
         }
 
-        // ---- compression boon: reversible passes (dedup + lossy), per-piece ----
+        // Reversible compression passes (dedup + lossy text), per-piece. Run
+        // after tool-loop injection so retrieve_original can ride the same loop.
         if dedup_eligible(route, &settings, key) || lossy_eligible(route, &settings, key) {
-            let comp_start = crate::tracer::now_ms();
-            let dedup = if dedup_eligible(route, &settings, key) {
-                compression::apply_dedup(state, &settings.compression, key, session_id, json).await
-            } else {
-                compression::DedupStats::default()
-            };
-            let lossy = if lossy_eligible(route, &settings, key) {
-                compression::apply_lossy(state, &settings.compression, key, session_id, json).await
-            } else {
-                compression::LossyStats::default()
-            };
+            if dedup_eligible(route, &settings, key) {
+                dedup = compression::apply_dedup(state, &settings.compression, key, session_id, json).await;
+            }
+            if lossy_eligible(route, &settings, key) {
+                lossy = compression::apply_lossy(state, &settings.compression, key, session_id, json).await;
+            }
             let refs = dedup.refs_created.saturating_add(lossy.refs_created);
             if refs > 0 {
                 outcome.rewritten = true;
@@ -368,23 +358,36 @@ impl BoonEngine {
                             tool_loop::COMPRESSION_SYNTHETIC_SERVER.to_string(),
                         );
                 }
-                let saved = dedup.tokens_before.saturating_sub(dedup.tokens_after)
-                    .saturating_add(lossy.tokens_before.saturating_sub(lossy.tokens_after));
-                state.metrics.record_compression_saved(saved);
+                state.metrics.record_compression_saved(
+                    dedup.tokens_before.saturating_sub(dedup.tokens_after)
+                        .saturating_add(lossy.tokens_before.saturating_sub(lossy.tokens_after)),
+                );
             }
-            if let Some(t) = tracer.as_deref_mut() {
+        }
+
+        // ---- single compression trace span (all passes combined) ----
+        if let Some(t) = tracer.as_deref_mut() {
+            let tokens_before = lossless
+                .tokens_before
+                .saturating_add(dedup.tokens_before)
+                .saturating_add(lossy.tokens_before);
+            let tokens_after = lossless
+                .tokens_after
+                .saturating_add(dedup.tokens_after)
+                .saturating_add(lossy.tokens_after);
+            if lossless.scanned > 0 || tokens_before > 0 {
                 t.record_elapsed(
-                    "boon:compression:reversible",
+                    "boon:compression",
                     "proxy_request",
                     comp_start,
                     "ok",
                     serde_json::json!({
-                        "dedup_duplicates": dedup.duplicates,
+                        "json_compacted": lossless.compressed,
                         "dedup_refs": dedup.refs_created,
-                        "lossy_segments": lossy.segments,
-                        "lossy_refs": lossy.refs_created,
-                        "tokens_before": dedup.tokens_before.saturating_add(lossy.tokens_before),
-                        "tokens_after": dedup.tokens_after.saturating_add(lossy.tokens_after),
+                        "lossy_segments": lossy.refs_created,
+                        "tokens_before": tokens_before,
+                        "tokens_after": tokens_after,
+                        "tokens_saved": tokens_before.saturating_sub(tokens_after),
                     }),
                 );
             }

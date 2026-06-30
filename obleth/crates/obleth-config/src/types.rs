@@ -1336,15 +1336,9 @@ impl Default for CompressionBoonSettings {
 }
 
 impl CompressionBoonSettings {
-    /// True when the boon is enabled. (Lossless compaction needs no helper.)
+    /// True when the boon is enabled. (All compaction is deterministic; no helper.)
     pub fn active(&self) -> bool {
         self.enabled
-    }
-
-    /// True when lossy semantic compression is fully enabled: the master switch
-    /// is on AND a summarizer model is configured.
-    pub fn lossy_active(&self) -> bool {
-        self.enabled && self.summarizer_model.is_some()
     }
 }
 
@@ -1809,18 +1803,6 @@ mod tests {
         assert_eq!(c.original_ttl_secs, 3_600);
         assert_eq!(c.max_lossy_segments, 4);
         assert!(!c.summarize_prompt.is_empty());
-        // Lossy is off until a summarizer model is configured.
-        assert!(!c.lossy_active());
-    }
-
-    #[test]
-    fn compression_lossy_active_requires_model_and_enabled() {
-        let mut c = CompressionBoonSettings { enabled: true, ..Default::default() };
-        assert!(!c.lossy_active()); // enabled but no summarizer
-        c.summarizer_model = Some("summarizer".into());
-        assert!(c.lossy_active());
-        c.enabled = false;
-        assert!(!c.lossy_active()); // master switch off
     }
 
     #[test]
