@@ -267,6 +267,61 @@ fn redundant_chat() -> String {
     s
 }
 
+// ── Cross-turn dedup (lossless): repeated context across turns ────────────────
+
+/// A reference document of the kind that gets re-grounded verbatim across turns
+/// (RAG chunks, a pasted spec, a large tool result). ~1.2k tokens, over the floor.
+fn big_doc() -> String {
+    let mut s = String::new();
+    for i in 0..40 {
+        s.push_str(&format!(
+            "Section {i}: endpoint /v{i} accepts a JSON payload and returns a normalized \
+             result object carrying status, latency_ms, and a request identifier.\n"
+        ));
+    }
+    s
+}
+
+/// A multi-turn conversation where the same reference doc is sent THREE times as
+/// full message segments — exactly the shape cross-turn dedup targets.
+fn conversation_with_repeated_context() -> Value {
+    let doc = big_doc();
+    json!({
+        "model": "verify",
+        "messages": [
+            {"role": "system", "content": doc},
+            {"role": "user", "content": "Based on the reference above, what does endpoint /v3 do?"},
+            {"role": "assistant", "content": "It accepts a JSON payload and returns a normalized result."},
+            {"role": "user", "content": doc},
+            {"role": "assistant", "content": "Understood — I have the reference in context."},
+            {"role": "user", "content": doc},
+            {"role": "user", "content": "Now summarize what every endpoint returns."}
+        ]
+    })
+}
+
+/// Sum the heuristic token count across every message content segment of a body.
+fn count_body_tokens(json: &Value) -> u32 {
+    let tk = HeuristicTokenizer::new();
+    let mut total = 0u32;
+    if let Some(msgs) = json.get("messages").and_then(|m| m.as_array()) {
+        for m in msgs {
+            match m.get("content") {
+                Some(Value::String(s)) => total += tk.count_text(s),
+                Some(Value::Array(parts)) => {
+                    for p in parts {
+                        if let Some(t) = p.get("text").and_then(|t| t.as_str()) {
+                            total += tk.count_text(t);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    total
+}
+
 // ── Runner + metrics ─────────────────────────────────────────────────────────
 
 struct Metrics {
@@ -480,6 +535,25 @@ fn print_other_content_report() {
     println!("None of these are on by default today — that is the real gap for your workload, not arrays.");
 }
 
+fn print_dedup_report() {
+    let cfg = CompressionBoonSettings { enabled: true, min_tokens: 128, ..Default::default() };
+    let mut body = conversation_with_repeated_context();
+    let msg_count = body["messages"].as_array().unwrap().len();
+    let before = count_body_tokens(&body);
+    let (stats, stash) = compression::dedup_rewrite(&cfg, &mut body);
+    let after = count_body_tokens(&body);
+
+    println!("\nCROSS-TURN DEDUP — lossless removal of context re-sent across turns");
+    println!("{}", "─".repeat(104));
+    println!("conversation: a reference doc re-sent 3× across {msg_count} messages");
+    println!("  duplicates found : {}", stats.duplicates);
+    println!("  refs created     : {} (later copies → [ref:HASH]; original stashed for retrieve_original)", stats.refs_created);
+    println!("  tokens before    : {before}");
+    println!("  tokens after     : {after}  ({:.1}% saved)", pct(before, after));
+    println!("  reversible       : {} originals stashed (fully recoverable)", stash.len());
+    println!("default: opt-in (per-tenant `dedup` policy). LOSSLESS — the first copy is kept verbatim.");
+}
+
 /// Prints the full verification report. Run with:
 ///   cargo test -p obleth-proxy compression_verify::report -- --nocapture
 #[test]
@@ -493,6 +567,7 @@ fn report() {
         &aggressive_cfg(),
     );
     print_other_content_report();
+    print_dedup_report();
     println!(
         "\nNote: 'plain_prose_thread_control' and 'redundant_chat' show the deterministic \
          ceiling on human prose — only the lossy line-dropper touches chat, and only when \
@@ -544,4 +619,44 @@ fn chat_prose_extraction_thins_filler() {
     assert!(tk.count_text(&out) < tk.count_text(&chat));
     // The substantive, query-relevant line is retained.
     assert!(out.contains("connection-pool exhaustion in the payments service"));
+}
+
+#[test]
+fn cross_turn_dedup_removes_repeated_blocks_losslessly() {
+    let cfg = CompressionBoonSettings { enabled: true, min_tokens: 128, ..Default::default() };
+    let mut body = conversation_with_repeated_context();
+    let before = count_body_tokens(&body);
+    let (stats, stash) = compression::dedup_rewrite(&cfg, &mut body);
+    let after = count_body_tokens(&body);
+
+    // The doc appears 3× → first occurrence kept, the two later copies deduped.
+    assert_eq!(stats.refs_created, 2, "two later duplicates should be replaced");
+    assert!(after < before, "dedup should reduce total tokens (got {before}→{after})");
+
+    let msgs = body["messages"].as_array().unwrap();
+    // First copy (system message) is verbatim; later copies are pointers.
+    assert!(msgs[0]["content"].as_str().unwrap().contains("Section 0:"), "first copy kept verbatim");
+    assert!(msgs[3]["content"].as_str().unwrap().starts_with("[ref:"), "2nd copy → ref marker");
+    assert!(msgs[5]["content"].as_str().unwrap().starts_with("[ref:"), "3rd copy → ref marker");
+
+    // Reversibility: the stash holds the exact original behind every ref.
+    assert_eq!(stash.len(), 2);
+    assert!(stash.iter().all(|(_, original)| original.contains("Section 0:")));
+}
+
+#[test]
+fn dedup_leaves_unique_content_untouched() {
+    let cfg = CompressionBoonSettings { enabled: true, min_tokens: 16, ..Default::default() };
+    let mut body = json!({
+        "model": "verify",
+        "messages": [
+            {"role": "user", "content": "first unique message with enough length to clear the floor ".repeat(8)},
+            {"role": "user", "content": "second DIFFERENT message with enough length to clear the floor ".repeat(8)}
+        ]
+    });
+    let snapshot = body.clone();
+    let (stats, stash) = compression::dedup_rewrite(&cfg, &mut body);
+    assert_eq!(stats.refs_created, 0, "no duplicates → nothing replaced");
+    assert!(stash.is_empty());
+    assert_eq!(body, snapshot, "unique content must be byte-identical after dedup");
 }
