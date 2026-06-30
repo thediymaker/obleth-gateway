@@ -502,6 +502,60 @@ pub(super) fn extract_prose(
     Some(out)
 }
 
+/// Mask variable tokens (digit runs, hex) so structurally-identical log lines
+/// share a template.
+fn log_template(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c.is_ascii_digit() {
+            out.push('#');
+            while chars.peek().is_some_and(|d| d.is_ascii_digit() || *d == ':' || *d == '.' || *d == '-') {
+                chars.next();
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Collapse repeated log lines: lines sharing a masked template that appears more
+/// than 3× are represented by their first occurrence + `(×N)`; `error`/`warn`
+/// lines are always kept verbatim. Returns `Some` only when strictly shorter.
+pub(super) fn compact_log(text: &str) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() < 8 {
+        return None;
+    }
+    use std::collections::HashMap;
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for line in &lines {
+        *counts.entry(log_template(line)).or_insert(0) += 1;
+    }
+    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out = String::with_capacity(text.len());
+    for line in &lines {
+        let lower = line.to_lowercase();
+        let is_problem = lower.contains("error") || lower.contains("warn");
+        let tmpl = log_template(line);
+        let count = counts.get(&tmpl).copied().unwrap_or(1);
+        if is_problem || count <= 3 {
+            out.push_str(line);
+            out.push('\n');
+        } else if emitted.insert(tmpl) {
+            // First occurrence of a frequently-repeated template.
+            out.push_str(line);
+            out.push_str(&format!(" (×{count})\n"));
+        }
+        // else: a subsequent occurrence of an already-collapsed template → drop.
+    }
+    if out.len() >= text.len() {
+        return None;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -779,5 +833,16 @@ mod tests {
     fn extract_prose_returns_none_when_short() {
         use std::collections::HashSet;
         assert_eq!(extract_prose("a\nb\nc", &HashSet::new(), 0.5), None);
+    }
+
+    #[test]
+    fn compact_log_collapses_repeated_templates_keeps_errors() {
+        let mut text = String::new();
+        for i in 0..50 { text.push_str(&format!("2026-06-29 INFO request {i} handled in {i}ms\n")); }
+        text.push_str("2026-06-29 ERROR disk full on /dev/sda1\n");
+        let out = compact_log(&text).expect("should compact");
+        assert!(out.len() < text.len());
+        assert!(out.contains("(×")); // collapsed repeat marker
+        assert!(out.contains("ERROR disk full")); // error line preserved verbatim
     }
 }
