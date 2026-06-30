@@ -152,7 +152,7 @@ fn try_compact_string(
     stats.scanned += 1;
     match classify(s) {
         ContentKind::Json => {
-            if let Some(compact) = compact_json(s) {
+            if let Some(compact) = super::structural_json::compact(s) {
                 let after = tk.count_text(&compact);
                 stats.tokens_before = stats.tokens_before.saturating_add(before);
                 stats.tokens_after = stats.tokens_after.saturating_add(after);
@@ -675,5 +675,23 @@ mod tests {
         };
         let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 0);
+    }
+
+    #[test]
+    fn apply_uses_structural_table_for_object_arrays() {
+        let rows: Vec<serde_json::Value> = (0..200)
+            .map(|i| json!({ "id": i, "name": format!("item-{i}"), "active": true }))
+            .collect();
+        let pretty = serde_json::to_string_pretty(&json!(rows)).unwrap();
+        let mut body = json!({
+            "model": "m",
+            "messages": [ { "role": "tool", "content": pretty } ]
+        });
+        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
+        let stats = apply(&cfg, false, &mut body);
+        assert_eq!(stats.compressed, 1);
+        assert!(stats.tokens_after < stats.tokens_before);
+        let out = body["messages"][0]["content"].as_str().unwrap();
+        assert!(out.starts_with("OBLETH_TABLE rows=200\n"));
     }
 }
