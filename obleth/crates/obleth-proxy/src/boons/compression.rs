@@ -374,23 +374,6 @@ fn dedup_marker(hash: &str) -> String {
     format!("[ref:{hash}] (identical to earlier content; call retrieve_original for the full text)")
 }
 
-/// Given eligible `(message_index, content)` segments in message order, return
-/// the `(index, content)` of every occurrence after the first for each repeated
-/// content. The first occurrence of each distinct content is kept verbatim.
-fn dedup_plan(segments: &[(usize, String)]) -> Vec<(usize, String)> {
-    use std::collections::HashSet;
-    let mut seen: HashSet<&str> = HashSet::new();
-    let mut targets: Vec<(usize, String)> = Vec::new();
-    for (mi, content) in segments {
-        if seen.contains(content.as_str()) {
-            targets.push((*mi, content.clone()));
-        } else {
-            seen.insert(content.as_str());
-        }
-    }
-    targets
-}
-
 #[derive(Debug, Default, Clone, Copy)]
 pub(super) struct DedupStats {
     /// Duplicate occurrences found (2nd+ copies of a repeated block).
@@ -404,8 +387,9 @@ pub(super) struct DedupStats {
 /// Cross-turn exact-duplicate dedup: when a large block (>= `min_tokens`) appears
 /// more than once across `messages[]`, keep the first occurrence verbatim and
 /// replace each later identical occurrence with a `[ref:HASH]` marker, stashing
-/// the original in Redis for `retrieve_original`. History-aware: the last message
-/// (the active turn) is never modified. Fail-open per occurrence.
+/// the original in Redis for `retrieve_original`. Covers both string content and
+/// array-parts text. Skips only a trailing assistant message (active turn).
+/// Best-effort Redis stash after gain check; fail-open per occurrence.
 pub(super) async fn apply_dedup(
     state: &AppState,
     cfg: &CompressionBoonSettings,
@@ -415,56 +399,57 @@ pub(super) async fn apply_dedup(
 ) -> DedupStats {
     let mut stats = DedupStats::default();
     let tk = HeuristicTokenizer::new();
-
-    // Pass 1: gather eligible string-content segments, excluding the last message.
-    let mut segments: Vec<(usize, String)> = Vec::new();
-    {
+    let targets: Vec<(usize, Option<usize>, String)> = {
         let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
             return stats;
         };
         let n = messages.len();
+        let skip_last_assistant = n > 0
+            && messages[n - 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
+        let mut out = Vec::new();
         for (mi, msg) in messages.iter().enumerate() {
-            if mi + 1 == n {
-                continue; // protect the active (last) turn
-            }
-            let Some(text) = msg.get("content").and_then(|c| c.as_str()) else {
-                continue;
-            };
-            if tk.count_text(text) < cfg.min_tokens {
+            if skip_last_assistant && mi + 1 == n {
                 continue;
             }
-            segments.push((mi, text.to_string()));
+            match msg.get("content") {
+                Some(Value::String(s)) if tk.count_text(s) >= cfg.min_tokens => {
+                    out.push((mi, None, s.clone()));
+                }
+                Some(Value::Array(parts)) => {
+                    for (pi, part) in parts.iter().enumerate() {
+                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                            if tk.count_text(t) >= cfg.min_tokens {
+                                out.push((mi, Some(pi), t.to_string()));
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
         }
-    }
-    let targets = dedup_plan(&segments);
-    if targets.is_empty() {
-        return stats;
-    }
-
-    // Pass 2: stash + replace each duplicate (bounded by max_lossy_segments).
-    for (mi, content) in targets {
+        out
+    };
+    // First occurrence of each distinct text is kept; later ones are replaced.
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let dups: Vec<(usize, Option<usize>, String)> = targets
+        .iter()
+        .filter(|(_, _, t)| !seen.insert(t.as_str()))
+        .cloned()
+        .collect();
+    for (mi, pi, content) in dups {
+        stats.duplicates += 1;
         if stats.refs_created >= cfg.max_lossy_segments {
             break;
         }
-        stats.duplicates += 1;
         let before = tk.count_text(&content);
         let hash = obleth_config::content_hash(&content);
         let marker = dedup_marker(&hash);
         let after = tk.count_text(&marker);
         if after >= before {
-            continue; // no gain
-        }
-        if let Err(e) = state.redis.compress_put(&hash, &content, cfg.original_ttl_secs).await {
-            tracing::warn!(error = %e, "compress_put failed; leaving duplicate verbatim");
             continue;
         }
-        if let Some(c) = json
-            .get_mut("messages")
-            .and_then(|m| m.as_array_mut())
-            .and_then(|m| m.get_mut(mi))
-            .and_then(|msg| msg.get_mut("content"))
-        {
-            *c = Value::String(marker);
+        let _ = state.redis.compress_put(&hash, &content, cfg.original_ttl_secs).await;
+        if set_segment_text(json, mi, pi, marker) {
             stats.refs_created += 1;
             stats.tokens_before = stats.tokens_before.saturating_add(before);
             stats.tokens_after = stats.tokens_after.saturating_add(after);
@@ -771,28 +756,6 @@ mod tests {
     fn dedup_marker_carries_ref() {
         let m = dedup_marker("cafef00d");
         assert!(m.contains("[ref:cafef00d]"));
-    }
-
-    #[test]
-    fn dedup_plan_marks_later_occurrences_only() {
-        let segs = vec![
-            (0usize, "AAAA".to_string()),
-            (1, "unique".to_string()),
-            (2, "AAAA".to_string()),
-            (4, "AAAA".to_string()),
-        ];
-        let plan = dedup_plan(&segs);
-        // First "AAAA" (index 0) is kept; indices 2 and 4 are replaced.
-        assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0].0, 2);
-        assert_eq!(plan[1].0, 4);
-        assert!(plan.iter().all(|(_, c)| c == "AAAA"));
-    }
-
-    #[test]
-    fn dedup_plan_no_duplicates_is_empty() {
-        let segs = vec![(0usize, "a".to_string()), (1, "b".to_string())];
-        assert!(dedup_plan(&segs).is_empty());
     }
 
     #[test]
