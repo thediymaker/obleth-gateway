@@ -291,13 +291,13 @@ pub(super) async fn apply_lossy(
         stats.segments += 1;
         let before = tk.count_text(&original);
         let hash = obleth_config::content_hash(&original);
-        // Best-effort stash for the retrieve_original bonus; never fail on Redis error.
-        let _ = state.redis.compress_put(&hash, &original, cfg.original_ttl_secs).await;
         let marker = lossy_marker(&compacted, &hash);
         let after = tk.count_text(&marker);
         if after >= before {
-            continue;
+            continue; // no token gain — skip before any Redis write
         }
+        // Best-effort stash for the retrieve_original bonus; never fail on Redis error.
+        let _ = state.redis.compress_put(&hash, &original, cfg.original_ttl_secs).await;
         if set_segment_text(json, mi, pi, marker) {
             stats.refs_created += 1;
             stats.tokens_before = stats.tokens_before.saturating_add(before);
@@ -471,18 +471,6 @@ pub(super) async fn apply_dedup(
         }
     }
     stats
-}
-
-/// The chat-completions body sent to the summarizer for one segment.
-fn summarize_request(upstream_model: &str, prompt: &str, content: &str) -> Value {
-    json!({
-        "model": upstream_model,
-        "messages": [
-            { "role": "system", "content": prompt },
-            { "role": "user", "content": content },
-        ],
-        "temperature": 0.2,
-    })
 }
 
 /// Normalize a line for near-duplicate detection: trim + lowercase + collapse digits.
@@ -761,14 +749,6 @@ mod tests {
         let mut body = json!({ "model": "m", "messages": [{ "role": "user", "content": "hi" }] });
         inject_retrieve_original_tool(&mut body, false);
         assert_eq!(body["tools"].as_array().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn summarize_request_shape() {
-        let body = summarize_request("llama3:8b", "summarize", "long text here");
-        assert_eq!(body["model"], "llama3:8b");
-        assert_eq!(body["messages"][0]["content"], "summarize");
-        assert_eq!(body["messages"][1]["content"], "long text here");
     }
 
     #[test]
