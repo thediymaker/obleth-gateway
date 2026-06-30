@@ -259,10 +259,8 @@ pub(super) async fn apply_lossy(
                 continue;
             }
             match msg.get("content") {
-                Some(Value::String(s)) => {
-                    if tk.count_text(s) >= cfg.min_tokens {
-                        out.push((mi, None, s.clone()));
-                    }
+                Some(Value::String(s)) if tk.count_text(s) >= cfg.min_tokens => {
+                    out.push((mi, None, s.clone()));
                 }
                 Some(Value::Array(parts)) => {
                     for (pi, part) in parts.iter().enumerate() {
