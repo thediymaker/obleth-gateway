@@ -50,6 +50,7 @@ fn csv_parse_line(line: &str) -> Vec<String> {
 }
 
 const TABLE_MARKER: &str = "OBLETH_TABLE rows=";
+const BLOCK_PREFIX: &str = "<<OBLETH_TABLE:";
 
 /// Encode an array of >=2 non-empty objects as `header\nrow\nrow...` using the
 /// UNION of keys (sorted). A key absent from an object yields an empty cell; a
@@ -142,15 +143,136 @@ fn try_encode_table(value: &Value) -> Option<String> {
     Some(out)
 }
 
-/// Compact a JSON text segment. Prefers the table form for arrays of like-keyed
-/// objects (validated by exact reconstruction and a strict length win); otherwise
-/// falls back to the existing lossless minify; otherwise `None`.
+/// Walk `value`, replacing every qualifying array with a placeholder string
+/// `<<OBLETH_TABLE:N>>` and pushing its `(row_count, body)` to `blocks`.
+fn collect_tables(value: &mut Value, blocks: &mut Vec<(usize, String)>) {
+    match value {
+        Value::Array(arr) => {
+            if let Some((n, body)) = encode_table_body(arr) {
+                let idx = blocks.len();
+                blocks.push((n, body));
+                *value = Value::String(format!("{BLOCK_PREFIX}{idx}>>"));
+            } else {
+                for item in arr.iter_mut() {
+                    collect_tables(item, blocks);
+                }
+            }
+        }
+        Value::Object(map) => {
+            for (_k, v) in map.iter_mut() {
+                collect_tables(v, blocks);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Compact a JSON segment whose qualifying arrays are nested (not the whole
+/// segment), by emitting a valid-JSON skeleton with `<<OBLETH_TABLE:N>>`
+/// placeholders followed by the appended table blocks.
+pub(super) fn compact_recursive(text: &str) -> Option<String> {
+    let original: Value = serde_json::from_str(text.trim()).ok()?;
+    let mut skeleton = original.clone();
+    let mut blocks: Vec<(usize, String)> = Vec::new();
+    collect_tables(&mut skeleton, &mut blocks);
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut out = serde_json::to_string(&skeleton).ok()?;
+    out.push('\n');
+    for (idx, (n, body)) in blocks.iter().enumerate() {
+        out.push('\n');
+        out.push_str(BLOCK_PREFIX);
+        out.push_str(&format!("{idx} rows={n}>>\n"));
+        out.push_str(body);
+    }
+    if out.len() >= text.len() {
+        return None;
+    }
+    if reconstruct_blocks(&out).as_ref() != Some(&original) {
+        return None;
+    }
+    Some(out)
+}
+
+/// Reconstruct the original `Value` from a skeleton + appended-blocks document.
+fn reconstruct_blocks(text: &str) -> Option<Value> {
+    let first_nl = text.find('\n')?;
+    let mut skeleton: Value = serde_json::from_str(text[..first_nl].trim()).ok()?;
+    let rest = &text[first_nl + 1..];
+
+    let mut tables: Vec<Vec<Value>> = Vec::new();
+    let mut pending_rows: Option<usize> = None;
+    let mut body = String::new();
+    for line in rest.lines() {
+        if let Some(after) = line.strip_prefix(BLOCK_PREFIX) {
+            if let Some(n) = pending_rows.take() {
+                tables.push(parse_table_body(&body, n)?);
+                body.clear();
+            }
+            let inner = after.strip_suffix(">>")?;
+            let (idx_str, rows_str) = inner.split_once(" rows=")?;
+            if idx_str.trim().parse::<usize>().ok()? != tables.len() {
+                return None; // blocks must appear in order 0,1,2,...
+            }
+            pending_rows = Some(rows_str.trim().parse().ok()?);
+        } else if pending_rows.is_some() {
+            body.push_str(line);
+            body.push('\n');
+        }
+        // lines before the first block header (the blank separator) are ignored
+    }
+    if let Some(n) = pending_rows.take() {
+        tables.push(parse_table_body(&body, n)?);
+    }
+    splice_placeholders(&mut skeleton, &tables)?;
+    Some(skeleton)
+}
+
+/// Replace every `<<OBLETH_TABLE:N>>` string value with reconstructed block N.
+fn splice_placeholders(value: &mut Value, tables: &[Vec<Value>]) -> Option<()> {
+    match value {
+        Value::String(s) => {
+            if let Some(idx) = s
+                .strip_prefix(BLOCK_PREFIX)
+                .and_then(|x| x.strip_suffix(">>"))
+                .and_then(|x| x.trim().parse::<usize>().ok())
+            {
+                let arr = tables.get(idx)?;
+                *value = Value::Array(arr.clone());
+            }
+            Some(())
+        }
+        Value::Array(arr) => {
+            for v in arr.iter_mut() {
+                splice_placeholders(v, tables)?;
+            }
+            Some(())
+        }
+        Value::Object(map) => {
+            for (_k, v) in map.iter_mut() {
+                splice_placeholders(v, tables)?;
+            }
+            Some(())
+        }
+        _ => Some(()),
+    }
+}
+
+/// Compact a JSON text segment. Top-level qualifying arrays keep their exact
+/// current `OBLETH_TABLE` form; otherwise nested/wrapped/multiple arrays use the
+/// skeleton+blocks form; otherwise lossless minify; otherwise `None`.
 pub(super) fn compact(text: &str) -> Option<String> {
     if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
-        if let Some(table) = try_encode_table(&value) {
-            if table.len() < text.len() && reconstruct_table(&table).as_ref() == Some(&value) {
-                return Some(table);
+        if value.is_array() {
+            if let Some(table) = try_encode_table(&value) {
+                if table.len() < text.len() && reconstruct_table(&table).as_ref() == Some(&value) {
+                    return Some(table);
+                }
             }
+        }
+        if let Some(rec) = compact_recursive(text) {
+            return Some(rec);
         }
     }
     super::compression::compact_json(text)
@@ -323,5 +445,57 @@ mod tests {
     #[test]
     fn compact_returns_none_when_no_gain() {
         assert_eq!(compact("{\"a\":1}"), None); // already minimal, not tabular
+    }
+
+    #[test]
+    fn compact_recursive_tabbifies_wrapped_array() {
+        let rows: Vec<Value> = (0..50).map(|i| json!({"id": i, "name": format!("u{i}"), "ok": true})).collect();
+        let value = json!({"results": rows, "meta": {"total": 50}});
+        let text = serde_json::to_string(&value).unwrap();
+        let out = compact_recursive(&text).expect("wrapped array compacts");
+        assert!(out.len() < text.len());
+        // Skeleton holds a placeholder; a block carries the rows.
+        assert!(out.contains("\"<<OBLETH_TABLE:0>>\""), "out: {out}");
+        assert!(out.contains("<<OBLETH_TABLE:0 rows=50>>"));
+        // Lossless round-trip through compact() entry as well.
+        assert_eq!(reconstruct_blocks(&out), Some(value));
+    }
+
+    #[test]
+    fn compact_recursive_handles_multiple_arrays() {
+        let a: Vec<Value> = (0..20).map(|i| json!({"x": i, "y": i * 2})).collect();
+        let b: Vec<Value> = (0..20).map(|i| json!({"k": format!("k{i}"), "v": i})).collect();
+        let value = json!({"first": a, "second": b});
+        let text = serde_json::to_string(&value).unwrap();
+        let out = compact_recursive(&text).expect("two arrays compact");
+        assert!(out.contains("<<OBLETH_TABLE:0 rows=20>>"));
+        assert!(out.contains("<<OBLETH_TABLE:1 rows=20>>"));
+        assert_eq!(reconstruct_blocks(&out), Some(value));
+    }
+
+    #[test]
+    fn compact_recursive_collision_is_safe() {
+        // Data legitimately containing a placeholder-looking string + a real array.
+        let rows: Vec<Value> = (0..40).map(|i| json!({"id": i, "v": i})).collect();
+        let value = json!({"note": "<<OBLETH_TABLE:0>>", "rows": rows});
+        let text = serde_json::to_string(&value).unwrap();
+        // Either it returns None (fell back) or it returns a form that round-trips
+        // to the EXACT original — never corruption.
+        if let Some(out) = compact_recursive(&text) {
+            assert_eq!(reconstruct_blocks(&out), Some(value));
+        }
+    }
+
+    #[test]
+    fn compact_keeps_top_level_array_output_byte_identical() {
+        // The common case must not gain a skeleton wrapper.
+        let value = json!([
+            {"id": 1, "name": "alice", "role": "admin"},
+            {"id": 2, "name": "bob", "role": "user"}
+        ]);
+        let pretty = serde_json::to_string_pretty(&value).unwrap();
+        let out = compact(&pretty).expect("top-level array compacts");
+        assert!(out.starts_with("OBLETH_TABLE rows=2\n"));
+        assert!(!out.contains("<<OBLETH_TABLE:"));
     }
 }
