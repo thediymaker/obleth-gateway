@@ -4,9 +4,10 @@
 //! gated per-model and by global settings. Fail-open like every boon — any
 //! error or absence of gain leaves the request untouched.
 //!
-//! Phase B2: lossy semantic compression — summarize long prose segments via a
-//! helper model, stash each original in Redis for reversibility, and replace
-//! the segment with `summary + [ref:HASH]`.
+//! Phase B2: lossy pass: deterministic, model-free text compaction — salience-based prose
+//! extraction (`extract_prose`) and log-template collapse (`compact_log`) — replacing long
+//! segments with a shorter form plus a `[ref:HASH]` marker; the original is best-effort stashed
+//! for the optional retrieve_original tool.
 
 use obleth_config::{CompressionBoonSettings, ResolvedKey};
 use obleth_tokenizer::{HeuristicTokenizer, Tokenizer};

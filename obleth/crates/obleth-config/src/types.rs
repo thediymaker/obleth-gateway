@@ -844,7 +844,7 @@ pub fn is_valid_tag(tag: &str) -> bool {
 /// `vision` relays image parts to a configured describer model.
 /// `structured_output` enforces `response_format` JSON schemas with gateway-side
 /// validation and repair. `compression` reduces the input tokens a model reads
-/// (JSON/code compaction, cross-turn dedup, lossy summarization) before dispatch.
+/// (JSON/code compaction, cross-turn dedup, deterministic lossy text compaction) before dispatch.
 /// Operators opt each model into a subset of these; nothing is granted by default.
 pub const MODEL_BOONS: &[&str] = &["vision", "structured_output", "compression"];
 

@@ -136,7 +136,7 @@ const MODEL_BOONS = [
     value: "compression",
     label: "Compression",
     description:
-      "Reduce the input tokens this model reads before dispatch: lossless JSON/code compaction always; cross-turn dedup and lossy summarization when the tenant opts in and the model supports function calling with the gateway tool loop enabled. Configure globally in Settings → Boons and per tenant on the tenant's Compression tab.",
+      "Reduce the input tokens this model reads before dispatch: lossless JSON/code compaction always; cross-turn dedup and lossy text compaction when the tenant opts in (works on any model). If the model supports function calling with the gateway tool loop enabled, a retrieve_original tool is added so it can recover compacted detail. Configure globally in Settings → Boons and per tenant on the tenant's Compression tab.",
   },
 ] as const;
 
