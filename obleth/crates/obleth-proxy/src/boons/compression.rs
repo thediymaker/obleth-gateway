@@ -153,8 +153,8 @@ pub(super) fn apply(cfg: &CompressionBoonSettings, code_compaction: bool, json: 
     stats
 }
 
-/// Apply the threshold + classify + compact pipeline to one string segment,
-/// rewriting it in place and updating `stats`.
+/// Apply the threshold + structural/embedded compaction pipeline to one string
+/// segment, rewriting it in place and updating `stats`.
 fn try_compact_string(
     cfg: &CompressionBoonSettings,
     code_compaction: bool,
@@ -167,26 +167,33 @@ fn try_compact_string(
         return;
     }
     stats.scanned += 1;
-    match classify(s) {
-        ContentKind::Json => {
-            if let Some(compact) = super::structural_json::compact(s) {
-                let after = tk.count_text(&compact);
-                stats.tokens_before = stats.tokens_before.saturating_add(before);
-                stats.tokens_after = stats.tokens_after.saturating_add(after);
-                stats.compressed += 1;
-                *s = compact;
+
+    // 1. Whole segment is JSON -> structural compaction (recurses into nesting).
+    // 2. Otherwise -> compact any JSON arrays embedded in the prose/markdown.
+    let mut compacted = if serde_json::from_str::<Value>(s.trim()).is_ok() {
+        super::structural_json::compact(s)
+    } else {
+        super::embedded_json::extract(s)
+    };
+
+    // 3. Conservative code whitespace compaction (opt-in), on top of the above.
+    if code_compaction {
+        let base = compacted.clone().unwrap_or_else(|| s.clone());
+        if matches!(classify(&base), ContentKind::Code) {
+            if let Some(cc) = compact_code(&base) {
+                compacted = Some(cc);
             }
         }
-        ContentKind::Code if code_compaction => {
-            if let Some(compact) = compact_code(s) {
-                let after = tk.count_text(&compact);
-                stats.tokens_before = stats.tokens_before.saturating_add(before);
-                stats.tokens_after = stats.tokens_after.saturating_add(after);
-                stats.compressed += 1;
-                *s = compact;
-            }
+    }
+
+    if let Some(out) = compacted {
+        let after = tk.count_text(&out);
+        if after < before {
+            stats.tokens_before = stats.tokens_before.saturating_add(before);
+            stats.tokens_after = stats.tokens_after.saturating_add(after);
+            stats.compressed += 1;
+            *s = out;
         }
-        _ => {}
     }
 }
 
@@ -868,5 +875,60 @@ mod tests {
         assert!(compacted.len() < first.len());
         // The active question (last message) is short (below floor) and untouched regardless.
         assert_eq!(body["messages"][1]["content"], "summarize the notes above");
+    }
+
+    #[test]
+    fn apply_compacts_wrapped_array() {
+        let rows: Vec<Value> = (0..100)
+            .map(|i| json!({"id": i, "name": format!("u{i}"), "active": true}))
+            .collect();
+        let content = serde_json::to_string(&json!({"results": rows, "meta": {"total": 100}})).unwrap();
+        let mut body = json!({"model": "m", "messages": [{"role": "tool", "content": content}]});
+        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
+        let stats = apply(&cfg, false, &mut body);
+        assert_eq!(stats.compressed, 1);
+        assert!(stats.tokens_after < stats.tokens_before);
+        assert!(body["messages"][0]["content"].as_str().unwrap().contains("<<OBLETH_TABLE:0"));
+    }
+
+    #[test]
+    fn apply_compacts_array_embedded_in_prose() {
+        let r: Vec<String> = (0..100)
+            .map(|i| format!("{{\"id\":{i},\"name\":\"u{i}\",\"active\":true}}"))
+            .collect();
+        let prose = format!("Here is the data you asked for: [{}] please summarize it.", r.join(","));
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": prose}]});
+        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
+        let stats = apply(&cfg, false, &mut body);
+        assert_eq!(stats.compressed, 1);
+        let out = body["messages"][0]["content"].as_str().unwrap();
+        assert!(out.starts_with("Here is the data you asked for: "));
+        assert!(out.contains("OBLETH_TABLE rows=100"));
+        assert!(out.ends_with(" please summarize it."));
+    }
+
+    #[test]
+    fn apply_compacts_sparse_object_array() {
+        let rows: Vec<Value> = (0..100)
+            .map(|i| if i % 2 == 0 { json!({"id": i, "name": format!("u{i}")}) } else { json!({"id": i, "email": format!("u{i}@x")}) })
+            .collect();
+        let content = serde_json::to_string(&json!(rows)).unwrap();
+        let mut body = json!({"model": "m", "messages": [{"role": "tool", "content": content}]});
+        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
+        let stats = apply(&cfg, false, &mut body);
+        assert_eq!(stats.compressed, 1);
+        assert!(stats.tokens_after < stats.tokens_before);
+    }
+
+    #[test]
+    fn apply_leaves_plain_prose_unchanged() {
+        let prose: String = (0..60)
+            .map(|i| format!("This is sentence number {i} with no structured data at all.\n"))
+            .collect();
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": prose.clone()}]});
+        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
+        let stats = apply(&cfg, false, &mut body);
+        assert_eq!(stats.compressed, 0);
+        assert_eq!(body["messages"][0]["content"].as_str().unwrap(), prose);
     }
 }
