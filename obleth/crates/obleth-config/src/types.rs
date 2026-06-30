@@ -1270,7 +1270,7 @@ impl Default for GuardrailsBoonSettings {
     }
 }
 
-fn default_compression_min_tokens() -> u32 { 512 }
+fn default_compression_min_tokens() -> u32 { 128 }
 fn default_compression_max_segments() -> u32 { 64 }
 fn default_compression_original_ttl_secs() -> u64 { 3_600 }
 fn default_compression_max_lossy_segments() -> u32 { 4 }
@@ -1751,7 +1751,7 @@ mod tests {
         let c = CompressionBoonSettings::default();
         assert!(!c.enabled);
         assert!(!c.active());
-        assert_eq!(c.min_tokens, 512);
+        assert_eq!(c.min_tokens, 128);
         assert_eq!(c.max_segments, 64);
     }
 
@@ -1772,7 +1772,7 @@ mod tests {
         // All fields are #[serde(default)] so an empty object must work.
         let c: CompressionBoonSettings = serde_json::from_str("{}").unwrap();
         assert!(!c.enabled);
-        assert_eq!(c.min_tokens, 512);
+        assert_eq!(c.min_tokens, 128);
     }
 
     #[test]
