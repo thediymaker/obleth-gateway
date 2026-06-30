@@ -437,6 +437,71 @@ fn summarize_request(upstream_model: &str, prompt: &str, content: &str) -> Value
     })
 }
 
+/// Normalize a line for near-duplicate detection: trim + lowercase + collapse digits.
+fn dedup_key(line: &str) -> String {
+    line.trim()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_digit() { '#' } else { c })
+        .collect()
+}
+
+/// Deterministic extractive compaction of prose/log-ish text: score each line by
+/// salience (length/density + overlap with the request's query terms), drop
+/// blank lines and near-duplicates, and keep the top `keep_ratio` of lines in
+/// original order. Returns `Some` only when strictly shorter than the input.
+pub(super) fn extract_prose(
+    text: &str,
+    query_terms: &std::collections::HashSet<String>,
+    keep_ratio: f32,
+) -> Option<String> {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() < 8 {
+        return None; // too small to benefit
+    }
+    let mut seen = std::collections::HashSet::new();
+    // (original_index, score) for non-blank, non-duplicate lines.
+    let mut scored: Vec<(usize, f32)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !seen.insert(dedup_key(line)) {
+            continue; // near-duplicate
+        }
+        let mut score = (trimmed.len().min(120) as f32) / 120.0; // density proxy
+        let lower = trimmed.to_lowercase();
+        if query_terms.iter().any(|t| lower.contains(t.as_str())) {
+            score += 2.0; // relevance to the request
+        }
+        scored.push((i, score));
+    }
+    if scored.is_empty() {
+        return None;
+    }
+    let keep = ((scored.len() as f32) * keep_ratio).ceil().max(1.0) as usize;
+    if keep >= scored.len() {
+        return None; // nothing meaningfully dropped
+    }
+    // Choose the top `keep` by score, then restore original order.
+    let mut by_score = scored.clone();
+    by_score.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    let mut kept_idx: Vec<usize> = by_score.into_iter().take(keep).map(|(i, _)| i).collect();
+    kept_idx.sort_unstable();
+    let omitted = lines.len() - kept_idx.len();
+    let mut out = String::with_capacity(text.len());
+    for i in &kept_idx {
+        out.push_str(lines[*i]);
+        out.push('\n');
+    }
+    out.push_str(&format!("[… {omitted} lines omitted]"));
+    if out.len() >= text.len() {
+        return None;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,5 +758,26 @@ mod tests {
         assert!(stats.tokens_after < stats.tokens_before);
         let out = body["messages"][0]["content"].as_str().unwrap();
         assert!(out.starts_with("OBLETH_TABLE rows=200\n"));
+    }
+
+    #[test]
+    fn extract_prose_drops_low_value_and_dupes_keeps_query_lines() {
+        use std::collections::HashSet;
+        let mut text = String::new();
+        for _ in 0..40 { text.push_str("boilerplate filler line that repeats a lot\n"); }
+        text.push_str("the deadbeef token error occurred in module X\n");
+        for _ in 0..40 { text.push_str("more boilerplate filler line that repeats\n"); }
+        let mut q = HashSet::new();
+        q.insert("deadbeef".to_string());
+        let out = extract_prose(&text, &q, 0.3).expect("should extract");
+        assert!(out.len() < text.len());
+        assert!(out.contains("deadbeef")); // query-relevant line is kept
+        assert!(out.contains("omitted")); // omission marker present
+    }
+
+    #[test]
+    fn extract_prose_returns_none_when_short() {
+        use std::collections::HashSet;
+        assert_eq!(extract_prose("a\nb\nc", &HashSet::new(), 0.5), None);
     }
 }
