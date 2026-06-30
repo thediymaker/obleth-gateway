@@ -6,6 +6,12 @@ use serde_json::Value;
 
 use super::structural_json;
 
+/// Upper bound on total bytes the balanced-bracket matcher may scan across one
+/// `find_spans` call, so adversarial bracket-heavy input cannot cause O(n²) work.
+/// Set generously relative to the input so all legitimate JSON still matches; only
+/// pathological repeated unbalanced scans are cut off.
+const MAX_SCAN_WORK_MULTIPLIER: usize = 2;
+
 /// Find balanced JSON spans inside `text` and replace each with its compacted
 /// form. Returns `Some(new_text)` when at least one span compacted to a strictly
 /// shorter form; else `None`.
@@ -44,10 +50,16 @@ fn find_spans(text: &str) -> Vec<(usize, usize)> {
     let bytes = text.as_bytes();
     let mut spans = Vec::new();
     let mut i = 0usize;
+    // Total scan budget for this call: generous vs. input length so all real JSON
+    // still matches; bounds adversarial O(n^2) bracket runs.
+    let mut budget: usize = bytes.len().saturating_mul(MAX_SCAN_WORK_MULTIPLIER);
     while i < bytes.len() {
         let b = bytes[i];
         if b == b'{' || b == b'[' {
-            if let Some(end) = match_balanced(bytes, i) {
+            if budget == 0 {
+                break;
+            }
+            if let Some(end) = match_balanced(bytes, i, &mut budget) {
                 if let Ok(v) = serde_json::from_str::<Value>(&text[i..end]) {
                     if contains_qualifying_array(&v) {
                         spans.push((i, end));
@@ -65,7 +77,9 @@ fn find_spans(text: &str) -> Vec<(usize, usize)> {
 /// Index one past the bracket that closes the one at `start`, or `None`.
 /// String- and escape-aware; balances only the opener's own bracket kind (inner
 /// brackets of the other kind are validated by the subsequent serde parse).
-fn match_balanced(bytes: &[u8], start: usize) -> Option<usize> {
+/// Decrements `budget` per byte scanned and gives up (returns `None`) if it hits 0,
+/// which bounds total scanning work across a `find_spans` call.
+fn match_balanced(bytes: &[u8], start: usize, budget: &mut usize) -> Option<usize> {
     let open = bytes[start];
     let close = if open == b'{' { b'}' } else { b']' };
     let mut depth = 0i32;
@@ -73,6 +87,10 @@ fn match_balanced(bytes: &[u8], start: usize) -> Option<usize> {
     let mut esc = false;
     let mut i = start;
     while i < bytes.len() {
+        if *budget == 0 {
+            return None;
+        }
+        *budget -= 1;
         let c = bytes[i];
         if in_str {
             if esc {
@@ -179,5 +197,13 @@ mod tests {
         assert!(out.contains("OBLETH_TABLE rows=50"));
         assert!(out.ends_with(" résumé ✅"));
         assert!(out.len() < text.len());
+    }
+
+    #[test]
+    fn adversarial_bracket_run_terminates_without_quadratic_blowup() {
+        // A long run of unmatched openers must not cause O(n^2) scanning. With the
+        // scan budget this returns quickly; without it this input would hang.
+        let text = "[".repeat(200_000);
+        assert_eq!(extract(&text), None);
     }
 }

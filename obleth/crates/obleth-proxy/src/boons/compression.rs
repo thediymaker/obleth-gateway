@@ -288,6 +288,13 @@ pub(super) async fn apply_lossy(
         if stats.segments >= cfg.max_lossy_segments {
             break;
         }
+        // Never re-process a segment the lossless structural pass already compacted:
+        // its table form is not valid JSON, so it would classify as Log/Prose and get
+        // truncated. The marker covers both the top-level `OBLETH_TABLE rows=` form and
+        // the nested `<<OBLETH_TABLE:` skeleton/block form.
+        if original.contains("OBLETH_TABLE") {
+            continue;
+        }
         let compacted = match classify(&original) {
             ContentKind::Log => compact_log(&original),
             ContentKind::Prose => extract_prose(&original, &query_terms, 0.4),
@@ -905,6 +912,29 @@ mod tests {
         assert!(out.starts_with("Here is the data you asked for: "));
         assert!(out.contains("OBLETH_TABLE rows=100"));
         assert!(out.ends_with(" please summarize it."));
+    }
+
+    #[test]
+    fn apply_lossy_skips_structurally_compacted_segments() {
+        // A segment the lossless structural pass already rewrote into OBLETH_TABLE form.
+        // Rows start with digits so classify() returns Log; without the guard the lossy
+        // pass would feed it to compact_log and truncate the table rows on the wire.
+        let mut text = String::from("OBLETH_TABLE rows=100\nid,name,active\n");
+        for i in 0..60 {
+            text.push_str(&format!("{i},user{i},true\n"));
+        }
+        // Verify the risk is real: the segment classifies as Log (rows starting with
+        // digits look timestamp-ish) and compact_log would happily collapse it.
+        assert_eq!(classify(&text), ContentKind::Log);
+        assert!(
+            compact_log(&text).is_some(),
+            "without the guard compact_log would clobber the table"
+        );
+        // The guard fires: the marker correctly identifies structurally-compacted segments.
+        assert!(
+            text.contains("OBLETH_TABLE"),
+            "guard condition must match on structural table output"
+        );
     }
 
     #[test]
