@@ -230,8 +230,8 @@ provisioner:
 # starving other workloads. BUT each pod holds the ~900 MB model resident in RAM,
 # so very small pods multiply memory. Sweet spot: ~4-8 cores per pod, then add
 # REPLICAS for aggregate throughput. On a CPU-rich cluster prefer e.g.
-# replicas: 24, numThreads: 8, limits.cpu "8" (~2500 sent/s over 192 cores) over
-# a handful of fat pods (same cores, a fraction of the throughput).
+# replicas: 24, numThreads: 4, limits.cpu "4" (~2500 sent/s over ~96 cores) over
+# a handful of fat pods (same or more cores, a fraction of the throughput).
 # Keep numThreads == requests.cpu == limits.cpu per replica. Caveat: the gateway
 # reuses keep-alive connections to the Service, so spread improves with request
 # concurrency (and gateway replicas); size minReplicas for steady-state load.
@@ -240,9 +240,9 @@ compressor:
   # Horizontal scale knob — the primary throughput lever. Raise this (or set it as
   # minReplicas with autoscaling on) rather than growing numThreads past ~8.
   replicas: 1
-  # onnxruntime intra-op threads per pod. Keep small (~4-8): a single inference
-  # saturates near 4 cores. MUST match resources.limits.cpu below.
-  numThreads: 8
+  # onnxruntime intra-op threads per pod. Keep small: a single inference saturates
+  # near 4 cores (the default). MUST match resources.limits.cpu below.
+  numThreads: 4
   image:
     repository: ghcr.io/thediymaker/obleth-gateway/obleth-compressor
     # Empty -> v{appVersion} from Chart.yaml, so each chart release pins its
@@ -255,10 +255,10 @@ compressor:
   # ~900 MB resident, so give memory headroom (and remember tiny pods multiply it).
   resources:
     requests:
-      cpu: "8"
+      cpu: "4"
       memory: 1536Mi
     limits:
-      cpu: "8"
+      cpu: "4"
       memory: 2Gi
   # CPU-based HPA is meaningful ONLY because resources.limits.cpu is set above.
   autoscaling:

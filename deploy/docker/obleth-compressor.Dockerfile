@@ -44,12 +44,12 @@ ARG MODEL_ID=chopratejas/kompress-v2-base
 # COMPRESSOR_NUM_THREADS caps onnxruntime's intra-op thread pool. Without it the
 # sidecar grabs EVERY host core per inference — it is genuinely CPU-hungry. A
 # single inference saturates near ~4 cores (8/16/24 barely beat it), so keep this
-# SMALL and scale with more replicas, not fatter pods. 8 is a safe near-peak
-# default; deploys pin it to the container's CPU limit (compose `cpus:`, Helm
+# SMALL and scale with more replicas, not fatter pods. 4 is the efficiency knee and
+# the default; deploys pin it to the container's CPU limit (compose `cpus:`, Helm
 # resources + compressor.numThreads) — matched so each replica cleanly owns N cores.
 ENV COMPRESSOR_MODEL_DIR=/models \
     COMPRESSOR_MODEL_NAME=${MODEL_ID} \
-    COMPRESSOR_NUM_THREADS=8
+    COMPRESSOR_NUM_THREADS=4
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8080/health || exit 1
