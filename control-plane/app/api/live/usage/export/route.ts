@@ -1,6 +1,7 @@
 import { NextRequest } from "next/server";
 import { obleth } from "@/lib/obleth";
 import type { UsageDailyGroupBy, UsageDailyRow } from "@/lib/obleth";
+import { guardAdmin } from "@/lib/auth/guard";
 
 // Every column the export can emit, in display order. The client sends a
 // `columns` allowlist (checkboxes); when absent we emit them all. Rows are
@@ -45,6 +46,8 @@ function today(): string {
 }
 
 export async function GET(req: NextRequest) {
+  const denied = await guardAdmin();
+  if (denied) return denied;
   try {
     const p = req.nextUrl.searchParams;
     const startDay = p.get("start_day") ?? defaultStart();
