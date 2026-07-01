@@ -291,7 +291,41 @@ pub(super) async fn apply_lossy(
         out
     };
 
-    for (mi, pi, original) in targets {
+    // Compute neural scores with a single batched call outside the loop.
+    // Exactly one `score` call per request; fails open (None) on any error.
+    let n_targets = targets.len();
+    let neural_scores: Vec<Option<Vec<f32>>> = {
+        let prose_indices: Vec<usize> = targets
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, _, t))| (classify(t) == ContentKind::Prose).then_some(i))
+            .collect();
+        let batches: Vec<Vec<String>> = prose_indices
+            .iter()
+            .map(|&i| super::kompress::split_sentences(&targets[i].2))
+            .collect();
+        // No references to `targets` are held past this point.
+        let flat: Option<Vec<Vec<f32>>> = if let Some(kc) = state.kompress.as_ref() {
+            if !prose_indices.is_empty() {
+                kc.score(&state.http, &batches)
+                    .await
+                    .filter(|v| v.len() == prose_indices.len())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let mut scores: Vec<Option<Vec<f32>>> = vec![None; n_targets];
+        if let Some(s) = flat {
+            for (j, &idx) in prose_indices.iter().enumerate() {
+                scores[idx] = Some(s[j].clone());
+            }
+        }
+        scores
+    };
+
+    for (idx, (mi, pi, original)) in targets.into_iter().enumerate() {
         if stats.segments >= cfg.max_lossy_segments {
             break;
         }
@@ -303,7 +337,12 @@ pub(super) async fn apply_lossy(
             continue;
         }
         let compacted = match classify(&original) {
-            ContentKind::Prose => extract_prose(&original, &query_terms, 0.4),
+            ContentKind::Prose => super::kompress::compact_prose_segment(
+                &original,
+                neural_scores[idx].as_deref(),
+                cfg.neural_keep_ratio,
+                &query_terms,
+            ),
             // Log segments are handled by the separate, safer `compact_logs` opt-in
             // (apply_log_compaction); JSON/Code are handled by the lossless pass.
             _ => None,
