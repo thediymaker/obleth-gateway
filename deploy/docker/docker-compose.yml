@@ -179,10 +179,10 @@ services:
     # from scaling HORIZONTALLY: many replicas each pinned to N cores behind the
     # Service — see the k8s chart (compressor.replicas / numThreads / resources /
     # autoscaling), not one fat container.
-    cpus: ${COMPRESSOR_CPUS:-8}
+    cpus: ${COMPRESSOR_CPUS:-4}
     environment:
-      COMPRESSOR_NUM_THREADS: ${COMPRESSOR_CPUS:-8}
-      OMP_NUM_THREADS: ${COMPRESSOR_CPUS:-8}
+      COMPRESSOR_NUM_THREADS: ${COMPRESSOR_CPUS:-4}
+      OMP_NUM_THREADS: ${COMPRESSOR_CPUS:-4}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s
