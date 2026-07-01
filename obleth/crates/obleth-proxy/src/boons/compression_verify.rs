@@ -644,6 +644,159 @@ fn cross_turn_dedup_removes_repeated_blocks_losslessly() {
     assert!(stash.iter().all(|(_, original)| original.contains("Section 0:")));
 }
 
+// ── Property/fuzz: the structural codec is lossless on ARBITRARY JSON ─────────
+// Curated fixtures prove known shapes; this proves the invariant across thousands
+// of randomly-generated values, including CSV-hostile strings (commas, quotes,
+// newlines, unicode, the literal "null"), sparse object arrays, and nesting.
+
+/// Tiny deterministic xorshift64 RNG — no external crate.
+struct Rng(u64);
+impl Rng {
+    fn next_u64(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next_u64() % n.max(1)
+    }
+}
+
+/// A scalar, sometimes carrying characters that stress CSV escaping / typing.
+fn gen_scalar(rng: &mut Rng) -> Value {
+    match rng.below(6) {
+        0 => Value::Null,
+        1 => Value::Bool(rng.next_u64() & 1 == 0),
+        2 => json!(rng.next_u64() as i64 % 100_000 - 50_000),
+        3 => {
+            // Deliberately nasty strings, incl. ones that collide with typed forms.
+            let choices = ["plain", "a,b", "has\"quote", "line\nbreak", "café ☕", "", "null", "true", "123"];
+            json!(choices[rng.below(choices.len() as u64) as usize])
+        }
+        4 => json!((rng.next_u64() % 1000) as f64 / 7.0),
+        _ => json!(format!("s{}", rng.below(1000))),
+    }
+}
+
+/// Object with 1..=5 keys from a small pool, so arrays of these objects sometimes
+/// share a key set (uniform) and sometimes do not (sparse / union-of-keys).
+fn gen_object(rng: &mut Rng, depth: u32) -> Value {
+    let keys = ["id", "name", "email", "role", "active", "score", "meta", "tags"];
+    let count = 1 + rng.below(5) as usize;
+    let mut map = serde_json::Map::new();
+    for _ in 0..count {
+        let k = keys[rng.below(keys.len() as u64) as usize];
+        map.insert(k.to_string(), gen_value(rng, depth.saturating_sub(1)));
+    }
+    Value::Object(map)
+}
+
+fn gen_value(rng: &mut Rng, depth: u32) -> Value {
+    if depth == 0 {
+        return gen_scalar(rng);
+    }
+    match rng.below(6) {
+        0 | 1 => gen_scalar(rng),
+        2 => {
+            // Array of objects — the qualifying-table candidate.
+            let n = 2 + rng.below(6) as usize;
+            Value::Array((0..n).map(|_| gen_object(rng, depth)).collect())
+        }
+        3 => {
+            let n = rng.below(5) as usize;
+            Value::Array((0..n).map(|_| gen_value(rng, depth - 1)).collect())
+        }
+        4 => gen_object(rng, depth),
+        _ => {
+            // Object wrapping an array-of-objects → exercises compact_recursive.
+            let n = 2 + rng.below(6) as usize;
+            let arr: Vec<Value> = (0..n).map(|_| gen_object(rng, depth)).collect();
+            json!({"wrapped": arr, "note": gen_scalar(rng)})
+        }
+    }
+}
+
+/// A sizable array of near-schema objects: a fixed column set per array with keys
+/// occasionally dropped (sparsity) and CSV-hostile / nested random values. This
+/// mirrors real tabular data, so the table encoder reliably wins — while still
+/// exercising sparse rows, nasty strings, nulls, and nested cells.
+fn gen_rows(rng: &mut Rng, n: usize) -> Vec<Value> {
+    let pool = ["id", "name", "email", "role", "active", "score", "meta", "tags"];
+    let ncols = 4 + rng.below(4) as usize; // 4..=7 columns
+    let schema: Vec<&str> = pool.iter().take(ncols).copied().collect();
+    (0..n)
+        .map(|_| {
+            let mut m = serde_json::Map::new();
+            for k in &schema {
+                // Dense (light ~8% sparsity), mostly scalar cells — the shape that
+                // actually compresses. A rare nested cell keeps that path covered.
+                if rng.below(12) == 0 {
+                    continue;
+                }
+                let cell = if rng.below(8) == 0 { gen_value(rng, 1) } else { gen_scalar(rng) };
+                m.insert((*k).to_string(), cell);
+            }
+            if m.is_empty() {
+                m.insert("id".to_string(), json!(rng.below(1000) as i64));
+            }
+            Value::Object(m)
+        })
+        .collect()
+}
+
+/// A compaction-friendly root: a sizable object-array, that array wrapped in an
+/// object, or two such arrays in one object (exercises the recursive path too).
+fn gen_root(rng: &mut Rng) -> Value {
+    let n = 8 + rng.below(24) as usize;
+    let arr = gen_rows(rng, n);
+    match rng.below(3) {
+        0 => Value::Array(arr),
+        1 => json!({"data": arr, "meta": {"total": n, "page": rng.below(9) as i64}}),
+        _ => {
+            let n2 = 8 + rng.below(16) as usize;
+            let arr2 = gen_rows(rng, n2);
+            json!({"first": arr, "second": arr2, "note": gen_scalar(rng)})
+        }
+    }
+}
+
+#[test]
+fn fuzz_structural_codec_is_always_lossless() {
+    let mut compacted = 0u32;
+    for seed in 1..=3000u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+        let v = gen_root(&mut rng);
+        let text = serde_json::to_string(&v).unwrap();
+
+        // The codec operates on PARSED JSON: a request arrives as text, is parsed
+        // once, and that parsed Value is the source of truth the gateway forwards.
+        // So the losslessness oracle is `from_str(text)`, not the pre-serialization
+        // value `v` — serde_json's default float parser is not correctly-rounded,
+        // so `v` and `from_str(to_string(v))` can differ by 1 ULP on some floats.
+        // The gateway never sees `v`; it sees `from_str(text)`.
+        let expected: Value = serde_json::from_str(&text).unwrap();
+
+        if let Some(out) = structural_json::compact(&text) {
+            compacted += 1;
+            // Decode the structural form; fall back to a plain-JSON parse for the
+            // minify path (which decode_for_verification returns None for).
+            let decoded = structural_json::decode_for_verification(&out)
+                .or_else(|| serde_json::from_str::<Value>(&out).ok());
+            assert_eq!(
+                decoded.as_ref(),
+                Some(&expected),
+                "seed {seed}: structural compaction was NOT lossless\n input:  {text}\n output: {out}"
+            );
+            assert!(out.len() < text.len(), "seed {seed}: compaction must be strictly smaller");
+        }
+    }
+    // Make sure the corpus actually exercised the compaction path a lot.
+    assert!(compacted > 200, "fuzz corpus barely triggered compaction ({compacted}) — generator too weak");
+}
+
 #[test]
 fn log_rewrite_collapses_and_is_reversible() {
     let cfg = CompressionBoonSettings { enabled: true, min_tokens: 16, ..Default::default() };
