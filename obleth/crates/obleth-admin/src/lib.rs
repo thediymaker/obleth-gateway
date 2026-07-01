@@ -1706,6 +1706,7 @@ async fn put_boon_settings(
             code_compaction: body
                 .compression_code_compaction
                 .unwrap_or(existing.compression.code_compaction),
+            neural_keep_ratio: existing.compression.neural_keep_ratio,
         },
     };
 
