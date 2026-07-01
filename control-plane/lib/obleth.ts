@@ -743,9 +743,9 @@ export interface UpdateBoonSettings {
 }
 
 // Live status of the optional neural compression sidecar (a health probe of
-// OBLETH_KOMPRESS_URL). Surfaced in the Compression settings tab, mirroring the
+// OBLETH_COMPRESSOR_URL). Surfaced in the Compression settings tab, mirroring the
 // way the Slurm tab shows provisioner health.
-export interface KompressStatusView {
+export interface CompressorStatusView {
   configured: boolean;
   url: string;
   reachable: boolean;
@@ -1512,7 +1512,7 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  getKompressStatus: () => api<KompressStatusView>("/settings/kompress"),
+  getCompressorStatus: () => api<CompressorStatusView>("/settings/compressor"),
   getCharoSettings: () => api<CharoSettingsView>("/settings/charo"),
   setCharoSettings: (body: CharoSettingsView, options?: AuditOptions) =>
     api<CharoSettingsView>("/settings/charo", {

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Concurrency-sweep load test for the kompress /score endpoint.
+Concurrency-sweep load test for the compressor /score endpoint.
 
 Stdlib only — no external deps, runs anywhere Python 3.9+ is available. Drives a
 RUNNING sidecar at increasing concurrency and reports p50/p95/p99 latency,
@@ -9,7 +9,7 @@ per-pod capacity knee and size the HPA target.
 
 Typical use:
 
-  # start a sidecar (see kompress/bench/README.md), then:
+  # start a sidecar (see compressor/bench/README.md), then:
   python loadtest.py --url http://127.0.0.1:8899 \
       --concurrency 1,2,4,8,16,32 --requests 200 --sentences 40
 
@@ -129,7 +129,7 @@ def run_level(url: str, body: bytes, concurrency: int, total: int, timeout: floa
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="kompress /score concurrency sweep")
+    ap = argparse.ArgumentParser(description="compressor /score concurrency sweep")
     ap.add_argument("--url", default="http://127.0.0.1:8899", help="sidecar base URL")
     ap.add_argument("--concurrency", default="1,2,4,8,16,32", help="comma-separated concurrency levels")
     ap.add_argument("--requests", type=int, default=200, help="requests per concurrency level")

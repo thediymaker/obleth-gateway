@@ -1,4 +1,4 @@
-# Runtime dependencies for the kompress sidecar.
+# Runtime dependencies for the compressor sidecar.
 # The build-time fetch dep (huggingface_hub) is NOT listed here; it is only
 # needed by fetch_model.py to download the pre-built ONNX artefact at image
 # build time. onnxruntime is the CPU wheel; model.py pins the CPUExecutionProvider.

@@ -8,7 +8,7 @@ name: obleth
 #   edge          -> HAProxy front door (TLS/round-robin; use a real LB in prod)
 #   observability -> Prometheus + Grafana + Jaeger (OTLP traces)
 #   slurm         -> obleth-provisioner plugin (keeps managed models alive on Slurm)
-#   kompress      -> neural prose compression sidecar (bakes ~600 MB ONNX model)
+#   compressor      -> neural prose compression sidecar (bakes ~600 MB ONNX model)
 #
 # Enable extras via config: add them to COMPOSE_PROFILES in .env (see
 # .env.example), then a single `docker compose up -d --build` (run from this
@@ -137,9 +137,9 @@ services:
       OBLETH_SLACK_WEBHOOK_URL: ${OBLETH_SLACK_WEBHOOK_URL:-}
       OBLETH_SLACK_ALERT_MIN_INTERVAL_SECS: ${OBLETH_SLACK_ALERT_MIN_INTERVAL_SECS:-300}
       # Neural prose compression sidecar (optional). Empty = off. Set to
-      # http://kompress:8080 and start the `kompress` profile to enable.
-      OBLETH_KOMPRESS_URL: ${OBLETH_KOMPRESS_URL:-}
-      OBLETH_KOMPRESS_TIMEOUT_MS: ${OBLETH_KOMPRESS_TIMEOUT_MS:-}
+      # http://compressor:8080 and start the `compressor` profile to enable.
+      OBLETH_COMPRESSOR_URL: ${OBLETH_COMPRESSOR_URL:-}
+      OBLETH_COMPRESSOR_TIMEOUT_MS: ${OBLETH_COMPRESSOR_TIMEOUT_MS:-}
       RUST_LOG: info,obleth=debug
     # host 8088 -> container 8080 (8080 may be taken by other local stacks);
     # internal networking + HAProxy still use 8080.
@@ -151,26 +151,26 @@ services:
       redis: { condition: service_healthy }
       clickhouse: { condition: service_healthy }
 
-  # Optional neural prose compression sidecar. Gated behind the `kompress`
+  # Optional neural prose compression sidecar. Gated behind the `compressor`
   # profile so it never starts by default (the image bakes a ~600 MB ONNX
-  # model). Opt in by adding `kompress` to COMPOSE_PROFILES in .env, then a
+  # model). Opt in by adding `compressor` to COMPOSE_PROFILES in .env, then a
   # single `docker compose up -d --build` picks it up. The obleth service
-  # calls it when OBLETH_KOMPRESS_URL is set; it fails open if the sidecar is
+  # calls it when OBLETH_COMPRESSOR_URL is set; it fails open if the sidecar is
   # absent or unreachable, so obleth must NOT depend on this service.
-  kompress:
-    profiles: ["kompress"]
-    image: ghcr.io/thediymaker/obleth-gateway/obleth-kompress:${OBLETH_VERSION:-latest}
+  compressor:
+    profiles: ["compressor"]
+    image: ghcr.io/thediymaker/obleth-gateway/obleth-compressor:${OBLETH_VERSION:-latest}
     build:
       context: ../..
-      dockerfile: deploy/docker/obleth-kompress.Dockerfile
+      dockerfile: deploy/docker/obleth-compressor.Dockerfile
       # Swap the neural model at build time. Defaults bake kompress-v2-base
       # (pre-built ONNX). For LLMLingua-2 set in .env:
-      #   KOMPRESS_SOURCE=export
-      #   KOMPRESS_MODEL_ID=microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank
+      #   COMPRESSOR_SOURCE=export
+      #   COMPRESSOR_MODEL_ID=microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank
       args:
-        KOMPRESS_SOURCE: ${KOMPRESS_SOURCE:-onnx}
-        MODEL_ID: ${KOMPRESS_MODEL_ID:-chopratejas/kompress-v2-base}
-        ONNX_FILE: ${KOMPRESS_ONNX_FILE:-onnx/kompress-fp32.onnx}
+        COMPRESSOR_SOURCE: ${COMPRESSOR_SOURCE:-onnx}
+        MODEL_ID: ${COMPRESSOR_MODEL_ID:-chopratejas/kompress-v2-base}
+        ONNX_FILE: ${COMPRESSOR_ONNX_FILE:-onnx/kompress-fp32.onnx}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s

@@ -1,4 +1,4 @@
-# kompress — sentence-scoring sidecar
+# compressor — sentence-scoring sidecar
 
 Optional, horizontally-scalable sidecar that assigns per-sentence importance
 scores for extractive prose compression.  The gateway POSTs sentence batches
@@ -52,7 +52,7 @@ or `"unknown"` if the file is absent.
 
 | Variable              | Default    | Description                                   |
 |-----------------------|------------|-----------------------------------------------|
-| `KOMPRESS_MODEL_DIR`  | `/models`  | Directory containing `model.onnx`, `tokenizer.json`, `revision.txt` |
+| `COMPRESSOR_MODEL_DIR`  | `/models`  | Directory containing `model.onnx`, `tokenizer.json`, `revision.txt` |
 | `PORT`                | `8080`     | Listening port (set in the Dockerfile CMD)    |
 
 ## Baking the model into an image
@@ -72,7 +72,7 @@ RUN pip install -r requirements.txt
 
 ```sh
 pip install -r requirements.txt
-KOMPRESS_MODEL_DIR=/path/to/exported/models uvicorn app:app --port 8080
+COMPRESSOR_MODEL_DIR=/path/to/exported/models uvicorn app:app --port 8080
 ```
 
 ## Running tests (no model needed)

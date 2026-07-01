@@ -1,7 +1,7 @@
 """
-Build-time model provisioning for the kompress sidecar.
+Build-time model provisioning for the compressor sidecar.
 
-Two sources, selected by --source (KOMPRESS_SOURCE build arg):
+Two sources, selected by --source (COMPRESSOR_SOURCE build arg):
 
   onnx    (default) Download a PRE-BUILT ONNX file + tokenizer from the repo.
           Used by chopratejas/kompress-v2-base, which ships ONNX. Only dep:
@@ -101,7 +101,7 @@ def fetch_export(model_id: str, out_dir: str) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Provision the kompress model.")
+    parser = argparse.ArgumentParser(description="Provision the compressor model.")
     parser.add_argument("--source", choices=["onnx", "export"], default="onnx")
     parser.add_argument("--model-id", default="chopratejas/kompress-v2-base")
     parser.add_argument("--out-dir", default="/models")

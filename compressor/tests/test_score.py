@@ -1,5 +1,5 @@
 """
-Unit tests for kompress scoring sidecar.
+Unit tests for compressor scoring sidecar.
 
 Uses a monkeypatched FakeScorer — no model download, no onnxruntime required.
 """

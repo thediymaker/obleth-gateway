@@ -1,29 +1,29 @@
 //! Neural prose compression: extractive sentence selection plus an HTTP client
-//! for the optional kompress scoring sidecar.
+//! for the optional compressor scoring sidecar.
 //!
 //! Pure functions (`split_sentences`, `select_kept`) are used by the lossy
-//! compression pass. `KompressClient` handles the sidecar POST and is held on
+//! compression pass. `CompressorClient` handles the sidecar POST and is held on
 //! `AppState` so a single client is shared across requests.
 
 // ── Sidecar client ────────────────────────────────────────────────────────────
 
-/// HTTP client for the optional kompress scoring sidecar.
+/// HTTP client for the optional compressor scoring sidecar.
 ///
-/// Construct with [`KompressClient::from_env`] or [`parse_config`].
+/// Construct with [`CompressorClient::from_env`] or [`parse_config`].
 /// The caller supplies the shared [`reqwest::Client`] on each [`score`] call so
 /// no internal client is held.
 #[derive(Clone)]
-pub struct KompressClient {
+pub struct CompressorClient {
     pub base_url: String,
     pub timeout: std::time::Duration,
 }
 
-/// Build a `KompressClient` from explicit values.
+/// Build a `CompressorClient` from explicit values.
 ///
 /// Returns `Some` only when `url` is `Some` and non-empty after trimming.
 /// Strips a single trailing `/` from the URL. `timeout_ms` is parsed as `u64`
 /// milliseconds; unparseable or absent values default to 800 ms.
-fn parse_config(url: Option<&str>, timeout_ms: Option<&str>) -> Option<KompressClient> {
+fn parse_config(url: Option<&str>, timeout_ms: Option<&str>) -> Option<CompressorClient> {
     let raw_url = url?;
     let trimmed = raw_url.trim();
     if trimmed.is_empty() {
@@ -34,18 +34,18 @@ fn parse_config(url: Option<&str>, timeout_ms: Option<&str>) -> Option<KompressC
         .and_then(|s| s.parse::<u64>().ok())
         .map(std::time::Duration::from_millis)
         .unwrap_or_else(|| std::time::Duration::from_millis(800));
-    Some(KompressClient { base_url, timeout })
+    Some(CompressorClient { base_url, timeout })
 }
 
-impl KompressClient {
+impl CompressorClient {
     /// Construct from environment variables.
     ///
-    /// Reads `OBLETH_KOMPRESS_URL` and `OBLETH_KOMPRESS_TIMEOUT_MS`.
+    /// Reads `OBLETH_COMPRESSOR_URL` and `OBLETH_COMPRESSOR_TIMEOUT_MS`.
     /// Returns `None` when the URL variable is unset or empty.
-    pub fn from_env() -> Option<KompressClient> {
+    pub fn from_env() -> Option<CompressorClient> {
         parse_config(
-            std::env::var("OBLETH_KOMPRESS_URL").ok().as_deref(),
-            std::env::var("OBLETH_KOMPRESS_TIMEOUT_MS").ok().as_deref(),
+            std::env::var("OBLETH_COMPRESSOR_URL").ok().as_deref(),
+            std::env::var("OBLETH_COMPRESSOR_TIMEOUT_MS").ok().as_deref(),
         )
     }
 

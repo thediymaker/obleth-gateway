@@ -322,10 +322,10 @@ pub(super) async fn apply_lossy(
             .collect();
         let batches: Vec<Vec<String>> = prose_indices
             .iter()
-            .map(|&i| super::kompress::split_sentences(&targets[i].2))
+            .map(|&i| super::compressor::split_sentences(&targets[i].2))
             .collect();
         // No references to `targets` are held past this point.
-        let flat: Option<Vec<Vec<f32>>> = if let Some(kc) = state.kompress.as_ref() {
+        let flat: Option<Vec<Vec<f32>>> = if let Some(kc) = state.compressor.as_ref() {
             if !prose_indices.is_empty() {
                 kc.score(&state.http, &batches)
                     .await
@@ -357,7 +357,7 @@ pub(super) async fn apply_lossy(
             continue;
         }
         let compacted = match classify(&original) {
-            ContentKind::Prose => super::kompress::compact_prose_segment(
+            ContentKind::Prose => super::compressor::compact_prose_segment(
                 &original,
                 neural_scores[idx].as_deref(),
                 cfg.neural_keep_ratio,

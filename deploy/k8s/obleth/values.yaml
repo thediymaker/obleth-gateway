@@ -220,13 +220,13 @@ provisioner:
 # Optional neural prose compression sidecar. Off by default — enable only when
 # you want extractive prose compression backed by the ONNX scoring model. The
 # image is large (~600 MB baked model); plan for slow image pulls on first
-# deploy. The obleth data plane calls the sidecar when OBLETH_KOMPRESS_URL is
+# deploy. The obleth data plane calls the sidecar when OBLETH_COMPRESSOR_URL is
 # set (wired automatically when this is enabled); it fails open if unreachable.
-kompress:
+compressor:
   enabled: false
   replicas: 1
   image:
-    repository: ghcr.io/thediymaker/obleth-gateway/obleth-kompress
+    repository: ghcr.io/thediymaker/obleth-gateway/obleth-compressor
     # Empty -> v{appVersion} from Chart.yaml, so each chart release pins its
     # own image. Override to test a specific tag (e.g. "main" for edge builds).
     tag: ""

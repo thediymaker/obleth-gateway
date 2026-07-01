@@ -38,7 +38,7 @@ import type {
   AutoRouterSettingsView,
   BoonSettingsView,
   CharoSettingsView,
-  KompressStatusView,
+  CompressorStatusView,
   ModelRoute,
   SlurmHealthView,
   SlurmSettingsView,
@@ -952,22 +952,22 @@ export function BoonsSettingsForm({
   );
 }
 
-function KompressStatusBlock({ kompress }: { kompress: KompressStatusView | null }) {
-  if (!kompress || !kompress.configured) {
+function CompressorStatusBlock({ compressor }: { compressor: CompressorStatusView | null }) {
+  if (!compressor || !compressor.configured) {
     return (
       <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-sm text-muted-foreground">
         <span className="mt-1 inline-block h-2 w-2 shrink-0 rounded-full bg-muted-foreground/50" />
         <span>
           <span className="font-medium text-foreground">Neural sidecar not configured.</span> The
           lossy prose pass uses the built-in heuristic. To enable the trained{" "}
-          <code>kompress</code> scorer, deploy the sidecar and set{" "}
-          <code>OBLETH_KOMPRESS_URL</code> (Docker: add <code>kompress</code> to{" "}
-          <code>COMPOSE_PROFILES</code>; Kubernetes: <code>kompress.enabled=true</code>).
+          <code>compressor</code> scorer, deploy the sidecar and set{" "}
+          <code>OBLETH_COMPRESSOR_URL</code> (Docker: add <code>compressor</code> to{" "}
+          <code>COMPOSE_PROFILES</code>; Kubernetes: <code>compressor.enabled=true</code>).
         </span>
       </div>
     );
   }
-  const ok = kompress.reachable;
+  const ok = compressor.reachable;
   return (
     <div
       className={
@@ -987,19 +987,19 @@ function KompressStatusBlock({ kompress }: { kompress: KompressStatusView | null
         {ok ? (
           <>
             <span className="font-medium">Neural sidecar reachable</span> — model{" "}
-            <span className="font-mono">{kompress.model ?? "unknown"}</span>
-            {kompress.revision && (
+            <span className="font-mono">{compressor.model ?? "unknown"}</span>
+            {compressor.revision && (
               <span className="ml-1 font-mono text-xs opacity-70">
-                {kompress.revision.slice(0, 7)}
+                {compressor.revision.slice(0, 7)}
               </span>
             )}{" "}
-            at <code>{kompress.url}</code>. The lossy prose pass uses the neural scorer.
+            at <code>{compressor.url}</code>. The lossy prose pass uses the neural scorer.
           </>
         ) : (
           <>
             <span className="font-medium">Neural sidecar unreachable</span> at{" "}
-            <code>{kompress.url}</code>
-            {kompress.error && <> — {kompress.error}</>}. The gateway falls back to the built-in
+            <code>{compressor.url}</code>
+            {compressor.error && <> — {compressor.error}</>}. The gateway falls back to the built-in
             heuristic until it recovers.
           </>
         )}
@@ -1010,10 +1010,10 @@ function KompressStatusBlock({ kompress }: { kompress: KompressStatusView | null
 
 export function CompressionSettingsForm({
   settings,
-  kompress,
+  compressor,
 }: {
   settings: BoonSettingsView | null;
-  kompress: KompressStatusView | null;
+  compressor: CompressorStatusView | null;
 }) {
   const [pending, start] = useTransition();
   const [status, setStatus] = useState<{ ok: boolean; message: string } | null>(null);
@@ -1076,7 +1076,7 @@ export function CompressionSettingsForm({
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <KompressStatusBlock kompress={kompress} />
+        <CompressorStatusBlock compressor={compressor} />
 
         <ToggleRow
           label="Enable compression boon"
@@ -1159,7 +1159,7 @@ export function CompressionSettingsForm({
             />
             <p className="text-xs text-muted-foreground">
               Fraction of sentences the lossy prose pass keeps (0.05–1.0). Lower is more aggressive.
-              Applies to both the built-in heuristic and the neural kompress sidecar.
+              Applies to both the built-in heuristic and the neural compressor sidecar.
             </p>
           </div>
         </div>

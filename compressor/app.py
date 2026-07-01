@@ -1,5 +1,5 @@
 """
-kompress scoring sidecar — FastAPI application.
+compressor scoring sidecar — FastAPI application.
 
 POST /score   — score sentence batches
 GET  /health  — liveness + revision
@@ -56,7 +56,7 @@ scorer: Optional[object] = None  # type: ignore[type-arg]
 async def lifespan(_app: FastAPI):
     """Load the scorer on startup; degrade to None (503 on /score) if absent."""
     global scorer
-    model_dir = os.environ.get("KOMPRESS_MODEL_DIR", "/models")
+    model_dir = os.environ.get("COMPRESSOR_MODEL_DIR", "/models")
     try:
         from model import Scorer  # noqa: PLC0415
 
@@ -68,7 +68,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="kompress", version="0.1.0", lifespan=lifespan)
+app = FastAPI(title="compressor", version="0.1.0", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +79,7 @@ app = FastAPI(title="kompress", version="0.1.0", lifespan=lifespan)
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     rev = scorer.revision if scorer is not None else "unknown"  # type: ignore[union-attr]
-    model = os.environ.get("KOMPRESS_MODEL_NAME", "kompress")
+    model = os.environ.get("COMPRESSOR_MODEL_NAME", "compressor")
     return HealthResponse(status="ok", model=model, revision=rev)
 
 
