@@ -222,16 +222,45 @@ provisioner:
 # image is large (~600 MB baked model); plan for slow image pulls on first
 # deploy. The obleth data plane calls the sidecar when OBLETH_COMPRESSOR_URL is
 # set (wired automatically when this is enabled); it fails open if unreachable.
+#
+# SCALING MODEL — scale HORIZONTALLY, with SMALL pods. Measured on the default
+# kompress-v2 model (CPU): a single inference saturates at ~4 cores — 4 cores do
+# ~105 sentences/s, and 8/16/24 cores do ~108/112/107 (i.e. barely more). Giving a
+# pod many cores is wasted: you get ~the same throughput as a 4-8 core pod while
+# starving other workloads. BUT each pod holds the ~900 MB model resident in RAM,
+# so very small pods multiply memory. Sweet spot: ~4-8 cores per pod, then add
+# REPLICAS for aggregate throughput. On a CPU-rich cluster prefer e.g.
+# replicas: 24, numThreads: 8, limits.cpu "8" (~2500 sent/s over 192 cores) over
+# a handful of fat pods (same cores, a fraction of the throughput).
+# Keep numThreads == requests.cpu == limits.cpu per replica. Caveat: the gateway
+# reuses keep-alive connections to the Service, so spread improves with request
+# concurrency (and gateway replicas); size minReplicas for steady-state load.
 compressor:
   enabled: false
+  # Horizontal scale knob — the primary throughput lever. Raise this (or set it as
+  # minReplicas with autoscaling on) rather than growing numThreads past ~8.
   replicas: 1
+  # onnxruntime intra-op threads per pod. Keep small (~4-8): a single inference
+  # saturates near 4 cores. MUST match resources.limits.cpu below.
+  numThreads: 8
   image:
     repository: ghcr.io/thediymaker/obleth-gateway/obleth-compressor
     # Empty -> v{appVersion} from Chart.yaml, so each chart release pins its
     # own image. Override to test a specific tag (e.g. "main" for edge builds).
     tag: ""
     pullPolicy: IfNotPresent
-  resources: {}
+  # Reserve AND bound each replica's cores. Keep cpu == numThreads (small). Do NOT
+  # leave this empty ({}) in production: the scorer would grab node cores uncapped,
+  # starve neighbours, and make CPU-based autoscaling meaningless. The model is
+  # ~900 MB resident, so give memory headroom (and remember tiny pods multiply it).
+  resources:
+    requests:
+      cpu: "8"
+      memory: 1536Mi
+    limits:
+      cpu: "8"
+      memory: 2Gi
+  # CPU-based HPA is meaningful ONLY because resources.limits.cpu is set above.
   autoscaling:
     enabled: false
     minReplicas: 1

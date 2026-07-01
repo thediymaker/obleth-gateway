@@ -171,6 +171,18 @@ services:
         COMPRESSOR_SOURCE: ${COMPRESSOR_SOURCE:-onnx}
         MODEL_ID: ${COMPRESSOR_MODEL_ID:-chopratejas/kompress-v2-base}
         ONNX_FILE: ${COMPRESSOR_ONNX_FILE:-onnx/kompress-fp32.onnx}
+    # The scorer is CPU-hungry: onnxruntime saturates every core it is allowed on
+    # each inference, and throughput is core-bound. This compose stack is meant for
+    # dev/testing, so cap it to a small, sane slice — a hard CPU quota AND the
+    # matching onnxruntime thread count — rather than letting it monopolize the
+    # host. Bump COMPRESSOR_CPUS locally to taste. In production, throughput comes
+    # from scaling HORIZONTALLY: many replicas each pinned to N cores behind the
+    # Service — see the k8s chart (compressor.replicas / numThreads / resources /
+    # autoscaling), not one fat container.
+    cpus: ${COMPRESSOR_CPUS:-8}
+    environment:
+      COMPRESSOR_NUM_THREADS: ${COMPRESSOR_CPUS:-8}
+      OMP_NUM_THREADS: ${COMPRESSOR_CPUS:-8}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s

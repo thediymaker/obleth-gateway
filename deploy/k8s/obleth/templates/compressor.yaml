@@ -29,6 +29,15 @@ spec:
           securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
           ports:
             - { name: http, containerPort: 8080 }
+          env:
+            # Bound onnxruntime's intra-op thread pool to this pod's core
+            # allotment. Without it the scorer spawns one thread per NODE core and
+            # thrashes against its cgroup CPU limit. Keep numThreads == the CPU
+            # limit below so each replica cleanly owns N cores.
+            - name: COMPRESSOR_NUM_THREADS
+              value: {{ .Values.compressor.numThreads | quote }}
+            - name: OMP_NUM_THREADS
+              value: {{ .Values.compressor.numThreads | quote }}
           readinessProbe:
             httpGet: { path: /health, port: http }
             initialDelaySeconds: 30
