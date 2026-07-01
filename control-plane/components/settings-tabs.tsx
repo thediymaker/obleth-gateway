@@ -18,7 +18,7 @@ import type {
   AutoRouterSettingsView,
   BoonSettingsView,
   CharoSettingsView,
-  KompressStatusView,
+  CompressorStatusView,
   ModelRoute,
   SlurmSettingsView,
   UsageRetentionView,
@@ -29,7 +29,7 @@ export function SettingsTabs({
   autoRouter,
   boons,
   charo,
-  kompress,
+  compressor,
   models,
   retention,
   slurm,
@@ -39,7 +39,7 @@ export function SettingsTabs({
   autoRouter: AutoRouterSettingsView | null;
   boons: BoonSettingsView | null;
   charo: CharoSettingsView | null;
-  kompress: KompressStatusView | null;
+  compressor: CompressorStatusView | null;
   models: ModelRoute[];
   retention: UsageRetentionView | null;
   slurm: SlurmSettingsView | null;
@@ -90,7 +90,7 @@ export function SettingsTabs({
       </TabsContent>
 
       <TabsContent value="compression">
-        <CompressionSettingsForm settings={boons} kompress={kompress} />
+        <CompressionSettingsForm settings={boons} compressor={compressor} />
       </TabsContent>
 
       <TabsContent value="data">

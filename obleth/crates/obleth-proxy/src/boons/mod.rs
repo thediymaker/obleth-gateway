@@ -32,7 +32,7 @@ mod compression_verify;
 pub(crate) mod drain;
 pub(crate) mod embedded_json;
 pub(crate) mod guardrails;
-pub(crate) mod kompress;
+pub(crate) mod compressor;
 pub mod mcp_tools;
 pub mod respond;
 pub(crate) mod structural_json;

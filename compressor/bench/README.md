@@ -1,4 +1,4 @@
-# kompress load-test harness
+# compressor load-test harness
 
 Stress-test the neural compression sidecar to find its per-pod capacity and tune
 runtime knobs. Everything here is stdlib Python + Docker — no extra deps.
@@ -8,20 +8,20 @@ runtime knobs. Everything here is stdlib Python + Docker — no extra deps.
 - **Do we need to scale, and to what?** Find the concurrency where p95 latency
   crosses your SLO and throughput flattens — that's one pod's capacity. Size the
   HPA target a bit below it.
-- **Which runtime settings are best?** Sweep `KOMPRESS_MAX_BATCH`, ONNX thread
+- **Which runtime settings are best?** Sweep `COMPRESSOR_MAX_BATCH`, ONNX thread
   counts, or the fp32-vs-int8 model and compare on identical load.
 
 ## Quick start
 
 ```bash
 # 1. Start a sidecar (fp32, default batch size):
-docker run -d --name kompress -p 8899:8080 \
-  ghcr.io/thediymaker/obleth-gateway/obleth-kompress:latest
+docker run -d --name compressor -p 8899:8080 \
+  ghcr.io/thediymaker/obleth-gateway/obleth-compressor:latest
 
 # 2. Sweep concurrency, sampling the container's CPU%:
 python loadtest.py --url http://127.0.0.1:8899 \
   --concurrency 1,2,4,8,16,32 --requests 200 --sentences 40 \
-  --docker-name kompress
+  --docker-name compressor
 ```
 
 Output columns: `conc` (concurrency), `req/s`, `sent/s` (sentences/s — the real
@@ -45,9 +45,9 @@ down — so comparisons are clean.
 KNOB=OMP_NUM_THREADS VALUES="1 2 4 8" ./sweep.sh
 
 # int8 vs fp32: build an int8 image first, then point IMAGE at it:
-#   docker build -f deploy/docker/obleth-kompress.Dockerfile \
-#     --build-arg ONNX_FILE=onnx/kompress-int8-wo.onnx -t kompress:int8 .
-IMAGE=kompress:int8 ./sweep.sh
+#   docker build -f deploy/docker/obleth-compressor.Dockerfile \
+#     --build-arg ONNX_FILE=onnx/kompress-int8-wo.onnx -t compressor:int8 .
+IMAGE=compressor:int8 ./sweep.sh
 ```
 
 ## Notes

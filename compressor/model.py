@@ -10,7 +10,7 @@ compressor wants to keep is information-dense and should rank higher.
 Sentences are scored in BATCHES — all sentences in a chunk are padded to a common
 length and run through the model in a single `session.run`, which lets onnxruntime
 parallelize across the batch dimension instead of one inference per sentence.
-Chunk size is bounded (`KOMPRESS_MAX_BATCH`) so a huge segment can't build one
+Chunk size is bounded (`COMPRESSOR_MAX_BATCH`) so a huge segment can't build one
 giant padded tensor.
 
 Heavy imports (onnxruntime, tokenizers, numpy) are loaded LAZILY inside __init__
@@ -60,7 +60,7 @@ class Scorer:
 
         # Cap sentences per ONNX call so an enormous segment can't allocate one
         # (huge_N x max_len) tensor. Tunable for perf/memory experiments.
-        self._max_batch = max(1, int(os.environ.get("KOMPRESS_MAX_BATCH", "32")))
+        self._max_batch = max(1, int(os.environ.get("COMPRESSOR_MAX_BATCH", "32")))
 
     @property
     def revision(self) -> str:

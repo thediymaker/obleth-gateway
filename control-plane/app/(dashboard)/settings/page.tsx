@@ -9,7 +9,7 @@ export default async function SettingsPage() {
   const settings = await safe(obleth.getAlertSettings(), null);
   const autoRouter = await safe(obleth.getAutoRouterSettings(), null);
   const boons = await safe(obleth.getBoonSettings(), null);
-  const kompress = await safe(obleth.getKompressStatus(), null);
+  const compressor = await safe(obleth.getCompressorStatus(), null);
   const charo = await safe(obleth.getCharoSettings(), null);
   const models = await safe(obleth.listModels(), []);
   const retention = await safe(obleth.getUsageRetention(), null);
@@ -29,7 +29,7 @@ export default async function SettingsPage() {
         autoRouter={autoRouter}
         boons={boons}
         charo={charo}
-        kompress={kompress}
+        compressor={compressor}
         models={models}
         retention={retention}
         slurm={slurm}

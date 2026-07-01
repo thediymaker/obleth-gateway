@@ -1325,7 +1325,7 @@ pub struct CompressionBoonSettings {
     /// this; tenants with no policy inherit it. Off by default.
     #[serde(default)]
     pub allow_lossy: bool,
-    /// Fraction of sentences the kompress sidecar selects to keep during the
+    /// Fraction of sentences the compressor sidecar selects to keep during the
     /// neural extractive pass. Range `(0.0, 1.0]`; defaults to 0.5.
     #[serde(default = "default_neural_keep_ratio")]
     pub neural_keep_ratio: f32,

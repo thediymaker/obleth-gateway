@@ -8,7 +8,7 @@ workflow falls back to auto-generated notes.
 Optional neural prose compression: shrink long prose more aggressively than the built-in heuristic, served by a model you run yourself — same governance, still fully reversible.
 
 - **Neural extractive prose compaction.** The compression boon's lossy pass can now score sentences with a trained extractive model instead of the built-in heuristic, keeping the most load-bearing sentences and dropping filler. It only ever selects existing sentences — nothing is rewritten or invented — and every original stays fully recoverable.
-- **Runs on your own infrastructure.** The model is served by an optional sidecar you deploy alongside the gateway: a plain container that scales horizontally behind a Service, with no Slurm or GPU required and no data leaving your network. Ships as a published image plus a Helm switch (`kompress.enabled`) and an opt-in Docker Compose profile.
+- **Runs on your own infrastructure.** The model is served by an optional sidecar you deploy alongside the gateway: a plain container that scales horizontally behind a Service, with no Slurm or GPU required and no data leaving your network. Ships as a published image plus a Helm switch (`compressor.enabled`) and an opt-in Docker Compose profile.
 - **Off by default, fails open.** Nothing changes until you deploy the sidecar and point the gateway at it. If it is absent, slow, or unavailable, the gateway silently falls back to the existing heuristic — a request is never delayed or failed because of it. A tunable keep-ratio dials how aggressively prose is trimmed.
 
 ## v0.6.0

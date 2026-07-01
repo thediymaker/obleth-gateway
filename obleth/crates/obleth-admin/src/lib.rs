@@ -254,7 +254,7 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/settings/boons",
             get(get_boon_settings).put(put_boon_settings),
         )
-        .route("/api/v1/settings/kompress", get(get_kompress_status))
+        .route("/api/v1/settings/compressor", get(get_compressor_status))
         .route(
             "/api/v1/settings/charo",
             get(get_charo_settings).put(put_charo_settings),
@@ -1615,7 +1615,7 @@ pub struct UpdateBoonSettings {
     /// Global default for lossy text compaction (tenant policy overrides). Omit to leave unchanged.
     #[serde(default)]
     pub compression_allow_lossy: Option<bool>,
-    /// Fraction of sentences the neural (kompress) prose pass keeps. Must be in
+    /// Fraction of sentences the neural (compressor) prose pass keeps. Must be in
     /// `(0.0, 1.0]`; values outside that range (or omitted) leave it unchanged.
     #[serde(default)]
     pub compression_neural_keep_ratio: Option<f32>,
@@ -1776,13 +1776,13 @@ pub struct CharoSettingsView {
 }
 
 /// Live status of the optional neural compression sidecar. Its URL is env-only
-/// operator config (`OBLETH_KOMPRESS_URL`), not stored in the DB, so this is a
+/// operator config (`OBLETH_COMPRESSOR_URL`), not stored in the DB, so this is a
 /// live on-demand probe of the sidecar's `/health` — mirroring how the Slurm tab
 /// surfaces provisioner health. Fail-soft: any error yields `reachable=false`
 /// with the reason, never an error response.
 #[derive(Debug, Serialize, ToSchema)]
-pub struct KompressStatusView {
-    /// True when `OBLETH_KOMPRESS_URL` is set (the feature is wired at all).
+pub struct CompressorStatusView {
+    /// True when `OBLETH_COMPRESSOR_URL` is set (the feature is wired at all).
     pub configured: bool,
     /// The configured sidecar base URL (empty when unconfigured).
     pub url: String,
@@ -1797,18 +1797,18 @@ pub struct KompressStatusView {
 }
 
 #[utoipa::path(
-    get, path = "/api/v1/settings/kompress", tag = "settings",
-    responses((status = 200, body = KompressStatusView))
+    get, path = "/api/v1/settings/compressor", tag = "settings",
+    responses((status = 200, body = CompressorStatusView))
 )]
-async fn get_kompress_status() -> Result<Json<KompressStatusView>> {
-    let url = std::env::var("OBLETH_KOMPRESS_URL")
+async fn get_compressor_status() -> Result<Json<CompressorStatusView>> {
+    let url = std::env::var("OBLETH_COMPRESSOR_URL")
         .unwrap_or_default()
         .trim()
         .trim_end_matches('/')
         .to_string();
 
     if url.is_empty() {
-        return Ok(Json(KompressStatusView {
+        return Ok(Json(CompressorStatusView {
             configured: false,
             url: String::new(),
             reachable: false,
@@ -1820,7 +1820,7 @@ async fn get_kompress_status() -> Result<Json<KompressStatusView>> {
 
     // Give the settings probe a little more room than the 800ms request-path
     // timeout — a cold sidecar can be slow to answer its first /health.
-    let timeout_ms = std::env::var("OBLETH_KOMPRESS_TIMEOUT_MS")
+    let timeout_ms = std::env::var("OBLETH_COMPRESSOR_TIMEOUT_MS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .filter(|ms| *ms > 0)
@@ -1828,7 +1828,7 @@ async fn get_kompress_status() -> Result<Json<KompressStatusView>> {
         .max(2000);
 
     let unreachable = |url: String, error: String| {
-        Json(KompressStatusView {
+        Json(CompressorStatusView {
             configured: true,
             url,
             reachable: false,
@@ -1850,7 +1850,7 @@ async fn get_kompress_status() -> Result<Json<KompressStatusView>> {
         Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
             Ok(v) => {
                 let ok = v.get("status").and_then(|s| s.as_str()) == Some("ok");
-                Ok(Json(KompressStatusView {
+                Ok(Json(CompressorStatusView {
                     configured: true,
                     url,
                     reachable: ok,

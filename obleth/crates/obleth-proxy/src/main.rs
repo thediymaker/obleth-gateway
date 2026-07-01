@@ -210,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
                 )
             })
             .unwrap_or(true),
-        kompress: crate::boons::kompress::KompressClient::from_env(),
+        compressor: crate::boons::compressor::CompressorClient::from_env(),
     };
 
     match store.all_resolved_models().await {

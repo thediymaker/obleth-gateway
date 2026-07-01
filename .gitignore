@@ -55,6 +55,6 @@ obench/.obench.json
 
 /asset-tools
 
-# ---- kompress sidecar ----
-kompress/.venv/
-kompress/**/__pycache__/
+# ---- compressor sidecar ----
+compressor/.venv/
+compressor/**/__pycache__/

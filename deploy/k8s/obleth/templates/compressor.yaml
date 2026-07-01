@@ -1,31 +1,31 @@
-{{- if .Values.kompress.enabled }}
+{{- if .Values.compressor.enabled }}
 # Optional neural prose compression sidecar. Serves POST /score + GET /health
-# on port 8080. The obleth data plane calls it when OBLETH_KOMPRESS_URL is
+# on port 8080. The obleth data plane calls it when OBLETH_COMPRESSOR_URL is
 # set; if absent or unreachable the gateway falls back to a built-in heuristic
-# (fail-open). Enable via kompress.enabled=true in your values override; the
+# (fail-open). Enable via compressor.enabled=true in your values override; the
 # image bakes a ~600 MB ONNX model so builds are slow.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ .Release.Name }}-kompress
+  name: {{ .Release.Name }}-compressor
   labels: {{- include "obleth.labels" . | nindent 4 }}
 spec:
-  {{- if not .Values.kompress.autoscaling.enabled }}
-  replicas: {{ .Values.kompress.replicas }}
+  {{- if not .Values.compressor.autoscaling.enabled }}
+  replicas: {{ .Values.compressor.replicas }}
   {{- end }}
   selector:
     matchLabels:
-      app: {{ .Release.Name }}-kompress
+      app: {{ .Release.Name }}-compressor
   template:
     metadata:
       labels:
-        app: {{ .Release.Name }}-kompress
+        app: {{ .Release.Name }}-compressor
     spec:
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
-        - name: kompress
-          image: {{ .Values.kompress.image.repository }}:{{ .Values.kompress.image.tag | default (printf "v%s" .Chart.AppVersion) }}
-          imagePullPolicy: {{ .Values.kompress.image.pullPolicy }}
+        - name: compressor
+          image: {{ .Values.compressor.image.repository }}:{{ .Values.compressor.image.tag | default (printf "v%s" .Chart.AppVersion) }}
+          imagePullPolicy: {{ .Values.compressor.image.pullPolicy }}
           securityContext: {{- toYaml .Values.securityContext | nindent 12 }}
           ports:
             - { name: http, containerPort: 8080 }
@@ -37,38 +37,38 @@ spec:
             httpGet: { path: /health, port: http }
             initialDelaySeconds: 60
             periodSeconds: 30
-          resources: {{- toYaml .Values.kompress.resources | nindent 12 }}
+          resources: {{- toYaml .Values.compressor.resources | nindent 12 }}
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ .Release.Name }}-kompress
+  name: {{ .Release.Name }}-compressor
   labels: {{- include "obleth.labels" . | nindent 4 }}
 spec:
   selector:
-    app: {{ .Release.Name }}-kompress
+    app: {{ .Release.Name }}-compressor
   ports:
     - { name: http, port: 8080, targetPort: http }
-{{- if .Values.kompress.autoscaling.enabled }}
+{{- if .Values.compressor.autoscaling.enabled }}
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
 metadata:
-  name: {{ .Release.Name }}-kompress
+  name: {{ .Release.Name }}-compressor
   labels: {{- include "obleth.labels" . | nindent 4 }}
 spec:
   scaleTargetRef:
     apiVersion: apps/v1
     kind: Deployment
-    name: {{ .Release.Name }}-kompress
-  minReplicas: {{ .Values.kompress.autoscaling.minReplicas }}
-  maxReplicas: {{ .Values.kompress.autoscaling.maxReplicas }}
+    name: {{ .Release.Name }}-compressor
+  minReplicas: {{ .Values.compressor.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.compressor.autoscaling.maxReplicas }}
   metrics:
     - type: Resource
       resource:
         name: cpu
         target:
           type: Utilization
-          averageUtilization: {{ .Values.kompress.autoscaling.targetCPUUtilizationPercentage }}
+          averageUtilization: {{ .Values.compressor.autoscaling.targetCPUUtilizationPercentage }}
 {{- end }}
 {{- end }}

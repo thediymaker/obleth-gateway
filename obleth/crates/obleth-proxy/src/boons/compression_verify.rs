@@ -682,7 +682,7 @@ fn report() {
     println!(
         "\nNote: 'plain_prose_thread_control' and 'redundant_chat' show the deterministic \
          ceiling on human prose — only the lossy line-dropper touches chat, and only when \
-         allow_lossy is on. Real, faithful chat/prose compression is Phase 2 (neural Kompress).\n"
+         allow_lossy is on. Real, faithful chat/prose compression is Phase 2 (neural Compressor).\n"
     );
 }
 
@@ -1026,7 +1026,7 @@ fn neural_select_kept_drops_low_scored_sentences() {
     // Descending scores: sentence 0 has the highest score, sentence 9 the lowest.
     let scores: Vec<f32> = (0..10).map(|i| 1.0 - i as f32 * 0.1).collect();
     let query_terms = std::collections::HashSet::new();
-    let out = super::kompress::select_kept(&sentences, &scores, 0.4, &query_terms)
+    let out = super::compressor::select_kept(&sentences, &scores, 0.4, &query_terms)
         .expect("should produce a compressed result");
     // The lowest-scored sentences should be dropped.
     assert!(

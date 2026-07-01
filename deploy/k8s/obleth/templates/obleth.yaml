@@ -70,8 +70,8 @@ spec:
             - { name: OBLETH_USAGE_RETENTION_DAYS, value: {{ .Values.obleth.usageRetentionDays | quote }} }
             - { name: OBLETH_OTEL_ENDPOINT, value: {{ .Values.obleth.otelEndpoint | quote }} }
             - { name: OBLETH_SLACK_ALERT_MIN_INTERVAL_SECS, value: {{ .Values.obleth.slackAlertMinIntervalSecs | quote }} }
-            {{- if .Values.kompress.enabled }}
-            - { name: OBLETH_KOMPRESS_URL, value: "http://{{ .Release.Name }}-kompress:8080" }
+            {{- if .Values.compressor.enabled }}
+            - { name: OBLETH_COMPRESSOR_URL, value: "http://{{ .Release.Name }}-compressor:8080" }
             {{- end }}
             - { name: RUST_LOG, value: "info,obleth=info" }
           envFrom:
