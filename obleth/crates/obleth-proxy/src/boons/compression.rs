@@ -45,19 +45,39 @@ pub(crate) fn classify(text: &str) -> ContentKind {
     if lines.len() >= 8 {
         let log_like = lines
             .iter()
-            .filter(|l| {
-                let t = l.trim_start();
-                t.starts_with(|c: char| c.is_ascii_digit()) // timestamp-ish
-                    || ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]
-                        .iter()
-                        .any(|lvl| t.starts_with(lvl) || t.contains(&format!(" {lvl} ")))
-            })
+            .filter(|l| line_looks_log(l.trim_start()))
             .count();
         if log_like * 2 >= lines.len() {
             return ContentKind::Log;
         }
     }
     ContentKind::Prose
+}
+
+/// Whether a single line looks like a log record: it begins with a timestamp or
+/// carries a level token. Handles ISO/epoch/bracketed timestamps (digit- or
+/// `[`-prefixed) AND classic syslog/journald `Mon DD HH:MM:SS` lines, whose
+/// month/weekday abbreviation starts with a letter (e.g. `Jun 30 20:41:28 …`).
+fn line_looks_log(t: &str) -> bool {
+    // ISO 8601 / epoch / bracketed timestamp.
+    if t.starts_with(|c: char| c.is_ascii_digit()) || t.starts_with('[') {
+        return true;
+    }
+    // syslog / ctime prefix: first whitespace-delimited token is a 3-letter
+    // month or weekday abbreviation (`Jun 30 …`, `Mon Jun 30 …`).
+    const ABBR: [&str; 19] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec", "Mon",
+        "Tue", "Wed", "Thu", "Fri", "Sat", "Sun",
+    ];
+    if let Some(first) = t.split_whitespace().next() {
+        if ABBR.contains(&first) {
+            return true;
+        }
+    }
+    // Level-prefixed or level-tagged line.
+    ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]
+        .iter()
+        .any(|lvl| t.starts_with(lvl) || t.contains(&format!(" {lvl} ")))
 }
 
 /// Losslessly minify JSON text. Returns `Some(minified)` only when the result
@@ -1104,6 +1124,30 @@ mod tests {
             ));
         }
         assert_eq!(classify(&text), ContentKind::Log);
+    }
+
+    #[test]
+    fn classifies_syslog_mon_dd_as_log_and_collapses() {
+        // Classic syslog/journald format: lines start with a month abbreviation
+        // ("Jun 30 …"), not a digit. Regression for logs misclassified as Prose.
+        let mut text = String::new();
+        for i in 83840..83870 {
+            text.push_str(&format!(
+                "Jun 30 21:00:01 sol_web systemd[1]: Started Session {i} of user root.\n"
+            ));
+            text.push_str(&format!(
+                "Jun 30 21:00:02 sol_web systemd[1]: session-{i}.scope: Succeeded.\n"
+            ));
+        }
+        text.push_str(
+            "Jun 30 20:41:28 sol_web certbot[1078880]: 1 renew failure(s), 0 parse failure(s)\n",
+        );
+        assert_eq!(classify(&text), ContentKind::Log);
+        // The log-collapse pass should crush the repeated session lines.
+        let out = compact_log(&text).expect("repetitive syslog should collapse");
+        assert!(out.len() < text.len() / 2, "expected >50% reduction");
+        assert!(out.contains("(×")); // collapse marker present
+        assert!(out.contains("renew failure")); // the one real event is preserved
     }
 
     #[test]
