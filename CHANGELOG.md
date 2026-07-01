@@ -4,12 +4,15 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
-## v0.6.1
-Optional neural prose compression: shrink long prose more aggressively than the built-in heuristic, served by a model you run yourself — same governance, still fully reversible.
+## v0.7.0
+Optional neural prose compression you host yourself, a per-request switch to A/B it from the API, sharper log compaction, and an access-control fix for the dashboard's admin API.
 
 - **Neural extractive prose compaction.** The compression boon's lossy pass can now score sentences with a trained extractive model instead of the built-in heuristic, keeping the most load-bearing sentences and dropping filler. It only ever selects existing sentences — nothing is rewritten or invented — and every original stays fully recoverable.
-- **Runs on your own infrastructure.** The model is served by an optional sidecar you deploy alongside the gateway: a plain container that scales horizontally behind a Service, with no Slurm or GPU required and no data leaving your network. Ships as a published image plus a Helm switch (`compressor.enabled`) and an opt-in Docker Compose profile.
+- **Run the model on your own infrastructure.** It is served by an optional sidecar you deploy alongside the gateway: a plain CPU container (no GPU, no Slurm) that scales horizontally behind a Service, with no data leaving your network. Ships as a published image plus a Helm switch (`compressor.enabled`) and an opt-in Docker Compose profile, and the model is swappable at build time.
 - **Off by default, fails open.** Nothing changes until you deploy the sidecar and point the gateway at it. If it is absent, slow, or unavailable, the gateway silently falls back to the existing heuristic — a request is never delayed or failed because of it. A tunable keep-ratio dials how aggressively prose is trimmed.
+- **A/B compression from the API.** Send `x-obleth-boons: lossy` to force the lossy pass on for a single request (even where it is otherwise off), and read the `x-obleth-compression` response header — `before`/`after`/`saved` tokens — to compare a request with and without compression, no dashboard round-trip.
+- **Sharper log compaction.** Repeated log lines now collapse via template mining (Drain-style), catching structurally-identical lines that differ only in their variable fields, and syslog `Mon DD HH:MM:SS` timestamps are recognized as logs.
+- **Security: admin-only enforcement on the dashboard's live API.** Every `/api/live/*` route now independently verifies the caller is an active admin. Previously these routes checked only for a signed-in session, so a non-admin (for example a tenant-portal user) could reach admin-only data such as config backups or other tenants' usage by calling them directly. No upgrade action is required — access simply tightens.
 
 ## v0.6.0
 Context compression: shrink oversized tool output, logs, and repeated context before it reaches the model — losslessly by default, with per-tenant control.
