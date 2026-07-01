@@ -1,0 +1,9 @@
+# Runtime dependencies for the kompress sidecar.
+# Build-time / export deps (transformers, optimum, torch) are NOT listed here;
+# they are only needed when running export_model.py to bake the ONNX artefact.
+fastapi>=0.111,<1.0
+uvicorn[standard]>=0.30,<1.0
+onnxruntime>=1.18,<2.0
+tokenizers>=0.19,<1.0
+numpy>=1.26,<3.0
+pydantic>=2.7,<3.0
