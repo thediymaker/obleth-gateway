@@ -38,6 +38,7 @@ import type {
   AutoRouterSettingsView,
   BoonSettingsView,
   CharoSettingsView,
+  KompressStatusView,
   ModelRoute,
   SlurmHealthView,
   SlurmSettingsView,
@@ -457,7 +458,7 @@ export function AutoRouterSettingsForm({
   );
 }
 
-type BoonSectionKey = "vision" | "structured" | "tool_loop" | "compression";
+type BoonSectionKey = "vision" | "structured" | "tool_loop";
 
 function ToggleSwitch({
   checked,
@@ -639,12 +640,6 @@ export function BoonsSettingsForm({
     String(settings?.tool_loop_tool_timeout_ms ?? 30000),
   );
   const [toolLoopNudge, setToolLoopNudge] = useState(settings?.tool_loop_nudge ?? "");
-  const [compressionEnabled, setCompressionEnabled] = useState(settings?.compression_enabled ?? false);
-  const [compressionCodeCompaction, setCompressionCodeCompaction] = useState(settings?.compression_code_compaction ?? false);
-  const [compressionMinTokens, setCompressionMinTokens] = useState(String(settings?.compression_min_tokens ?? 512));
-  const [compressionMaxSegments, setCompressionMaxSegments] = useState(String(settings?.compression_max_segments ?? 64));
-  const [compressionMaxLossy, setCompressionMaxLossy] = useState(String(settings?.compression_max_lossy_segments ?? 4));
-  const [compressionTtl, setCompressionTtl] = useState(String(settings?.compression_original_ttl_secs ?? 3600));
   const [expanded, setExpanded] = useState<BoonSectionKey | null>(null);
 
   const visionModels = models.filter(
@@ -674,12 +669,6 @@ export function BoonsSettingsForm({
       tool_loop_max_turns: Math.min(Number(toolLoopMaxTurns) || 4, 8),
       tool_loop_tool_timeout_ms: Number(toolLoopTimeout) || 30000,
       tool_loop_nudge: toolLoopNudge,
-      compression_enabled: compressionEnabled,
-      compression_code_compaction: compressionCodeCompaction,
-      compression_min_tokens: Number(compressionMinTokens) || 512,
-      compression_max_segments: Number(compressionMaxSegments) || 64,
-      compression_max_lossy_segments: Number(compressionMaxLossy) || 4,
-      compression_original_ttl_secs: Number(compressionTtl) || 3600,
     };
     start(async () => {
       const result = await setBoonSettingsAction(body);
@@ -939,92 +928,246 @@ export function BoonsSettingsForm({
             </div>
           </BoonPanel>
 
-          <BoonPanel
-            title="Compression"
-            description="Compacts long conversation history before dispatch."
-            icon={Archive}
-            enabled={compressionEnabled}
-            expanded={expanded === "compression"}
-            onToggle={() => toggleSection("compression")}
-            summary={
-              <>
-                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
-                  {compressionMinTokens || "512"} min tokens
-                </Badge>
-                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
-                  {compressionMaxLossy || "4"} max lossy
-                </Badge>
-                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
-                  code {compressionCodeCompaction ? "on" : "off"}
-                </Badge>
-              </>
-            }
-          >
-            <div className="space-y-4">
-              <ToggleRow
-                label="Enable compression boon"
-                hint="Requires a per-tenant compression policy for dedup or lossy summarization."
-                checked={compressionEnabled}
-                onChange={() => setCompressionEnabled((value) => !value)}
-              />
-          <p className="text-sm text-muted-foreground">
-            Long content is compacted at the gateway before being sent upstream — lossless
-            structural JSON/code compaction always, plus deterministic dedup and lossy text
-            compaction (no model needed) when a tenant opts in via its compression policy.
-            Fail-open: if a segment can&apos;t be safely shrunk, it passes through unchanged.
-          </p>
-              <ToggleRow
-                label="Code compaction by default"
-                hint="Conservative whitespace stripping for fenced code blocks."
-                checked={compressionCodeCompaction}
-                onChange={() => setCompressionCodeCompaction((value) => !value)}
-              />
-          <div className="grid gap-4 sm:grid-cols-2">
-            <div className="space-y-1">
-              <Label htmlFor="compression_min_tokens">Min tokens to compress</Label>
-              <Input
-                id="compression_min_tokens"
-                type="number"
-                value={compressionMinTokens}
-                onChange={(e) => setCompressionMinTokens(e.target.value)}
-              />
-            </div>
-            <div className="space-y-1">
-              <Label htmlFor="compression_max_segments">Max segments</Label>
-              <Input
-                id="compression_max_segments"
-                type="number"
-                value={compressionMaxSegments}
-                onChange={(e) => setCompressionMaxSegments(e.target.value)}
-              />
-            </div>
-            <div className="space-y-1">
-              <Label htmlFor="compression_max_lossy_segments">Max lossy segments</Label>
-              <Input
-                id="compression_max_lossy_segments"
-                type="number"
-                value={compressionMaxLossy}
-                onChange={(e) => setCompressionMaxLossy(e.target.value)}
-              />
-            </div>
-            <div className="space-y-1">
-              <Label htmlFor="compression_original_ttl_secs">Original context TTL (secs)</Label>
-              <Input
-                id="compression_original_ttl_secs"
-                type="number"
-                value={compressionTtl}
-                onChange={(e) => setCompressionTtl(e.target.value)}
-              />
-            </div>
-          </div>
-            </div>
-          </BoonPanel>
         </div>
 
         <div className="flex flex-wrap items-center gap-3 border-t border-border/60 pt-4">
           <Button onClick={save} disabled={pending}>
             <Save className="h-4 w-4" />
             {pending ? "Saving..." : "Save boons"}
+          </Button>
+          {status && (
+            <p
+              className={
+                status.ok
+                  ? "rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
+                  : "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              }
+            >
+              {status.message}
+            </p>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+function KompressStatusBlock({ kompress }: { kompress: KompressStatusView | null }) {
+  if (!kompress || !kompress.configured) {
+    return (
+      <div className="flex items-start gap-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-sm text-muted-foreground">
+        <span className="mt-1 inline-block h-2 w-2 shrink-0 rounded-full bg-muted-foreground/50" />
+        <span>
+          <span className="font-medium text-foreground">Neural sidecar not configured.</span> The
+          lossy prose pass uses the built-in heuristic. To enable the trained{" "}
+          <code>kompress</code> scorer, deploy the sidecar and set{" "}
+          <code>OBLETH_KOMPRESS_URL</code> (Docker: add <code>kompress</code> to{" "}
+          <code>COMPOSE_PROFILES</code>; Kubernetes: <code>kompress.enabled=true</code>).
+        </span>
+      </div>
+    );
+  }
+  const ok = kompress.reachable;
+  return (
+    <div
+      className={
+        ok
+          ? "flex items-start gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
+          : "flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:text-amber-400"
+      }
+    >
+      <span
+        className={
+          ok
+            ? "mt-1 inline-block h-2 w-2 shrink-0 rounded-full bg-emerald-500"
+            : "mt-1 inline-block h-2 w-2 shrink-0 rounded-full bg-amber-500"
+        }
+      />
+      <span>
+        {ok ? (
+          <>
+            <span className="font-medium">Neural sidecar reachable</span> — model{" "}
+            <span className="font-mono">{kompress.model ?? "unknown"}</span>
+            {kompress.revision && (
+              <span className="ml-1 font-mono text-xs opacity-70">
+                {kompress.revision.slice(0, 7)}
+              </span>
+            )}{" "}
+            at <code>{kompress.url}</code>. The lossy prose pass uses the neural scorer.
+          </>
+        ) : (
+          <>
+            <span className="font-medium">Neural sidecar unreachable</span> at{" "}
+            <code>{kompress.url}</code>
+            {kompress.error && <> — {kompress.error}</>}. The gateway falls back to the built-in
+            heuristic until it recovers.
+          </>
+        )}
+      </span>
+    </div>
+  );
+}
+
+export function CompressionSettingsForm({
+  settings,
+  kompress,
+}: {
+  settings: BoonSettingsView | null;
+  kompress: KompressStatusView | null;
+}) {
+  const [pending, start] = useTransition();
+  const [status, setStatus] = useState<{ ok: boolean; message: string } | null>(null);
+
+  const [enabled, setEnabled] = useState(settings?.compression_enabled ?? false);
+  const [codeCompaction, setCodeCompaction] = useState(
+    settings?.compression_code_compaction ?? false,
+  );
+  const [dedup, setDedup] = useState(settings?.compression_dedup ?? false);
+  const [compactLogs, setCompactLogs] = useState(settings?.compression_compact_logs ?? false);
+  const [allowLossy, setAllowLossy] = useState(settings?.compression_allow_lossy ?? false);
+  const [minTokens, setMinTokens] = useState(String(settings?.compression_min_tokens ?? 512));
+  const [maxSegments, setMaxSegments] = useState(String(settings?.compression_max_segments ?? 64));
+  const [maxLossy, setMaxLossy] = useState(
+    String(settings?.compression_max_lossy_segments ?? 4),
+  );
+  const [ttl, setTtl] = useState(String(settings?.compression_original_ttl_secs ?? 3600));
+  const [keepRatio, setKeepRatio] = useState(
+    String(settings?.compression_neural_keep_ratio ?? 0.5),
+  );
+
+  function save() {
+    setStatus(null);
+    // Send only compression_* fields; the Management API merges partials, so the
+    // other boons (vision, structured output, tool loop) are left untouched.
+    const body: UpdateBoonSettings = {
+      compression_enabled: enabled,
+      compression_code_compaction: codeCompaction,
+      compression_dedup: dedup,
+      compression_compact_logs: compactLogs,
+      compression_allow_lossy: allowLossy,
+      compression_min_tokens: Number(minTokens) || 512,
+      compression_max_segments: Number(maxSegments) || 64,
+      compression_max_lossy_segments: Number(maxLossy) || 4,
+      compression_original_ttl_secs: Number(ttl) || 3600,
+      compression_neural_keep_ratio: Number(keepRatio) || 0.5,
+    };
+    start(async () => {
+      const result = await setBoonSettingsAction(body);
+      setStatus(
+        result.ok
+          ? { ok: true, message: "Compression settings saved." }
+          : { ok: false, message: result.error },
+      );
+    });
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <Archive className="h-4 w-4" />
+          Compression
+        </CardTitle>
+        <CardDescription>
+          Compacts long conversation history at the gateway before dispatch — lossless structural
+          JSON/code compaction always, plus deterministic dedup and lossy text compaction when a
+          tenant opts in via its per-tenant compression policy. Fail-open: anything that can&apos;t
+          be safely shrunk passes through unchanged.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <KompressStatusBlock kompress={kompress} />
+
+        <ToggleRow
+          label="Enable compression boon"
+          hint="Master switch. Also grant the compression boon to a model. The toggles below are system-wide defaults; a per-tenant policy overrides them."
+          checked={enabled}
+          onChange={() => setEnabled((value) => !value)}
+        />
+        <ToggleRow
+          label="Code compaction by default"
+          hint="Conservative whitespace stripping for fenced code blocks. A tenant policy can override this."
+          checked={codeCompaction}
+          onChange={() => setCodeCompaction((value) => !value)}
+        />
+        <ToggleRow
+          label="Log template-collapse by default"
+          hint="Near-lossless: repeated log lines collapse to one representative line + (×N). Best for verbose logs. A tenant policy overrides this."
+          checked={compactLogs}
+          onChange={() => setCompactLogs((value) => !value)}
+        />
+        <ToggleRow
+          label="Cross-turn dedup by default"
+          hint="Replace a large block repeated across messages with a [ref:HASH] marker (recoverable). A tenant policy overrides this."
+          checked={dedup}
+          onChange={() => setDedup((value) => !value)}
+        />
+        <ToggleRow
+          label="Lossy text compaction by default"
+          hint="Drop low-salience prose sentences (uses the neural sidecar when deployed). Lossy — original stays recoverable. A tenant policy overrides this."
+          checked={allowLossy}
+          onChange={() => setAllowLossy((value) => !value)}
+        />
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-1">
+            <Label htmlFor="compression_min_tokens">Min tokens to compress</Label>
+            <Input
+              id="compression_min_tokens"
+              type="number"
+              value={minTokens}
+              onChange={(e) => setMinTokens(e.target.value)}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="compression_max_segments">Max segments</Label>
+            <Input
+              id="compression_max_segments"
+              type="number"
+              value={maxSegments}
+              onChange={(e) => setMaxSegments(e.target.value)}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="compression_max_lossy_segments">Max lossy segments</Label>
+            <Input
+              id="compression_max_lossy_segments"
+              type="number"
+              value={maxLossy}
+              onChange={(e) => setMaxLossy(e.target.value)}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="compression_original_ttl_secs">Original context TTL (secs)</Label>
+            <Input
+              id="compression_original_ttl_secs"
+              type="number"
+              value={ttl}
+              onChange={(e) => setTtl(e.target.value)}
+            />
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="compression_neural_keep_ratio">Prose keep ratio</Label>
+            <Input
+              id="compression_neural_keep_ratio"
+              type="number"
+              step="0.05"
+              min="0.05"
+              max="1"
+              value={keepRatio}
+              onChange={(e) => setKeepRatio(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              Fraction of sentences the lossy prose pass keeps (0.05–1.0). Lower is more aggressive.
+              Applies to both the built-in heuristic and the neural kompress sidecar.
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3 border-t border-border/60 pt-4">
+          <Button onClick={save} disabled={pending}>
+            <Save className="h-4 w-4" />
+            {pending ? "Saving..." : "Save compression"}
           </Button>
           {status && (
             <p

@@ -710,6 +710,10 @@ export interface BoonSettingsView {
   compression_original_ttl_secs: number;
   compression_max_lossy_segments: number;
   compression_code_compaction: boolean;
+  compression_dedup: boolean;
+  compression_compact_logs: boolean;
+  compression_allow_lossy: boolean;
+  compression_neural_keep_ratio: number;
 }
 
 export interface UpdateBoonSettings {
@@ -732,6 +736,22 @@ export interface UpdateBoonSettings {
   compression_original_ttl_secs?: number;
   compression_max_lossy_segments?: number;
   compression_code_compaction?: boolean;
+  compression_dedup?: boolean;
+  compression_compact_logs?: boolean;
+  compression_allow_lossy?: boolean;
+  compression_neural_keep_ratio?: number;
+}
+
+// Live status of the optional neural compression sidecar (a health probe of
+// OBLETH_KOMPRESS_URL). Surfaced in the Compression settings tab, mirroring the
+// way the Slurm tab shows provisioner health.
+export interface KompressStatusView {
+  configured: boolean;
+  url: string;
+  reachable: boolean;
+  model: string | null;
+  revision: string | null;
+  error: string | null;
 }
 
 export interface CharoSettingsView {
@@ -1492,6 +1512,7 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
+  getKompressStatus: () => api<KompressStatusView>("/settings/kompress"),
   getCharoSettings: () => api<CharoSettingsView>("/settings/charo"),
   setCharoSettings: (body: CharoSettingsView, options?: AuditOptions) =>
     api<CharoSettingsView>("/settings/charo", {
