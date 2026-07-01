@@ -54,7 +54,6 @@ impl KompressClient {
     ///
     /// Fails open on any error (send failure, non-2xx status, parse error) by
     /// returning `None`.  The caller supplies the shared `http` client.
-    #[allow(dead_code)] // wired into apply_lossy in a later task
     pub(super) async fn score(
         &self,
         http: &reqwest::Client,
@@ -82,7 +81,6 @@ impl KompressClient {
 /// ```json
 /// {"segments": [{"sentences": ["s1", "s2"]}, ...]}
 /// ```
-#[allow(dead_code)] // called by score
 fn build_score_body(batches: &[Vec<String>]) -> serde_json::Value {
     let segments: Vec<serde_json::Value> = batches
         .iter()
@@ -95,7 +93,6 @@ fn build_score_body(batches: &[Vec<String>]) -> serde_json::Value {
 ///
 /// Expects `{"results": [{"scores": [f32, ...]}, ...]}` with exactly
 /// `expected_len` elements. Returns `None` on any structural mismatch.
-#[allow(dead_code)] // called by score
 fn parse_score_response(v: &serde_json::Value, expected_len: usize) -> Option<Vec<Vec<f32>>> {
     let results = v["results"].as_array()?;
     if results.len() != expected_len {
@@ -121,7 +118,6 @@ fn parse_score_response(v: &serde_json::Value, expected_len: usize) -> Option<Ve
 /// newlines. Each piece is trimmed; empty pieces are dropped. The sentence text
 /// is preserved as-is otherwise (no other normalisation) so reassembly is
 /// faithful.
-#[allow(dead_code)] // called by the lossy compression pass in a later task
 pub(super) fn split_sentences(text: &str) -> Vec<String> {
     let mut sentences: Vec<String> = Vec::new();
     let mut current = String::new();
@@ -178,7 +174,6 @@ pub(super) fn split_sentences(text: &str) -> Vec<String> {
 ///
 /// Otherwise returns `Some(result)` where `result` is the kept sentences joined
 /// by `" "` followed by `" [… N sentences omitted]"`.
-#[allow(dead_code)] // called by the lossy compression pass in a later task
 pub(super) fn select_kept(
     sentences: &[String],
     scores: &[f32],
@@ -242,6 +237,24 @@ pub(super) fn select_kept(
     } else {
         None
     }
+}
+
+/// Choose the prose compaction for one segment: prefer the neural extractive
+/// selection when sidecar `scores` are available and productive, otherwise fall
+/// back to the deterministic `extract_prose` heuristic. Pure; no I/O.
+pub(super) fn compact_prose_segment(
+    original: &str,
+    neural_scores: Option<&[f32]>,
+    keep_ratio: f32,
+    query_terms: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if let Some(scores) = neural_scores {
+        let sentences = split_sentences(original);
+        if let Some(out) = select_kept(&sentences, scores, keep_ratio, query_terms) {
+            return Some(out);
+        }
+    }
+    super::compression::extract_prose(original, query_terms, keep_ratio)
 }
 
 #[cfg(test)]
@@ -347,5 +360,42 @@ mod tests {
         let sents: Vec<String> = (0..8).map(|i| format!("s{i}")).collect();
         let scores: Vec<f32> = (0..8).map(|i| i as f32).collect();
         assert!(select_kept(&sents, &scores, 1.0, &HashSet::new()).is_none());
+    }
+
+    #[test]
+    fn compact_prose_segment_uses_neural_when_scores_help() {
+        let text = "Alpha one. Beta two. Gamma three. Delta four. Epsilon five. Zeta six.";
+        let sents = split_sentences(text);
+        // High score to first three, low to the rest.
+        let scores: Vec<f32> = sents
+            .iter()
+            .enumerate()
+            .map(|(i, _)| if i < 3 { 0.9 } else { 0.1 })
+            .collect();
+        let out = compact_prose_segment(text, Some(&scores), 0.5, &HashSet::new()).unwrap();
+        assert!(out.contains("sentences omitted]"));
+        assert!(out.len() < text.len());
+    }
+
+    #[test]
+    fn compact_prose_segment_falls_back_to_heuristic_without_scores() {
+        // 12 distinct non-trivial lines so extract_prose (line-based, needs >=8 lines) fires.
+        let text: String = (0..12)
+            .map(|i| format!("This is a reasonably long note line number {i} with content.\n"))
+            .collect();
+        let out = compact_prose_segment(&text, None, 0.4, &HashSet::new());
+        assert!(out.is_some(), "heuristic should compact 12 lines");
+        assert!(out.unwrap().contains("lines omitted]"));
+    }
+
+    #[test]
+    fn compact_prose_segment_falls_back_when_scores_mismatch() {
+        let text: String = (0..12)
+            .map(|i| format!("This is a reasonably long note line number {i} with content.\n"))
+            .collect();
+        // Wrong-length scores → select_kept returns None → heuristic path used.
+        let out = compact_prose_segment(&text, Some(&[0.9, 0.1]), 0.4, &HashSet::new());
+        assert!(out.is_some());
+        assert!(out.unwrap().contains("lines omitted]"));
     }
 }

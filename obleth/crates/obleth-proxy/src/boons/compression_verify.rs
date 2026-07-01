@@ -1019,6 +1019,35 @@ fn log_rewrite_skips_structural_tables() {
 }
 
 #[test]
+fn neural_select_kept_drops_low_scored_sentences() {
+    let sentences: Vec<String> = (0..10)
+        .map(|i| format!("This is sentence number {i} with some meaningful content here."))
+        .collect();
+    // Descending scores: sentence 0 has the highest score, sentence 9 the lowest.
+    let scores: Vec<f32> = (0..10).map(|i| 1.0 - i as f32 * 0.1).collect();
+    let query_terms = std::collections::HashSet::new();
+    let out = super::kompress::select_kept(&sentences, &scores, 0.4, &query_terms)
+        .expect("should produce a compressed result");
+    // The lowest-scored sentences should be dropped.
+    assert!(
+        !out.contains("sentence number 9"),
+        "lowest-scored sentence must be dropped"
+    );
+    assert!(
+        !out.contains("sentence number 8"),
+        "low-scored sentence must be dropped"
+    );
+    // Result must be strictly shorter than the joined original.
+    let joined = sentences.join(" ");
+    assert!(
+        out.len() < joined.len(),
+        "result must be shorter than original"
+    );
+    // Omission marker should be present.
+    assert!(out.contains("sentences omitted]"));
+}
+
+#[test]
 fn dedup_leaves_unique_content_untouched() {
     let cfg = CompressionBoonSettings {
         enabled: true,

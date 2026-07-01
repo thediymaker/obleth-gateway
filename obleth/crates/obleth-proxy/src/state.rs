@@ -54,6 +54,5 @@ pub struct AppState {
     pub session_id_derivation: bool,
     /// Optional kompress neural scoring sidecar. `None` when `OBLETH_KOMPRESS_URL`
     /// is unset; the lossy compression pass skips neural scoring gracefully.
-    #[allow(dead_code)] // read by apply_lossy in a later task
     pub kompress: Option<crate::boons::kompress::KompressClient>,
 }
