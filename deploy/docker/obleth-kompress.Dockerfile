@@ -22,6 +22,8 @@ RUN if [ "$KOMPRESS_SOURCE" = "export" ]; then \
     else \
         pip install --no-cache-dir huggingface_hub; \
     fi
+# torch's ONNX exporter imports onnxscript at runtime (export source only).
+RUN if [ "$KOMPRESS_SOURCE" = "export" ]; then pip install --no-cache-dir onnxscript; fi
 COPY kompress/fetch_model.py ./
 RUN python fetch_model.py --source "$KOMPRESS_SOURCE" --model-id "$MODEL_ID" \
         --onnx-file "$ONNX_FILE" --out-dir /models
@@ -37,7 +39,10 @@ COPY kompress/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY --from=fetch /models /models
 COPY kompress/app.py kompress/model.py ./
-ENV KOMPRESS_MODEL_DIR=/models
+# Report the baked model in /health (surfaced in the dashboard sidecar status).
+ARG MODEL_ID=chopratejas/kompress-v2-base
+ENV KOMPRESS_MODEL_DIR=/models \
+    KOMPRESS_MODEL_NAME=${MODEL_ID}
 EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=3s --start-period=30s --retries=3 \
     CMD curl -fsS http://127.0.0.1:8080/health || exit 1
