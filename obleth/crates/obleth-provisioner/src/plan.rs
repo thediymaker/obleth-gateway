@@ -414,7 +414,7 @@ mod tests {
             900,
         );
         assert!(
-            !actions.iter().any(|a| *a == Action::Submit),
+            !actions.contains(&Action::Submit),
             "submit must be suppressed at limit"
         );
     }
@@ -432,7 +432,7 @@ mod tests {
             &HashMap::new(),
             900,
         );
-        assert!(actions.iter().any(|a| *a == Action::Submit));
+        assert!(actions.contains(&Action::Submit));
     }
 
     #[test]
@@ -442,7 +442,7 @@ mod tests {
             .map(|i| rv("lost", &format!("j{i}"), None, 60))
             .collect();
         let actions = plan(&spec(2), &lost, &HashMap::new(), &HashMap::new(), 900);
-        assert!(actions.iter().any(|a| *a == Action::Submit));
+        assert!(actions.contains(&Action::Submit));
     }
 
     #[test]

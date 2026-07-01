@@ -839,9 +839,11 @@ mod tests {
             }
         }
 
-        let mut settings = BoonSettings::default();
-        settings.compression = CompressionBoonSettings {
-            enabled: true,
+        let mut settings = BoonSettings {
+            compression: CompressionBoonSettings {
+                enabled: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
 
@@ -894,9 +896,11 @@ mod tests {
     #[test]
     fn dedup_and_lossy_gate_on_tenant_toggle_only() {
         use obleth_config::{BoonSettings, CompressionBoonSettings, CompressionPolicy};
-        let mut settings = BoonSettings::default();
-        settings.compression = CompressionBoonSettings {
-            enabled: true,
+        let settings = BoonSettings {
+            compression: CompressionBoonSettings {
+                enabled: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         // Note: NO summarizer, tool loop OFF, model NOT function-calling.
@@ -939,9 +943,11 @@ mod tests {
     #[test]
     fn force_lossy_still_requires_the_boon_granted() {
         use obleth_config::{BoonSettings, CompressionBoonSettings};
-        let mut settings = BoonSettings::default();
-        settings.compression = CompressionBoonSettings {
-            enabled: true,
+        let settings = BoonSettings {
+            compression: CompressionBoonSettings {
+                enabled: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         // Model was NOT granted the compression boon.

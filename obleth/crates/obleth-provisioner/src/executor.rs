@@ -14,6 +14,7 @@ use obleth_config::ManagedModelSpec;
 /// the disjoint window base reserved for this `Submit` by the caller — reserving
 /// it in `main.rs` (rather than recomputing here) keeps multiple `Submit`s in the
 /// same tick from all landing on the same base. Ignored for non-`Submit` actions.
+#[allow(clippy::too_many_arguments)]
 pub async fn apply(
     action: &Action,
     model_id: uuid::Uuid,

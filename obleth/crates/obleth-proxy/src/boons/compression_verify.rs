@@ -9,7 +9,7 @@
 //!   1. A regression suite — each fixture asserts its expected behavior.
 //!   2. A losslessness proof — every compressed fixture round-trips exactly.
 //!   3. A human-readable, tunable report. To see the table:
-//!        cargo test -p obleth-proxy compression_verify::report -- --nocapture
+//!      cargo test -p obleth-proxy compression_verify::report -- --nocapture
 //!
 //! To TUNE: the report prints results at the production default (`min_tokens=512`)
 //! AND at an aggressive `min_tokens=16`, so the effect of the per-segment floor
@@ -494,8 +494,8 @@ fn print_report(title: &str, cfg: &CompressionBoonSettings) {
     );
     println!("{}", "─".repeat(104));
     println!(
-        "{:<30} {:>10} {:>10} {:>9} {:>6} {:>10}  {}",
-        "fixture", "tok_before", "tok_after", "saved", "segs", "lossless", "shape"
+        "{:<30} {:>10} {:>10} {:>9} {:>6} {:>10}  shape",
+        "fixture", "tok_before", "tok_after", "saved", "segs", "lossless"
     );
     println!("{}", "─".repeat(104));
 
@@ -611,8 +611,8 @@ fn print_other_content_report() {
     println!("\nOTHER CONTENT TYPES — code / logs / chat (what dominates real traffic)");
     println!("{}", "─".repeat(104));
     println!(
-        "{:<34} {:>10} {:>10} {:>9} {:>10}  {}",
-        "fixture", "tok_before", "tok_after", "saved", "pass", "default"
+        "{:<34} {:>10} {:>10} {:>9} {:>10}  default",
+        "fixture", "tok_before", "tok_after", "saved", "pass"
     );
     println!("{}", "─".repeat(104));
     for (label, before_t, after_t, pass, default_state) in &rows {

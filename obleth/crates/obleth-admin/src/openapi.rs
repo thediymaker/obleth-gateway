@@ -15,15 +15,16 @@ use crate::usage::{
 };
 use crate::{
     AlertSettingsView, ApplyAutotuneCapacity, AuditEntryView, AuditQuery, AutoRouterSettingsView,
-    BoonSettingsView, CapacityView, CharoSettingsView, CompactUsageResult, CreateFairshareGroup,
-    CreateKey, CreateMcpServer, CreateModel, CreateModelEndpoint, CreateTenant, CreatedKey,
-    EmailSettingsView, FairshareLiveView, GroupFairshareView, CompressorStatusView, ListKeysQuery,
-    LiveStats, SetCapacity, SetDisabled, SetModelCache, SetModelCapacity, SetModelCapacityMode,
-    SetModelReliability, SetModelWeight, SetTenantAllowlist, SetTenantBudget, SetTenantCompression,
-    SetTenantGuardrails, SetTenantSchedule, SetTenantStatus, TenantFairshareView, TestAlertResult,
-    UpdateAlertSettings, UpdateAutoRouterSettings, UpdateBoonSettings, UpdateEmailSettings,
-    UpdateGroupWeight, UpdateKey, UpdateMcpServer, UpdateModel, UpdateModelEndpoint, UpdateQuota,
-    UpdateTenant, UpdateTenantGroup, UpdateUsageRetention, UpdateWeight, UsageRetentionView,
+    BoonSettingsView, CapacityView, CharoSettingsView, CompactUsageResult, CompressorStatusView,
+    CreateFairshareGroup, CreateKey, CreateMcpServer, CreateModel, CreateModelEndpoint,
+    CreateTenant, CreatedKey, EmailSettingsView, FairshareLiveView, GroupFairshareView,
+    ListKeysQuery, LiveStats, SetCapacity, SetDisabled, SetModelCache, SetModelCapacity,
+    SetModelCapacityMode, SetModelReliability, SetModelWeight, SetTenantAllowlist, SetTenantBudget,
+    SetTenantCompression, SetTenantGuardrails, SetTenantSchedule, SetTenantStatus,
+    TenantFairshareView, TestAlertResult, UpdateAlertSettings, UpdateAutoRouterSettings,
+    UpdateBoonSettings, UpdateEmailSettings, UpdateGroupWeight, UpdateKey, UpdateMcpServer,
+    UpdateModel, UpdateModelEndpoint, UpdateQuota, UpdateTenant, UpdateTenantGroup,
+    UpdateUsageRetention, UpdateWeight, UsageRetentionView,
 };
 use obleth_config::{
     ApiKey, ApiKeyBackup, AppSettingBackup, BackupData, BackupEncryption, CompressionPolicy,
