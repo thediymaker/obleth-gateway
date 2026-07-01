@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException
@@ -46,20 +47,14 @@ class HealthResponse(BaseModel):
 # App + scorer lifecycle
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="kompress", version="0.1.0")
-
 # Module-level scorer — None until startup succeeds or tests inject a fake.
 # Tests can do:  import app; app.scorer = FakeScorer()
 scorer: Optional[object] = None  # type: ignore[type-arg]
 
 
-def get_scorer():
-    """Return the active scorer or None."""
-    return scorer
-
-
-@app.on_event("startup")
-def _startup() -> None:
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Load the scorer on startup; degrade to None (503 on /score) if absent."""
     global scorer
     model_dir = os.environ.get("KOMPRESS_MODEL_DIR", "/models")
     try:
@@ -70,6 +65,10 @@ def _startup() -> None:
     except Exception as exc:  # noqa: BLE001
         log.warning("Scorer unavailable (%s). /score will return 503.", exc)
         scorer = None
+    yield
+
+
+app = FastAPI(title="kompress", version="0.1.0", lifespan=lifespan)
 
 
 # ---------------------------------------------------------------------------
