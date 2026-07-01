@@ -526,6 +526,7 @@ impl Store {
     // ---- api keys --------------------------------------------------------
 
     /// Create a key. Returns the stored metadata plus the one-time raw secret.
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_api_key(
         &self,
         tenant_id: Uuid,
@@ -724,6 +725,7 @@ impl Store {
         rows.iter().map(api_key_from_row).collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_api_key(
         &self,
         id: Uuid,
@@ -2281,11 +2283,16 @@ impl Store {
         let previous_status: String = current.try_get("health_status")?;
         // The displayed badge is threshold-gated, matching the alerting logic: a
         // sub-threshold failure streak holds the last stable badge instead of
-        // flapping to "down". Healthy/disabled/transient outcomes display as-is.
-        let displayed_status = if status == "healthy" || status == "disabled" || transient {
+        // flapping to "down". The badge shows the fresh `status` verbatim when the
+        // outcome is healthy/disabled/transient, or when a failure is confirmed
+        // down (streak at/over threshold); a sub-threshold failure holds the last
+        // stable badge.
+        let show_status = status == "healthy"
+            || status == "disabled"
+            || transient
+            || new_failures >= failure_threshold.max(1);
+        let displayed_status = if show_status {
             status
-        } else if new_failures >= failure_threshold.max(1) {
-            status // confirmed down
         } else {
             previous_status.as_str() // hold last stable badge
         };
@@ -3603,6 +3610,9 @@ mod tests {
         );
     }
 
+    // A positional bundle of column values for a model insert; test-only, so the
+    // wide tuple is clearer inline than a named alias would be.
+    #[allow(clippy::type_complexity)]
     fn default_test_model(
         name: &str,
     ) -> (

@@ -4064,11 +4064,13 @@ mod tests {
     #[test]
     fn boon_view_round_trips_compression() {
         use obleth_config::{BoonSettings, CompressionBoonSettings};
-        let mut s = BoonSettings::default();
-        s.compression = CompressionBoonSettings {
-            enabled: true,
-            min_tokens: 256,
-            max_segments: 8,
+        let s = BoonSettings {
+            compression: CompressionBoonSettings {
+                enabled: true,
+                min_tokens: 256,
+                max_segments: 8,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let view = BoonSettingsView::from_settings(&s);
@@ -4103,10 +4105,12 @@ mod tests {
     #[test]
     fn boon_view_round_trips_code_compaction() {
         use obleth_config::{BoonSettings, CompressionBoonSettings};
-        let mut s = BoonSettings::default();
-        s.compression = CompressionBoonSettings {
-            enabled: true,
-            code_compaction: true,
+        let s = BoonSettings {
+            compression: CompressionBoonSettings {
+                enabled: true,
+                code_compaction: true,
+                ..Default::default()
+            },
             ..Default::default()
         };
         let view = BoonSettingsView::from_settings(&s);

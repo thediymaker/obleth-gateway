@@ -371,37 +371,6 @@ impl SpansFlusher {
     }
 }
 
-#[cfg(test)]
-mod conv_tests {
-    use super::*;
-    #[test]
-    fn usage_row_mirrors_session_source() {
-        let rec = UsageRecord {
-            request_id: uuid::Uuid::nil(),
-            tenant_id: uuid::Uuid::nil(),
-            key_id: uuid::Uuid::nil(),
-            model: "m".into(),
-            admission: "ok".into(),
-            weight: 1,
-            input_tokens: 0,
-            output_tokens: 0,
-            estimated_tokens: 0,
-            queue_wait_ms: 0,
-            ttft_ms: 0,
-            total_ms: 0,
-            status_code: 200,
-            cache_status: "off".into(),
-            cost_usd: 0.0,
-            ts_ms: 0,
-            session_id: "abc".into(),
-            session_id_source: "derived".into(),
-            request_type: "chat".into(),
-        };
-        let row = UsageRow::from(&rec);
-        assert_eq!(row.session_id_source, "derived");
-    }
-}
-
 /// True when `name` is a safe bare SQL identifier (letters, digits, underscore,
 /// not starting with a digit). Used to guard identifiers that must be string-
 /// interpolated into ClickHouse DDL.
@@ -637,4 +606,35 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
         .await?;
     client.query(&mv_ddl).execute().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod conv_tests {
+    use super::*;
+    #[test]
+    fn usage_row_mirrors_session_source() {
+        let rec = UsageRecord {
+            request_id: uuid::Uuid::nil(),
+            tenant_id: uuid::Uuid::nil(),
+            key_id: uuid::Uuid::nil(),
+            model: "m".into(),
+            admission: "ok".into(),
+            weight: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_tokens: 0,
+            queue_wait_ms: 0,
+            ttft_ms: 0,
+            total_ms: 0,
+            status_code: 200,
+            cache_status: "off".into(),
+            cost_usd: 0.0,
+            ts_ms: 0,
+            session_id: "abc".into(),
+            session_id_source: "derived".into(),
+            request_type: "chat".into(),
+        };
+        let row = UsageRow::from(&rec);
+        assert_eq!(row.session_id_source, "derived");
+    }
 }

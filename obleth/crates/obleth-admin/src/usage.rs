@@ -928,8 +928,7 @@ pub async fn query_usage_daily(
         inner_where.push_str(" and tenant_id = toUUID(?)");
     }
     if !key_ids.is_empty() {
-        let placeholders = std::iter::repeat("toUUID(?)")
-            .take(key_ids.len())
+        let placeholders = std::iter::repeat_n("toUUID(?)", key_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
         inner_where.push_str(&format!(" and key_id in ({placeholders})"));

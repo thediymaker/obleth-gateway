@@ -3416,7 +3416,7 @@ mod tests {
 
     #[test]
     fn weighted_order_preserves_membership() {
-        let eps = vec![
+        let eps = [
             endpoint("a", "http://a", 10, 100, true, true),
             endpoint("b", "http://b", 20, 50, true, true),
             endpoint("c", "http://c", 30, 1, true, true),

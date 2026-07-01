@@ -138,7 +138,7 @@ pub fn parse_mem_mb(raw: &str) -> Option<i64> {
         Some('M') => (&core[..core.len() - 1], 1.0),
         Some('G') => (&core[..core.len() - 1], 1024.0),
         Some('T') => (&core[..core.len() - 1], 1024.0 * 1024.0),
-        Some(c) if c.is_ascii_digit() => (core.as_ref(), 1.0),
+        Some(c) if c.is_ascii_digit() => (core, 1.0),
         _ => return None,
     };
     let n: f64 = num_part.trim().parse().ok()?;
@@ -482,11 +482,7 @@ pub fn parse_partitions(v: &serde_json::Value) -> Vec<PartitionInfo> {
                     let name = p.get("name").and_then(|x| x.as_str())?.to_string();
                     let nodes = p
                         .get("nodes")
-                        .and_then(|n| {
-                            n.get("configured")
-                                .map(|c| c.clone())
-                                .or_else(|| Some(n.clone()))
-                        })
+                        .and_then(|n| n.get("configured").cloned().or_else(|| Some(n.clone())))
                         .map(|n| str_list(Some(&n)))
                         .unwrap_or_default();
                     Some(PartitionInfo {
