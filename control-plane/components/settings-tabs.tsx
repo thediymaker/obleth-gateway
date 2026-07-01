@@ -1,12 +1,13 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { Bell, Route, Database, Info, Server, Bot } from "lucide-react";
+import { Bell, Route, Database, Info, Server, Bot, Archive } from "lucide-react";
 import {
   AlertSettingsForm,
   AutoRouterSettingsForm,
   BoonsSettingsForm,
   CharoSettingsForm,
+  CompressionSettingsForm,
   SlurmSettingsForm,
   UsageRetentionForm,
 } from "@/components/settings-form";
@@ -17,6 +18,7 @@ import type {
   AutoRouterSettingsView,
   BoonSettingsView,
   CharoSettingsView,
+  KompressStatusView,
   ModelRoute,
   SlurmSettingsView,
   UsageRetentionView,
@@ -27,6 +29,7 @@ export function SettingsTabs({
   autoRouter,
   boons,
   charo,
+  kompress,
   models,
   retention,
   slurm,
@@ -36,6 +39,7 @@ export function SettingsTabs({
   autoRouter: AutoRouterSettingsView | null;
   boons: BoonSettingsView | null;
   charo: CharoSettingsView | null;
+  kompress: KompressStatusView | null;
   models: ModelRoute[];
   retention: UsageRetentionView | null;
   slurm: SlurmSettingsView | null;
@@ -51,6 +55,10 @@ export function SettingsTabs({
         <TabsTrigger value="routing">
           <Route className="h-3.5 w-3.5" />
           Routing
+        </TabsTrigger>
+        <TabsTrigger value="compression">
+          <Archive className="h-3.5 w-3.5" />
+          Compression
         </TabsTrigger>
         <TabsTrigger value="data">
           <Database className="h-3.5 w-3.5" />
@@ -79,6 +87,10 @@ export function SettingsTabs({
           <AutoRouterSettingsForm settings={autoRouter} models={models} />
           <BoonsSettingsForm settings={boons} models={models} />
         </div>
+      </TabsContent>
+
+      <TabsContent value="compression">
+        <CompressionSettingsForm settings={boons} kompress={kompress} />
       </TabsContent>
 
       <TabsContent value="data">
