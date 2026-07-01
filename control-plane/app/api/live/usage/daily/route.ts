@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { obleth } from "@/lib/obleth";
 import type { UsageDailyGroupBy } from "@/lib/obleth";
+import { guardAdmin } from "@/lib/auth/guard";
 
 function defaultStart(): string {
   const d = new Date(Date.now() - 7 * 86_400_000);
@@ -12,6 +13,8 @@ function today(): string {
 }
 
 export async function GET(req: NextRequest) {
+  const denied = await guardAdmin();
+  if (denied) return denied;
   try {
     const p = req.nextUrl.searchParams;
     const rows = await obleth.usageDaily({

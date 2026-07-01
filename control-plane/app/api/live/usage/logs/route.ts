@@ -1,10 +1,13 @@
 import { NextRequest, NextResponse } from "next/server";
 import { obleth, type UsageLogParams, type UsageLogStatus } from "@/lib/obleth";
+import { guardAdmin } from "@/lib/auth/guard";
 
 // Live request-log feed for the dashboard. Forwards the supported filters and
 // keyset cursor straight through to the management API, which returns the page
 // newest-first with tenant/key names already resolved.
 export async function GET(req: NextRequest) {
+  const denied = await guardAdmin();
+  if (denied) return denied;
   const sp = req.nextUrl.searchParams;
   const str = (k: string) => sp.get(k)?.trim() || undefined;
   const num = (k: string) => {

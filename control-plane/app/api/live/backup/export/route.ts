@@ -1,9 +1,13 @@
 import { obleth } from "@/lib/obleth";
+import { guardAdmin } from "@/lib/auth/guard";
 
 // Streams the gateway's config backup to the browser as a JSON download.
-// Session auth is enforced by the proxy middleware like every /api/live route;
-// the admin-API bearer token is attached by the server-side obleth client.
+// Admin-only: the proxy middleware only checks session presence, so this route
+// independently enforces the admin role before exposing config secrets. The
+// admin-API bearer token is attached by the server-side obleth client.
 export async function GET() {
+  const denied = await guardAdmin();
+  if (denied) return denied;
   try {
     const backup = await obleth.exportBackup();
     const stamp = new Date()
