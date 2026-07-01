@@ -1,15 +1,16 @@
-# Build context: repo root (obleth-gateway/). The builder stage downloads the
-# ONNX model from Hugging Face (~600 MB) — image builds are slow and require
-# network. The runtime image does NOT include torch; only onnxruntime is shipped.
-FROM python:3.12-slim AS builder
+# Build context: repo root (obleth-gateway/). The model repo already ships a
+# pre-built ONNX artefact (onnx/kompress-fp32.onnx), so this stage just downloads
+# it (~600 MB) — no torch/transformers export. The build is slow only because of
+# the download size and needs network. The runtime image ships only onnxruntime.
+FROM python:3.12-slim AS fetch
 WORKDIR /build
-# Install build-time deps: optimum exporters, transformers, and torch (CPU).
-# torch is heavy but stays only in the builder layer; it is NOT carried into
-# the runtime image.
-RUN pip install --no-cache-dir "optimum[exporters]" transformers torch
-COPY kompress/export_model.py ./
+# Sole build-time dep (never carried into the runtime image): the Hub client.
+RUN pip install --no-cache-dir huggingface_hub
+COPY kompress/fetch_model.py ./
 ARG MODEL_ID=chopratejas/kompress-v2-base
-RUN python export_model.py --model-id $MODEL_ID --out-dir /models
+# Swap to onnx/kompress-int8-wo.onnx for a smaller, faster, slightly-lossier image.
+ARG ONNX_FILE=onnx/kompress-fp32.onnx
+RUN python fetch_model.py --model-id $MODEL_ID --out-dir /models --onnx-file $ONNX_FILE
 
 FROM python:3.12-slim AS runtime
 LABEL org.opencontainers.image.source="https://github.com/thediymaker/obleth-gateway"
@@ -20,7 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
 WORKDIR /app
 COPY kompress/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-COPY --from=builder /models /models
+COPY --from=fetch /models /models
 COPY kompress/app.py kompress/model.py ./
 ENV KOMPRESS_MODEL_DIR=/models
 EXPOSE 8080
