@@ -34,8 +34,20 @@ class Scorer:
         tokenizer_path = os.path.join(model_dir, "tokenizer.json")
         revision_path = os.path.join(model_dir, "revision.txt")
 
+        # onnxruntime otherwise spins up one intra-op thread per host core and
+        # saturates the whole machine on a single inference (throughput is
+        # CPU-bound and flat with request size). Bound it to COMPRESSOR_NUM_THREADS
+        # so one sidecar stays within its allotment — the deploy sets this to the
+        # pod/container CPU limit. Unset = onnxruntime default (all cores).
+        sess_options = ort.SessionOptions()
+        num_threads = os.environ.get("COMPRESSOR_NUM_THREADS")
+        if num_threads:
+            n = max(1, int(num_threads))
+            sess_options.intra_op_num_threads = n
+            sess_options.inter_op_num_threads = 1
         self._session = ort.InferenceSession(
             model_path,
+            sess_options,
             providers=["CPUExecutionProvider"],
         )
         self._tokenizer = Tokenizer.from_file(tokenizer_path)

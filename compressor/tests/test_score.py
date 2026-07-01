@@ -35,7 +35,9 @@ def test_health_ok(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
-    assert body["model"] == "kompress-v2-base"
+    # /health reports COMPRESSOR_MODEL_NAME (baked from the model id at build
+    # time); unset in tests, so it falls back to the generic default.
+    assert body["model"] == "compressor"
 
 
 def test_score_aligned(client):
