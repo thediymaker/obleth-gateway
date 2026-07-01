@@ -163,6 +163,14 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/obleth-kompress.Dockerfile
+      # Swap the neural model at build time. Defaults bake kompress-v2-base
+      # (pre-built ONNX). For LLMLingua-2 set in .env:
+      #   KOMPRESS_SOURCE=export
+      #   KOMPRESS_MODEL_ID=microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank
+      args:
+        KOMPRESS_SOURCE: ${KOMPRESS_SOURCE:-onnx}
+        MODEL_ID: ${KOMPRESS_MODEL_ID:-chopratejas/kompress-v2-base}
+        ONNX_FILE: ${KOMPRESS_ONNX_FILE:-onnx/kompress-fp32.onnx}
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/health"]
       interval: 30s

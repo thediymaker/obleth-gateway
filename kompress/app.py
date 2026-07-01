@@ -79,7 +79,8 @@ app = FastAPI(title="kompress", version="0.1.0", lifespan=lifespan)
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     rev = scorer.revision if scorer is not None else "unknown"  # type: ignore[union-attr]
-    return HealthResponse(status="ok", model="kompress-v2-base", revision=rev)
+    model = os.environ.get("KOMPRESS_MODEL_NAME", "kompress")
+    return HealthResponse(status="ok", model=model, revision=rev)
 
 
 @app.post("/score", response_model=ScoreResponse)
