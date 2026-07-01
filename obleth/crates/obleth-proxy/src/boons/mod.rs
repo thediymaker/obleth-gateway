@@ -28,6 +28,7 @@
 pub(crate) mod compression;
 #[cfg(test)]
 mod compression_verify;
+pub(crate) mod drain;
 pub(crate) mod embedded_json;
 pub(crate) mod guardrails;
 pub(crate) mod kompress;

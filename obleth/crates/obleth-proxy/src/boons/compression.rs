@@ -748,51 +748,44 @@ pub(super) fn extract_prose(
     Some(out)
 }
 
-/// Mask variable tokens (digit runs, hex) so structurally-identical log lines
-/// share a template.
-fn log_template(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut chars = line.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c.is_ascii_digit() {
-            out.push('#');
-            while chars
-                .peek()
-                .is_some_and(|d| d.is_ascii_digit() || *d == ':' || *d == '.' || *d == '-')
-            {
-                chars.next();
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Collapse repeated log lines: lines sharing a masked template that appears more
-/// than 3× are represented by their first occurrence + `(×N)`; `error`/`warn`
-/// lines are always kept verbatim. Returns `Some` only when strictly shorter.
+/// Collapse repeated log lines via Drain-style template mining: lines whose
+/// mined template appears more than 3× are represented by their first occurrence
+/// followed by a `(×N)` count. `error`/`warn` lines are always kept verbatim, and
+/// blank lines pass through. Drain clusters lines that vary in non-numeric fields
+/// too (hostnames, paths, uuids), so it collapses varied logs far better than a
+/// digit-only mask. Returns `Some` only when strictly shorter. The original is
+/// stashed for `retrieve_original` by the caller, so the collapse stays reversible.
 pub(super) fn compact_log(text: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() < 8 {
         return None;
     }
-    use std::collections::HashMap;
-    let mut counts: HashMap<String, usize> = HashMap::new();
-    for line in &lines {
-        *counts.entry(log_template(line)).or_insert(0) += 1;
+    // 0.7 keeps genuinely-repeated templates (~1.0 similarity) together while
+    // keeping structurally-different lines of the same token count apart — so a
+    // lone signal line (e.g. an error/summary) is never absorbed into a noisy
+    // cluster and dropped.
+    let ids = super::drain::cluster_ids(&lines, 0.6);
+    use std::collections::{HashMap, HashSet};
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    for &id in &ids {
+        *counts.entry(id).or_insert(0) += 1;
     }
-    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut emitted: HashSet<usize> = HashSet::new();
     let mut out = String::with_capacity(text.len());
-    for line in &lines {
+    for (i, line) in lines.iter().enumerate() {
+        if line.trim().is_empty() {
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
         let lower = line.to_lowercase();
         let is_problem = lower.contains("error") || lower.contains("warn");
-        let tmpl = log_template(line);
-        let count = counts.get(&tmpl).copied().unwrap_or(1);
+        let id = ids[i];
+        let count = counts.get(&id).copied().unwrap_or(1);
         if is_problem || count <= 3 {
             out.push_str(line);
             out.push('\n');
-        } else if emitted.insert(tmpl) {
+        } else if emitted.insert(id) {
             // First occurrence of a frequently-repeated template.
             out.push_str(line);
             out.push_str(&format!(" (×{count})\n"));
@@ -1124,6 +1117,23 @@ mod tests {
             ));
         }
         assert_eq!(classify(&text), ContentKind::Log);
+    }
+
+    #[test]
+    fn compact_log_collapses_non_numeric_variable_logs() {
+        // Lines vary only in non-numeric fields (user, workstation). The old
+        // digit-only mask would leave these as distinct templates; Drain clusters
+        // them and collapses.
+        let names = [
+            "alice", "bob", "carol", "dave", "erin", "frank", "grace", "heidi", "ivan", "judy",
+        ];
+        let mut text = String::new();
+        for (i, n) in names.iter().cycle().take(20).enumerate() {
+            text.push_str(&format!("user {n} logged in from workstation-{n}-{i}\n"));
+        }
+        let out = compact_log(&text).expect("varied logins should collapse");
+        assert!(out.len() < text.len());
+        assert!(out.contains("(×"));
     }
 
     #[test]
