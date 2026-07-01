@@ -1,16 +1,30 @@
-# Build context: repo root (obleth-gateway/). The model repo already ships a
-# pre-built ONNX artefact (onnx/kompress-fp32.onnx), so this stage just downloads
-# it (~600 MB) — no torch/transformers export. The build is slow only because of
-# the download size and needs network. The runtime image ships only onnxruntime.
+# Build context: repo root (obleth-gateway/). This stage provisions the model.
+# The runtime image ships only onnxruntime — no torch/transformers.
+#
+# The neural model is swappable via build args:
+#   KOMPRESS_SOURCE=onnx    (default) download a pre-built ONNX (kompress-v2-base
+#                           ships one). Only needs huggingface_hub. Fast-ish.
+#   KOMPRESS_SOURCE=export  export a token-classification model (e.g. LLMLingua-2)
+#                           to ONNX with torch. Heavier build.
+# e.g. LLMLingua-2:
+#   --build-arg KOMPRESS_SOURCE=export \
+#   --build-arg MODEL_ID=microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank
 FROM python:3.12-slim AS fetch
 WORKDIR /build
-# Sole build-time dep (never carried into the runtime image): the Hub client.
-RUN pip install --no-cache-dir huggingface_hub
-COPY kompress/fetch_model.py ./
+ARG KOMPRESS_SOURCE=onnx
 ARG MODEL_ID=chopratejas/kompress-v2-base
-# Swap to onnx/kompress-int8-wo.onnx for a smaller, faster, slightly-lossier image.
+# For source=onnx: swap to onnx/kompress-int8-wo.onnx for a smaller/faster image.
 ARG ONNX_FILE=onnx/kompress-fp32.onnx
-RUN python fetch_model.py --model-id $MODEL_ID --out-dir /models --onnx-file $ONNX_FILE
+# Install only the deps the chosen source needs (export drags in a CPU torch).
+RUN if [ "$KOMPRESS_SOURCE" = "export" ]; then \
+        pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu && \
+        pip install --no-cache-dir "transformers>=4.48,<5" onnx huggingface_hub; \
+    else \
+        pip install --no-cache-dir huggingface_hub; \
+    fi
+COPY kompress/fetch_model.py ./
+RUN python fetch_model.py --source "$KOMPRESS_SOURCE" --model-id "$MODEL_ID" \
+        --onnx-file "$ONNX_FILE" --out-dir /models
 
 FROM python:3.12-slim AS runtime
 LABEL org.opencontainers.image.source="https://github.com/thediymaker/obleth-gateway"

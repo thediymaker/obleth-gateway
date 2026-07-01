@@ -1,24 +1,23 @@
 """
-Build-time fetch script: downloads the PRE-BUILT ONNX artefact + tokenizer for
-chopratejas/kompress-v2-base into the directory the sidecar serves.
+Build-time model provisioning for the kompress sidecar.
 
-The model repo already ships ONNX (`onnx/kompress-fp32.onnx`), so there is no
-torch/transformers export step — we just pull the files. Run this ONCE at Docker
-image build time. It needs one build-time dependency NOT in requirements.txt:
+Two sources, selected by --source (KOMPRESS_SOURCE build arg):
 
-    pip install huggingface_hub
+  onnx    (default) Download a PRE-BUILT ONNX file + tokenizer from the repo.
+          Used by chopratejas/kompress-v2-base, which ships ONNX. Only dep:
+          huggingface_hub.
 
-The runtime sidecar reads `model.onnx` + `tokenizer.json` + `revision.txt` from
-the output dir via onnxruntime + tokenizers — no torch/transformers at run time.
+  export  Export a standard AutoModelForTokenClassification model to ONNX at
+          build time. Used for models that ship only weights — e.g. LLMLingua-2
+          (microsoft/llmlingua-2-*). Deps: torch (CPU) + transformers + onnx.
+
+Either way the runtime reads model.onnx + tokenizer.json + revision.txt from the
+output dir via onnxruntime + tokenizers; the runtime scorer is model-agnostic (it
+consumes per-token scores/logits). Run ONCE at image build time.
 
 Usage:
-    python fetch_model.py [--model-id ID] [--out-dir DIR] [--onnx-file PATH]
-
-Defaults:
-    --model-id   chopratejas/kompress-v2-base
-    --out-dir    /models
-    --onnx-file  onnx/kompress-fp32.onnx   (use onnx/kompress-int8-wo.onnx for a
-                                            smaller, faster, slightly-lossier build)
+    python fetch_model.py --source onnx   --model-id ID --onnx-file PATH --out-dir DIR
+    python fetch_model.py --source export --model-id ID                  --out-dir DIR
 """
 from __future__ import annotations
 
@@ -27,56 +26,98 @@ import os
 import shutil
 
 
-def fetch(model_id: str, out_dir: str, onnx_file: str) -> None:
+def _write_revision(model_id: str, out_dir: str) -> str:
+    revision = "unknown"
     try:
-        from huggingface_hub import hf_hub_download, model_info  # type: ignore[import-untyped]
+        from huggingface_hub import model_info  # type: ignore[import-untyped]
+
+        revision = model_info(model_id).sha or "unknown"
+    except Exception:  # noqa: BLE001
+        pass
+    with open(os.path.join(out_dir, "revision.txt"), "w", encoding="utf-8") as fh:
+        fh.write(revision)
+    return revision
+
+
+def fetch_onnx(model_id: str, out_dir: str, onnx_file: str) -> None:
+    """Download a pre-built ONNX artefact + tokenizer from the model repo."""
+    try:
+        from huggingface_hub import hf_hub_download  # type: ignore[import-untyped]
     except ImportError as exc:
         raise SystemExit(
             f"Build-time dep missing: {exc}\nRun:  pip install huggingface_hub"
         ) from exc
 
-    os.makedirs(out_dir, exist_ok=True)
-    print(f"Fetching {model_id!r} ({onnx_file}) -> {out_dir!r} ...")
+    print(f"Fetching pre-built ONNX {model_id!r} ({onnx_file}) -> {out_dir!r} ...")
+    shutil.copyfile(hf_hub_download(repo_id=model_id, filename=onnx_file),
+                    os.path.join(out_dir, "model.onnx"))
+    shutil.copyfile(hf_hub_download(repo_id=model_id, filename="tokenizer.json"),
+                    os.path.join(out_dir, "tokenizer.json"))
 
-    onnx_src = hf_hub_download(repo_id=model_id, filename=onnx_file)
-    shutil.copyfile(onnx_src, os.path.join(out_dir, "model.onnx"))
 
-    tokenizer_src = hf_hub_download(repo_id=model_id, filename="tokenizer.json")
-    shutil.copyfile(tokenizer_src, os.path.join(out_dir, "tokenizer.json"))
-
-    # Resolve the commit revision for /health provenance.
-    revision = "unknown"
+def fetch_export(model_id: str, out_dir: str) -> None:
+    """Export a token-classification model (e.g. LLMLingua-2) to ONNX via torch."""
     try:
-        revision = model_info(model_id).sha or "unknown"
-    except Exception:  # noqa: BLE001
-        pass
+        import torch
+        from transformers import AutoModelForTokenClassification, AutoTokenizer
+    except ImportError as exc:
+        raise SystemExit(
+            f"Build-time deps missing: {exc}\n"
+            'Run:  pip install "transformers>=4.48,<5" torch onnx'
+        ) from exc
 
-    with open(os.path.join(out_dir, "revision.txt"), "w", encoding="utf-8") as fh:
-        fh.write(revision)
+    print(f"Exporting token-classification model {model_id!r} -> {out_dir!r} ...")
+    model = AutoModelForTokenClassification.from_pretrained(model_id)
+    model.eval()
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-    print(f"Fetch complete.  Revision: {revision}")
-    print(f"Files in {out_dir}: {sorted(os.listdir(out_dir))}")
+    class LogitsOnly(torch.nn.Module):
+        def __init__(self, inner: torch.nn.Module) -> None:
+            super().__init__()
+            self.inner = inner
+
+        def forward(self, input_ids, attention_mask):  # noqa: ANN001
+            return self.inner(input_ids=input_ids, attention_mask=attention_mask).logits
+
+    enc = tokenizer("The quick brown fox jumps over the lazy dog.", return_tensors="pt")
+    with torch.no_grad():
+        torch.onnx.export(
+            LogitsOnly(model),
+            (enc["input_ids"], enc["attention_mask"]),
+            os.path.join(out_dir, "model.onnx"),
+            input_names=["input_ids", "attention_mask"],
+            output_names=["logits"],
+            dynamic_axes={
+                "input_ids": {0: "batch", 1: "sequence"},
+                "attention_mask": {0: "batch", 1: "sequence"},
+                "logits": {0: "batch", 1: "sequence"},
+            },
+            opset_version=17,
+            do_constant_folding=True,
+        )
+    tokenizer.save_pretrained(out_dir)
+    if not os.path.isfile(os.path.join(out_dir, "tokenizer.json")):
+        raise SystemExit("tokenizer.json not produced — the model needs a fast tokenizer.")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Fetch the kompress ONNX artefact.")
-    parser.add_argument(
-        "--model-id",
-        default="chopratejas/kompress-v2-base",
-        help="HuggingFace model id (default: chopratejas/kompress-v2-base)",
-    )
-    parser.add_argument(
-        "--out-dir",
-        default="/models",
-        help="Output directory for the ONNX artefacts (default: /models)",
-    )
-    parser.add_argument(
-        "--onnx-file",
-        default="onnx/kompress-fp32.onnx",
-        help="Which ONNX file in the repo to fetch (default: onnx/kompress-fp32.onnx)",
-    )
+    parser = argparse.ArgumentParser(description="Provision the kompress model.")
+    parser.add_argument("--source", choices=["onnx", "export"], default="onnx")
+    parser.add_argument("--model-id", default="chopratejas/kompress-v2-base")
+    parser.add_argument("--out-dir", default="/models")
+    parser.add_argument("--onnx-file", default="onnx/kompress-fp32.onnx",
+                        help="repo path of the pre-built ONNX (source=onnx only)")
     args = parser.parse_args()
-    fetch(args.model_id, args.out_dir, args.onnx_file)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    if args.source == "onnx":
+        fetch_onnx(args.model_id, args.out_dir, args.onnx_file)
+    else:
+        fetch_export(args.model_id, args.out_dir)
+
+    revision = _write_revision(args.model_id, args.out_dir)
+    print(f"Done.  Revision: {revision}")
+    print(f"Files in {args.out_dir}: {sorted(os.listdir(args.out_dir))}")
 
 
 if __name__ == "__main__":
