@@ -45,7 +45,9 @@ impl CompressorClient {
     pub fn from_env() -> Option<CompressorClient> {
         parse_config(
             std::env::var("OBLETH_COMPRESSOR_URL").ok().as_deref(),
-            std::env::var("OBLETH_COMPRESSOR_TIMEOUT_MS").ok().as_deref(),
+            std::env::var("OBLETH_COMPRESSOR_TIMEOUT_MS")
+                .ok()
+                .as_deref(),
         )
     }
 

@@ -29,10 +29,10 @@ pub(crate) mod code_prune;
 pub(crate) mod compression;
 #[cfg(test)]
 mod compression_verify;
+pub(crate) mod compressor;
 pub(crate) mod drain;
 pub(crate) mod embedded_json;
 pub(crate) mod guardrails;
-pub(crate) mod compressor;
 pub mod mcp_tools;
 pub mod respond;
 pub(crate) mod structural_json;
@@ -115,17 +115,22 @@ fn log_compaction_eligible(
 
 /// Lossy semantic compression is eligible when the base holds and the
 /// `allow_lossy` piece is on. A per-tenant policy overrides the global
-/// `allow_lossy` default; a tenant with no policy inherits it.
+/// `allow_lossy` default; a tenant with no policy inherits it. `force` is the
+/// per-request `x-obleth-boons: lossy` override — it turns the lossy pass on for
+/// this request regardless of the toggle, but the base gate (boon granted, not
+/// internal, globally active) still applies.
 fn lossy_eligible(
     route: &obleth_config::ResolvedModel,
     settings: &obleth_config::BoonSettings,
     key: &obleth_config::ResolvedKey,
+    force: bool,
 ) -> bool {
     opt_in_compression_base(route, settings, key)
-        && match &key.compression_policy {
-            Some(p) => p.allow_lossy,
-            None => settings.compression.allow_lossy,
-        }
+        && (force
+            || match &key.compression_policy {
+                Some(p) => p.allow_lossy,
+                None => settings.compression.allow_lossy,
+            })
 }
 
 /// Per-tenant code-compaction toggle with the global setting as the no-policy
@@ -140,12 +145,22 @@ fn effective_code_compaction(
     }
 }
 
-/// Request header that disables boon processing for a single request when set
-/// to `off`. Also returned on responses listing the boons that were applied.
+/// Per-request boon control header (comma-separated tokens), also echoed on
+/// responses listing the boons that were applied. Recognized request tokens:
+/// - `off`   — disable ALL boon processing for this request (wins over others).
+/// - `lossy` — force the compression boon's lossy prose pass ON for this request
+///   even when the tenant/global `allow_lossy` toggle is off. The model must
+///   still have the `compression` boon granted. Intended for back-to-back A/B
+///   testing (compare a request with and without lossy compression).
 pub const BOONS_HEADER: &str = "x-obleth-boons";
 /// Response header carrying a non-fatal boon warning (e.g. structured-output
 /// validation failed and the original completion passed through).
 pub const BOONS_WARNING_HEADER: &str = "x-obleth-boons-warning";
+/// Response header summarizing what the compression boon did, for cheap
+/// back-to-back comparison without reading traces:
+/// `before=<tokens>;after=<tokens>;saved=<tokens>`. Emitted only when the
+/// compression boon ran on the request.
+pub const COMPRESSION_HEADER: &str = "x-obleth-compression";
 
 /// Hot-swappable boon configuration shared across the data plane.
 #[derive(Clone)]
@@ -167,6 +182,10 @@ pub struct EnrichOutcome {
     /// Set by the guardrails boon when a scanner rejects the request. The proxy
     /// must return `block.status` immediately when this is Some.
     pub blocked: Option<guardrails::GuardrailsBlock>,
+    /// Combined compression token totals `(before, after)` across all passes,
+    /// for the `x-obleth-compression` response header. `Some` only when the
+    /// compression boon actually ran (saw tokens) on this request.
+    pub compression_tokens: Option<(u32, u32)>,
 }
 
 /// Response-side work armed by request enrichment. Captures everything the
@@ -226,7 +245,9 @@ impl BoonEngine {
     /// intercepted.
     ///
     /// `opt_out` is the per-request `x-obleth-boons: off` escape hatch;
-    /// `is_chat` restricts the tools/structured boons to chat completions.
+    /// `force_lossy` is the per-request `x-obleth-boons: lossy` override that
+    /// turns the lossy compression pass on for this request; `is_chat` restricts
+    /// the tools/structured boons to chat completions.
     #[allow(clippy::too_many_arguments)]
     pub async fn enrich_request(
         &self,
@@ -235,6 +256,7 @@ impl BoonEngine {
         key: &ResolvedKey,
         session_id: &str,
         opt_out: bool,
+        force_lossy: bool,
         is_chat: bool,
         json: &mut Value,
         mut tracer: Option<&mut crate::tracer::SpanRecorder>,
@@ -362,7 +384,7 @@ impl BoonEngine {
         // after tool-loop injection so retrieve_original can ride the same loop.
         if dedup_eligible(route, &settings, key)
             || log_compaction_eligible(route, &settings, key)
-            || lossy_eligible(route, &settings, key)
+            || lossy_eligible(route, &settings, key, force_lossy)
         {
             if dedup_eligible(route, &settings, key) {
                 dedup =
@@ -379,7 +401,7 @@ impl BoonEngine {
                 )
                 .await;
             }
-            if lossy_eligible(route, &settings, key) {
+            if lossy_eligible(route, &settings, key, force_lossy) {
                 lossy =
                     compression::apply_lossy(state, &settings.compression, key, session_id, json)
                         .await;
@@ -417,18 +439,25 @@ impl BoonEngine {
             }
         }
 
+        // ---- combined compression token totals (all passes) ----
+        let tokens_before = lossless
+            .tokens_before
+            .saturating_add(dedup.tokens_before)
+            .saturating_add(logs.tokens_before)
+            .saturating_add(lossy.tokens_before);
+        let tokens_after = lossless
+            .tokens_after
+            .saturating_add(dedup.tokens_after)
+            .saturating_add(logs.tokens_after)
+            .saturating_add(lossy.tokens_after);
+        // Surface totals for the `x-obleth-compression` response header whenever
+        // the compression boon actually inspected tokens on this request.
+        if tokens_before > 0 {
+            outcome.compression_tokens = Some((tokens_before, tokens_after));
+        }
+
         // ---- single compression trace span (all passes combined) ----
         if let Some(t) = tracer.as_deref_mut() {
-            let tokens_before = lossless
-                .tokens_before
-                .saturating_add(dedup.tokens_before)
-                .saturating_add(logs.tokens_before)
-                .saturating_add(lossy.tokens_before);
-            let tokens_after = lossless
-                .tokens_after
-                .saturating_add(dedup.tokens_after)
-                .saturating_add(logs.tokens_after)
-                .saturating_add(lossy.tokens_after);
             if lossless.scanned > 0 || tokens_before > 0 {
                 t.record_elapsed(
                     "boon:compression",
@@ -883,7 +912,7 @@ mod tests {
             allow_lossy: true,
         }));
         assert!(dedup_eligible(&route, &settings, &key));
-        assert!(lossy_eligible(&route, &settings, &key));
+        assert!(lossy_eligible(&route, &settings, &key, false));
 
         // Toggles off → ineligible.
         key.compression_policy = Some(CompressionPolicy {
@@ -894,12 +923,33 @@ mod tests {
             allow_lossy: false,
         });
         assert!(!dedup_eligible(&route, &settings, &key));
-        assert!(!lossy_eligible(&route, &settings, &key));
+        assert!(!lossy_eligible(&route, &settings, &key, false));
+        // ...but the per-request force override turns it on despite the toggle.
+        assert!(lossy_eligible(&route, &settings, &key, true));
 
         // No policy → ineligible (conservative).
         key.compression_policy = None;
         assert!(!dedup_eligible(&route, &settings, &key));
-        assert!(!lossy_eligible(&route, &settings, &key));
+        assert!(!lossy_eligible(&route, &settings, &key, false));
+        // Force still respects the base gate: it flips only the allow_lossy
+        // toggle, so with the boon granted + globally active it now applies.
+        assert!(lossy_eligible(&route, &settings, &key, true));
+    }
+
+    #[test]
+    fn force_lossy_still_requires_the_boon_granted() {
+        use obleth_config::{BoonSettings, CompressionBoonSettings};
+        let mut settings = BoonSettings::default();
+        settings.compression = CompressionBoonSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        // Model was NOT granted the compression boon.
+        let mut route = test_route();
+        route.boons = vec![];
+        let key = test_key_with_policy(None);
+        // The force override cannot bypass the base gate (boon must be granted).
+        assert!(!lossy_eligible(&route, &settings, &key, true));
     }
 
     #[test]

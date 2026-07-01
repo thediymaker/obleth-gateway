@@ -344,10 +344,25 @@ async fn proxy_handler_inner(
     // request; the structured-output boon and the gateway tool loop may arm a
     // response plan that intercepts and rewrites the completion below (streaming
     // clients of the tool loop are driven live; see `stream_tap`).
-    let boons_opt_out = headers
+    // `x-obleth-boons` is a comma-separated control list: `off` disables all
+    // boons for the request; `lossy` forces the compression boon's lossy pass on
+    // (for back-to-back A/B testing). `off` wins if both are present.
+    let (boons_opt_out, boons_force_lossy) = headers
         .get(crate::boons::BOONS_HEADER)
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.trim().eq_ignore_ascii_case("off"));
+        .map(|v| {
+            let mut opt_out = false;
+            let mut force_lossy = false;
+            for tok in v.split(',') {
+                match tok.trim().to_ascii_lowercase().as_str() {
+                    "off" => opt_out = true,
+                    "lossy" => force_lossy = true,
+                    _ => {}
+                }
+            }
+            (opt_out, force_lossy)
+        })
+        .unwrap_or((false, false));
     let boon_outcome = state
         .boons
         .enrich_request(
@@ -356,6 +371,7 @@ async fn proxy_handler_inner(
             &resolved,
             &req_meta.session_id,
             boons_opt_out,
+            boons_force_lossy,
             req_meta.request_type == "chat",
             &mut json,
             tracer.as_mut(),
@@ -377,6 +393,16 @@ async fn proxy_handler_inner(
         est = state.tokenizer.estimate_request(&json);
     }
     let boons_applied = boon_outcome.applied;
+    // Compact compression summary for the `x-obleth-compression` response header,
+    // so a back-to-back A/B client can diff savings without reading traces.
+    let compression_header = boon_outcome.compression_tokens.map(|(before, after)| {
+        format!(
+            "before={};after={};saved={}",
+            before,
+            after,
+            before.saturating_sub(after)
+        )
+    });
     let response_plan = boon_outcome.response_plan;
 
     // Live streaming tool loop: when the *only* response transform is the
@@ -1155,6 +1181,9 @@ async fn proxy_handler_inner(
             .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
         if !boons_applied.is_empty() {
             builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
+            if let Some(h) = &compression_header {
+                builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
+            }
         }
         return builder.body(Body::from(buf)).unwrap_or_else(|_| {
             error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
@@ -1269,6 +1298,9 @@ async fn proxy_handler_inner(
                     .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
                 if !boons_applied.is_empty() {
                     builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
+                    if let Some(h) = &compression_header {
+                        builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
+                    }
                 }
                 return builder
                     .body(Body::from_stream(body_stream))
@@ -1442,6 +1474,9 @@ async fn proxy_handler_inner(
             .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
         if !boons_applied.is_empty() {
             builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
+            if let Some(h) = &compression_header {
+                builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
+            }
         }
         if let Some(w) = warning {
             builder = builder.header(crate::boons::BOONS_WARNING_HEADER, w);
@@ -1606,6 +1641,9 @@ async fn proxy_handler_inner(
         .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
     if !boons_applied.is_empty() {
         builder = builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
+        if let Some(h) = &compression_header {
+            builder = builder.header(crate::boons::COMPRESSION_HEADER, h);
+        }
     }
     builder
         .body(Body::from_stream(body_stream))
