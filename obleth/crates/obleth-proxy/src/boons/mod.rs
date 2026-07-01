@@ -80,43 +80,50 @@ fn opt_in_compression_base(
     settings.compression.active() && route.boons.iter().any(|b| b == "compression") && !key.internal
 }
 
-/// Cross-turn dedup is eligible when the base holds and the tenant enabled the
-/// `dedup` piece. No tenant policy => no dedup.
+/// Cross-turn dedup is eligible when the base holds and the `dedup` piece is on.
+/// A per-tenant policy overrides the global `dedup` default; a tenant with no
+/// policy inherits it.
 fn dedup_eligible(
     route: &obleth_config::ResolvedModel,
     settings: &obleth_config::BoonSettings,
     key: &obleth_config::ResolvedKey,
 ) -> bool {
     opt_in_compression_base(route, settings, key)
-        && key.compression_policy.as_ref().is_some_and(|p| p.dedup)
+        && match &key.compression_policy {
+            Some(p) => p.dedup,
+            None => settings.compression.dedup,
+        }
 }
 
 /// Near-lossless log template-collapse is eligible when the base holds and the
-/// tenant enabled the `compact_logs` piece. Separate from `allow_lossy`.
+/// `compact_logs` piece is on. A per-tenant policy overrides the global
+/// `compact_logs` default; a tenant with no policy inherits it. Independent of
+/// `allow_lossy`.
 fn log_compaction_eligible(
     route: &obleth_config::ResolvedModel,
     settings: &obleth_config::BoonSettings,
     key: &obleth_config::ResolvedKey,
 ) -> bool {
     opt_in_compression_base(route, settings, key)
-        && key
-            .compression_policy
-            .as_ref()
-            .is_some_and(|p| p.compact_logs)
+        && match &key.compression_policy {
+            Some(p) => p.compact_logs,
+            None => settings.compression.compact_logs,
+        }
 }
 
-/// Lossy semantic compression is eligible when the base holds and the tenant
-/// enabled the `allow_lossy` piece.
+/// Lossy semantic compression is eligible when the base holds and the
+/// `allow_lossy` piece is on. A per-tenant policy overrides the global
+/// `allow_lossy` default; a tenant with no policy inherits it.
 fn lossy_eligible(
     route: &obleth_config::ResolvedModel,
     settings: &obleth_config::BoonSettings,
     key: &obleth_config::ResolvedKey,
 ) -> bool {
     opt_in_compression_base(route, settings, key)
-        && key
-            .compression_policy
-            .as_ref()
-            .is_some_and(|p| p.allow_lossy)
+        && match &key.compression_policy {
+            Some(p) => p.allow_lossy,
+            None => settings.compression.allow_lossy,
+        }
 }
 
 /// Per-tenant code-compaction toggle with the global setting as the no-policy

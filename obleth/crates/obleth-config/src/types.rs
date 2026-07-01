@@ -1311,6 +1311,20 @@ pub struct CompressionBoonSettings {
     /// (strip trailing whitespace, collapse blank-line runs). Off by default.
     #[serde(default)]
     pub code_compaction: bool,
+    /// Cross-turn exact-duplicate dedup default. A per-tenant policy overrides
+    /// this; tenants with no policy inherit it. Off by default.
+    #[serde(default)]
+    pub dedup: bool,
+    /// Near-lossless log template-collapse default (repeated log lines → one
+    /// representative line + `(×N)`). A per-tenant policy overrides this;
+    /// tenants with no policy inherit it. Off by default.
+    #[serde(default)]
+    pub compact_logs: bool,
+    /// Lossy text compaction default (salience-based prose line/sentence drop;
+    /// uses the neural sidecar when deployed). A per-tenant policy overrides
+    /// this; tenants with no policy inherit it. Off by default.
+    #[serde(default)]
+    pub allow_lossy: bool,
     /// Fraction of sentences the kompress sidecar selects to keep during the
     /// neural extractive pass. Range `(0.0, 1.0]`; defaults to 0.5.
     #[serde(default = "default_neural_keep_ratio")]
@@ -1326,6 +1340,9 @@ impl Default for CompressionBoonSettings {
             original_ttl_secs: default_compression_original_ttl_secs(),
             max_lossy_segments: default_compression_max_lossy_segments(),
             code_compaction: false,
+            dedup: false,
+            compact_logs: false,
+            allow_lossy: false,
             neural_keep_ratio: default_neural_keep_ratio(),
         }
     }

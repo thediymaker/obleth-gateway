@@ -254,6 +254,7 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/settings/boons",
             get(get_boon_settings).put(put_boon_settings),
         )
+        .route("/api/v1/settings/kompress", get(get_kompress_status))
         .route(
             "/api/v1/settings/charo",
             get(get_charo_settings).put(put_charo_settings),
@@ -1516,6 +1517,10 @@ pub struct BoonSettingsView {
     pub compression_original_ttl_secs: u64,
     pub compression_max_lossy_segments: u32,
     pub compression_code_compaction: bool,
+    pub compression_dedup: bool,
+    pub compression_compact_logs: bool,
+    pub compression_allow_lossy: bool,
+    pub compression_neural_keep_ratio: f32,
 }
 
 impl BoonSettingsView {
@@ -1540,6 +1545,10 @@ impl BoonSettingsView {
             compression_original_ttl_secs: s.compression.original_ttl_secs,
             compression_max_lossy_segments: s.compression.max_lossy_segments,
             compression_code_compaction: s.compression.code_compaction,
+            compression_dedup: s.compression.dedup,
+            compression_compact_logs: s.compression.compact_logs,
+            compression_allow_lossy: s.compression.allow_lossy,
+            compression_neural_keep_ratio: s.compression.neural_keep_ratio,
         }
     }
 }
@@ -1597,6 +1606,19 @@ pub struct UpdateBoonSettings {
     /// Toggle conservative code compaction. Omit to leave unchanged.
     #[serde(default)]
     pub compression_code_compaction: Option<bool>,
+    /// Global default for cross-turn dedup (tenant policy overrides). Omit to leave unchanged.
+    #[serde(default)]
+    pub compression_dedup: Option<bool>,
+    /// Global default for log template-collapse (tenant policy overrides). Omit to leave unchanged.
+    #[serde(default)]
+    pub compression_compact_logs: Option<bool>,
+    /// Global default for lossy text compaction (tenant policy overrides). Omit to leave unchanged.
+    #[serde(default)]
+    pub compression_allow_lossy: Option<bool>,
+    /// Fraction of sentences the neural (kompress) prose pass keeps. Must be in
+    /// `(0.0, 1.0]`; values outside that range (or omitted) leave it unchanged.
+    #[serde(default)]
+    pub compression_neural_keep_ratio: Option<f32>,
 }
 
 #[utoipa::path(
@@ -1706,7 +1728,17 @@ async fn put_boon_settings(
             code_compaction: body
                 .compression_code_compaction
                 .unwrap_or(existing.compression.code_compaction),
-            neural_keep_ratio: existing.compression.neural_keep_ratio,
+            dedup: body.compression_dedup.unwrap_or(existing.compression.dedup),
+            compact_logs: body
+                .compression_compact_logs
+                .unwrap_or(existing.compression.compact_logs),
+            allow_lossy: body
+                .compression_allow_lossy
+                .unwrap_or(existing.compression.allow_lossy),
+            neural_keep_ratio: body
+                .compression_neural_keep_ratio
+                .filter(|r| *r > 0.0 && *r <= 1.0)
+                .unwrap_or(existing.compression.neural_keep_ratio),
         },
     };
 
@@ -1741,6 +1773,107 @@ async fn put_boon_settings(
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CharoSettingsView {
     pub enabled: bool,
+}
+
+/// Live status of the optional neural compression sidecar. Its URL is env-only
+/// operator config (`OBLETH_KOMPRESS_URL`), not stored in the DB, so this is a
+/// live on-demand probe of the sidecar's `/health` — mirroring how the Slurm tab
+/// surfaces provisioner health. Fail-soft: any error yields `reachable=false`
+/// with the reason, never an error response.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct KompressStatusView {
+    /// True when `OBLETH_KOMPRESS_URL` is set (the feature is wired at all).
+    pub configured: bool,
+    /// The configured sidecar base URL (empty when unconfigured).
+    pub url: String,
+    /// True when the sidecar answered `/health` with status `"ok"`.
+    pub reachable: bool,
+    /// Model name the sidecar reports (e.g. `"kompress-v2-base"`).
+    pub model: Option<String>,
+    /// Model commit revision the sidecar reports.
+    pub revision: Option<String>,
+    /// Human-readable reason when the sidecar is configured but not reachable.
+    pub error: Option<String>,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/settings/kompress", tag = "settings",
+    responses((status = 200, body = KompressStatusView))
+)]
+async fn get_kompress_status() -> Result<Json<KompressStatusView>> {
+    let url = std::env::var("OBLETH_KOMPRESS_URL")
+        .unwrap_or_default()
+        .trim()
+        .trim_end_matches('/')
+        .to_string();
+
+    if url.is_empty() {
+        return Ok(Json(KompressStatusView {
+            configured: false,
+            url: String::new(),
+            reachable: false,
+            model: None,
+            revision: None,
+            error: None,
+        }));
+    }
+
+    // Give the settings probe a little more room than the 800ms request-path
+    // timeout — a cold sidecar can be slow to answer its first /health.
+    let timeout_ms = std::env::var("OBLETH_KOMPRESS_TIMEOUT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .unwrap_or(2000)
+        .max(2000);
+
+    let unreachable = |url: String, error: String| {
+        Json(KompressStatusView {
+            configured: true,
+            url,
+            reachable: false,
+            model: None,
+            revision: None,
+            error: Some(error),
+        })
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => return Ok(unreachable(url, e.to_string())),
+    };
+
+    match client.get(format!("{url}/health")).send().await {
+        Ok(resp) if resp.status().is_success() => match resp.json::<serde_json::Value>().await {
+            Ok(v) => {
+                let ok = v.get("status").and_then(|s| s.as_str()) == Some("ok");
+                Ok(Json(KompressStatusView {
+                    configured: true,
+                    url,
+                    reachable: ok,
+                    model: v.get("model").and_then(|s| s.as_str()).map(str::to_string),
+                    revision: v
+                        .get("revision")
+                        .and_then(|s| s.as_str())
+                        .map(str::to_string),
+                    error: if ok {
+                        None
+                    } else {
+                        Some("sidecar reported a non-ok status".to_string())
+                    },
+                }))
+            }
+            Err(e) => Ok(unreachable(url, format!("invalid /health response: {e}"))),
+        },
+        Ok(resp) => Ok(unreachable(
+            url,
+            format!("sidecar returned HTTP {}", resp.status()),
+        )),
+        Err(e) => Ok(unreachable(url, e.to_string())),
+    }
 }
 
 #[utoipa::path(
@@ -3942,6 +4075,17 @@ mod tests {
         assert!(view.compression_enabled);
         assert_eq!(view.compression_min_tokens, 256);
         assert_eq!(view.compression_max_segments, 8);
+        // Defaults surface the neural keep ratio so operators can read/tune it.
+        assert_eq!(view.compression_neural_keep_ratio, 0.5);
+    }
+
+    #[test]
+    fn boon_view_round_trips_neural_keep_ratio() {
+        use obleth_config::BoonSettings;
+        let mut s = BoonSettings::default();
+        s.compression.neural_keep_ratio = 0.3;
+        let view = BoonSettingsView::from_settings(&s);
+        assert_eq!(view.compression_neural_keep_ratio, 0.3);
     }
 
     #[test]
