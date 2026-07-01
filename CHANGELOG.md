@@ -4,6 +4,17 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.6.0
+Context compression: shrink oversized tool output, logs, and repeated context before it reaches the model — losslessly by default, with per-tenant control.
+
+- **New compression boon.** Grant `compression` to a model and the gateway compacts oversized message segments before they go upstream, cutting tokens (and cost/latency) without changing answers. Deterministic, runs locally (no helper model), and fails open — a segment is rewritten only when the result provably reconstructs to the same value and is strictly smaller.
+- **Lossless JSON structural compaction, everywhere.** Arrays of like objects become a compact table form (columns once, one row each) wherever they appear — standalone, wrapped in an object, several per payload, embedded in a prose message or a ```json fence, and with sparse/non-uniform keys. Typically 35–45% on JSON payloads, fully reversible.
+- **Near-lossless log compaction (opt-in).** Enable **Log compaction** for a tenant and repeated, structurally-identical log lines collapse to a single representative with a count, while every ERROR/WARN line is kept verbatim. Reversible, and a separate switch from lossy prose.
+- **Cross-turn deduplication (opt-in).** Large blocks re-sent verbatim across turns (a pasted document, a system prompt, a prior tool result) are replaced after the first occurrence with a compact reference — commonly 60%+ on re-grounded conversations, fully recoverable.
+- **Per-tenant compression policy in the dashboard.** A Compression tab per tenant: master switch plus independent toggles for code-whitespace compaction, cross-turn dedup, log compaction, and lossy prose — enable the safe pieces without opting into anything lossy.
+- **Visible in request traces.** The `boon:compression` span reports what each pass did (JSON compacted, dedup refs, log segments, tokens before/after/saved).
+- **More faithful float handling.** JSON floating-point numbers now round-trip exactly through the gateway (correctly-rounded parsing).
+
 ## v0.5.5
 Import models straight from an OpenAI-compatible provider — no file to hand-write.
 
