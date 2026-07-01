@@ -27,7 +27,7 @@ jobs:
     needs: verify
     strategy:
       matrix:
-        component: [obleth, obleth-provisioner, control-plane, benchmark-backend]
+        component: [obleth, obleth-provisioner, control-plane, benchmark-backend, obleth-kompress]
         # Native runners for both arches — never QEMU (Rust under emulation
         # takes 30-60 min per image).
         runner: [ubuntu-latest, ubuntu-24.04-arm]
@@ -46,6 +46,10 @@ jobs:
             context: ./control-plane
           - component: benchmark-backend
             context: ./benchmark-backend
+          # NOTE: this image is slow to build — the builder stage downloads and
+          # bakes a ~600 MB ONNX model from Hugging Face.
+          - component: obleth-kompress
+            context: .
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -80,7 +84,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        component: [obleth, obleth-provisioner, control-plane, benchmark-backend]
+        component: [obleth, obleth-provisioner, control-plane, benchmark-backend, obleth-kompress]
     steps:
       - uses: docker/login-action@v3
         with:
