@@ -1684,7 +1684,9 @@ async fn put_boon_settings(
         },
         guardrails: existing.guardrails.clone(),
         compression: obleth_config::CompressionBoonSettings {
-            enabled: body.compression_enabled.unwrap_or(existing.compression.enabled),
+            enabled: body
+                .compression_enabled
+                .unwrap_or(existing.compression.enabled),
             min_tokens: body
                 .compression_min_tokens
                 .filter(|n| *n > 0)
@@ -3929,7 +3931,12 @@ mod tests {
     fn boon_view_round_trips_compression() {
         use obleth_config::{BoonSettings, CompressionBoonSettings};
         let mut s = BoonSettings::default();
-        s.compression = CompressionBoonSettings { enabled: true, min_tokens: 256, max_segments: 8, ..Default::default() };
+        s.compression = CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 256,
+            max_segments: 8,
+            ..Default::default()
+        };
         let view = BoonSettingsView::from_settings(&s);
         assert!(view.compression_enabled);
         assert_eq!(view.compression_min_tokens, 256);
@@ -3952,7 +3959,11 @@ mod tests {
     fn boon_view_round_trips_code_compaction() {
         use obleth_config::{BoonSettings, CompressionBoonSettings};
         let mut s = BoonSettings::default();
-        s.compression = CompressionBoonSettings { enabled: true, code_compaction: true, ..Default::default() };
+        s.compression = CompressionBoonSettings {
+            enabled: true,
+            code_compaction: true,
+            ..Default::default()
+        };
         let view = BoonSettingsView::from_settings(&s);
         assert!(view.compression_code_compaction);
     }
@@ -3960,8 +3971,7 @@ mod tests {
     #[test]
     fn set_tenant_compression_deserializes_null_and_policy() {
         // null clears the policy.
-        let cleared: SetTenantCompression =
-            serde_json::from_str(r#"{"policy": null}"#).unwrap();
+        let cleared: SetTenantCompression = serde_json::from_str(r#"{"policy": null}"#).unwrap();
         assert!(cleared.policy.is_none());
 
         // A present policy round-trips.
@@ -3976,7 +3986,8 @@ mod tests {
     fn set_tenant_compression_carries_per_piece_flags() {
         let set: SetTenantCompression = serde_json::from_str(
             r#"{"policy":{"enabled":true,"code_compaction":true,"dedup":true,"allow_lossy":true}}"#,
-        ).unwrap();
+        )
+        .unwrap();
         let p = set.policy.expect("policy present");
         assert!(p.enabled && p.code_compaction && p.dedup && p.allow_lossy);
     }

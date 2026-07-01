@@ -68,8 +68,7 @@ const SCHEMA_V11: &str =
     include_str!("../../../../schema/postgres/0011_endpoint_selection_session_hash.sql");
 const SCHEMA_V12: &str =
     include_str!("../../../../schema/postgres/0012_model_debug_diagnostics.sql");
-const SCHEMA_V13: &str =
-    include_str!("../../../../schema/postgres/0013_compression_policy.sql");
+const SCHEMA_V13: &str = include_str!("../../../../schema/postgres/0013_compression_policy.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.

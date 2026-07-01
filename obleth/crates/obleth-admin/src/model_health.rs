@@ -425,7 +425,14 @@ async fn inference_probe(
                 }
                 let body = res.text().await.unwrap_or_default();
                 let (input_tokens, output_tokens) = probe_token_usage(&body);
-                emit_probe_usage(state, model, Some(code), latency_ms, input_tokens, output_tokens);
+                emit_probe_usage(
+                    state,
+                    model,
+                    Some(code),
+                    latency_ms,
+                    input_tokens,
+                    output_tokens,
+                );
                 let status = classify_probe(Some(code));
                 let message = match status {
                     "healthy" => format!("real probe succeeded (HTTP {code})"),
@@ -489,7 +496,13 @@ fn emit_probe_usage(
 ) {
     if let Some(sink) = state.health.telemetry.as_ref() {
         let total_ms = latency_ms.unwrap_or(0).max(0) as u32;
-        sink.record(build_probe_usage(model, http_status, total_ms, input_tokens, output_tokens));
+        sink.record(build_probe_usage(
+            model,
+            http_status,
+            total_ms,
+            input_tokens,
+            output_tokens,
+        ));
     }
 }
 
@@ -621,7 +634,11 @@ struct ProbeRequest {
 /// serves. `api_base` already includes the `/v1` suffix. Returns `None` for
 /// model types we deliberately do not auto-probe because a "minimal" request
 /// is still costly (image / audio) or the type is unrecognized.
-fn build_probe_request(api_base: &str, model_type: &str, upstream_model: &str) -> Option<ProbeRequest> {
+fn build_probe_request(
+    api_base: &str,
+    model_type: &str,
+    upstream_model: &str,
+) -> Option<ProbeRequest> {
     let base = api_base.trim_end_matches('/');
     match model_type {
         "chat" => Some(ProbeRequest {
@@ -947,7 +964,8 @@ mod tests {
 
     #[test]
     fn probe_request_embedding_uses_embeddings_endpoint() {
-        let r = build_probe_request("https://up/v1/", "embedding", "qwen4-embedding").expect("embed");
+        let r =
+            build_probe_request("https://up/v1/", "embedding", "qwen4-embedding").expect("embed");
         assert_eq!(r.url, "https://up/v1/embeddings");
         assert_eq!(r.body["model"], "qwen4-embedding");
         assert_eq!(r.body["input"], "ping");
@@ -1003,7 +1021,8 @@ mod tests {
             "enabled": true, "cache_enabled": false, "cache_ttl_secs": 300,
             "created_at": "2024-01-01T00:00:00Z",
             "updated_at": "2024-01-01T00:00:00Z",
-        })).expect("sample model")
+        }))
+        .expect("sample model")
     }
 
     #[test]

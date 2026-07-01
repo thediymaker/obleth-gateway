@@ -26,13 +26,13 @@
 //! like [`crate::classifier::Classifier`].
 
 pub(crate) mod compression;
-pub(crate) mod structural_json;
-pub(crate) mod embedded_json;
 #[cfg(test)]
 mod compression_verify;
+pub(crate) mod embedded_json;
 pub(crate) mod guardrails;
 pub mod mcp_tools;
 pub mod respond;
+pub(crate) mod structural_json;
 pub mod structured;
 pub mod tool_loop;
 pub mod tool_stream;
@@ -60,10 +60,7 @@ fn compression_eligible(
     key: &obleth_config::ResolvedKey,
     is_chat: bool,
 ) -> bool {
-    let tenant_opted_in = key
-        .compression_policy
-        .as_ref()
-        .is_none_or(|p| p.enabled);
+    let tenant_opted_in = key.compression_policy.as_ref().is_none_or(|p| p.enabled);
     is_chat
         && !key.internal
         && settings.compression.active()
@@ -79,9 +76,7 @@ fn opt_in_compression_base(
     settings: &obleth_config::BoonSettings,
     key: &obleth_config::ResolvedKey,
 ) -> bool {
-    settings.compression.active()
-        && route.boons.iter().any(|b| b == "compression")
-        && !key.internal
+    settings.compression.active() && route.boons.iter().any(|b| b == "compression") && !key.internal
 }
 
 /// Cross-turn dedup is eligible when the base holds and the tenant enabled the
@@ -103,7 +98,10 @@ fn log_compaction_eligible(
     key: &obleth_config::ResolvedKey,
 ) -> bool {
     opt_in_compression_base(route, settings, key)
-        && key.compression_policy.as_ref().is_some_and(|p| p.compact_logs)
+        && key
+            .compression_policy
+            .as_ref()
+            .is_some_and(|p| p.compact_logs)
 }
 
 /// Lossy semantic compression is eligible when the base holds and the tenant
@@ -114,7 +112,10 @@ fn lossy_eligible(
     key: &obleth_config::ResolvedKey,
 ) -> bool {
     opt_in_compression_base(route, settings, key)
-        && key.compression_policy.as_ref().is_some_and(|p| p.allow_lossy)
+        && key
+            .compression_policy
+            .as_ref()
+            .is_some_and(|p| p.allow_lossy)
 }
 
 /// Per-tenant code-compaction toggle with the global setting as the no-policy
@@ -354,13 +355,24 @@ impl BoonEngine {
             || lossy_eligible(route, &settings, key)
         {
             if dedup_eligible(route, &settings, key) {
-                dedup = compression::apply_dedup(state, &settings.compression, key, session_id, json).await;
+                dedup =
+                    compression::apply_dedup(state, &settings.compression, key, session_id, json)
+                        .await;
             }
             if log_compaction_eligible(route, &settings, key) {
-                logs = compression::apply_log_compaction(state, &settings.compression, key, session_id, json).await;
+                logs = compression::apply_log_compaction(
+                    state,
+                    &settings.compression,
+                    key,
+                    session_id,
+                    json,
+                )
+                .await;
             }
             if lossy_eligible(route, &settings, key) {
-                lossy = compression::apply_lossy(state, &settings.compression, key, session_id, json).await;
+                lossy =
+                    compression::apply_lossy(state, &settings.compression, key, session_id, json)
+                        .await;
             }
             let refs = dedup
                 .refs_created
@@ -374,7 +386,10 @@ impl BoonEngine {
                 // Bonus: when the model can call tools, let it recover originals.
                 let reversible = route.supports_function_calling && settings.tool_loop.active();
                 if reversible {
-                    compression::inject_retrieve_original_tool(json, route.supports_system_messages);
+                    compression::inject_retrieve_original_tool(
+                        json,
+                        route.supports_system_messages,
+                    );
                     tool_loop_servers
                         .get_or_insert_with(std::collections::HashMap::new)
                         .insert(
@@ -383,7 +398,9 @@ impl BoonEngine {
                         );
                 }
                 state.metrics.record_compression_saved(
-                    dedup.tokens_before.saturating_sub(dedup.tokens_after)
+                    dedup
+                        .tokens_before
+                        .saturating_sub(dedup.tokens_after)
                         .saturating_add(logs.tokens_before.saturating_sub(logs.tokens_after))
                         .saturating_add(lossy.tokens_before.saturating_sub(lossy.tokens_after)),
                 );
@@ -784,7 +801,10 @@ mod tests {
         }
 
         let mut settings = BoonSettings::default();
-        settings.compression = CompressionBoonSettings { enabled: true, ..Default::default() };
+        settings.compression = CompressionBoonSettings {
+            enabled: true,
+            ..Default::default()
+        };
 
         let mut route = test_route();
         route.boons = vec!["compression".to_string()];
@@ -812,11 +832,23 @@ mod tests {
         key.internal = false;
 
         // Tenant opt-out policy (enabled = false) -> ineligible.
-        key.compression_policy = Some(CompressionPolicy { enabled: false, code_compaction: false, dedup: false, compact_logs: false, allow_lossy: false });
+        key.compression_policy = Some(CompressionPolicy {
+            enabled: false,
+            code_compaction: false,
+            dedup: false,
+            compact_logs: false,
+            allow_lossy: false,
+        });
         assert!(!compression_eligible(&route, &settings, &key, true));
 
         // Tenant policy enabled -> eligible again.
-        key.compression_policy = Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: false, compact_logs: false, allow_lossy: false });
+        key.compression_policy = Some(CompressionPolicy {
+            enabled: true,
+            code_compaction: false,
+            dedup: false,
+            compact_logs: false,
+            allow_lossy: false,
+        });
         assert!(compression_eligible(&route, &settings, &key, true));
     }
 
@@ -824,18 +856,33 @@ mod tests {
     fn dedup_and_lossy_gate_on_tenant_toggle_only() {
         use obleth_config::{BoonSettings, CompressionBoonSettings, CompressionPolicy};
         let mut settings = BoonSettings::default();
-        settings.compression = CompressionBoonSettings { enabled: true, ..Default::default() };
+        settings.compression = CompressionBoonSettings {
+            enabled: true,
+            ..Default::default()
+        };
         // Note: NO summarizer, tool loop OFF, model NOT function-calling.
         let mut route = test_route();
         route.boons = vec!["compression".to_string()];
         route.supports_function_calling = false;
 
-        let mut key = test_key_with_policy(Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: true, compact_logs: false, allow_lossy: true }));
+        let mut key = test_key_with_policy(Some(CompressionPolicy {
+            enabled: true,
+            code_compaction: false,
+            dedup: true,
+            compact_logs: false,
+            allow_lossy: true,
+        }));
         assert!(dedup_eligible(&route, &settings, &key));
         assert!(lossy_eligible(&route, &settings, &key));
 
         // Toggles off → ineligible.
-        key.compression_policy = Some(CompressionPolicy { enabled: true, code_compaction: false, dedup: false, compact_logs: false, allow_lossy: false });
+        key.compression_policy = Some(CompressionPolicy {
+            enabled: true,
+            code_compaction: false,
+            dedup: false,
+            compact_logs: false,
+            allow_lossy: false,
+        });
         assert!(!dedup_eligible(&route, &settings, &key));
         assert!(!lossy_eligible(&route, &settings, &key));
 

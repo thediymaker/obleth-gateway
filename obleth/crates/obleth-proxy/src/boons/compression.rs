@@ -13,8 +13,8 @@ use obleth_config::{CompressionBoonSettings, ResolvedKey};
 use obleth_tokenizer::{HeuristicTokenizer, Tokenizer};
 use serde_json::Value;
 
-use crate::state::AppState;
 use super::tool_loop::retrieve_original_tool_def;
+use crate::state::AppState;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ContentKind {
@@ -122,7 +122,11 @@ pub(crate) struct CompressionStats {
 
 /// Compact eligible JSON segments of `messages[]` in place. Phase A is lossless
 /// and deterministic; it never calls a helper model or touches the network.
-pub(super) fn apply(cfg: &CompressionBoonSettings, code_compaction: bool, json: &mut Value) -> CompressionStats {
+pub(super) fn apply(
+    cfg: &CompressionBoonSettings,
+    code_compaction: bool,
+    json: &mut Value,
+) -> CompressionStats {
     let tk = HeuristicTokenizer::new();
     let mut stats = CompressionStats::default();
     let Some(messages) = json.get_mut("messages").and_then(|m| m.as_array_mut()) else {
@@ -219,7 +223,10 @@ pub(super) fn inject_retrieve_original_tool(json: &mut Value, supports_system: b
         match obj.get_mut("tools").and_then(|v| v.as_array_mut()) {
             Some(existing) => existing.push(retrieve_original_tool_def()),
             None => {
-                obj.insert("tools".into(), Value::Array(vec![retrieve_original_tool_def()]));
+                obj.insert(
+                    "tools".into(),
+                    Value::Array(vec![retrieve_original_tool_def()]),
+                );
             }
         }
     }
@@ -258,8 +265,8 @@ pub(super) async fn apply_lossy(
             return stats;
         };
         let n = messages.len();
-        let skip_last_assistant = n > 0
-            && messages[n - 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
+        let skip_last_assistant =
+            n > 0 && messages[n - 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
         let mut out = Vec::new();
         for (mi, msg) in messages.iter().enumerate() {
             if skip_last_assistant && mi + 1 == n {
@@ -311,7 +318,10 @@ pub(super) async fn apply_lossy(
             continue; // no token gain — skip before any Redis write
         }
         // Best-effort stash for the retrieve_original bonus; never fail on Redis error.
-        let _ = state.redis.compress_put(&hash, &original, cfg.original_ttl_secs).await;
+        let _ = state
+            .redis
+            .compress_put(&hash, &original, cfg.original_ttl_secs)
+            .await;
         if set_segment_text(json, mi, pi, marker) {
             stats.refs_created += 1;
             stats.tokens_before = stats.tokens_before.saturating_add(before);
@@ -353,7 +363,11 @@ fn latest_user_query_terms(json: &Value) -> std::collections::HashSet<String> {
 /// Write `text` into message `mi`'s content (whole string when `pi` is None, else
 /// the `text` of part `pi`). Returns whether it wrote.
 fn set_segment_text(json: &mut Value, mi: usize, pi: Option<usize>, text: String) -> bool {
-    let Some(msg) = json.get_mut("messages").and_then(|m| m.as_array_mut()).and_then(|m| m.get_mut(mi)) else {
+    let Some(msg) = json
+        .get_mut("messages")
+        .and_then(|m| m.as_array_mut())
+        .and_then(|m| m.get_mut(mi))
+    else {
         return false;
     };
     match pi {
@@ -415,7 +429,10 @@ pub(super) async fn apply_dedup(
     // Best-effort stash of each replaced original for `retrieve_original`; never
     // fail the request on a Redis error.
     for (hash, original) in stash {
-        let _ = state.redis.compress_put(&hash, &original, cfg.original_ttl_secs).await;
+        let _ = state
+            .redis
+            .compress_put(&hash, &original, cfg.original_ttl_secs)
+            .await;
     }
     stats
 }
@@ -425,7 +442,10 @@ pub(super) async fn apply_dedup(
 /// `(hash, original)` pairs the caller should stash for retrieval. No I/O, so it
 /// is directly testable and measurable. The first occurrence of each distinct
 /// block is kept verbatim; a trailing assistant message (active turn) is skipped.
-pub(super) fn dedup_rewrite(cfg: &CompressionBoonSettings, json: &mut Value) -> (DedupStats, Vec<(String, String)>) {
+pub(super) fn dedup_rewrite(
+    cfg: &CompressionBoonSettings,
+    json: &mut Value,
+) -> (DedupStats, Vec<(String, String)>) {
     let mut stats = DedupStats::default();
     let mut stash: Vec<(String, String)> = Vec::new();
     let tk = HeuristicTokenizer::new();
@@ -434,8 +454,8 @@ pub(super) fn dedup_rewrite(cfg: &CompressionBoonSettings, json: &mut Value) -> 
             return (stats, stash);
         };
         let n = messages.len();
-        let skip_last_assistant = n > 0
-            && messages[n - 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
+        let skip_last_assistant =
+            n > 0 && messages[n - 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
         let mut out = Vec::new();
         for (mi, msg) in messages.iter().enumerate() {
             if skip_last_assistant && mi + 1 == n {
@@ -516,7 +536,10 @@ pub(super) async fn apply_log_compaction(
 ) -> LogStats {
     let (stats, stash) = log_rewrite(cfg, json);
     for (hash, original) in stash {
-        let _ = state.redis.compress_put(&hash, &original, cfg.original_ttl_secs).await;
+        let _ = state
+            .redis
+            .compress_put(&hash, &original, cfg.original_ttl_secs)
+            .await;
     }
     stats
 }
@@ -525,7 +548,10 @@ pub(super) async fn apply_log_compaction(
 /// `compact_log`, returning stats + the `(hash, original)` pairs to stash. No I/O,
 /// so it is directly testable. Skips a trailing assistant message (active turn)
 /// and any segment the lossless pass already turned into a table.
-pub(super) fn log_rewrite(cfg: &CompressionBoonSettings, json: &mut Value) -> (LogStats, Vec<(String, String)>) {
+pub(super) fn log_rewrite(
+    cfg: &CompressionBoonSettings,
+    json: &mut Value,
+) -> (LogStats, Vec<(String, String)>) {
     let mut stats = LogStats::default();
     let mut stash: Vec<(String, String)> = Vec::new();
     let tk = HeuristicTokenizer::new();
@@ -535,8 +561,8 @@ pub(super) fn log_rewrite(cfg: &CompressionBoonSettings, json: &mut Value) -> (L
             return (stats, stash);
         };
         let n = messages.len();
-        let skip_last_assistant = n > 0
-            && messages[n - 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
+        let skip_last_assistant =
+            n > 0 && messages[n - 1].get("role").and_then(|r| r.as_str()) == Some("assistant");
         let mut out = Vec::new();
         for (mi, msg) in messages.iter().enumerate() {
             if skip_last_assistant && mi + 1 == n {
@@ -574,7 +600,9 @@ pub(super) fn log_rewrite(cfg: &CompressionBoonSettings, json: &mut Value) -> (L
             continue;
         }
         stats.segments += 1;
-        let Some(compacted) = compact_log(&original) else { continue };
+        let Some(compacted) = compact_log(&original) else {
+            continue;
+        };
         let before = tk.count_text(&original);
         let hash = obleth_config::content_hash(&original);
         let marker = lossy_marker(&compacted, &hash);
@@ -641,7 +669,11 @@ pub(super) fn extract_prose(
     }
     // Choose the top `keep` by score, then restore original order.
     let mut by_score = scored.clone();
-    by_score.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal).then(a.0.cmp(&b.0)));
+    by_score.sort_by(|a, b| {
+        b.1.partial_cmp(&a.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.0.cmp(&b.0))
+    });
     let mut kept_idx: Vec<usize> = by_score.into_iter().take(keep).map(|(i, _)| i).collect();
     kept_idx.sort_unstable();
     let omitted = lines.len() - kept_idx.len();
@@ -665,7 +697,10 @@ fn log_template(line: &str) -> String {
     while let Some(c) = chars.next() {
         if c.is_ascii_digit() {
             out.push('#');
-            while chars.peek().is_some_and(|d| d.is_ascii_digit() || *d == ':' || *d == '.' || *d == '-') {
+            while chars
+                .peek()
+                .is_some_and(|d| d.is_ascii_digit() || *d == ':' || *d == '.' || *d == '-')
+            {
                 chars.next();
             }
         } else {
@@ -718,7 +753,10 @@ mod tests {
 
     #[test]
     fn classifies_json_object() {
-        assert_eq!(classify("  {\"a\": 1, \"b\": [1,2,3]}  "), ContentKind::Json);
+        assert_eq!(
+            classify("  {\"a\": 1, \"b\": [1,2,3]}  "),
+            ContentKind::Json
+        );
     }
 
     #[test]
@@ -728,7 +766,10 @@ mod tests {
 
     #[test]
     fn classifies_prose() {
-        assert_eq!(classify("The quick brown fox jumps over the lazy dog."), ContentKind::Prose);
+        assert_eq!(
+            classify("The quick brown fox jumps over the lazy dog."),
+            ContentKind::Prose
+        );
     }
 
     #[test]
@@ -783,7 +824,12 @@ mod tests {
                 { "role": "tool", "content": pretty }
             ]
         });
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
+        let cfg = obleth_config::CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 16,
+            max_segments: 64,
+            ..Default::default()
+        };
         let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 1);
         assert!(stats.tokens_after < stats.tokens_before);
@@ -798,14 +844,20 @@ mod tests {
             "model": "m",
             "messages": [ { "role": "tool", "content": "{\"a\": 1}" } ]
         });
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 512, max_segments: 64, ..Default::default() };
+        let cfg = obleth_config::CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 512,
+            max_segments: 64,
+            ..Default::default()
+        };
         let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 0);
     }
 
     #[test]
     fn apply_respects_max_segments() {
-        let big = serde_json::to_string_pretty(&json!({ "rows": (0..500).collect::<Vec<i64>>() })).unwrap();
+        let big = serde_json::to_string_pretty(&json!({ "rows": (0..500).collect::<Vec<i64>>() }))
+            .unwrap();
         let mut body = json!({
             "model": "m",
             "messages": [
@@ -813,7 +865,12 @@ mod tests {
                 { "role": "tool", "content": big }
             ]
         });
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 1, ..Default::default() };
+        let cfg = obleth_config::CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 16,
+            max_segments: 1,
+            ..Default::default()
+        };
         let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 1);
     }
@@ -829,7 +886,12 @@ mod tests {
                 "content": [{ "type": "text", "text": pretty }]
             }]
         });
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
+        let cfg = obleth_config::CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 16,
+            max_segments: 64,
+            ..Default::default()
+        };
         let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 1);
         assert!(stats.tokens_after < stats.tokens_before);
@@ -855,11 +917,15 @@ mod tests {
         let tools = body["tools"].as_array().unwrap();
         // Existing tool preserved, retrieve_original appended.
         assert_eq!(tools.len(), 2);
-        assert!(tools.iter().any(|t| t["function"]["name"] == "retrieve_original"));
+        assert!(tools
+            .iter()
+            .any(|t| t["function"]["name"] == "retrieve_original"));
         // A system nudge mentioning the marker mechanism was injected.
-        let has_nudge = body["messages"].as_array().unwrap().iter().any(|msg| {
-            msg["content"].as_str().is_some_and(|c| c.contains("[ref:"))
-        });
+        let has_nudge = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|msg| msg["content"].as_str().is_some_and(|c| c.contains("[ref:")));
         assert!(has_nudge);
     }
 
@@ -900,7 +966,10 @@ mod tests {
             "messages": [ { "role": "user", "content": big } ]
         });
         let cfg = obleth_config::CompressionBoonSettings {
-            enabled: true, min_tokens: 16, max_segments: 64, ..Default::default()
+            enabled: true,
+            min_tokens: 16,
+            max_segments: 64,
+            ..Default::default()
         };
         let stats = apply(&cfg, true, &mut body);
         assert_eq!(stats.compressed, 1);
@@ -915,7 +984,10 @@ mod tests {
             "messages": [ { "role": "user", "content": big } ]
         });
         let cfg = obleth_config::CompressionBoonSettings {
-            enabled: true, min_tokens: 16, max_segments: 64, ..Default::default()
+            enabled: true,
+            min_tokens: 16,
+            max_segments: 64,
+            ..Default::default()
         };
         let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 0);
@@ -931,7 +1003,12 @@ mod tests {
             "model": "m",
             "messages": [ { "role": "tool", "content": pretty } ]
         });
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
+        let cfg = obleth_config::CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 16,
+            max_segments: 64,
+            ..Default::default()
+        };
         let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 1);
         assert!(stats.tokens_after < stats.tokens_before);
@@ -943,9 +1020,13 @@ mod tests {
     fn extract_prose_drops_low_value_and_dupes_keeps_query_lines() {
         use std::collections::HashSet;
         let mut text = String::new();
-        for _ in 0..40 { text.push_str("boilerplate filler line that repeats a lot\n"); }
+        for _ in 0..40 {
+            text.push_str("boilerplate filler line that repeats a lot\n");
+        }
         text.push_str("the deadbeef token error occurred in module X\n");
-        for _ in 0..40 { text.push_str("more boilerplate filler line that repeats\n"); }
+        for _ in 0..40 {
+            text.push_str("more boilerplate filler line that repeats\n");
+        }
         let mut q = HashSet::new();
         q.insert("deadbeef".to_string());
         let out = extract_prose(&text, &q, 0.3).expect("should extract");
@@ -963,7 +1044,9 @@ mod tests {
     #[test]
     fn compact_log_collapses_repeated_templates_keeps_errors() {
         let mut text = String::new();
-        for i in 0..50 { text.push_str(&format!("2026-06-29 INFO request {i} handled in {i}ms\n")); }
+        for i in 0..50 {
+            text.push_str(&format!("2026-06-29 INFO request {i} handled in {i}ms\n"));
+        }
         text.push_str("2026-06-29 ERROR disk full on /dev/sda1\n");
         let out = compact_log(&text).expect("should compact");
         assert!(out.len() < text.len());
@@ -974,19 +1057,30 @@ mod tests {
     #[test]
     fn classifies_log_shaped_text() {
         let mut text = String::new();
-        for i in 0..20 { text.push_str(&format!("2026-06-29T10:00:0{} INFO did thing {}\n", i % 10, i)); }
+        for i in 0..20 {
+            text.push_str(&format!(
+                "2026-06-29T10:00:0{} INFO did thing {}\n",
+                i % 10,
+                i
+            ));
+        }
         assert_eq!(classify(&text), ContentKind::Log);
     }
 
     #[test]
     fn classifies_plain_paragraph_as_prose() {
-        assert_eq!(classify("The quick brown fox jumps over the lazy dog. It was a fine day."), ContentKind::Prose);
+        assert_eq!(
+            classify("The quick brown fox jumps over the lazy dog. It was a fine day."),
+            ContentKind::Prose
+        );
     }
 
     #[test]
     fn apply_lossy_compacts_prose_in_latest_user_message() {
         // Build a long prose user message (the latest turn) + a short follow-up question.
-        let big: String = (0..60).map(|i| format!("This is line number {i} of some pasted notes.\n")).collect();
+        let big: String = (0..60)
+            .map(|i| format!("This is line number {i} of some pasted notes.\n"))
+            .collect();
         let body = json!({
             "model": "m",
             "messages": [
@@ -996,7 +1090,10 @@ mod tests {
         });
         // No AppState/Redis in a unit test → call the pure helper path via a thin wrapper is not possible;
         // instead assert extract_prose drives the change through a small synchronous shim:
-        let q: std::collections::HashSet<String> = ["summarize", "notes"].iter().map(|s| s.to_string()).collect();
+        let q: std::collections::HashSet<String> = ["summarize", "notes"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
         let first = body["messages"][0]["content"].as_str().unwrap().to_string();
         let compacted = extract_prose(&first, &q, 0.4).expect("prose compacts");
         assert!(compacted.len() < first.len());
@@ -1009,13 +1106,22 @@ mod tests {
         let rows: Vec<Value> = (0..100)
             .map(|i| json!({"id": i, "name": format!("u{i}"), "active": true}))
             .collect();
-        let content = serde_json::to_string(&json!({"results": rows, "meta": {"total": 100}})).unwrap();
+        let content =
+            serde_json::to_string(&json!({"results": rows, "meta": {"total": 100}})).unwrap();
         let mut body = json!({"model": "m", "messages": [{"role": "tool", "content": content}]});
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
+        let cfg = obleth_config::CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 16,
+            max_segments: 64,
+            ..Default::default()
+        };
         let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 1);
         assert!(stats.tokens_after < stats.tokens_before);
-        assert!(body["messages"][0]["content"].as_str().unwrap().contains("<<OBLETH_TABLE:0"));
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("<<OBLETH_TABLE:0"));
     }
 
     #[test]
@@ -1023,9 +1129,17 @@ mod tests {
         let r: Vec<String> = (0..100)
             .map(|i| format!("{{\"id\":{i},\"name\":\"u{i}\",\"active\":true}}"))
             .collect();
-        let prose = format!("Here is the data you asked for: [{}] please summarize it.", r.join(","));
+        let prose = format!(
+            "Here is the data you asked for: [{}] please summarize it.",
+            r.join(",")
+        );
         let mut body = json!({"model": "m", "messages": [{"role": "user", "content": prose}]});
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
+        let cfg = obleth_config::CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 16,
+            max_segments: 64,
+            ..Default::default()
+        };
         let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 1);
         let out = body["messages"][0]["content"].as_str().unwrap();
@@ -1060,11 +1174,22 @@ mod tests {
     #[test]
     fn apply_compacts_sparse_object_array() {
         let rows: Vec<Value> = (0..100)
-            .map(|i| if i % 2 == 0 { json!({"id": i, "name": format!("u{i}")}) } else { json!({"id": i, "email": format!("u{i}@x")}) })
+            .map(|i| {
+                if i % 2 == 0 {
+                    json!({"id": i, "name": format!("u{i}")})
+                } else {
+                    json!({"id": i, "email": format!("u{i}@x")})
+                }
+            })
             .collect();
         let content = serde_json::to_string(&json!(rows)).unwrap();
         let mut body = json!({"model": "m", "messages": [{"role": "tool", "content": content}]});
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
+        let cfg = obleth_config::CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 16,
+            max_segments: 64,
+            ..Default::default()
+        };
         let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 1);
         assert!(stats.tokens_after < stats.tokens_before);
@@ -1075,8 +1200,14 @@ mod tests {
         let prose: String = (0..60)
             .map(|i| format!("This is sentence number {i} with no structured data at all.\n"))
             .collect();
-        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": prose.clone()}]});
-        let cfg = obleth_config::CompressionBoonSettings { enabled: true, min_tokens: 16, max_segments: 64, ..Default::default() };
+        let mut body =
+            json!({"model": "m", "messages": [{"role": "user", "content": prose.clone()}]});
+        let cfg = obleth_config::CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 16,
+            max_segments: 64,
+            ..Default::default()
+        };
         let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 0);
         assert_eq!(body["messages"][0]["content"].as_str().unwrap(), prose);
