@@ -1282,6 +1282,9 @@ fn default_compression_original_ttl_secs() -> u64 {
 fn default_compression_max_lossy_segments() -> u32 {
     4
 }
+fn default_neural_keep_ratio() -> f32 {
+    0.5
+}
 
 /// Configuration for the compression boon: lossless structural/code compaction
 /// plus deterministic (model-free) lossy text compaction.
@@ -1308,6 +1311,10 @@ pub struct CompressionBoonSettings {
     /// (strip trailing whitespace, collapse blank-line runs). Off by default.
     #[serde(default)]
     pub code_compaction: bool,
+    /// Fraction of sentences the kompress sidecar selects to keep during the
+    /// neural extractive pass. Range `(0.0, 1.0]`; defaults to 0.5.
+    #[serde(default = "default_neural_keep_ratio")]
+    pub neural_keep_ratio: f32,
 }
 
 impl Default for CompressionBoonSettings {
@@ -1319,6 +1326,7 @@ impl Default for CompressionBoonSettings {
             original_ttl_secs: default_compression_original_ttl_secs(),
             max_lossy_segments: default_compression_max_lossy_segments(),
             code_compaction: false,
+            neural_keep_ratio: default_neural_keep_ratio(),
         }
     }
 }

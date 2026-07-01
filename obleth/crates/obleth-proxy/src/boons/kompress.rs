@@ -1,7 +1,119 @@
-//! Pure extractive sentence selection for the neural prose compression pass.
+//! Neural prose compression: extractive sentence selection plus an HTTP client
+//! for the optional kompress scoring sidecar.
 //!
-//! No I/O, no async, no state. These functions are called by the lossy
-//! compression pass to reduce prose blocks before sending to an upstream model.
+//! Pure functions (`split_sentences`, `select_kept`) are used by the lossy
+//! compression pass. `KompressClient` handles the sidecar POST and is held on
+//! `AppState` so a single client is shared across requests.
+
+// ── Sidecar client ────────────────────────────────────────────────────────────
+
+/// HTTP client for the optional kompress scoring sidecar.
+///
+/// Construct with [`KompressClient::from_env`] or [`parse_config`].
+/// The caller supplies the shared [`reqwest::Client`] on each [`score`] call so
+/// no internal client is held.
+#[derive(Clone)]
+pub struct KompressClient {
+    pub base_url: String,
+    pub timeout: std::time::Duration,
+}
+
+/// Build a `KompressClient` from explicit values.
+///
+/// Returns `Some` only when `url` is `Some` and non-empty after trimming.
+/// Strips a single trailing `/` from the URL. `timeout_ms` is parsed as `u64`
+/// milliseconds; unparseable or absent values default to 800 ms.
+fn parse_config(url: Option<&str>, timeout_ms: Option<&str>) -> Option<KompressClient> {
+    let raw_url = url?;
+    let trimmed = raw_url.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let base_url = trimmed.trim_end_matches('/').to_string();
+    let timeout = timeout_ms
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_else(|| std::time::Duration::from_millis(800));
+    Some(KompressClient { base_url, timeout })
+}
+
+impl KompressClient {
+    /// Construct from environment variables.
+    ///
+    /// Reads `OBLETH_KOMPRESS_URL` and `OBLETH_KOMPRESS_TIMEOUT_MS`.
+    /// Returns `None` when the URL variable is unset or empty.
+    pub fn from_env() -> Option<KompressClient> {
+        parse_config(
+            std::env::var("OBLETH_KOMPRESS_URL").ok().as_deref(),
+            std::env::var("OBLETH_KOMPRESS_TIMEOUT_MS").ok().as_deref(),
+        )
+    }
+
+    /// POST `batches` to the sidecar's `/score` endpoint and return the
+    /// per-sentence scores.
+    ///
+    /// Fails open on any error (send failure, non-2xx status, parse error) by
+    /// returning `None`.  The caller supplies the shared `http` client.
+    #[allow(dead_code)] // wired into apply_lossy in a later task
+    pub(super) async fn score(
+        &self,
+        http: &reqwest::Client,
+        batches: &[Vec<String>],
+    ) -> Option<Vec<Vec<f32>>> {
+        let url = format!("{}/score", self.base_url);
+        let body = build_score_body(batches);
+        let resp = http
+            .post(&url)
+            .json(&body)
+            .timeout(self.timeout)
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let json: serde_json::Value = resp.json().await.ok()?;
+        parse_score_response(&json, batches.len())
+    }
+}
+
+/// Serialize `batches` into the sidecar request shape.
+///
+/// ```json
+/// {"segments": [{"sentences": ["s1", "s2"]}, ...]}
+/// ```
+#[allow(dead_code)] // called by score
+fn build_score_body(batches: &[Vec<String>]) -> serde_json::Value {
+    let segments: Vec<serde_json::Value> = batches
+        .iter()
+        .map(|batch| serde_json::json!({"sentences": batch}))
+        .collect();
+    serde_json::json!({"segments": segments})
+}
+
+/// Parse the sidecar's response body.
+///
+/// Expects `{"results": [{"scores": [f32, ...]}, ...]}` with exactly
+/// `expected_len` elements. Returns `None` on any structural mismatch.
+#[allow(dead_code)] // called by score
+fn parse_score_response(v: &serde_json::Value, expected_len: usize) -> Option<Vec<Vec<f32>>> {
+    let results = v["results"].as_array()?;
+    if results.len() != expected_len {
+        return None;
+    }
+    results
+        .iter()
+        .map(|elem| {
+            let scores_arr = elem["scores"].as_array()?;
+            scores_arr
+                .iter()
+                .map(|n| n.as_f64().map(|f| f as f32))
+                .collect::<Option<Vec<f32>>>()
+        })
+        .collect()
+}
+
+// ── Pure extractive helpers ───────────────────────────────────────────────────
 
 /// Split `text` into sentence substrings.
 ///
@@ -136,6 +248,45 @@ pub(super) fn select_kept(
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn parse_config_none_without_url() {
+        assert!(parse_config(None, None).is_none());
+        assert!(parse_config(Some("   "), Some("1000")).is_none());
+    }
+
+    #[test]
+    fn parse_config_trims_and_defaults_timeout() {
+        let c = parse_config(Some("http://k:8080/"), None).unwrap();
+        assert_eq!(c.base_url, "http://k:8080");
+        assert_eq!(c.timeout, std::time::Duration::from_millis(800));
+    }
+
+    #[test]
+    fn parse_config_reads_timeout_ms() {
+        let c = parse_config(Some("http://k:8080"), Some("1200")).unwrap();
+        assert_eq!(c.timeout, std::time::Duration::from_millis(1200));
+    }
+
+    #[test]
+    fn build_score_body_shapes_segments() {
+        let body = build_score_body(&[vec!["a".into(), "b".into()], vec!["c".into()]]);
+        assert_eq!(body["segments"][0]["sentences"][1], "b");
+        assert_eq!(body["segments"][1]["sentences"][0], "c");
+    }
+
+    #[test]
+    fn parse_score_response_reads_aligned_scores() {
+        let v = serde_json::json!({"results":[{"scores":[0.1,0.2]},{"scores":[0.9]}]});
+        let got = parse_score_response(&v, 2).unwrap();
+        assert_eq!(got, vec![vec![0.1_f32, 0.2], vec![0.9]]);
+    }
+
+    #[test]
+    fn parse_score_response_none_on_count_mismatch() {
+        let v = serde_json::json!({"results":[{"scores":[0.1]}]});
+        assert!(parse_score_response(&v, 2).is_none());
+    }
 
     fn hs(items: &[&str]) -> HashSet<String> {
         items.iter().map(|s| s.to_string()).collect()
