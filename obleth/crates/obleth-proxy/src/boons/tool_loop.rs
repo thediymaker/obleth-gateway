@@ -79,7 +79,8 @@ pub(super) fn retrieve_original_tool_def() -> Value {
 fn format_retrieve_result(reference: Option<&str>, content: Option<String>) -> String {
     match (reference, content) {
         (None, _) => "Error: retrieve_original requires a `ref` argument (the hash \
-                      from a [ref:HASH] marker).".to_string(),
+                      from a [ref:HASH] marker)."
+            .to_string(),
         (Some(_), Some(original)) => original,
         (Some(r), None) => format!(
             "The original content for ref {r} is no longer available (it may have expired)."
@@ -646,7 +647,10 @@ mod tests {
         let def = retrieve_original_tool_def();
         assert_eq!(def["type"], "function");
         assert_eq!(def["function"]["name"], RETRIEVE_ORIGINAL_TOOL);
-        assert_eq!(def["function"]["parameters"]["properties"]["ref"]["type"], "string");
+        assert_eq!(
+            def["function"]["parameters"]["properties"]["ref"]["type"],
+            "string"
+        );
         assert_eq!(def["function"]["parameters"]["required"][0], "ref");
     }
 

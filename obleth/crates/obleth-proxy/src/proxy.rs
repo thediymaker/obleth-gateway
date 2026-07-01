@@ -2196,7 +2196,10 @@ async fn fetch_upstream_models(
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
-        let resp = timeout(Duration::from_secs(4), req.send()).await.ok()?.ok()?;
+        let resp = timeout(Duration::from_secs(4), req.send())
+            .await
+            .ok()?
+            .ok()?;
         if !resp.status().is_success() {
             return None;
         }

@@ -1270,10 +1270,18 @@ impl Default for GuardrailsBoonSettings {
     }
 }
 
-fn default_compression_min_tokens() -> u32 { 128 }
-fn default_compression_max_segments() -> u32 { 64 }
-fn default_compression_original_ttl_secs() -> u64 { 3_600 }
-fn default_compression_max_lossy_segments() -> u32 { 4 }
+fn default_compression_min_tokens() -> u32 {
+    128
+}
+fn default_compression_max_segments() -> u32 {
+    64
+}
+fn default_compression_original_ttl_secs() -> u64 {
+    3_600
+}
+fn default_compression_max_lossy_segments() -> u32 {
+    4
+}
 
 /// Configuration for the compression boon: lossless structural/code compaction
 /// plus deterministic (model-free) lossy text compaction.
@@ -1689,7 +1697,13 @@ mod tests {
     fn normalize_boons_accepts_new_vocabulary() {
         // The retired `tools` boon is dropped along with any other unknown value;
         // `compression` is part of the vocabulary and is kept.
-        let boons = normalize_boons([" structured_output ", "vision", "compression", "bogus", "tools"]);
+        let boons = normalize_boons([
+            " structured_output ",
+            "vision",
+            "compression",
+            "bogus",
+            "tools",
+        ]);
         assert_eq!(boons, vec!["structured_output", "vision", "compression"]);
     }
 
@@ -1764,7 +1778,10 @@ mod tests {
 
     #[test]
     fn compression_settings_active_when_enabled() {
-        let c = CompressionBoonSettings { enabled: true, ..Default::default() };
+        let c = CompressionBoonSettings {
+            enabled: true,
+            ..Default::default()
+        };
         assert!(c.active());
     }
 
@@ -1799,7 +1816,13 @@ mod tests {
 
     #[test]
     fn compression_policy_round_trips() {
-        let p = CompressionPolicy { enabled: true, code_compaction: false, dedup: false, compact_logs: false, allow_lossy: true };
+        let p = CompressionPolicy {
+            enabled: true,
+            code_compaction: false,
+            dedup: false,
+            compact_logs: false,
+            allow_lossy: true,
+        };
         let json = serde_json::to_string(&p).unwrap();
         let back: CompressionPolicy = serde_json::from_str(&json).unwrap();
         assert_eq!(p, back);
@@ -1808,7 +1831,8 @@ mod tests {
     #[test]
     fn compression_policy_new_fields_default_false() {
         // Old 2-field shape still deserializes; new piece-flags default off.
-        let p: CompressionPolicy = serde_json::from_str(r#"{"enabled":true,"allow_lossy":true}"#).unwrap();
+        let p: CompressionPolicy =
+            serde_json::from_str(r#"{"enabled":true,"allow_lossy":true}"#).unwrap();
         assert!(p.enabled);
         assert!(p.allow_lossy);
         assert!(!p.code_compaction);
@@ -1817,8 +1841,15 @@ mod tests {
 
     #[test]
     fn compression_policy_full_round_trips() {
-        let p = CompressionPolicy { enabled: true, code_compaction: true, dedup: true, compact_logs: true, allow_lossy: false };
-        let back: CompressionPolicy = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        let p = CompressionPolicy {
+            enabled: true,
+            code_compaction: true,
+            dedup: true,
+            compact_logs: true,
+            allow_lossy: false,
+        };
+        let back: CompressionPolicy =
+            serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(p, back);
     }
 }

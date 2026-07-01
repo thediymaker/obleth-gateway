@@ -322,7 +322,10 @@ mod tests {
     #[test]
     fn csv_parse_roundtrips_quoted_commas() {
         let fields = csv_parse_line("1,\"\"\"a,b\"\"\",true");
-        assert_eq!(fields, vec!["1".to_string(), "\"a,b\"".to_string(), "true".to_string()]);
+        assert_eq!(
+            fields,
+            vec!["1".to_string(), "\"a,b\"".to_string(), "true".to_string()]
+        );
     }
 
     #[test]
@@ -333,9 +336,16 @@ mod tests {
     #[test]
     fn csv_escape_parse_roundtrips_json_cells() {
         let cells = ["1", "\"alice\"", "\"a,b\"", "true", "null"];
-        let line = cells.iter().map(|c| csv_escape(c)).collect::<Vec<_>>().join(",");
+        let line = cells
+            .iter()
+            .map(|c| csv_escape(c))
+            .collect::<Vec<_>>()
+            .join(",");
         let parsed = csv_parse_line(&line);
-        assert_eq!(parsed, cells.iter().map(|c| c.to_string()).collect::<Vec<_>>());
+        assert_eq!(
+            parsed,
+            cells.iter().map(|c| c.to_string()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -347,7 +357,11 @@ mod tests {
             .collect();
         let arr = format!("[{}]", rows.join(","));
         let out = compact(&arr).expect("compact pasted array should table-ify");
-        assert!(out.starts_with("OBLETH_TABLE rows=80\n"), "got: {}", &out[..out.len().min(40)]);
+        assert!(
+            out.starts_with("OBLETH_TABLE rows=80\n"),
+            "got: {}",
+            &out[..out.len().min(40)]
+        );
         assert!(out.len() < arr.len());
     }
 
@@ -397,7 +411,10 @@ mod tests {
         // Union columns sorted: email,id,name
         assert!(body.starts_with("email,id,name\n"), "body was: {body:?}");
         // Round-trips exactly, distinguishing absent from present.
-        assert_eq!(parse_table_body(&body, n), Some(value.as_array().unwrap().clone()));
+        assert_eq!(
+            parse_table_body(&body, n),
+            Some(value.as_array().unwrap().clone())
+        );
     }
 
     #[test]
@@ -420,7 +437,9 @@ mod tests {
     fn is_qualifying_array_rejects_non_objects_and_singletons() {
         assert!(!is_qualifying_array(json!([1, 2, 3]).as_array().unwrap()));
         assert!(!is_qualifying_array(json!([{"a": 1}]).as_array().unwrap())); // <2
-        assert!(is_qualifying_array(json!([{"a": 1}, {"b": 2}]).as_array().unwrap()));
+        assert!(is_qualifying_array(
+            json!([{"a": 1}, {"b": 2}]).as_array().unwrap()
+        ));
     }
 
     #[test]
@@ -463,7 +482,9 @@ mod tests {
 
     #[test]
     fn compact_recursive_tabbifies_wrapped_array() {
-        let rows: Vec<Value> = (0..50).map(|i| json!({"id": i, "name": format!("u{i}"), "ok": true})).collect();
+        let rows: Vec<Value> = (0..50)
+            .map(|i| json!({"id": i, "name": format!("u{i}"), "ok": true}))
+            .collect();
         let value = json!({"results": rows, "meta": {"total": 50}});
         let text = serde_json::to_string(&value).unwrap();
         let out = compact_recursive(&text).expect("wrapped array compacts");
@@ -478,7 +499,9 @@ mod tests {
     #[test]
     fn compact_recursive_handles_multiple_arrays() {
         let a: Vec<Value> = (0..20).map(|i| json!({"x": i, "y": i * 2})).collect();
-        let b: Vec<Value> = (0..20).map(|i| json!({"k": format!("k{i}"), "v": i})).collect();
+        let b: Vec<Value> = (0..20)
+            .map(|i| json!({"k": format!("k{i}"), "v": i}))
+            .collect();
         let value = json!({"first": a, "second": b});
         let text = serde_json::to_string(&value).unwrap();
         let out = compact_recursive(&text).expect("two arrays compact");

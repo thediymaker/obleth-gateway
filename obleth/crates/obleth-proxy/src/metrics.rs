@@ -119,7 +119,9 @@ impl Metrics {
             .unwrap();
         registry.register(Box::new(cache_lookups.clone())).unwrap();
         registry.register(Box::new(tokens_saved.clone())).unwrap();
-        registry.register(Box::new(compression_tokens_saved.clone())).unwrap();
+        registry
+            .register(Box::new(compression_tokens_saved.clone()))
+            .unwrap();
         registry.register(Box::new(mcp_requests.clone())).unwrap();
         registry
             .register(Box::new(upstream_attempts.clone()))
