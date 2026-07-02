@@ -98,19 +98,20 @@ pub struct CompressionArgs {
     #[arg(long, env = "OBLETH_API_KEY")]
     pub api_key: String,
     /// Input price $/1M tokens for the cost estimate.
-    #[arg(long, env = "PRICE_IN_PER_MTOK", default_value_t = 0.30)]
+    #[arg(long, env = "PRICE_IN_PER_MTOK", default_value_t = crate::benchmarks::compression::DEFAULT_PRICE_IN_PER_MTOK)]
     pub price_per_mtok: f64,
     /// Comma-separated prefill tokens/sec to model for the crossover.
+    // keep in sync with compression::default_prefill_tps()
     #[arg(long, env = "PREFILL_TPS", value_delimiter = ',', default_value = "500,2000,8000")]
     pub prefill_tps: Vec<u32>,
     /// Timed repetitions per arm (median reported).
-    #[arg(long, env = "REPS", default_value_t = 5)]
+    #[arg(long, env = "REPS", default_value_t = crate::benchmarks::compression::DEFAULT_REPS)]
     pub reps: u32,
     /// Output tokens to request (keep small + constant so fixture latency is fixed).
-    #[arg(long, env = "MAX_TOKENS", default_value_t = 1)]
+    #[arg(long, env = "MAX_TOKENS", default_value_t = crate::benchmarks::compression::DEFAULT_MAX_TOKENS)]
     pub max_tokens: u32,
     /// Per-segment min_tokens floor to set during the run (restored after).
-    #[arg(long, env = "BENCH_MIN_TOKENS", default_value_t = 64)]
+    #[arg(long, env = "BENCH_MIN_TOKENS", default_value_t = crate::benchmarks::compression::DEFAULT_MIN_TOKENS)]
     pub min_tokens: u32,
 }
 
