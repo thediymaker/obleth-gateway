@@ -2972,6 +2972,7 @@ async fn create_model(
             &body.tags.clone().unwrap_or_default(),
             &body.boons.clone().unwrap_or_default(),
             &body.tool_servers.clone().unwrap_or_default(),
+            0, // TODO(task 6): wire from payload
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -3079,6 +3080,7 @@ async fn update_model(
                 .tool_servers
                 .clone()
                 .unwrap_or_else(|| existing.tool_servers.clone()),
+            0, // TODO(task 6): wire from payload
         )
         .await?;
     sync_model(&state, &model).await?;

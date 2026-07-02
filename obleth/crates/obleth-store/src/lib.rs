@@ -69,6 +69,7 @@ const SCHEMA_V11: &str =
 const SCHEMA_V12: &str =
     include_str!("../../../../schema/postgres/0012_model_debug_diagnostics.sql");
 const SCHEMA_V13: &str = include_str!("../../../../schema/postgres/0013_compression_policy.sql");
+const SCHEMA_V14: &str = include_str!("../../../../schema/postgres/0014_model_energy_slots.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -169,6 +170,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V11).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V12).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V13).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V14).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -987,6 +989,7 @@ impl Store {
         tags: &[String],
         boons: &[String],
         tool_servers: &[String],
+        energy_slots_per_node: i64,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -995,8 +998,9 @@ impl Store {
                 input_cost_per_token, output_cost_per_token,
                 cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                 admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
-                supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
+                supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
+                energy_slots_per_node
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
              returning id, model_name, description, upstream_model, api_base, api_key, model_type,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
@@ -1004,7 +1008,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics,
+                       debug_diagnostics, energy_slots_per_node,
                        created_at, updated_at",
         )
         .bind(Uuid::new_v4())
@@ -1032,6 +1036,7 @@ impl Store {
         .bind(sqlx::types::Json(obleth_config::normalize_tool_servers(
             tool_servers,
         )))
+        .bind(energy_slots_per_node.max(0))
         .fetch_one(&self.pool)
         .await?;
         model_from_row(&row)
@@ -1047,7 +1052,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics,
+                    debug_diagnostics, energy_slots_per_node,
                     created_at, updated_at
              from models order by model_name",
         )
@@ -1066,7 +1071,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics,
+                    debug_diagnostics, energy_slots_per_node,
                     created_at, updated_at
              from models where id = $1",
         )
@@ -1087,7 +1092,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics,
+                    debug_diagnostics, energy_slots_per_node,
                     created_at, updated_at
              from models where model_name = $1",
         )
@@ -1124,6 +1129,7 @@ impl Store {
         tags: &[String],
         boons: &[String],
         tool_servers: &[String],
+        energy_slots_per_node: i64,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -1137,6 +1143,7 @@ impl Store {
                 enabled = $15, tags = $16, model_type = $17,
                 cost_per_image = $18, cost_per_audio_second = $19, cost_per_character = $20,
                 supports_vision = $21, boons = $22, tool_servers = $23,
+                energy_slots_per_node = $24,
                 updated_at = now()
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, model_type,
@@ -1146,7 +1153,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics,
+                       debug_diagnostics, energy_slots_per_node,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1174,6 +1181,7 @@ impl Store {
         .bind(sqlx::types::Json(obleth_config::normalize_tool_servers(
             tool_servers,
         )))
+        .bind(energy_slots_per_node.max(0))
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1206,7 +1214,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics,
+                       debug_diagnostics, energy_slots_per_node,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1235,7 +1243,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics,
+                       debug_diagnostics, energy_slots_per_node,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1265,7 +1273,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics,
+                       debug_diagnostics, energy_slots_per_node,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1291,7 +1299,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics,
+                       debug_diagnostics, energy_slots_per_node,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1310,7 +1318,7 @@ impl Store {
                     context_window, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics
+                    debug_diagnostics, energy_slots_per_node
              from models where enabled = true",
         )
         .fetch_all(&self.pool)
@@ -1414,7 +1422,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics,
+                       debug_diagnostics, energy_slots_per_node,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1451,7 +1459,7 @@ impl Store {
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
                        request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                       debug_diagnostics,
+                       debug_diagnostics, energy_slots_per_node,
                        created_at, updated_at",
         )
         .bind(id)
@@ -2639,6 +2647,37 @@ impl Store {
         .await?;
         Ok(())
     }
+
+    /// Load the persisted energy-accounting settings, or `None` if unset.
+    pub async fn get_energy_settings(&self) -> Result<Option<obleth_config::EnergySettings>> {
+        let row = sqlx::query("select value from app_settings where key = 'energy'")
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some(row) => {
+                let value: sqlx::types::Json<obleth_config::EnergySettings> =
+                    row.try_get("value")?;
+                Ok(Some(value.0))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Persist the energy-accounting settings (upsert on the single `energy` key).
+    pub async fn put_energy_settings(
+        &self,
+        settings: &obleth_config::EnergySettings,
+    ) -> Result<()> {
+        sqlx::query(
+            "insert into app_settings (key, value, updated_at)
+             values ('energy', $1, now())
+             on conflict (key) do update set value = excluded.value, updated_at = now()",
+        )
+        .bind(sqlx::types::Json(settings))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// A single audit-log entry.
@@ -3250,6 +3289,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                0,
             )
             .await
             .expect("create model");
@@ -3436,6 +3476,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                0,
             )
             .await
             .expect("create model");
@@ -3566,6 +3607,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                0,
             )
             .await
             .expect("create model");
@@ -3644,6 +3686,7 @@ mod tests {
         Vec<String>,
         Vec<String>,
         Vec<String>,
+        i64,
     ) {
         (
             name,
@@ -3668,6 +3711,7 @@ mod tests {
             vec![],
             vec![],
             vec![],
+            0,
         )
     }
 
@@ -3779,7 +3823,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21,
+                &args.19, &args.20, &args.21, args.22,
             )
             .await
             .expect("create model");
@@ -3857,7 +3901,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21,
+                &args.19, &args.20, &args.21, args.22,
             )
             .await
             .expect("model");
@@ -3936,7 +3980,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21,
+                &args.19, &args.20, &args.21, args.22,
             )
             .await
             .expect("create model");
@@ -4127,7 +4171,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21,
+                &args.19, &args.20, &args.21, args.22,
             )
             .await
             .expect("create model");
@@ -4183,7 +4227,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21,
+                &args.19, &args.20, &args.21, args.22,
             )
             .await
             .expect("create model");
@@ -4253,6 +4297,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                0,
             )
             .await
             .expect("create model");
@@ -4323,6 +4368,7 @@ mod tests {
                 &[],
                 &[],
                 &[],
+                0,
             )
             .await
             .expect("create model");
@@ -4389,7 +4435,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21,
+                &args.19, &args.20, &args.21, args.22,
             )
             .await
             .expect("create model");
@@ -4456,5 +4502,153 @@ mod tests {
             outcome.summary.status, "unknown",
             "displayed status for an `unknown` check must be `unknown`"
         );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Verifies that `energy_slots_per_node` round-trips through the store and is
+    /// not silently cleared back to `0` by an unrelated update's RETURNING.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn energy_slots_round_trips_and_survives_unrelated_update() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let model = store
+            .create_model(
+                &format!("eslots-{}", Uuid::new_v4()),
+                "energy slots test model",
+                "upstream-model",
+                "http://127.0.0.1:8081",
+                None,
+                "chat",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                8192,
+                100,
+                None,
+                false,
+                true,
+                false,
+                false,
+                false,
+                &[],
+                &[],
+                &[],
+                8,
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+
+        assert_eq!(
+            model.energy_slots_per_node, 8,
+            "create_model must persist energy_slots_per_node"
+        );
+
+        // A read SELECT must report the value (not the tolerant default).
+        assert_eq!(
+            store
+                .get_model(model.id)
+                .await
+                .unwrap()
+                .energy_slots_per_node,
+            8,
+            "get_model must return the persisted value"
+        );
+        assert_eq!(
+            store
+                .list_models()
+                .await
+                .unwrap()
+                .iter()
+                .find(|m| m.id == model.id)
+                .unwrap()
+                .energy_slots_per_node,
+            8,
+            "list_models must return the persisted value"
+        );
+
+        // An UNRELATED update's RETURNING must not reset it to 0
+        // (same cache-poisoning trap as debug_diagnostics).
+        store
+            .update_model_cache(model.id, true, 60)
+            .await
+            .expect("update_model_cache (unrelated update)");
+        assert_eq!(
+            store
+                .get_model(model.id)
+                .await
+                .unwrap()
+                .energy_slots_per_node,
+            8,
+            "unrelated update must not clear energy_slots_per_node"
+        );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Verifies that energy settings round-trip through the store via the
+    /// `app_settings` upsert pattern.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn energy_settings_round_trip() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        // Clean up any leftover key from a prior run.
+        sqlx::query("delete from app_settings where key = 'energy'")
+            .execute(&store.pool)
+            .await
+            .ok();
+
+        assert!(
+            store.get_energy_settings().await.unwrap().is_none(),
+            "must return None before any put"
+        );
+        let s = obleth_config::EnergySettings {
+            enabled: true,
+            prometheus_url: "http://prom:9090".into(),
+            power_query: "habana_device_power_watts".into(),
+            poll_interval_secs: 30,
+            energy_cost_per_kwh: 0.12,
+            carbon_g_per_kwh: 400.0,
+            pue: 1.2,
+        };
+        store.put_energy_settings(&s).await.expect("put");
+        assert_eq!(
+            store.get_energy_settings().await.expect("get"),
+            Some(s.clone()),
+            "get must return the stored settings"
+        );
+
+        // Upsert (overwrite) must also work.
+        let s2 = obleth_config::EnergySettings {
+            enabled: false,
+            pue: 1.5,
+            ..s
+        };
+        store.put_energy_settings(&s2).await.expect("put again");
+        assert_eq!(
+            store.get_energy_settings().await.expect("get2"),
+            Some(s2),
+            "second put must overwrite the first"
+        );
+
+        // Tidy up so other tests see a clean state.
+        sqlx::query("delete from app_settings where key = 'energy'")
+            .execute(&store.pool)
+            .await
+            .ok();
     }
 }
