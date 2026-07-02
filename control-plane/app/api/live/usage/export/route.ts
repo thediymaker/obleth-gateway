@@ -26,6 +26,9 @@ const ALL_COLUMNS = [
   "cache_misses",
   "avg_ttft_ms",
   "avg_total_ms",
+  "energy_kwh",
+  "co2_g",
+  "energy_cost_usd",
 ] as const;
 
 type Column = (typeof ALL_COLUMNS)[number];
@@ -94,6 +97,12 @@ export async function GET(req: NextRequest) {
           return row.tenant_id === EMPTY_UUID ? "" : row.tenant_id;
         case "key_id":
           return row.key_id === EMPTY_UUID ? "" : row.key_id;
+        case "energy_kwh":
+          return Number((row.energy_wh / 1000).toFixed(4));
+        case "co2_g":
+          return row.co2_g;
+        case "energy_cost_usd":
+          return row.energy_cost_usd;
         default:
           return (row[col] ?? "") as string | number;
       }

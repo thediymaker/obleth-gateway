@@ -15,6 +15,11 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import type { EnergySettingsView } from "@/lib/obleth";
 
+// Preserves an explicit 0 (renewable campus → carbon 0; free power → cost 0).
+// Only falls back when the field is blank or unparseable.
+const parseRate = (x: string, fallback: number): number =>
+  x.trim() === "" || Number.isNaN(Number(x)) ? fallback : Number(x);
+
 export function EnergySettingsForm({
   settings,
 }: {
@@ -51,8 +56,8 @@ export function EnergySettingsForm({
         prometheus_url: prometheusUrl.trim(),
         power_query: powerQuery.trim(),
         poll_interval_secs: Number(pollInterval) || 60,
-        energy_cost_per_kwh: Number(costPerKwh) || 0.1,
-        carbon_g_per_kwh: Number(carbonPerKwh) || 400,
+        energy_cost_per_kwh: parseRate(costPerKwh, 0.1),
+        carbon_g_per_kwh: parseRate(carbonPerKwh, 400),
         pue: Number(pue) || 1.0,
       });
       setStatus(
