@@ -51,6 +51,9 @@ struct UsageRow<'a> {
     status_code: u16,
     cache_status: &'a str,
     cost_usd: f64,
+    energy_wh: f64,
+    energy_cost_usd: f64,
+    co2_g: f64,
     ts_ms: i64,
     session_id: &'a str,
     session_id_source: &'a str,
@@ -75,6 +78,9 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             status_code: r.status_code,
             cache_status: &r.cache_status,
             cost_usd: r.cost_usd,
+            energy_wh: r.energy_wh,
+            energy_cost_usd: r.energy_cost_usd,
+            co2_g: r.co2_g,
             ts_ms: r.ts_ms,
             session_id: &r.session_id,
             session_id_source: &r.session_id_source,
@@ -413,6 +419,9 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             status_code UInt16,
             cache_status LowCardinality(String) DEFAULT 'off',
             cost_usd Float64 DEFAULT 0,
+            energy_wh Float64 DEFAULT 0,
+            energy_cost_usd Float64 DEFAULT 0,
+            co2_g Float64 DEFAULT 0,
             ts_ms Int64,
             session_id String DEFAULT '',
             session_id_source LowCardinality(String) DEFAULT '',
@@ -450,6 +459,19 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
         ))
         .execute()
         .await?;
+    // Idempotent adds for databases created before per-request energy was frozen.
+    for col in [
+        "energy_wh Float64 DEFAULT 0",
+        "energy_cost_usd Float64 DEFAULT 0",
+        "co2_g Float64 DEFAULT 0",
+    ] {
+        client
+            .query(&format!(
+                "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS {col}"
+            ))
+            .execute()
+            .await?;
+    }
     // Idempotent adds for databases created before the per-request log surfaced
     // session grouping and request class.
     client
@@ -531,7 +553,10 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
             cache_misses UInt64,
             ttft_ms_sum UInt64,
             total_ms_sum UInt64,
-            cost_usd_sum Float64
+            cost_usd_sum Float64,
+            energy_wh_sum Float64,
+            energy_cost_usd_sum Float64,
+            co2_g_sum Float64
         ) ENGINE = SummingMergeTree()
         PARTITION BY toYYYYMM(day)
         ORDER BY (day, tenant_id, key_id, model)"
@@ -544,6 +569,19 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
         ))
         .execute()
         .await?;
+    // Idempotent adds for rollups created before per-request energy was frozen.
+    for col in [
+        "energy_wh_sum Float64 DEFAULT 0",
+        "energy_cost_usd_sum Float64 DEFAULT 0",
+        "co2_g_sum Float64 DEFAULT 0",
+    ] {
+        client
+            .query(&format!(
+                "ALTER TABLE {database}.usage_daily ADD COLUMN IF NOT EXISTS {col}"
+            ))
+            .execute()
+            .await?;
+    }
 
     // The aggregation projection shared by the materialized view and the
     // backfill, so both compute identical columns from the raw ledger.
@@ -566,7 +604,10 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
         countIf(cache_status = 'miss') AS cache_misses,
         sumIf(ttft_ms, status_code >= 200 AND status_code < 400) AS ttft_ms_sum,
         sumIf(total_ms, status_code >= 200 AND status_code < 400) AS total_ms_sum,
-        sum(cost_usd) AS cost_usd_sum";
+        sum(cost_usd) AS cost_usd_sum,
+        sum(energy_wh) AS energy_wh_sum,
+        sum(energy_cost_usd) AS energy_cost_usd_sum,
+        sum(co2_g) AS co2_g_sum";
 
     // One-time backfill BEFORE the view exists, and only when the rollup is
     // empty, so restarts never double-count (SummingMergeTree would otherwise
@@ -639,5 +680,40 @@ mod conv_tests {
         };
         let row = UsageRow::from(&rec);
         assert_eq!(row.session_id_source, "derived");
+    }
+
+    #[test]
+    fn usage_row_mirrors_energy_fields() {
+        let mut rec = UsageRecord {
+            request_id: uuid::Uuid::nil(),
+            tenant_id: uuid::Uuid::nil(),
+            key_id: uuid::Uuid::nil(),
+            model: "m".into(),
+            admission: "ok".into(),
+            weight: 1,
+            input_tokens: 0,
+            output_tokens: 0,
+            estimated_tokens: 0,
+            queue_wait_ms: 0,
+            ttft_ms: 0,
+            total_ms: 0,
+            status_code: 200,
+            cache_status: "off".into(),
+            cost_usd: 0.0,
+            energy_wh: 0.0,
+            energy_cost_usd: 0.0,
+            co2_g: 0.0,
+            ts_ms: 0,
+            session_id: "abc".into(),
+            session_id_source: "derived".into(),
+            request_type: "chat".into(),
+        };
+        rec.energy_wh = 1.5;
+        rec.energy_cost_usd = 0.0002;
+        rec.co2_g = 0.6;
+        let row = UsageRow::from(&rec);
+        assert_eq!(row.energy_wh, 1.5);
+        assert_eq!(row.energy_cost_usd, 0.0002);
+        assert_eq!(row.co2_g, 0.6);
     }
 }
