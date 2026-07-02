@@ -11,6 +11,7 @@ export default async function SettingsPage() {
   const boons = await safe(obleth.getBoonSettings(), null);
   const compressor = await safe(obleth.getCompressorStatus(), null);
   const charo = await safe(obleth.getCharoSettings(), null);
+  const energy = await safe(obleth.getEnergySettings(), null);
   const models = await safe(obleth.listModels(), []);
   const retention = await safe(obleth.getUsageRetention(), null);
   const slurm = await safe(obleth.getSlurmSettings(), null);
@@ -30,6 +31,7 @@ export default async function SettingsPage() {
         boons={boons}
         charo={charo}
         compressor={compressor}
+        energy={energy}
         models={models}
         retention={retention}
         slurm={slurm}
