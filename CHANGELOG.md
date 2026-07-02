@@ -4,6 +4,14 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## Unreleased
+
+### Changed
+- Consolidated the compression A/B benchmark into `obench` as `obench compression`
+  (and a "compression savings" option in the interactive TUI). The standalone
+  `bench/compression` Python harness has been removed. Reports now write to
+  `BENCH_OUT_DIR` instead of the source tree.
+
 ## v0.7.0
 Optional neural prose compression you host yourself, a per-request switch to A/B it from the API, sharper log compaction, and an access-control fix for the dashboard's admin API.
 
