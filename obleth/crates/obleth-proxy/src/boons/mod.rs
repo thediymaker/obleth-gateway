@@ -706,6 +706,9 @@ pub(crate) fn bill_helper_call(
         status_code: 200,
         cache_status: "off".to_string(),
         cost_usd,
+        // Helper calls record no duration (total_ms: 0), so slot-share energy
+        // is zero here by construction; the main request's wall time covers
+        // this hardware time at the main model's slot rate.
         energy_wh: 0.0,
         energy_cost_usd: 0.0,
         co2_g: 0.0,

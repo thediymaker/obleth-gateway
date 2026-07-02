@@ -55,4 +55,7 @@ pub struct AppState {
     /// Optional compressor neural scoring sidecar. `None` when `OBLETH_COMPRESSOR_URL`
     /// is unset; the lossy compression pass skips neural scoring gracefully.
     pub compressor: Option<crate::boons::compressor::CompressorClient>,
+    /// Energy & carbon accounting: hot-swappable settings + latest cluster
+    /// power reading from the background Prometheus poller.
+    pub energy: crate::energy::EnergyEngine,
 }

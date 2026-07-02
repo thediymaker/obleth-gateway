@@ -433,6 +433,7 @@ async fn proxy_handler_inner(
         .map(|r| (r.input_cost_per_token, r.output_cost_per_token))
         .unwrap_or((0.0, 0.0));
     let modality_cost = compute_modality_cost(route.as_deref(), &json);
+    let energy_slots = route.as_ref().map(|r| r.energy_slots_per_node).unwrap_or(0);
 
     // ---- response cache (exact-match, before admission so hits cost nothing) ----
     // Tool-loop answers depend on live tool results (e.g. a web search), so a
@@ -499,6 +500,7 @@ async fn proxy_handler_inner(
                     (cached.input_tokens as f64) * in_cost_rate
                         + (cached.output_tokens as f64) * out_cost_rate
                         + modality_cost,
+                    crate::energy::EnergyFigures::default(),
                 );
                 return cached_response(cached, request_id);
             }
@@ -653,6 +655,7 @@ async fn proxy_handler_inner(
                     403,
                     cache_status_label,
                     0.0,
+                    crate::energy::EnergyFigures::default(),
                 );
                 if let Some(t) = tracer.take() {
                     t.finish("error");
@@ -722,6 +725,7 @@ async fn proxy_handler_inner(
                     429,
                     cache_status_label,
                     0.0,
+                    crate::energy::EnergyFigures::default(),
                 );
                 if let Some(t) = tracer.take() {
                     t.finish("error");
@@ -759,6 +763,7 @@ async fn proxy_handler_inner(
                     403,
                     cache_status_label,
                     0.0,
+                    crate::energy::EnergyFigures::default(),
                 );
                 if let Some(t) = tracer.take() {
                     t.finish("error");
@@ -1059,6 +1064,7 @@ async fn proxy_handler_inner(
                 code,
                 cache_status_label,
                 0.0,
+                crate::energy::EnergyFigures::default(),
             );
             let detail = if timed_out {
                 "upstream request timed out"
@@ -1167,6 +1173,7 @@ async fn proxy_handler_inner(
             in_cost_rate,
             out_cost_rate,
             modality_cost,
+            energy_slots,
             None,
         )
         .await;
@@ -1284,6 +1291,7 @@ async fn proxy_handler_inner(
                         in_cost_rate,
                         out_cost_rate,
                         modality_cost,
+                        energy_slots,
                         None,
                     )
                     .await;
@@ -1463,6 +1471,7 @@ async fn proxy_handler_inner(
             in_cost_rate,
             out_cost_rate,
             modality_cost,
+            energy_slots,
             cache_put,
         )
         .await;
@@ -1606,6 +1615,7 @@ async fn proxy_handler_inner(
             in_cost_rate,
             out_cost_rate,
             modality_cost,
+            energy_slots,
             cache_put,
         )
         .await;
@@ -1679,6 +1689,7 @@ async fn settle_request(
     in_cost_rate: f64,
     out_cost_rate: f64,
     modality_cost: f64,
+    energy_slots: i64,
     cache_put: Option<(&str, i64, &str, String)>,
 ) {
     // store the full response for identical future requests
@@ -1737,6 +1748,10 @@ async fn settle_request(
     let cost_usd = (input_tokens as f64) * in_cost_rate
         + (output_tokens as f64) * out_cost_rate
         + modality_cost;
+    // Frozen energy figures: slot-share of live cluster power over serving
+    // time (queue wait excluded). Zeros when accounting is off. Frozen like
+    // `cost_usd` so later settings edits never rewrite history.
+    let energy = state.energy.compute(energy_slots, total_ms, queue_wait_ms);
     if let Some(period) = term_period {
         let added = input_tokens.saturating_add(output_tokens) as i64;
         match state
@@ -1797,6 +1812,7 @@ async fn settle_request(
         status_code,
         cache_status,
         cost_usd,
+        energy,
     );
     state.metrics.total_ms.observe(total_ms as f64);
 }
@@ -2904,6 +2920,7 @@ fn finalize(
     status_code: u16,
     cache_status: &str,
     cost_usd: f64,
+    energy: crate::energy::EnergyFigures,
 ) {
     state
         .metrics
@@ -2930,9 +2947,9 @@ fn finalize(
         status_code,
         cache_status: cache_status.to_string(),
         cost_usd,
-        energy_wh: 0.0,
-        energy_cost_usd: 0.0,
-        co2_g: 0.0,
+        energy_wh: energy.energy_wh,
+        energy_cost_usd: energy.energy_cost_usd,
+        co2_g: energy.co2_g,
         ts_ms: now_ms(),
         session_id: meta.session_id.clone(),
         session_id_source: meta.session_id_source.to_string(),

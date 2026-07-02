@@ -164,6 +164,18 @@ async fn main() -> anyhow::Result<()> {
     };
     let boons = boons::BoonEngine::new(initial_boon_settings);
 
+    // Energy & carbon accounting settings live in Postgres (app_settings,
+    // key='energy') and are hot-reloadable, mirroring the boon settings above.
+    let initial_energy_settings = match store.get_energy_settings().await {
+        Ok(Some(s)) => s,
+        Ok(None) => obleth_config::EnergySettings::default(),
+        Err(e) => {
+            tracing::warn!(error = %e, "energy settings load failed; starting with defaults");
+            obleth_config::EnergySettings::default()
+        }
+    };
+    let energy = energy::EnergyEngine::new(initial_energy_settings);
+
     // Alert settings are persisted in Postgres (app_settings, key='alerts') and
     // hot-reloadable at runtime. On boot, prefer the saved settings; otherwise
     // seed from the legacy env-configured Slack webhook so existing deployments
@@ -212,6 +224,7 @@ async fn main() -> anyhow::Result<()> {
             })
             .unwrap_or(true),
         compressor: crate::boons::compressor::CompressorClient::from_env(),
+        energy: energy.clone(),
     };
 
     match store.all_resolved_models().await {
@@ -237,7 +250,10 @@ async fn main() -> anyhow::Result<()> {
         model_registry.clone(),
         classifier.clone(),
         boons.clone(),
+        energy.clone(),
     );
+
+    energy::spawn_energy_poller(energy.clone(), http.clone(), alerts.clone());
 
     match store.all_resolved_mcp_servers().await {
         Ok(servers) => {
@@ -403,6 +419,7 @@ fn spawn_model_registry_refresh(
     registry: router::ModelRegistry,
     classifier: classifier::Classifier,
     boons: boons::BoonEngine,
+    energy: energy::EnergyEngine,
 ) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(15));
@@ -422,6 +439,11 @@ fn spawn_model_registry_refresh(
                 Ok(Some(settings)) => boons.update(settings),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(error = %e, "boon settings refresh failed"),
+            }
+            match store.get_energy_settings().await {
+                Ok(Some(settings)) => energy.update(settings),
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "energy settings refresh failed"),
             }
         }
     });
