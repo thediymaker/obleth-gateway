@@ -46,11 +46,11 @@ pub struct Cli {
     #[arg(long)]
     pub all: bool,
 
-    #[arg(long, env = "ADMIN_BASE", default_value = "http://localhost:9180")]
+    #[arg(long, env = "ADMIN_BASE", default_value = "http://localhost:9180", global = true)]
     pub admin_base: String,
-    #[arg(long, env = "ADMIN_TOKEN", default_value = "dev-admin-token")]
+    #[arg(long, env = "ADMIN_TOKEN", default_value = "dev-admin-token", global = true)]
     pub admin_token: String,
-    #[arg(long, env = "PROXY_BASE", default_value = "http://localhost:8088")]
+    #[arg(long, env = "PROXY_BASE", default_value = "http://localhost:8088", global = true)]
     pub proxy_base: String,
     #[arg(long, env = "UI_BASE", default_value = "http://localhost:3002")]
     pub ui_base: String,
