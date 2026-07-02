@@ -2530,6 +2530,9 @@ async fn get_key_usage(
             output_tokens: 0,
             total_tokens: 0,
             cost_usd: 0.0,
+            energy_wh: 0.0,
+            energy_cost_usd: 0.0,
+            co2_g: 0.0,
         });
     Ok(Json(summary))
 }
