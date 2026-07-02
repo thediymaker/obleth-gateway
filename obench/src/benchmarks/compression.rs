@@ -2,6 +2,16 @@
 //! former bench/compression/ab.py). For each corpus sample it sends the SAME
 //! request three ways — off / default / lossy — and diffs the result.
 
+/// Default knob values, shared by the CLI (clap defaults) and the TUI so they can't drift.
+pub const DEFAULT_PRICE_IN_PER_MTOK: f64 = 0.30;
+pub const DEFAULT_MAX_TOKENS: u32 = 1;
+pub const DEFAULT_REPS: u32 = 5;
+pub const DEFAULT_MIN_TOKENS: u32 = 64;
+/// Default prefill rates to model for the latency crossover (Vec can't be a const).
+pub fn default_prefill_tps() -> Vec<u32> {
+    vec![500, 2000, 8000]
+}
+
 /// Parse the `x-obleth-compression` response header (`before=N;after=M;saved=K`)
 /// into `(before, after, saved)`. Returns None if `before` is absent.
 pub fn parse_compression_header(val: &str) -> Option<(u64, u64, u64)> {
@@ -207,8 +217,9 @@ async fn median_ms(
     boons: Option<&str>,
 ) -> Result<f64> {
     let _ = chat(client, cfg, messages, boons).await?; // warm
-    let mut samples = Vec::with_capacity(cfg.reps as usize);
-    for _ in 0..cfg.reps {
+    let reps = cfg.reps.max(1);
+    let mut samples = Vec::with_capacity(reps as usize);
+    for _ in 0..reps {
         samples.push(chat(client, cfg, messages, boons).await?.0);
     }
     samples.sort_by(|a, b| a.partial_cmp(b).unwrap());

@@ -602,11 +602,18 @@ async fn run_state_machine(
                             admin_token: cli.admin_token.clone(),
                             api_key: w.comp_key.clone(),
                             model: w.comp_model.clone(),
-                            price_in_per_mtok: 0.30,
-                            prefill_tps: vec![500, 2000, 8000],
-                            max_tokens: 1,
-                            reps: 5,
-                            min_tokens: 64,
+                            price_in_per_mtok: std::env::var("PRICE_IN_PER_MTOK").ok().and_then(|s| s.parse().ok())
+                                .unwrap_or(crate::benchmarks::compression::DEFAULT_PRICE_IN_PER_MTOK),
+                            prefill_tps: std::env::var("PREFILL_TPS").ok()
+                                .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<u32>>())
+                                .filter(|v: &Vec<u32>| !v.is_empty())
+                                .unwrap_or_else(crate::benchmarks::compression::default_prefill_tps),
+                            max_tokens: std::env::var("MAX_TOKENS").ok().and_then(|s| s.parse().ok())
+                                .unwrap_or(crate::benchmarks::compression::DEFAULT_MAX_TOKENS),
+                            reps: std::env::var("REPS").ok().and_then(|s| s.parse().ok())
+                                .unwrap_or(crate::benchmarks::compression::DEFAULT_REPS),
+                            min_tokens: std::env::var("BENCH_MIN_TOKENS").ok().and_then(|s| s.parse().ok())
+                                .unwrap_or(crate::benchmarks::compression::DEFAULT_MIN_TOKENS),
                         };
                         crossterm::terminal::disable_raw_mode()?;
                         crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen)?;
