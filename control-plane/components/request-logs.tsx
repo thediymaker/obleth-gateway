@@ -393,6 +393,7 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
               <th className="hidden px-3 py-2 font-medium 2xl:table-cell">Session</th>
               <th className="px-3 py-2 font-medium">Request ID</th>
               <th className="hidden px-3 py-2 text-right font-medium xl:table-cell">Cost</th>
+              <th className="hidden px-3 py-2 text-right font-medium xl:table-cell">Energy</th>
               <th className="px-3 py-2 text-right font-medium">Tokens</th>
               <th className="hidden px-3 py-2 text-right font-medium xl:table-cell">TTFB</th>
               <th className="px-3 py-2 text-right font-medium">Duration</th>
@@ -410,7 +411,7 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
                 />
                 {expandedRequestId === row.request_id && (
                   <tr>
-                    <td colSpan={12} className="max-w-0 border-b border-emerald-900/40 p-0">
+                    <td colSpan={13} className="max-w-0 border-b border-emerald-900/40 p-0">
                       <div className="min-w-0 w-full max-w-full overflow-hidden">
                         <RequestDetail row={row} />
                       </div>
@@ -421,7 +422,7 @@ export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; mode
             ))}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={12} className="px-4 py-16 text-center text-muted-foreground">
+                <td colSpan={13} className="px-4 py-16 text-center text-muted-foreground">
                   {query.isLoading
                     ? "Loading requests..."
                     : "No requests match the current filters and window."}
@@ -498,6 +499,9 @@ function LogRow({
       </td>
       <td className="hidden px-3 py-1.5 text-right tabular-nums xl:table-cell">
         {formatCurrency(row.cost_usd)}
+      </td>
+      <td className="hidden px-3 py-1.5 text-right tabular-nums xl:table-cell">
+        {formatWh(row.energy_wh)}
       </td>
       <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
         {formatNumber(row.total_tokens)}
@@ -671,6 +675,12 @@ function formatTimeParts(ms: number): { date: string; time: string } {
 function formatSeconds(ms: number): string {
   if (!ms || ms <= 0) return "--";
   return `${(ms / 1000).toFixed(2)}s`;
+}
+
+export function formatWh(wh: number): string {
+  if (wh <= 0) return "—";
+  if (wh < 0.01) return "< 0.01 Wh";
+  return `${wh.toFixed(2)} Wh`;
 }
 
 function truncateId(id: string): string {

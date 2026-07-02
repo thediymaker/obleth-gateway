@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { SpanEntry, UsageLogEntry } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
+import { formatWh } from "@/components/request-logs";
 
 interface Props {
   row: UsageLogEntry;
@@ -582,6 +583,13 @@ function UsageDetailCard({ row, withTrace }: { row: UsageLogEntry; withTrace?: b
         <DetailRow label="Duration" value={fmtMs(row.total_ms)} mono />
         <DetailRow label="Cache" value={row.cache_status} />
         <DetailRow label="Admission" value={row.admission} />
+        {row.energy_wh > 0 && (
+          <>
+            <DetailRow label="Energy" value={formatWh(row.energy_wh)} mono />
+            <DetailRow label="Energy cost" value={`$${row.energy_cost_usd.toFixed(4)}`} mono />
+            <DetailRow label="CO₂" value={`${row.co2_g.toFixed(2)} g`} mono />
+          </>
+        )}
       </dl>
     </div>
   );
