@@ -32,6 +32,9 @@ use crate::engine::fleet;
 
 #[derive(Clone, PartialEq)]
 enum Step {
+    PickBench,
+    CompressionModel,
+    CompressionKey,
     PickTarget,
     LiveUrl,
     KeysList,
@@ -74,6 +77,9 @@ struct Wizard {
     // demo
     fixture_all: bool,
     fixture_model: String,
+    // compression mode inputs
+    comp_model: String,
+    comp_key: String,
     // settings form cursor (0 = profile, 1 = concurrency, 2 = output, 3 = prompt)
     settings_row: usize,
 }
@@ -108,11 +114,11 @@ impl Wizard {
         // Tenant keys are never restored: a saved label without its secret is
         // useless, so the user always re-adds keys for each run.
         Self {
-            step: Step::PickTarget,
+            step: Step::PickBench,
             cursor: 0,
             input: String::new(),
             error: String::new(),
-            return_to: Step::PickTarget,
+            return_to: Step::PickBench,
             target,
             profile,
             input_tokens,
@@ -128,6 +134,8 @@ impl Wizard {
                 saved.fixture_all
             },
             fixture_model: saved.fixture_model.clone(),
+            comp_model: String::new(),
+            comp_key: String::new(),
             settings_row: 0,
         }
     }
@@ -429,6 +437,33 @@ async fn run_state_machine(
     loop {
         // ── draw ──────────────────────────────────────────────────────────────
         match w.step {
+            Step::PickBench => {
+                let kinds: &[(&str, &str)] = &[
+                    ("load / readiness", "Drive concurrent load and get a PASS/FAIL verdict on whether the gateway stays up (demo or live)."),
+                    ("compression savings", "Back-to-back A/B measuring how much the compression boon saves + the latency crossover."),
+                ];
+                terminal.draw(|f| draw_pick_scope(f, w.target, kinds, w.cursor))?;
+            }
+            Step::CompressionModel => {
+                terminal.draw(|f| draw_text_input(
+                    f,
+                    "compression — model",
+                    "Name of a model that has the compression boon granted.",
+                    "e.g. my-model-with-compression",
+                    &w.input,
+                    false,
+                ))?;
+            }
+            Step::CompressionKey => {
+                terminal.draw(|f| draw_text_input(
+                    f,
+                    "compression — API key",
+                    "An API key that can call this model. Input hidden.",
+                    "paste the key and press Enter to run the A/B",
+                    &w.input,
+                    true,
+                ))?;
+            }
             Step::PickTarget => {
                 terminal.draw(|f| draw_pick_target(f, w.cursor, snap))?;
             }
@@ -521,6 +556,81 @@ async fn run_state_machine(
         let code = k.code;
 
         match w.step {
+            Step::PickBench => match code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
+                KeyCode::Up => w.cursor = w.cursor.saturating_sub(1),
+                KeyCode::Down => w.cursor = (w.cursor + 1).min(1),
+                KeyCode::Enter | KeyCode::Char(' ') => {
+                    if w.cursor == 0 {
+                        w.step = Step::PickTarget; // load flow, unchanged
+                    } else {
+                        w.input = w.comp_model.clone();
+                        w.step = Step::CompressionModel;
+                    }
+                    w.cursor = 0;
+                }
+                _ => {}
+            },
+
+            Step::CompressionModel => match code {
+                KeyCode::Esc => { w.step = Step::PickBench; w.cursor = 0; }
+                KeyCode::Enter => {
+                    let v = w.input.trim().to_string();
+                    if !v.is_empty() {
+                        w.comp_model = v;
+                        w.input.clear();
+                        w.step = Step::CompressionKey;
+                    }
+                }
+                KeyCode::Backspace => { w.input.pop(); }
+                KeyCode::Char(c) => w.input.push(c),
+                _ => {}
+            },
+
+            Step::CompressionKey => match code {
+                KeyCode::Esc => { w.input = w.comp_model.clone(); w.step = Step::CompressionModel; }
+                KeyCode::Enter => {
+                    let v = w.input.trim().to_string();
+                    if v.is_empty() { /* stay */ } else {
+                        w.comp_key = v;
+                        w.input.clear();
+                        // Leave the alternate screen, run the A/B (it prints its
+                        // own report), then wait for a keypress before returning.
+                        let cfg = crate::benchmarks::compression::CompressionConfig {
+                            proxy_base: cli.proxy_base.clone(),
+                            admin_base: cli.admin_base.clone(),
+                            admin_token: cli.admin_token.clone(),
+                            api_key: w.comp_key.clone(),
+                            model: w.comp_model.clone(),
+                            price_in_per_mtok: 0.30,
+                            prefill_tps: vec![500, 2000, 8000],
+                            max_tokens: 1,
+                            reps: 5,
+                            min_tokens: 64,
+                        };
+                        crossterm::terminal::disable_raw_mode()?;
+                        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen)?;
+                        let res = crate::benchmarks::compression::run(&cfg).await;
+                        println!("\n[press Enter to return to obench]");
+                        let mut _line = String::new();
+                        let _ = std::io::stdin().read_line(&mut _line);
+                        crossterm::terminal::enable_raw_mode()?;
+                        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::EnterAlternateScreen)?;
+                        if let Err(e) = res {
+                            w.error = format!("compression run failed: {e}");
+                            w.return_to = Step::PickBench;
+                            w.step = Step::Error;
+                        } else {
+                            w.step = Step::PickBench;
+                        }
+                        w.cursor = 0;
+                    }
+                }
+                KeyCode::Backspace => { w.input.pop(); }
+                KeyCode::Char(c) => w.input.push(c),
+                _ => {}
+            },
+
             Step::PickTarget => match code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Up => w.cursor = w.cursor.saturating_sub(1),
