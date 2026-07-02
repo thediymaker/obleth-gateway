@@ -348,7 +348,7 @@ export function ReportsDashboard() {
           value={totals.energyWh > 0 ? formatEnergyKwh(totals.energyWh) : "\u2014"}
         />
         <Kpi
-          label="CO\u2082"
+          label="CO₂"
           value={totals.co2G > 0 ? formatCo2(totals.co2G) : "\u2014"}
         />
       </div>
