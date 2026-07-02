@@ -2930,6 +2930,9 @@ fn finalize(
         status_code,
         cache_status: cache_status.to_string(),
         cost_usd,
+        energy_wh: 0.0,
+        energy_cost_usd: 0.0,
+        co2_g: 0.0,
         ts_ms: now_ms(),
         session_id: meta.session_id.clone(),
         session_id_source: meta.session_id_source.to_string(),
@@ -3235,6 +3238,7 @@ mod tests {
             retry_backoff_ms: obleth_config::DEFAULT_RETRY_BACKOFF_MS,
             endpoint_selection_mode: obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
             debug_diagnostics: false,
+            energy_slots_per_node: 0,
             endpoints,
         }
     }

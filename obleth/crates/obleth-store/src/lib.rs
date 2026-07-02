@@ -1387,6 +1387,9 @@ impl Store {
                     retry_backoff_ms: row.try_get("retry_backoff_ms")?,
                     endpoint_selection_mode: row.try_get("endpoint_selection_mode")?,
                     debug_diagnostics: row.try_get("debug_diagnostics").unwrap_or(false),
+                    // Tolerant read: column added in the energy-accounting migration;
+                    // older SQL statements or pre-migration rows degrade to 0 (off).
+                    energy_slots_per_node: row.try_get("energy_slots_per_node").unwrap_or(0),
                     endpoints,
                 },
             ));
@@ -2906,6 +2909,9 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         // Tolerant read: statements that don't select `debug_diagnostics`
         // degrade to false rather than erroring.
         debug_diagnostics: row.try_get("debug_diagnostics").unwrap_or(false),
+        // Tolerant read: column added in the energy-accounting migration;
+        // older SQL statements or pre-migration rows degrade to 0 (off).
+        energy_slots_per_node: row.try_get("energy_slots_per_node").unwrap_or(0),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })

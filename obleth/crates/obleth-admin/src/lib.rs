@@ -4010,6 +4010,7 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         retry_backoff_ms: model.retry_backoff_ms,
         endpoint_selection_mode: model.endpoint_selection_mode.clone(),
         debug_diagnostics: model.debug_diagnostics,
+        energy_slots_per_node: model.energy_slots_per_node,
         endpoints,
     };
     if model.enabled {
