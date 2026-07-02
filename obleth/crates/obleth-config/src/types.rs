@@ -346,6 +346,13 @@ pub struct ModelRoute {
     /// span. Opt-in; off by default. Diagnose-only — never changes routing.
     #[serde(default)]
     pub debug_diagnostics: bool,
+    /// Declared saturation for energy accounting: how many concurrent
+    /// sequences of this model saturate one node (instances per node x
+    /// sequences per instance). Each request is charged
+    /// `node_watts / energy_slots_per_node` for its serving time.
+    /// `0` (default) disables energy accounting for this model.
+    #[serde(default)]
+    pub energy_slots_per_node: i64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -466,6 +473,13 @@ pub struct ResolvedModel {
     pub endpoint_selection_mode: String,
     #[serde(default)]
     pub debug_diagnostics: bool,
+    /// Declared saturation for energy accounting: how many concurrent
+    /// sequences of this model saturate one node (instances per node x
+    /// sequences per instance). Each request is charged
+    /// `node_watts / energy_slots_per_node` for its serving time.
+    /// `0` (default) disables energy accounting for this model.
+    #[serde(default)]
+    pub energy_slots_per_node: i64,
     /// Upstream endpoints for this model. When empty, the data plane falls back
     /// to the legacy single `api_base`/`api_key` pair above (older cached
     /// payloads and un-migrated rows).
@@ -676,6 +690,18 @@ pub struct UsageRecord {
     /// replayable.
     #[serde(default)]
     pub cost_usd: f64,
+    /// Energy attributed to this request in watt-hours, frozen at completion
+    /// from the live cluster power reading and the model's declared
+    /// `energy_slots_per_node` — like `cost_usd`, never recomputed later.
+    /// Charged on serving time only (`total_ms - queue_wait_ms`).
+    #[serde(default)]
+    pub energy_wh: f64,
+    /// USD cost of `energy_wh` at the electricity rate in effect at completion.
+    #[serde(default)]
+    pub energy_cost_usd: f64,
+    /// Grams of CO2 for `energy_wh` at the grid intensity in effect at completion.
+    #[serde(default)]
+    pub co2_g: f64,
     /// Unix epoch milliseconds at request completion.
     pub ts_ms: i64,
     /// Client-supplied session/conversation id used to group related requests
@@ -737,6 +763,59 @@ pub struct SlurmSettings {
 
 fn default_slurm_api_version() -> String {
     "v0.0.40".to_string()
+}
+
+fn default_energy_poll_interval_secs() -> u64 {
+    60
+}
+
+fn default_pue() -> f64 {
+    1.0
+}
+
+/// System-wide energy & carbon accounting settings, stored as a single
+/// `app_settings` row (key `energy`) like the other global settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EnergySettings {
+    /// Master switch. When false the power poller no-ops and requests record
+    /// zero energy.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL of the operator's Prometheus (e.g. `http://prometheus:9090`).
+    #[serde(default)]
+    pub prometheus_url: String,
+    /// Operator-supplied PromQL returning one power series (watts) per node.
+    /// obleth derives cluster watts via `sum()` and node count via `count()`
+    /// of this expression, so any exporter (Habana, DCGM, IPMI) works.
+    #[serde(default)]
+    pub power_query: String,
+    /// Poll cadence in seconds.
+    #[serde(default = "default_energy_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+    /// Electricity rate in USD per kWh.
+    #[serde(default)]
+    pub energy_cost_per_kwh: f64,
+    /// Grid carbon intensity in grams CO2 per kWh.
+    #[serde(default)]
+    pub carbon_g_per_kwh: f64,
+    /// Facility overhead multiplier (PUE). 1.0 = IT power only.
+    #[serde(default = "default_pue")]
+    pub pue: f64,
+}
+
+impl Default for EnergySettings {
+    fn default() -> Self {
+        serde_json::from_str("{}").expect("EnergySettings defaults")
+    }
+}
+
+impl EnergySettings {
+    /// True when the feature is on and the Prometheus target is configured.
+    pub fn active(&self) -> bool {
+        self.enabled
+            && !self.prometheus_url.trim().is_empty()
+            && !self.power_query.trim().is_empty()
+    }
 }
 
 /// Runtime-configurable alerting settings, editable from the control plane and
@@ -1876,5 +1955,36 @@ mod tests {
         let back: CompressionPolicy =
             serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn energy_settings_defaults() {
+        let s: EnergySettings = serde_json::from_str("{}").unwrap();
+        assert!(!s.enabled);
+        assert_eq!(s.poll_interval_secs, 60);
+        assert_eq!(s.pue, 1.0);
+        assert!(!s.active());
+        let active = EnergySettings {
+            enabled: true,
+            prometheus_url: "http://prom:9090".into(),
+            power_query: "habana_device_power_watts".into(),
+            ..Default::default()
+        };
+        assert!(active.active());
+    }
+
+    #[test]
+    fn usage_record_energy_fields_default_for_old_wal() {
+        // A record serialized before the energy fields existed must replay.
+        let old = r#"{"request_id":"00000000-0000-0000-0000-000000000000",
+            "tenant_id":"00000000-0000-0000-0000-000000000000",
+            "key_id":"00000000-0000-0000-0000-000000000000",
+            "model":"m","admission":"fast","weight":1,"input_tokens":1,
+            "output_tokens":1,"estimated_tokens":2,"queue_wait_ms":0,"ttft_ms":0,
+            "total_ms":10,"status_code":200,"cache_status":"off","ts_ms":0}"#;
+        let r: UsageRecord = serde_json::from_str(old).unwrap();
+        assert_eq!(r.energy_wh, 0.0);
+        assert_eq!(r.energy_cost_usd, 0.0);
+        assert_eq!(r.co2_g, 0.0);
     }
 }

@@ -706,6 +706,9 @@ pub(crate) fn bill_helper_call(
         status_code: 200,
         cache_status: "off".to_string(),
         cost_usd,
+        energy_wh: 0.0,
+        energy_cost_usd: 0.0,
+        co2_g: 0.0,
         ts_ms: now_ms(),
         session_id: session_id.to_string(),
         session_id_source: "none".to_string(),
@@ -761,6 +764,7 @@ mod tests {
             retry_backoff_ms: 200,
             endpoint_selection_mode: "failover".to_string(),
             debug_diagnostics: false,
+            energy_slots_per_node: 0,
             endpoints: vec![],
         }
     }

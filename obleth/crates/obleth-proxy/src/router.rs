@@ -399,6 +399,7 @@ mod tests {
             retry_backoff_ms: obleth_config::DEFAULT_RETRY_BACKOFF_MS,
             endpoint_selection_mode: obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
             debug_diagnostics: false,
+            energy_slots_per_node: 0,
             endpoints: Vec::new(),
         }
     }
