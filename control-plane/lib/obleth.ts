@@ -758,6 +758,31 @@ export interface CharoSettingsView {
   enabled: boolean;
 }
 
+export interface EnergySettingsView {
+  enabled: boolean;
+  prometheus_url: string;
+  power_query: string;
+  poll_interval_secs: number;
+  energy_cost_per_kwh: number;
+  carbon_g_per_kwh: number;
+  pue: number;
+}
+
+export interface UpdateEnergySettings {
+  enabled?: boolean;
+  prometheus_url?: string;
+  power_query?: string;
+  poll_interval_secs?: number;
+  energy_cost_per_kwh?: number;
+  carbon_g_per_kwh?: number;
+  pue?: number;
+}
+
+export interface EnergyTestResult {
+  cluster_watts: number;
+  node_count: number;
+}
+
 export interface ChannelResult {
   channel: string;
   ok: boolean;
@@ -1519,6 +1544,18 @@ export const obleth = {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
+    }),
+  getEnergySettings: () => api<EnergySettingsView>("/settings/energy"),
+  setEnergySettings: (body: UpdateEnergySettings, options?: AuditOptions) =>
+    api<EnergySettingsView>("/settings/energy", {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  testEnergyQuery: (prometheus_url: string, power_query: string) =>
+    api<EnergyTestResult>("/settings/energy/test", {
+      method: "POST",
+      body: JSON.stringify({ prometheus_url, power_query }),
     }),
   getSlurmSettings: () => api<SlurmSettingsView>("/settings/slurm"),
   setSlurmSettings: (body: UpdateSlurmSettings, options?: AuditOptions) =>

@@ -11,12 +11,14 @@ import type {
   AutotuneWorkload,
   ConfigBackup,
   CompressionPolicy,
+  EnergyTestResult,
   GuardrailsPolicy,
   ModelRoute,
   RestoreReport,
   UpdateAlertSettings,
   UpdateAutoRouterSettings,
   UpdateBoonSettings,
+  UpdateEnergySettings,
   UpdateSlurmSettings,
   SlurmHealthView,
 } from "@/lib/obleth";
@@ -1387,6 +1389,32 @@ export async function setBoonSettingsAction(
   }
   revalidatePath("/settings");
   return { ok: true };
+}
+
+export async function setEnergySettingsAction(
+  body: UpdateEnergySettings,
+): Promise<ActionResult> {
+  const session = await requireAdmin();
+  try {
+    await obleth.setEnergySettings(body, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/settings");
+  return { ok: true };
+}
+
+export async function testEnergyQueryAction(
+  prometheusUrl: string,
+  powerQuery: string,
+): Promise<ActionResult & { data?: EnergyTestResult }> {
+  await requireAdmin();
+  try {
+    const data = await obleth.testEnergyQuery(prometheusUrl, powerQuery);
+    return { ok: true, data };
+  } catch (e) {
+    return actionError(e);
+  }
 }
 
 export async function setCharoSettingsAction(

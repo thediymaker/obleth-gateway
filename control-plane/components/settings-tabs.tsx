@@ -1,7 +1,7 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { Bell, Route, Database, Info, Server, Bot, Archive } from "lucide-react";
+import { Bell, Route, Database, Info, Server, Bot, Archive, Zap } from "lucide-react";
 import {
   AlertSettingsForm,
   AutoRouterSettingsForm,
@@ -11,6 +11,7 @@ import {
   SlurmSettingsForm,
   UsageRetentionForm,
 } from "@/components/settings-form";
+import { EnergySettingsForm } from "@/components/energy-settings-form";
 import { BackupRestore } from "@/components/backup-restore";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type {
@@ -19,6 +20,7 @@ import type {
   BoonSettingsView,
   CharoSettingsView,
   CompressorStatusView,
+  EnergySettingsView,
   ModelRoute,
   SlurmSettingsView,
   UsageRetentionView,
@@ -30,6 +32,7 @@ export function SettingsTabs({
   boons,
   charo,
   compressor,
+  energy,
   models,
   retention,
   slurm,
@@ -40,6 +43,7 @@ export function SettingsTabs({
   boons: BoonSettingsView | null;
   charo: CharoSettingsView | null;
   compressor: CompressorStatusView | null;
+  energy: EnergySettingsView | null;
   models: ModelRoute[];
   retention: UsageRetentionView | null;
   slurm: SlurmSettingsView | null;
@@ -59,6 +63,10 @@ export function SettingsTabs({
         <TabsTrigger value="compression">
           <Archive className="h-3.5 w-3.5" />
           Compression
+        </TabsTrigger>
+        <TabsTrigger value="energy">
+          <Zap className="h-3.5 w-3.5" />
+          Energy
         </TabsTrigger>
         <TabsTrigger value="data">
           <Database className="h-3.5 w-3.5" />
@@ -91,6 +99,10 @@ export function SettingsTabs({
 
       <TabsContent value="compression">
         <CompressionSettingsForm settings={boons} compressor={compressor} />
+      </TabsContent>
+
+      <TabsContent value="energy">
+        <EnergySettingsForm settings={energy} />
       </TabsContent>
 
       <TabsContent value="data">
