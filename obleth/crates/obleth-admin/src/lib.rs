@@ -255,6 +255,11 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/settings/boons",
             get(get_boon_settings).put(put_boon_settings),
         )
+        .route(
+            "/api/v1/settings/energy",
+            get(get_energy_settings).put(put_energy_settings),
+        )
+        .route("/api/v1/settings/energy/test", post(test_energy_query))
         .route("/api/v1/settings/compressor", get(get_compressor_status))
         .route(
             "/api/v1/settings/charo",
@@ -611,6 +616,10 @@ pub struct CreateModel {
     /// Registered MCP servers whose tools this model may use (gateway tool loop).
     #[serde(default)]
     pub tool_servers: Option<Vec<String>>,
+    /// Energy accounting: concurrent sequences that saturate one node.
+    /// 0 disables energy accounting for this model.
+    #[serde(default)]
+    pub energy_slots_per_node: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -646,6 +655,10 @@ pub struct UpdateModel {
     /// Registered MCP servers whose tools this model may use (gateway tool loop).
     #[serde(default)]
     pub tool_servers: Option<Vec<String>>,
+    /// Energy accounting: concurrent sequences that saturate one node.
+    /// 0 disables energy accounting for this model.
+    #[serde(default)]
+    pub energy_slots_per_node: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1768,6 +1781,168 @@ async fn put_boon_settings(
         )
         .await?;
     Ok(Json(BoonSettingsView::from_settings(&settings)))
+}
+
+/// View of the persisted energy-accounting settings.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EnergySettingsView {
+    pub enabled: bool,
+    pub prometheus_url: String,
+    pub power_query: String,
+    pub poll_interval_secs: u64,
+    pub energy_cost_per_kwh: f64,
+    pub carbon_g_per_kwh: f64,
+    pub pue: f64,
+}
+
+impl EnergySettingsView {
+    fn from_settings(s: &obleth_config::EnergySettings) -> Self {
+        EnergySettingsView {
+            enabled: s.enabled,
+            prometheus_url: s.prometheus_url.clone(),
+            power_query: s.power_query.clone(),
+            poll_interval_secs: s.poll_interval_secs,
+            energy_cost_per_kwh: s.energy_cost_per_kwh,
+            carbon_g_per_kwh: s.carbon_g_per_kwh,
+            pue: s.pue,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateEnergySettings {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Base URL of the operator's Prometheus. Omit to leave unchanged.
+    #[serde(default)]
+    pub prometheus_url: Option<String>,
+    /// PromQL returning one power series (watts) per node. Omit to leave unchanged.
+    #[serde(default)]
+    pub power_query: Option<String>,
+    /// Poll cadence in seconds. Omit/zero leaves unchanged.
+    #[serde(default)]
+    pub poll_interval_secs: Option<u64>,
+    /// Electricity rate (USD/kWh). Omit to leave unchanged.
+    #[serde(default)]
+    pub energy_cost_per_kwh: Option<f64>,
+    /// Grid carbon intensity (gCO2/kWh). Omit to leave unchanged.
+    #[serde(default)]
+    pub carbon_g_per_kwh: Option<f64>,
+    /// Facility overhead multiplier. Omit or non-positive leaves unchanged.
+    #[serde(default)]
+    pub pue: Option<f64>,
+}
+
+fn merge_energy_settings(
+    existing: &obleth_config::EnergySettings,
+    body: &UpdateEnergySettings,
+) -> obleth_config::EnergySettings {
+    obleth_config::EnergySettings {
+        enabled: body.enabled.unwrap_or(existing.enabled),
+        prometheus_url: body
+            .prometheus_url
+            .as_deref()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| existing.prometheus_url.clone()),
+        power_query: body
+            .power_query
+            .as_deref()
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| existing.power_query.clone()),
+        poll_interval_secs: body
+            .poll_interval_secs
+            .filter(|n| *n > 0)
+            .unwrap_or(existing.poll_interval_secs),
+        energy_cost_per_kwh: body
+            .energy_cost_per_kwh
+            .filter(|v| *v >= 0.0)
+            .unwrap_or(existing.energy_cost_per_kwh),
+        carbon_g_per_kwh: body
+            .carbon_g_per_kwh
+            .filter(|v| *v >= 0.0)
+            .unwrap_or(existing.carbon_g_per_kwh),
+        pue: body.pue.filter(|v| *v > 0.0).unwrap_or(existing.pue),
+    }
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/settings/energy", tag = "settings",
+    responses((status = 200, body = EnergySettingsView))
+)]
+async fn get_energy_settings(State(state): State<AdminState>) -> Result<Json<EnergySettingsView>> {
+    let settings = state.store.get_energy_settings().await?.unwrap_or_default();
+    Ok(Json(EnergySettingsView::from_settings(&settings)))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/settings/energy", tag = "settings",
+    request_body = UpdateEnergySettings,
+    responses((status = 200, body = EnergySettingsView))
+)]
+async fn put_energy_settings(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+    Json(body): Json<UpdateEnergySettings>,
+) -> Result<Json<EnergySettingsView>> {
+    let existing = state.store.get_energy_settings().await?.unwrap_or_default();
+    let settings = merge_energy_settings(&existing, &body);
+    state.store.put_energy_settings(&settings).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_energy_settings",
+            "settings",
+            "energy",
+            serde_json::json!({
+                "enabled": settings.enabled,
+                "prometheus_url": settings.prometheus_url,
+                "power_query": settings.power_query,
+                "poll_interval_secs": settings.poll_interval_secs,
+                "energy_cost_per_kwh": settings.energy_cost_per_kwh,
+                "carbon_g_per_kwh": settings.carbon_g_per_kwh,
+                "pue": settings.pue,
+            }),
+        )
+        .await?;
+    Ok(Json(EnergySettingsView::from_settings(&settings)))
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct TestEnergyQuery {
+    pub prometheus_url: String,
+    pub power_query: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct EnergyTestResult {
+    pub cluster_watts: f64,
+    pub node_count: u64,
+}
+
+#[utoipa::path(
+    post, path = "/api/v1/settings/energy/test", tag = "settings",
+    request_body = TestEnergyQuery,
+    responses((status = 200, body = EnergyTestResult))
+)]
+async fn test_energy_query(
+    State(state): State<AdminState>,
+    Json(body): Json<TestEnergyQuery>,
+) -> Result<Json<EnergyTestResult>> {
+    state.ssrf.validate(&body.prometheus_url)?;
+    let q = body.power_query.trim();
+    let base = body.prometheus_url.trim();
+    let http = reqwest::Client::new();
+    let watts = crate::energy_probe::instant_query(&http, base, &format!("sum({q})"))
+        .await
+        .map_err(AdminError::BadRequest)?;
+    let nodes = crate::energy_probe::instant_query(&http, base, &format!("count({q})"))
+        .await
+        .map_err(AdminError::BadRequest)?;
+    Ok(Json(EnergyTestResult {
+        cluster_watts: watts,
+        node_count: nodes.max(0.0) as u64,
+    }))
 }
 
 /// Whether the Charo control-plane assistant is shown in the dashboard.
@@ -2973,7 +3148,7 @@ async fn create_model(
             &body.tags.clone().unwrap_or_default(),
             &body.boons.clone().unwrap_or_default(),
             &body.tool_servers.clone().unwrap_or_default(),
-            0, // TODO(task 6): wire from payload
+            body.energy_slots_per_node.unwrap_or(0),
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -3081,7 +3256,8 @@ async fn update_model(
                 .tool_servers
                 .clone()
                 .unwrap_or_else(|| existing.tool_servers.clone()),
-            0, // TODO(task 6): wire from payload
+            body.energy_slots_per_node
+                .unwrap_or(existing.energy_slots_per_node),
         )
         .await?;
     sync_model(&state, &model).await?;
@@ -4143,5 +4319,41 @@ mod tests {
         .unwrap();
         let p = set.policy.expect("policy present");
         assert!(p.enabled && p.code_compaction && p.dedup && p.allow_lossy);
+    }
+
+    #[test]
+    fn energy_settings_view_round_trip() {
+        let s = obleth_config::EnergySettings {
+            enabled: true,
+            prometheus_url: "http://prom:9090".into(),
+            power_query: "habana_device_power_watts".into(),
+            poll_interval_secs: 30,
+            energy_cost_per_kwh: 0.12,
+            carbon_g_per_kwh: 400.0,
+            pue: 1.2,
+        };
+        let view = EnergySettingsView::from_settings(&s);
+        assert!(view.enabled);
+        assert_eq!(view.poll_interval_secs, 30);
+        assert_eq!(view.pue, 1.2);
+    }
+
+    #[test]
+    fn update_energy_settings_merges_partials() {
+        let existing = obleth_config::EnergySettings::default();
+        let body = UpdateEnergySettings {
+            enabled: Some(true),
+            prometheus_url: Some("http://prom:9090".into()),
+            power_query: Some("watts".into()),
+            poll_interval_secs: None,
+            energy_cost_per_kwh: Some(0.15),
+            carbon_g_per_kwh: None,
+            pue: None,
+        };
+        let merged = merge_energy_settings(&existing, &body);
+        assert!(merged.enabled);
+        assert_eq!(merged.poll_interval_secs, 60); // untouched default
+        assert_eq!(merged.energy_cost_per_kwh, 0.15);
+        assert_eq!(merged.pue, 1.0);
     }
 }
