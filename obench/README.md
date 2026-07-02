@@ -243,3 +243,27 @@ watch in the control plane:
 
 Fairshare ratios, per-tenant accounting, and ledger reconciliation are things you
 observe in those views — obench does not assert them automatically.
+
+## Compression mode
+
+`obench compression` runs a back-to-back A/B of the compression boon: for each
+corpus it sends the same request three ways — `off` (baseline), `default`
+(lossless + dedup + log passes), and `lossy` (adds the neural prose pass) — and
+diffs the `x-obleth-compression` response header to report tokens saved, cost
+saved, and a **modeled** upstream-prefill latency crossover.
+
+```bash
+obench compression --model <model-with-compression-boon> --api-key sk-... \
+  --admin-token <token>            # enables the boon + lowers min_tokens, then restores
+```
+
+Requires a model granted the `compression` boon and an API key that can call it.
+With an admin token, the run enables compression globally and temporarily lowers
+the per-segment `min_tokens` floor so the size sweep is visible, restoring both on
+exit (including Ctrl-C). Flags: `--price-per-mtok` (0.30), `--prefill-tps`
+(500,2000,8000), `--reps` (5), `--max-tokens` (1), `--min-tokens` (64); each has
+the matching env-var fallback (`MODEL`, `OBLETH_API_KEY`, `PRICE_IN_PER_MTOK`, …).
+
+The report is written to `BENCH_OUT_DIR` as `compression-report.md` +
+`compression-meta.json` (nothing is written into the source tree). Interactively,
+`obench` (no args) offers "compression savings" on its first screen.
