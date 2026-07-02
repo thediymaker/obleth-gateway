@@ -9,6 +9,7 @@
 pub mod alerts;
 pub mod autotune;
 mod backup;
+pub mod energy_probe;
 mod error;
 pub mod model_health;
 mod openapi;

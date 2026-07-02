@@ -4,6 +4,7 @@
 //! a Prometheus metrics endpoint. Wires Postgres (config SoT), Redis (hot cache
 //! + budgets), ClickHouse (usage ledger) and the fairshare scheduler together.
 
+mod energy;
 mod mcp;
 mod metrics;
 mod proxy;
