@@ -349,6 +349,20 @@ impl AdminClient {
         let v = self.req(reqwest::Method::GET, "/capacity", None).await?;
         Ok(v["max_in_flight"].as_u64().unwrap_or(0) as u32)
     }
+
+    /// Fetch the current model-boons settings view (flattened per boon). Used to
+    /// snapshot compression settings before a benchmark mutates them.
+    pub async fn get_boons(&self) -> anyhow::Result<Value> {
+        self.req(reqwest::Method::GET, "/settings/boons", None).await
+    }
+
+    /// Update model-boons settings. The server merges partial bodies, so `patch`
+    /// need only carry the fields being changed.
+    pub async fn set_boons(&self, patch: Value) -> anyhow::Result<()> {
+        self.req(reqwest::Method::PUT, "/settings/boons", Some(patch))
+            .await?;
+        Ok(())
+    }
 }
 
 /// Query an OpenAI-compatible upstream for its model catalog.
