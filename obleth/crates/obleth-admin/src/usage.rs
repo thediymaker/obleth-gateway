@@ -146,6 +146,9 @@ pub struct UsageLogRow {
     pub total_ms: u32,
     pub cache_status: String,
     pub cost_usd: f64,
+    pub energy_wh: f64,
+    pub energy_cost_usd: f64,
+    pub co2_g: f64,
 }
 
 /// Read individual `usage` rows newest-first, honoring the supplied filters and
@@ -162,7 +165,8 @@ pub async fn query_usage_logs(
         "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, session_id_source, \
          admission, status_code, input_tokens, output_tokens, \
          toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
-         queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd \
+         queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
+         energy_wh, energy_cost_usd, co2_g \
          from usage where ts_ms >= ?",
     );
     if q.until_ms.is_some() {
@@ -285,6 +289,12 @@ pub struct UsageDailyRow {
     /// Total USD spend across the grouped rows, summed from the per-request
     /// cost frozen at completion time (never recomputed from current prices).
     pub cost_usd: f64,
+    /// Total energy consumed across the grouped rows in watt-hours.
+    pub energy_wh: f64,
+    /// Estimated energy cost in USD for the grouped rows.
+    pub energy_cost_usd: f64,
+    /// Total CO₂ equivalent in grams for the grouped rows.
+    pub co2_g: f64,
 }
 
 /// Per-tenant usage aggregate.
@@ -297,6 +307,9 @@ pub struct UsageAgg {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    pub energy_wh: f64,
+    pub energy_cost_usd: f64,
+    pub co2_g: f64,
 }
 
 /// Per-key usage aggregate.
@@ -312,6 +325,9 @@ pub struct UsageKeyAgg {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    pub energy_wh: f64,
+    pub energy_cost_usd: f64,
+    pub co2_g: f64,
 }
 
 /// Per-model usage aggregate.
@@ -344,6 +360,9 @@ pub struct UsageModelAgg {
     pub avg_gen_tokens: f64,
     /// Distinct API keys (users) that hit this model in the window.
     pub users: u64,
+    pub energy_wh: f64,
+    pub energy_cost_usd: f64,
+    pub co2_g: f64,
 }
 
 /// Time-bucketed usage for charts.
@@ -354,6 +373,7 @@ pub struct UsageTimePoint {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub total_tokens: u64,
+    pub energy_wh: f64,
 }
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
@@ -364,6 +384,7 @@ pub struct TenantUsageTimePoint {
     pub bucket_ms: i64,
     pub requests: u64,
     pub total_tokens: u64,
+    pub energy_wh: f64,
 }
 
 /// Time-bucketed per-model series powering the three charts in the expanded
@@ -388,6 +409,7 @@ pub struct ModelUsageTimePoint {
     pub avg_total_ms: f64,
     /// Median (p50) end-to-end latency in milliseconds over the bucket.
     pub p50_total_ms: f64,
+    pub energy_wh: f64,
 }
 
 /// One tenant/key pair's usage of a single model over the window.
@@ -404,6 +426,9 @@ pub struct UsageKeyModelBreakdown {
     pub requests: u64,
     pub total_tokens: u64,
     pub gen_tokens_per_sec: f64,
+    pub energy_wh: f64,
+    pub energy_cost_usd: f64,
+    pub co2_g: f64,
 }
 
 /// Response-cache effectiveness over the window.
@@ -438,7 +463,8 @@ pub async fn query_usage(
             let mut sql = String::from(
                 "select tenant_id, count() as requests, \
                  sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
-                 sum(input_tokens) + sum(output_tokens) as total_tok \
+                 sum(input_tokens) + sum(output_tokens) as total_tok, \
+                 sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
                  from usage where ts_ms >= ?",
             );
             if q.tenant_id.is_some() {
@@ -466,7 +492,8 @@ pub async fn query_usage_by_key(
     let mut sql = String::from(
         "select key_id, tenant_id, count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
-         sum(input_tokens) + sum(output_tokens) as total_tok \
+         sum(input_tokens) + sum(output_tokens) as total_tok, \
+         sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
          from usage where ts_ms >= ?",
     );
     if q.tenant_id.is_some() {
@@ -518,6 +545,9 @@ struct KeyUsageSummaryRow {
     pub out_tok: u64,
     pub total_tok: u64,
     pub cost_sum: f64,
+    pub e_wh: f64,
+    pub e_cost_usd: f64,
+    pub e_co2_g: f64,
 }
 
 impl From<KeyUsageSummaryRow> for KeyUsageSummary {
@@ -533,6 +563,9 @@ impl From<KeyUsageSummaryRow> for KeyUsageSummary {
             output_tokens: r.out_tok,
             total_tokens: r.total_tok,
             cost_usd: r.cost_sum,
+            energy_wh: r.e_wh,
+            energy_cost_usd: r.e_cost_usd,
+            co2_g: r.e_co2_g,
         }
     }
 }
@@ -561,6 +594,12 @@ pub struct KeyUsageSummary {
     pub total_tokens: u64,
     /// USD spend in the window, summed from each request's frozen cost.
     pub cost_usd: f64,
+    /// Energy consumed in watt-hours in the window.
+    pub energy_wh: f64,
+    /// Estimated energy cost in USD in the window.
+    pub energy_cost_usd: f64,
+    /// CO₂ equivalent in grams in the window.
+    pub co2_g: f64,
 }
 
 /// Summary for one key. `last_used_ms` / `last_model` / `last_status_code` are
@@ -583,10 +622,16 @@ pub async fn query_key_usage_summary(
          sumIf(input_tokens, ts_ms >= ?) as in_tok, \
          sumIf(output_tokens, ts_ms >= ?) as out_tok, \
          sumIf(toUInt64(input_tokens) + toUInt64(output_tokens), ts_ms >= ?) as total_tok, \
-         sumIf(cost_usd, ts_ms >= ?) as cost_sum \
+         sumIf(cost_usd, ts_ms >= ?) as cost_sum, \
+         sumIf(energy_wh, ts_ms >= ?) as e_wh, \
+         sumIf(energy_cost_usd, ts_ms >= ?) as e_cost_usd, \
+         sumIf(co2_g, ts_ms >= ?) as e_co2_g \
          from usage where key_id = toUUID(?) group by key_id";
     let rows = client
         .query(sql)
+        .bind(since)
+        .bind(since)
+        .bind(since)
         .bind(since)
         .bind(since)
         .bind(since)
@@ -618,7 +663,10 @@ pub async fn query_keys_usage_summary(
          sum(input_tokens) as in_tok, \
          sum(output_tokens) as out_tok, \
          sum(toUInt64(input_tokens) + toUInt64(output_tokens)) as total_tok, \
-         sum(cost_usd) as cost_sum \
+         sum(cost_usd) as cost_sum, \
+         sum(energy_wh) as e_wh, \
+         sum(energy_cost_usd) as e_cost_usd, \
+         sum(co2_g) as e_co2_g \
          from usage where ts_ms >= ?",
     );
     if q.tenant_id.is_some() {
@@ -656,7 +704,8 @@ pub async fn query_usage_by_model(
          round(if(countIf(total_ms > 0) > 0, quantileIf(0.5)(total_ms, total_ms > 0), 0), 1) as p50_total, \
          round(avg(input_tokens), 1) as avg_prompt, \
          round(avg(output_tokens), 1) as avg_gen, \
-         uniq(key_id) as users \
+         uniq(key_id) as users, \
+         sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
          from usage where ts_ms >= ?",
     );
     if q.tenant_id.is_some() {
@@ -681,7 +730,8 @@ pub async fn query_usage_series(
         "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
          count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
-         sum(input_tokens) + sum(output_tokens) as total_tok \
+         sum(input_tokens) + sum(output_tokens) as total_tok, \
+         sum(energy_wh) as energy_wh \
          from usage where ts_ms >= ?"
     );
     if q.tenant_id.is_some() {
@@ -704,7 +754,8 @@ pub async fn query_usage_series_by_tenant(
     let sql = format!(
         "select tenant_id, intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
          count() as requests, \
-         sum(input_tokens) + sum(output_tokens) as total_tokens \
+         sum(input_tokens) + sum(output_tokens) as total_tokens, \
+         sum(energy_wh) as energy_wh \
          from usage where ts_ms >= ? \
          group by tenant_id, bucket_ms order by bucket_ms, tenant_id"
     );
@@ -745,7 +796,8 @@ pub async fn query_usage_series_by_model(
          round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft, \
          round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft, \
          round(if(countIf(total_ms > 0) > 0, avgIf(total_ms, total_ms > 0), 0), 1) as avg_total, \
-         round(if(countIf(total_ms > 0) > 0, quantileIf(0.5)(total_ms, total_ms > 0), 0), 1) as p50_total \
+         round(if(countIf(total_ms > 0) > 0, quantileIf(0.5)(total_ms, total_ms > 0), 0), 1) as p50_total, \
+         sum(energy_wh) as energy_wh \
          from usage where ts_ms >= ? and model = ? \
          group by bucket_ms order by bucket_ms"
     );
@@ -774,7 +826,8 @@ pub async fn query_usage_breakdown_by_model(
          sum(input_tokens) + sum(output_tokens) as total_tokens, \
          round(if(countIf(total_ms >= 20 and output_tokens >= 1) > 0, \
          quantileIf(0.5)(output_tokens / (greatest(if(total_ms - ttft_ms >= 20, total_ms - ttft_ms, total_ms - queue_wait_ms), 1) / 1000.), \
-         total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps \
+         total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps, \
+         sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
          from usage where ts_ms >= ? and model = ? \
          group by key_id, tenant_id order by total_tokens desc limit {limit}"
     );
@@ -950,7 +1003,10 @@ pub async fn query_usage_daily(
          sum(cache_misses), \
          round(sum(ttft_ms_sum) / greatest(sum(success_requests), 1), 1) as avg_ttft_ms, \
          round(sum(total_ms_sum) / greatest(sum(success_requests), 1), 1) as avg_total_ms, \
-         round(sum(cost_usd_sum), 6) as cost_usd \
+         round(sum(cost_usd_sum), 6) as cost_usd, \
+         round(sum(energy_wh_sum), 6) as energy_wh, \
+         round(sum(energy_cost_usd_sum), 6) as energy_cost_usd, \
+         round(sum(co2_g_sum), 6) as co2_g \
          from (select * from usage_daily {inner_where}) "
     );
     sql.push_str(group_clause);
