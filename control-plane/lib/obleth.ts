@@ -102,6 +102,7 @@ export interface ModelRoute {
   cost_per_image: number;
   cost_per_audio_second: number;
   cost_per_character: number;
+  energy_slots_per_node: number;
   context_window: number;
   admission_weight: number;
   max_in_flight: number | null;
@@ -364,6 +365,9 @@ export interface KeyUsageSummary {
   output_tokens: number;
   total_tokens: number;
   cost_usd: number;
+  energy_wh: number;
+  energy_cost_usd: number;
+  co2_g: number;
 }
 
 export interface UsageModelAgg {
@@ -381,6 +385,9 @@ export interface UsageModelAgg {
   avg_prompt_tokens: number;
   avg_gen_tokens: number;
   users: number;
+  energy_wh: number;
+  energy_cost_usd: number;
+  co2_g: number;
 }
 
 export interface UsageTimePoint {
@@ -410,6 +417,9 @@ export interface UsageDailyRow {
   avg_total_ms: number;
   /** Total USD spend, summed from each request's frozen completion-time cost. */
   cost_usd: number;
+  energy_wh: number;
+  energy_cost_usd: number;
+  co2_g: number;
 }
 
 /// One row of the live request log (`usage/logs`), enriched with tenant/key names.
@@ -432,6 +442,9 @@ export interface UsageLogEntry {
   total_ms: number;
   cache_status: string;
   cost_usd: number;
+  energy_wh: number;
+  energy_cost_usd: number;
+  co2_g: number;
   tenant_name: string;
   key_name: string;
   key_prefix: string;
@@ -1425,6 +1438,9 @@ export const obleth = {
         output_tokens: u.output_tokens,
         total_tokens: u.total_tokens,
         cost_usd: 0,
+        energy_wh: 0,
+        energy_cost_usd: 0,
+        co2_g: 0,
       }));
     }
   },

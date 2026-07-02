@@ -950,6 +950,13 @@ function CreateModelWizard({
                 {(createType === "chat" || createType === "embedding") && (
                   <Field label="Context window" name="context_window" type="number" defaultValue="131072" />
                 )}
+                <Field
+                  label="Energy slots per node"
+                  name="energy_slots_per_node"
+                  type="number"
+                  defaultValue="0"
+                  hint="Concurrent sequences that saturate one node (instances per node × sequences per instance). 0 = energy accounting off for this model."
+                />
               </section>
 
               <section className={cn("space-y-3", step !== 4 && "hidden")}>
@@ -1354,6 +1361,13 @@ function ConnectionTab({
               {editType === "audio_transcription" && (
                 <Field label="Cost / audio second" name="cost_per_audio_second" defaultValue={toPlainDecimal(model.cost_per_audio_second)} />
               )}
+              <Field
+                label="Energy slots per node"
+                name="energy_slots_per_node"
+                type="number"
+                defaultValue={String(model.energy_slots_per_node)}
+                hint="Concurrent sequences that saturate one node (instances per node × sequences per instance). 0 = energy accounting off for this model."
+              />
             </FormSection>
           </div>
           {state?.ok === false && (
@@ -2464,6 +2478,7 @@ function Field({
   required,
   type = "text",
   defaultValue,
+  hint,
 }: {
   label: string;
   name: string;
@@ -2471,11 +2486,13 @@ function Field({
   required?: boolean;
   type?: string;
   defaultValue?: string;
+  hint?: string;
 }) {
   return (
     <div className="space-y-1.5">
       <Label htmlFor={`${name}-${label}`}>{label}</Label>
       <Input id={`${name}-${label}`} name={name} type={type} placeholder={placeholder} required={required} defaultValue={defaultValue} />
+      {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
     </div>
   );
 }

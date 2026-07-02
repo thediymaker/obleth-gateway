@@ -2,7 +2,7 @@ import { describe, it, expect, afterEach } from "vitest";
 import { createRoot } from "react-dom/client";
 import type { Root } from "react-dom/client";
 import { act } from "react";
-import { SessionCell } from "./request-logs";
+import { SessionCell, formatWh } from "./request-logs";
 import type { UsageLogEntry } from "@/lib/obleth";
 
 // Minimal UsageLogEntry fixture — only the fields SessionCell uses.
@@ -13,24 +13,42 @@ function makeEntry(
   return { session_id, session_id_source };
 }
 
-let container: HTMLDivElement;
-let root: Root;
-
-function renderCell(entry: Pick<UsageLogEntry, "session_id" | "session_id_source">) {
-  container = document.createElement("div");
-  document.body.appendChild(container);
-  act(() => {
-    root = createRoot(container);
-    root.render(<SessionCell entry={entry} />);
+describe("formatWh", () => {
+  it('returns "—" for zero', () => {
+    expect(formatWh(0)).toBe("—");
   });
-}
 
-afterEach(() => {
-  act(() => root.unmount());
-  document.body.removeChild(container);
+  it('returns "—" for negative values', () => {
+    expect(formatWh(-1)).toBe("—");
+  });
+
+  it('returns "< 0.01 Wh" for positive values below threshold', () => {
+    expect(formatWh(0.005)).toBe("< 0.01 Wh");
+  });
+
+  it('renders "1.23 Wh" for energy_wh: 1.234', () => {
+    expect(formatWh(1.234)).toBe("1.23 Wh");
+  });
 });
 
 describe("SessionCell", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  function renderCell(entry: Pick<UsageLogEntry, "session_id" | "session_id_source">) {
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    act(() => {
+      root = createRoot(container);
+      root.render(<SessionCell entry={entry} />);
+    });
+  }
+
+  afterEach(() => {
+    act(() => root.unmount());
+    document.body.removeChild(container);
+  });
+
   it('renders "derived" badge when session_id_source is "derived"', () => {
     renderCell(makeEntry("sess-abc123", "derived"));
     expect(container.textContent).toContain("derived");

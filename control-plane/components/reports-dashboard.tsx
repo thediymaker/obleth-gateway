@@ -86,10 +86,22 @@ const EXPORT_COLUMNS: { key: string; label: string; def: boolean }[] = [
   { key: "cache_misses", label: "Cache misses", def: false },
   { key: "avg_ttft_ms", label: "Avg TTFB (ms)", def: false },
   { key: "avg_total_ms", label: "Avg total (ms)", def: false },
+  { key: "energy_kwh", label: "Energy (kWh)", def: false },
+  { key: "co2_g", label: "CO₂ (g)", def: false },
+  { key: "energy_cost_usd", label: "Energy cost (USD)", def: false },
 ];
 
 function isoDay(d: Date): string {
   return format(d, "yyyy-MM-dd");
+}
+
+function formatEnergyKwh(wh: number): string {
+  return `${(wh / 1000).toFixed(2)} kWh`;
+}
+
+function formatCo2(g: number): string {
+  if (g >= 1000) return `${(g / 1000).toFixed(2)} kg`;
+  return `${g.toFixed(2)} g`;
 }
 
 function defaultRange(): DateRange {
@@ -147,6 +159,8 @@ export function ReportsDashboard() {
         acc.errors += r.error_requests;
         acc.cacheHits += r.cache_hits;
         acc.cacheMisses += r.cache_misses;
+        acc.energyWh += r.energy_wh;
+        acc.co2G += r.co2_g;
         return acc;
       },
       {
@@ -157,6 +171,8 @@ export function ReportsDashboard() {
         errors: 0,
         cacheHits: 0,
         cacheMisses: 0,
+        energyWh: 0,
+        co2G: 0,
       },
     );
   }, [rows]);
@@ -318,7 +334,7 @@ export function ReportsDashboard() {
       </div>
 
       {/* KPI strip */}
-      <div className="grid gap-4 sm:grid-cols-3 lg:grid-cols-5">
+      <div className="grid gap-4 sm:grid-cols-3 lg:grid-cols-5 xl:grid-cols-7">
         <Kpi label="Requests" value={formatNumber(totals.requests)} />
         <Kpi label="Total tokens" value={formatNumber(totals.tokens)} />
         <Kpi label="Success rate" value={`${successRate.toFixed(1)}%`} />
@@ -326,6 +342,14 @@ export function ReportsDashboard() {
         <Kpi
           label="Cache hit rate"
           value={cacheLookups > 0 ? `${cacheHitRate.toFixed(1)}%` : "\u2014"}
+        />
+        <Kpi
+          label="Energy"
+          value={totals.energyWh > 0 ? formatEnergyKwh(totals.energyWh) : "\u2014"}
+        />
+        <Kpi
+          label="CO\u2082"
+          value={totals.co2G > 0 ? formatCo2(totals.co2G) : "\u2014"}
         />
       </div>
 
@@ -590,6 +614,8 @@ export function ReportsDashboard() {
                 <th className="py-2 pr-4 text-right font-medium">Input tok</th>
                 <th className="py-2 pr-4 text-right font-medium">Output tok</th>
                 <th className="py-2 pr-4 text-right font-medium">Total tok</th>
+                <th className="py-2 pr-4 text-right font-medium">Energy</th>
+                <th className="py-2 pr-4 text-right font-medium">CO₂</th>
                 <th className="py-2 pr-4 text-right font-medium">Avg TTFB</th>
                 <th className="py-2 text-right font-medium">Avg total</th>
               </tr>
@@ -597,7 +623,7 @@ export function ReportsDashboard() {
             <tbody>
               {rows.length === 0 ? (
                 <tr>
-                  <td colSpan={8} className="py-8 text-center text-muted-foreground">
+                  <td colSpan={10} className="py-8 text-center text-muted-foreground">
                     No data
                   </td>
                 </tr>
@@ -619,6 +645,12 @@ export function ReportsDashboard() {
                     </td>
                     <td className="py-2 pr-4 text-right tabular-nums">
                       {formatNumber(r.total_tokens)}
+                    </td>
+                    <td className="py-2 pr-4 text-right tabular-nums">
+                      {r.energy_wh > 0 ? formatEnergyKwh(r.energy_wh) : "—"}
+                    </td>
+                    <td className="py-2 pr-4 text-right tabular-nums">
+                      {r.co2_g > 0 ? formatCo2(r.co2_g) : "—"}
                     </td>
                     <td className="py-2 pr-4 text-right tabular-nums">
                       {Math.round(r.avg_ttft_ms)} ms
