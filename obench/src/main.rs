@@ -20,6 +20,21 @@ async fn mod_tui_run(args: &cli::Cli) -> anyhow::Result<()> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = cli::Cli::parse();
+
+    // Benchmark-kind dispatch. Absent subcommand → load (historical default).
+    let kind = match &args.command {
+        Some(cli::Command::Compression(_)) => benchmarks::BenchKind::Compression,
+        None => benchmarks::BenchKind::Load,
+    };
+    if kind == benchmarks::BenchKind::Compression {
+        let Some(cli::Command::Compression(cargs)) = args.command.clone() else {
+            unreachable!()
+        };
+        let cfg = cargs.into_config(&args);
+        let code = benchmarks::compression::run(&cfg).await?;
+        std::process::exit(code);
+    }
+
     let headless = args.no_tui || (args.target.is_some() && args.profile.is_some());
     if headless {
         let (Some(tgt), Some(prof)) = (args.target, args.profile) else {

@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum Target {
@@ -76,6 +76,60 @@ pub struct Cli {
     /// Force headless even with no subcommand.
     #[arg(long)]
     pub no_tui: bool,
+
+    /// Optional benchmark subcommand. Absent → the load/readiness benchmark
+    /// (the historical default; all the flags above apply to it).
+    #[command(subcommand)]
+    pub command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum Command {
+    /// Compression boon A/B — measure token savings + latency crossover.
+    Compression(CompressionArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct CompressionArgs {
+    /// Model to call; must have the `compression` boon granted.
+    #[arg(long, env = "MODEL")]
+    pub model: String,
+    /// API key the requests authenticate with.
+    #[arg(long, env = "OBLETH_API_KEY")]
+    pub api_key: String,
+    /// Input price $/1M tokens for the cost estimate.
+    #[arg(long, env = "PRICE_IN_PER_MTOK", default_value_t = 0.30)]
+    pub price_per_mtok: f64,
+    /// Comma-separated prefill tokens/sec to model for the crossover.
+    #[arg(long, env = "PREFILL_TPS", value_delimiter = ',', default_value = "500,2000,8000")]
+    pub prefill_tps: Vec<u32>,
+    /// Timed repetitions per arm (median reported).
+    #[arg(long, env = "REPS", default_value_t = 5)]
+    pub reps: u32,
+    /// Output tokens to request (keep small + constant so fixture latency is fixed).
+    #[arg(long, env = "MAX_TOKENS", default_value_t = 1)]
+    pub max_tokens: u32,
+    /// Per-segment min_tokens floor to set during the run (restored after).
+    #[arg(long, env = "BENCH_MIN_TOKENS", default_value_t = 64)]
+    pub min_tokens: u32,
+}
+
+impl CompressionArgs {
+    /// Build the run config, taking connection settings from the top-level Cli.
+    pub fn into_config(self, cli: &Cli) -> crate::benchmarks::compression::CompressionConfig {
+        crate::benchmarks::compression::CompressionConfig {
+            proxy_base: cli.proxy_base.clone(),
+            admin_base: cli.admin_base.clone(),
+            admin_token: cli.admin_token.clone(),
+            api_key: self.api_key,
+            model: self.model,
+            price_in_per_mtok: self.price_per_mtok,
+            prefill_tps: self.prefill_tps,
+            max_tokens: self.max_tokens,
+            reps: self.reps,
+            min_tokens: self.min_tokens,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -114,5 +168,39 @@ mod tests {
         assert_eq!(cli.target, Some(Target::Demo));
         assert_eq!(cli.profile, Some(Profile::Heavy));
         assert!(cli.all);
+    }
+
+    #[test]
+    fn bare_load_invocation_still_parses() {
+        let cli = Cli::try_parse_from(["obench", "--target", "demo", "--profile", "smoke", "--all"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.target, Some(Target::Demo));
+    }
+
+    #[test]
+    fn compression_subcommand_parses() {
+        let cli = Cli::try_parse_from([
+            "obench", "compression", "--model", "m1", "--api-key", "sk-x",
+        ])
+        .unwrap();
+        match cli.command {
+            Some(Command::Compression(a)) => {
+                assert_eq!(a.model, "m1");
+                assert_eq!(a.api_key, "sk-x");
+                assert_eq!(a.reps, 5);
+                assert_eq!(a.prefill_tps, vec![500, 2000, 8000]);
+            }
+            _ => panic!("expected compression subcommand"),
+        }
+    }
+
+    #[test]
+    fn compression_prefill_tps_parses_csv() {
+        let cli = Cli::try_parse_from([
+            "obench", "compression", "--model", "m", "--api-key", "k", "--prefill-tps", "100,200",
+        ])
+        .unwrap();
+        let Some(Command::Compression(a)) = cli.command else { panic!() };
+        assert_eq!(a.prefill_tps, vec![100, 200]);
     }
 }

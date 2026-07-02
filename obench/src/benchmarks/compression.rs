@@ -126,8 +126,6 @@ use crate::admin::AdminClient;
 use crate::report;
 
 /// All knobs for a compression A/B run (mirrors ab.py's env surface).
-// consumed by the CLI in the next task
-#[allow(dead_code)]
 pub struct CompressionConfig {
     pub proxy_base: String,
     pub admin_base: String,
@@ -141,8 +139,6 @@ pub struct CompressionConfig {
     pub min_tokens: u32,
 }
 
-// consumed by the CLI in the next task
-#[allow(dead_code)]
 pub struct ArmResult {
     pub ms: f64,
     pub before: u64,
@@ -150,8 +146,6 @@ pub struct ArmResult {
     pub saved: u64,
 }
 
-// consumed by the CLI in the next task
-#[allow(dead_code)]
 pub struct SampleArms {
     pub off: ArmResult,
     pub default: ArmResult,
@@ -159,8 +153,6 @@ pub struct SampleArms {
 }
 
 impl SampleArms {
-    // consumed by the CLI in the next task
-    #[allow(dead_code)]
     fn get(&self, arm: &str) -> &ArmResult {
         match arm {
             "off" => &self.off,
@@ -171,14 +163,10 @@ impl SampleArms {
 }
 
 /// (arm label, `x-obleth-boons` header value or None for the default arm).
-// consumed by the CLI in the next task
-#[allow(dead_code)]
 const ARMS: [(&str, Option<&str>); 3] =
     [("off", Some("off")), ("default", None), ("lossy", Some("lossy"))];
 
 /// POST one chat completion; return (elapsed_ms, x-obleth-compression header).
-// consumed by the CLI in the next task
-#[allow(dead_code)]
 async fn chat(
     client: &reqwest::Client,
     cfg: &CompressionConfig,
@@ -212,8 +200,6 @@ async fn chat(
 }
 
 /// Median latency over `reps` timed calls (after one warm call).
-// consumed by the CLI in the next task
-#[allow(dead_code)]
 async fn median_ms(
     client: &reqwest::Client,
     cfg: &CompressionConfig,
@@ -230,8 +216,6 @@ async fn median_ms(
 }
 
 /// Run all three arms for one corpus sample.
-// consumed by the CLI in the next task
-#[allow(dead_code)]
 async fn run_sample(
     client: &reqwest::Client,
     cfg: &CompressionConfig,
@@ -256,8 +240,6 @@ async fn run_sample(
 
 /// Snapshot + enable compression and lower min_tokens for the run. Returns the
 /// prior (enabled, min_tokens) so the caller can restore them.
-// consumed by the CLI in the next task
-#[allow(dead_code)]
 async fn setup_boons(admin: &AdminClient, min_tokens: u32) -> Result<(bool, u32)> {
     let prev = admin.get_boons().await?;
     let prev_enabled = prev["compression_enabled"].as_bool().unwrap_or(true);
@@ -272,8 +254,6 @@ async fn setup_boons(admin: &AdminClient, min_tokens: u32) -> Result<(bool, u32)
     Ok((prev_enabled, prev_min))
 }
 
-// consumed by the CLI in the next task
-#[allow(dead_code)]
 async fn restore_boons(admin: &AdminClient, prev: (bool, u32)) {
     let _ = admin
         .set_boons(json!({ "compression_enabled": prev.0, "compression_min_tokens": prev.1 }))
@@ -282,8 +262,6 @@ async fn restore_boons(admin: &AdminClient, prev: (bool, u32)) {
 }
 
 /// Render the full markdown report from measured rows + size sweeps.
-// consumed by the CLI in the next task
-#[allow(dead_code)]
 #[allow(clippy::type_complexity)]
 pub fn render_report(
     cfg: &CompressionConfig,
@@ -388,8 +366,6 @@ pub fn render_report(
 }
 
 /// Corpora, keyed by display label, matching ab.py.
-// consumed by the CLI in the next task
-#[allow(dead_code)]
 fn corpora() -> Vec<(String, Messages)> {
     vec![
         ("logs (repetitive)".into(), logs_payload(120)),
@@ -401,8 +377,6 @@ fn corpora() -> Vec<(String, Messages)> {
 }
 
 /// Size sweeps: (label, arm that does the work, payload fn, sizes).
-// consumed by the CLI in the next task
-#[allow(dead_code)]
 #[allow(clippy::type_complexity)]
 fn sweep_specs() -> Vec<(String, &'static str, fn(usize) -> Messages, Vec<usize>)> {
     vec![
@@ -412,8 +386,6 @@ fn sweep_specs() -> Vec<(String, &'static str, fn(usize) -> Messages, Vec<usize>
 }
 
 /// Execute the A/B, write + print the report, restore settings on every path.
-// consumed by the CLI in the next task
-#[allow(dead_code)]
 pub async fn run(cfg: &CompressionConfig) -> Result<i32> {
     if cfg.api_key.is_empty() || cfg.model.is_empty() {
         anyhow::bail!("compression benchmark needs --model and --api-key (a model granted the compression boon)");
