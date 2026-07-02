@@ -20,6 +20,15 @@ pub fn write_meta(profile: &str, meta: &serde_json::Value) -> Result<PathBuf> {
     Ok(path)
 }
 
+/// Write a rendered markdown report to `{name}-report.md` in BENCH_OUT_DIR.
+/// Reports are artifacts, so they never land in the source tree.
+pub fn write_report(name: &str, markdown: &str) -> Result<PathBuf> {
+    let path = out_dir().join(format!("{name}-report.md"));
+    let mut f = File::create(&path)?;
+    f.write_all(markdown.as_bytes())?;
+    Ok(path)
+}
+
 pub fn append_timeline(profile: &str, row: &serde_json::Value) -> Result<()> {
     let path = out_dir().join(format!("{profile}-timeline.jsonl"));
     let mut f = OpenOptions::new().create(true).append(true).open(path)?;
@@ -97,5 +106,17 @@ mod tests {
         append_timeline("unit", &serde_json::json!({ "t": 1 })).unwrap();
         let tl = out_dir().join("unit-timeline.jsonl");
         assert!(tl.exists());
+    }
+
+    #[test]
+    fn write_report_creates_md_file() {
+        std::env::set_var(
+            "BENCH_OUT_DIR",
+            std::env::temp_dir().join("obench-report-test").to_str().unwrap(),
+        );
+        let p = write_report("compression", "# hello\n\nbody").unwrap();
+        assert!(p.exists());
+        assert!(p.to_string_lossy().ends_with("compression-report.md"));
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), "# hello\n\nbody");
     }
 }
