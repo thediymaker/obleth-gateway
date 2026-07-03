@@ -100,7 +100,7 @@ const EXPORT_COLUMNS: { key: string; label: string; def: boolean }[] = [
 ];
 
 // Header label for the breakdown table's first column, per grouping.
-const GROUP_LABELS: Record<string, string> = {
+const GROUP_LABELS: Record<BreakdownGroup, string> = {
   day: "Day",
   tenant: "Team",
   key: "Key",
@@ -380,7 +380,15 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
         )}
 
         {/* Export lives at the top now; the column picker opens in a modal. */}
-        <Dialog open={exportOpen} onOpenChange={setExportOpen}>
+        <Dialog
+          open={exportOpen}
+          onOpenChange={(open) => {
+            setExportOpen(open);
+            // Spec: the export grouping follows the table's current grouping;
+            // the user can still switch (e.g. to per key + model) before download.
+            if (open) setExportGroup(tableGroup);
+          }}
+        >
           <DialogTrigger asChild>
             <Button className="ml-auto gap-2" disabled={!startDay}>
               <Download className="h-4 w-4" />

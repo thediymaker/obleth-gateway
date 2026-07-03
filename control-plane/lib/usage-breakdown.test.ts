@@ -73,6 +73,12 @@ describe("toBreakdownRows", () => {
     expect(out[0].sublabel).toBe("obl_a1b2");
   });
 
+  it("falls back to the truncated id when a key name is empty", () => {
+    const lk = lookups({ keyNames: new Map([[K1, ""]]) });
+    const out = toBreakdownRows([makeRow()], "key", lk);
+    expect(out[0].label).toBe(K1.slice(0, 8));
+  });
+
   it("model grouping labels unknown models", () => {
     const out = toBreakdownRows([makeRow({ model: "" })], "model", lookups());
     expect(out[0].label).toBe("(unknown)");
