@@ -112,7 +112,10 @@ mod tests {
     fn write_report_creates_md_file() {
         std::env::set_var(
             "BENCH_OUT_DIR",
-            std::env::temp_dir().join("obench-report-test").to_str().unwrap(),
+            std::env::temp_dir()
+                .join("obench-report-test")
+                .to_str()
+                .unwrap(),
         );
         let p = write_report("compression", "# hello\n\nbody").unwrap();
         assert!(p.exists());

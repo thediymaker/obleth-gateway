@@ -46,11 +46,26 @@ pub struct Cli {
     #[arg(long)]
     pub all: bool,
 
-    #[arg(long, env = "ADMIN_BASE", default_value = "http://localhost:9180", global = true)]
+    #[arg(
+        long,
+        env = "ADMIN_BASE",
+        default_value = "http://localhost:9180",
+        global = true
+    )]
     pub admin_base: String,
-    #[arg(long, env = "ADMIN_TOKEN", default_value = "dev-admin-token", global = true)]
+    #[arg(
+        long,
+        env = "ADMIN_TOKEN",
+        default_value = "dev-admin-token",
+        global = true
+    )]
     pub admin_token: String,
-    #[arg(long, env = "PROXY_BASE", default_value = "http://localhost:8088", global = true)]
+    #[arg(
+        long,
+        env = "PROXY_BASE",
+        default_value = "http://localhost:8088",
+        global = true
+    )]
     pub proxy_base: String,
     #[arg(long, env = "UI_BASE", default_value = "http://localhost:3002")]
     pub ui_base: String,
@@ -102,7 +117,12 @@ pub struct CompressionArgs {
     pub price_per_mtok: f64,
     /// Comma-separated prefill tokens/sec to model for the crossover.
     // keep in sync with compression::default_prefill_tps()
-    #[arg(long, env = "PREFILL_TPS", value_delimiter = ',', default_value = "500,2000,8000")]
+    #[arg(
+        long,
+        env = "PREFILL_TPS",
+        value_delimiter = ',',
+        default_value = "500,2000,8000"
+    )]
     pub prefill_tps: Vec<u32>,
     /// Timed repetitions per arm (median reported).
     #[arg(long, env = "REPS", default_value_t = crate::benchmarks::compression::DEFAULT_REPS)]
@@ -173,7 +193,9 @@ mod tests {
 
     #[test]
     fn bare_load_invocation_still_parses() {
-        let cli = Cli::try_parse_from(["obench", "--target", "demo", "--profile", "smoke", "--all"]).unwrap();
+        let cli =
+            Cli::try_parse_from(["obench", "--target", "demo", "--profile", "smoke", "--all"])
+                .unwrap();
         assert!(cli.command.is_none());
         assert_eq!(cli.target, Some(Target::Demo));
     }
@@ -181,7 +203,12 @@ mod tests {
     #[test]
     fn compression_subcommand_parses() {
         let cli = Cli::try_parse_from([
-            "obench", "compression", "--model", "m1", "--api-key", "sk-x",
+            "obench",
+            "compression",
+            "--model",
+            "m1",
+            "--api-key",
+            "sk-x",
         ])
         .unwrap();
         match cli.command {
@@ -198,10 +225,19 @@ mod tests {
     #[test]
     fn compression_prefill_tps_parses_csv() {
         let cli = Cli::try_parse_from([
-            "obench", "compression", "--model", "m", "--api-key", "k", "--prefill-tps", "100,200",
+            "obench",
+            "compression",
+            "--model",
+            "m",
+            "--api-key",
+            "k",
+            "--prefill-tps",
+            "100,200",
         ])
         .unwrap();
-        let Some(Command::Compression(a)) = cli.command else { panic!() };
+        let Some(Command::Compression(a)) = cli.command else {
+            panic!()
+        };
         assert_eq!(a.prefill_tps, vec![100, 200]);
     }
 }
