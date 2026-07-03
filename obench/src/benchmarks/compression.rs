@@ -93,15 +93,20 @@ pub fn json_payload(n_rows: usize) -> Messages {
     user(format!("Analyze this data:\n{blob}"))
 }
 
-/// Whitespace-heavy code — the code compactor path.
+/// Code with trailing whitespace and blank-line runs — the two things the
+/// conservative code compactor actually removes (internal space runs like
+/// `result   =` are deliberately preserved by it, so they don't count).
 pub fn code_payload(n_funcs: usize) -> Messages {
     let mut parts = Vec::with_capacity(n_funcs);
     for i in 0..n_funcs {
         parts.push(format!(
-            "def handler_{i}(request,   context):\n    # process the incoming request for endpoint {i}\n    result   =   compute({i},  request.payload)\n\n\n    return    result\n"
+            "def handler_{i}(request,   context):   \n    # process the incoming request for endpoint {i}  \n    result   =   compute({i},  request.payload)     \n\n\n    return    result\n"
         ));
     }
-    user(format!("Review this code:\n```python\n{}\n```", parts.join("\n")))
+    user(format!(
+        "Review this code:\n```python\n{}\n```",
+        parts.join("\n")
+    ))
 }
 
 /// Low-density human prose — the neural lossy path (where the sidecar overhead
@@ -173,8 +178,11 @@ impl SampleArms {
 }
 
 /// (arm label, `x-obleth-boons` header value or None for the default arm).
-const ARMS: [(&str, Option<&str>); 3] =
-    [("off", Some("off")), ("default", None), ("lossy", Some("lossy"))];
+const ARMS: [(&str, Option<&str>); 3] = [
+    ("off", Some("off")),
+    ("default", None),
+    ("lossy", Some("lossy")),
+];
 
 /// POST one chat completion; return (elapsed_ms, x-obleth-compression header).
 async fn chat(
@@ -240,7 +248,15 @@ async fn run_sample(
             .and_then(parse_compression_header)
             .unwrap_or((0, 0, 0));
         let ms = median_ms(client, cfg, messages, hdr).await?;
-        arms.insert(name, ArmResult { ms, before, after, saved });
+        arms.insert(
+            name,
+            ArmResult {
+                ms,
+                before,
+                after,
+                saved,
+            },
+        );
     }
     Ok(SampleArms {
         off: arms.remove("off").unwrap(),
@@ -249,27 +265,48 @@ async fn run_sample(
     })
 }
 
-/// Snapshot + enable compression and lower min_tokens for the run. Returns the
-/// prior (enabled, min_tokens) so the caller can restore them.
-async fn setup_boons(admin: &AdminClient, min_tokens: u32) -> Result<(bool, u32)> {
+/// The boon settings obench applies for the run. Code compaction is opt-in and
+/// defaults to false gateway-side, so the run enables it — otherwise the code
+/// corpus can't exercise the compactor at all.
+fn setup_payload(min_tokens: u32) -> Value {
+    json!({
+        "compression_enabled": true,
+        "compression_min_tokens": min_tokens,
+        "compression_code_compaction": true,
+    })
+}
+
+/// Snapshot + enable compression, lower min_tokens, and turn on code compaction
+/// for the run. Returns the prior (enabled, min_tokens, code_compaction) so the
+/// caller can restore them.
+async fn setup_boons(admin: &AdminClient, min_tokens: u32) -> Result<(bool, u32, bool)> {
     let prev = admin.get_boons().await?;
     let prev_enabled = prev["compression_enabled"].as_bool().unwrap_or(true);
     let prev_min = prev["compression_min_tokens"].as_u64().unwrap_or(512) as u32;
-    admin
-        .set_boons(json!({ "compression_enabled": true, "compression_min_tokens": min_tokens }))
-        .await?;
+    let prev_code = prev["compression_code_compaction"]
+        .as_bool()
+        .unwrap_or(false);
+    admin.set_boons(setup_payload(min_tokens)).await?;
     println!(
-        "[setup] compression_enabled=true, min_tokens {prev_min}->{min_tokens} \
-         (allow_lossy unchanged; the lossy arm forces it per-request)"
+        "[setup] compression_enabled=true, min_tokens {prev_min}->{min_tokens}, \
+         code_compaction {prev_code}->true (allow_lossy unchanged; the lossy arm \
+         forces it per-request)"
     );
-    Ok((prev_enabled, prev_min))
+    Ok((prev_enabled, prev_min, prev_code))
 }
 
-async fn restore_boons(admin: &AdminClient, prev: (bool, u32)) {
+async fn restore_boons(admin: &AdminClient, prev: (bool, u32, bool)) {
     let _ = admin
-        .set_boons(json!({ "compression_enabled": prev.0, "compression_min_tokens": prev.1 }))
+        .set_boons(json!({
+            "compression_enabled": prev.0,
+            "compression_min_tokens": prev.1,
+            "compression_code_compaction": prev.2,
+        }))
         .await;
-    println!("[teardown] restored compression_min_tokens={}", prev.1);
+    println!(
+        "[teardown] restored compression_min_tokens={}, code_compaction={}",
+        prev.1, prev.2
+    );
 }
 
 /// Render the full markdown report from measured rows + size sweeps.
@@ -328,7 +365,11 @@ pub fn render_report(
             let per_req = saved as f64 * cfg.price_in_per_mtok / 1_000_000.0;
             o.push_str(&format!(
                 "| {} | {name} | {saved} | ${per_req:.6} | ${:.2} |\n",
-                if name == "default" { corpus.as_str() } else { "" },
+                if name == "default" {
+                    corpus.as_str()
+                } else {
+                    ""
+                },
                 per_req * 1_000_000.0
             ));
         }
@@ -338,9 +379,10 @@ pub fn render_report(
     // Net latency: measured overhead vs modeled upstream saving.
     o.push_str("## Net latency: measured overhead vs modeled upstream saving\n\n");
     o.push_str(
-        "The fixture upstream does not scale latency with prompt size, so upstream saving is \
-         **modeled**: `upstream_ms_saved = tokens_saved / prefill_tps`. Net = \
-         `upstream_saved − gateway_overhead`. Positive = compression makes the request faster.\n\n",
+        "Upstream saving is **modeled** rather than measured — `upstream_ms_saved = \
+         tokens_saved / prefill_tps` — so the crossover reads the same against any upstream. \
+         Net = `upstream_saved − gateway_overhead`. Positive = compression makes the request \
+         faster.\n\n",
     );
     for (label, arm, sweep) in sweeps {
         o.push_str(&format!(
@@ -391,8 +433,18 @@ fn corpora() -> Vec<(String, Messages)> {
 #[allow(clippy::type_complexity)]
 fn sweep_specs() -> Vec<(String, &'static str, fn(usize) -> Messages, Vec<usize>)> {
     vec![
-        ("logs (deterministic)".into(), "default", logs_payload as fn(usize) -> Messages, vec![20, 60, 120, 300, 600]),
-        ("prose (neural lossy)".into(), "lossy", prose_payload as fn(usize) -> Messages, vec![2, 4, 8, 16, 32]),
+        (
+            "logs (deterministic)".into(),
+            "default",
+            logs_payload as fn(usize) -> Messages,
+            vec![20, 60, 120, 300, 600],
+        ),
+        (
+            "prose (neural lossy)".into(),
+            "lossy",
+            prose_payload as fn(usize) -> Messages,
+            vec![2, 4, 8, 16, 32],
+        ),
     ]
 }
 
@@ -517,6 +569,27 @@ mod tests {
     }
 
     #[test]
+    fn code_payload_has_compactable_whitespace() {
+        // The corpus claims to exercise the code compactor, which only strips
+        // trailing whitespace and collapses blank-line runs — so the payload
+        // must actually contain both.
+        let m = code_payload(3);
+        let c = m[0]["content"].as_str().unwrap();
+        assert!(c.lines().any(|l| l.ends_with(' ') || l.ends_with('\t')));
+        assert!(c.contains("\n\n\n"));
+    }
+
+    #[test]
+    fn setup_payload_enables_code_compaction() {
+        let p = setup_payload(64);
+        assert_eq!(p["compression_enabled"], true);
+        assert_eq!(p["compression_min_tokens"], 64);
+        // The code corpus can only exercise the compactor if the opt-in flag
+        // is on for the run (it defaults to false gateway-side).
+        assert_eq!(p["compression_code_compaction"], true);
+    }
+
+    #[test]
     fn json_and_code_and_prose_are_single_user_turns() {
         for m in [json_payload(120), code_payload(40), prose_payload(6)] {
             assert_eq!(m.len(), 1);
@@ -526,7 +599,12 @@ mod tests {
     }
 
     fn arm(ms: f64, before: u64, after: u64, saved: u64) -> ArmResult {
-        ArmResult { ms, before, after, saved }
+        ArmResult {
+            ms,
+            before,
+            after,
+            saved,
+        }
     }
 
     #[test]
@@ -554,16 +632,22 @@ mod tests {
         let sweeps = vec![(
             "logs (deterministic)".to_string(),
             "default",
-            vec![(20usize, SampleArms {
-                off: arm(10.0, 0, 0, 0),
-                default: arm(10.5, 200, 80, 120),
-                lossy: arm(11.0, 200, 80, 120),
-            })],
+            vec![(
+                20usize,
+                SampleArms {
+                    off: arm(10.0, 0, 0, 0),
+                    default: arm(10.5, 200, 80, 120),
+                    lossy: arm(11.0, 200, 80, 120),
+                },
+            )],
         )];
         let md = render_report(&cfg, &rows, &sweeps);
         assert!(md.contains("# Compression boon — back-to-back A/B"));
         assert!(md.contains("Token savings (measured)"));
         assert!(md.contains("modeled")); // the crossover section labels itself modeled
+                                         // The saving is modeled regardless of upstream — the report must not
+                                         // assume it is pointed at the GPU-free fixture.
+        assert!(!md.contains("fixture"));
         assert!(md.contains("demo-model"));
         assert!(md.contains("60.0%") || md.contains("60%")); // logs default savings
     }

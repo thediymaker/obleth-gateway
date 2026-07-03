@@ -28,7 +28,12 @@ pub(crate) enum ContentKind {
 /// `Json`; bare scalars do not (no structural gain).
 pub(crate) fn classify(text: &str) -> ContentKind {
     let trimmed = text.trim();
-    if trimmed.starts_with("```") {
+    // A fence line anywhere — not only at the start — makes the segment Code:
+    // real requests usually preamble the fence ("Review this code:\n```…"), and
+    // Code must win over Prose so the lossy pass never summarizes code away.
+    // Valid JSON text cannot produce a line starting with a backtick, so this
+    // cannot shadow the Json arm below.
+    if trimmed.lines().any(|l| l.trim_start().starts_with("```")) {
         return ContentKind::Code;
     }
     if (trimmed.starts_with('{') && trimmed.ends_with('}'))
@@ -830,6 +835,15 @@ mod tests {
     }
 
     #[test]
+    fn classifies_preambled_code_fence_as_code() {
+        // Real requests rarely start at the fence — "Review this code:\n```…".
+        // Code embedded behind a preamble must still classify as Code so the
+        // code compactor can run and the lossy prose pass keeps its hands off.
+        let text = "Review this code:\n```python\ndef f():\n    pass\n```";
+        assert_eq!(classify(text), ContentKind::Code);
+    }
+
+    #[test]
     fn bare_number_is_not_json() {
         // A bare scalar is not worth treating as structured JSON.
         assert_eq!(classify("42"), ContentKind::Prose);
@@ -1026,6 +1040,31 @@ mod tests {
         let stats = apply(&cfg, true, &mut body);
         assert_eq!(stats.compressed, 1);
         assert!(stats.tokens_after < stats.tokens_before);
+    }
+
+    #[test]
+    fn apply_compacts_preambled_code_when_enabled() {
+        let big = format!(
+            "Review this code:\n```py\n{}\n```",
+            "x = 1   \n\n\n".repeat(60)
+        );
+        let mut body = json!({
+            "model": "m",
+            "messages": [ { "role": "user", "content": big } ]
+        });
+        let cfg = obleth_config::CompressionBoonSettings {
+            enabled: true,
+            min_tokens: 16,
+            max_segments: 64,
+            ..Default::default()
+        };
+        let stats = apply(&cfg, true, &mut body);
+        assert_eq!(stats.compressed, 1);
+        assert!(stats.tokens_after < stats.tokens_before);
+        // The preamble survives; the fenced code is whitespace-normalized.
+        let text = body["messages"][0]["content"].as_str().unwrap();
+        assert!(text.starts_with("Review this code:"));
+        assert!(!text.contains("\n\n\n"));
     }
 
     #[test]
