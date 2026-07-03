@@ -41,6 +41,11 @@ import { Calendar } from "@/components/ui/calendar";
 import { formatNumber } from "@/lib/utils";
 import { Select } from "@/components/ui/select";
 import type { ApiKey, Tenant, UsageDailyRow } from "@/lib/obleth";
+import {
+  formatUsd,
+  toBreakdownRows,
+  type BreakdownGroup,
+} from "@/lib/usage-breakdown";
 
 const REQUESTS_COLOR = "hsl(38 75% 60%)";
 const TOKENS_COLOR = "hsl(205 55% 58%)";
@@ -92,6 +97,14 @@ const EXPORT_COLUMNS: { key: string; label: string; def: boolean }[] = [
   { key: "energy_cost_usd", label: "Energy cost (USD)", def: false },
 ];
 
+// Header label for the breakdown table's first column, per grouping.
+const GROUP_LABELS: Record<string, string> = {
+  day: "Day",
+  tenant: "Team",
+  key: "Key",
+  model: "Model",
+};
+
 function isoDay(d: Date): string {
   return format(d, "yyyy-MM-dd");
 }
@@ -121,12 +134,17 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
 
   const [tenantId, setTenantId] = useState("");
   const [keyId, setKeyId] = useState("");
+  const [tableGroup, setTableGroup] = useState<BreakdownGroup>("day");
 
   // Keys shown in the key filter — only the selected tenant's.
   const tenantKeys = useMemo(
     () => (tenantId ? keys.filter((k) => k.tenant_id === tenantId) : []),
     [keys, tenantId],
   );
+
+  const tenantNames = useMemo(() => new Map(tenants.map((t) => [t.id, t.name])), [tenants]);
+  const keyNames = useMemo(() => new Map(keys.map((k) => [k.id, k.name])), [keys]);
+  const keyPrefixes = useMemo(() => new Map(keys.map((k) => [k.id, k.key_prefix])), [keys]);
 
   function selectTenant(id: string) {
     setTenantId(id);
@@ -168,6 +186,28 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
       return res.json();
     },
   });
+
+  // Shares the ["usage-daily", ...] key family, so the "day" grouping dedupes
+  // against the chart query instead of refetching.
+  const tableQuery = useQuery({
+    queryKey: ["usage-daily", startDay, endDay, tenantId, keyId, tableGroup],
+    enabled: Boolean(startDay && endDay),
+    queryFn: async (): Promise<UsageDailyRow[]> => {
+      const res = await fetch(dailyUrl(tableGroup));
+      if (!res.ok) throw new Error(`Failed to load breakdown (${res.status})`);
+      return res.json();
+    },
+  });
+
+  const breakdownRows = useMemo(
+    () =>
+      toBreakdownRows(tableQuery.data ?? [], tableGroup, {
+        tenantNames,
+        keyNames,
+        keyPrefixes,
+      }),
+    [tableQuery.data, tableGroup, tenantNames, keyNames, keyPrefixes],
+  );
 
   const rows = useMemo(() => query.data ?? [], [query.data]);
 
@@ -650,21 +690,33 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
       </div>
 
 
-      {/* Table */}
+      {/* Breakdown table */}
       <Card>
-        <CardHeader>
-          <CardTitle>Daily breakdown</CardTitle>
+        <CardHeader className="flex-row items-center justify-between space-y-0">
+          <CardTitle>Breakdown</CardTitle>
+          <Select
+            value={tableGroup}
+            onChange={(e) => setTableGroup(e.target.value as BreakdownGroup)}
+            aria-label="Group breakdown by"
+            className="h-8 w-32 text-xs"
+          >
+            <option value="day">By day</option>
+            <option value="tenant">By team</option>
+            <option value="key">By key</option>
+            <option value="model">By model</option>
+          </Select>
         </CardHeader>
         <CardContent className="overflow-x-auto">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b border-border text-left text-xs text-muted-foreground">
-                <th className="py-2 pr-4 font-medium">Day</th>
+                <th className="py-2 pr-4 font-medium">{GROUP_LABELS[tableGroup]}</th>
                 <th className="py-2 pr-4 text-right font-medium">Requests</th>
                 <th className="py-2 pr-4 text-right font-medium">Errors</th>
                 <th className="py-2 pr-4 text-right font-medium">Input tok</th>
                 <th className="py-2 pr-4 text-right font-medium">Output tok</th>
                 <th className="py-2 pr-4 text-right font-medium">Total tok</th>
+                <th className="py-2 pr-4 text-right font-medium">Spend</th>
                 <th className="py-2 pr-4 text-right font-medium">Energy</th>
                 <th className="py-2 pr-4 text-right font-medium">CO₂</th>
                 <th className="py-2 pr-4 text-right font-medium">Avg TTFB</th>
@@ -672,16 +724,28 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
               </tr>
             </thead>
             <tbody>
-              {rows.length === 0 ? (
+              {breakdownRows.length === 0 ? (
                 <tr>
-                  <td colSpan={10} className="py-8 text-center text-muted-foreground">
+                  <td colSpan={11} className="py-8 text-center text-muted-foreground">
                     No data
                   </td>
                 </tr>
               ) : (
-                rows.map((r) => (
-                  <tr key={r.day} className="border-b border-border/50">
-                    <td className="py-2 pr-4 font-mono text-xs">{r.day}</td>
+                breakdownRows.map((r) => (
+                  <tr
+                    key={`${r.day}|${r.tenant_id}|${r.key_id}|${r.model}`}
+                    className="border-b border-border/50"
+                  >
+                    <td className="py-2 pr-4">
+                      <span className={tableGroup === "day" ? "font-mono text-xs" : ""}>
+                        {r.label}
+                      </span>
+                      {r.sublabel && (
+                        <span className="ml-2 font-mono text-xs text-muted-foreground">
+                          {r.sublabel}
+                        </span>
+                      )}
+                    </td>
                     <td className="py-2 pr-4 text-right tabular-nums">
                       {formatNumber(r.requests)}
                     </td>
@@ -697,6 +761,7 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
                     <td className="py-2 pr-4 text-right tabular-nums">
                       {formatNumber(r.total_tokens)}
                     </td>
+                    <td className="py-2 pr-4 text-right tabular-nums">{formatUsd(r.cost_usd)}</td>
                     <td className="py-2 pr-4 text-right tabular-nums">
                       {r.energy_wh > 0 ? formatEnergyKwh(r.energy_wh) : "—"}
                     </td>
