@@ -445,24 +445,28 @@ async fn run_state_machine(
                 terminal.draw(|f| draw_pick_scope(f, w.target, kinds, w.cursor))?;
             }
             Step::CompressionModel => {
-                terminal.draw(|f| draw_text_input(
-                    f,
-                    "compression — model",
-                    "Name of a model that has the compression boon granted.",
-                    "e.g. my-model-with-compression",
-                    &w.input,
-                    false,
-                ))?;
+                terminal.draw(|f| {
+                    draw_text_input(
+                        f,
+                        "compression — model",
+                        "Name of a model that has the compression boon granted.",
+                        "e.g. my-model-with-compression",
+                        &w.input,
+                        false,
+                    )
+                })?;
             }
             Step::CompressionKey => {
-                terminal.draw(|f| draw_text_input(
-                    f,
-                    "compression — API key",
-                    "An API key that can call this model. Input hidden.",
-                    "paste the key and press Enter to run the A/B",
-                    &w.input,
-                    true,
-                ))?;
+                terminal.draw(|f| {
+                    draw_text_input(
+                        f,
+                        "compression — API key",
+                        "An API key that can call this model. Input hidden.",
+                        "paste the key and press Enter to run the A/B",
+                        &w.input,
+                        true,
+                    )
+                })?;
             }
             Step::PickTarget => {
                 terminal.draw(|f| draw_pick_target(f, w.cursor, snap))?;
@@ -573,7 +577,10 @@ async fn run_state_machine(
             },
 
             Step::CompressionModel => match code {
-                KeyCode::Esc => { w.step = Step::PickBench; w.cursor = 0; }
+                KeyCode::Esc => {
+                    w.step = Step::PickBench;
+                    w.cursor = 0;
+                }
                 KeyCode::Enter => {
                     let v = w.input.trim().to_string();
                     if !v.is_empty() {
@@ -582,16 +589,22 @@ async fn run_state_machine(
                         w.step = Step::CompressionKey;
                     }
                 }
-                KeyCode::Backspace => { w.input.pop(); }
+                KeyCode::Backspace => {
+                    w.input.pop();
+                }
                 KeyCode::Char(c) => w.input.push(c),
                 _ => {}
             },
 
             Step::CompressionKey => match code {
-                KeyCode::Esc => { w.input = w.comp_model.clone(); w.step = Step::CompressionModel; }
+                KeyCode::Esc => {
+                    w.input = w.comp_model.clone();
+                    w.step = Step::CompressionModel;
+                }
                 KeyCode::Enter => {
                     let v = w.input.trim().to_string();
-                    if v.is_empty() { /* stay */ } else {
+                    if v.is_empty() { /* stay */
+                    } else {
                         w.comp_key = v;
                         w.input.clear();
                         // Leave the alternate screen, run the A/B (it prints its
@@ -602,27 +615,50 @@ async fn run_state_machine(
                             admin_token: cli.admin_token.clone(),
                             api_key: w.comp_key.clone(),
                             model: w.comp_model.clone(),
-                            price_in_per_mtok: std::env::var("PRICE_IN_PER_MTOK").ok().and_then(|s| s.parse().ok())
-                                .unwrap_or(crate::benchmarks::compression::DEFAULT_PRICE_IN_PER_MTOK),
-                            prefill_tps: std::env::var("PREFILL_TPS").ok()
-                                .map(|s| s.split(',').filter_map(|x| x.trim().parse().ok()).collect::<Vec<u32>>())
+                            price_in_per_mtok: std::env::var("PRICE_IN_PER_MTOK")
+                                .ok()
+                                .and_then(|s| s.parse().ok())
+                                .unwrap_or(
+                                    crate::benchmarks::compression::DEFAULT_PRICE_IN_PER_MTOK,
+                                ),
+                            prefill_tps: std::env::var("PREFILL_TPS")
+                                .ok()
+                                .map(|s| {
+                                    s.split(',')
+                                        .filter_map(|x| x.trim().parse().ok())
+                                        .collect::<Vec<u32>>()
+                                })
                                 .filter(|v: &Vec<u32>| !v.is_empty())
-                                .unwrap_or_else(crate::benchmarks::compression::default_prefill_tps),
-                            max_tokens: std::env::var("MAX_TOKENS").ok().and_then(|s| s.parse().ok())
+                                .unwrap_or_else(
+                                    crate::benchmarks::compression::default_prefill_tps,
+                                ),
+                            max_tokens: std::env::var("MAX_TOKENS")
+                                .ok()
+                                .and_then(|s| s.parse().ok())
                                 .unwrap_or(crate::benchmarks::compression::DEFAULT_MAX_TOKENS),
-                            reps: std::env::var("REPS").ok().and_then(|s| s.parse().ok())
+                            reps: std::env::var("REPS")
+                                .ok()
+                                .and_then(|s| s.parse().ok())
                                 .unwrap_or(crate::benchmarks::compression::DEFAULT_REPS),
-                            min_tokens: std::env::var("BENCH_MIN_TOKENS").ok().and_then(|s| s.parse().ok())
+                            min_tokens: std::env::var("BENCH_MIN_TOKENS")
+                                .ok()
+                                .and_then(|s| s.parse().ok())
                                 .unwrap_or(crate::benchmarks::compression::DEFAULT_MIN_TOKENS),
                         };
                         crossterm::terminal::disable_raw_mode()?;
-                        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::LeaveAlternateScreen)?;
+                        crossterm::execute!(
+                            terminal.backend_mut(),
+                            crossterm::terminal::LeaveAlternateScreen
+                        )?;
                         let res = crate::benchmarks::compression::run(&cfg).await;
                         println!("\n[press Enter to return to obench]");
                         let mut _line = String::new();
                         let _ = std::io::stdin().read_line(&mut _line);
                         crossterm::terminal::enable_raw_mode()?;
-                        crossterm::execute!(terminal.backend_mut(), crossterm::terminal::EnterAlternateScreen)?;
+                        crossterm::execute!(
+                            terminal.backend_mut(),
+                            crossterm::terminal::EnterAlternateScreen
+                        )?;
                         if let Err(e) = res {
                             w.error = format!("compression run failed: {e}");
                             w.return_to = Step::PickBench;
@@ -633,7 +669,9 @@ async fn run_state_machine(
                         w.cursor = 0;
                     }
                 }
-                KeyCode::Backspace => { w.input.pop(); }
+                KeyCode::Backspace => {
+                    w.input.pop();
+                }
                 KeyCode::Char(c) => w.input.push(c),
                 _ => {}
             },
