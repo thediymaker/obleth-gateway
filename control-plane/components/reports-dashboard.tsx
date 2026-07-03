@@ -39,7 +39,8 @@ import {
 } from "@/components/ui/dialog";
 import { Calendar } from "@/components/ui/calendar";
 import { formatNumber } from "@/lib/utils";
-import type { UsageDailyRow } from "@/lib/obleth";
+import { Select } from "@/components/ui/select";
+import type { ApiKey, Tenant, UsageDailyRow } from "@/lib/obleth";
 
 const REQUESTS_COLOR = "hsl(38 75% 60%)";
 const TOKENS_COLOR = "hsl(205 55% 58%)";
@@ -110,7 +111,7 @@ function defaultRange(): DateRange {
   return { from, to };
 }
 
-export function ReportsDashboard() {
+export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: ApiKey[] }) {
   const [range, setRange] = useState<DateRange | undefined>(defaultRange);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
@@ -118,16 +119,39 @@ export function ReportsDashboard() {
     () => new Set(EXPORT_COLUMNS.filter((c) => c.def).map((c) => c.key)),
   );
 
+  const [tenantId, setTenantId] = useState("");
+  const [keyId, setKeyId] = useState("");
+
+  // Keys shown in the key filter — only the selected tenant's.
+  const tenantKeys = useMemo(
+    () => (tenantId ? keys.filter((k) => k.tenant_id === tenantId) : []),
+    [keys, tenantId],
+  );
+
+  function selectTenant(id: string) {
+    setTenantId(id);
+    setKeyId(""); // a key belongs to one tenant; changing tenant invalidates it
+  }
+
   const startDay = range?.from ? isoDay(range.from) : undefined;
   const endDay = range?.to ? isoDay(range.to) : startDay;
 
+  function dailyUrl(group: string): string {
+    const params = new URLSearchParams({
+      start_day: startDay ?? "",
+      end_day: endDay ?? "",
+      group_by: group,
+    });
+    if (tenantId) params.set("tenant_id", tenantId);
+    if (keyId) params.set("key_id", keyId);
+    return `/api/live/usage/daily?${params.toString()}`;
+  }
+
   const query = useQuery({
-    queryKey: ["usage-daily", startDay, endDay],
+    queryKey: ["usage-daily", startDay, endDay, tenantId, keyId, "day"],
     enabled: Boolean(startDay && endDay),
     queryFn: async (): Promise<UsageDailyRow[]> => {
-      const res = await fetch(
-        `/api/live/usage/daily?start_day=${startDay}&end_day=${endDay}&group_by=day`,
-      );
+      const res = await fetch(dailyUrl("day"));
       if (!res.ok) throw new Error(`Failed to load usage (${res.status})`);
       return res.json();
     },
@@ -136,12 +160,10 @@ export function ReportsDashboard() {
   // Separate model-grouped read powers the "top models" chart without forcing
   // the day series to carry per-model rows.
   const modelQuery = useQuery({
-    queryKey: ["usage-daily-models", startDay, endDay],
+    queryKey: ["usage-daily", startDay, endDay, tenantId, keyId, "model"],
     enabled: Boolean(startDay && endDay),
     queryFn: async (): Promise<UsageDailyRow[]> => {
-      const res = await fetch(
-        `/api/live/usage/daily?start_day=${startDay}&end_day=${endDay}&group_by=model`,
-      );
+      const res = await fetch(dailyUrl("model"));
       if (!res.ok) throw new Error(`Failed to load models (${res.status})`);
       return res.json();
     },
@@ -273,6 +295,35 @@ export function ReportsDashboard() {
             </div>
           </DialogContent>
         </Dialog>
+
+        <Select
+          value={tenantId}
+          onChange={(e) => selectTenant(e.target.value)}
+          aria-label="Filter by team"
+          className="h-9 w-44 text-sm"
+        >
+          <option value="">All teams</option>
+          {tenants.map((t) => (
+            <option key={t.id} value={t.id}>
+              {t.name}
+            </option>
+          ))}
+        </Select>
+        {tenantId && (
+          <Select
+            value={keyId}
+            onChange={(e) => setKeyId(e.target.value)}
+            aria-label="Filter by key"
+            className="h-9 w-44 text-sm"
+          >
+            <option value="">All keys</option>
+            {tenantKeys.map((k) => (
+              <option key={k.id} value={k.id}>
+                {k.name || k.key_prefix}
+              </option>
+            ))}
+          </Select>
+        )}
 
         {query.isFetching && (
           <span className="flex items-center gap-1.5 text-xs text-muted-foreground">
