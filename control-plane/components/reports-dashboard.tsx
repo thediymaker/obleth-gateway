@@ -223,6 +223,7 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
         acc.cacheMisses += r.cache_misses;
         acc.energyWh += r.energy_wh;
         acc.co2G += r.co2_g;
+        acc.costUsd += r.cost_usd;
         return acc;
       },
       {
@@ -235,6 +236,7 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
         cacheMisses: 0,
         energyWh: 0,
         co2G: 0,
+        costUsd: 0,
       },
     );
   }, [rows]);
@@ -425,9 +427,10 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
       </div>
 
       {/* KPI strip */}
-      <div className="grid gap-4 sm:grid-cols-3 lg:grid-cols-5 xl:grid-cols-7">
+      <div className="grid gap-4 sm:grid-cols-3 lg:grid-cols-4 xl:grid-cols-8">
         <Kpi label="Requests" value={formatNumber(totals.requests)} />
         <Kpi label="Total tokens" value={formatNumber(totals.tokens)} />
+        <Kpi label="Spend" value={formatUsd(totals.costUsd)} />
         <Kpi label="Success rate" value={`${successRate.toFixed(1)}%`} />
         <Kpi label="Errors" value={formatNumber(totals.errors)} />
         <Kpi
