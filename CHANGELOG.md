@@ -6,6 +6,15 @@ workflow falls back to auto-generated notes.
 
 ## Unreleased
 
+Per-request energy and carbon accounting for self-hosted clusters: watt-hours, electricity cost, and CO₂ tracked alongside token cost — per request, per tenant, per model.
+
+### Added
+- **Energy & carbon on every request.** Each completed request is charged its wall-time share of a serving slot's power draw, priced with your electricity rate and grid carbon intensity. The three values (`energy_wh`, `energy_cost_usd`, `co2_g`) land in the usage ledger next to `cost_usd` and follow the same rule: frozen at completion — changing rates or settings later never rewrites history.
+- **Bring your own power metrics.** Settings → Energy points the gateway at your Prometheus with any PromQL expression that returns per-node power (Habana, DCGM, and IPMI exporters all work — the gateway only averages across nodes). Set $/kWh, gCO₂/kWh, and an optional PUE multiplier for facility overhead. A **Test query** button shows live "X kW across N nodes" before you enable anything.
+- **Per-model saturation, declared by you.** Each model gets an "energy slots per node" count — how many concurrent requests saturate one node. Node power is split across those slots; queue time is never charged, and idle power is never attributed, so totals understate your bill rather than overstate it. Leave it at 0 (the default, e.g. for external API models) and the model stays out of energy accounting entirely.
+- **Visible everywhere cost is.** Energy column in the request log (cost and CO₂ in the detail view), energy/carbon totals and per-tenant/per-model breakdowns in reports, and CSV exports include the new columns.
+- **Off by default, fails open.** Nothing changes until you configure it. If Prometheus is unreachable, requests are never delayed or failed — the gateway keeps the last power reading, records zeros when it has none, and raises a deduplicated alert.
+
 ### Changed
 - Consolidated the compression A/B benchmark into `obench` as `obench compression`
   (and a "compression savings" option in the interactive TUI). The standalone

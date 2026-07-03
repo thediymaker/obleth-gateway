@@ -955,7 +955,7 @@ function CreateModelWizard({
                   name="energy_slots_per_node"
                   type="number"
                   defaultValue="0"
-                  hint="Concurrent sequences that saturate one node (instances per node × sequences per instance). 0 = energy accounting off for this model."
+                  hint="How many of this model's requests one node can serve at once when fully loaded (replicas per node × concurrent sequences per replica). Node power is split across this many slots. 0 = energy accounting off for this model."
                 />
               </section>
 
@@ -1366,7 +1366,7 @@ function ConnectionTab({
                 name="energy_slots_per_node"
                 type="number"
                 defaultValue={String(model.energy_slots_per_node)}
-                hint="Concurrent sequences that saturate one node (instances per node × sequences per instance). 0 = energy accounting off for this model."
+                hint="How many of this model's requests one node can serve at once when fully loaded (replicas per node × concurrent sequences per replica). Node power is split across this many slots. 0 = energy accounting off for this model."
               />
             </FormSection>
           </div>
