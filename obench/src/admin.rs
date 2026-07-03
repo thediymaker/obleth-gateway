@@ -353,7 +353,8 @@ impl AdminClient {
     /// Fetch the current model-boons settings view (flattened per boon). Used to
     /// snapshot compression settings before a benchmark mutates them.
     pub async fn get_boons(&self) -> anyhow::Result<Value> {
-        self.req(reqwest::Method::GET, "/settings/boons", None).await
+        self.req(reqwest::Method::GET, "/settings/boons", None)
+            .await
     }
 
     /// Update model-boons settings. The server merges partial bodies, so `patch`
