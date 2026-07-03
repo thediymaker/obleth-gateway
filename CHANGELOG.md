@@ -4,7 +4,7 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
-## Unreleased
+## v0.7.1
 
 Per-request energy and carbon accounting for self-hosted clusters: watt-hours, electricity cost, and CO₂ tracked alongside token cost — per request, per tenant, per model.
 
