@@ -4,6 +4,16 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.7.2
+
+Chargeback-ready reports: filter and group historical usage by team and API key, with spend visible everywhere — plus a compression fix for fenced code.
+
+- **Filter reports by team and key.** The Reports page gains team/key filters that re-scope every KPI, chart, and table — answer "what did this course spend this month" without leaving the dashboard.
+- **Breakdown table with grouping.** The daily table can now group by day, team, key, or model — chargeback views sort by spend, and key rows show the key's name with its prefix.
+- **Spend, finally visible.** A Spend KPI and a per-row Spend column join the reports (frozen completion-time cost, summed — never recomputed), and the CSV export now carries `cost_usd` and `key_name` by default.
+- **Export exactly the report you're looking at.** The CSV dialog inherits the active team/key filter and defaults its row grouping to the table's current grouping, with per-key+model, day, team, key, and model options.
+- **Compression: fenced code behind a preamble now compacts.** A code block introduced by prose (e.g. "Here's the patch:" followed by a ``` fence) was classified as prose and skipped by the deterministic code compactor; it is now recognized as code. The obench compression corpus was updated to exercise this path.
+
 ## v0.7.1
 
 Per-request energy and carbon accounting for self-hosted clusters: watt-hours, electricity cost, and CO₂ tracked alongside token cost — per request, per tenant, per model.
