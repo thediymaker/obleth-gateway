@@ -40,7 +40,7 @@ import {
 import { Calendar } from "@/components/ui/calendar";
 import { formatNumber } from "@/lib/utils";
 import { Select } from "@/components/ui/select";
-import type { ApiKey, Tenant, UsageDailyRow } from "@/lib/obleth";
+import type { ApiKey, Tenant, UsageDailyGroupBy, UsageDailyRow } from "@/lib/obleth";
 import {
   formatUsd,
   toBreakdownRows,
@@ -79,6 +79,7 @@ const EXPORT_COLUMNS: { key: string; label: string; def: boolean }[] = [
   { key: "tenant_id", label: "Tenant ID", def: false },
   { key: "tenant_name", label: "Tenant name", def: true },
   { key: "key_id", label: "Key ID", def: false },
+  { key: "key_name", label: "Key name", def: true },
   { key: "key_prefix", label: "Key prefix", def: false },
   { key: "model", label: "Model", def: true },
   { key: "requests", label: "Requests", def: true },
@@ -92,6 +93,7 @@ const EXPORT_COLUMNS: { key: string; label: string; def: boolean }[] = [
   { key: "cache_misses", label: "Cache misses", def: false },
   { key: "avg_ttft_ms", label: "Avg TTFB (ms)", def: false },
   { key: "avg_total_ms", label: "Avg total (ms)", def: false },
+  { key: "cost_usd", label: "Spend (USD)", def: true },
   { key: "energy_kwh", label: "Energy (kWh)", def: false },
   { key: "co2_g", label: "CO₂ (g)", def: false },
   { key: "energy_cost_usd", label: "Energy cost (USD)", def: false },
@@ -128,6 +130,7 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
   const [range, setRange] = useState<DateRange | undefined>(defaultRange);
   const [pickerOpen, setPickerOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
+  const [exportGroup, setExportGroup] = useState<UsageDailyGroupBy>("key_model");
   const [columns, setColumns] = useState<Set<string>>(
     () => new Set(EXPORT_COLUMNS.filter((c) => c.def).map((c) => c.key)),
   );
@@ -301,9 +304,11 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
     const params = new URLSearchParams({
       start_day: startDay,
       end_day: endDay,
-      group_by: "key_model",
+      group_by: exportGroup,
       columns: ordered.join(","),
     });
+    if (tenantId) params.set("tenant_id", tenantId);
+    if (keyId) params.set("key_id", keyId);
     window.location.href = `/api/live/usage/export?${params.toString()}`;
     setExportOpen(false);
   }
@@ -390,8 +395,22 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
               </DialogTitle>
             </DialogHeader>
             <p className="text-sm text-muted-foreground">
-              Per-key/model daily rows for {rangeLabel}. Choose the columns to include.
+              Rows for {rangeLabel}
+              {tenantId ? " (current team/key filter applies)" : ""}. Choose the row grouping
+              and the columns to include.
             </p>
+            <Select
+              value={exportGroup}
+              onChange={(e) => setExportGroup(e.target.value as UsageDailyGroupBy)}
+              aria-label="Export row grouping"
+              className="h-8 w-44 text-xs"
+            >
+              <option value="key_model">Per key + model</option>
+              <option value="day">Per day</option>
+              <option value="tenant">Per team</option>
+              <option value="key">Per key</option>
+              <option value="model">Per model</option>
+            </Select>
             <div className="grid grid-cols-2 gap-x-6 gap-y-2 sm:grid-cols-3">
               {EXPORT_COLUMNS.map((c) => (
                 <label key={c.key} className="flex items-center gap-2 text-sm">
