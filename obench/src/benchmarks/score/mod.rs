@@ -9,7 +9,7 @@ pub mod capacity;
 pub mod overload;
 // pub mod report;
 // pub mod resilience;
-// pub mod streaming;
+pub mod streaming;
 
 use serde::Serialize;
 
