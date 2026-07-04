@@ -1,5 +1,10 @@
 use std::collections::BTreeMap;
 
+/// Cap on stored gap samples (memory guard); stall counting is never capped.
+pub const GAP_SAMPLE_CAP: usize = 200_000;
+/// An inter-chunk gap at or above this is a mid-stream stall.
+pub const STALL_GAP_MS: u64 = 1_000;
+
 #[derive(Clone, Debug)]
 pub struct RequestOutcome {
     pub status: u16,
@@ -8,6 +13,7 @@ pub struct RequestOutcome {
     pub in_tokens: u64,
     pub out_tokens: u64,
     pub usage_estimated: bool,
+    pub gaps_ms: Vec<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -29,6 +35,8 @@ pub struct Stats {
     pub any_estimated: bool,
     /// True if a sample window saw zero completions while load was active.
     pub stalled: bool,
+    pub gaps: Vec<u64>,
+    pub stall_events: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -48,6 +56,14 @@ pub struct Summary {
     pub out_tokens: u64,
     pub any_estimated: bool,
     pub verdict: Verdict,
+    #[allow(dead_code)]
+    pub p50_gap_ms: u64,
+    #[allow(dead_code)]
+    pub p99_gap_ms: u64,
+    #[allow(dead_code)]
+    pub gap_samples: u64,
+    #[allow(dead_code)]
+    pub stall_events: u64,
 }
 
 /// Decide whether a sequence of per-tick completed-request counts constitutes a
@@ -89,6 +105,14 @@ impl Stats {
                 self.out_tokens += r.out_tokens;
                 if r.usage_estimated {
                     self.any_estimated = true;
+                }
+                for &g in &r.gaps_ms {
+                    if g >= STALL_GAP_MS {
+                        self.stall_events += 1;
+                    }
+                    if self.gaps.len() < GAP_SAMPLE_CAP {
+                        self.gaps.push(g);
+                    }
                 }
             }
             429 => self.rejected += 1,
@@ -142,6 +166,10 @@ impl Stats {
             out_tokens: self.out_tokens,
             any_estimated: self.any_estimated,
             verdict,
+            p50_gap_ms: percentile(&self.gaps, 50.0),
+            p99_gap_ms: percentile(&self.gaps, 99.0),
+            gap_samples: self.gaps.len() as u64,
+            stall_events: self.stall_events,
         }
     }
 }
@@ -158,6 +186,7 @@ mod tests {
             in_tokens: 10,
             out_tokens: 20,
             usage_estimated: false,
+            gaps_ms: Vec::new(),
         }
     }
 
@@ -195,6 +224,7 @@ mod tests {
                 in_tokens: 0,
                 out_tokens: 0,
                 usage_estimated: false,
+                gaps_ms: Vec::new(),
             });
         }
         let sum = s.summarize(10.0, 0.05);
@@ -223,10 +253,48 @@ mod tests {
             in_tokens: 0,
             out_tokens: 0,
             usage_estimated: false,
+            gaps_ms: Vec::new(),
         });
         let sum = s.summarize(1.0, 0.0);
         assert_eq!(sum.errors, 0);
         assert_eq!(sum.rejected, 1);
+    }
+
+    #[test]
+    fn gaps_aggregate_into_summary() {
+        let mut s = Stats::default();
+        let mut o = ok(10, 20);
+        o.gaps_ms = vec![5, 5, 6, 1200]; // one stall (>= 1000ms)
+        s.record(&o);
+        let sum = s.summarize(1.0, 0.05);
+        assert_eq!(sum.gap_samples, 4);
+        assert_eq!(sum.stall_events, 1);
+        assert!(sum.p50_gap_ms <= 6);
+        assert_eq!(sum.p99_gap_ms, 1200);
+    }
+
+    #[test]
+    fn no_gaps_yields_zero_gap_summary() {
+        let mut s = Stats::default();
+        s.record(&ok(10, 20));
+        let sum = s.summarize(1.0, 0.05);
+        assert_eq!(sum.gap_samples, 0);
+        assert_eq!(sum.stall_events, 0);
+        assert_eq!(sum.p99_gap_ms, 0);
+    }
+
+    #[test]
+    fn gap_reservoir_is_capped() {
+        let mut s = Stats::default();
+        let mut o = ok(10, 20);
+        o.gaps_ms = vec![5; GAP_SAMPLE_CAP + 100];
+        s.record(&o);
+        assert_eq!(s.gaps.len(), GAP_SAMPLE_CAP);
+        // stall counting is NOT capped
+        let mut o2 = ok(10, 20);
+        o2.gaps_ms = vec![2000; 3];
+        s.record(&o2);
+        assert_eq!(s.stall_events, 3);
     }
 
     // ── stall watchdog decision logic ─────────────────────────────────────────

@@ -87,6 +87,7 @@ mod tests {
             in_tokens: 5,
             out_tokens: 7,
             usage_estimated: false,
+            gaps_ms: Vec::new(),
         });
         let sum = s.summarize(1.0, 0.05);
         let out = render_summary(&sum, "http://localhost:3000");
