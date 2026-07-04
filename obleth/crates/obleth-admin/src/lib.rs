@@ -164,6 +164,10 @@ pub fn router(state: AdminState) -> Router {
             get(model_health::list_health).post(model_health::check_all),
         )
         .route(
+            "/api/v1/models/validate",
+            post(model_health::validate_model),
+        )
+        .route(
             "/api/v1/models/:id",
             get(get_model).put(update_model).delete(delete_model),
         )
@@ -3263,6 +3267,11 @@ async fn update_model(
                 .unwrap_or(existing.energy_slots_per_node),
         )
         .await?;
+    if model_health::probe_config_changed(&existing, &model) {
+        // The old failure streak / alert state describe a configuration that
+        // no longer exists; reset so the scheduler re-verifies immediately.
+        state.store.reset_model_health(id).await?;
+    }
     sync_model(&state, &model).await?;
     state
         .store
