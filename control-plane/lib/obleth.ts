@@ -310,6 +310,20 @@ export interface BulkModelHealthResult {
   skipped: number;
 }
 
+export interface ValidateModelBody {
+  api_base: string;
+  api_key?: string | null;
+  upstream_model: string;
+  model_type?: string | null;
+}
+
+export interface ValidateModelResult {
+  reachable: boolean;
+  wildcard: boolean;
+  listed: boolean | null;
+  warnings: string[];
+}
+
 export interface ModelHealthConfigBody {
   checks_enabled: boolean;
   alerts_enabled: boolean;
@@ -1172,6 +1186,11 @@ export const obleth = {
     api<void>(`/models/${id}`, {
       method: "DELETE",
       headers: auditActorHeaders(options),
+    }),
+  validateModel: (body: ValidateModelBody) =>
+    api<ValidateModelResult>("/models/validate", {
+      method: "POST",
+      body: JSON.stringify(body),
     }),
   modelHealth: () => api<ModelHealthSummary[]>("/models/health"),
   modelHealthDetail: (id: string) =>

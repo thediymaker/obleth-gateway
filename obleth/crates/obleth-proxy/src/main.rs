@@ -295,6 +295,7 @@ async fn main() -> anyhow::Result<()> {
         http: http.clone(),
         alerts: Some(Arc::new(alerts.clone()) as Arc<dyn obleth_admin::AlertSink>),
         telemetry: Some(telemetry.clone()),
+        catalogs: Default::default(),
     };
     let admin_state = obleth_admin::AdminState {
         store: store.clone(),

@@ -1,17 +1,27 @@
 //! Model health checks for registered model routes.
 //!
-//! For each model we first look for a passive signal — recent real client
-//! traffic in the ClickHouse usage ledger — and only fall back to an active
-//! probe when a model has seen no traffic. The active probe issues a minimal
-//! real inference request (`POST /chat/completions` or `POST /embeddings` with
-//! `max_tokens: 1`) so the upstream actually executes a forward pass. Probe
-//! tokens are accounted under the internal `health_probe` tenant so they never
-//! appear in client billing.
+//! Health is determined by the cheapest trustworthy signal, in order:
 //!
-//! Transient conditions (overloaded upstream, an unsupported probe endpoint, a
-//! single network blip) are classified as `degraded` rather than `unhealthy`
-//! so a model doesn't flap to "down" and fire false alerts.
+//! 1. **Passive** — recent real client traffic in the ClickHouse usage ledger
+//!    (window follows the model's check interval).
+//! 2. **Active minimal inference** — a real forward pass per modality: one-token
+//!    chat completion, one-string embedding, one-character speech, or a
+//!    generated 0.1 s silence WAV transcription. Probe tokens are accounted
+//!    under the internal `health_probe` tenant so they never appear in client
+//!    billing.
+//! 3. **Catalog existence** — for types with no cheap inference probe (image),
+//!    `GET /models` membership, cached per `api_base`. A wildcard (`"*"`)
+//!    catalog can never confirm membership and yields `unknown`, never healthy.
+//!
+//! A probe rejection (HTTP 400/404/422) is disambiguated against the catalog:
+//! a listed model rejected by its modality endpoint is a `model_type` config
+//! error (`degraded`, with a pointed message), not an outage.
+//!
+//! Transient conditions (overloaded upstream, an unverifiable catalog, a
+//! single network blip) are classified as `degraded`/`unknown` rather than
+//! `unhealthy` so a model doesn't flap to "down" and fire false alerts.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -54,6 +64,16 @@ pub fn health_tenant_id() -> Uuid {
     Uuid::nil()
 }
 
+/// True when a model update changed a field the health probe depends on —
+/// the existing failure streak / alert state describe a configuration that no
+/// longer exists and must be reset (see `Store::reset_model_health`). Compares
+/// post-normalization values, so a no-op PUT never wipes a real streak.
+pub(crate) fn probe_config_changed(before: &ModelRoute, after: &ModelRoute) -> bool {
+    before.api_base != after.api_base
+        || before.upstream_model != after.upstream_model
+        || before.model_type != after.model_type
+}
+
 #[derive(Clone)]
 pub struct ModelHealthRuntime {
     pub scheduled_enabled: bool,
@@ -64,6 +84,43 @@ pub struct ModelHealthRuntime {
     pub alerts: Option<Arc<dyn AlertSink>>,
     /// Sink for emitting `health_probe` usage records. `None` in tests/tools.
     pub telemetry: Option<obleth_telemetry::TelemetrySink>,
+    /// Short-TTL cache of upstream `/models` catalogs keyed by `api_base`, so
+    /// a sweep over many models sharing one upstream fetches its catalog once.
+    pub catalogs: CatalogCache,
+}
+
+type CatalogEntries = HashMap<String, (Instant, Arc<Catalog>)>;
+
+/// Cached upstream catalog lookups (see [`fetch_upstream_catalog`]).
+/// Best-effort and in-process: a miss just costs one extra GET.
+#[derive(Clone, Default)]
+pub struct CatalogCache(Arc<std::sync::Mutex<CatalogEntries>>);
+
+const CATALOG_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// What `GET {api_base}/models` revealed about an upstream.
+#[derive(Debug)]
+pub enum Catalog {
+    /// A wildcard pass-through (`"*"` entry): membership is unknowable — this
+    /// must never be read as confirmation that a model exists (a wildcard
+    /// upstream once reported every model behind it healthy for 24 h).
+    Wildcard,
+    /// The upstream enumerates real model ids.
+    Ids(std::collections::HashSet<String>),
+}
+
+impl CatalogCache {
+    fn get(&self, api_base: &str) -> Option<Arc<Catalog>> {
+        let cache = self.0.lock().expect("catalog cache poisoned");
+        let (fetched_at, catalog) = cache.get(api_base)?;
+        (fetched_at.elapsed() < CATALOG_CACHE_TTL).then(|| catalog.clone())
+    }
+
+    fn put(&self, api_base: &str, catalog: Arc<Catalog>) {
+        let mut cache = self.0.lock().expect("catalog cache poisoned");
+        cache.retain(|_, (fetched_at, _)| fetched_at.elapsed() < CATALOG_CACHE_TTL);
+        cache.insert(api_base.to_string(), (Instant::now(), catalog));
+    }
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -197,6 +254,109 @@ pub async fn update_config(
     Ok(Json(summary))
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ValidateModelRequest {
+    pub api_base: String,
+    pub api_key: Option<String>,
+    pub upstream_model: String,
+    #[serde(default)]
+    pub model_type: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ValidateModelResult {
+    /// The upstream answered `GET /models` with 2xx.
+    pub reachable: bool,
+    /// The catalog is a wildcard pass-through (membership unverifiable).
+    pub wildcard: bool,
+    /// Whether `upstream_model` appears in the catalog; `null` when
+    /// unknowable (unreachable or wildcard).
+    pub listed: Option<bool>,
+    /// Human-readable advisories. Empty = nothing suspicious.
+    pub warnings: Vec<String>,
+}
+
+/// Advisory pre-flight for a model registration: does the upstream actually
+/// serve this id? Never blocks a write — the dashboard surfaces `warnings`
+/// after save. Always HTTP 200 (an unreachable upstream is a *finding*, not
+/// an error). Bypasses the probe catalog cache so a just-registered upstream
+/// model is seen immediately.
+#[utoipa::path(
+    post, path = "/api/v1/models/validate", tag = "models",
+    request_body = ValidateModelRequest,
+    responses((status = 200, body = ValidateModelResult))
+)]
+pub async fn validate_model(
+    State(state): State<AdminState>,
+    Json(body): Json<ValidateModelRequest>,
+) -> Result<Json<ValidateModelResult>> {
+    let mut warnings = Vec::new();
+    if let Some(model_type) = body.model_type.as_deref() {
+        // The silent chat-default on an unknown type is exactly how models end
+        // up probed against the wrong endpoint — flag it at the door.
+        if !obleth_config::is_valid_model_type(&model_type.trim().to_ascii_lowercase()) {
+            warnings.push(format!(
+                "model_type `{model_type}` is not recognized and will be stored as `chat`"
+            ));
+        }
+    }
+    if body.api_base.trim().is_empty() {
+        warnings.push(
+            "no static api_base to validate (provisioned-only models are verified per endpoint)"
+                .to_string(),
+        );
+        return Ok(Json(ValidateModelResult {
+            reachable: false,
+            wildcard: false,
+            listed: None,
+            warnings,
+        }));
+    }
+    state.ssrf.validate(&body.api_base)?;
+
+    match fetch_catalog_direct(&state, &body.api_base, body.api_key.as_deref()).await {
+        Ok(catalog) => match catalog.as_ref() {
+            Catalog::Wildcard => {
+                warnings.push(
+                    "upstream catalog is a wildcard pass-through; cannot verify the model id"
+                        .to_string(),
+                );
+                Ok(Json(ValidateModelResult {
+                    reachable: true,
+                    wildcard: true,
+                    listed: None,
+                    warnings,
+                }))
+            }
+            Catalog::Ids(ids) => {
+                let listed = ids.contains(&body.upstream_model);
+                if !listed {
+                    warnings.push(format!(
+                        "`{}` is not listed by the upstream catalog — check upstream_model \
+                         (and that the model is deployed)",
+                        body.upstream_model
+                    ));
+                }
+                Ok(Json(ValidateModelResult {
+                    reachable: true,
+                    wildcard: false,
+                    listed: Some(listed),
+                    warnings,
+                }))
+            }
+        },
+        Err(error) => {
+            warnings.push(format!("upstream validation failed: {}", error.message));
+            Ok(Json(ValidateModelResult {
+                reachable: false,
+                wildcard: false,
+                listed: None,
+                warnings,
+            }))
+        }
+    }
+}
+
 pub fn spawn_worker(state: AdminState) {
     if !state.health.scheduled_enabled {
         tracing::info!("model health scheduler disabled");
@@ -268,6 +428,10 @@ async fn run_model_health_check(
     model: ModelRoute,
     trigger: &str,
 ) -> Result<ModelHealthRecordOutcome> {
+    // Fetched up front: the passive window follows the model's own check
+    // interval, and the same summary row supplies `next_check_at` below.
+    let summary = state.store.get_model_health_summary(model.id).await?;
+
     // Probe each configured endpoint first, both so the data plane can route
     // around dead clusters independently of the model-level signal, and so
     // dynamic-endpoint models (Slurm-provisioned, with no static api_base) can
@@ -286,7 +450,13 @@ async fn run_model_health_check(
             message: Some("model route is disabled".to_string()),
             response_excerpt: None,
         }
-    } else if let Some(passive) = passive_signal(state, &model).await {
+    } else if let Some(passive) = passive_signal(
+        state,
+        &model,
+        passive_window_secs(summary.check_interval_secs),
+    )
+    .await
+    {
         passive
     } else if model.api_base.trim().is_empty() {
         // No static api_base (Slurm-provisioned / dynamic endpoints): the model
@@ -305,7 +475,6 @@ async fn run_model_health_check(
     } else {
         liveness_probe(state, &model).await
     };
-    let summary = state.store.get_model_health_summary(model.id).await?;
     let next_check_at = jittered_next_check_at(summary.check_interval_secs);
     state
         .store
@@ -323,8 +492,20 @@ async fn run_model_health_check(
         .map_err(AdminError::from)
 }
 
-async fn passive_signal(state: &AdminState, model: &ModelRoute) -> Option<ProbeResult> {
-    let row = recent_traffic(state, &model.model_name, PASSIVE_WINDOW_SECS).await?;
+/// Passive-signal window for a model: at least [`PASSIVE_WINDOW_SECS`], widened
+/// to the model's own check interval so a model with steady traffic is always
+/// settled by the free ledger lookup instead of an active probe. (The default
+/// interval is 900s; a fixed 300s window would miss two-thirds of it.)
+fn passive_window_secs(check_interval_secs: i64) -> i64 {
+    check_interval_secs.max(PASSIVE_WINDOW_SECS)
+}
+
+async fn passive_signal(
+    state: &AdminState,
+    model: &ModelRoute,
+    window_secs: i64,
+) -> Option<ProbeResult> {
+    let row = recent_traffic(state, &model.model_name, window_secs).await?;
     if row.requests == 0 {
         // No recent traffic to judge by; fall back to an active probe.
         return None;
@@ -334,7 +515,7 @@ async fn passive_signal(state: &AdminState, model: &ModelRoute) -> Option<ProbeR
             None,
             None,
             format!(
-                "passive: {} successful request(s) in the last {PASSIVE_WINDOW_SECS}s",
+                "passive: {} successful request(s) in the last {window_secs}s",
                 row.successes
             ),
         ));
@@ -344,7 +525,7 @@ async fn passive_signal(state: &AdminState, model: &ModelRoute) -> Option<ProbeR
             None,
             None,
             format!(
-                "passive: {} upstream server error(s) and no successes in the last {PASSIVE_WINDOW_SECS}s",
+                "passive: {} upstream server error(s) and no successes in the last {window_secs}s",
                 row.server_errors
             ),
         ));
@@ -384,6 +565,184 @@ async fn liveness_probe(state: &AdminState, model: &ModelRoute) -> ProbeResult {
     inference_probe(state, model, &model.api_base, model.api_key.as_deref()).await
 }
 
+/// A failed catalog fetch: HTTP status when the upstream answered, `None` on a
+/// transport error — the same shape `classify_probe` consumes.
+struct CatalogError {
+    http: Option<u16>,
+    message: String,
+}
+
+/// Fetch (or reuse a cached copy of) the upstream's `/models` catalog.
+/// Successful fetches are cached per `api_base` for [`CATALOG_CACHE_TTL`] so a
+/// sweep over many models sharing one upstream lists it once; errors are not
+/// cached.
+async fn fetch_upstream_catalog(
+    state: &AdminState,
+    api_base: &str,
+    api_key: Option<&str>,
+) -> std::result::Result<Arc<Catalog>, CatalogError> {
+    if let Some(catalog) = state.health.catalogs.get(api_base) {
+        return Ok(catalog);
+    }
+    let catalog = fetch_catalog_direct(state, api_base, api_key).await?;
+    state.health.catalogs.put(api_base, catalog.clone());
+    Ok(catalog)
+}
+
+/// Uncached catalog fetch. The validation endpoint uses this directly so an
+/// operator who just registered a model upstream sees current truth, not a
+/// ≤60 s-old snapshot.
+async fn fetch_catalog_direct(
+    state: &AdminState,
+    api_base: &str,
+    api_key: Option<&str>,
+) -> std::result::Result<Arc<Catalog>, CatalogError> {
+    let url = format!("{}/models", api_base.trim_end_matches('/'));
+    let timeout = Duration::from_secs(state.health.timeout_secs.max(1));
+    let mut request = state.health.http.get(&url).timeout(timeout);
+    if let Some(key) = api_key {
+        request = request.bearer_auth(key);
+    }
+    let response = request.send().await.map_err(|error| CatalogError {
+        http: None,
+        message: format!("catalog is unreachable: {error}"),
+    })?;
+    let code = response.status().as_u16();
+    if !(200..300).contains(&code) {
+        return Err(CatalogError {
+            http: Some(code),
+            message: format!("catalog request failed (HTTP {code})"),
+        });
+    }
+    let body = response.text().await.unwrap_or_default();
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|_| CatalogError {
+        http: Some(code),
+        message: "catalog response is not valid JSON".to_string(),
+    })?;
+    let ids: std::collections::HashSet<String> = json
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|models| {
+            models
+                .iter()
+                .filter_map(|m| m.get("id").and_then(|id| id.as_str()))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(Arc::new(if ids.contains("*") {
+        Catalog::Wildcard
+    } else {
+        Catalog::Ids(ids)
+    }))
+}
+
+/// Active check for model types with no minimal inference probe (`image`,
+/// unrecognized): does the upstream's catalog list the model at all? Cheaper
+/// and weaker than an inference probe — the healthy message says so.
+async fn existence_probe(
+    state: &AdminState,
+    model: &ModelRoute,
+    api_base: &str,
+    api_key: Option<&str>,
+) -> ProbeResult {
+    let started = Instant::now();
+    let catalog = fetch_upstream_catalog(state, api_base, api_key).await;
+    let latency_ms: Option<i64> = started.elapsed().as_millis().try_into().ok();
+    match catalog {
+        Ok(catalog) => classify_existence(&catalog, &model.upstream_model, latency_ms),
+        Err(error) => ProbeResult {
+            status: classify_probe(error.http).to_string(),
+            latency_ms,
+            http_status: error.http.map(i64::from),
+            message: Some(normalize_excerpt(&error.message, 240)),
+            response_excerpt: None,
+        },
+    }
+}
+
+/// Map a fetched catalog to an existence-check result. A wildcard catalog can
+/// never confirm membership — `unknown`, NEVER healthy (regression guard: a
+/// wildcard upstream once reported every model behind it healthy for 24 h,
+/// see the 2026-06-28 spec).
+fn classify_existence(
+    catalog: &Catalog,
+    upstream_model: &str,
+    latency_ms: Option<i64>,
+) -> ProbeResult {
+    match catalog {
+        Catalog::Wildcard => ProbeResult::unknown(format!(
+            "upstream catalog is a wildcard pass-through; cannot verify `{upstream_model}` — status unverified"
+        )),
+        Catalog::Ids(ids) if ids.contains(upstream_model) => ProbeResult::healthy(
+            latency_ms,
+            None,
+            format!("upstream lists `{upstream_model}` (existence check; inference not verified)"),
+        ),
+        Catalog::Ids(_) => ProbeResult::unhealthy(
+            latency_ms,
+            None,
+            format!("`{upstream_model}` is not listed by the upstream catalog"),
+        ),
+    }
+}
+
+/// Refine an inference-probe rejection (HTTP 400/404/422) using the upstream
+/// catalog: those codes mean either "model is gone" (a real outage) or "wrong
+/// endpoint for this modality" (a `model_type` config error). May only refine,
+/// never mask — on a wildcard catalog or a failed fetch the original result is
+/// returned verbatim.
+async fn disambiguate_rejection(
+    state: &AdminState,
+    model: &ModelRoute,
+    api_base: &str,
+    api_key: Option<&str>,
+    code: u16,
+    probe_url: &str,
+    original: ProbeResult,
+) -> ProbeResult {
+    let Ok(catalog) = fetch_upstream_catalog(state, api_base, api_key).await else {
+        return original;
+    };
+    refine_rejection(&catalog, model, code, probe_url, original)
+}
+
+/// Pure half of [`disambiguate_rejection`]: catalog in hand, decide whether
+/// the rejection was a config error (listed → `degraded` with a pointer at
+/// `model_type`) or a genuine absence (→ `unhealthy`, alertable). A wildcard
+/// catalog adds no information — the original result passes through verbatim.
+fn refine_rejection(
+    catalog: &Catalog,
+    model: &ModelRoute,
+    code: u16,
+    probe_url: &str,
+    original: ProbeResult,
+) -> ProbeResult {
+    let endpoint = probe_url
+        .rsplit_once("/v1")
+        .map(|(_, path)| path)
+        .unwrap_or(probe_url);
+    match catalog {
+        Catalog::Wildcard => original,
+        Catalog::Ids(ids) if ids.contains(&model.upstream_model) => ProbeResult::degraded(
+            original.latency_ms,
+            original.http_status,
+            format!(
+                "upstream lists `{}` but `{endpoint}` rejected it (HTTP {code}) — model_type `{}` may be misconfigured",
+                model.upstream_model, model.model_type
+            ),
+        ),
+        Catalog::Ids(_) => ProbeResult::unhealthy(
+            original.latency_ms,
+            original.http_status,
+            format!(
+                "model `{}` not found upstream (HTTP {code}; not in /models)",
+                model.upstream_model
+            ),
+        ),
+    }
+}
+
 /// Minimal real-inference liveness probe against an arbitrary `api_base`.
 /// Used for both the model-level probe and per-endpoint probes. Emits a
 /// `health_probe` usage record (internal tenant) so probe tokens are accounted.
@@ -394,10 +753,9 @@ async fn inference_probe(
     api_key: Option<&str>,
 ) -> ProbeResult {
     let Some(req) = build_probe_request(api_base, &model.model_type, &model.upstream_model) else {
-        return ProbeResult::unknown(format!(
-            "model type `{}` is not auto-probed; status unverified",
-            model.model_type
-        ));
+        // No minimal inference request exists for this type (image /
+        // unrecognized): fall back to the catalog existence check.
+        return existence_probe(state, model, api_base, api_key).await;
     };
 
     let timeout = Duration::from_secs(state.health.timeout_secs.max(1));
@@ -406,7 +764,7 @@ async fn inference_probe(
 
     loop {
         attempt += 1;
-        let mut request = client.post(&req.url).timeout(timeout).json(&req.body);
+        let mut request = req.build(client, timeout);
         if let Some(key) = api_key {
             request = request.bearer_auth(key);
         }
@@ -439,13 +797,29 @@ async fn inference_probe(
                     "unhealthy" => format!("real probe rejected by upstream (HTTP {code})"),
                     _ => format!("real probe inconclusive (HTTP {code})"),
                 };
-                return ProbeResult {
+                let result = ProbeResult {
                     status: status.to_string(),
                     latency_ms,
                     http_status: Some(code as i64),
                     message: Some(normalize_excerpt(&message, 240)),
                     response_excerpt: None,
                 };
+                // 400/404/422 conflate "model gone" with "wrong endpoint for
+                // this modality" — let the catalog tell them apart (401/403
+                // skip: bad credentials fail /models identically).
+                if status == "unhealthy" && matches!(code, 400 | 404 | 422) {
+                    return disambiguate_rejection(
+                        state,
+                        model,
+                        api_base,
+                        api_key,
+                        code,
+                        req.url(),
+                        result,
+                    )
+                    .await;
+                }
+                return result;
             }
             Err(error) => {
                 let retryable = error.is_timeout() || error.is_connect() || error.is_request();
@@ -625,15 +999,75 @@ fn aggregate_endpoint_health(results: &[ProbeResult], min_replicas: i64) -> Prob
     ProbeResult::unhealthy(None, None, format!("all {total} endpoint(s) unreachable"))
 }
 
-struct ProbeRequest {
-    url: String,
-    body: serde_json::Value,
+/// The minimal real inference request for one probe attempt. Multipart is a
+/// separate variant because `reqwest::multipart::Form` cannot be reused across
+/// retry attempts — the form is rebuilt from these parts on every attempt.
+enum ProbeRequest {
+    Json {
+        url: String,
+        body: serde_json::Value,
+    },
+    Multipart {
+        url: String,
+        model: String,
+        wav: Vec<u8>,
+    },
+}
+
+impl ProbeRequest {
+    fn url(&self) -> &str {
+        match self {
+            ProbeRequest::Json { url, .. } | ProbeRequest::Multipart { url, .. } => url,
+        }
+    }
+
+    /// Assemble the reqwest builder for one attempt.
+    fn build(&self, client: &reqwest::Client, timeout: Duration) -> reqwest::RequestBuilder {
+        match self {
+            ProbeRequest::Json { url, body } => client.post(url).timeout(timeout).json(body),
+            ProbeRequest::Multipart { url, model, wav } => {
+                let file = reqwest::multipart::Part::bytes(wav.clone())
+                    .file_name("probe.wav")
+                    .mime_str("audio/wav")
+                    .expect("static mime type is valid");
+                let form = reqwest::multipart::Form::new()
+                    .text("model", model.clone())
+                    .part("file", file);
+                client.post(url).timeout(timeout).multipart(form)
+            }
+        }
+    }
+}
+
+/// 0.1 s of 8 kHz 16-bit mono silence as a complete RIFF/WAV file (1644
+/// bytes) — the cheapest input a transcription server accepts as a real
+/// forward pass. Generated, not a repo asset, so it is fully deterministic.
+fn probe_silence_wav() -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 8_000;
+    const SAMPLES: u32 = 800; // 0.1 s
+    const DATA_LEN: u32 = SAMPLES * 2; // 16-bit mono
+    let mut wav = Vec::with_capacity(44 + DATA_LEN as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + DATA_LEN).to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes()); // fmt chunk size
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE * 2).to_le_bytes()); // byte rate
+    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&DATA_LEN.to_le_bytes());
+    wav.resize(44 + DATA_LEN as usize, 0);
+    wav
 }
 
 /// Build the minimal real inference request used to verify a model actually
 /// serves. `api_base` already includes the `/v1` suffix. Returns `None` for
-/// model types we deliberately do not auto-probe because a "minimal" request
-/// is still costly (image / audio) or the type is unrecognized.
+/// `image` (a "minimal" generation is still costly) and unrecognized types —
+/// those fall back to the catalog existence check.
 fn build_probe_request(
     api_base: &str,
     model_type: &str,
@@ -641,7 +1075,7 @@ fn build_probe_request(
 ) -> Option<ProbeRequest> {
     let base = api_base.trim_end_matches('/');
     match model_type {
-        "chat" => Some(ProbeRequest {
+        "chat" => Some(ProbeRequest::Json {
             url: format!("{base}/chat/completions"),
             body: serde_json::json!({
                 "model": upstream_model,
@@ -650,9 +1084,26 @@ fn build_probe_request(
                 "stream": false,
             }),
         }),
-        "embedding" => Some(ProbeRequest {
+        "embedding" => Some(ProbeRequest::Json {
             url: format!("{base}/embeddings"),
             body: serde_json::json!({ "model": upstream_model, "input": "ping" }),
+        }),
+        // One character of speech: a real forward pass at negligible cost.
+        // `voice` is required by the OpenAI schema; a server that rejects the
+        // fixed name 400s into the catalog disambiguation path, which points
+        // at configuration rather than declaring an outage.
+        "audio_speech" => Some(ProbeRequest::Json {
+            url: format!("{base}/audio/speech"),
+            body: serde_json::json!({
+                "model": upstream_model,
+                "input": ".",
+                "voice": "alloy",
+            }),
+        }),
+        "audio_transcription" => Some(ProbeRequest::Multipart {
+            url: format!("{base}/audio/transcriptions"),
+            model: upstream_model.to_string(),
+            wav: probe_silence_wav(),
         }),
         _ => None,
     }
@@ -837,6 +1288,131 @@ fn classify_probe(http: Option<u16>) -> &'static str {
 mod tests {
     use super::*;
 
+    fn ids(models: &[&str]) -> Catalog {
+        Catalog::Ids(models.iter().map(|m| m.to_string()).collect())
+    }
+
+    #[test]
+    fn existence_wildcard_is_never_healthy() {
+        // Regression pin (2026-06-28 spec): a wildcard catalog must yield
+        // `unknown`, not a false healthy, for every model behind it.
+        let r = classify_existence(&Catalog::Wildcard, "kimi-k2", None);
+        assert_eq!(r.status, "unknown");
+        assert!(r.message.as_deref().unwrap_or("").contains("wildcard"));
+    }
+
+    #[test]
+    fn existence_listed_is_healthy_with_caveat() {
+        let r = classify_existence(&ids(&["sdxl", "flux-dev"]), "sdxl", Some(12));
+        assert_eq!(r.status, "healthy");
+        assert!(r
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("inference not verified"));
+    }
+
+    #[test]
+    fn existence_absent_is_unhealthy() {
+        let r = classify_existence(&ids(&["sdxl"]), "flux-dev", None);
+        assert_eq!(r.status, "unhealthy");
+    }
+
+    #[test]
+    fn rejection_listed_model_becomes_degraded_misconfig_hint() {
+        let mut model = sample_model();
+        model.upstream_model = "tts-1".into();
+        let original = ProbeResult::unhealthy(Some(9), Some(404), "rejected".into());
+        let r = refine_rejection(
+            &ids(&["tts-1"]),
+            &model,
+            404,
+            "https://up/v1/chat/completions",
+            original,
+        );
+        assert_eq!(r.status, "degraded");
+        let msg = r.message.as_deref().unwrap_or("");
+        assert!(msg.contains("model_type"), "misconfig hint missing: {msg}");
+        assert!(msg.contains("/chat/completions"));
+        // Latency/status of the original probe are preserved.
+        assert_eq!(r.latency_ms, Some(9));
+        assert_eq!(r.http_status, Some(404));
+    }
+
+    #[test]
+    fn rejection_absent_model_stays_unhealthy_with_catalog_evidence() {
+        let model = sample_model();
+        let original = ProbeResult::unhealthy(None, Some(404), "rejected".into());
+        let r = refine_rejection(
+            &ids(&["something-else"]),
+            &model,
+            404,
+            "https://up/v1/chat/completions",
+            original,
+        );
+        assert_eq!(r.status, "unhealthy");
+        assert!(r
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("not in /models"));
+    }
+
+    #[test]
+    fn rejection_wildcard_catalog_passes_original_through() {
+        let model = sample_model();
+        let original = ProbeResult::unhealthy(Some(3), Some(404), "original message".into());
+        let r = refine_rejection(
+            &Catalog::Wildcard,
+            &model,
+            404,
+            "https://up/v1/chat/completions",
+            original,
+        );
+        assert_eq!(r.status, "unhealthy");
+        assert_eq!(r.message.as_deref(), Some("original message"));
+    }
+
+    #[test]
+    fn catalog_cache_round_trip_and_wildcard_detection() {
+        let cache = CatalogCache::default();
+        assert!(cache.get("https://up/v1").is_none());
+        cache.put("https://up/v1", Arc::new(ids(&["a", "b"])));
+        let hit = cache.get("https://up/v1").expect("cache hit");
+        assert!(matches!(hit.as_ref(), Catalog::Ids(ids) if ids.len() == 2));
+        assert!(cache.get("https://other/v1").is_none());
+    }
+
+    #[test]
+    fn probe_config_change_detection() {
+        let before = sample_model();
+        // No-op update must not reset a real failure streak.
+        assert!(!probe_config_changed(&before, &before.clone()));
+        for mutate in [
+            |m: &mut ModelRoute| m.api_base = "https://other/v1".into(),
+            |m: &mut ModelRoute| m.upstream_model = "renamed".into(),
+            |m: &mut ModelRoute| m.model_type = "embedding".into(),
+        ] {
+            let mut after = before.clone();
+            mutate(&mut after);
+            assert!(probe_config_changed(&before, &after));
+        }
+        // Non-probe fields don't reset.
+        let mut after = before.clone();
+        after.description = "new description".into();
+        after.input_cost_per_token = 1.0;
+        assert!(!probe_config_changed(&before, &after));
+    }
+
+    #[test]
+    fn passive_window_follows_check_interval() {
+        // Default interval (900s) widens the window past the 300s floor…
+        assert_eq!(passive_window_secs(900), 900);
+        // …while a short interval never narrows it below the floor.
+        assert_eq!(passive_window_secs(60), 300);
+        assert_eq!(passive_window_secs(300), 300);
+    }
+
     #[test]
     fn excerpt_collapses_and_truncates() {
         let value = normalize_excerpt(" a\n b\t ccccc ", 7);
@@ -955,30 +1531,66 @@ mod tests {
         assert_eq!(aggregate_endpoint_health(&results, 2).status, "healthy");
     }
 
+    fn expect_json(req: ProbeRequest) -> (String, serde_json::Value) {
+        match req {
+            ProbeRequest::Json { url, body } => (url, body),
+            ProbeRequest::Multipart { .. } => panic!("expected a JSON probe request"),
+        }
+    }
+
     #[test]
     fn probe_request_chat_is_one_token_completion() {
         let r = build_probe_request("https://up/v1", "chat", "kimi-k2").expect("chat probe");
-        assert_eq!(r.url, "https://up/v1/chat/completions");
-        assert_eq!(r.body["model"], "kimi-k2");
-        assert_eq!(r.body["max_tokens"], 1);
-        assert_eq!(r.body["stream"], false);
-        assert!(r.body["messages"].is_array());
+        let (url, body) = expect_json(r);
+        assert_eq!(url, "https://up/v1/chat/completions");
+        assert_eq!(body["model"], "kimi-k2");
+        assert_eq!(body["max_tokens"], 1);
+        assert_eq!(body["stream"], false);
+        assert!(body["messages"].is_array());
     }
 
     #[test]
     fn probe_request_embedding_uses_embeddings_endpoint() {
         let r =
             build_probe_request("https://up/v1/", "embedding", "qwen4-embedding").expect("embed");
-        assert_eq!(r.url, "https://up/v1/embeddings");
-        assert_eq!(r.body["model"], "qwen4-embedding");
-        assert_eq!(r.body["input"], "ping");
+        let (url, body) = expect_json(r);
+        assert_eq!(url, "https://up/v1/embeddings");
+        assert_eq!(body["model"], "qwen4-embedding");
+        assert_eq!(body["input"], "ping");
+    }
+
+    #[test]
+    fn probe_request_speech_is_one_character() {
+        let r = build_probe_request("https://up/v1", "audio_speech", "tts-1").expect("tts probe");
+        let (url, body) = expect_json(r);
+        assert_eq!(url, "https://up/v1/audio/speech");
+        assert_eq!(body["model"], "tts-1");
+        assert_eq!(body["input"], ".");
+        assert_eq!(body["voice"], "alloy");
+    }
+
+    #[test]
+    fn probe_request_transcription_is_multipart_silence_wav() {
+        let r = build_probe_request("https://up/v1", "audio_transcription", "whisper-1")
+            .expect("stt probe");
+        let ProbeRequest::Multipart { url, model, wav } = r else {
+            panic!("expected a multipart probe request");
+        };
+        assert_eq!(url, "https://up/v1/audio/transcriptions");
+        assert_eq!(model, "whisper-1");
+        // Complete RIFF/WAV container: header magic + declared sizes match.
+        assert_eq!(wav.len(), 1644);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 1600);
+        // Silence: every PCM sample is zero.
+        assert!(wav[44..].iter().all(|b| *b == 0));
     }
 
     #[test]
     fn probe_request_costly_and_unknown_modes_are_none() {
         assert!(build_probe_request("https://up/v1", "image", "m").is_none());
-        assert!(build_probe_request("https://up/v1", "audio_transcription", "m").is_none());
-        assert!(build_probe_request("https://up/v1", "audio_speech", "m").is_none());
         assert!(build_probe_request("https://up/v1", "something-else", "m").is_none());
     }
 
