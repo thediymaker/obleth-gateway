@@ -1,4 +1,5 @@
 pub mod compression;
+pub mod score;
 
 /// Which benchmark obench is running. Load is the historical default; new kinds
 /// (e.g. compressor capacity) add a variant + a module. Deliberately an enum,
