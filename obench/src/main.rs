@@ -24,6 +24,7 @@ async fn main() -> anyhow::Result<()> {
     // Benchmark-kind dispatch. Absent subcommand → load (historical default).
     let kind = match &args.command {
         Some(cli::Command::Compression(_)) => benchmarks::BenchKind::Compression,
+        Some(cli::Command::Score(_)) => benchmarks::BenchKind::Load, // wired in a later task
         None => benchmarks::BenchKind::Load,
     };
     if kind == benchmarks::BenchKind::Compression {
