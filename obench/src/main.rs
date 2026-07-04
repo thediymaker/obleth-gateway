@@ -1,4 +1,5 @@
 mod admin;
+mod backend_ctl;
 mod benchmarks;
 mod cli;
 mod config;
