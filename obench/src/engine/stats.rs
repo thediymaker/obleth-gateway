@@ -56,13 +56,9 @@ pub struct Summary {
     pub out_tokens: u64,
     pub any_estimated: bool,
     pub verdict: Verdict,
-    #[allow(dead_code)]
     pub p50_gap_ms: u64,
-    #[allow(dead_code)]
     pub p99_gap_ms: u64,
-    #[allow(dead_code)]
     pub gap_samples: u64,
-    #[allow(dead_code)]
     pub stall_events: u64,
 }
 
