@@ -144,7 +144,10 @@ mod tests {
     #[test]
     fn jitter_penalized_only_with_oracle() {
         let jittery = q(5, 40, 0); // ratio 8.0 -> -(8-3)*10 = -40 (capped)
-        assert_eq!(streaming_section(&[jittery.clone()], true).score, Some(60));
+        assert_eq!(
+            streaming_section(std::slice::from_ref(&jittery), true).score,
+            Some(60)
+        );
         assert_eq!(streaming_section(&[jittery], false).score, Some(100));
     }
 
