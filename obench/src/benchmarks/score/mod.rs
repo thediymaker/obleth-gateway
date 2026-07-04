@@ -6,7 +6,7 @@
 pub mod capacity;
 // pub mod fairshare;   // (files created in later tasks — add these mod lines as the files land)
 // pub mod overhead;
-// pub mod overload;
+pub mod overload;
 // pub mod report;
 // pub mod resilience;
 // pub mod streaming;
