@@ -10,6 +10,8 @@
 //! measure exactly how many requests reached the backend (e.g. to quantify
 //! gateway cache offload) rather than inferring it from container metrics.
 //!
+//! `POST /control` injects runtime faults via `{"model": "<substring>|*", "mode": "ok"|"recover"|"fail"|"stall"|"slow"}`.
+//!
 //! Per-model latency profiles: the upstream model name (the value obleth sends
 //! after route transformation) selects a latency profile so a single fixture can
 //! emulate a fleet of fast/slow/embedding models. Names containing `turbo`,
@@ -52,6 +54,49 @@ struct Counters {
     embeddings: AtomicU64,
     prompt_tokens: AtomicU64,
     completion_tokens: AtomicU64,
+}
+
+/// Runtime-injectable fault, set via `POST /control`. Keyed by a substring of
+/// the model name (or `*` for all models) so obench can kill one simulated
+/// model while the rest of the fleet stays healthy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FaultMode {
+    Ok,
+    Fail,
+    Stall,
+    Slow,
+}
+
+impl FaultMode {
+    fn parse(s: &str) -> Option<FaultMode> {
+        match s {
+            "ok" | "recover" => Some(FaultMode::Ok),
+            "fail" => Some(FaultMode::Fail),
+            "stall" => Some(FaultMode::Stall),
+            "slow" => Some(FaultMode::Slow),
+            _ => None,
+        }
+    }
+}
+
+type FaultMap = Arc<std::sync::RwLock<std::collections::HashMap<String, FaultMode>>>;
+
+/// Resolve the active fault for a model name: `*` wins first, then the first
+/// entry whose key is a case-insensitive substring of the name. Callers set
+/// non-overlapping keys, so multi-match order does not matter.
+fn fault_for_model(model: &str, map: &std::collections::HashMap<String, FaultMode>) -> FaultMode {
+    if let Some(f) = map.get("*") {
+        if *f != FaultMode::Ok {
+            return *f;
+        }
+    }
+    let m = model.to_ascii_lowercase();
+    for (k, v) in map {
+        if k != "*" && m.contains(&k.to_ascii_lowercase()) {
+            return *v;
+        }
+    }
+    FaultMode::Ok
 }
 
 /// Latency characteristics for one simulated model. Derived from the upstream
@@ -104,6 +149,7 @@ struct Cfg {
     default_output: u32,
     slots: Arc<Semaphore>,
     counters: Arc<Counters>,
+    faults: FaultMap,
 }
 
 #[tokio::main]
@@ -128,11 +174,13 @@ async fn main() {
             10_000,
         ) as usize)),
         counters: Arc::new(Counters::default()),
+        faults: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
     };
 
     let app = Router::new()
         .route("/health", get(|| async { "ok" }))
         .route("/stats", get(stats))
+        .route("/control", post(control))
         .route("/v1/chat/completions", post(chat))
         .route("/v1/completions", post(chat))
         .route("/v1/embeddings", post(embeddings))
@@ -157,6 +205,32 @@ async fn stats(State(cfg): State<Cfg>) -> Json<Value> {
         "prompt_tokens": c.prompt_tokens.load(Ordering::Relaxed),
         "completion_tokens": c.completion_tokens.load(Ordering::Relaxed),
     }))
+}
+
+/// Set or clear a fault: `{"model": "turbo", "mode": "fail"}`. `model`
+/// defaults to `*`. Modes: fail | stall | slow | ok | recover.
+async fn control(State(cfg): State<Cfg>, Json(body): Json<Value>) -> Response {
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("*")
+        .to_string();
+    let mode = body.get("mode").and_then(Value::as_str).unwrap_or("");
+    match FaultMode::parse(mode) {
+        Some(FaultMode::Ok) => {
+            cfg.faults.write().unwrap().remove(&model);
+            (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+        }
+        Some(m) => {
+            cfg.faults.write().unwrap().insert(model, m);
+            (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
+        }
+        None => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": format!("unknown mode {mode:?}") })),
+        )
+            .into_response(),
+    }
 }
 
 async fn chat(State(cfg): State<Cfg>, Json(body): Json<Value>) -> Response {
@@ -190,14 +264,29 @@ async fn chat(State(cfg): State<Cfg>, Json(body): Json<Value>) -> Response {
         .completion_tokens
         .fetch_add(output_tokens as u64, Ordering::Relaxed);
 
+    let fault = fault_for_model(&model, &cfg.faults.read().unwrap());
+    if fault == FaultMode::Fail {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": { "message": "injected fault: fail", "type": "obench_fault" } })),
+        )
+            .into_response();
+    }
+
     // Acquire a simulated GPU slot; when none free, this awaits -> models saturation.
     let permit = cfg.slots.clone().acquire_owned().await.ok();
 
-    let profile = profile_for(&model, &cfg);
+    let mut profile = profile_for(&model, &cfg);
+    if fault == FaultMode::Slow {
+        profile.ttft_ms *= 10;
+        profile.token_ms *= 10;
+    }
+    let stall = fault == FaultMode::Stall;
+
     if stream {
-        stream_response(profile, model, prompt_tokens, output_tokens, permit).await
+        stream_response(profile, model, prompt_tokens, output_tokens, permit, stall).await
     } else {
-        json_response(profile, model, prompt_tokens, output_tokens, permit).await
+        json_response(profile, model, prompt_tokens, output_tokens, permit, stall).await
     }
 }
 
@@ -215,6 +304,15 @@ async fn embeddings(State(cfg): State<Cfg>, Json(body): Json<Value>) -> Response
     cfg.counters
         .prompt_tokens
         .fetch_add(prompt_tokens as u64, Ordering::Relaxed);
+
+    let fault = fault_for_model(&model, &cfg.faults.read().unwrap());
+    if fault == FaultMode::Fail {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": { "message": "injected fault: fail", "type": "obench_fault" } })),
+        )
+            .into_response();
+    }
 
     let permit = cfg.slots.clone().acquire_owned().await.ok();
     let profile = profile_for(&model, &cfg);
@@ -258,7 +356,11 @@ async fn json_response(
     prompt_tokens: u32,
     output_tokens: u32,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    stall: bool,
 ) -> Response {
+    if stall {
+        tokio::time::sleep(Duration::from_secs(60)).await;
+    }
     tokio::time::sleep(Duration::from_millis(
         profile.ttft_ms + profile.token_ms * output_tokens as u64,
     ))
@@ -289,6 +391,7 @@ async fn stream_response(
     prompt_tokens: u32,
     output_tokens: u32,
     permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    stall: bool,
 ) -> Response {
     let body = async_stream::stream! {
         // hold the slot for the whole stream
@@ -300,6 +403,11 @@ async fn stream_response(
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": null}]
         });
         yield sse(&role);
+
+        if stall {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            return;
+        }
 
         for _ in 0..output_tokens {
             tokio::time::sleep(Duration::from_millis(profile.token_ms)).await;
@@ -360,4 +468,43 @@ fn env_string(primary: &str, legacy: &str, default: &str) -> String {
     std::env::var(primary)
         .or_else(|_| std::env::var(legacy))
         .unwrap_or_else(|_| default.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    #[test]
+    fn parse_modes() {
+        assert_eq!(FaultMode::parse("fail"), Some(FaultMode::Fail));
+        assert_eq!(FaultMode::parse("stall"), Some(FaultMode::Stall));
+        assert_eq!(FaultMode::parse("slow"), Some(FaultMode::Slow));
+        assert_eq!(FaultMode::parse("ok"), Some(FaultMode::Ok));
+        assert_eq!(FaultMode::parse("recover"), Some(FaultMode::Ok));
+        assert_eq!(FaultMode::parse("nope"), None);
+    }
+
+    #[test]
+    fn fault_matches_by_substring() {
+        let mut m = HashMap::new();
+        m.insert("turbo".to_string(), FaultMode::Fail);
+        assert_eq!(fault_for_model("obench-turbo", &m), FaultMode::Fail);
+        assert_eq!(fault_for_model("obench-base", &m), FaultMode::Ok);
+    }
+
+    #[test]
+    fn star_fault_applies_to_all() {
+        let mut m = HashMap::new();
+        m.insert("*".to_string(), FaultMode::Slow);
+        assert_eq!(fault_for_model("anything", &m), FaultMode::Slow);
+    }
+
+    #[test]
+    fn empty_map_is_ok() {
+        assert_eq!(
+            fault_for_model("obench-turbo", &HashMap::new()),
+            FaultMode::Ok
+        );
+    }
 }
