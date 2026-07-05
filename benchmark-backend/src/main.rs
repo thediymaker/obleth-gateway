@@ -81,6 +81,28 @@ impl FaultMode {
 
 type FaultMap = Arc<std::sync::RwLock<std::collections::HashMap<String, FaultMode>>>;
 
+/// Apply a parsed `/control` command to the fault map. A blanket recover
+/// (`model == "*"`, mode `Ok`) clears every fault in the map, not just a
+/// literal `"*"` entry — otherwise per-model faults set earlier in a run
+/// (e.g. resilience's `obench-turbo` fault) would survive a `{"model":"*",
+/// "mode":"ok"}` clear-all and leak into later sections/runs. Any other `Ok`
+/// clears just that one model's entry; a non-`Ok` mode sets/overwrites it.
+fn apply_control(
+    map: &mut std::collections::HashMap<String, FaultMode>,
+    model: &str,
+    mode: FaultMode,
+) {
+    if mode == FaultMode::Ok {
+        if model == "*" {
+            map.clear();
+        } else {
+            map.remove(model);
+        }
+    } else {
+        map.insert(model.to_string(), mode);
+    }
+}
+
 /// Resolve the active fault for a model name: `*` wins first, then the first
 /// entry whose key is a case-insensitive substring of the name. Callers set
 /// non-overlapping keys, so multi-match order does not matter.
@@ -217,12 +239,8 @@ async fn control(State(cfg): State<Cfg>, Json(body): Json<Value>) -> Response {
         .to_string();
     let mode = body.get("mode").and_then(Value::as_str).unwrap_or("");
     match FaultMode::parse(mode) {
-        Some(FaultMode::Ok) => {
-            cfg.faults.write().unwrap().remove(&model);
-            (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
-        }
         Some(m) => {
-            cfg.faults.write().unwrap().insert(model, m);
+            apply_control(&mut cfg.faults.write().unwrap(), &model, m);
             (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
         }
         None => (
@@ -506,5 +524,32 @@ mod tests {
             fault_for_model("obench-turbo", &HashMap::new()),
             FaultMode::Ok
         );
+    }
+
+    #[test]
+    fn star_recover_clears_the_entire_map() {
+        let mut m = HashMap::new();
+        m.insert("turbo".to_string(), FaultMode::Fail);
+        m.insert("base".to_string(), FaultMode::Slow);
+        m.insert("*".to_string(), FaultMode::Stall);
+        apply_control(&mut m, "*", FaultMode::Ok);
+        assert!(m.is_empty(), "expected every fault cleared, got {m:?}");
+    }
+
+    #[test]
+    fn single_model_recover_clears_only_that_key() {
+        let mut m = HashMap::new();
+        m.insert("turbo".to_string(), FaultMode::Fail);
+        m.insert("base".to_string(), FaultMode::Slow);
+        apply_control(&mut m, "turbo", FaultMode::Ok);
+        assert_eq!(m.len(), 1);
+        assert_eq!(m.get("base"), Some(&FaultMode::Slow));
+    }
+
+    #[test]
+    fn non_ok_mode_sets_the_key() {
+        let mut m = HashMap::new();
+        apply_control(&mut m, "turbo", FaultMode::Fail);
+        assert_eq!(m.get("turbo"), Some(&FaultMode::Fail));
     }
 }
