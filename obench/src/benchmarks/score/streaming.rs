@@ -78,10 +78,10 @@ pub async fn run_streaming(
     proxy_base: &str,
     input_tokens: u32,
     conc: u32,
+    stop: Arc<AtomicBool>,
 ) -> anyhow::Result<Summary> {
     let client = Arc::new(LoadClient::new((conc as usize) * 2));
     let stats = Arc::new(Mutex::new(Stats::default()));
-    let stop = Arc::new(AtomicBool::new(false));
     let (proxy, k, m) = (proxy_base.to_string(), key.to_string(), model.to_string());
     let make_req = move || {
         ProxyRequest::Chat(ChatRequest {

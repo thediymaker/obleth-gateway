@@ -119,15 +119,20 @@ pub async fn run_fairshare(
     admin: &crate::admin::AdminClient,
     proxy_base: &str,
     seeded: &crate::seed::SeededRun,
+    stop: Arc<AtomicBool>,
 ) -> anyhow::Result<SectionResult> {
     // Force queueing so fairshare actually arbitrates.
     let prev_capacity = admin.get_capacity().await?;
     admin.set_capacity(CONTENTION_CAPACITY).await?;
 
-    let result = scenario(proxy_base, seeded).await;
+    let result = scenario(proxy_base, seeded, &stop).await;
 
     // Restore on every path.
-    let _ = admin.set_capacity(prev_capacity).await;
+    if let Err(e) = admin.set_capacity(prev_capacity).await {
+        eprintln!(
+            "warning: fairshare failed to restore capacity to {prev_capacity} after the run: {e} — the gateway may be left clamped at {CONTENTION_CAPACITY}"
+        );
+    }
     result
 }
 
@@ -139,6 +144,7 @@ struct TenantHandle {
 async fn scenario(
     proxy_base: &str,
     seeded: &crate::seed::SeededRun,
+    stop: &Arc<AtomicBool>,
 ) -> anyhow::Result<SectionResult> {
     let group_names: Vec<&str> = FIXTURE_GROUPS.iter().map(|g| g.0).collect();
     let total_weight: u32 = FIXTURE_GROUPS.iter().map(|g| g.1).sum();
@@ -147,7 +153,12 @@ async fn scenario(
         .map(|g| g.1 as f64 / total_weight as f64)
         .collect();
 
-    let stop = Arc::new(AtomicBool::new(false));
+    // Local flag driving the request-generating tasks below; distinct from
+    // the orchestrator's `stop` (checked in the sampling loop further down)
+    // so this scenario's own normal-completion signal never taints the
+    // shared Ctrl-C flag the orchestrator uses to decide whether to run the
+    // next section.
+    let task_stop = Arc::new(AtomicBool::new(false));
     let client = Arc::new(LoadClient::new((PER_TENANT_CONC as usize) * 2));
 
     let mut tenant_handles: Vec<TenantHandle> = Vec::new();
@@ -189,7 +200,7 @@ async fn scenario(
         };
 
         let task_client = client.clone();
-        let task_stop = stop.clone();
+        let worker_stop = task_stop.clone();
         let task_stats = stats.clone();
 
         let jh = if is_chatbot {
@@ -198,21 +209,21 @@ async fn scenario(
                     task_client,
                     make_req,
                     run_cfg,
-                    task_stop,
+                    worker_stop,
                     task_stats,
                 )
                 .await;
             })
         } else {
             // The other three groups' tenants join mid-run, sharing the same
-            // stop flag so the final `stop.store` + join drains them too.
+            // stop flag so the final `task_stop.store` + join drains them too.
             tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_secs(INJECT_AT_S)).await;
                 crate::engine::load::run_closed_loop(
                     task_client,
                     make_req,
                     run_cfg,
-                    task_stop,
+                    worker_stop,
                     task_stats,
                 )
                 .await;
@@ -231,6 +242,9 @@ async fn scenario(
     let starvation_from_s = (INJECT_AT_S + 10) as f64;
 
     while started.elapsed().as_secs() < TOTAL_S {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         tokio::time::sleep(std::time::Duration::from_secs(SAMPLE_EVERY_S)).await;
         let t_s = started.elapsed().as_secs_f64();
 
@@ -271,7 +285,7 @@ async fn scenario(
         last_ok = cur;
     }
 
-    stop.store(true, Ordering::Relaxed);
+    task_stop.store(true, Ordering::Relaxed);
     for jh in join_handles {
         let _ = jh.await;
     }
