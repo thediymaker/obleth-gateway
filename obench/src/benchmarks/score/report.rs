@@ -274,14 +274,17 @@ pub fn write_scorecard(card: &Scorecard, markdown: &str) -> Result<(PathBuf, Pat
     Ok((json_path, md_path))
 }
 
-/// Finds the newest `scorecards/{target}-{ts}.json` with `ts < before_unix`
-/// (strictly less, so a run never picks itself as its own baseline).
+/// Finds the newest parseable `scorecards/{target}-{ts}.json` with
+/// `ts < before_unix` (strictly less, so a run never picks itself as its own
+/// baseline). Candidates are tried newest-first; a corrupt/truncated newest
+/// file is skipped in favor of the next-newest one rather than giving up on
+/// baselining entirely.
 pub fn latest_baseline(target: &str, before_unix: u64) -> Option<Scorecard> {
     let dir = crate::report::out_dir().join("scorecards");
     let entries = std::fs::read_dir(&dir).ok()?;
 
     let prefix = format!("{target}-");
-    let mut best: Option<(u64, PathBuf)> = None;
+    let mut candidates: Vec<(u64, PathBuf)> = Vec::new();
 
     for entry in entries.flatten() {
         let path = entry.path();
@@ -303,14 +306,20 @@ pub fn latest_baseline(target: &str, before_unix: u64) -> Option<Scorecard> {
         if ts >= before_unix {
             continue;
         }
-        if best.as_ref().is_none_or(|(b, _)| ts > *b) {
-            best = Some((ts, path));
-        }
+        candidates.push((ts, path));
     }
 
-    let (_, path) = best?;
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str(&content).ok()
+    candidates.sort_by_key(|(ts, _)| std::cmp::Reverse(*ts));
+
+    for (_, path) in candidates {
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Ok(card) = serde_json::from_str(&content) {
+            return Some(card);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -412,5 +421,29 @@ mod tests {
         // a run must not pick ITSELF as baseline
         assert_eq!(latest_baseline("demo", 150).unwrap().created_unix, 100);
         assert!(latest_baseline("live", 200).is_none());
+    }
+
+    #[test]
+    fn latest_baseline_falls_back_past_a_corrupt_newest_file() {
+        let _guard = crate::report::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var(
+            "BENCH_OUT_DIR",
+            std::env::temp_dir()
+                .join("obench-score-test-corrupt")
+                .to_str()
+                .unwrap(),
+        );
+        let dir = crate::report::out_dir().join("scorecards");
+        let _ = std::fs::remove_dir_all(&dir);
+        let old = card_with_capacity(serde_json::json!([]));
+        write_scorecard(&old, "# md").unwrap(); // created_unix=100
+
+        // Simulate a newer baseline file that failed to write cleanly.
+        std::fs::write(dir.join("demo-150.json"), "{ not valid json").unwrap();
+
+        let found = latest_baseline("demo", 200).unwrap();
+        assert_eq!(found.created_unix, 100);
     }
 }
