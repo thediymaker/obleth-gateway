@@ -2576,6 +2576,37 @@ impl Store {
         Ok(())
     }
 
+    /// Load the full Charo settings blob. Falls back to the legacy `charo_enabled`
+    /// boolean (with defaults for the newer fields) when `charo_settings` is unset,
+    /// so upgrades preserve the operator's existing show/hide choice.
+    pub async fn get_charo_settings(&self) -> Result<obleth_config::CharoSettings> {
+        let row = sqlx::query("select value from app_settings where key = 'charo_settings'")
+            .fetch_optional(&self.pool)
+            .await?;
+        if let Some(row) = row {
+            let value: sqlx::types::Json<obleth_config::CharoSettings> = row.try_get("value")?;
+            return Ok(value.0);
+        }
+        // Legacy fallback: synthesize from the old boolean key.
+        let enabled = self.get_charo_enabled().await?.unwrap_or(true);
+        Ok(obleth_config::CharoSettings { enabled, ..Default::default() })
+    }
+
+    /// Persist the full Charo settings blob (upsert on `charo_settings`). Also keeps
+    /// the legacy `charo_enabled` key in sync so any remaining reader stays correct.
+    pub async fn set_charo_settings(&self, settings: &obleth_config::CharoSettings) -> Result<()> {
+        sqlx::query(
+            "insert into app_settings (key, value, updated_at)
+             values ('charo_settings', $1, now())
+             on conflict (key) do update set value = excluded.value, updated_at = now()",
+        )
+        .bind(sqlx::types::Json(settings))
+        .execute(&self.pool)
+        .await?;
+        self.set_charo_enabled(settings.enabled).await?;
+        Ok(())
+    }
+
     /// Load the persisted raw-usage retention setting, or `None` if unset.
     pub async fn get_usage_retention_settings(
         &self,
@@ -4647,6 +4678,58 @@ mod tests {
 
         // Tidy up so other tests see a clean state.
         sqlx::query("delete from app_settings where key = 'energy'")
+            .execute(&store.pool)
+            .await
+            .ok();
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Verifies the full `charo_settings` blob round-trips and that the legacy
+    /// `charo_enabled` boolean stays in sync on write, plus the fallback path
+    /// when only the legacy key is present.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn charo_settings_round_trip() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        // Clean up any leftover keys from a prior run.
+        sqlx::query("delete from app_settings where key in ('charo_settings', 'charo_enabled')")
+            .execute(&store.pool)
+            .await
+            .ok();
+
+        // No keys set at all: get_charo_settings falls back to full defaults.
+        let defaults = store.get_charo_settings().await.expect("get default");
+        assert_eq!(defaults, obleth_config::CharoSettings::default());
+
+        // Legacy-only fallback: charo_enabled set, charo_settings absent.
+        store.set_charo_enabled(false).await.expect("set legacy");
+        let fallback = store.get_charo_settings().await.expect("get fallback");
+        assert!(!fallback.enabled);
+        assert_eq!(
+            fallback.brain_model,
+            obleth_config::CharoSettings::default().brain_model
+        );
+
+        let s = obleth_config::CharoSettings {
+            brain_model: Some("llama-3".into()),
+            bench_max_concurrency: 24,
+            ..obleth_config::CharoSettings::default()
+        };
+        store.set_charo_settings(&s).await.expect("set");
+        let got = store.get_charo_settings().await.expect("get");
+        assert_eq!(got.brain_model.as_deref(), Some("llama-3"));
+        assert_eq!(got.bench_max_concurrency, 24);
+        // Legacy key stays in sync.
+        assert_eq!(store.get_charo_enabled().await.unwrap(), Some(true));
+
+        // Tidy up so other tests see a clean state.
+        sqlx::query("delete from app_settings where key in ('charo_settings', 'charo_enabled')")
             .execute(&store.pool)
             .await
             .ok();
