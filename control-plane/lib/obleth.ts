@@ -64,6 +64,7 @@ export interface Tenant {
   guardrails_policy: GuardrailsPolicy | null;
   compression_policy: CompressionPolicy | null;
   tracing_enabled: boolean;
+  synthetic: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -965,6 +966,7 @@ export const obleth = {
       tokens_per_minute?: number;
       max_in_flight?: number | null;
       fairshare_group?: string;
+      synthetic?: boolean;
     },
     options?: AuditOptions,
   ) =>
@@ -1135,6 +1137,16 @@ export const obleth = {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ tracing_enabled }),
+    }),
+  setTenantSynthetic: (
+    id: string,
+    synthetic: boolean,
+    options?: AuditOptions,
+  ) =>
+    api<void>(`/tenants/${id}/synthetic`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ synthetic }),
     }),
   deleteKey: (id: string, options?: AuditOptions) =>
     api<void>(`/keys/${id}`, {
