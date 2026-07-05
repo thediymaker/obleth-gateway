@@ -228,7 +228,7 @@ async fn proxy_handler_inner(
     let req_meta = RequestMeta {
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
-        request_type: request_type_for_path(&path),
+        request_type: effective_request_type(&resolved, &path),
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -2755,6 +2755,17 @@ fn request_type_for_path(path: &str) -> &'static str {
     }
 }
 
+/// The request class recorded in the ledger: synthetic tenants' traffic is
+/// tagged `benchmark` (replacing the path-derived class, mirroring how health
+/// probes record `health_probe`), everything else classifies by path.
+fn effective_request_type(resolved: &ResolvedKey, path: &str) -> &'static str {
+    if resolved.synthetic {
+        obleth_config::BENCHMARK_REQUEST_TYPE
+    } else {
+        request_type_for_path(path)
+    }
+}
+
 /// Provenance of a resolved conversation id.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SessionSource {
@@ -2993,9 +3004,9 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        backoff_for, build_targets, build_upstream_url, has_path_traversal, is_retryable_status,
-        prepare_upstream_body, resolve_conversation, session_hash_order, tenant_active_now,
-        weighted_order,
+        backoff_for, build_targets, build_upstream_url, effective_request_type,
+        has_path_traversal, is_retryable_status, prepare_upstream_body, resolve_conversation,
+        session_hash_order, tenant_active_now, weighted_order,
     };
     use axum::http::HeaderMap;
     use chrono::{DateTime, TimeZone, Utc};
@@ -3058,6 +3069,20 @@ mod tests {
             compression_policy: None,
             synthetic: false,
         }
+    }
+
+    #[test]
+    fn synthetic_tenant_requests_are_tagged_benchmark() {
+        let mut resolved = key_with_schedule("UTC", None, None, None);
+        assert_eq!(
+            effective_request_type(&resolved, "/v1/chat/completions"),
+            "chat"
+        );
+        resolved.synthetic = true;
+        assert_eq!(
+            effective_request_type(&resolved, "/v1/chat/completions"),
+            obleth_config::BENCHMARK_REQUEST_TYPE
+        );
     }
 
     #[test]

@@ -110,6 +110,12 @@ pub struct Tenant {
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
+
+/// `request_type` label stamped on usage rows from synthetic tenants
+/// (benchmark/test traffic). Mirrors the `health_probe` convention: default
+/// usage reads exclude it; `include_internal=true` opts back in.
+pub const BENCHMARK_REQUEST_TYPE: &str = "benchmark";
+
 pub fn default_tenant_status() -> String {
     "active".to_string()
 }
