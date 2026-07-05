@@ -114,7 +114,22 @@ pub enum Action {
         replica_id: Uuid,
         job_id: String,
         endpoint_id: Option<Uuid>,
+        reason: CancelReason,
     },
     /// GC a long-dead `lost` replica row.
     Delete { replica_id: Uuid },
+}
+
+/// Why a replica's job is being cancelled — recorded on the replica row so the
+/// dashboard's draining pill says what actually happened, not just "scaled down".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// Over target: normal scale-down.
+    ScaleDown,
+    /// Operator hit the restart action (`cancel_requested` on the row).
+    OperatorRestart,
+    /// Self-heal: the job still reports RUNNING but the replica failed
+    /// consecutive health probes (zombie job) — cancel so the resubmit-to-target
+    /// replaces it with a fresh one.
+    ProbeFailed,
 }

@@ -44,6 +44,21 @@ pub struct SlurmSettingsView {
     pub provisioner_version: Option<String>,
     pub provisioner_git_sha: Option<String>,
     pub provisioner_built_at: Option<String>,
+    /// Outcome of the provisioner's last reconcile tick: `ok`, `idle`, or
+    /// `error`. The heartbeat above only proves the *process* is alive — a
+    /// provisioner can poll green for days while every tick fails against
+    /// slurmrestd and holds all replica state frozen. Null until reported (or
+    /// for an older provisioner that doesn't send it).
+    pub provisioner_tick_status: Option<String>,
+    /// Idle reason or error text for a non-`ok` tick status.
+    pub provisioner_tick_detail: Option<String>,
+    /// Seconds since the last *successful* reconcile tick, or null if none is
+    /// known. This — not replica `updated_at` — is what "replica states may be
+    /// stale" should key off.
+    pub provisioner_last_ok_secs: Option<i64>,
+    /// Seconds the current non-`ok` streak has lasted, or null when the last
+    /// tick was `ok` / nothing has been reported.
+    pub provisioner_held_secs: Option<i64>,
 }
 
 /// Build identity the provisioner reports via request headers, stored as JSON in
@@ -77,8 +92,99 @@ impl SlurmSettingsView {
             provisioner_version: None,
             provisioner_git_sha: None,
             provisioner_built_at: None,
+            provisioner_tick_status: None,
+            provisioner_tick_detail: None,
+            provisioner_last_ok_secs: None,
+            provisioner_held_secs: None,
         }
     }
+}
+
+/// The provisioner's last reconcile-tick outcome, stored as JSON in Redis
+/// alongside the heartbeat and echoed back on the settings view. `last_ok_at`
+/// and `since` (start of the current non-`ok` streak) are maintained across
+/// writes so the dashboard can say "reconcile failing since X" and the gateway
+/// can alert once the streak passes `HELD_ALERT_SECS`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvisionerTick {
+    /// `ok` | `idle` | `error` (as reported by the provisioner).
+    pub status: String,
+    /// Idle reason or error text; absent for `ok`.
+    #[serde(default)]
+    pub detail: Option<String>,
+    /// Epoch seconds of the report this blob reflects.
+    pub at: i64,
+    /// Epoch seconds of the last `ok` tick, carried across non-`ok` writes.
+    #[serde(default)]
+    pub last_ok_at: Option<i64>,
+    /// Epoch seconds when the current non-`ok` streak started; 0 when `ok`.
+    #[serde(default)]
+    pub since: i64,
+}
+
+/// What the tick-status merge decided about alerting.
+#[derive(Debug, PartialEq, Eq)]
+enum TickTransition {
+    None,
+    /// Reconciliation has been failing/idle past the alert threshold.
+    Held,
+    /// A held streak just ended with a successful tick.
+    Recovered,
+}
+
+/// How long reconciliation may fail/hold before the gateway raises an alert.
+/// Generous vs. the 15s tick so a slurmrestd blip or restart never pages;
+/// a genuinely unreachable cluster still surfaces within minutes instead of
+/// silently freezing replica state for days.
+const HELD_ALERT_SECS: i64 = 600;
+
+/// Fold one tick report into the previous stored state, deciding the alert
+/// transition. Pure, for tests: all clock/Redis I/O stays in the handler.
+fn merge_tick(
+    prev: Option<&ProvisionerTick>,
+    status: &str,
+    detail: Option<String>,
+    now: i64,
+) -> (ProvisionerTick, TickTransition) {
+    if status == "ok" {
+        // A held streak (past threshold) that just ended is worth a recovery
+        // note; a short blip that never alerted recovers silently.
+        let was_held = prev
+            .filter(|p| p.status != "ok" && p.since > 0)
+            .map(|p| now - p.since >= HELD_ALERT_SECS)
+            .unwrap_or(false);
+        let tick = ProvisionerTick {
+            status: "ok".into(),
+            detail: None,
+            at: now,
+            last_ok_at: Some(now),
+            since: 0,
+        };
+        let transition = if was_held {
+            TickTransition::Recovered
+        } else {
+            TickTransition::None
+        };
+        return (tick, transition);
+    }
+    // Non-ok: keep the last-known-good marker and the streak start.
+    let since = prev
+        .filter(|p| p.status != "ok" && p.since > 0)
+        .map(|p| p.since)
+        .unwrap_or(now);
+    let tick = ProvisionerTick {
+        status: status.to_string(),
+        detail,
+        at: now,
+        last_ok_at: prev.and_then(|p| p.last_ok_at),
+        since,
+    };
+    let transition = if now - since >= HELD_ALERT_SECS {
+        TickTransition::Held
+    } else {
+        TickTransition::None
+    };
+    (tick, transition)
 }
 
 /// How recently the provisioner must have polled to count as "running". The
@@ -277,6 +383,21 @@ pub async fn get_slurm_settings(
         view.provisioner_git_sha = build.git_sha;
         view.provisioner_built_at = build.built_at;
     }
+    if let Some(tick) = state
+        .redis
+        .get_provisioner_tick_status()
+        .await
+        .ok()
+        .flatten()
+        .and_then(|json| serde_json::from_str::<ProvisionerTick>(&json).ok())
+    {
+        let now = Utc::now().timestamp();
+        view.provisioner_last_ok_secs = tick.last_ok_at.map(|t| (now - t).max(0));
+        view.provisioner_held_secs =
+            (tick.status != "ok" && tick.since > 0).then(|| (now - tick.since).max(0));
+        view.provisioner_tick_detail = tick.detail;
+        view.provisioner_tick_status = Some(tick.status);
+    }
     Ok(Json(view))
 }
 
@@ -426,6 +547,53 @@ pub async fn get_slurm_settings_resolved(
         }
     }
     let settings = state.store.get_slurm_settings().await?.unwrap_or_default();
+    // The provisioner also reports its previous tick's outcome. Merge it with
+    // the stored streak state (best-effort, like the heartbeat) and raise an
+    // alert when reconciliation has been failing long enough that replica
+    // state on the dashboard is effectively frozen. Gated on `enabled`: a
+    // deliberately disabled Slurm idles the provisioner forever and must not
+    // page anyone.
+    if let Some(status) = header_str("x-obleth-provisioner-tick-status") {
+        let detail = header_str("x-obleth-provisioner-tick-detail");
+        let prev = state
+            .redis
+            .get_provisioner_tick_status()
+            .await
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str::<ProvisionerTick>(&json).ok());
+        let (tick, transition) = merge_tick(prev.as_ref(), &status, detail, Utc::now().timestamp());
+        if settings.enabled {
+            match transition {
+                TickTransition::Held => state.alerts.issue(
+                    "slurm_reconcile_held",
+                    "Slurm reconciliation is failing",
+                    format!(
+                        "The provisioner is running but has not completed a reconcile tick for {} minute(s) (status `{}`): {}. \
+                         Replica states shown on model pages are frozen at their last reconciled values until this clears.",
+                        (Utc::now().timestamp() - tick.since).max(0) / 60,
+                        tick.status,
+                        tick.detail.as_deref().unwrap_or("no detail reported"),
+                    ),
+                ),
+                TickTransition::Recovered => state.alerts.issue(
+                    "slurm_reconcile_recovered",
+                    "Slurm reconciliation recovered",
+                    "The provisioner completed a reconcile tick after a held period; replica states are live again.".to_string(),
+                ),
+                TickTransition::None => {}
+            }
+        }
+        if let Ok(json) = serde_json::to_string(&tick) {
+            if let Err(e) = state
+                .redis
+                .set_provisioner_tick_status(&json, PROVISIONER_HEARTBEAT_TTL_SECS)
+                .await
+            {
+                tracing::warn!(error = %e, "failed to record provisioner tick status");
+            }
+        }
+    }
     Ok(Json(settings))
 }
 
@@ -517,5 +685,70 @@ mod tests {
         let (secs, running) = provisioner_status(940, 1_000, 60);
         assert_eq!(secs, Some(60));
         assert!(running);
+    }
+
+    // --- merge_tick (reconcile-outcome streak tracking) ---
+
+    #[test]
+    fn first_ok_tick_sets_last_ok_and_no_alert() {
+        let (tick, tr) = merge_tick(None, "ok", None, 1_000);
+        assert_eq!(tick.status, "ok");
+        assert_eq!(tick.last_ok_at, Some(1_000));
+        assert_eq!(tick.since, 0);
+        assert_eq!(tr, TickTransition::None);
+    }
+
+    #[test]
+    fn error_streak_preserves_last_ok_and_start_and_alerts_past_threshold() {
+        let (ok_tick, _) = merge_tick(None, "ok", None, 1_000);
+        // First error: streak starts now, below threshold -> no alert yet.
+        let (e1, tr1) = merge_tick(Some(&ok_tick), "error", Some("boom".into()), 1_015);
+        assert_eq!(e1.since, 1_015);
+        assert_eq!(e1.last_ok_at, Some(1_000));
+        assert_eq!(tr1, TickTransition::None);
+        // Still failing 15s later: streak start must NOT move.
+        let (e2, tr2) = merge_tick(Some(&e1), "error", Some("boom".into()), 1_030);
+        assert_eq!(e2.since, 1_015);
+        assert_eq!(tr2, TickTransition::None);
+        // Past the threshold: held.
+        let (e3, tr3) = merge_tick(Some(&e2), "error", Some("boom".into()), 1_015 + HELD_ALERT_SECS);
+        assert_eq!(e3.since, 1_015);
+        assert_eq!(e3.last_ok_at, Some(1_000));
+        assert_eq!(tr3, TickTransition::Held);
+    }
+
+    #[test]
+    fn ok_after_held_streak_is_recovered_ok_after_blip_is_silent() {
+        let (ok_tick, _) = merge_tick(None, "ok", None, 1_000);
+        let (err, _) = merge_tick(Some(&ok_tick), "error", Some("boom".into()), 1_015);
+
+        // Short blip: recovers silently.
+        let (back, tr) = merge_tick(Some(&err), "ok", None, 1_045);
+        assert_eq!(tr, TickTransition::None);
+        assert_eq!(back.last_ok_at, Some(1_045));
+
+        // Long outage: recovery is announced.
+        let (_, tr) = merge_tick(Some(&err), "ok", None, 1_015 + HELD_ALERT_SECS + 5);
+        assert_eq!(tr, TickTransition::Recovered);
+    }
+
+    #[test]
+    fn error_with_no_prior_state_starts_streak_now() {
+        // Redis TTL expired / first report ever is already an error: the streak
+        // starts at this observation, and there is no last-known-good.
+        let (tick, tr) = merge_tick(None, "error", Some("boom".into()), 5_000);
+        assert_eq!(tick.since, 5_000);
+        assert_eq!(tick.last_ok_at, None);
+        assert_eq!(tr, TickTransition::None);
+    }
+
+    #[test]
+    fn idle_streak_is_tracked_like_error() {
+        // `idle` also freezes replica state (nothing reconciles); the streak and
+        // held detection apply the same way. The enabled-gate in the handler is
+        // what keeps a deliberately disabled Slurm from alerting.
+        let (i1, _) = merge_tick(None, "idle", Some("slurm disabled in settings".into()), 1_000);
+        let (_, tr) = merge_tick(Some(&i1), "idle", Some("slurm disabled in settings".into()), 1_000 + HELD_ALERT_SECS);
+        assert_eq!(tr, TickTransition::Held);
     }
 }

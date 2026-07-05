@@ -111,10 +111,66 @@ fn replica_views_from_json(rows: &serde_json::Value) -> Vec<ReplicaView> {
     out
 }
 
+/// Outcome of the previous reconcile tick, reported to the gateway as headers
+/// on the once-per-tick settings fetch (the same request that serves as the
+/// liveness heartbeat). This is what lets the dashboard distinguish "process
+/// alive and reconciling" from "process alive but every tick failing/holding" —
+/// without it, a week of `slurm job lookup failed; holding tick` looks
+/// identical to a healthy provisioner.
+#[derive(Debug, Clone)]
+pub struct TickReport {
+    /// `ok` | `idle` | `error`.
+    pub status: &'static str,
+    /// Idle reason or error text; empty for `ok`.
+    pub detail: String,
+}
+
+impl TickReport {
+    pub fn ok() -> Self {
+        Self {
+            status: "ok",
+            detail: String::new(),
+        }
+    }
+    pub fn idle(reason: &str) -> Self {
+        Self {
+            status: "idle",
+            detail: reason.to_string(),
+        }
+    }
+    pub fn error(detail: &str) -> Self {
+        Self {
+            status: "error",
+            detail: detail.to_string(),
+        }
+    }
+}
+
+/// Longest tick detail we put on the wire. Error chains can be long; the
+/// dashboard only needs the head of the message.
+const TICK_DETAIL_MAX: usize = 240;
+
+/// Make an arbitrary string safe as an HTTP header value: collapse all
+/// whitespace/control characters to single spaces, drop non-ASCII, and bound
+/// the length. reqwest would otherwise reject the request outright on an
+/// invalid header value — and a failed settings fetch reads as "provisioner
+/// down", which is the exact confusion this reporting exists to remove.
+fn header_safe(value: &str, max: usize) -> String {
+    let cleaned: String = value
+        .chars()
+        .map(|c| if c.is_ascii_whitespace() { ' ' } else { c })
+        .filter(|c| c.is_ascii() && !c.is_control())
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(max).collect()
+}
+
 pub struct HttpObleth {
     http: reqwest::Client,
     base: String,
     token: String,
+    /// Previous tick's outcome, attached to the next settings fetch.
+    last_tick: std::sync::Mutex<Option<TickReport>>,
 }
 
 impl HttpObleth {
@@ -123,6 +179,15 @@ impl HttpObleth {
             http,
             base: format!("{}/api/v1", cfg.admin_base_url.trim_end_matches('/')),
             token: cfg.admin_token.clone(),
+            last_tick: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Record the outcome of the tick that just finished; the next
+    /// `get_slurm_settings` call carries it to the gateway.
+    pub fn set_last_tick(&self, report: TickReport) {
+        if let Ok(mut t) = self.last_tick.lock() {
+            *t = Some(report);
         }
     }
     fn req(&self, m: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
@@ -180,13 +245,19 @@ impl OblethClient for HttpObleth {
     }
 
     async fn get_slurm_settings(&self) -> anyhow::Result<Option<SlurmSettings>> {
-        let s: SlurmSettings = self
-            .req(reqwest::Method::GET, "/settings/slurm/resolved")
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        // Report the previous tick's outcome alongside this fetch (the same
+        // request the gateway treats as the heartbeat), so the dashboard can
+        // show "reconcile failing since X" rather than a green process light.
+        let mut req = self.req(reqwest::Method::GET, "/settings/slurm/resolved");
+        let tick = self.last_tick.lock().ok().and_then(|t| t.clone());
+        if let Some(t) = tick {
+            req = req.header("X-Obleth-Provisioner-Tick-Status", t.status);
+            let detail = header_safe(&t.detail, TICK_DETAIL_MAX);
+            if !detail.is_empty() {
+                req = req.header("X-Obleth-Provisioner-Tick-Detail", detail);
+            }
+        }
+        let s: SlurmSettings = req.send().await?.error_for_status()?.json().await?;
         Ok(Some(s))
     }
 
@@ -351,6 +422,28 @@ impl OblethClient for HttpObleth {
         .await?
         .error_for_status()?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn header_safe_collapses_whitespace_and_bounds_length() {
+        // Multi-line error chains must flatten to one bounded ASCII line.
+        let raw = "slurm job lookup failed; holding tick:\n\n  error sending request for url (http://slurm:6820/…)\ttimed out";
+        let safe = header_safe(raw, 60);
+        assert!(safe.is_ascii());
+        assert!(!safe.contains('\n') && !safe.contains('\t'));
+        assert!(safe.len() <= 60, "got {} chars: {safe}", safe.len());
+        assert!(safe.starts_with("slurm job lookup failed; holding tick:"));
+    }
+
+    #[test]
+    fn header_safe_drops_non_ascii_and_controls() {
+        assert_eq!(header_safe("ok\u{7}\u{200b}→ done", 100), "ok done");
+        assert_eq!(header_safe("", 100), "");
     }
 }
 

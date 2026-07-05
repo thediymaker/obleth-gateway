@@ -4,6 +4,15 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## Unreleased
+
+Slurm provisioning you can trust at a glance: the dashboard now tells you when replica state is frozen instead of silently showing stale green, and zombie jobs — running on the cluster with a dead server inside — restart themselves.
+
+- **Frozen replica state is now visible, loudly.** The provisioner reports each reconcile tick's outcome to the gateway. When it can't reach Slurm (or is idle), the model's Replicas panel shows a warning with the failure reason and how long states have been frozen, state badges gray out with a `?`, and Settings → Slurm distinguishes "running" from "running but failing since X" — previously a week-old "Healthy" pill was indistinguishable from a live one.
+- **Alert when reconciliation is stuck.** If the provisioner hasn't completed a successful reconcile for 10 minutes while Slurm provisioning is enabled, a deduplicated alert fires (and a recovery notice follows when it clears) — you no longer find out from a screenshot.
+- **Zombie jobs self-heal.** A replica whose Slurm job still reports RUNNING but which keeps failing health probes (crashed/hung inference server) is now restarted automatically after 3 consecutive failures (`OBLETH_PROVISIONER_RESTART_AFTER_FAILURES`, 0 disables) — capped at one restart per model per tick so a probe-side network problem can never mass-cancel a fleet.
+- **Honest wording and cross-checks.** Replica rows say "updated Xh ago" (it was never a liveness "seen"), draining rows say *why* (scaled down / restart requested / failed health probes), and when gateway health probes contradict Slurm's view of a model, the Replicas panel says so. Disabling Slurm in Settings now warns that running jobs are not cancelled by it.
+
 ## v0.7.2
 
 Chargeback-ready reports: filter and group historical usage by team and API key, with spend visible everywhere — plus a compression fix for fenced code.

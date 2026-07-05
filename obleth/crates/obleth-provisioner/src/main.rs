@@ -12,9 +12,9 @@ mod warmup;
 pub(crate) use obleth_provisioner::{domain, slurm};
 
 use config::ProvisionerConfig;
-use obleth_client::{HttpObleth, OblethClient};
+use obleth_client::{HttpObleth, OblethClient, TickReport};
 use obleth_provisioner::slurm::{SlurmClient, Slurmrestd};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 /// Outcome of one loop iteration, so the loop can log idle/active transitions
@@ -34,20 +34,31 @@ async fn main() -> anyhow::Result<()> {
 
     // Track the last idle reason so we only log on transitions.
     let mut last_idle: Option<&'static str> = None;
+    // Self-heal state: consecutive failed health probes per healthy replica.
+    // In-memory on purpose — the provisioner is a singleton, and a restart
+    // merely resets the streaks (worst case: remediation is delayed by
+    // `restart_after_failures` ticks). No schema for a transient counter.
+    let mut probe_failures: HashMap<uuid::Uuid, i64> = HashMap::new();
     loop {
-        match run_once(&cfg, &obleth, &http).await {
+        match run_once(&cfg, &obleth, &http, &mut probe_failures).await {
             Ok(Tick::Ran) => {
+                obleth.set_last_tick(TickReport::ok());
                 if last_idle.take().is_some() {
                     tracing::info!("slurm active; reconciling managed models");
                 }
             }
             Ok(Tick::Idle(reason)) => {
+                obleth.set_last_tick(TickReport::idle(reason));
                 if last_idle != Some(reason) {
                     tracing::info!(reason, "provisioner idle (no slurm work)");
                     last_idle = Some(reason);
                 }
             }
             Err(e) => {
+                // Reported to the gateway on the next settings fetch so the
+                // dashboard can show "reconcile failing since X" instead of a
+                // deceptively green heartbeat while every tick holds.
+                obleth.set_last_tick(TickReport::error(&format!("{e:#}")));
                 tracing::warn!(error = %e, "tick failed; holding (no destructive action)");
             }
         }
@@ -63,6 +74,7 @@ async fn run_once(
     cfg: &ProvisionerConfig,
     obleth: &dyn OblethClient,
     http: &reqwest::Client,
+    probe_failures: &mut HashMap<uuid::Uuid, i64>,
 ) -> anyhow::Result<Tick> {
     let settings = match obleth.get_slurm_settings().await? {
         Some(s) => s,
@@ -81,7 +93,7 @@ async fn run_once(
         &settings.slurm_user,
         &settings.slurm_jwt,
     );
-    tick(cfg, &slurm, obleth, http).await?;
+    tick(cfg, &slurm, obleth, http, probe_failures).await?;
     Ok(Tick::Ran)
 }
 
@@ -90,9 +102,18 @@ async fn tick(
     slurm: &dyn SlurmClient,
     obleth: &dyn OblethClient,
     http: &reqwest::Client,
+    probe_failures: &mut HashMap<uuid::Uuid, i64>,
 ) -> anyhow::Result<()> {
     let specs = obleth.list_managed_models().await?; // obleth down -> bail (held). enabled only.
     let all_replicas = obleth.list_all_replicas().await?; // obleth down -> bail (held)
+
+    // Drop self-heal streaks for replicas that no longer exist or are no longer
+    // healthy (restarted, lost, draining) so the map can't grow unbounded.
+    probe_failures.retain(|id, _| {
+        all_replicas
+            .iter()
+            .any(|r| r.id == *id && r.state == "healthy")
+    });
 
     // Look up Slurm state for just the jobs we track, by id — never the whole
     // controller (which on a busy cluster is huge and OOM-kills us). A clean
@@ -160,19 +181,21 @@ async fn tick(
             }
         };
 
-        // probe starting and pending replicas that have a running job.
-        // "pending" means the job was submitted but we haven't seen it Running yet;
-        // once Slurm transitions the job to Running, the replica is still "pending"
-        // (there is no separate MarkStarting step), so we must probe both states.
+        // Probe every replica with a running job. "pending" means the job was
+        // submitted but we haven't seen it Running yet; once Slurm transitions
+        // the job to Running, the replica is still "pending" (there is no
+        // separate MarkStarting step), so both pre-promotion states are probed —
+        // and healthy ones are re-probed for self-heal (see below).
         let mut health: HashMap<uuid::Uuid, u16> = HashMap::new();
         for r in &replicas {
-            // Probe replicas awaiting promotion, plus any stranded "healthy" row
-            // with no endpoint linked (a prior promote whose endpoint write
-            // failed) so the planner can re-promote and re-link it.
-            if r.state == "starting"
-                || r.state == "pending"
-                || (r.state == "healthy" && r.endpoint_id.is_none())
-            {
+            // Probe replicas awaiting promotion, stranded "healthy" rows with no
+            // endpoint linked (a prior promote whose endpoint write failed, so
+            // the planner can re-promote and re-link), AND every promoted
+            // healthy replica — the last so self-heal can spot a zombie job
+            // (Slurm still says RUNNING, but the inference server inside it is
+            // dead) and restart it instead of leaving the model unhealthy
+            // forever.
+            if r.state == "starting" || r.state == "pending" || r.state == "healthy" {
                 if let Some(j) = jobs.get(&r.slurm_job_id) {
                     if j.state == domain::JobState::Running {
                         match j.nodes.first() {
@@ -248,6 +271,21 @@ async fn tick(
             }
         }
 
+        // Self-heal bookkeeping: judge each healthy replica's probe outcome and
+        // collect the ones past the failure threshold for a (staged) restart.
+        plan::update_probe_failures(&replicas, &jobs, &health, probe_failures);
+        let restart: HashSet<uuid::Uuid> = if cfg.restart_after_failures > 0 {
+            replicas
+                .iter()
+                .filter(|r| {
+                    probe_failures.get(&r.id).copied().unwrap_or(0) >= cfg.restart_after_failures
+                })
+                .map(|r| r.id)
+                .collect()
+        } else {
+            HashSet::new()
+        };
+
         let mut live_port_bases: Vec<i64> = replicas
             .iter()
             .filter(|r| r.state != "lost" && r.state != "draining")
@@ -258,7 +296,14 @@ async fn tick(
             target_replicas: spec.target_replicas,
             max_job_failures: spec.max_job_failures,
         };
-        let actions = plan::plan(&view, &replicas, &jobs, &health, cfg.lost_retention_secs);
+        let actions = plan::plan(
+            &view,
+            &replicas,
+            &jobs,
+            &health,
+            &restart,
+            cfg.lost_retention_secs,
+        );
         for action in &actions {
             // Reserve a distinct window per Submit *before* applying, so several
             // Submits in one tick don't all collapse onto the same port_base
@@ -331,6 +376,7 @@ async fn tick(
             &replicas,
             &jobs,
             &HashMap::new(),
+            &HashSet::new(),
             cfg.lost_retention_secs,
         );
         for action in &actions {

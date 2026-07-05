@@ -1325,54 +1325,84 @@ export function SlurmSettingsForm({ settings }: { settings: SlurmSettingsView | 
           />
           Enable Slurm provisioning
         </label>
-
-        {settings?.enabled && (
-          <div
-            className={
-              settings.provisioner_running
-                ? "flex items-start gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
-                : "flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:text-amber-400"
-            }
-          >
-            <span
-              className={
-                settings.provisioner_running
-                  ? "mt-1 inline-block h-2 w-2 shrink-0 rounded-full bg-emerald-500"
-                  : "mt-1 inline-block h-2 w-2 shrink-0 rounded-full bg-amber-500"
-              }
-            />
-            <span>
-              {settings.provisioner_running ? (
-                <>
-                  <span className="font-medium">Provisioner running</span> — last polled{" "}
-                  {formatLastSeen(settings.provisioner_last_seen_secs)}.
-                  {settings.provisioner_version && (
-                    <>
-                      {" "}
-                      <span className="font-mono">
-                        v{settings.provisioner_version}
-                        {settings.provisioner_git_sha && (
-                          <span className="ml-1 text-xs opacity-70">
-                            {settings.provisioner_git_sha.slice(0, 7)}
-                          </span>
-                        )}
-                      </span>
-                    </>
-                  )}
-                </>
-              ) : (
-                <>
-                  <span className="font-medium">Provisioner not detected</span>{" "}
-                  (last polled {formatLastSeen(settings.provisioner_last_seen_secs)}). Enabling
-                  Slurm only stores these connection details — the separate{" "}
-                  <code>obleth-provisioner</code> process must be running for replicas to launch.
-                  In Kubernetes set <code>provisioner.enabled=true</code>; in Docker add{" "}
-                  <code>slurm</code> to <code>COMPOSE_PROFILES</code>.
-                </>
-              )}
-            </span>
-          </div>
+        {!enabled && settings?.enabled && (
+          <p className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-600 dark:text-amber-400">
+            Disabling stops reconciliation but does <strong>not</strong> cancel Slurm jobs that are
+            already running — they keep their allocations, and their replica entries freeze at
+            their current state. To stop hosting a model and release its nodes, disable that model
+            (or set its target replicas to 0) before turning Slurm off here.
+          </p>
         )}
+
+        {settings?.enabled && (() => {
+          // Three states, not two: alive + reconciling (green), alive but the
+          // reconcile tick keeps failing/holding (amber — replica state across
+          // the dashboard is frozen), and process not detected at all (amber).
+          const reconcileFailing =
+            settings.provisioner_running &&
+            settings.provisioner_tick_status != null &&
+            settings.provisioner_tick_status !== "ok" &&
+            (settings.provisioner_held_secs ?? 0) > 60;
+          const healthyBox = settings.provisioner_running && !reconcileFailing;
+          return (
+            <div
+              className={
+                healthyBox
+                  ? "flex items-start gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
+                  : "flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-600 dark:text-amber-400"
+              }
+            >
+              <span
+                className={
+                  healthyBox
+                    ? "mt-1 inline-block h-2 w-2 shrink-0 rounded-full bg-emerald-500"
+                    : "mt-1 inline-block h-2 w-2 shrink-0 rounded-full bg-amber-500"
+                }
+              />
+              <span>
+                {healthyBox ? (
+                  <>
+                    <span className="font-medium">Provisioner running</span> — last polled{" "}
+                    {formatLastSeen(settings.provisioner_last_seen_secs)}.
+                    {settings.provisioner_version && (
+                      <>
+                        {" "}
+                        <span className="font-mono">
+                          v{settings.provisioner_version}
+                          {settings.provisioner_git_sha && (
+                            <span className="ml-1 text-xs opacity-70">
+                              {settings.provisioner_git_sha.slice(0, 7)}
+                            </span>
+                          )}
+                        </span>
+                      </>
+                    )}
+                  </>
+                ) : reconcileFailing ? (
+                  <>
+                    <span className="font-medium">Provisioner running, but reconciliation is failing</span>{" "}
+                    ({formatLastSeen(settings.provisioner_held_secs).replace(" ago", "")} and counting;
+                    last successful tick {formatLastSeen(settings.provisioner_last_ok_secs)}).
+                    {settings.provisioner_tick_detail && (
+                      <> Last error: <span className="font-mono text-xs">{settings.provisioner_tick_detail}</span>.</>
+                    )}{" "}
+                    Replica states shown on model pages are frozen until this clears — check that{" "}
+                    <code>slurmrestd</code> is reachable (Test connection below) and the JWT is valid.
+                  </>
+                ) : (
+                  <>
+                    <span className="font-medium">Provisioner not detected</span>{" "}
+                    (last polled {formatLastSeen(settings.provisioner_last_seen_secs)}). Enabling
+                    Slurm only stores these connection details — the separate{" "}
+                    <code>obleth-provisioner</code> process must be running for replicas to launch.
+                    In Kubernetes set <code>provisioner.enabled=true</code>; in Docker add{" "}
+                    <code>slurm</code> to <code>COMPOSE_PROFILES</code>.
+                  </>
+                )}
+              </span>
+            </div>
+          );
+        })()}
 
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-1.5">

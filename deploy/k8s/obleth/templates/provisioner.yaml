@@ -45,6 +45,7 @@ spec:
                   name: {{ include "obleth.secretName" . }}
                   key: OBLETH_ADMIN_TOKEN
             - { name: OBLETH_PROVISIONER_INTERVAL_SECS, value: {{ .Values.provisioner.intervalSecs | quote }} }
+            - { name: OBLETH_PROVISIONER_RESTART_AFTER_FAILURES, value: {{ .Values.provisioner.restartAfterFailures | quote }} }
             - { name: RUST_LOG, value: {{ .Values.provisioner.logLevel | quote }} }
           resources: {{- toYaml .Values.provisioner.resources | nindent 12 }}
 {{- end }}
