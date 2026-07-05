@@ -2561,23 +2561,24 @@ async fn get_key_usage(
         .next()
         .ok_or(AdminError::NotFound)?;
 
-    let summary = usage::query_key_usage_summary(&state.clickhouse, id, q.since_ms)
-        .await?
-        .unwrap_or(usage::KeyUsageSummary {
-            key_id: id,
-            tenant_id: key.tenant_id,
-            last_used_ms: 0,
-            last_model: String::new(),
-            last_status_code: 0,
-            requests: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-            cost_usd: 0.0,
-            energy_wh: 0.0,
-            energy_cost_usd: 0.0,
-            co2_g: 0.0,
-        });
+    let summary =
+        usage::query_key_usage_summary(&state.clickhouse, id, q.since_ms, q.include_internal)
+            .await?
+            .unwrap_or(usage::KeyUsageSummary {
+                key_id: id,
+                tenant_id: key.tenant_id,
+                last_used_ms: 0,
+                last_model: String::new(),
+                last_status_code: 0,
+                requests: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                cost_usd: 0.0,
+                energy_wh: 0.0,
+                energy_cost_usd: 0.0,
+                co2_g: 0.0,
+            });
     Ok(Json(summary))
 }
 
@@ -2685,7 +2686,7 @@ async fn get_costs(
         })
         .collect();
     Ok(Json(
-        usage::query_costs(&state.clickhouse, q.since_ms, &costs).await?,
+        usage::query_costs(&state.clickhouse, q.since_ms, q.include_internal, &costs).await?,
     ))
 }
 
@@ -2802,9 +2803,14 @@ async fn get_usage_breakdown(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageBreakdownQuery>,
 ) -> Result<Json<Vec<UsageBreakdownEntry>>> {
-    let rows =
-        usage::query_usage_breakdown_by_model(&state.clickhouse, &q.model, q.since_ms, q.limit)
-            .await?;
+    let rows = usage::query_usage_breakdown_by_model(
+        &state.clickhouse,
+        &q.model,
+        q.since_ms,
+        q.limit,
+        q.include_internal,
+    )
+    .await?;
 
     let tenant_meta: std::collections::HashMap<Uuid, (String, String)> = state
         .store
