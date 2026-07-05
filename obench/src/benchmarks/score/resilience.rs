@@ -9,17 +9,28 @@
 //! would just measure that floor; the ratio measures whether detection
 //! happened on the first possible probe cycle.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
 use serde::Serialize;
 
 use crate::benchmarks::score::{SectionId, SectionResult};
+use crate::engine::load::{ChatRequest, LoadClient, ProxyRequest};
+use crate::engine::stats::Stats;
 
 const DETECT_BUDGET_S: u64 = 150;
 const RECOVER_BUDGET_S: u64 = 150;
 const POLL_MS: u64 = 500;
 const LOAD_CONC: u32 = 4;
+/// Pace of the background load loop during resilience: one request per
+/// worker every `PACE_MS`, so `LOAD_CONC` workers produce roughly
+/// `LOAD_CONC * (1000 / PACE_MS)` req/s (~16 req/s at the defaults above).
+const PACE_MS: u64 = 250;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct ResilienceOutcome {
+    pub model: String,
     pub mttd_s: Option<f64>,
     pub mttr_s: Option<f64>,
     pub errors_before_detect: u64,
@@ -33,7 +44,10 @@ pub fn resilience_score(o: &ResilienceOutcome) -> (u8, Vec<String>) {
     let mut recs = Vec::new();
 
     let Some(mttd_s) = o.mttd_s else {
-        recs.push("gateway never marked the model unhealthy within the budget".to_string());
+        recs.push(format!(
+            "gateway never marked {} unhealthy within the budget",
+            o.model
+        ));
         return (10, recs);
     };
 
@@ -114,43 +128,29 @@ pub async fn run_resilience(
         .await?;
     let effective_interval_s = 60.0f64;
 
-    // Background light load so the passive tier has a signal.
-    let stats = std::sync::Arc::new(std::sync::Mutex::new(crate::engine::stats::Stats::default()));
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let client = std::sync::Arc::new(crate::engine::load::LoadClient::new(8));
+    // Background paced load so the passive tier has a signal — deliberately
+    // NOT `run_closed_loop` (that hammers as fast as it can, which is right
+    // for capacity/streaming/overhead but wrong here: once the fault goes
+    // live every request fails instantly, so a closed loop turns the outage
+    // into tens of thousands of req/s of 500s, flooding the telemetry
+    // pipeline for no benefit — measured at ~5.7k err/s / ~860k rows per run
+    // before this fix). `paced_load_loop` below keeps a steady trickle
+    // (~16 req/s) running through detection, the leak window, AND recovery:
+    // the post-recovery successes are what let the passive tier flip back to
+    // healthy, so MTTR stays measurable.
+    let stats = Arc::new(Mutex::new(Stats::default()));
+    let stop = Arc::new(AtomicBool::new(false));
+    let client = Arc::new(LoadClient::new(8));
     let loop_handle = {
         let (stats, stop, client) = (stats.clone(), stop.clone(), client.clone());
         let (proxy, k, m) = (proxy_base.to_string(), key.to_string(), model.to_string());
-        tokio::spawn(async move {
-            let make_req = move || {
-                crate::engine::load::ProxyRequest::Chat(crate::engine::load::ChatRequest {
-                    proxy_base: proxy.clone(),
-                    key: k.clone(),
-                    model: m.clone(),
-                    input_tokens: 32,
-                    output_tokens: 4,
-                    stream: false,
-                })
-            };
-            crate::engine::load::run_closed_loop(
-                client,
-                make_req,
-                crate::engine::load::RunConfig {
-                    conc: LOAD_CONC,
-                    duration_s: 0,
-                    warmup_s: 0,
-                },
-                stop,
-                stats,
-            )
-            .await;
-        })
+        tokio::spawn(async move { paced_load_loop(client, proxy, k, m, stop, stats).await })
     };
 
     // The whole scenario is wrapped so cleanup ALWAYS runs.
     let result = scenario(admin, ctl, model, &stats, effective_interval_s).await;
 
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
     let _ = loop_handle.await;
     let _ = ctl.set_fault(model, "ok").await;
     let _ = admin
@@ -166,11 +166,55 @@ pub async fn run_resilience(
     result
 }
 
+/// Steady background load for the resilience scenario: `LOAD_CONC` workers,
+/// each dispatching one non-streaming 4-token chat request and sleeping
+/// `PACE_MS` before the next, until `stop` is set. Deliberately local to this
+/// module rather than `run_closed_loop` — see the comment at its call site in
+/// `run_resilience` for why a closed loop is the wrong tool once the fault is
+/// live.
+async fn paced_load_loop(
+    client: Arc<LoadClient>,
+    proxy_base: String,
+    key: String,
+    model: String,
+    stop: Arc<AtomicBool>,
+    stats: Arc<Mutex<Stats>>,
+) {
+    let mut handles = Vec::new();
+    for _ in 0..LOAD_CONC {
+        let client = client.clone();
+        let (proxy_base, key, model) = (proxy_base.clone(), key.clone(), model.clone());
+        let stop = stop.clone();
+        let stats = stats.clone();
+        handles.push(tokio::spawn(async move {
+            loop {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let req = ProxyRequest::Chat(ChatRequest {
+                    proxy_base: proxy_base.clone(),
+                    key: key.clone(),
+                    model: model.clone(),
+                    input_tokens: 32,
+                    output_tokens: 4,
+                    stream: false,
+                });
+                let outcome = client.dispatch(&req).await;
+                stats.lock().unwrap().record(&outcome);
+                tokio::time::sleep(Duration::from_millis(PACE_MS)).await;
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.await;
+    }
+}
+
 async fn scenario(
     admin: &crate::admin::AdminClient,
     ctl: &crate::backend_ctl::BackendControl,
     model: &str,
-    stats: &std::sync::Arc<std::sync::Mutex<crate::engine::stats::Stats>>,
+    stats: &Arc<Mutex<Stats>>,
     effective_interval_s: f64,
 ) -> anyhow::Result<ResilienceOutcome> {
     let status_of = |health: &serde_json::Value| -> String {
@@ -182,8 +226,12 @@ async fn scenario(
             .to_string()
     };
 
-    // Let a little healthy traffic flow first.
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    // No healthy warm-up phase here (deliberately removed): any success this
+    // scenario itself streamed right before injecting sat inside the
+    // gateway's passive-signal look-back window (>=300s — see the module
+    // docs) and made the fault undetectable for the whole detect budget. The
+    // background paced load started in `run_resilience` is enough of a
+    // signal on its own once the fault flips it to failures.
 
     // Inject: model name keys the fault (backend matches by substring; the
     // obench-* names are non-overlapping — "turbo" only matches obench-turbo).
@@ -237,6 +285,7 @@ async fn scenario(
     }
 
     Ok(ResilienceOutcome {
+        model: model.to_string(),
         mttd_s,
         mttr_s,
         errors_before_detect,
@@ -251,6 +300,7 @@ mod tests {
 
     fn o(mttd: Option<f64>, mttr: Option<f64>, after: u64) -> ResilienceOutcome {
         ResilienceOutcome {
+            model: "obench-turbo".to_string(),
             mttd_s: mttd,
             mttr_s: mttr,
             errors_before_detect: 40,
