@@ -6,6 +6,10 @@ use anyhow::Result;
 
 use crate::engine::stats::{Summary, Verdict};
 
+/// Serializes tests that mutate the process-global BENCH_OUT_DIR env var.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn out_dir() -> PathBuf {
     let dir = std::env::var("BENCH_OUT_DIR").unwrap_or_else(|_| "/tmp/obleth-bench".to_string());
     let p = PathBuf::from(dir);
@@ -98,6 +102,9 @@ mod tests {
 
     #[test]
     fn write_and_append_roundtrip() {
+        let _guard = crate::report::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(
             "BENCH_OUT_DIR",
             std::env::temp_dir().join("obench-test").to_str().unwrap(),
@@ -111,6 +118,9 @@ mod tests {
 
     #[test]
     fn write_report_creates_md_file() {
+        let _guard = crate::report::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(
             "BENCH_OUT_DIR",
             std::env::temp_dir()
