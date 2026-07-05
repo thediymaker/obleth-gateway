@@ -50,6 +50,12 @@ const PROVISIONER_HEARTBEAT_KEY: &str = "obleth:provisioner:heartbeat";
 /// the "running" derivation built on it — is untouched; both share a TTL so they
 /// expire together when the provisioner stops.
 const PROVISIONER_VERSION_KEY: &str = "obleth:provisioner:version";
+/// Companion to the heartbeat holding the provisioner's last reconcile-tick
+/// outcome (JSON: status/detail/at/last_ok_at/since). The heartbeat proves the
+/// *process* is alive; this proves reconciliation is actually *succeeding* —
+/// a provisioner can poll green for days while every tick fails against
+/// slurmrestd and holds all replica state frozen.
+const PROVISIONER_TICK_KEY: &str = "obleth:provisioner:tick";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RedisError {
@@ -144,6 +150,23 @@ impl RedisStore {
     pub async fn get_provisioner_version(&self) -> Result<Option<String>> {
         let mut conn = self.conn.clone();
         let v: Option<String> = conn.get(PROVISIONER_VERSION_KEY).await?;
+        Ok(v)
+    }
+
+    /// Record the provisioner's last reconcile-tick outcome (an opaque JSON
+    /// blob), expiring after `ttl_secs`. Same rationale as the heartbeat: any
+    /// gateway pod may serve the provisioner's poll or the dashboard's read.
+    pub async fn set_provisioner_tick_status(&self, json: &str, ttl_secs: u64) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let _: () = conn.set_ex(PROVISIONER_TICK_KEY, json, ttl_secs).await?;
+        Ok(())
+    }
+
+    /// The provisioner's last-reported tick outcome (raw JSON), or `None` when
+    /// it hasn't reported within the TTL or never reported one.
+    pub async fn get_provisioner_tick_status(&self) -> Result<Option<String>> {
+        let mut conn = self.conn.clone();
+        let v: Option<String> = conn.get(PROVISIONER_TICK_KEY).await?;
         Ok(v)
     }
 

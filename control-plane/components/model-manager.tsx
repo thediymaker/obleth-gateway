@@ -1289,7 +1289,7 @@ function ModelDetailPanel({
             </div>
             <aside className="min-w-0 space-y-3 lg:self-start">
               <ProvisionErrorBanner modelId={model.id} />
-              <ReplicaPanel modelId={model.id} />
+              <ReplicaPanel modelId={model.id} healthStatus={summary.status} />
             </aside>
           </div>
         </TabsContent>

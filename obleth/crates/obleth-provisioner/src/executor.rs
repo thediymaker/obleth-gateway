@@ -102,6 +102,7 @@ pub async fn apply(
             replica_id,
             job_id,
             endpoint_id,
+            reason,
         } => {
             // Deregister the endpoint first so the proxy stops routing to this
             // backend immediately — otherwise it lingers in rotation (still
@@ -112,15 +113,18 @@ pub async fn apply(
                     tracing::warn!(endpoint_id = %ep, error = %e, "failed to deregister endpoint on cancel");
                 }
             }
+            let message = match reason {
+                CancelReason::ScaleDown => "scaled down",
+                CancelReason::OperatorRestart => "restart requested",
+                CancelReason::ProbeFailed => "restarting: failed health probes while job running",
+            };
+            if *reason == CancelReason::ProbeFailed {
+                tracing::warn!(%replica_id, %job_id, model = model_name,
+                    "self-heal: cancelling zombie replica (job RUNNING, probes failing)");
+            }
             slurm.cancel(job_id).await?;
             obleth
-                .patch_replica(
-                    *replica_id,
-                    Some("draining"),
-                    None,
-                    None,
-                    Some("scaled down"),
-                )
+                .patch_replica(*replica_id, Some("draining"), None, None, Some(message))
                 .await?;
         }
         Action::Delete { replica_id } => {
@@ -387,6 +391,7 @@ mod tests {
                 replica_id: rid,
                 job_id: "j9".into(),
                 endpoint_id: Some(ep),
+                reason: CancelReason::ScaleDown,
             },
             Uuid::new_v4(),
             "nemotron",
@@ -418,6 +423,7 @@ mod tests {
                 replica_id: rid,
                 job_id: "j9".into(),
                 endpoint_id: None,
+                reason: CancelReason::ScaleDown,
             },
             Uuid::new_v4(),
             "nemotron",
