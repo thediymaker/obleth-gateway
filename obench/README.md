@@ -155,8 +155,8 @@ Flags:
 - `--max-conc <n>` — cap the capacity ramp (default 256; the safety valve for
   live targets).
 - `--backend-base <url>` — where benchmark-backend is reachable from the
-  machine running obench (default `http://localhost:8081`); used by the
-  overhead section's direct leg and by fault injection.
+  machine running obench (default `http://localhost:8081`, env `BACKEND_BASE`);
+  used by the overhead section's direct leg and by fault injection.
 - `--baseline <path>` — diff against an explicit scorecard JSON. Without it,
   the newest `scorecards/<target>-<ts>.json` in `BENCH_OUT_DIR` is used
   automatically, so back-to-back runs self-compare.
@@ -167,7 +167,14 @@ Flags:
   rise versus the previous run.
 - `--compression-model` / `--compression-key` — include the compression A/B as
   a scored section (needs a model with the `compression` boon and a key that
-  can call it).
+  can call it; the section calls the admin API to enable/restore the boon, so
+  it needs `--admin-base` to be reachable).
+
+`obench score` exits `0` on a normal run, `1` if `--fail-under` is set and the
+system score misses it (or a regression was flagged), and `130` if Ctrl-C
+interrupted the run — every in-flight section is stopped, teardown still
+runs, and any fault the resilience section had injected is cleared before
+exit.
 
 Artifacts, all in `BENCH_OUT_DIR`: `scorecard.md` (the printed report),
 `scorecard.json` (machine-readable, full per-section metrics), and a dated

@@ -29,12 +29,6 @@ impl BackendControl {
         Ok(())
     }
 
-    #[allow(dead_code)] // consumed in task 10
-    pub async fn stats(&self) -> Result<serde_json::Value> {
-        let url = format!("{}/stats", self.base);
-        Ok(self.http.get(&url).send().await?.json().await?)
-    }
-
     pub async fn healthy(&self) -> bool {
         let url = format!("{}/health", self.base);
         matches!(self.http.get(&url).send().await, Ok(r) if r.status().is_success())
