@@ -117,7 +117,7 @@ export function SettingsTabs({
       </TabsContent>
 
       <TabsContent value="assistant">
-        <CharoSettingsForm settings={charo} />
+        <CharoSettingsForm settings={charo} models={models} />
       </TabsContent>
 
       <TabsContent value="about">{versionCard}</TabsContent>
