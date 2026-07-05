@@ -22,11 +22,10 @@ use crate::{
     SetModelCache, SetModelCapacity, SetModelCapacityMode, SetModelReliability, SetModelWeight,
     SetTenantAllowlist, SetTenantBudget, SetTenantCompression, SetTenantGuardrails,
     SetTenantSchedule, SetTenantStatus, SetTenantSynthetic, TenantFairshareView, TestAlertResult,
-    TestEnergyQuery,
-    UpdateAlertSettings, UpdateAutoRouterSettings, UpdateBoonSettings, UpdateEmailSettings,
-    UpdateEnergySettings, UpdateGroupWeight, UpdateKey, UpdateMcpServer, UpdateModel,
-    UpdateModelEndpoint, UpdateQuota, UpdateTenant, UpdateTenantGroup, UpdateUsageRetention,
-    UpdateWeight, UsageRetentionView,
+    TestEnergyQuery, UpdateAlertSettings, UpdateAutoRouterSettings, UpdateBoonSettings,
+    UpdateEmailSettings, UpdateEnergySettings, UpdateGroupWeight, UpdateKey, UpdateMcpServer,
+    UpdateModel, UpdateModelEndpoint, UpdateQuota, UpdateTenant, UpdateTenantGroup,
+    UpdateUsageRetention, UpdateWeight, UsageRetentionView,
 };
 use obleth_config::{
     ApiKey, ApiKeyBackup, AppSettingBackup, BackupData, BackupEncryption, CompressionPolicy,

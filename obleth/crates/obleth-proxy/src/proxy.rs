@@ -3004,9 +3004,9 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        backoff_for, build_targets, build_upstream_url, effective_request_type,
-        has_path_traversal, is_retryable_status, prepare_upstream_body, resolve_conversation,
-        session_hash_order, tenant_active_now, weighted_order,
+        backoff_for, build_targets, build_upstream_url, effective_request_type, has_path_traversal,
+        is_retryable_status, prepare_upstream_body, resolve_conversation, session_hash_order,
+        tenant_active_now, weighted_order,
     };
     use axum::http::HeaderMap;
     use chrono::{DateTime, TimeZone, Utc};
