@@ -82,6 +82,10 @@ struct Wizard {
     comp_key: String,
     // settings form cursor (0 = profile, 1 = concurrency, 2 = output, 3 = prompt)
     settings_row: usize,
+    /// True when the wizard was entered via the "system score" PickBench entry.
+    /// Score reuses the target/live/demo wizard steps but has no profile, so it
+    /// skips `Step::Settings` and jumps straight to `Step::Review`.
+    score_mode: bool,
 }
 
 impl Wizard {
@@ -137,6 +141,7 @@ impl Wizard {
             comp_model: String::new(),
             comp_key: String::new(),
             settings_row: 0,
+            score_mode: false,
         }
     }
 
@@ -306,22 +311,53 @@ fn review_items(w: &Wizard) -> Vec<(String, ReviewAction)> {
         }
     }
 
-    v.push((
-        format!(
-            "load:      {} · {} workers · out {} · in {} tokens",
-            format!("{:?}", w.profile).to_lowercase(),
-            w.conc,
-            w.output_tokens,
-            w.input_tokens
-        ),
-        ReviewAction::Goto(Step::Settings),
-    ));
-    v.push(("run benchmark".to_string(), ReviewAction::Run));
+    if w.score_mode {
+        let sections: Vec<&str> = crate::benchmarks::score::weights(w.target)
+            .iter()
+            .map(|(id, _)| id.name())
+            .collect();
+        let n_models = match w.target {
+            Target::Demo => {
+                if w.fixture_all {
+                    fixture_model_list().len()
+                } else {
+                    1
+                }
+            }
+            Target::Live => w.selected_live_models().len(),
+        };
+        v.push((
+            format!("sections:  {} on {n_models} model(s)", sections.join(", ")),
+            ReviewAction::Goto(Step::PickBench),
+        ));
+        v.push(("run system score".to_string(), ReviewAction::Run));
+    } else {
+        v.push((
+            format!(
+                "load:      {} · {} workers · out {} · in {} tokens",
+                format!("{:?}", w.profile).to_lowercase(),
+                w.conc,
+                w.output_tokens,
+                w.input_tokens
+            ),
+            ReviewAction::Goto(Step::Settings),
+        ));
+        v.push(("run benchmark".to_string(), ReviewAction::Run));
+    }
     v
 }
 
 /// Optional advisory note shown under the review rows (e.g. the fairshare hint).
 fn review_note(w: &Wizard) -> Option<String> {
+    if w.score_mode {
+        // Only live scores cost real money/tokens — demo drives the GPU-free
+        // backend, so there's nothing to warn about there.
+        if w.target == Target::Live {
+            let models = w.selected_live_models().len().max(1);
+            return Some(estimate_score_note(models, 256));
+        }
+        return None;
+    }
     if w.target == Target::Live {
         let withsec = w
             .keys
@@ -336,6 +372,17 @@ fn review_note(w: &Wizard) -> Option<String> {
         }
     }
     None
+}
+
+/// Rough time/cost expectation shown on the review screen before a live system
+/// score run: capacity ramps drive real, billable requests up to `max_conc`.
+/// `mins` is a coarse estimate, not a measured figure — it exists to set
+/// expectations, not to be precise.
+fn estimate_score_note(models: usize, max_conc: u32) -> String {
+    let mins = models * 2 + 3;
+    format!(
+        "estimated runtime ~{mins} min; capacity ramps send real requests up to conc {max_conc} — this costs real tokens"
+    )
 }
 
 /// Translate the wizard into the scope + optional in-memory live config used to
@@ -441,6 +488,7 @@ async fn run_state_machine(
                 let kinds: &[(&str, &str)] = &[
                     ("load / readiness", "Drive concurrent load and get a PASS/FAIL verdict on whether the gateway stays up (demo or live)."),
                     ("compression savings", "Back-to-back A/B measuring how much the compression boon saves + the latency crossover."),
+                    ("system score", "Benchmark every measurable aspect — capacity, overhead, overload, streaming, resilience, fairshare — and get a graded scorecard. Live scores your real models; demo scores the gateway itself."),
                 ];
                 terminal.draw(|f| draw_pick_scope(f, w.target, kinds, w.cursor))?;
             }
@@ -563,13 +611,22 @@ async fn run_state_machine(
             Step::PickBench => match code {
                 KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
                 KeyCode::Up => w.cursor = w.cursor.saturating_sub(1),
-                KeyCode::Down => w.cursor = (w.cursor + 1).min(1),
+                KeyCode::Down => w.cursor = (w.cursor + 1).min(2),
                 KeyCode::Enter | KeyCode::Char(' ') => {
-                    if w.cursor == 0 {
-                        w.step = Step::PickTarget; // load flow, unchanged
-                    } else {
-                        w.input = w.comp_model.clone();
-                        w.step = Step::CompressionModel;
+                    match w.cursor {
+                        0 => {
+                            w.score_mode = false;
+                            w.step = Step::PickTarget; // load flow, unchanged
+                        }
+                        1 => {
+                            w.score_mode = false;
+                            w.input = w.comp_model.clone();
+                            w.step = Step::CompressionModel;
+                        }
+                        _ => {
+                            w.score_mode = true;
+                            w.step = Step::PickTarget;
+                        }
                     }
                     w.cursor = 0;
                 }
@@ -823,8 +880,13 @@ async fn run_state_machine(
                 }
                 KeyCode::Enter if w.live_selected.iter().any(|s| *s) => {
                     w.clamp_profile();
-                    w.step = Step::Settings;
-                    w.settings_row = 0;
+                    if w.score_mode {
+                        w.step = Step::Review;
+                        w.cursor = review_items(&w).len().saturating_sub(1);
+                    } else {
+                        w.step = Step::Settings;
+                        w.settings_row = 0;
+                    }
                 }
                 _ => {}
             },
@@ -840,13 +902,19 @@ async fn run_state_machine(
                     if w.cursor == 0 {
                         w.fixture_all = true;
                         w.clamp_profile();
-                        w.step = Step::Settings;
-                        w.settings_row = 0;
+                        if w.score_mode {
+                            w.step = Step::Review;
+                            w.cursor = review_items(&w).len().saturating_sub(1);
+                        } else {
+                            w.step = Step::Settings;
+                            w.settings_row = 0;
+                            w.cursor = 0;
+                        }
                     } else {
                         w.fixture_all = false;
                         w.step = Step::FixtureModel;
+                        w.cursor = 0;
                     }
-                    w.cursor = 0;
                 }
                 _ => {}
             },
@@ -863,8 +931,14 @@ async fn run_state_machine(
                     KeyCode::Enter | KeyCode::Char(' ') => {
                         w.fixture_model = models[w.cursor].clone();
                         w.clamp_profile();
-                        w.step = Step::Settings;
-                        w.settings_row = 0;
+                        if w.score_mode {
+                            w.step = Step::Review;
+                            w.cursor = review_items(&w).len().saturating_sub(1);
+                        } else {
+                            w.step = Step::Settings;
+                            w.settings_row = 0;
+                            w.cursor = 0;
+                        }
                     }
                     _ => {}
                 }
@@ -920,8 +994,22 @@ async fn run_state_machine(
                 let items = review_items(&w);
                 match code {
                     KeyCode::Char('q') | KeyCode::Esc => {
-                        w.step = Step::Settings;
-                        w.settings_row = 0;
+                        if w.score_mode {
+                            w.step = match w.target {
+                                Target::Demo => {
+                                    if w.fixture_all {
+                                        Step::FixtureScope
+                                    } else {
+                                        Step::FixtureModel
+                                    }
+                                }
+                                Target::Live => Step::LivePickModels,
+                            };
+                        } else {
+                            w.step = Step::Settings;
+                            w.settings_row = 0;
+                        }
+                        w.cursor = 0;
                     }
                     KeyCode::Up => w.cursor = w.cursor.saturating_sub(1),
                     KeyCode::Down => w.cursor = (w.cursor + 1).min(items.len().saturating_sub(1)),
@@ -939,6 +1027,68 @@ async fn run_state_machine(
                                     w.error = msg;
                                     w.return_to = Step::Review;
                                     w.step = Step::Error;
+                                } else if w.score_mode {
+                                    crate::persist::save(&w.to_saved());
+                                    let (scope, live_cfg) = build_run_inputs(&w);
+                                    let mut run_cli = cli.clone();
+                                    run_cli.target = Some(w.target);
+                                    match &scope {
+                                        Scope::Single(name) => {
+                                            run_cli.model = Some(name.clone());
+                                            run_cli.all = false;
+                                        }
+                                        Scope::All => {
+                                            run_cli.model = None;
+                                            run_cli.all = true;
+                                        }
+                                    }
+                                    let sargs = crate::cli::ScoreArgs {
+                                        quick: false,
+                                        skip: vec![],
+                                        only: vec![],
+                                        max_conc: 256,
+                                        backend_base: std::env::var("BACKEND_BASE")
+                                            .unwrap_or_else(|_| "http://localhost:8081".into()),
+                                        baseline: None,
+                                        fail_under: None,
+                                        compression_model: None,
+                                        compression_key: None,
+                                    };
+                                    crossterm::terminal::disable_raw_mode()?;
+                                    crossterm::execute!(
+                                        terminal.backend_mut(),
+                                        crossterm::terminal::LeaveAlternateScreen
+                                    )?;
+                                    let res = match w.target {
+                                        Target::Demo => {
+                                            crate::benchmarks::score::run(&run_cli, &sargs, None)
+                                                .await
+                                        }
+                                        Target::Live => {
+                                            crate::benchmarks::score::run(
+                                                &run_cli,
+                                                &sargs,
+                                                live_cfg.as_ref(),
+                                            )
+                                            .await
+                                        }
+                                    };
+                                    println!("\n[press Enter to return to obench]");
+                                    let mut _line = String::new();
+                                    let _ = std::io::stdin().read_line(&mut _line);
+                                    crossterm::terminal::enable_raw_mode()?;
+                                    crossterm::execute!(
+                                        terminal.backend_mut(),
+                                        crossterm::terminal::EnterAlternateScreen
+                                    )?;
+                                    if let Err(e) = res {
+                                        w.error = format!("system score run failed: {e}");
+                                        w.return_to = Step::PickBench;
+                                        w.step = Step::Error;
+                                    } else {
+                                        w.step = Step::PickBench;
+                                    }
+                                    w.cursor = 0;
                                 } else {
                                     crate::persist::save(&w.to_saved());
                                     let (scope, live_cfg) = build_run_inputs(&w);
@@ -1755,4 +1905,16 @@ fn draw_message(f: &mut Frame, title: &str, lines: &[String], color: Color) {
 
     let help = Paragraph::new("[any key] dismiss").style(Style::default().fg(theme::MUTED));
     f.render_widget(help, chunks[2]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn score_note_scales_with_models() {
+        let n = estimate_score_note(4, 256);
+        assert!(n.contains("~11 min"));
+        assert!(n.contains("256"));
+    }
 }
