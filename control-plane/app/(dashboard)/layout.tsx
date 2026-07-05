@@ -14,7 +14,14 @@ export default async function DashboardLayout({ children }: { children: React.Re
 
   // Charo is enabled by default; only hide it when the operator has explicitly
   // turned it off in Settings. If the gateway is unreachable, fail open (show it).
-  const charo = await safe(obleth.getCharoSettings(), { enabled: true });
+  const charo = await safe(obleth.getCharoSettings(), {
+    enabled: true,
+    brain_model: null,
+    tools_enabled: {},
+    bench_max_concurrency: 40,
+    bench_max_duration_s: 120,
+    bench_max_requests: 500,
+  });
 
   return (
     <AppShell username={session.email} version={CONTROL_PLANE_VERSION}>
