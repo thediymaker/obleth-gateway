@@ -158,10 +158,16 @@ pub fn diff(current: &Scorecard, baseline: &Scorecard) -> Vec<Regression> {
 
 /// Caps each affected section's score at 60. Does not recompute the system
 /// score — that's the orchestrator's job, since it alone knows the weights.
+/// Does recompute the section's own `grade` string, since a capped score can
+/// drop it a letter grade (e.g. A/100 -> C/60) and leaving the stale letter
+/// behind would show `"score": 60, "grade": "A"` in both the table and JSON.
 pub fn apply_regressions(card: &mut Scorecard, regressions: &[Regression]) {
     for reg in regressions {
         if let Some(sec) = card.sections.iter_mut().find(|s| s.id == reg.section) {
             sec.score = sec.score.map(|s| s.min(60));
+            if let Some(s) = sec.score {
+                sec.grade = grade_from_score(s).letter().to_string();
+            }
         }
     }
 }
@@ -369,6 +375,7 @@ mod tests {
         }];
         apply_regressions(&mut cur, &regs);
         assert_eq!(cur.sections[0].score, Some(60));
+        assert_eq!(cur.sections[0].grade, "C");
     }
 
     #[test]
