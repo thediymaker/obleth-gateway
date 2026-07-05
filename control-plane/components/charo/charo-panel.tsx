@@ -13,6 +13,8 @@ import {
 import { cn } from "@/lib/utils";
 import type { ModelRoute } from "@/lib/obleth";
 import { TraceCard } from "./trace-card";
+import { resultRenderer } from "./results/registry";
+import { BenchResultCard } from "./results/bench-result-card";
 import type { useCharoStream } from "./use-charo-stream";
 import type { CharoState } from "./sprite";
 
@@ -86,7 +88,7 @@ export function CharoPanel({
   stream: Stream;
   mascotState: CharoState;
 }) {
-  const { messages, busy, send, reset } = stream;
+  const { messages, busy, send, reset, runToolDirect } = stream;
   const [models, setModels] = useState<ModelRoute[]>([]);
   const [modelId, setModelId] = useState("");
   const [text, setText] = useState("");
@@ -327,6 +329,15 @@ export function CharoPanel({
                 />
               </div>
             )}
+            {m.role === "assistant" && (m.liveSteps?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0 && (
+              <div className="w-full">
+                <BenchResultCard data={{ modelName: selected?.model_name, steps: m.liveSteps }} />
+              </div>
+            )}
+            {m.role === "assistant" && m.toolResults?.map((tr, i) => {
+              const Renderer = resultRenderer(tr.type);
+              return <div key={i} className="w-full"><Renderer data={tr.data} /></div>;
+            })}
           </div>
         ))}
       </div>
@@ -346,6 +357,16 @@ export function CharoPanel({
                 {p.label}
               </button>
             ))}
+            {selected && (
+              <button
+                type="button"
+                onClick={() => selected && runToolDirect("run_benchmark", { model: selected.model_name, steps: [1, 5, 10], step_duration_s: 5 })}
+                disabled={busy || !selected}
+                className="rounded-full border border-violet-400/40 px-2.5 py-0.5 text-xs text-violet-600 transition-colors hover:bg-violet-500/10 disabled:opacity-50 dark:text-violet-300"
+              >
+                Benchmark this model
+              </button>
+            )}
           </div>
         )}
 
