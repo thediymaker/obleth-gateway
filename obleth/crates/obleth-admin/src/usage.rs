@@ -143,8 +143,8 @@ pub struct UsageLogQuery {
     /// When `true`, return only requests that have at least one span in
     /// ClickHouse (i.e. were traced).
     pub traced_only: Option<bool>,
-    /// When true, include internal traffic (e.g. health probes) that is hidden
-    /// from the request log by default.
+    /// When true, include internal traffic (health probes, benchmark runs)
+    /// that is hidden from the request log by default.
     pub include_internal: Option<bool>,
 }
 

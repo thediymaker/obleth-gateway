@@ -667,9 +667,23 @@ pub(crate) async fn chat_call_completion(
     }
 }
 
+/// Label override for helper-call usage rows: synthetic tenants' helper calls
+/// (vision, tool loop, guardrails, ...) are tagged `benchmark` just like their
+/// main-path requests, so default usage/cost reads exclude them uniformly.
+/// Everything else keeps the boon's own label.
+fn helper_request_type<'a>(key: &ResolvedKey, label: &'a str) -> &'a str {
+    if key.synthetic {
+        obleth_config::BENCHMARK_REQUEST_TYPE
+    } else {
+        label
+    }
+}
+
 /// Record a helper-model call against the tenant's ledger so the cost of the
 /// boon is attributed and visible in the request log. `request_type` labels
-/// the boon (e.g. `vision_boon`, `structured_output_boon`).
+/// the boon (e.g. `vision_boon`, `structured_output_boon`), unless `key` is a
+/// synthetic tenant, in which case it is stamped `benchmark` instead (see
+/// [`helper_request_type`]).
 pub(crate) fn bill_helper_call(
     state: &AppState,
     helper: &ResolvedModel,
@@ -679,6 +693,7 @@ pub(crate) fn bill_helper_call(
     input_tokens: u32,
     output_tokens: u32,
 ) {
+    let request_type = helper_request_type(key, request_type);
     let total_tokens = input_tokens.saturating_add(output_tokens);
     let cost_usd = (input_tokens as f64) * helper.input_cost_per_token
         + (output_tokens as f64) * helper.output_cost_per_token;
@@ -807,6 +822,19 @@ mod tests {
         };
         k.compression_policy = policy;
         k
+    }
+
+    #[test]
+    fn helper_request_type_tags_synthetic_tenants_as_benchmark() {
+        let mut key = test_key_with_policy(None);
+
+        assert_eq!(helper_request_type(&key, "vision_boon"), "vision_boon");
+
+        key.synthetic = true;
+        assert_eq!(
+            helper_request_type(&key, "vision_boon"),
+            obleth_config::BENCHMARK_REQUEST_TYPE
+        );
     }
 
     #[test]
