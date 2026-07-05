@@ -4,6 +4,10 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## Unreleased
+
+- **Synthetic-tenant tagging** — tenants can be flagged synthetic (obench seeds its fixture tenants that way); their traffic is recorded as benchmark traffic and, together with health probes, excluded from usage and cost stats by default (`include_internal=true` opts back in). Benchmark traffic never enters the permanent daily rollup.
+
 ## v0.7.2
 
 Chargeback-ready reports: filter and group historical usage by team and API key, with spend visible everywhere — plus a compression fix for fenced code.
