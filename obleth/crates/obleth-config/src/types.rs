@@ -102,6 +102,11 @@ pub struct Tenant {
     /// Per-tenant compression policy. `None` means follow the global default.
     #[serde(default)]
     pub compression_policy: Option<CompressionPolicy>,
+    /// Synthetic tenants generate benchmark/test traffic. The proxy tags their
+    /// requests `request_type = "benchmark"`, which default usage/cost reads
+    /// exclude.
+    #[serde(default)]
+    pub synthetic: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -225,6 +230,10 @@ pub struct ResolvedKey {
     /// global default for eligible models.
     #[serde(default)]
     pub compression_policy: Option<CompressionPolicy>,
+    /// Mirrors `Tenant::synthetic`: requests from this key are tagged as
+    /// benchmark traffic in the usage ledger.
+    #[serde(default)]
+    pub synthetic: bool,
 }
 
 /// Outcome of admission for a single request, recorded in telemetry.

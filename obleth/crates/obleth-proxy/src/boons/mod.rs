@@ -803,6 +803,7 @@ mod tests {
             tracing_enabled: false,
             guardrails_policy: None,
             compression_policy: None,
+            synthetic: false,
         };
         k.compression_policy = policy;
         k
@@ -843,6 +844,7 @@ mod tests {
                 tracing_enabled: false,
                 guardrails_policy: None,
                 compression_policy: None,
+                synthetic: false,
             }
         }
 
