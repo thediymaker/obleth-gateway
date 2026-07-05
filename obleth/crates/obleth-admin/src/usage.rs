@@ -5,6 +5,28 @@ use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
+/// `request_type` labels for gateway-internal traffic: health probes and
+/// benchmark runs from synthetic tenants. Default usage/cost reads exclude
+/// them; pass `include_internal=true` to opt back in.
+pub const INTERNAL_REQUEST_TYPES: &[&str] = &[
+    crate::model_health::HEALTH_PROBE_REQUEST_TYPE,
+    obleth_config::BENCHMARK_REQUEST_TYPE,
+];
+
+/// SQL fragment excluding internal traffic unless explicitly included. The
+/// labels are compile-time constants, so inlining them is injection-safe.
+fn internal_filter(include_internal: Option<bool>) -> String {
+    if include_internal == Some(true) {
+        return String::new();
+    }
+    let list = INTERNAL_REQUEST_TYPES
+        .iter()
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(" and request_type not in ({list})")
+}
+
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
 pub struct UsageQuery {
     #[schema(value_type = Option<String>)]
@@ -19,6 +41,9 @@ pub struct UsageQuery {
     /// Cap the number of returned rows (highest-volume first). Critical for
     /// per-key reads where a tenant fleet can hold 100k+ keys.
     pub limit: Option<u64>,
+    /// When true, include internal traffic (health probes, benchmark runs)
+    /// that is excluded from this read by default.
+    pub include_internal: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, IntoParams, ToSchema)]
@@ -31,6 +56,9 @@ pub struct UsageSeriesQuery {
     pub since_ms: Option<i64>,
     /// Bucket width in milliseconds. Default 300_000 (5 minutes).
     pub bucket_ms: Option<i64>,
+    /// When true, include internal traffic (health probes, benchmark runs)
+    /// that is excluded from this read by default.
+    pub include_internal: Option<bool>,
 }
 
 /// Filters for the per-model tenant/key breakdown
@@ -44,6 +72,9 @@ pub struct UsageBreakdownQuery {
     pub since_ms: Option<i64>,
     /// Cap on rows returned (busiest tenant/key pairs first).
     pub limit: Option<u64>,
+    /// When true, include internal traffic (health probes, benchmark runs)
+    /// that is excluded from this read by default.
+    pub include_internal: Option<bool>,
 }
 
 /// Date-range read against the permanent daily rollup (`usage_daily`).
@@ -187,13 +218,7 @@ pub async fn query_usage_logs(
     if q.session_id.is_some() {
         sql.push_str(" and session_id = ?");
     }
-    if q.include_internal != Some(true) {
-        // `health_probe` is a literal constant, no bind needed / no injection surface.
-        sql.push_str(&format!(
-            " and request_type != '{}'",
-            obleth_admin_health_probe_label()
-        ));
-    }
+    sql.push_str(&internal_filter(q.include_internal));
     match q.status.as_deref() {
         Some("success") => sql.push_str(" and status_code >= 200 and status_code < 400"),
         Some("error") => sql.push_str(" and status_code >= 400"),
@@ -476,6 +501,7 @@ pub async fn query_usage(
             if q.model.is_some() {
                 sql.push_str(" and model = ?");
             }
+            sql.push_str(&internal_filter(q.include_internal));
             sql.push_str(" group by tenant_id");
             bind_usage_filters(client.query(&sql).bind(since), &q)
                 .fetch_all::<UsageAgg>()
@@ -502,6 +528,7 @@ pub async fn query_usage_by_key(
     if q.key_id.is_some() {
         sql.push_str(" and key_id = toUUID(?)");
     }
+    sql.push_str(&internal_filter(q.include_internal));
     sql.push_str(" group by key_id, tenant_id order by total_tok desc");
     if let Some(limit) = q.limit {
         sql.push_str(&format!(" limit {}", limit.min(10_000)));
@@ -526,6 +553,9 @@ pub struct KeyUsageSummaryQuery {
     pub since_ms: Option<i64>,
     /// Cap on rows returned by the bulk feed (busiest keys first).
     pub limit: Option<u64>,
+    /// When true, include internal traffic (health probes, benchmark runs)
+    /// that is excluded from this read by default.
+    pub include_internal: Option<bool>,
 }
 
 /// ClickHouse row for per-key summary queries. Aggregate aliases intentionally
@@ -610,9 +640,11 @@ pub async fn query_key_usage_summary(
     client: &clickhouse::Client,
     key_id: Uuid,
     since_ms: Option<i64>,
+    include_internal: Option<bool>,
 ) -> Result<Option<KeyUsageSummary>, clickhouse::error::Error> {
     let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let sql = "select \
+    let sql = format!(
+        "select \
          key_id, \
          any(tenant_id) as tenant_id, \
          max(ts_ms) as last_used_ms, \
@@ -626,9 +658,11 @@ pub async fn query_key_usage_summary(
          sumIf(energy_wh, ts_ms >= ?) as e_wh, \
          sumIf(energy_cost_usd, ts_ms >= ?) as e_cost_usd, \
          sumIf(co2_g, ts_ms >= ?) as e_co2_g \
-         from usage where key_id = toUUID(?) group by key_id";
+         from usage where key_id = toUUID(?){} group by key_id",
+        internal_filter(include_internal)
+    );
     let rows = client
-        .query(sql)
+        .query(&sql)
         .bind(since)
         .bind(since)
         .bind(since)
@@ -673,6 +707,7 @@ pub async fn query_keys_usage_summary(
         // Qualify the raw column so the SELECT alias `tenant_id` cannot shadow it.
         sql.push_str(" and usage.tenant_id = toUUID(?)");
     }
+    sql.push_str(&internal_filter(q.include_internal));
     sql.push_str(&format!(
         " group by key_id order by total_tok desc limit {limit}"
     ));
@@ -714,6 +749,7 @@ pub async fn query_usage_by_model(
     if q.model.is_some() {
         sql.push_str(" and model = ?");
     }
+    sql.push_str(&internal_filter(q.include_internal));
     sql.push_str(" group by model order by total_tok desc");
     bind_usage_filters(client.query(&sql).bind(since), &q)
         .fetch_all::<UsageModelAgg>()
@@ -737,6 +773,7 @@ pub async fn query_usage_series(
     if q.tenant_id.is_some() {
         sql.push_str(" and tenant_id = toUUID(?)");
     }
+    sql.push_str(&internal_filter(q.include_internal));
     sql.push_str(" group by bucket_ms order by bucket_ms");
     let mut query = client.query(&sql).bind(since);
     if let Some(tid) = q.tenant_id {
@@ -751,12 +788,13 @@ pub async fn query_usage_series_by_tenant(
 ) -> Result<Vec<TenantUsageTimePoint>, clickhouse::error::Error> {
     let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
     let bucket = q.bucket_ms.unwrap_or(300_000).max(10_000);
+    let filter = internal_filter(q.include_internal);
     let sql = format!(
         "select tenant_id, intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
          count() as requests, \
          sum(input_tokens) + sum(output_tokens) as total_tokens, \
          sum(energy_wh) as energy_wh \
-         from usage where ts_ms >= ? \
+         from usage where ts_ms >= ?{filter} \
          group by tenant_id, bucket_ms order by bucket_ms, tenant_id"
     );
     client
@@ -777,6 +815,7 @@ pub async fn query_usage_series_by_model(
 ) -> Result<Vec<ModelUsageTimePoint>, clickhouse::error::Error> {
     let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
     let bucket = q.bucket_ms.unwrap_or(300_000).max(10_000);
+    let filter = internal_filter(q.include_internal);
     // Per-stream engine rates, NOT volume-over-wall-clock. `gen_tps` is the
     // median decode rate (output tokens over the decode window = total - ttft,
     // falling back to total - queue when the response wasn't streamed), the same
@@ -798,7 +837,7 @@ pub async fn query_usage_series_by_model(
          round(if(countIf(total_ms > 0) > 0, avgIf(total_ms, total_ms > 0), 0), 1) as avg_total, \
          round(if(countIf(total_ms > 0) > 0, quantileIf(0.5)(total_ms, total_ms > 0), 0), 1) as p50_total, \
          sum(energy_wh) as energy_wh \
-         from usage where ts_ms >= ? and model = ? \
+         from usage where ts_ms >= ? and model = ?{filter} \
          group by bucket_ms order by bucket_ms"
     );
     let model = q.model.unwrap_or_default();
@@ -818,9 +857,11 @@ pub async fn query_usage_breakdown_by_model(
     model: &str,
     since_ms: Option<i64>,
     limit: Option<u64>,
+    include_internal: Option<bool>,
 ) -> Result<Vec<UsageKeyModelBreakdown>, clickhouse::error::Error> {
     let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
     let limit = limit.unwrap_or(100).min(1000);
+    let filter = internal_filter(include_internal);
     let sql = format!(
         "select key_id, tenant_id, count() as requests, \
          sum(input_tokens) + sum(output_tokens) as total_tokens, \
@@ -828,7 +869,7 @@ pub async fn query_usage_breakdown_by_model(
          quantileIf(0.5)(output_tokens / (greatest(if(total_ms - ttft_ms >= 20, total_ms - ttft_ms, total_ms - queue_wait_ms), 1) / 1000.), \
          total_ms >= 20 and output_tokens >= 1), 0), 1) as gen_tps, \
          sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
-         from usage where ts_ms >= ? and model = ? \
+         from usage where ts_ms >= ? and model = ?{filter} \
          group by key_id, tenant_id order by total_tokens desc limit {limit}"
     );
     client
@@ -856,6 +897,7 @@ pub async fn query_cache_stats(
     if q.model.is_some() {
         sql.push_str(" and model = ?");
     }
+    sql.push_str(&internal_filter(q.include_internal));
     let mut query = client.query(&sql).bind(since);
     if let Some(tid) = q.tenant_id {
         query = query.bind(tid.to_string());
@@ -874,6 +916,7 @@ pub async fn query_cache_stats(
 pub async fn query_costs(
     client: &clickhouse::Client,
     since_ms: Option<i64>,
+    include_internal: Option<bool>,
     model_costs: &[(String, f64, f64)],
 ) -> Result<Vec<CostAgg>, clickhouse::error::Error> {
     // One row per model from the raw ledger, carrying the authoritative spend
@@ -889,13 +932,15 @@ pub async fn query_costs(
         total_cost: f64,
     }
     let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let filter = internal_filter(include_internal);
+    let sql = format!(
+        "select model, count() as requests, \
+         sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens, \
+         sum(cost_usd) as total_cost \
+         from usage where ts_ms >= ?{filter} group by model order by total_cost desc"
+    );
     let rows = client
-        .query(
-            "select model, count() as requests, \
-             sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens, \
-             sum(cost_usd) as total_cost \
-             from usage where ts_ms >= ? group by model order by total_cost desc",
-        )
+        .query(&sql)
         .bind(since)
         .fetch_all::<CostRawRow>()
         .await?;
@@ -1060,10 +1105,6 @@ pub async fn drop_usage_partition(
     client.query(&sql).execute().await
 }
 
-fn obleth_admin_health_probe_label() -> &'static str {
-    crate::model_health::HEALTH_PROBE_REQUEST_TYPE
-}
-
 fn default_start_day() -> String {
     use chrono::{Duration, Utc};
     (Utc::now() - Duration::days(7))
@@ -1154,5 +1195,24 @@ pub async fn batch_has_trace(
             tracing::warn!(error = %e, "batch_has_trace failed");
             std::collections::HashSet::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod internal_filter_tests {
+    use super::*;
+
+    #[test]
+    fn default_excludes_internal_traffic() {
+        assert_eq!(
+            internal_filter(None),
+            " and request_type not in ('health_probe', 'benchmark')"
+        );
+        assert_eq!(internal_filter(Some(false)), internal_filter(None));
+    }
+
+    #[test]
+    fn opt_in_disables_the_filter() {
+        assert!(internal_filter(Some(true)).is_empty());
     }
 }
