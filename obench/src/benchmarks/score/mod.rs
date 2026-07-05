@@ -209,6 +209,36 @@ pub fn section_enabled(id: SectionId, skip: &[String], only: &[String]) -> bool 
     }
 }
 
+const ALL_SECTIONS: &[SectionId] = &[
+    SectionId::Overhead,
+    SectionId::Capacity,
+    SectionId::Overload,
+    SectionId::Streaming,
+    SectionId::Resilience,
+    SectionId::Fairshare,
+    SectionId::Compression,
+];
+
+/// Validate that every name in `names` (as given to `--skip`/`--only`) names a
+/// real section. Returns `Err` listing the bad names alongside the full set
+/// of valid ones, so a typo doesn't silently run (or skip) nothing.
+pub fn validate_section_names(names: &[String]) -> Result<(), String> {
+    let bad: Vec<&str> = names
+        .iter()
+        .filter(|n| SectionId::from_name(n).is_none())
+        .map(|s| s.as_str())
+        .collect();
+    if bad.is_empty() {
+        return Ok(());
+    }
+    let valid: Vec<&str> = ALL_SECTIONS.iter().map(|s| s.name()).collect();
+    Err(format!(
+        "unknown section name(s): {} — valid sections are: {}",
+        bad.join(", "),
+        valid.join(", ")
+    ))
+}
+
 /// Concurrency to drive the streaming check at: half the capacity ramp's
 /// sustainable concurrency (clamped to a sane 1..64 band), or a fixed default
 /// of 8 when there's no capacity card to derive it from (capacity was
@@ -233,6 +263,15 @@ pub async fn run(
     let Some(target) = cli.target else {
         anyhow::bail!("obench score needs --target demo or --target live");
     };
+
+    // Validate --skip/--only before anything else runs (seeding included) so
+    // a typo'd section name fails fast instead of silently running/skipping
+    // nothing.
+    let mut section_names = args.skip.clone();
+    section_names.extend(args.only.iter().cloned());
+    if let Err(e) = validate_section_names(&section_names) {
+        anyhow::bail!(e);
+    }
 
     let scope = crate::cli::scope_from(cli.model.clone(), cli.all);
     let admin = crate::admin::AdminClient::new(cli.admin_base.clone(), cli.admin_token.clone());
@@ -687,6 +726,24 @@ mod tests {
             &[],
             &["capacity".into()]
         ));
+    }
+
+    #[test]
+    fn validate_section_names_accepts_valid() {
+        assert!(validate_section_names(&["capacity".into(), "streaming".into()]).is_ok());
+    }
+
+    #[test]
+    fn validate_section_names_accepts_empty() {
+        assert!(validate_section_names(&[]).is_ok());
+    }
+
+    #[test]
+    fn validate_section_names_rejects_bogus() {
+        let err = validate_section_names(&["capacity".into(), "bogus".into()]).unwrap_err();
+        assert!(err.contains("bogus"));
+        assert!(err.contains("capacity"));
+        assert!(err.contains("overhead")); // full valid list is listed
     }
 
     #[test]
