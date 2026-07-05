@@ -70,6 +70,7 @@ const SCHEMA_V12: &str =
     include_str!("../../../../schema/postgres/0012_model_debug_diagnostics.sql");
 const SCHEMA_V13: &str = include_str!("../../../../schema/postgres/0013_compression_policy.sql");
 const SCHEMA_V14: &str = include_str!("../../../../schema/postgres/0014_model_energy_slots.sql");
+const SCHEMA_V15: &str = include_str!("../../../../schema/postgres/0015_tenant_synthetic.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -171,6 +172,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V12).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V13).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V14).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V15).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -271,7 +273,7 @@ impl Store {
 
     pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
         let rows = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, created_at, updated_at
              from tenants order by created_at",
         )
         .fetch_all(&self.pool)
@@ -281,7 +283,7 @@ impl Store {
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Tenant> {
         let row = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, created_at, updated_at
              from tenants where id = $1",
         )
         .bind(id)
@@ -830,6 +832,20 @@ impl Store {
         Ok(())
     }
 
+    /// Mark a tenant as synthetic (benchmark/test traffic) or real.
+    pub async fn set_tenant_synthetic(&self, id: Uuid, synthetic: bool) -> Result<()> {
+        Self::guard_reserved_tenant(id)?;
+        sqlx::query(
+            "update tenants set synthetic = $2, updated_at = now() where id = $1 returning id",
+        )
+        .bind(id)
+        .bind(synthetic)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        Ok(())
+    }
+
     pub async fn delete_key(&self, id: Uuid) -> Result<String> {
         self.guard_reserved_key(id).await?;
         let row = sqlx::query("delete from api_keys where id = $1 returning key_hash")
@@ -855,7 +871,8 @@ impl Store {
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
-                    t.compression_policy
+                    t.compression_policy,
+                    t.synthetic
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group
@@ -882,7 +899,8 @@ impl Store {
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
-                    t.compression_policy
+                    t.compression_policy,
+                    t.synthetic
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group",
@@ -913,7 +931,8 @@ impl Store {
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
-                    t.compression_policy
+                    t.compression_policy,
+                    t.synthetic
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group
@@ -2745,6 +2764,7 @@ fn tenant_from_row(row: &PgRow) -> Result<Tenant> {
         tracing_enabled: row.try_get("tracing_enabled").unwrap_or(false),
         guardrails_policy: guardrails_policy_from_row(row)?,
         compression_policy: compression_policy_from_row(row)?,
+        synthetic: row.try_get("synthetic").unwrap_or(false),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -2851,6 +2871,7 @@ fn resolved_from_row(row: &PgRow) -> Result<ResolvedKey> {
         tracing_enabled: row.try_get::<bool, _>("tracing_enabled").unwrap_or(false),
         guardrails_policy: guardrails_policy_from_row(row)?,
         compression_policy: compression_policy_from_row(row)?,
+        synthetic: row.try_get("synthetic").unwrap_or(false),
     })
 }
 
@@ -3436,6 +3457,53 @@ mod tests {
             store.delete_tenant(tenant.id).await,
             Err(StoreError::NotFound)
         ));
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// `synthetic` must default to false, flip via `set_tenant_synthetic`, and
+    /// flow through into the resolved hot-path key view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn synthetic_flag_round_trips_to_resolved_key() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let name = format!("t-{}", Uuid::new_v4());
+        let tenant = store
+            .create_tenant(&name, 100, 0, None, None)
+            .await
+            .expect("create tenant");
+        fixtures.track_tenant(tenant.id);
+        assert!(!tenant.synthetic, "tenants default to non-synthetic");
+
+        store
+            .set_tenant_synthetic(tenant.id, true)
+            .await
+            .expect("set synthetic");
+        assert!(
+            store
+                .get_tenant(tenant.id)
+                .await
+                .expect("get tenant")
+                .synthetic
+        );
+
+        let (_key, secret) = store
+            .create_api_key(tenant.id, "k", "", None, None, None, None)
+            .await
+            .expect("create key");
+        let hash = hash_api_key(&secret);
+        let resolved = store
+            .resolved_key_by_hash(&hash)
+            .await
+            .expect("resolve")
+            .expect("present");
+        assert!(resolved.synthetic);
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
