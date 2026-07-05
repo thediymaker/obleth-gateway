@@ -564,7 +564,12 @@ pub async fn run(
     admin.teardown(&seeded.teardown).await;
 
     if stop.load(std::sync::atomic::Ordering::Relaxed) {
-        let _ = ctl.set_fault("*", "ok").await;
+        if let Err(e) = ctl.set_fault("*", "ok").await {
+            eprintln!(
+                "warning: Ctrl-C cleanup failed to clear injected faults on benchmark-backend: {e} — a fault from a resilience run may still be active; clear it manually via POST {}/control {{\"model\":\"*\",\"mode\":\"ok\"}}",
+                args.backend_base
+            );
+        }
         std::process::exit(130);
     }
 
