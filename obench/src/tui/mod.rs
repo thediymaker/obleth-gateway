@@ -727,11 +727,9 @@ async fn run_state_machine(
                     w.input.clear();
                     w.step = Step::KeyAdd;
                 }
-                KeyCode::Char('d') => {
-                    if w.cursor < w.keys.len() {
-                        w.keys.remove(w.cursor);
-                        w.cursor = w.cursor.min(w.keys.len().saturating_sub(1));
-                    }
+                KeyCode::Char('d') if w.cursor < w.keys.len() => {
+                    w.keys.remove(w.cursor);
+                    w.cursor = w.cursor.min(w.keys.len().saturating_sub(1));
                 }
                 KeyCode::Char('+') | KeyCode::Right => {
                     if let Some(k) = w.keys.get_mut(w.cursor) {
@@ -823,12 +821,10 @@ async fn run_state_machine(
                         *s = !*s;
                     }
                 }
-                KeyCode::Enter => {
-                    if w.live_selected.iter().any(|s| *s) {
-                        w.clamp_profile();
-                        w.step = Step::Settings;
-                        w.settings_row = 0;
-                    }
+                KeyCode::Enter if w.live_selected.iter().any(|s| *s) => {
+                    w.clamp_profile();
+                    w.step = Step::Settings;
+                    w.settings_row = 0;
                 }
                 _ => {}
             },

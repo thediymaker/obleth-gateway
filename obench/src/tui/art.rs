@@ -131,8 +131,7 @@ fn build_silhouette() -> Silhouette {
             }
         }
     }
-    if count > 0 {
-        let axis = sum_x / count;
+    if let Some(axis) = sum_x.checked_div(count) {
         let half = (axis - min_x).max(max_x - axis);
         min_x = axis.saturating_sub(half);
         max_x = (axis + half).min(iw - 1);
@@ -179,11 +178,11 @@ pub fn render_mark(max_w: u16, max_h: u16) -> Vec<String> {
     let mut out = Vec::with_capacity(rows);
     for ry in 0..rows {
         let y0 = ry * m.h / rows;
-        let y1 = (((ry + 1) * m.h + rows - 1) / rows).min(m.h);
+        let y1 = ((ry + 1) * m.h).div_ceil(rows).min(m.h);
         let mut line = String::with_capacity(cols);
         for cx in 0..cols {
             let x0 = cx * m.w / cols;
-            let x1 = (((cx + 1) * m.w + cols - 1) / cols).min(m.w);
+            let x1 = ((cx + 1) * m.w).div_ceil(cols).min(m.w);
             let (mut on, mut total) = (0usize, 0usize);
             for yy in y0..y1.max(y0 + 1) {
                 for xx in x0..x1.max(x0 + 1) {
