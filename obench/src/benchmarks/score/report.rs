@@ -384,6 +384,9 @@ mod tests {
 
     #[test]
     fn scorecard_roundtrips_and_latest_baseline_found() {
+        let _guard = crate::report::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         std::env::set_var(
             "BENCH_OUT_DIR",
             std::env::temp_dir()
