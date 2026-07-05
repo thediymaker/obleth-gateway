@@ -365,7 +365,6 @@ impl AdminClient {
         Ok(())
     }
 
-    #[allow(dead_code)] // consumed in task 10
     pub async fn find_model_id(&self, model_name: &str) -> Result<Option<String>> {
         let v = self.req(reqwest::Method::GET, "/models", None).await?;
         Ok(v.as_array().and_then(|a| {
@@ -375,12 +374,10 @@ impl AdminClient {
         }))
     }
 
-    #[allow(dead_code)] // consumed in task 10
     pub async fn model_health(&self) -> Result<Value> {
         self.req(reqwest::Method::GET, "/models/health", None).await
     }
 
-    #[allow(dead_code)] // consumed in task 10
     pub async fn set_model_health_config(
         &self,
         id: &str,

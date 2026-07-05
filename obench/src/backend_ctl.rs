@@ -18,7 +18,6 @@ impl BackendControl {
         }
     }
 
-    #[allow(dead_code)] // consumed in task 10
     pub async fn set_fault(&self, model: &str, mode: &str) -> Result<()> {
         let url = format!("{}/control", self.base);
         let res = self
