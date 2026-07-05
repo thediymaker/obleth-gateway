@@ -189,6 +189,7 @@ impl AdminClient {
         weight: u32,
         tokens_per_minute: u64,
         group: &str,
+        synthetic: bool,
     ) -> Result<(String, bool)> {
         let tenants = self.req(reqwest::Method::GET, "/tenants", None).await?;
         let existing = tenants
@@ -217,10 +218,21 @@ impl AdminClient {
                 Some(json!({ "fairshare_group": group })),
             )
             .await?;
+            if synthetic {
+                // Older gateways lack this route; tagging degrades gracefully.
+                let _ = self
+                    .req(
+                        reqwest::Method::PUT,
+                        &format!("/tenants/{id}/synthetic"),
+                        Some(json!({ "synthetic": true })),
+                    )
+                    .await;
+            }
             Ok((id, false))
         } else {
             let created = self.req(reqwest::Method::POST, "/tenants", Some(json!({
                 "name": name, "weight": weight, "tokens_per_minute": tokens_per_minute, "fairshare_group": group,
+                "synthetic": synthetic,
             }))).await?;
             Ok((
                 created["id"].as_str().context("new tenant id")?.to_string(),
