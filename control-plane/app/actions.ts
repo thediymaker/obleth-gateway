@@ -1431,6 +1431,8 @@ export async function setCharoSettingsAction(
   } catch (e) {
     return actionError(e);
   }
+  revalidatePath("/settings");
+  revalidatePath("/", "layout");
   return { ok: true };
 }
 
