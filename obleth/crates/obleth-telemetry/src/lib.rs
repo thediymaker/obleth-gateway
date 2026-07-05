@@ -609,6 +609,12 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
         sum(energy_cost_usd) AS energy_cost_usd_sum,
         sum(co2_g) AS co2_g_sum";
 
+    // Benchmark traffic (synthetic tenants) never enters the permanent rollup:
+    // usage_daily has no request_type dimension and an immutable sort key, so
+    // it cannot be filtered at read time. Health probes DO roll up — their
+    // tokens are deliberately accounted under the nil tenant (model_health.rs).
+    let bench = obleth_config::BENCHMARK_REQUEST_TYPE;
+
     // One-time backfill BEFORE the view exists, and only when the rollup is
     // empty, so restarts never double-count (SummingMergeTree would otherwise
     // re-add existing history) and the view below cannot also capture the same
@@ -623,6 +629,7 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
             "INSERT INTO {database}.usage_daily
              SELECT {rollup_select}
              FROM {database}.usage
+             WHERE request_type != '{bench}'
              GROUP BY day, tenant_id, key_id, model"
         );
         if let Err(e) = client.query(&backfill).execute().await {
@@ -635,6 +642,7 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
          TO {database}.usage_daily AS
          SELECT {rollup_select}
          FROM {database}.usage
+         WHERE request_type != '{bench}'
          GROUP BY day, tenant_id, key_id, model"
     );
     // Drop-and-recreate so latency-sum semantics (success-only) take effect on
