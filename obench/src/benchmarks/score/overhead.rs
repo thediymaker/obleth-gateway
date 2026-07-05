@@ -3,7 +3,7 @@
 //! delta the proxy adds. `256` may saturate the gateway on purpose — it's
 //! reported for visibility but excluded from grading.
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -97,12 +97,31 @@ pub async fn run_overhead(
     key: &str,
     model: &str,
     input_tokens: u32,
+    stop: Arc<AtomicBool>,
 ) -> anyhow::Result<Vec<OverheadPoint>> {
     let mut points = Vec::new();
 
     for &conc in OVERHEAD_CONCS {
-        let direct = run_leg(backend_base, "obench-direct", model, input_tokens, conc).await?;
-        let proxy = run_leg(proxy_base, key, model, input_tokens, conc).await?;
+        let direct = run_leg(
+            backend_base,
+            "obench-direct",
+            model,
+            input_tokens,
+            conc,
+            stop.clone(),
+        )
+        .await?;
+        if leg_is_empty(&direct) {
+            anyhow::bail!(
+                "overhead: direct leg for {model} at conc={conc} completed zero requests — check --backend-base reachability"
+            );
+        }
+        let proxy = run_leg(proxy_base, key, model, input_tokens, conc, stop.clone()).await?;
+        if leg_is_empty(&proxy) {
+            anyhow::bail!(
+                "overhead: proxy leg for {model} at conc={conc} completed zero requests — model may be unseeded or unreachable through the gateway"
+            );
+        }
 
         let point = OverheadPoint {
             conc,
@@ -118,9 +137,21 @@ pub async fn run_overhead(
             point.direct_p50_ttfb_ms, point.proxy_p50_ttfb_ms, point.direct_rps, point.proxy_rps
         );
         points.push(point);
+
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
     }
 
     Ok(points)
+}
+
+/// True when a leg's summary shows no completed requests — grading a run
+/// with zero completions produces noise (e.g. a `proxy_p50` of 0 from an
+/// empty percentile array), which reads as a real-but-wrong overhead score
+/// instead of the setup problem it actually is.
+fn leg_is_empty(sum: &Summary) -> bool {
+    sum.completed == 0
 }
 
 async fn run_leg(
@@ -129,10 +160,10 @@ async fn run_leg(
     model: &str,
     input_tokens: u32,
     conc: u32,
+    stop: Arc<AtomicBool>,
 ) -> anyhow::Result<Summary> {
     let client = Arc::new(LoadClient::new((conc as usize) * 2));
     let stats = Arc::new(Mutex::new(Stats::default()));
-    let stop = Arc::new(AtomicBool::new(false));
     let (proxy, k, m) = (proxy_base.to_string(), key.to_string(), model.to_string());
     let make_req = move || {
         ProxyRequest::Chat(ChatRequest {
@@ -212,5 +243,27 @@ mod tests {
     #[test]
     fn empty_points_skipped() {
         assert_eq!(overhead_section(&[]).score, None);
+    }
+
+    #[test]
+    fn leg_is_empty_detects_zero_completions() {
+        let empty = crate::engine::stats::Stats::default().summarize(1.0, 1.0);
+        assert!(leg_is_empty(&empty));
+    }
+
+    #[test]
+    fn leg_is_empty_false_once_a_request_completes() {
+        let mut s = crate::engine::stats::Stats::default();
+        s.record(&crate::engine::stats::RequestOutcome {
+            status: 200,
+            ttfb_ms: 5,
+            total_ms: 10,
+            in_tokens: 1,
+            out_tokens: 1,
+            usage_estimated: false,
+            gaps_ms: vec![],
+        });
+        let sum = s.summarize(1.0, 1.0);
+        assert!(!leg_is_empty(&sum));
     }
 }

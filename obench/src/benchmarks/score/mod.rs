@@ -341,12 +341,18 @@ pub async fn run(
                     r.recommendations.push(msg);
                     results.push(r);
                 } else {
+                    // First in-scope chat model — `models` is guaranteed
+                    // non-empty here (the degenerate-scope guard above bails
+                    // before any section runs), and always the same model a
+                    // `--model <name>` scope resolved to.
+                    let model = models.first().cloned().unwrap_or_default();
                     match overhead::run_overhead(
                         &args.backend_base,
                         &proxy_base,
                         &key,
-                        "obench-base",
+                        &model,
                         cli.input_tokens,
+                        stop.clone(),
                     )
                     .await
                     {
