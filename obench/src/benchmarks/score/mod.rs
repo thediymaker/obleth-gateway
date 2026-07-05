@@ -293,10 +293,33 @@ pub async fn run(
     let ctl = crate::backend_ctl::BackendControl::new(args.backend_base.clone());
 
     let w = weights(target);
+
+    // Resilience must be the FIRST section to touch a model, not merely
+    // scheduled early. The gateway's active/passive health prober consults a
+    // passive tier first, with a look-back window of `interval.max(300s)`;
+    // ANY success in that window reports the model healthy regardless of
+    // concurrent error volume. If overhead/capacity/streaming/fairshare (or a
+    // previous resilience run against the same demo fleet) has already driven
+    // traffic to the model, that traffic's successes sit inside the window
+    // for the entire resilience detect budget (150s < 300s) and the fault
+    // injected by resilience can never be observed — a deterministic F,
+    // not flakiness. Running resilience before any other section executes is
+    // the only way its MTTD is measurable. This reorders EXECUTION only —
+    // `weights()` (and therefore the scoring order and the printed/rendered
+    // section table, restored via the sort below) is untouched.
+    let mut exec_order = w.clone();
+    if let Some(pos) = exec_order
+        .iter()
+        .position(|(id, _)| *id == SectionId::Resilience)
+    {
+        let resilience = exec_order.remove(pos);
+        exec_order.insert(0, resilience);
+    }
+
     let mut results: Vec<SectionResult> = Vec::new();
     let mut cards: Vec<capacity::CapacityCard> = Vec::new();
 
-    for &(id, _weight) in &w {
+    for &(id, _weight) in &exec_order {
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
@@ -475,6 +498,16 @@ pub async fn run(
         let _ = ctl.set_fault("*", "ok").await;
         std::process::exit(130);
     }
+
+    // Restore canonical (weights()) order for scoring/display now that
+    // execution has finished — resilience ran first above, but the printed
+    // table and scorecard.json should still read overhead/capacity/.../
+    // resilience/... in the order operators expect.
+    results.sort_by_key(|r| {
+        w.iter()
+            .position(|(id, _)| *id == r.id)
+            .unwrap_or(usize::MAX)
+    });
 
     let sys = system_score(&results, &w);
     let created_unix = std::time::SystemTime::now()
