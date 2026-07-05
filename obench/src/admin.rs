@@ -402,7 +402,6 @@ impl AdminClient {
         Ok(())
     }
 
-    #[allow(dead_code)] // consumed in task 10
     pub async fn get_version(&self) -> Result<String> {
         let v = self.req(reqwest::Method::GET, "/version", None).await?;
         Ok(v["version"].as_str().unwrap_or("unknown").to_string())

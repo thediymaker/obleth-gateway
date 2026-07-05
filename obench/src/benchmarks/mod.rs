@@ -8,6 +8,5 @@ pub mod score;
 pub enum BenchKind {
     Load,
     Compression,
-    #[allow(dead_code)] // consumed in task 13
     Score,
 }

@@ -3,14 +3,12 @@
 
 use anyhow::{Context, Result};
 
-#[allow(dead_code)] // consumed in task 10
 pub struct BackendControl {
     base: String,
     http: reqwest::Client,
 }
 
 impl BackendControl {
-    #[allow(dead_code)] // consumed in task 10
     pub fn new(base: String) -> Self {
         Self {
             base: base.trim_end_matches('/').to_string(),
@@ -37,7 +35,6 @@ impl BackendControl {
         Ok(self.http.get(&url).send().await?.json().await?)
     }
 
-    #[allow(dead_code)] // consumed in task 10
     pub async fn healthy(&self) -> bool {
         let url = format!("{}/health", self.base);
         matches!(self.http.get(&url).send().await, Ok(r) if r.status().is_success())
