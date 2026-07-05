@@ -68,8 +68,8 @@ pub async fn apply(
             // (e.g. when a prior tick created it but failed to patch the replica),
             // otherwise create one.
             let existing = obleth.list_endpoints(model_id).await?;
-            let ep = match existing.into_iter().find(|(_, n)| n == &name) {
-                Some((id, _)) => id,
+            let ep = match existing.into_iter().find(|e| e.name == name) {
+                Some(e) => e.id,
                 None => obleth.create_endpoint(model_id, &name, api_base).await?,
             };
             let node = host_from_api_base(api_base);

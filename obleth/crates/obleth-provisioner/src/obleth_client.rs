@@ -37,8 +37,9 @@ pub trait OblethClient: Send + Sync {
         name: &str,
         api_base: &str,
     ) -> anyhow::Result<Uuid>;
-    /// List this model's endpoints as (endpoint_id, name) pairs.
-    async fn list_endpoints(&self, model_id: Uuid) -> anyhow::Result<Vec<(Uuid, String)>>;
+    /// List this model's endpoints, including the gateway's health verdict for
+    /// each (see `EndpointView` — the real-inference signal self-heal folds in).
+    async fn list_endpoints(&self, model_id: Uuid) -> anyhow::Result<Vec<crate::domain::EndpointView>>;
     async fn delete_endpoint(&self, model_id: Uuid, endpoint_id: Uuid) -> anyhow::Result<()>;
     /// Record (or clear with `None`) the provisioner's last submit error for a
     /// model, so the dashboard can show it.
@@ -373,7 +374,10 @@ impl OblethClient for HttpObleth {
             .ok_or_else(|| anyhow::anyhow!("create_endpoint: response missing a valid id: {v}"))
     }
 
-    async fn list_endpoints(&self, model_id: Uuid) -> anyhow::Result<Vec<(Uuid, String)>> {
+    async fn list_endpoints(
+        &self,
+        model_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::domain::EndpointView>> {
         let rows: serde_json::Value = self
             .req(
                 reqwest::Method::GET,
@@ -383,6 +387,7 @@ impl OblethClient for HttpObleth {
             .await?
             .json()
             .await?;
+        let now = chrono::Utc::now();
         let mut out = Vec::new();
         for e in rows.as_array().cloned().unwrap_or_default() {
             let id = e
@@ -395,7 +400,23 @@ impl OblethClient for HttpObleth {
                 .unwrap_or_default()
                 .to_string();
             if let Some(id) = id {
-                out.push((id, name));
+                out.push(crate::domain::EndpointView {
+                    id,
+                    name,
+                    health_status: e
+                        .get("health_status")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string),
+                    consecutive_failures: e
+                        .get("consecutive_failures")
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or(0),
+                    checked_secs_ago: e
+                        .get("last_checked_at")
+                        .and_then(|x| x.as_str())
+                        .and_then(|s| s.parse::<chrono::DateTime<chrono::Utc>>().ok())
+                        .map(|t| (now - t).num_seconds()),
+                });
             }
         }
         Ok(out)
@@ -530,7 +551,10 @@ impl OblethClient for MockObleth {
         ));
         Ok(Uuid::new_v4())
     }
-    async fn list_endpoints(&self, _model_id: Uuid) -> anyhow::Result<Vec<(Uuid, String)>> {
+    async fn list_endpoints(
+        &self,
+        _model_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::domain::EndpointView>> {
         // MockObleth doesn't track the returned endpoint ids by name, so report
         // none exist — each test promote creates exactly one endpoint.
         Ok(Vec::new())
