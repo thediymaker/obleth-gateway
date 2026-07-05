@@ -302,6 +302,15 @@ pub async fn run(
         .filter(|m| !m.to_lowercase().contains("embed"))
         .cloned()
         .collect();
+    if models.is_empty() {
+        // Nothing to score: tear down whatever seeding just created (demo
+        // creates real gateway objects; live is a no-op teardown) before
+        // bailing, so a degenerate scope never leaks seeded state.
+        admin.teardown(&seeded.teardown).await;
+        anyhow::bail!(
+            "only embedding models in scope — score needs at least one chat model; run without --model or pick a chat model"
+        );
+    }
     // Capacity/streaming/overhead/resilience drive a single tenant; fairshare
     // (below) uses the whole seeded fleet.
     let key = seeded
