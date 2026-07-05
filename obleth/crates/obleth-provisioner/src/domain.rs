@@ -66,6 +66,25 @@ pub struct ReplicaView {
     pub cancel_requested: bool,
 }
 
+/// One of a model's registered endpoints, as the gateway sees it — including
+/// the gateway's own health verdict. The gateway's endpoint check is a real
+/// 1-token inference, so it catches "zombie" servers that still answer
+/// metadata GETs (which the provisioner's cheap health_path probe cannot):
+/// an Ollama that lists its models instantly but hangs forever on a
+/// completion passes the GET probe and fails the gateway check.
+#[derive(Debug, Clone)]
+pub struct EndpointView {
+    pub id: Uuid,
+    pub name: String,
+    /// Gateway-recorded health status ("healthy" | "unhealthy" | "degraded" |
+    /// …); `None` when the gateway has never checked this endpoint.
+    pub health_status: Option<String>,
+    /// Consecutive failed gateway checks (reset on a passing one).
+    pub consecutive_failures: i64,
+    /// Seconds since the gateway last checked this endpoint; `None` if never.
+    pub checked_secs_ago: Option<i64>,
+}
+
 /// Live, version-agnostic snapshot of what the configured Slurm cluster offers.
 /// Powers the launcher's resource dropdowns. Every field is best-effort: a
 /// version skew or permission gap yields empties, never an error.

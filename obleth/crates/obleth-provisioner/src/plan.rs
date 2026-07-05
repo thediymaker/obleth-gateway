@@ -206,6 +206,61 @@ pub fn update_probe_failures(
     }
 }
 
+/// Consecutive failed *gateway* checks of a replica's endpoint that count as a
+/// restart signal. The gateway's check is a real 1-token inference at a slow
+/// cadence (minutes), so two failures is already a sustained outage — and it
+/// catches zombies the provisioner's own GET probe cannot (a server that
+/// answers metadata instantly but hangs forever on inference).
+const GATEWAY_UNHEALTHY_CHECKS: i64 = 2;
+
+/// Ignore the gateway's endpoint verdict when it is older than this — e.g.
+/// when scheduled model health checks are disabled, a stale `unhealthy` row
+/// must not keep restarting a replica that recovered long ago.
+const GATEWAY_CHECK_MAX_AGE_SECS: i64 = 3600;
+
+/// Which healthy replicas self-heal should restart this tick. Two independent
+/// signals, either suffices:
+///
+/// 1. the provisioner's own port-window probe has failed `probe_threshold`
+///    consecutive ticks (`probe_failures`, maintained by
+///    `update_probe_failures`) — the server is not answering at all;
+/// 2. the gateway's health check of the replica's registered endpoint is
+///    `unhealthy` with at least `GATEWAY_UNHEALTHY_CHECKS` consecutive
+///    failures and a recent check — the server answers GETs but fails real
+///    inference (zombie).
+///
+/// `probe_threshold <= 0` disables self-heal entirely (both signals). The
+/// planner additionally caps restarts at one per model per tick.
+pub fn restart_candidates(
+    replicas: &[ReplicaView],
+    probe_failures: &HashMap<Uuid, i64>,
+    probe_threshold: i64,
+    endpoints: &[EndpointView],
+) -> HashSet<Uuid> {
+    if probe_threshold <= 0 {
+        return HashSet::new();
+    }
+    let unhealthy_eps: HashSet<Uuid> = endpoints
+        .iter()
+        .filter(|e| {
+            e.health_status.as_deref() == Some("unhealthy")
+                && e.consecutive_failures >= GATEWAY_UNHEALTHY_CHECKS
+                && e.checked_secs_ago
+                    .is_some_and(|s| s <= GATEWAY_CHECK_MAX_AGE_SECS)
+        })
+        .map(|e| e.id)
+        .collect();
+    replicas
+        .iter()
+        .filter(|r| {
+            r.state == "healthy"
+                && (probe_failures.get(&r.id).copied().unwrap_or(0) >= probe_threshold
+                    || r.endpoint_id.is_some_and(|ep| unhealthy_eps.contains(&ep)))
+        })
+        .map(|r| r.id)
+        .collect()
+}
+
 /// The slice of ManagedModelSpec the planner needs (keeps it decoupled from the
 /// full DB struct in tests).
 pub struct ManagedSpecView {
@@ -622,6 +677,81 @@ mod tests {
             .filter(|a| matches!(a, Action::Cancel { .. }))
             .count();
         assert_eq!(cancels, 2, "operator + one self-heal: {actions:?}");
+    }
+
+    // --- restart_candidates (self-heal restart signals) ---
+
+    fn ep(id: Uuid, status: &str, failures: i64, checked_secs_ago: Option<i64>) -> EndpointView {
+        EndpointView {
+            id,
+            name: "ep".into(),
+            health_status: Some(status.into()),
+            consecutive_failures: failures,
+            checked_secs_ago,
+        }
+    }
+
+    #[test]
+    fn probe_failures_past_threshold_are_candidates() {
+        let r = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
+        let counts = HashMap::from([(r.id, 3i64)]);
+        let set = restart_candidates(&[r.clone()], &counts, 3, &[]);
+        assert!(set.contains(&r.id));
+        // below threshold -> not a candidate
+        let counts = HashMap::from([(r.id, 2i64)]);
+        assert!(restart_candidates(&[r], &counts, 3, &[]).is_empty());
+    }
+
+    #[test]
+    fn gateway_unhealthy_endpoint_is_a_candidate_even_when_get_probe_passes() {
+        // The zombie case from production: Ollama answers /v1/models instantly
+        // (provisioner GET probe passes, counter stays 0) but hangs on real
+        // inference — the gateway's endpoint check says unhealthy. Restart it.
+        let ep_id = Uuid::new_v4();
+        let r = rv("healthy", "j1", Some(ep_id), 600);
+        let eps = [ep(ep_id, "unhealthy", 528, Some(60))];
+        let set = restart_candidates(&[r.clone()], &HashMap::new(), 3, &eps);
+        assert!(set.contains(&r.id));
+    }
+
+    #[test]
+    fn gateway_signal_requires_failures_and_recency() {
+        let ep_id = Uuid::new_v4();
+        let r = rv("healthy", "j1", Some(ep_id), 600);
+        // only one failed check -> not yet
+        let eps = [ep(ep_id, "unhealthy", 1, Some(60))];
+        assert!(restart_candidates(&[r.clone()], &HashMap::new(), 3, &eps).is_empty());
+        // stale verdict (checks disabled long ago) -> ignored
+        let eps = [ep(ep_id, "unhealthy", 528, Some(90_000))];
+        assert!(restart_candidates(&[r.clone()], &HashMap::new(), 3, &eps).is_empty());
+        // never checked -> ignored
+        let mut never = ep(ep_id, "unhealthy", 528, None);
+        never.checked_secs_ago = None;
+        assert!(restart_candidates(&[r.clone()], &HashMap::new(), 3, &[never]).is_empty());
+        // healthy endpoint -> ignored
+        let eps = [ep(ep_id, "healthy", 0, Some(60))];
+        assert!(restart_candidates(&[r], &HashMap::new(), 3, &eps).is_empty());
+    }
+
+    #[test]
+    fn zero_threshold_disables_both_signals() {
+        let ep_id = Uuid::new_v4();
+        let r = rv("healthy", "j1", Some(ep_id), 600);
+        let counts = HashMap::from([(r.id, 99i64)]);
+        let eps = [ep(ep_id, "unhealthy", 528, Some(60))];
+        assert!(restart_candidates(&[r], &counts, 0, &eps).is_empty());
+    }
+
+    #[test]
+    fn non_healthy_replicas_are_never_candidates() {
+        // A starting replica's endpoint doesn't exist yet; a draining one is
+        // already being reconciled away. Only promoted healthy rows restart.
+        let ep_id = Uuid::new_v4();
+        let mut r = rv("draining", "j1", Some(ep_id), 600);
+        let eps = [ep(ep_id, "unhealthy", 528, Some(60))];
+        assert!(restart_candidates(&[r.clone()], &HashMap::new(), 3, &eps).is_empty());
+        r.state = "starting".into();
+        assert!(restart_candidates(&[r], &HashMap::new(), 3, &eps).is_empty());
     }
 
     // --- update_probe_failures (self-heal counters) ---

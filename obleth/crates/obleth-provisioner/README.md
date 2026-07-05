@@ -54,11 +54,16 @@ Every tick (`OBLETH_PROVISIONER_INTERVAL_SECS`, default 15s):
      - **Mark lost** replicas whose Slurm job vanished or finished (preempted),
        and detach their endpoint; the next pass resubmits to restore target.
      - **Self-heal zombie jobs.** A `healthy` replica whose job still reports
-       RUNNING but which fails `OBLETH_PROVISIONER_RESTART_AFTER_FAILURES`
-       consecutive health probes (default 3; `0` disables) is restarted:
-       endpoint deregistered, job cancelled, and a fresh replica submitted.
-       At most **one** self-heal restart per model per tick, so a probe-side
-       network problem rolls a fleet gradually instead of mass-cancelling it.
+       RUNNING is restarted (endpoint deregistered, job cancelled, fresh
+       replica submitted) on either of two signals: it fails
+       `OBLETH_PROVISIONER_RESTART_AFTER_FAILURES` consecutive provisioner
+       probes (default 3; `0` disables self-heal entirely), **or** the
+       gateway's own health check of its registered endpoint — a real 1-token
+       inference — has been `unhealthy` for 2+ consecutive recent checks. The
+       second signal catches servers that still answer metadata GETs but hang
+       on actual inference. At most **one** self-heal restart per model per
+       tick, so a probe-side network problem rolls a fleet gradually instead
+       of mass-cancelling it.
      - **Cancel** excess jobs when above target (pending first, then starting,
        then healthy; oldest first within a tier).
      - **GC** `lost` replica rows older than

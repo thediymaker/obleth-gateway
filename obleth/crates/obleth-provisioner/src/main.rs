@@ -271,20 +271,26 @@ async fn tick(
             }
         }
 
-        // Self-heal bookkeeping: judge each healthy replica's probe outcome and
-        // collect the ones past the failure threshold for a (staged) restart.
+        // Self-heal bookkeeping: judge each healthy replica's probe outcome,
+        // pull the gateway's endpoint-health verdicts (its check is a real
+        // 1-token inference — it catches zombies whose metadata GET still
+        // answers), and collect restart candidates. Endpoint fetch is
+        // best-effort: without it the GET-probe signal still works.
         plan::update_probe_failures(&replicas, &jobs, &health, probe_failures);
-        let restart: HashSet<uuid::Uuid> = if cfg.restart_after_failures > 0 {
-            replicas
-                .iter()
-                .filter(|r| {
-                    probe_failures.get(&r.id).copied().unwrap_or(0) >= cfg.restart_after_failures
-                })
-                .map(|r| r.id)
-                .collect()
-        } else {
-            HashSet::new()
+        let endpoints = match obleth.list_endpoints(spec.model_id).await {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::warn!(model_id = %spec.model_id, error = %e,
+                    "endpoint health lookup failed; self-heal using probe signal only");
+                Vec::new()
+            }
         };
+        let restart = plan::restart_candidates(
+            &replicas,
+            probe_failures,
+            cfg.restart_after_failures,
+            &endpoints,
+        );
 
         let mut live_port_bases: Vec<i64> = replicas
             .iter()
