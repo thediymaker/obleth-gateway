@@ -4,7 +4,7 @@
 //! into one graded system score, and tracks regressions across runs.
 
 pub mod capacity;
-// pub mod fairshare;   // (files created in later tasks — add these mod lines as the files land)
+pub mod fairshare;
 pub mod overhead;
 pub mod overload;
 // pub mod report;
