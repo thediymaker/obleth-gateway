@@ -2726,7 +2726,9 @@ struct RequestMeta {
     session_id: String,
     /// How `session_id` was obtained: "client" | "derived" | "none".
     session_id_source: &'static str,
-    /// Coarse request class derived from the request path.
+    /// Coarse request class derived from the request path, except synthetic
+    /// tenants' requests are stamped `benchmark` instead (see
+    /// [`effective_request_type`]).
     request_type: &'static str,
 }
 
