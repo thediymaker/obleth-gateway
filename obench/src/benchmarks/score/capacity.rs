@@ -2,7 +2,7 @@
 //! to one model at a time. Produces the headline "max sustainable load" card.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
@@ -118,6 +118,7 @@ pub async fn run_ramp(
     proxy_base: &str,
     input_tokens: u32,
     max_conc: u32,
+    stop: Arc<AtomicBool>,
 ) -> anyhow::Result<CapacityCard> {
     let cfg = KneeConfig::default();
     let mut history: Vec<StepResult> = Vec::new();
@@ -127,7 +128,6 @@ pub async fn run_ramp(
     for &conc in RAMP_STEPS.iter().filter(|&&c| c <= max_conc) {
         let client = Arc::new(LoadClient::new((conc as usize) * 2));
         let stats = Arc::new(Mutex::new(Stats::default()));
-        let stop = Arc::new(AtomicBool::new(false));
         let (proxy, k, m) = (proxy_base.to_string(), key.to_string(), model.to_string());
         let make_req = move || {
             ProxyRequest::Chat(ChatRequest {
@@ -148,7 +148,7 @@ pub async fn run_ramp(
                 duration_s: STEP_SECS,
                 warmup_s: 2,
             },
-            stop,
+            stop.clone(),
             stats.clone(),
         )
         .await;
@@ -192,6 +192,13 @@ pub async fn run_ramp(
                 stop_step = Some((step, reason));
                 break;
             }
+        }
+
+        // Ctrl-C mid-ramp: the step above already cut its run_closed_loop
+        // short (it shares this same flag), so just stop climbing further
+        // steps rather than starting a fresh one.
+        if stop.load(Ordering::Relaxed) {
+            break;
         }
     }
     Ok(card_from_steps(model, clean, stop_step))

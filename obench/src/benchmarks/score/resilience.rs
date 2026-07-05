@@ -104,6 +104,7 @@ pub async fn run_resilience(
     proxy_base: &str,
     key: &str,
     model: &str,
+    stop: Arc<AtomicBool>,
 ) -> anyhow::Result<ResilienceOutcome> {
     let id = admin
         .find_model_id(model)
@@ -139,21 +140,29 @@ pub async fn run_resilience(
     // the post-recovery successes are what let the passive tier flip back to
     // healthy, so MTTR stays measurable.
     let stats = Arc::new(Mutex::new(Stats::default()));
-    let stop = Arc::new(AtomicBool::new(false));
+    // Controls the paced background load below; distinct from the
+    // orchestrator's `stop` (threaded into `scenario` so its poll loops can
+    // cut a Ctrl-C'd run short) so this function's own end-of-scenario
+    // cleanup never taints the shared Ctrl-C flag.
+    let load_stop = Arc::new(AtomicBool::new(false));
     let client = Arc::new(LoadClient::new(8));
     let loop_handle = {
-        let (stats, stop, client) = (stats.clone(), stop.clone(), client.clone());
+        let (stats, load_stop, client) = (stats.clone(), load_stop.clone(), client.clone());
         let (proxy, k, m) = (proxy_base.to_string(), key.to_string(), model.to_string());
-        tokio::spawn(async move { paced_load_loop(client, proxy, k, m, stop, stats).await })
+        tokio::spawn(async move { paced_load_loop(client, proxy, k, m, load_stop, stats).await })
     };
 
     // The whole scenario is wrapped so cleanup ALWAYS runs.
-    let result = scenario(admin, ctl, model, &stats, effective_interval_s).await;
+    let result = scenario(admin, ctl, model, &stats, effective_interval_s, &stop).await;
 
-    stop.store(true, Ordering::Relaxed);
+    load_stop.store(true, Ordering::Relaxed);
     let _ = loop_handle.await;
-    let _ = ctl.set_fault(model, "ok").await;
-    let _ = admin
+    if let Err(e) = ctl.set_fault(model, "ok").await {
+        eprintln!(
+            "warning: resilience failed to clear the injected fault on {model}: {e} — the benchmark backend may still be failing requests for it until cleared manually"
+        );
+    }
+    if let Err(e) = admin
         .set_model_health_config(
             &id,
             prev_enabled,
@@ -161,7 +170,12 @@ pub async fn run_resilience(
             prev_interval,
             prev_threshold,
         )
-        .await;
+        .await
+    {
+        eprintln!(
+            "warning: resilience failed to restore health-check config for {model}: {e} — it may be left at the tightened interval=1s/threshold=1 probe settings used during the scenario"
+        );
+    }
 
     result
 }
@@ -216,6 +230,7 @@ async fn scenario(
     model: &str,
     stats: &Arc<Mutex<Stats>>,
     effective_interval_s: f64,
+    stop: &Arc<AtomicBool>,
 ) -> anyhow::Result<ResilienceOutcome> {
     let status_of = |health: &serde_json::Value| -> String {
         health
@@ -241,6 +256,9 @@ async fn scenario(
 
     let mut mttd_s = None;
     while t0.elapsed().as_secs() < DETECT_BUDGET_S {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
         let h = admin
             .model_health()
             .await
@@ -272,6 +290,9 @@ async fn scenario(
     let mut mttr_s = None;
     if mttd_s.is_some() {
         while t1.elapsed().as_secs() < RECOVER_BUDGET_S {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
             let h = admin
                 .model_health()
                 .await

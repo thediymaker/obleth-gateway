@@ -361,12 +361,16 @@ pub async fn run(
                 } else {
                     let mut failed = None;
                     for model in &models {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
                         match capacity::run_ramp(
                             model,
                             &key,
                             &proxy_base,
                             cli.input_tokens,
                             args.max_conc,
+                            stop.clone(),
                         )
                         .await
                         {
@@ -394,14 +398,24 @@ pub async fn run(
                 let mut quals = Vec::new();
                 let mut failed = None;
                 for model in &models {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        break;
+                    }
                     let sustainable = cards
                         .iter()
                         .find(|c| &c.model == model)
                         .map(|c| c.sustainable_conc)
                         .filter(|c| *c > 0);
                     let conc = streaming_conc(sustainable, args.quick);
-                    match streaming::run_streaming(model, &key, &proxy_base, cli.input_tokens, conc)
-                        .await
+                    match streaming::run_streaming(
+                        model,
+                        &key,
+                        &proxy_base,
+                        cli.input_tokens,
+                        conc,
+                        stop.clone(),
+                    )
+                    .await
                     {
                         Ok(summary) => {
                             if let Some(q) = streaming::quality_from_summary(model, conc, &summary)
@@ -429,7 +443,16 @@ pub async fn run(
                     models.first().cloned().unwrap_or_default()
                 };
                 println!("resilience: injecting fault on {model}");
-                match resilience::run_resilience(&admin, &ctl, &proxy_base, &key, &model).await {
+                match resilience::run_resilience(
+                    &admin,
+                    &ctl,
+                    &proxy_base,
+                    &key,
+                    &model,
+                    stop.clone(),
+                )
+                .await
+                {
                     Ok(outcome) => results.push(resilience::resilience_section(&outcome)),
                     Err(e) => results.push(SectionResult::errored(id, &e.to_string())),
                 }
@@ -438,7 +461,8 @@ pub async fn run(
                 if scope != Scope::All {
                     results.push(SectionResult::skipped(id, "needs --all"));
                 } else {
-                    match fairshare::run_fairshare(&admin, &proxy_base, &seeded).await {
+                    match fairshare::run_fairshare(&admin, &proxy_base, &seeded, stop.clone()).await
+                    {
                         Ok(r) => results.push(r),
                         Err(e) => results.push(SectionResult::errored(id, &e.to_string())),
                     }
