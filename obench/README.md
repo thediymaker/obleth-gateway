@@ -115,6 +115,73 @@ Per-profile defaults can be overridden with `--conc`, `--duration-s`,
 60 s, 64 output tokens, streaming) and exists specifically to be reshaped by
 those flags.
 
+## System score
+
+`obench score` runs a battery of check sections against a deployment and rolls
+them into one graded **system score** (0–100, A–F). Where the load benchmark
+answers "did it stay up?", the scorecard answers "how well does this deployment
+actually behave?" — proxy tax, per-model capacity, overload manners, streaming
+quality, failure detection, fairshare arbitration.
+
+```bash
+obench score --target demo            # full scorecard against the local stack
+obench score --target demo --quick    # skip the capacity ramps (much faster)
+obench score --target live            # black-box subset against a real gateway
+```
+
+What runs depends on the target — sections that need fault injection, a
+direct-to-backend path, or admin control are demo-only:
+
+| Section | demo | live | What it measures |
+|---------|------|------|------------------|
+| `overhead` | ✔ | — | Proxy tax: TTFB/throughput delta between direct-to-backend and through-the-gateway legs of identical load |
+| `capacity` | ✔ | ✔ | Per-model stepped concurrency ramp with knee detection — prints a capacity card per model |
+| `overload` | ✔ | ✔ | Behavior *past* the knee: clean 429s and bounded latency vs 5xx/hangs/latency blowup (reuses ramp data, zero extra runtime) |
+| `streaming` | ✔ | ✔ | Inter-chunk jitter and mid-stream stalls; jitter is only graded on demo, where the backend's fixed cadence makes the gateway the sole source of it |
+| `resilience` | ✔ | — | Injects a backend fault and measures the health prober's detection (MTTD) and recovery (MTTR), plus requests that still failed after detection |
+| `fairshare` | ✔ | — | Clamps capacity to force contention, injects tenants mid-run, grades Jain fairness index, convergence time, and starvation |
+| `compression` | opt-in | opt-in | The compression A/B (below) — runs only when `--compression-model` and `--compression-key` are given |
+
+Each section grades independently; a section that fails to run reports `ERR`
+with the error in the scorecard rather than killing the run. Skipped and
+errored sections redistribute their weight, so the system score always
+reflects what was actually measured.
+
+Flags:
+
+- `--quick` — skip the capacity ramps; capacity and overload report as skipped.
+- `--skip <csv>` / `--only <csv>` — drop or isolate sections by name
+  (`--only capacity` for a fast capacity-only regression run). `--only` wins.
+- `--max-conc <n>` — cap the capacity ramp (default 256; the safety valve for
+  live targets).
+- `--backend-base <url>` — where benchmark-backend is reachable from the
+  machine running obench (default `http://localhost:8081`); used by the
+  overhead section's direct leg and by fault injection.
+- `--baseline <path>` — diff against an explicit scorecard JSON. Without it,
+  the newest `scorecards/<target>-<ts>.json` in `BENCH_OUT_DIR` is used
+  automatically, so back-to-back runs self-compare.
+- `--fail-under <score>` — exit 1 if the system score lands below the
+  threshold **or any regression is flagged**. This is the CI hook:
+  `obench score --target demo --fail-under 70` in a pipeline fails the build
+  on a sustainable-concurrency drop, a knee-latency rise, or a proxy-overhead
+  rise versus the previous run.
+- `--compression-model` / `--compression-key` — include the compression A/B as
+  a scored section (needs a model with the `compression` boon and a key that
+  can call it).
+
+Artifacts, all in `BENCH_OUT_DIR`: `scorecard.md` (the printed report),
+`scorecard.json` (machine-readable, full per-section metrics), and a dated
+baseline copy `scorecards/<target>-<ts>.json` that future runs diff against.
+
+The resilience section drives benchmark-backend's fault-injection endpoint —
+`POST /control` with `{"model": "<substring>|*", "mode": "fail"|"stall"|"slow"|"ok"}`
+kills one simulated model while the rest of the fleet stays healthy. It exists
+only on the demo backend and is never exposed beyond the local stack. During
+the section obench temporarily tightens the model's health-check config
+(interval 1s, threshold 1) and restores the previous values afterwards — note
+the gateway's prober floors re-check scheduling at 60s, so detection time is
+graded relative to that effective interval, not as an absolute number.
+
 ## The `auto` profile
 
 `auto` runs a stepped concurrency ramp (`32 → 64 → 128 → 256 → 512 → 1024 →
