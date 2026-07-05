@@ -16,6 +16,11 @@ export interface ChatTurn {
   error?: string;
   /** True while the assistant turn is still streaming. */
   streaming?: boolean;
+  toolResults?: { type: string; data: unknown }[];
+  /** Live per-step accumulation while a bench tool runs. */
+  liveSteps?: import("@/lib/charo/bench/types").StepOutcome[];
+  /** Set when a confirmation-gated tool is awaiting the operator. */
+  pendingConfirm?: { name: string; args: unknown };
 }
 
 type WireContent =
@@ -209,5 +214,58 @@ export function useCharoStream() {
     [busy, messages],
   );
 
-  return { messages, state, busy, send, reset };
+  const runToolDirect = useCallback(async (name: string, args: unknown) => {
+    const assistantId = uid();
+    setMessages((prev) => [...prev, { id: assistantId, role: "assistant", content: "", streaming: true, liveSteps: [], toolResults: [] }]);
+    setBusy(true);
+    setState("thinking");
+    const ac = new AbortController();
+    abortRef.current = ac;
+    const patch = (fn: (t: ChatTurn) => ChatTurn) =>
+      setMessages((prev) => prev.map((m) => (m.id === assistantId ? fn(m) : m)));
+
+    try {
+      const res = await fetch(`/api/charo/tools/${encodeURIComponent(name)}/run`, {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(args), signal: ac.signal,
+      });
+      if (!res.ok || !res.body) throw new Error(`tool run failed (${res.status})`);
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let sep: number;
+        while ((sep = buffer.indexOf("\n\n")) !== -1) {
+          const frame = buffer.slice(0, sep); buffer = buffer.slice(sep + 2);
+          let event = "message", data = "";
+          for (const line of frame.split("\n")) {
+            if (line.startsWith("event:")) event = line.slice(6).trim();
+            else if (line.startsWith("data:")) data += line.slice(5).trim();
+          }
+          if (!data) continue;
+          let parsed: Record<string, unknown> = {};
+          try { parsed = JSON.parse(data); } catch { continue; }
+
+          if (event === "tool_progress" && parsed.kind === "bench_step" && parsed.step) {
+            patch((m) => ({ ...m, liveSteps: [...(m.liveSteps ?? []), parsed.step as NonNullable<ChatTurn["liveSteps"]>[number]] }));
+          } else if (event === "tool_result") {
+            patch((m) => ({ ...m, toolResults: [...(m.toolResults ?? []), parsed as { type: string; data: unknown }] }));
+          } else if (event === "error") {
+            patch((m) => ({ ...m, error: String(parsed.message ?? "tool error"), streaming: false }));
+          }
+        }
+      }
+      patch((m) => ({ ...m, streaming: false }));
+      setState("result");
+    } catch (e) {
+      if (!ac.signal.aborted) { patch((m) => ({ ...m, error: String(e), streaming: false })); setState("error"); }
+    } finally {
+      setBusy(false); abortRef.current = null;
+    }
+  }, []);
+
+  return { messages, state, busy, send, reset, runToolDirect };
 }
