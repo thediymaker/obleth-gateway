@@ -6,13 +6,14 @@ import { Button } from "@/components/ui/button";
 import { useCharoContext } from "./charo-context";
 import { resultRenderer } from "./results/registry";
 import { BenchResultCard } from "./results/bench-result-card";
+import { ConfirmCard } from "./results/confirm-card";
 import { CharoSettingsForm } from "@/components/settings-form";
 import type { CharoSettingsView, ModelRoute } from "@/lib/obleth";
 import type { BenchResult } from "@/lib/charo/bench/types";
 
 export function CharoWorkspace({ settings, models }: { settings: CharoSettingsView | null; models: ModelRoute[] }) {
   const stream = useCharoContext();
-  const { messages, busy, send, runToolDirect } = stream;
+  const { messages, busy, send, runToolDirect, confirmRun, confirmCancel } = stream;
   const [text, setText] = useState("");
   const [subject, setSubject] = useState(models.find((m) => m.enabled)?.model_name ?? "");
   const brain = settings?.brain_model ?? null;
@@ -24,8 +25,10 @@ export function CharoWorkspace({ settings, models }: { settings: CharoSettingsVi
 
   const onSend = () => {
     if (!text.trim() || busy) return;
-    // With a brain, chat drives tools; without, fall back to the plain tester.
-    send(brain ?? subject, text);
+    // Always send through the agent loop; the gateway uses the configured brain
+    // and, with no brain, falls back to testing `subject`. `subject` is also the
+    // vision/tester target for that fallback.
+    send(subject, text);
     setText("");
   };
 
@@ -60,6 +63,14 @@ export function CharoWorkspace({ settings, models }: { settings: CharoSettingsVi
                     const R = resultRenderer(tr.type);
                     return <R key={i} data={tr.data} />;
                   })}
+                  {m.pendingConfirm && (
+                    <ConfirmCard
+                      pending={m.pendingConfirm}
+                      disabled={busy}
+                      onRun={() => confirmRun(m.id)}
+                      onCancel={() => confirmCancel(m.id)}
+                    />
+                  )}
                 </div>
               ))}
             </div>
