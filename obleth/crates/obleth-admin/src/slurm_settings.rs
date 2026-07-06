@@ -711,7 +711,12 @@ mod tests {
         assert_eq!(e2.since, 1_015);
         assert_eq!(tr2, TickTransition::None);
         // Past the threshold: held.
-        let (e3, tr3) = merge_tick(Some(&e2), "error", Some("boom".into()), 1_015 + HELD_ALERT_SECS);
+        let (e3, tr3) = merge_tick(
+            Some(&e2),
+            "error",
+            Some("boom".into()),
+            1_015 + HELD_ALERT_SECS,
+        );
         assert_eq!(e3.since, 1_015);
         assert_eq!(e3.last_ok_at, Some(1_000));
         assert_eq!(tr3, TickTransition::Held);
@@ -747,8 +752,18 @@ mod tests {
         // `idle` also freezes replica state (nothing reconciles); the streak and
         // held detection apply the same way. The enabled-gate in the handler is
         // what keeps a deliberately disabled Slurm from alerting.
-        let (i1, _) = merge_tick(None, "idle", Some("slurm disabled in settings".into()), 1_000);
-        let (_, tr) = merge_tick(Some(&i1), "idle", Some("slurm disabled in settings".into()), 1_000 + HELD_ALERT_SECS);
+        let (i1, _) = merge_tick(
+            None,
+            "idle",
+            Some("slurm disabled in settings".into()),
+            1_000,
+        );
+        let (_, tr) = merge_tick(
+            Some(&i1),
+            "idle",
+            Some("slurm disabled in settings".into()),
+            1_000 + HELD_ALERT_SECS,
+        );
         assert_eq!(tr, TickTransition::Held);
     }
 }
