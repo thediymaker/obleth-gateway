@@ -8,6 +8,7 @@ import {
   BookText,
   Boxes,
   BarChart3,
+  Bot,
   ChevronDown,
   Gauge,
   KeyRound,
@@ -51,6 +52,7 @@ const nav = [
   { href: "/logs", label: "Request Logs", icon: Radio },
   { href: "/reports", label: "Reports", icon: BarChart3 },
   { href: "/audit", label: "Audit", icon: ScrollText },
+  { href: "/charo", label: "Charo", icon: Bot },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 
