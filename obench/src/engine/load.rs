@@ -92,6 +92,7 @@ impl LoadClient {
                     in_tokens: 0,
                     out_tokens: 0,
                     usage_estimated: false,
+                    gaps_ms: Vec::new(),
                 }
                 .with_error(&e.to_string())
             }
@@ -110,6 +111,7 @@ impl LoadClient {
                 in_tokens: 0,
                 out_tokens: 0,
                 usage_estimated: false,
+                gaps_ms: Vec::new(),
             };
         }
 
@@ -122,6 +124,7 @@ impl LoadClient {
             in_tokens: prompt_tokens,
             out_tokens: 0,
             usage_estimated: estimated,
+            gaps_ms: Vec::new(),
         }
     }
 
@@ -160,6 +163,7 @@ impl LoadClient {
                     in_tokens: 0,
                     out_tokens: 0,
                     usage_estimated: false,
+                    gaps_ms: Vec::new(),
                 }
                 .with_error(&e.to_string())
             }
@@ -168,13 +172,21 @@ impl LoadClient {
         let status = resp.status().as_u16();
         let mut ttfb_ms = 0u64;
         let mut text = String::new();
+        let mut gaps_ms: Vec<u64> = Vec::new();
+        let mut last_chunk_at: Option<Instant> = None;
         let mut stream = resp.bytes_stream();
         while let Some(chunk) = stream.next().await {
             match chunk {
                 Ok(bytes) => {
+                    let now = Instant::now();
                     if ttfb_ms == 0 {
                         ttfb_ms = start.elapsed().as_millis() as u64;
+                    } else if req.stream {
+                        if let Some(prev) = last_chunk_at {
+                            gaps_ms.push(now.duration_since(prev).as_millis() as u64);
+                        }
                     }
+                    last_chunk_at = Some(now);
                     text.push_str(&String::from_utf8_lossy(&bytes));
                 }
                 Err(_) => break,
@@ -193,6 +205,7 @@ impl LoadClient {
                 in_tokens: 0,
                 out_tokens: 0,
                 usage_estimated: false,
+                gaps_ms: Vec::new(),
             };
         }
 
@@ -212,6 +225,7 @@ impl LoadClient {
             in_tokens: u.prompt_tokens,
             out_tokens: u.completion_tokens,
             usage_estimated: estimated,
+            gaps_ms,
         }
     }
 }

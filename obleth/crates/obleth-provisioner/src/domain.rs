@@ -66,6 +66,25 @@ pub struct ReplicaView {
     pub cancel_requested: bool,
 }
 
+/// One of a model's registered endpoints, as the gateway sees it — including
+/// the gateway's own health verdict. The gateway's endpoint check is a real
+/// 1-token inference, so it catches "zombie" servers that still answer
+/// metadata GETs (which the provisioner's cheap health_path probe cannot):
+/// an Ollama that lists its models instantly but hangs forever on a
+/// completion passes the GET probe and fails the gateway check.
+#[derive(Debug, Clone)]
+pub struct EndpointView {
+    pub id: Uuid,
+    pub name: String,
+    /// Gateway-recorded health status ("healthy" | "unhealthy" | "degraded" |
+    /// …); `None` when the gateway has never checked this endpoint.
+    pub health_status: Option<String>,
+    /// Consecutive failed gateway checks (reset on a passing one).
+    pub consecutive_failures: i64,
+    /// Seconds since the gateway last checked this endpoint; `None` if never.
+    pub checked_secs_ago: Option<i64>,
+}
+
 /// Live, version-agnostic snapshot of what the configured Slurm cluster offers.
 /// Powers the launcher's resource dropdowns. Every field is best-effort: a
 /// version skew or permission gap yields empties, never an error.
@@ -114,7 +133,22 @@ pub enum Action {
         replica_id: Uuid,
         job_id: String,
         endpoint_id: Option<Uuid>,
+        reason: CancelReason,
     },
     /// GC a long-dead `lost` replica row.
     Delete { replica_id: Uuid },
+}
+
+/// Why a replica's job is being cancelled — recorded on the replica row so the
+/// dashboard's draining pill says what actually happened, not just "scaled down".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CancelReason {
+    /// Over target: normal scale-down.
+    ScaleDown,
+    /// Operator hit the restart action (`cancel_requested` on the row).
+    OperatorRestart,
+    /// Self-heal: the job still reports RUNNING but the replica failed
+    /// consecutive health probes (zombie job) — cancel so the resubmit-to-target
+    /// replaces it with a fresh one.
+    ProbeFailed,
 }

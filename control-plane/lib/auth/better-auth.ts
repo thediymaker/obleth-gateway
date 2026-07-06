@@ -14,6 +14,27 @@ function secret(): string {
 }
 
 /**
+ * Extra origins better-auth should accept for its CSRF/origin check, on top of
+ * `baseURL` (which is always trusted). Without this, hitting the dashboard from
+ * anything other than the exact `BETTER_AUTH_URL` host — e.g. a LAN IP or
+ * hostname in a self-hosted Docker/K8s deploy — is rejected with an
+ * invalid-origin error and login fails.
+ *
+ * `TRUSTED_ORIGINS` is a comma-separated list of origins (scheme + host + port),
+ * e.g. "http://192.168.1.50:3002,https://dashboard.internal". A single "*"
+ * trusts all origins — convenient on a trusted private network, but do not use
+ * it on anything internet-reachable.
+ */
+function trustedOrigins(): string[] {
+  const raw = process.env.TRUSTED_ORIGINS;
+  if (!raw) return [];
+  return raw
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
+}
+
+/**
  * Construct the better-auth instance. Kept as a factory (rather than a
  * module-scope const) because it calls `getDb()` and `secret()`, both of which
  * throw when `DATABASE_URL` / the session secret are absent. Next.js evaluates
@@ -29,6 +50,7 @@ function createAuth() {
     database: getDb(),
     secret: secret(),
     baseURL: process.env.BETTER_AUTH_URL ?? "http://localhost:3000",
+    trustedOrigins: trustedOrigins(),
     emailAndPassword: { enabled: true },
     user: {
       additionalFields: {

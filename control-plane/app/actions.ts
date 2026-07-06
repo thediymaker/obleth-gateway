@@ -10,6 +10,7 @@ import type {
   AutotuneReport,
   AutotuneWorkload,
   ConfigBackup,
+  CharoSettingsView,
   CompressionPolicy,
   EnergyTestResult,
   GuardrailsPolicy,
@@ -26,7 +27,9 @@ import { requireAdmin } from "@/lib/auth/roles";
 import { resolveRecipeById, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
 import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
 
-export type ActionResult = { ok: true } | { ok: false; error: string };
+export type ActionResult =
+  | { ok: true; warnings?: string[] }
+  | { ok: false; error: string };
 
 function actionError(e: unknown): ActionResult {
   if (e instanceof OblethApiError) return { ok: false, error: e.message };
@@ -583,6 +586,13 @@ export async function toggleTenantTracingAction(id: string, tracing_enabled: boo
   revalidatePath("/tenants");
 }
 
+export async function toggleTenantSyntheticAction(id: string, synthetic: boolean) {
+  const session = await requireAdmin();
+  await obleth.setTenantSynthetic(id, synthetic, { auditActor: session.email });
+  updateTag(CACHE_TAGS.tenants);
+  revalidatePath("/tenants");
+}
+
 export async function deleteKeyAction(id: string) {
   const session = await requireAdmin();
   await obleth.deleteKey(id, { auditActor: session.email });
@@ -749,7 +759,14 @@ export async function createModelAction(
   }
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
-  return { ok: true };
+  const warnings = isSlurm
+    ? undefined
+    : await modelRegistrationWarnings({
+        api_base: parsed.data.api_base,
+        upstream_model: parsed.data.upstream_model,
+        model_type: parsed.data.model_type,
+      });
+  return { ok: true, warnings };
 }
 
 export async function setModelCapacityAction(
@@ -890,7 +907,26 @@ export async function deleteModelEndpointAction(
 // Granular model update actions (split-tab UI)
 // ----------------------------------------------------------------------------
 
-export type ModelActionState = { ok: true } | { ok: false; error: string };
+export type ModelActionState =
+  | { ok: true; warnings?: string[] }
+  | { ok: false; error: string };
+
+// Advisory post-save validation: does the upstream actually list this model?
+// Never blocks or fails a save — validation trouble just means no warnings.
+async function modelRegistrationWarnings(body: {
+  api_base: string;
+  upstream_model: string;
+  model_type?: string | null;
+}): Promise<string[] | undefined> {
+  // Provisioned-only models (blank api_base) are verified per endpoint.
+  if (!body.api_base.trim()) return undefined;
+  try {
+    const result = await obleth.validateModel(body);
+    return result.warnings.length > 0 ? result.warnings : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 // Full replacement body for PUT /models/{id}, built from the current model so a
 // partial edit re-sends every field the gateway expects. `api_key` is omitted
@@ -966,7 +1002,12 @@ export async function updateModelConnectionAction(
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
-  return { ok: true };
+  const warnings = await modelRegistrationWarnings({
+    api_base: String(formData.get("api_base") ?? current.api_base),
+    upstream_model: String(formData.get("upstream_model") ?? current.upstream_model),
+    model_type: String(formData.get("model_type") ?? current.model_type),
+  });
+  return { ok: true, warnings };
 }
 
 // Capabilities tab: native capabilities, context window, routing tags, boons,
@@ -1422,11 +1463,11 @@ export async function testEnergyQueryAction(
 }
 
 export async function setCharoSettingsAction(
-  enabled: boolean,
+  next: CharoSettingsView,
 ): Promise<ActionResult> {
   const session = await requireAdmin();
   try {
-    await obleth.setCharoSettings({ enabled }, { auditActor: session.email });
+    await obleth.setCharoSettings(next, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }

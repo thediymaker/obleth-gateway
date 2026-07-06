@@ -70,6 +70,7 @@ const SCHEMA_V12: &str =
     include_str!("../../../../schema/postgres/0012_model_debug_diagnostics.sql");
 const SCHEMA_V13: &str = include_str!("../../../../schema/postgres/0013_compression_policy.sql");
 const SCHEMA_V14: &str = include_str!("../../../../schema/postgres/0014_model_energy_slots.sql");
+const SCHEMA_V15: &str = include_str!("../../../../schema/postgres/0015_tenant_synthetic.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -171,6 +172,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V12).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V13).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V14).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V15).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -271,7 +273,7 @@ impl Store {
 
     pub async fn list_tenants(&self) -> Result<Vec<Tenant>> {
         let rows = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, created_at, updated_at
              from tenants order by created_at",
         )
         .fetch_all(&self.pool)
@@ -281,7 +283,7 @@ impl Store {
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Tenant> {
         let row = sqlx::query(
-            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, created_at, updated_at
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, created_at, updated_at
              from tenants where id = $1",
         )
         .bind(id)
@@ -830,6 +832,20 @@ impl Store {
         Ok(())
     }
 
+    /// Mark a tenant as synthetic (benchmark/test traffic) or real.
+    pub async fn set_tenant_synthetic(&self, id: Uuid, synthetic: bool) -> Result<()> {
+        Self::guard_reserved_tenant(id)?;
+        sqlx::query(
+            "update tenants set synthetic = $2, updated_at = now() where id = $1 returning id",
+        )
+        .bind(id)
+        .bind(synthetic)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        Ok(())
+    }
+
     pub async fn delete_key(&self, id: Uuid) -> Result<String> {
         self.guard_reserved_key(id).await?;
         let row = sqlx::query("delete from api_keys where id = $1 returning key_hash")
@@ -855,7 +871,8 @@ impl Store {
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
-                    t.compression_policy
+                    t.compression_policy,
+                    t.synthetic
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group
@@ -882,7 +899,8 @@ impl Store {
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
-                    t.compression_policy
+                    t.compression_policy,
+                    t.synthetic
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group",
@@ -913,7 +931,8 @@ impl Store {
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
-                    t.compression_policy
+                    t.compression_policy,
+                    t.synthetic
              from api_keys k
              join tenants t on t.id = k.tenant_id
              join fairshare_groups g on g.name = t.fairshare_group
@@ -2162,6 +2181,31 @@ impl Store {
         model_health_summary_from_row(&row)
     }
 
+    /// Reset a model's health state after a probe-relevant config change
+    /// (`api_base` / `upstream_model` / `model_type`): the old failure streak
+    /// and alert state describe a configuration that no longer exists.
+    /// `health_next_check_at = now()` makes the scheduler re-verify within one
+    /// worker tick, so the fix proves itself immediately. Check history rows
+    /// are left untouched.
+    pub async fn reset_model_health(&self, id: Uuid) -> Result<()> {
+        let r = sqlx::query(
+            "update models set
+                health_status = 'unknown',
+                health_consecutive_failures = 0,
+                health_alert_state = 'ok',
+                health_next_check_at = now(),
+                updated_at = now()
+             where id = $1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if r.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
     pub async fn claim_due_model_health_checks(&self, limit: i64) -> Result<Vec<ModelHealthClaim>> {
         let rows = sqlx::query(
             "with due as (
@@ -2576,6 +2620,40 @@ impl Store {
         Ok(())
     }
 
+    /// Load the full Charo settings blob. Falls back to the legacy `charo_enabled`
+    /// boolean (with defaults for the newer fields) when `charo_settings` is unset,
+    /// so upgrades preserve the operator's existing show/hide choice.
+    pub async fn get_charo_settings(&self) -> Result<obleth_config::CharoSettings> {
+        let row = sqlx::query("select value from app_settings where key = 'charo_settings'")
+            .fetch_optional(&self.pool)
+            .await?;
+        if let Some(row) = row {
+            let value: sqlx::types::Json<obleth_config::CharoSettings> = row.try_get("value")?;
+            return Ok(value.0);
+        }
+        // Legacy fallback: synthesize from the old boolean key.
+        let enabled = self.get_charo_enabled().await?.unwrap_or(true);
+        Ok(obleth_config::CharoSettings {
+            enabled,
+            ..Default::default()
+        })
+    }
+
+    /// Persist the full Charo settings blob (upsert on `charo_settings`). Also keeps
+    /// the legacy `charo_enabled` key in sync so any remaining reader stays correct.
+    pub async fn set_charo_settings(&self, settings: &obleth_config::CharoSettings) -> Result<()> {
+        sqlx::query(
+            "insert into app_settings (key, value, updated_at)
+             values ('charo_settings', $1, now())
+             on conflict (key) do update set value = excluded.value, updated_at = now()",
+        )
+        .bind(sqlx::types::Json(settings))
+        .execute(&self.pool)
+        .await?;
+        self.set_charo_enabled(settings.enabled).await?;
+        Ok(())
+    }
+
     /// Load the persisted raw-usage retention setting, or `None` if unset.
     pub async fn get_usage_retention_settings(
         &self,
@@ -2745,6 +2823,7 @@ fn tenant_from_row(row: &PgRow) -> Result<Tenant> {
         tracing_enabled: row.try_get("tracing_enabled").unwrap_or(false),
         guardrails_policy: guardrails_policy_from_row(row)?,
         compression_policy: compression_policy_from_row(row)?,
+        synthetic: row.try_get("synthetic").unwrap_or(false),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -2851,6 +2930,7 @@ fn resolved_from_row(row: &PgRow) -> Result<ResolvedKey> {
         tracing_enabled: row.try_get::<bool, _>("tracing_enabled").unwrap_or(false),
         guardrails_policy: guardrails_policy_from_row(row)?,
         compression_policy: compression_policy_from_row(row)?,
+        synthetic: row.try_get("synthetic").unwrap_or(false),
     })
 }
 
@@ -3355,6 +3435,37 @@ mod tests {
             .expect("health checks");
         assert!(checks.len() >= 2);
 
+        // A probe-relevant config change resets health state: the failure
+        // streak and alert state are cleared, the badge returns to `unknown`,
+        // and the model is immediately due for a re-check.
+        let failed_again = store
+            .record_model_health_check(
+                model.id,
+                "manual",
+                "unhealthy",
+                Some(12),
+                Some(404),
+                Some("failed"),
+                None,
+                Utc::now() + chrono::Duration::seconds(3600),
+            )
+            .await
+            .expect("record failed health again");
+        assert_eq!(failed_again.summary.consecutive_failures, 1);
+        assert_eq!(failed_again.summary.alert_state, "firing");
+        store
+            .reset_model_health(model.id)
+            .await
+            .expect("reset health");
+        let reset = store
+            .get_model_health_summary(model.id)
+            .await
+            .expect("summary after reset");
+        assert_eq!(reset.status, "unknown");
+        assert_eq!(reset.consecutive_failures, 0);
+        assert_eq!(reset.alert_state, "ok");
+        assert!(reset.next_check_at <= Utc::now());
+
         store
             .update_model_health_config(
                 model.id,
@@ -3436,6 +3547,53 @@ mod tests {
             store.delete_tenant(tenant.id).await,
             Err(StoreError::NotFound)
         ));
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// `synthetic` must default to false, flip via `set_tenant_synthetic`, and
+    /// flow through into the resolved hot-path key view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn synthetic_flag_round_trips_to_resolved_key() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let name = format!("t-{}", Uuid::new_v4());
+        let tenant = store
+            .create_tenant(&name, 100, 0, None, None)
+            .await
+            .expect("create tenant");
+        fixtures.track_tenant(tenant.id);
+        assert!(!tenant.synthetic, "tenants default to non-synthetic");
+
+        store
+            .set_tenant_synthetic(tenant.id, true)
+            .await
+            .expect("set synthetic");
+        assert!(
+            store
+                .get_tenant(tenant.id)
+                .await
+                .expect("get tenant")
+                .synthetic
+        );
+
+        let (_key, secret) = store
+            .create_api_key(tenant.id, "k", "", None, None, None, None)
+            .await
+            .expect("create key");
+        let hash = hash_api_key(&secret);
+        let resolved = store
+            .resolved_key_by_hash(&hash)
+            .await
+            .expect("resolve")
+            .expect("present");
+        assert!(resolved.synthetic);
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
@@ -4647,6 +4805,58 @@ mod tests {
 
         // Tidy up so other tests see a clean state.
         sqlx::query("delete from app_settings where key = 'energy'")
+            .execute(&store.pool)
+            .await
+            .ok();
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Verifies the full `charo_settings` blob round-trips and that the legacy
+    /// `charo_enabled` boolean stays in sync on write, plus the fallback path
+    /// when only the legacy key is present.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn charo_settings_round_trip() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+
+        // Clean up any leftover keys from a prior run.
+        sqlx::query("delete from app_settings where key in ('charo_settings', 'charo_enabled')")
+            .execute(&store.pool)
+            .await
+            .ok();
+
+        // No keys set at all: get_charo_settings falls back to full defaults.
+        let defaults = store.get_charo_settings().await.expect("get default");
+        assert_eq!(defaults, obleth_config::CharoSettings::default());
+
+        // Legacy-only fallback: charo_enabled set, charo_settings absent.
+        store.set_charo_enabled(false).await.expect("set legacy");
+        let fallback = store.get_charo_settings().await.expect("get fallback");
+        assert!(!fallback.enabled);
+        assert_eq!(
+            fallback.brain_model,
+            obleth_config::CharoSettings::default().brain_model
+        );
+
+        let s = obleth_config::CharoSettings {
+            brain_model: Some("llama-3".into()),
+            bench_max_concurrency: 24,
+            ..obleth_config::CharoSettings::default()
+        };
+        store.set_charo_settings(&s).await.expect("set");
+        let got = store.get_charo_settings().await.expect("get");
+        assert_eq!(got.brain_model.as_deref(), Some("llama-3"));
+        assert_eq!(got.bench_max_concurrency, 24);
+        // Legacy key stays in sync.
+        assert_eq!(store.get_charo_enabled().await.unwrap(), Some(true));
+
+        // Tidy up so other tests see a clean state.
+        sqlx::query("delete from app_settings where key in ('charo_settings', 'charo_enabled')")
             .execute(&store.pool)
             .await
             .ok();
