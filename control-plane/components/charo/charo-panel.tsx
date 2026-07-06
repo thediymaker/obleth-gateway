@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Send, X, ImagePlus, RotateCcw, Trash2, ChevronDown, Check } from "lucide-react";
+import { Send, X, ImagePlus, RotateCcw, Trash2, ChevronDown, Check, Maximize2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -13,6 +13,9 @@ import {
 import { cn } from "@/lib/utils";
 import type { ModelRoute } from "@/lib/obleth";
 import { TraceCard } from "./trace-card";
+import { resultRenderer } from "./results/registry";
+import { BenchResultCard } from "./results/bench-result-card";
+import { ConfirmCard } from "./results/confirm-card";
 import type { useCharoStream } from "./use-charo-stream";
 import type { CharoState } from "./sprite";
 
@@ -80,13 +83,15 @@ export function CharoPanel({
   onClose,
   stream,
   mascotState,
+  onExpand,
 }: {
   open: boolean;
   onClose: () => void;
   stream: Stream;
   mascotState: CharoState;
+  onExpand?: () => void;
 }) {
-  const { messages, busy, send, reset } = stream;
+  const { messages, busy, send, reset, runToolDirect, confirmRun, confirmCancel } = stream;
   const [models, setModels] = useState<ModelRoute[]>([]);
   const [modelId, setModelId] = useState("");
   const [text, setText] = useState("");
@@ -238,6 +243,11 @@ export function CharoPanel({
             >
               <RotateCcw className="h-4 w-4" />
             </Button>
+            {onExpand && (
+              <Button variant="ghost" size="icon" title="Open workspace" onClick={onExpand}>
+                <Maximize2 className="h-4 w-4" />
+              </Button>
+            )}
             <Button variant="ghost" size="icon" title="Close" onClick={onClose}>
               <X className="h-4 w-4" />
             </Button>
@@ -327,6 +337,25 @@ export function CharoPanel({
                 />
               </div>
             )}
+            {m.role === "assistant" && (m.liveSteps?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0 && (
+              <div className="w-full">
+                <BenchResultCard data={{ modelName: selected?.model_name, steps: m.liveSteps }} />
+              </div>
+            )}
+            {m.role === "assistant" && m.toolResults?.map((tr, i) => {
+              const Renderer = resultRenderer(tr.type);
+              return <div key={i} className="w-full"><Renderer data={tr.data} /></div>;
+            })}
+            {m.role === "assistant" && m.pendingConfirm && (
+              <div className="w-full">
+                <ConfirmCard
+                  pending={m.pendingConfirm}
+                  disabled={busy}
+                  onRun={() => confirmRun(m.id)}
+                  onCancel={() => confirmCancel(m.id)}
+                />
+              </div>
+            )}
           </div>
         ))}
       </div>
@@ -346,6 +375,16 @@ export function CharoPanel({
                 {p.label}
               </button>
             ))}
+            {selected && (
+              <button
+                type="button"
+                onClick={() => selected && runToolDirect("run_benchmark", { model: selected.model_name, steps: [1, 5, 10], step_duration_s: 5 })}
+                disabled={busy || !selected}
+                className="rounded-full border border-violet-400/40 px-2.5 py-0.5 text-xs text-violet-600 transition-colors hover:bg-violet-500/10 disabled:opacity-50 dark:text-violet-300"
+              >
+                Benchmark this model
+              </button>
+            )}
           </div>
         )}
 

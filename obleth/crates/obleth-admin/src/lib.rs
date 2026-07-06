@@ -1965,10 +1965,43 @@ async fn test_energy_query(
     }))
 }
 
-/// Whether the Charo control-plane assistant is shown in the dashboard.
+/// Charo assistant settings surfaced to the dashboard. Mirrors
+/// `obleth_config::CharoSettings` exactly.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CharoSettingsView {
     pub enabled: bool,
+    pub brain_model: Option<String>,
+    #[serde(default)]
+    pub tools_enabled: std::collections::BTreeMap<String, bool>,
+    pub bench_max_concurrency: u32,
+    pub bench_max_duration_s: u32,
+    pub bench_max_requests: u32,
+}
+
+impl From<obleth_config::CharoSettings> for CharoSettingsView {
+    fn from(s: obleth_config::CharoSettings) -> Self {
+        CharoSettingsView {
+            enabled: s.enabled,
+            brain_model: s.brain_model,
+            tools_enabled: s.tools_enabled,
+            bench_max_concurrency: s.bench_max_concurrency,
+            bench_max_duration_s: s.bench_max_duration_s,
+            bench_max_requests: s.bench_max_requests,
+        }
+    }
+}
+
+impl From<CharoSettingsView> for obleth_config::CharoSettings {
+    fn from(v: CharoSettingsView) -> Self {
+        obleth_config::CharoSettings {
+            enabled: v.enabled,
+            brain_model: v.brain_model,
+            tools_enabled: v.tools_enabled,
+            bench_max_concurrency: v.bench_max_concurrency,
+            bench_max_duration_s: v.bench_max_duration_s,
+            bench_max_requests: v.bench_max_requests,
+        }
+    }
 }
 
 /// Live status of the optional neural compression sidecar. Its URL is env-only
@@ -2077,8 +2110,8 @@ async fn get_compressor_status() -> Result<Json<CompressorStatusView>> {
     responses((status = 200, body = CharoSettingsView))
 )]
 async fn get_charo_settings(State(state): State<AdminState>) -> Result<Json<CharoSettingsView>> {
-    let enabled = state.store.get_charo_enabled().await?.unwrap_or(true);
-    Ok(Json(CharoSettingsView { enabled }))
+    let settings = state.store.get_charo_settings().await?;
+    Ok(Json(settings.into()))
 }
 
 #[utoipa::path(
@@ -2091,7 +2124,8 @@ async fn put_charo_settings(
     headers: HeaderMap,
     Json(body): Json<CharoSettingsView>,
 ) -> Result<Json<CharoSettingsView>> {
-    state.store.set_charo_enabled(body.enabled).await?;
+    let settings: obleth_config::CharoSettings = body.into();
+    state.store.set_charo_settings(&settings).await?;
     state
         .store
         .record_audit(
@@ -2099,12 +2133,10 @@ async fn put_charo_settings(
             "set_charo_settings",
             "settings",
             "charo",
-            serde_json::json!({ "enabled": body.enabled }),
+            serde_json::json!(settings),
         )
         .await?;
-    Ok(Json(CharoSettingsView {
-        enabled: body.enabled,
-    }))
+    Ok(Json(settings.into()))
 }
 
 #[derive(Debug, Serialize, ToSchema)]

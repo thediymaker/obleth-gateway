@@ -784,6 +784,11 @@ export interface CompressorStatusView {
 
 export interface CharoSettingsView {
   enabled: boolean;
+  brain_model: string | null;
+  tools_enabled: Record<string, boolean>;
+  bench_max_concurrency: number;
+  bench_max_duration_s: number;
+  bench_max_requests: number;
 }
 
 export interface EnergySettingsView {

@@ -1186,15 +1186,36 @@ export function CompressionSettingsForm({
   );
 }
 
-export function CharoSettingsForm({ settings }: { settings: CharoSettingsView | null }) {
+export function CharoSettingsForm({
+  settings,
+  models,
+}: {
+  settings: CharoSettingsView | null;
+  models: ModelRoute[];
+}) {
   const [pending, start] = useTransition();
   const [status, setStatus] = useState<{ ok: boolean; message: string } | null>(null);
   const [enabled, setEnabled] = useState(settings?.enabled ?? true);
+  const [brain, setBrain] = useState<string>(settings?.brain_model ?? "");
+  const [maxConc, setMaxConc] = useState(settings?.bench_max_concurrency ?? 40);
+  const [maxDur, setMaxDur] = useState(settings?.bench_max_duration_s ?? 120);
+  const [maxReq, setMaxReq] = useState(settings?.bench_max_requests ?? 500);
+  const [runBench, setRunBench] = useState(settings?.tools_enabled?.run_benchmark ?? true);
+
+  const brainCandidates = models.filter((m) => m.enabled && m.supports_function_calling);
 
   function save() {
     setStatus(null);
     start(async () => {
-      const result = await setCharoSettingsAction(enabled);
+      const next: CharoSettingsView = {
+        enabled,
+        brain_model: brain || null,
+        tools_enabled: { run_benchmark: runBench },
+        bench_max_concurrency: maxConc,
+        bench_max_duration_s: maxDur,
+        bench_max_requests: maxReq,
+      };
+      const result = await setCharoSettingsAction(next);
       setStatus(
         result.ok
           ? { ok: true, message: "Assistant settings saved." }
@@ -1208,34 +1229,66 @@ export function CharoSettingsForm({ settings }: { settings: CharoSettingsView | 
       <CardHeader>
         <CardTitle>Charo assistant</CardTitle>
         <CardDescription>
-          Charo is a draggable on-screen companion for operators. Open it to chat-test any model
-          through the gateway and confirm its configured boons (web search, tools, vision,
-          guardrails, structured output, cache) actually fire. Every token is billed to the
-          reserved internal tenant, so accounting stays intact. Disable it to hide Charo from the
-          dashboard for everyone.
+          Charo is an on-screen operator companion. Give it a brain model to let it run
+          tools (like the capacity benchmark) and answer with live results. Without a brain
+          model it stays a plain model-tester: the persona rides the model under test and no
+          tools are offered. Every token is billed to the reserved internal tenant.
         </CardDescription>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent className="space-y-5">
         <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => setEnabled(e.target.checked)}
-            className="h-4 w-4"
-          />
+          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4" />
           Show Charo in the dashboard
         </label>
-        <Button onClick={save} disabled={pending}>
-          {pending ? "Saving..." : "Save assistant"}
-        </Button>
-        {status && (
-          <p
-            className={
-              status.ok
-                ? "rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
-                : "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
-            }
+
+        <div className="space-y-1.5">
+          <label className="text-sm font-medium">Brain model</label>
+          <select
+            value={brain}
+            onChange={(e) => setBrain(e.target.value)}
+            className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm"
           >
+            <option value="">None (legacy tester mode)</option>
+            {brainCandidates.map((m) => (
+              <option key={m.id} value={m.model_name}>{m.model_name}</option>
+            ))}
+          </select>
+          <p className="text-xs text-muted-foreground">
+            Only function-calling models can be a brain. {brainCandidates.length === 0 && "No enabled model supports function calling yet."}
+          </p>
+        </div>
+
+        <div className="space-y-2">
+          <div className="text-sm font-medium">Tools</div>
+          <label className="flex items-center gap-2 text-sm">
+            <input type="checkbox" checked={runBench} onChange={(e) => setRunBench(e.target.checked)} className="h-4 w-4" />
+            Capacity benchmark (<code>run_benchmark</code>)
+          </label>
+        </div>
+
+        <div className="grid grid-cols-3 gap-3">
+          <label className="space-y-1 text-sm">
+            <span className="text-muted-foreground">Max concurrency</span>
+            <input type="number" min={1} value={maxConc} onChange={(e) => setMaxConc(Number(e.target.value))}
+              className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm" />
+          </label>
+          <label className="space-y-1 text-sm">
+            <span className="text-muted-foreground">Max duration (s)</span>
+            <input type="number" min={1} value={maxDur} onChange={(e) => setMaxDur(Number(e.target.value))}
+              className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm" />
+          </label>
+          <label className="space-y-1 text-sm">
+            <span className="text-muted-foreground">Max requests</span>
+            <input type="number" min={1} value={maxReq} onChange={(e) => setMaxReq(Number(e.target.value))}
+              className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm" />
+          </label>
+        </div>
+
+        <Button onClick={save} disabled={pending}>{pending ? "Saving..." : "Save assistant"}</Button>
+        {status && (
+          <p className={status.ok
+            ? "rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
+            : "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"}>
             {status.message}
           </p>
         )}

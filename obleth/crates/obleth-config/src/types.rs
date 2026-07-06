@@ -1,6 +1,7 @@
 //! Shared domain types used across the data plane, store, cache and admin API.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -748,6 +749,50 @@ pub struct UsageRecord {
 pub struct UsageRetentionSettings {
     /// Days of raw per-request history to keep. Clamped to a sane floor on use.
     pub days: i64,
+}
+
+/// Charo assistant configuration, persisted as a JSON blob in `app_settings`
+/// under key `charo_settings`. All fields have serde defaults so a blob written
+/// by an older build still loads.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CharoSettings {
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Model name Charo thinks with. `None` → legacy mode (persona on subject).
+    #[serde(default)]
+    pub brain_model: Option<String>,
+    /// Per-tool enable/disable by tool name. Missing key → enabled.
+    #[serde(default)]
+    pub tools_enabled: BTreeMap<String, bool>,
+    #[serde(default = "default_bench_max_concurrency")]
+    pub bench_max_concurrency: u32,
+    #[serde(default = "default_bench_max_duration_s")]
+    pub bench_max_duration_s: u32,
+    #[serde(default = "default_bench_max_requests")]
+    pub bench_max_requests: u32,
+}
+
+fn default_bench_max_concurrency() -> u32 {
+    40
+}
+fn default_bench_max_duration_s() -> u32 {
+    120
+}
+fn default_bench_max_requests() -> u32 {
+    500
+}
+
+impl Default for CharoSettings {
+    fn default() -> Self {
+        CharoSettings {
+            enabled: true,
+            brain_model: None,
+            tools_enabled: BTreeMap::new(),
+            bench_max_concurrency: default_bench_max_concurrency(),
+            bench_max_duration_s: default_bench_max_duration_s(),
+            bench_max_requests: default_bench_max_requests(),
+        }
+    }
 }
 
 /// System-wide Slurm provisioning settings, editable from the control plane and
@@ -2001,5 +2046,25 @@ mod tests {
         assert_eq!(r.energy_wh, 0.0);
         assert_eq!(r.energy_cost_usd, 0.0);
         assert_eq!(r.co2_g, 0.0);
+    }
+
+    #[test]
+    fn charo_settings_defaults() {
+        let s = CharoSettings::default();
+        assert!(s.enabled);
+        assert_eq!(s.brain_model, None);
+        assert!(s.tools_enabled.is_empty());
+        assert_eq!(s.bench_max_concurrency, 40);
+        assert_eq!(s.bench_max_duration_s, 120);
+        assert_eq!(s.bench_max_requests, 500);
+    }
+
+    #[test]
+    fn charo_settings_deserializes_partial_json() {
+        // A stored blob written before a field existed still loads (serde defaults).
+        let s: CharoSettings = serde_json::from_str(r#"{"brain_model":"llama-3"}"#).unwrap();
+        assert_eq!(s.brain_model.as_deref(), Some("llama-3"));
+        assert!(s.enabled); // default
+        assert_eq!(s.bench_max_concurrency, 40); // default
     }
 }
