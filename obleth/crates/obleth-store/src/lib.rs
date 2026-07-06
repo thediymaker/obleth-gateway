@@ -2225,6 +2225,7 @@ impl Store {
              from due
              where m.id = due.id
              returning m.id, m.model_name, m.description, m.upstream_model, m.api_base, m.api_key,
+                       m.model_type,
                        m.input_cost_per_token, m.output_cost_per_token, m.context_window,
                        m.admission_weight, m.max_in_flight,
                        m.supports_function_calling, m.supports_system_messages,
@@ -3352,7 +3353,11 @@ mod tests {
                 "upstream-model",
                 "http://127.0.0.1:8081",
                 None,
-                "chat",
+                // A non-chat type: the scheduled claim query must round-trip
+                // `model_type`, or the worker probes every model against
+                // /chat/completions (regression 2026-07-06 — embedding/TTS
+                // models were pinned `degraded` by a chat probe they don't serve).
+                "embedding",
                 0.0,
                 0.0,
                 0.0,
@@ -3484,7 +3489,14 @@ mod tests {
             .claim_due_model_health_checks(10)
             .await
             .expect("claim due");
-        assert!(claims.iter().any(|claim| claim.model.id == model.id));
+        let claimed = claims
+            .iter()
+            .find(|claim| claim.model.id == model.id)
+            .expect("model is due and claimed");
+        // The claimed model must carry its real type, not the `chat` default of
+        // a tolerant read — otherwise the scheduled worker probes the wrong
+        // modality endpoint.
+        assert_eq!(claimed.model.model_type, "embedding");
 
         let deleted = store
             .delete_model_health_checks_before(Utc::now() + chrono::Duration::days(1))
