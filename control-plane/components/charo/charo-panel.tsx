@@ -15,6 +15,7 @@ import type { ModelRoute } from "@/lib/obleth";
 import { TraceCard } from "./trace-card";
 import { resultRenderer } from "./results/registry";
 import { BenchResultCard } from "./results/bench-result-card";
+import { ConfirmCard } from "./results/confirm-card";
 import type { useCharoStream } from "./use-charo-stream";
 import type { CharoState } from "./sprite";
 
@@ -90,7 +91,7 @@ export function CharoPanel({
   mascotState: CharoState;
   onExpand?: () => void;
 }) {
-  const { messages, busy, send, reset, runToolDirect } = stream;
+  const { messages, busy, send, reset, runToolDirect, confirmRun, confirmCancel } = stream;
   const [models, setModels] = useState<ModelRoute[]>([]);
   const [modelId, setModelId] = useState("");
   const [text, setText] = useState("");
@@ -345,6 +346,16 @@ export function CharoPanel({
               const Renderer = resultRenderer(tr.type);
               return <div key={i} className="w-full"><Renderer data={tr.data} /></div>;
             })}
+            {m.role === "assistant" && m.pendingConfirm && (
+              <div className="w-full">
+                <ConfirmCard
+                  pending={m.pendingConfirm}
+                  disabled={busy}
+                  onRun={() => confirmRun(m.id)}
+                  onCancel={() => confirmCancel(m.id)}
+                />
+              </div>
+            )}
           </div>
         ))}
       </div>

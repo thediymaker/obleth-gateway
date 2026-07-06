@@ -23,7 +23,12 @@ const AGENT_PERSONA =
 
 const MAX_ITERS = 4;
 
-interface AgentBody { messages?: ChatMessage[]; subjectModel?: string }
+interface AgentBody {
+  messages?: ChatMessage[];
+  subjectModel?: string;
+  /** Operator-approved resume of a confirmation-gated tool (see the confirm flow). */
+  confirmed?: { name: string; args: unknown };
+}
 
 export async function POST(req: NextRequest) {
   const session = await getSession();
@@ -59,9 +64,30 @@ export async function POST(req: NextRequest) {
           return;
         }
 
-        const schemas = isAdmin && settings ? toolSchemas(settings) : [];
+        let schemas = isAdmin && settings ? toolSchemas(settings) : [];
         const transcript: ChatMessage[] = [{ role: "system", content: AGENT_PERSONA }, ...history];
         const ctx: ToolCtx = { settings: settings!, gatewayChat, signal: req.signal };
+
+        // Confirmation resume: the operator approved a confirmation-gated tool in
+        // the UI. Run it server-side, feed the result into the transcript, and drop
+        // the tool schemas so the follow-up loop only produces a plain verdict
+        // (no re-run). This is the spec's "resume via a short-lived confirmation".
+        const confirmed = body.confirmed;
+        if (confirmed && isAdmin && getTool(confirmed.name)) {
+          send("tool_call", { name: confirmed.name, args: confirmed.args });
+          const env = await runTool(confirmed.name, confirmed.args, ctx, (p) =>
+            send("tool_progress", p),
+          );
+          send("tool_result", env);
+          transcript.push({
+            role: "user",
+            content:
+              `The ${confirmed.name} tool finished. Result JSON: ` +
+              `${JSON.stringify(env.data).slice(0, 2000)}. ` +
+              `Give the operator a brief plain verdict; do not call any tool.`,
+          });
+          schemas = [];
+        }
 
         for (let iter = 0; iter < MAX_ITERS; iter++) {
           const res = await gatewayChat(
