@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
-import { Send, X, ImagePlus, RotateCcw, Trash2, ChevronDown, Check, Maximize2, Minimize2 } from "lucide-react";
+import { Send, Square, X, ImagePlus, RotateCcw, Trash2, ChevronDown, Check, Maximize2, Minimize2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -133,7 +133,30 @@ const PANEL_CSS = `
     position: relative;
     z-index: 3;
   }
+  @keyframes charo-typing {
+    0%, 60%, 100% { transform: translateY(0); opacity: .35; }
+    30% { transform: translateY(-3px); opacity: 1; }
+  }
+  .charo-typing-dot {
+    animation: charo-typing 1.2s ease-in-out infinite;
+  }
 `;
+
+// Three bouncing dots shown in the assistant slot between hitting send and the
+// first token, so a pending response never reads as dead air.
+function TypingDots() {
+  return (
+    <span className="flex items-center gap-1 py-1" role="status" aria-label="Charo is thinking">
+      {[0, 160, 320].map((d) => (
+        <span
+          key={d}
+          className="charo-typing-dot h-1.5 w-1.5 rounded-full bg-muted-foreground/70"
+          style={{ animationDelay: `${d}ms` }}
+        />
+      ))}
+    </span>
+  );
+}
 
 export function CharoPanel({
   open,
@@ -153,7 +176,7 @@ export function CharoPanel({
   stream: Stream;
   mascotState: CharoState;
 }) {
-  const { messages, busy, send, reset, runToolDirect, confirmRun, confirmCancel } = stream;
+  const { messages, busy, send, stop, reset, runToolDirect, confirmRun, confirmCancel } = stream;
   const [models, setModels] = useState<ModelRoute[]>([]);
   const [modelId, setModelId] = useState("");
   const [text, setText] = useState("");
@@ -222,7 +245,7 @@ export function CharoPanel({
     <div className="flex items-center justify-between gap-3 border-b border-border bg-secondary/20 px-4 py-3">
       <div className="truncate text-sm font-semibold">Charo</div>
       <div className="flex items-center gap-1">
-        <Button variant="ghost" size="icon" title="Clear conversation" onClick={reset} disabled={busy}>
+        <Button variant="ghost" size="icon" title="Clear conversation" onClick={reset}>
           <RotateCcw className="h-4 w-4" />
         </Button>
         {expanded ? (
@@ -315,7 +338,16 @@ export function CharoPanel({
           const hasToolResults = (m.toolResults?.length ?? 0) > 0;
           const showBubble = !!content || !!m.image || !!m.error || !m.streaming;
           if (!showBubble && !hasTrace && !hasLiveBench && !hasToolResults && !m.pendingConfirm) {
-            return null;
+            // Streaming but nothing to show yet (waiting on the first token or a
+            // tool's first progress event): show the typing indicator, not dead air.
+            if (!m.streaming) return null;
+            return (
+              <div key={m.id} className="flex flex-col items-start">
+                <div className="w-fit rounded-lg rounded-tl-sm bg-muted px-3 py-2">
+                  <TypingDots />
+                </div>
+              </div>
+            );
           }
           return (
             <div key={m.id} className="flex flex-col items-start space-y-2">
@@ -473,18 +505,30 @@ export function CharoPanel({
                 </Button>
               </>
             )}
-            <Button
-              size="icon"
-              className={cn(
-                "h-9 w-9 shrink-0 disabled:opacity-100",
-                !canSend && "bg-secondary text-muted-foreground hover:bg-secondary",
-              )}
-              title="Send"
-              onClick={onSend}
-              disabled={!canSend}
-            >
-              <Send className="h-4 w-4" />
-            </Button>
+            {busy ? (
+              <Button
+                size="icon"
+                variant="secondary"
+                className="h-9 w-9 shrink-0"
+                title="Stop"
+                onClick={stop}
+              >
+                <Square className="h-3.5 w-3.5 fill-current" />
+              </Button>
+            ) : (
+              <Button
+                size="icon"
+                className={cn(
+                  "h-9 w-9 shrink-0 disabled:opacity-100",
+                  !canSend && "bg-secondary text-muted-foreground hover:bg-secondary",
+                )}
+                title="Send"
+                onClick={onSend}
+                disabled={!canSend}
+              >
+                <Send className="h-4 w-4" />
+              </Button>
+            )}
           </div>
         </div>
       </div>

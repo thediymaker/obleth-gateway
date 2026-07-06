@@ -9,17 +9,11 @@ import { toolSchemas, getTool } from "@/lib/charo/tools/registry";
 import { runTool } from "@/lib/charo/tools/executor";
 import { ToolCallAccumulator } from "@/lib/charo/tools/tool-call-accumulator";
 import { deltaText, deltaToolCalls, finishReason } from "@/lib/charo/relay";
+import { AGENT_PERSONA } from "@/lib/charo/persona";
 import type { ToolCtx } from "@/lib/charo/tools/types";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
-
-const AGENT_PERSONA =
-  "You are Charo, an operator's assistant inside the obleth AI gateway. You can run " +
-  "tools on the operator's behalf — currently a capacity benchmark. When the operator " +
-  "asks to test or benchmark a model, call run_benchmark with that model's name. Keep a " +
-  "dry, unhurried voice; answer the actual question with a point of view, no padding. " +
-  "Do not narrate your own plumbing. When a tool returns, summarise the result plainly.";
 
 const MAX_ITERS = 4;
 

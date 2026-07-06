@@ -111,6 +111,9 @@ export function useCharoStream() {
   const [state, setState] = useState<CharoState>("idle");
   const [busy, setBusy] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+  // The assistant turn currently being streamed, so stop() can annotate the
+  // right bubble without wiping the conversation.
+  const activeTurnRef = useRef<string | null>(null);
   // Background trace polls outlive the stream they belong to; track them so a
   // reset can cancel any still in flight.
   const pollsRef = useRef<Set<AbortController>>(new Set());
@@ -123,12 +126,35 @@ export function useCharoStream() {
 
   const reset = useCallback(() => {
     abortRef.current?.abort();
+    abortRef.current = null;
+    activeTurnRef.current = null;
     pollsRef.current.forEach((c) => c.abort());
     pollsRef.current.clear();
     setMessages([]);
     setState("idle");
     setBusy(false);
   }, []);
+
+  // Halt the in-flight turn (a long/hung benchmark, or a slow stream) without
+  // clearing the conversation, so the operator can immediately send again. The
+  // abort propagates through the request signal to the server-side tool/gateway
+  // calls, so an actual benchmark run is cut, not just hidden. Any already-shown
+  // partial output (live bench steps, tokens) is kept.
+  const stop = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    const id = activeTurnRef.current;
+    activeTurnRef.current = null;
+    if (id) {
+      patchTurn(id, (m) => ({
+        ...m,
+        streaming: false,
+        content: m.content || "(stopped)",
+      }));
+    }
+    setBusy(false);
+    setState("idle");
+  }, [patchTurn]);
 
   // Poll the trace endpoint until the receipt flushes (or we give up and clear
   // the pending state). Runs in the background, past the stream's end.
@@ -279,6 +305,7 @@ export function useCharoStream() {
 
       setBusy(true);
       setState("thinking");
+      activeTurnRef.current = assistantId;
       const ac = new AbortController();
       abortRef.current = ac;
       const wire = toWire(history);
@@ -319,8 +346,14 @@ export function useCharoStream() {
           setState("error");
         }
       } finally {
-        setBusy(false);
-        abortRef.current = null;
+        // Only tear down if we still own the active request: stop()/Clear or a
+        // follow-up turn may have already taken over (busy stays owned by that
+        // newer turn).
+        if (abortRef.current === ac) {
+          abortRef.current = null;
+          setBusy(false);
+        }
+        if (activeTurnRef.current === assistantId) activeTurnRef.current = null;
       }
     },
     [busy, messages, runLegacyChat, applyAgentEvent, patchTurn],
@@ -348,6 +381,7 @@ export function useCharoStream() {
       ]);
       setBusy(true);
       setState("thinking");
+      activeTurnRef.current = assistantId;
       const ac = new AbortController();
       abortRef.current = ac;
 
@@ -371,8 +405,14 @@ export function useCharoStream() {
           setState("error");
         }
       } finally {
-        setBusy(false);
-        abortRef.current = null;
+        // Only tear down if we still own the active request: stop()/Clear or a
+        // follow-up turn may have already taken over (busy stays owned by that
+        // newer turn).
+        if (abortRef.current === ac) {
+          abortRef.current = null;
+          setBusy(false);
+        }
+        if (activeTurnRef.current === assistantId) activeTurnRef.current = null;
       }
     },
     [busy, messages, applyAgentEvent, patchTurn],
@@ -400,6 +440,7 @@ export function useCharoStream() {
       ]);
       setBusy(true);
       setState("thinking");
+      activeTurnRef.current = assistantId;
       const ac = new AbortController();
       abortRef.current = ac;
 
@@ -440,12 +481,18 @@ export function useCharoStream() {
           setState("error");
         }
       } finally {
-        setBusy(false);
-        abortRef.current = null;
+        // Only tear down if we still own the active request: stop()/Clear or a
+        // follow-up turn may have already taken over (busy stays owned by that
+        // newer turn).
+        if (abortRef.current === ac) {
+          abortRef.current = null;
+          setBusy(false);
+        }
+        if (activeTurnRef.current === assistantId) activeTurnRef.current = null;
       }
     },
     [busy, patchTurn],
   );
 
-  return { messages, state, busy, send, reset, runToolDirect, confirmRun, confirmCancel };
+  return { messages, state, busy, send, stop, reset, runToolDirect, confirmRun, confirmCancel };
 }
