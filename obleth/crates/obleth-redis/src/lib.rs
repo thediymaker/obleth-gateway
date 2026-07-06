@@ -627,6 +627,7 @@ mod tests {
             tracing_enabled: false,
             guardrails_policy: None,
             compression_policy: None,
+            synthetic: false,
         };
         store.put_resolved_key(&hash, &key).await.unwrap();
         let got = store.get_resolved_key(&hash).await.unwrap().unwrap();
