@@ -35,15 +35,15 @@ pub fn scope_from(model: Option<String>, all: bool) -> Scope {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "obench", version, about = "obleth benchmark & readiness suite")]
 pub struct Cli {
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub target: Option<Target>,
     #[arg(long)]
     pub profile: Option<Profile>,
     /// Drive a single named model (Scope::Single). Ignored if --all is set.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub model: Option<String>,
     /// Drive the whole fleet (Scope::All). Default when neither is given.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub all: bool,
 
     #[arg(
@@ -86,7 +86,7 @@ pub struct Cli {
     pub max_error_rate: Option<f64>,
     /// Path to live config for headless `--target live` (remote obleth proxy
     /// URL + tenant keys + models). The interactive TUI builds this for you.
-    #[arg(long, default_value = "live.config.json")]
+    #[arg(long, default_value = "live.config.json", global = true)]
     pub config: String,
     /// Force headless even with no subcommand.
     #[arg(long)]
@@ -102,6 +102,8 @@ pub struct Cli {
 pub enum Command {
     /// Compression boon A/B — measure token savings + latency crossover.
     Compression(CompressionArgs),
+    /// Deployment scorecard — benchmark every measurable aspect and grade it.
+    Score(ScoreArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -151,6 +153,37 @@ impl CompressionArgs {
             min_tokens: self.min_tokens,
         }
     }
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct ScoreArgs {
+    /// Skip the per-model capacity ramps (capacity/overload report as skipped).
+    #[arg(long)]
+    pub quick: bool,
+    /// Sections to skip (csv): overhead,capacity,overload,streaming,resilience,fairshare,compression
+    #[arg(long, value_delimiter = ',')]
+    pub skip: Vec<String>,
+    /// Run only these sections (csv). Empty = all applicable.
+    #[arg(long, value_delimiter = ',')]
+    pub only: Vec<String>,
+    /// Concurrency cap for capacity ramps (live safety valve).
+    #[arg(long, default_value_t = 256)]
+    pub max_conc: u32,
+    /// Direct URL of benchmark-backend as reachable from THIS machine (demo overhead check).
+    #[arg(long, env = "BACKEND_BASE", default_value = "http://localhost:8081")]
+    pub backend_base: String,
+    /// Explicit baseline scorecard JSON to diff against (default: latest for target).
+    #[arg(long)]
+    pub baseline: Option<String>,
+    /// Exit nonzero if the system score is below this (also on flagged regressions).
+    #[arg(long)]
+    pub fail_under: Option<u8>,
+    /// Model with the compression boon granted — enables the compression section.
+    #[arg(long)]
+    pub compression_model: Option<String>,
+    /// API key for the compression model.
+    #[arg(long, env = "OBLETH_API_KEY")]
+    pub compression_key: Option<String>,
 }
 
 #[cfg(test)]
@@ -239,5 +272,41 @@ mod tests {
             panic!()
         };
         assert_eq!(a.prefill_tps, vec![100, 200]);
+    }
+
+    #[test]
+    fn score_subcommand_parses_with_global_target() {
+        let cli = Cli::try_parse_from(["obench", "score", "--target", "demo", "--quick"]).unwrap();
+        assert_eq!(cli.target, Some(Target::Demo));
+        match cli.command {
+            Some(Command::Score(a)) => {
+                assert!(a.quick);
+                assert_eq!(a.max_conc, 256);
+                assert_eq!(a.backend_base, "http://localhost:8081");
+                assert!(a.skip.is_empty());
+                assert!(a.fail_under.is_none());
+            }
+            _ => panic!("expected score subcommand"),
+        }
+    }
+
+    #[test]
+    fn score_skip_parses_csv() {
+        let cli = Cli::try_parse_from([
+            "obench",
+            "score",
+            "--target",
+            "demo",
+            "--skip",
+            "fairshare,resilience",
+        ])
+        .unwrap();
+        let Some(Command::Score(a)) = cli.command else {
+            panic!()
+        };
+        assert_eq!(
+            a.skip,
+            vec!["fairshare".to_string(), "resilience".to_string()]
+        );
     }
 }

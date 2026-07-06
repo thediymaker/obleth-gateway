@@ -1,4 +1,5 @@
 mod admin;
+mod backend_ctl;
 mod benchmarks;
 mod cli;
 mod config;
@@ -24,6 +25,7 @@ async fn main() -> anyhow::Result<()> {
     // Benchmark-kind dispatch. Absent subcommand → load (historical default).
     let kind = match &args.command {
         Some(cli::Command::Compression(_)) => benchmarks::BenchKind::Compression,
+        Some(cli::Command::Score(_)) => benchmarks::BenchKind::Score,
         None => benchmarks::BenchKind::Load,
     };
     if kind == benchmarks::BenchKind::Compression {
@@ -32,6 +34,11 @@ async fn main() -> anyhow::Result<()> {
         };
         let cfg = cargs.into_config(&args);
         let code = benchmarks::compression::run(&cfg).await?;
+        std::process::exit(code);
+    }
+
+    if let Some(cli::Command::Score(sargs)) = args.command.clone() {
+        let code = benchmarks::score::run(&args, &sargs, None).await?;
         std::process::exit(code);
     }
 

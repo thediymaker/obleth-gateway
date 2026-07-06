@@ -364,6 +364,48 @@ impl AdminClient {
             .await?;
         Ok(())
     }
+
+    pub async fn find_model_id(&self, model_name: &str) -> Result<Option<String>> {
+        let v = self.req(reqwest::Method::GET, "/models", None).await?;
+        Ok(v.as_array().and_then(|a| {
+            a.iter()
+                .find(|m| m["model_name"].as_str() == Some(model_name))
+                .and_then(|m| m["id"].as_str().map(String::from))
+        }))
+    }
+
+    pub async fn model_health(&self) -> Result<Value> {
+        self.req(reqwest::Method::GET, "/models/health", None).await
+    }
+
+    pub async fn set_model_health_config(
+        &self,
+        id: &str,
+        checks_enabled: bool,
+        alerts_enabled: bool,
+        interval_secs: i64,
+        failure_threshold: i64,
+    ) -> Result<()> {
+        self.req(
+            reqwest::Method::PUT,
+            &format!("/models/{id}/health/config"),
+            Some(json!({
+                "checks_enabled": checks_enabled,
+                "alerts_enabled": alerts_enabled,
+                "check_interval_secs": interval_secs,
+                "failure_threshold": failure_threshold,
+                "maintenance_until": Value::Null,
+                "maintenance_note": Value::Null,
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_version(&self) -> Result<String> {
+        let v = self.req(reqwest::Method::GET, "/version", None).await?;
+        Ok(v["version"].as_str().unwrap_or("unknown").to_string())
+    }
 }
 
 /// Query an OpenAI-compatible upstream for its model catalog.

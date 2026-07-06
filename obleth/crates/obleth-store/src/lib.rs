@@ -2162,6 +2162,31 @@ impl Store {
         model_health_summary_from_row(&row)
     }
 
+    /// Reset a model's health state after a probe-relevant config change
+    /// (`api_base` / `upstream_model` / `model_type`): the old failure streak
+    /// and alert state describe a configuration that no longer exists.
+    /// `health_next_check_at = now()` makes the scheduler re-verify within one
+    /// worker tick, so the fix proves itself immediately. Check history rows
+    /// are left untouched.
+    pub async fn reset_model_health(&self, id: Uuid) -> Result<()> {
+        let r = sqlx::query(
+            "update models set
+                health_status = 'unknown',
+                health_consecutive_failures = 0,
+                health_alert_state = 'ok',
+                health_next_check_at = now(),
+                updated_at = now()
+             where id = $1",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        if r.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+        Ok(())
+    }
+
     pub async fn claim_due_model_health_checks(&self, limit: i64) -> Result<Vec<ModelHealthClaim>> {
         let rows = sqlx::query(
             "with due as (
@@ -3354,6 +3379,37 @@ mod tests {
             .await
             .expect("health checks");
         assert!(checks.len() >= 2);
+
+        // A probe-relevant config change resets health state: the failure
+        // streak and alert state are cleared, the badge returns to `unknown`,
+        // and the model is immediately due for a re-check.
+        let failed_again = store
+            .record_model_health_check(
+                model.id,
+                "manual",
+                "unhealthy",
+                Some(12),
+                Some(404),
+                Some("failed"),
+                None,
+                Utc::now() + chrono::Duration::seconds(3600),
+            )
+            .await
+            .expect("record failed health again");
+        assert_eq!(failed_again.summary.consecutive_failures, 1);
+        assert_eq!(failed_again.summary.alert_state, "firing");
+        store
+            .reset_model_health(model.id)
+            .await
+            .expect("reset health");
+        let reset = store
+            .get_model_health_summary(model.id)
+            .await
+            .expect("summary after reset");
+        assert_eq!(reset.status, "unknown");
+        assert_eq!(reset.consecutive_failures, 0);
+        assert_eq!(reset.alert_state, "ok");
+        assert!(reset.next_check_at <= Utc::now());
 
         store
             .update_model_health_config(

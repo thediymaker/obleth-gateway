@@ -4,6 +4,17 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## Unreleased
+
+Reliable health for every model type: real probes for speech and transcription, catalog checks for the rest, and config mistakes that read as config mistakes — not outages.
+
+- **Every model type now gets an honest health signal.** Text-to-speech and transcription models are verified with real minimal inference probes (one character of speech; a 0.1-second silence clip). Image models are checked against the upstream's model catalog. Previously these types could only ever show "unchecked" — or worse, sit falsely unhealthy when mis-typed.
+- **Configuration mistakes no longer masquerade as outages.** When a probe is rejected but the upstream's catalog still lists the model, the model is marked degraded with a pointed message ("model_type may be misconfigured") instead of counting toward failure alerts. A model genuinely missing upstream still alerts, now with catalog evidence in the message.
+- **Fixing a model's connection takes effect immediately.** Changing a model's API base, upstream id, or type clears the old failure streak and alert state and re-checks within seconds — no more stale "down" badges after a config fix.
+- **Busy models are no longer probed needlessly.** The passive traffic window now follows the model's check interval, so any model with recent successful traffic is settled from the usage ledger for free.
+- **Pre-flight validation on model save.** Creating or editing a model warns when the upstream doesn't list the model id, the catalog can't be verified (wildcard pass-through), or the model type isn't recognized — the save always succeeds; the warnings tell you what to fix.
+- Wildcard upstream catalogs (`/models` returning `*`) are explicitly treated as unverifiable and can never produce a false healthy badge.
+
 ## v0.7.2
 
 Chargeback-ready reports: filter and group historical usage by team and API key, with spend visible everywhere — plus a compression fix for fenced code.

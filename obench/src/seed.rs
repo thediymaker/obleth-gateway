@@ -22,6 +22,21 @@ pub struct SeededRun {
     pub teardown: Teardown,
 }
 
+/// Normalize an api_base to end in exactly one `/v1`, as the gateway's active
+/// health-probe tier assumes (`build_probe_request` in obleth-admin does
+/// `{api_base}/chat/completions`, i.e. it expects the base to already include
+/// `/v1`). obench's fixture backend is seeded with a bare `http://host:port`
+/// base, so without this the active probe 404s against every obench-seeded
+/// model. Safe for the request-serving data path too: the proxy's
+/// `build_upstream_url` dedupes a doubled `/v1/v1/...` (see
+/// obleth-proxy/src/proxy.rs `build_upstream_url` tests), so appending `/v1`
+/// here does not change the URL requests actually get routed to.
+fn normalize_api_base_v1(base: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    let trimmed = trimmed.strip_suffix("/v1").unwrap_or(trimmed);
+    format!("{trimmed}/v1")
+}
+
 pub async fn seed_fixture(
     admin: &AdminClient,
     fixture_api_base: &str,
@@ -31,13 +46,14 @@ pub async fn seed_fixture(
         Scope::Single(name) => vec![name.as_str()],
         Scope::All => fleet::FIXTURE_MODELS.to_vec(),
     };
+    let api_base = normalize_api_base_v1(fixture_api_base);
     let mut teardown = Teardown::default();
     for name in &models {
         let (id, created) = admin
             .ensure_model(&ModelSpec {
                 model_name: name.to_string(),
                 upstream_model: name.to_string(),
-                api_base: fixture_api_base.to_string(),
+                api_base: api_base.clone(),
                 api_key: None,
                 input_cost_per_token: 0.0,
                 output_cost_per_token: 0.0,
@@ -108,4 +124,47 @@ pub fn live_run_from_config(cfg: &LiveConfig, scope: &Scope) -> Result<SeededRun
         models,
         teardown: Teardown::default(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_api_base_v1;
+
+    #[test]
+    fn appends_v1_when_missing() {
+        assert_eq!(
+            normalize_api_base_v1("http://benchmark-backend:8081"),
+            "http://benchmark-backend:8081/v1"
+        );
+    }
+
+    #[test]
+    fn leaves_single_v1_suffix_alone() {
+        assert_eq!(
+            normalize_api_base_v1("http://benchmark-backend:8081/v1"),
+            "http://benchmark-backend:8081/v1"
+        );
+    }
+
+    #[test]
+    fn strips_trailing_slash_before_checking_v1() {
+        assert_eq!(
+            normalize_api_base_v1("http://benchmark-backend:8081/v1/"),
+            "http://benchmark-backend:8081/v1"
+        );
+        assert_eq!(
+            normalize_api_base_v1("http://benchmark-backend:8081/"),
+            "http://benchmark-backend:8081/v1"
+        );
+    }
+
+    #[test]
+    fn does_not_touch_v1_in_the_middle_of_the_base() {
+        // Only a trailing `/v1` counts as "already normalized" — a base whose
+        // path happens to contain "v1" elsewhere must still get one appended.
+        assert_eq!(
+            normalize_api_base_v1("http://v1proxy.example.com:8081"),
+            "http://v1proxy.example.com:8081/v1"
+        );
+    }
 }
