@@ -18,6 +18,13 @@ pub struct ProvisionerConfig {
     /// slow cold first token, which can take many seconds on a fresh replica.
     pub warmup_timeout_secs: u64,
     pub lost_retention_secs: i64,
+    /// Self-heal: restart a `healthy` replica after this many consecutive
+    /// failed health probes while its Slurm job still reports RUNNING (a
+    /// "zombie" job — allocation alive, inference server dead). `0` disables
+    /// self-heal restarts. Restarts are additionally capped at one per model
+    /// per tick, so a probe-side network problem rolls replicas gradually
+    /// instead of mass-cancelling a fleet.
+    pub restart_after_failures: i64,
     pub port_span: i64,
     /// Job-name prefix used to tag and later find this gateway's jobs.
     pub job_name_prefix: String,
@@ -38,6 +45,8 @@ impl ProvisionerConfig {
             health_timeout_secs: opt("OBLETH_PROVISIONER_HEALTH_TIMEOUT_SECS", "5").parse()?,
             warmup_timeout_secs: opt("OBLETH_PROVISIONER_WARMUP_TIMEOUT_SECS", "600").parse()?,
             lost_retention_secs: opt("OBLETH_PROVISIONER_LOST_RETENTION_SECS", "900").parse()?,
+            restart_after_failures: opt("OBLETH_PROVISIONER_RESTART_AFTER_FAILURES", "3")
+                .parse()?,
             port_span: opt("OBLETH_PORT_SPAN", "8").parse()?,
             job_name_prefix: opt("OBLETH_PROVISIONER_JOB_PREFIX", "obleth-"),
         })
@@ -57,6 +66,7 @@ mod tests {
         assert_eq!(c.health_timeout_secs, 5);
         assert_eq!(c.warmup_timeout_secs, 600);
         assert_eq!(c.lost_retention_secs, 900);
+        assert_eq!(c.restart_after_failures, 3);
         assert_eq!(c.job_name_prefix, "obleth-");
     }
 }
