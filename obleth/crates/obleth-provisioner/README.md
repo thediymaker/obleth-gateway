@@ -33,11 +33,16 @@ Every tick (`OBLETH_PROVISIONER_INTERVAL_SECS`, default 15s):
    **not** drain existing replicas — drain-on-global-disable is a future
    enhancement. Per-model disable still drains; see step 4.)*
 1. **List enabled managed models** from the obleth Management API.
-2. **List owned Slurm jobs** from `slurmrestd`, filtered to this gateway's jobs by
-   job-name prefix (`OBLETH_PROVISIONER_JOB_PREFIX`, default `obleth-`).
+2. **Look up the tracked Slurm jobs** in `slurmrestd`, **by job id** — only the
+   jobs the gateway's replica rows point at, never a listing of the whole
+   controller (which on a busy cluster is huge). A clean "not found" means the
+   job is gone; a transport error holds the whole tick (see fail-safe below).
 3. For each model:
-   - **Probe** any `starting` replicas whose Slurm job is `Running` (single HTTP
-     health check against the replica's `health_path` on its node + serving port).
+   - **Probe** replicas whose Slurm job is `Running`: every port in the
+     replica's window (`serving_port + slot*OBLETH_PORT_SPAN`) is checked
+     concurrently against the model's `health_path`, and the lowest healthy
+     port wins. This covers replicas awaiting promotion **and** already-healthy
+     ones (for self-healing, below).
    - **Reconcile** to `target_replicas`:
      - **Submit** new Slurm jobs when below target.
      - **Promote** a probed-healthy `starting` replica into obleth's model
@@ -48,6 +53,17 @@ Every tick (`OBLETH_PROVISIONER_INTERVAL_SECS`, default 15s):
        `OBLETH_PROVISIONER_WARMUP_TIMEOUT_SECS=0`.
      - **Mark lost** replicas whose Slurm job vanished or finished (preempted),
        and detach their endpoint; the next pass resubmits to restore target.
+     - **Self-heal zombie jobs.** A `healthy` replica whose job still reports
+       RUNNING is restarted (endpoint deregistered, job cancelled, fresh
+       replica submitted) on either of two signals: it fails
+       `OBLETH_PROVISIONER_RESTART_AFTER_FAILURES` consecutive provisioner
+       probes (default 3; `0` disables self-heal entirely), **or** the
+       gateway's own health check of its registered endpoint — a real 1-token
+       inference — has been `unhealthy` for 2+ consecutive recent checks. The
+       second signal catches servers that still answer metadata GETs but hang
+       on actual inference. At most **one** self-heal restart per model per
+       tick, so a probe-side network problem rolls a fleet gradually instead
+       of mass-cancelling it.
      - **Cancel** excess jobs when above target (pending first, then starting,
        then healthy; oldest first within a tier).
      - **GC** `lost` replica rows older than
@@ -57,11 +73,18 @@ Every tick (`OBLETH_PROVISIONER_INTERVAL_SECS`, default 15s):
    reconciled toward target 0: its jobs are cancelled, its endpoint detached,
    and its rows GC'd. Disabling a model is a safe, reversible "stop hosting" —
    the spec is kept so it can be re-enabled later.
-5. **Cancel orphan jobs.** Any Slurm job owned by this gateway (matched by name
-   prefix) that has **no replica row tracking it** is cancelled. This recovers
-   the rare case where a prior tick submitted a job but failed to record its
-   replica row, which would otherwise leak a live GPU allocation until its time
-   limit.
+
+**Orphan jobs are prevented at the source**, not swept: if a submit succeeds but
+recording its replica row fails, the executor immediately cancels the
+just-submitted job. There is no periodic cluster-wide orphan scan (that would
+mean listing the whole controller).
+
+**Tick outcome reporting.** Each settings fetch carries the previous tick's
+outcome (`ok` / `idle` / `error` + detail) to the gateway, which tracks the last
+*successful* reconcile. The dashboard uses this to distinguish "provisioner
+alive and reconciling" from "alive but every tick failing — replica state
+frozen", and the gateway raises an alert when reconciliation has been failing
+for more than 10 minutes.
 
 **Fail-safe.** If either the Management API or `slurmrestd` is unreachable, the
 tick bails out *before* computing any plan and takes **no destructive action on
@@ -83,7 +106,9 @@ endpoint/token and cadence knobs come from the environment:
 | `OBLETH_PROVISIONER_HEALTH_TIMEOUT_SECS` | optional | `5` | per-replica health probe timeout |
 | `OBLETH_PROVISIONER_WARMUP_TIMEOUT_SECS` | optional | `600` | budget for the post-promotion warmup inference; `0` disables warmup |
 | `OBLETH_PROVISIONER_LOST_RETENTION_SECS` | optional | `900` | how long `lost` replica rows are kept before GC |
-| `OBLETH_PROVISIONER_JOB_PREFIX` | optional | `obleth-` | job-name prefix used to find this gateway's jobs |
+| `OBLETH_PROVISIONER_RESTART_AFTER_FAILURES` | optional | `3` | restart a healthy replica after this many consecutive failed probes while its job reports RUNNING (zombie job); `0` disables self-heal |
+| `OBLETH_PORT_SPAN` | optional | `8` | width of each replica's port window (`serving_port + slot*span`) |
+| `OBLETH_PROVISIONER_JOB_PREFIX` | optional | `obleth-` | job-name prefix used to tag this gateway's jobs |
 
 **Slurm connection settings (dashboard → Settings → Slurm), not env vars:**
 `enabled`, `slurmrestd_url`, `slurmrestd_api_version`, `slurm_user`, `slurm_jwt`.
@@ -99,15 +124,17 @@ PUT /api/v1/models/:id/managed
 ```
 
 The managed spec carries: `partition`, `gres`, `nodes`, `constraints`, `exclude`,
-`account`, `qos`, `time_limit`, `image`, `launch_command`, `serving_port`,
-`health_path`, and `target_replicas`. Nothing cluster-specific is compiled into
-the binary — change the spec, not the code.
+`account`, `qos`, `time_limit`, `image`, `launch_command`, `script_body`,
+`serving_port`, `health_path`, `target_replicas`, `min_replicas` (health floor),
+and `max_job_failures` (resubmit breaker). Nothing cluster-specific is compiled
+into the binary — change the spec, not the code.
 
 ## slurmrestd version note
 
 > **Verify the submit payload against your `slurmrestd` version's schema** at
-> `/openapi/v3`, and set `OBLETH_SLURMRESTD_API_VERSION` to match (default
-> `v0.0.40`). The version-sensitive JSON is isolated in `src/slurm.rs`.
+> `/openapi/v3`, and set the **API version** in the dashboard (Settings → Slurm)
+> to match (default `v0.0.40`). The version-sensitive JSON is isolated in
+> `src/slurm.rs`.
 
 `slurmrestd`'s job-submit schema changes between API versions. If submits fail
 with schema/validation errors, compare the payload built in `src/slurm.rs`
@@ -115,9 +142,6 @@ against your cluster's `/openapi/v3` and adjust the version segment accordingly.
 
 ## v1 limitations
 
-- **Fixed serving port per model.** The serving port comes from the model spec;
-  there is no replica self-registration yet, so every replica of a model serves
-  on the same port.
 - **Single-node health probe.** The health probe targets the first node of a
   job. Multi-node nodelist bracket-ranges (e.g. `gpu[01-04]`) are not expanded —
   they fall back to the raw nodelist string.

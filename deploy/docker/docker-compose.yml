@@ -209,6 +209,9 @@ services:
     environment:
       OBLETH_ADMIN_BASE_URL: http://obleth:9180
       OBLETH_ADMIN_TOKEN: ${OBLETH_ADMIN_TOKEN:?set OBLETH_ADMIN_TOKEN in deploy/docker/.env}
+      # Self-heal: restart a healthy replica after N consecutive failed health
+      # probes while its Slurm job still reports RUNNING (zombie job). 0 disables.
+      OBLETH_PROVISIONER_RESTART_AFTER_FAILURES: ${OBLETH_PROVISIONER_RESTART_AFTER_FAILURES:-3}
       RUST_LOG: info,obleth_provisioner=debug
     depends_on:
       obleth: { condition: service_started }

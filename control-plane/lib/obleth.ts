@@ -675,6 +675,17 @@ export interface SlurmSettingsView {
   provisioner_version: string | null;
   provisioner_git_sha: string | null;
   provisioner_built_at: string | null;
+  // Outcome of the provisioner's last reconcile tick ("ok" | "idle" | "error").
+  // provisioner_running only proves the process is alive; a provisioner can
+  // poll green while every tick fails and replica state sits frozen. Null until
+  // reported (or for an older provisioner that doesn't send it).
+  provisioner_tick_status: string | null;
+  provisioner_tick_detail: string | null;
+  // Seconds since the last successful reconcile / length of the current non-ok
+  // streak. These — not replica updated_at — are what "states may be stale"
+  // keys off.
+  provisioner_last_ok_secs: number | null;
+  provisioner_held_secs: number | null;
 }
 
 export interface UpdateSlurmSettings {

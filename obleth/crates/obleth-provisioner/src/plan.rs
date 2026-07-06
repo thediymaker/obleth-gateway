@@ -1,5 +1,5 @@
 use crate::domain::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
 /// Smallest free disjoint window base for a new replica: serving_port + i*span
@@ -18,15 +18,24 @@ pub fn next_free_window_base(serving_port: i64, span: i64, live_port_bases: &[i6
 
 /// Pure reconcile. `jobs` is keyed by slurm_job_id; `health` is keyed by
 /// replica id and carries the discovered port for `starting`/`pending` replicas.
+/// `restart` holds replica ids the self-heal loop wants restarted (healthy rows
+/// whose job still reports RUNNING but which keep failing health probes).
 pub fn plan(
     spec: &ManagedSpecView,
     replicas: &[ReplicaView],
     jobs: &HashMap<String, JobInfo>,
     health: &HashMap<Uuid, u16>,
+    restart: &HashSet<Uuid>,
     lost_retention_secs: i64,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
     let mut alive = 0i64;
+    // Self-heal restarts are capped at one per model per tick: if the
+    // provisioner itself loses the network path to the nodes, every probe fails
+    // at once, and an uncapped restart would mass-cancel a whole fleet of
+    // actually-fine replicas. Rolling one at a time keeps capacity up and gives
+    // the operator (and the held-reconcile alert) time to notice.
+    let mut restart_budget = 1usize;
     // Replicas with a live job, eligible to be cancelled if we're over target.
     // (replica_id, job_id, endpoint_id, rank, age) where lower rank = cancel first.
     let mut cancellable: Vec<(Uuid, String, Option<Uuid>, u8, i64)> = Vec::new();
@@ -53,20 +62,31 @@ pub fn plan(
             continue;
         }
 
-        // Operator-requested restart: cancel this replica's job now (regardless
-        // of target) so the resubmit-to-target below launches a fresh one. Don't
+        // Operator-requested restart (cancel_requested) or self-heal restart
+        // (in the `restart` set): cancel this replica's job now (regardless of
+        // target) so the resubmit-to-target below launches a fresh one. Don't
         // count it as alive. After cancel it becomes "draining" (skipped above)
         // until its job goes Gone and the row is GC'd, which clears the flag.
-        if r.cancel_requested
+        // Operator restarts are never budget-limited; self-heal ones are.
+        let self_heal = !r.cancel_requested && restart.contains(&r.id) && restart_budget > 0;
+        if (r.cancel_requested || self_heal)
             && matches!(
                 jobs.get(&r.slurm_job_id).map(|j| j.state),
                 Some(JobState::Pending | JobState::Running)
             )
         {
+            if self_heal {
+                restart_budget -= 1;
+            }
             actions.push(Action::Cancel {
                 replica_id: r.id,
                 job_id: r.slurm_job_id.clone(),
                 endpoint_id: r.endpoint_id,
+                reason: if r.cancel_requested {
+                    CancelReason::OperatorRestart
+                } else {
+                    CancelReason::ProbeFailed
+                },
             });
             continue;
         }
@@ -133,6 +153,7 @@ pub fn plan(
                 replica_id: id,
                 job_id,
                 endpoint_id,
+                reason: CancelReason::ScaleDown,
             });
         }
     }
@@ -152,6 +173,92 @@ pub fn plan(
 /// `health_path` against the bare node — that is a separate, native check.)
 fn endpoint_api_base(node: &str, serving_port: i64) -> String {
     format!("http://{node}:{serving_port}/v1")
+}
+
+/// Advance the per-replica consecutive-probe-failure counters after one tick's
+/// probes, for self-heal. Only `healthy` replicas whose job reports RUNNING
+/// with a known node are judged: those are the rows the tick actually probed,
+/// so a missing `health` entry means the probe failed. A passing probe clears
+/// the counter. Everything else (booting replicas, jobs without nodes, jobs the
+/// planner is already reconciling away) is left untouched — probe failures
+/// there are expected, not evidence of a zombie.
+pub fn update_probe_failures(
+    replicas: &[ReplicaView],
+    jobs: &HashMap<String, JobInfo>,
+    health: &HashMap<Uuid, u16>,
+    counts: &mut HashMap<Uuid, i64>,
+) {
+    for r in replicas {
+        if r.state != "healthy" {
+            continue;
+        }
+        let Some(j) = jobs.get(&r.slurm_job_id) else {
+            continue;
+        };
+        if j.state != JobState::Running || j.nodes.is_empty() {
+            continue;
+        }
+        if health.contains_key(&r.id) {
+            counts.remove(&r.id);
+        } else {
+            *counts.entry(r.id).or_insert(0) += 1;
+        }
+    }
+}
+
+/// Consecutive failed *gateway* checks of a replica's endpoint that count as a
+/// restart signal. The gateway's check is a real 1-token inference at a slow
+/// cadence (minutes), so two failures is already a sustained outage — and it
+/// catches zombies the provisioner's own GET probe cannot (a server that
+/// answers metadata instantly but hangs forever on inference).
+const GATEWAY_UNHEALTHY_CHECKS: i64 = 2;
+
+/// Ignore the gateway's endpoint verdict when it is older than this — e.g.
+/// when scheduled model health checks are disabled, a stale `unhealthy` row
+/// must not keep restarting a replica that recovered long ago.
+const GATEWAY_CHECK_MAX_AGE_SECS: i64 = 3600;
+
+/// Which healthy replicas self-heal should restart this tick. Two independent
+/// signals, either suffices:
+///
+/// 1. the provisioner's own port-window probe has failed `probe_threshold`
+///    consecutive ticks (`probe_failures`, maintained by
+///    `update_probe_failures`) — the server is not answering at all;
+/// 2. the gateway's health check of the replica's registered endpoint is
+///    `unhealthy` with at least `GATEWAY_UNHEALTHY_CHECKS` consecutive
+///    failures and a recent check — the server answers GETs but fails real
+///    inference (zombie).
+///
+/// `probe_threshold <= 0` disables self-heal entirely (both signals). The
+/// planner additionally caps restarts at one per model per tick.
+pub fn restart_candidates(
+    replicas: &[ReplicaView],
+    probe_failures: &HashMap<Uuid, i64>,
+    probe_threshold: i64,
+    endpoints: &[EndpointView],
+) -> HashSet<Uuid> {
+    if probe_threshold <= 0 {
+        return HashSet::new();
+    }
+    let unhealthy_eps: HashSet<Uuid> = endpoints
+        .iter()
+        .filter(|e| {
+            e.health_status.as_deref() == Some("unhealthy")
+                && e.consecutive_failures >= GATEWAY_UNHEALTHY_CHECKS
+                && e.checked_secs_ago
+                    .is_some_and(|s| s <= GATEWAY_CHECK_MAX_AGE_SECS)
+        })
+        .map(|e| e.id)
+        .collect();
+    replicas
+        .iter()
+        .filter(|r| {
+            r.state == "healthy"
+                && (probe_failures.get(&r.id).copied().unwrap_or(0) >= probe_threshold
+                    || r.endpoint_id.is_some_and(|ep| unhealthy_eps.contains(&ep)))
+        })
+        .map(|r| r.id)
+        .collect()
 }
 
 /// The slice of ManagedModelSpec the planner needs (keeps it decoupled from the
@@ -219,7 +326,7 @@ mod tests {
 
     #[test]
     fn empty_state_submits_target() {
-        let actions = plan(&spec(2), &[], &HashMap::new(), &HashMap::new(), 900);
+        let actions = plan(&spec(2), &[], &HashMap::new(), &HashMap::new(), &HashSet::new(), 900);
         assert_eq!(actions.iter().filter(|a| **a == Action::Submit).count(), 2);
     }
 
@@ -231,7 +338,7 @@ mod tests {
             job("j1", JobState::Running, &["n1"]),
             job("j2", JobState::Running, &["n2"]),
         ]);
-        let actions = plan(&spec(2), &[r1, r2], &jobs, &HashMap::new(), 900);
+        let actions = plan(&spec(2), &[r1, r2], &jobs, &HashMap::new(), &HashSet::new(), 900);
         assert!(actions.is_empty(), "got {actions:?}");
     }
 
@@ -241,7 +348,7 @@ mod tests {
         let id = r.id;
         let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
         let health = HashMap::from([(id, 8000u16)]);
-        let actions = plan(&spec(1), &[r], &jobs, &health, 900);
+        let actions = plan(&spec(1), &[r], &jobs, &health, &HashSet::new(), 900);
         assert_eq!(
             actions,
             vec![Action::Promote {
@@ -259,7 +366,7 @@ mod tests {
         let id = r.id;
         let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
         let health = HashMap::from([(id, 8000u16)]);
-        let actions = plan(&spec(1), &[r], &jobs, &health, 900);
+        let actions = plan(&spec(1), &[r], &jobs, &health, &HashSet::new(), 900);
         assert_eq!(
             actions,
             vec![Action::Promote {
@@ -277,7 +384,7 @@ mod tests {
         let id = r.id;
         let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
         let health = HashMap::from([(id, 8000u16)]);
-        let actions = plan(&spec(1), &[r], &jobs, &health, 900);
+        let actions = plan(&spec(1), &[r], &jobs, &health, &HashSet::new(), 900);
         assert!(actions.is_empty(), "got {actions:?}");
     }
 
@@ -286,7 +393,7 @@ mod tests {
         let r = rv("starting", "j1", None, 30);
         let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
         let health: HashMap<Uuid, u16> = HashMap::new();
-        let actions = plan(&spec(1), &[r], &jobs, &health, 900);
+        let actions = plan(&spec(1), &[r], &jobs, &health, &HashSet::new(), 900);
         // still "alive" (counts toward target), so no submit, no promote.
         assert!(actions.is_empty(), "got {actions:?}");
     }
@@ -297,7 +404,7 @@ mod tests {
         let r = rv("healthy", "j1", Some(ep), 500);
         let id = r.id;
         // job gone from slurm entirely
-        let actions = plan(&spec(1), &[r], &HashMap::new(), &HashMap::new(), 900);
+        let actions = plan(&spec(1), &[r], &HashMap::new(), &HashMap::new(), &HashSet::new(), 900);
         assert!(actions.contains(&Action::MarkLost {
             replica_id: id,
             endpoint_id: Some(ep)
@@ -314,13 +421,14 @@ mod tests {
             job("j1", JobState::Running, &["n1"]),
             job("j2", JobState::Pending, &[""]),
         ]);
-        let actions = plan(&spec(1), &[healthy, pending], &jobs, &HashMap::new(), 900);
+        let actions = plan(&spec(1), &[healthy, pending], &jobs, &HashMap::new(), &HashSet::new(), 900);
         assert_eq!(
             actions,
             vec![Action::Cancel {
                 replica_id: pid,
                 job_id: "j2".into(),
-                endpoint_id: None
+                endpoint_id: None,
+                reason: CancelReason::ScaleDown
             }]
         );
     }
@@ -332,13 +440,14 @@ mod tests {
         r.cancel_requested = true;
         let id = r.id;
         let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
-        let actions = plan(&spec(1), &[r], &jobs, &HashMap::new(), 900);
+        let actions = plan(&spec(1), &[r], &jobs, &HashMap::new(), &HashSet::new(), 900);
         // Cancelled (with its endpoint) regardless of target, and a fresh replica
         // submitted to refill — i.e. a restart.
         assert!(actions.contains(&Action::Cancel {
             replica_id: id,
             job_id: "j1".into(),
-            endpoint_id: Some(ep)
+            endpoint_id: Some(ep),
+            reason: CancelReason::OperatorRestart
         }));
         assert!(actions.contains(&Action::Submit));
     }
@@ -353,13 +462,14 @@ mod tests {
             job("j1", JobState::Running, &["n1"]),
             job("j2", JobState::Running, &["n2"]),
         ]);
-        let actions = plan(&spec(1), &[h1, h2], &jobs, &HashMap::new(), 900);
+        let actions = plan(&spec(1), &[h1, h2], &jobs, &HashMap::new(), &HashSet::new(), 900);
         assert_eq!(
             actions,
             vec![Action::Cancel {
                 replica_id: h1id,
                 job_id: "j1".into(),
-                endpoint_id: Some(ep)
+                endpoint_id: Some(ep),
+                reason: CancelReason::ScaleDown
             }]
         );
     }
@@ -373,7 +483,7 @@ mod tests {
         let id = r.id;
         let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
         let health = HashMap::from([(id, 8000u16)]);
-        let actions = plan(&spec(1), &[r], &jobs, &health, 900);
+        let actions = plan(&spec(1), &[r], &jobs, &health, &HashSet::new(), 900);
         assert_eq!(
             actions,
             vec![Action::Promote {
@@ -388,7 +498,7 @@ mod tests {
         let r = rv("pending", "j1", None, 30);
         let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
         let health: HashMap<Uuid, u16> = HashMap::new();
-        let actions = plan(&spec(1), &[r], &jobs, &health, 900);
+        let actions = plan(&spec(1), &[r], &jobs, &health, &HashSet::new(), 900);
         assert!(actions.is_empty(), "got {actions:?}");
     }
 
@@ -396,7 +506,7 @@ mod tests {
     fn old_lost_rows_are_gced() {
         let r = rv("lost", "j1", None, 5000);
         let id = r.id;
-        let actions = plan(&spec(0), &[r], &HashMap::new(), &HashMap::new(), 900);
+        let actions = plan(&spec(0), &[r], &HashMap::new(), &HashMap::new(), &HashSet::new(), 900);
         assert!(actions.contains(&Action::Delete { replica_id: id }));
     }
 
@@ -411,6 +521,7 @@ mod tests {
             &lost,
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
             900,
         );
         assert!(
@@ -430,6 +541,7 @@ mod tests {
             &lost,
             &HashMap::new(),
             &HashMap::new(),
+            &HashSet::new(),
             900,
         );
         assert!(actions.contains(&Action::Submit));
@@ -441,7 +553,7 @@ mod tests {
         let lost: Vec<ReplicaView> = (0..100)
             .map(|i| rv("lost", &format!("j{i}"), None, 60))
             .collect();
-        let actions = plan(&spec(2), &lost, &HashMap::new(), &HashMap::new(), 900);
+        let actions = plan(&spec(2), &lost, &HashMap::new(), &HashMap::new(), &HashSet::new(), 900);
         assert!(actions.contains(&Action::Submit));
     }
 
@@ -451,7 +563,7 @@ mod tests {
         let r = rv("draining", "j1", None, 120);
         let id = r.id;
         let jobs = HashMap::from([job("j1", JobState::Gone, &[])]);
-        let actions = plan(&spec(1), &[r], &jobs, &HashMap::new(), 900);
+        let actions = plan(&spec(1), &[r], &jobs, &HashMap::new(), &HashSet::new(), 900);
         assert!(
             actions.contains(&Action::Delete { replica_id: id }),
             "got {actions:?}"
@@ -463,7 +575,7 @@ mod tests {
         // Job purged from Slurm entirely (absent from the map) -> delete the row.
         let r = rv("draining", "j1", None, 120);
         let id = r.id;
-        let actions = plan(&spec(1), &[r], &HashMap::new(), &HashMap::new(), 900);
+        let actions = plan(&spec(1), &[r], &HashMap::new(), &HashMap::new(), &HashSet::new(), 900);
         assert!(
             actions.contains(&Action::Delete { replica_id: id }),
             "got {actions:?}"
@@ -477,7 +589,7 @@ mod tests {
         let id = r.id;
         let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
         // spec target 0 so the only possible action would concern this replica.
-        let actions = plan(&spec(0), &[r], &jobs, &HashMap::new(), 900);
+        let actions = plan(&spec(0), &[r], &jobs, &HashMap::new(), &HashSet::new(), 900);
         assert!(
             !actions
                 .iter()
@@ -487,12 +599,211 @@ mod tests {
     }
 
     #[test]
+    fn zombie_replica_in_restart_set_is_cancelled_and_replaced() {
+        // Slurm says RUNNING but the replica keeps failing probes (self-heal
+        // decided it's a zombie): cancel it — with its endpoint, so it leaves
+        // rotation immediately — and submit a fresh replacement this tick.
+        let ep = Uuid::new_v4();
+        let r = rv("healthy", "j1", Some(ep), 600);
+        let id = r.id;
+        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
+        let restart = HashSet::from([id]);
+        let actions = plan(&spec(1), &[r], &jobs, &HashMap::new(), &restart, 900);
+        assert!(actions.contains(&Action::Cancel {
+            replica_id: id,
+            job_id: "j1".into(),
+            endpoint_id: Some(ep),
+            reason: CancelReason::ProbeFailed
+        }));
+        assert!(actions.contains(&Action::Submit));
+    }
+
+    #[test]
+    fn self_heal_restarts_are_capped_at_one_per_tick() {
+        // Two zombies at once (e.g. the provisioner lost its network path to the
+        // nodes): only ONE may be restarted per tick, so a false positive rolls
+        // the fleet gradually instead of mass-cancelling it.
+        let r1 = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
+        let r2 = rv("healthy", "j2", Some(Uuid::new_v4()), 500);
+        let restart = HashSet::from([r1.id, r2.id]);
+        let jobs = HashMap::from([
+            job("j1", JobState::Running, &["n1"]),
+            job("j2", JobState::Running, &["n2"]),
+        ]);
+        let actions = plan(&spec(2), &[r1, r2], &jobs, &HashMap::new(), &restart, 900);
+        let cancels = actions
+            .iter()
+            .filter(|a| matches!(a, Action::Cancel { .. }))
+            .count();
+        let submits = actions.iter().filter(|a| **a == Action::Submit).count();
+        assert_eq!(cancels, 1, "exactly one self-heal restart per tick: {actions:?}");
+        assert_eq!(submits, 1, "one replacement for the one cancel: {actions:?}");
+    }
+
+    #[test]
+    fn restart_set_is_ignored_when_job_already_gone() {
+        // The job died between the probe and the plan: MarkLost wins (normal
+        // lost/resubmit path), no Cancel is sent for a job that no longer exists.
+        let ep = Uuid::new_v4();
+        let r = rv("healthy", "j1", Some(ep), 600);
+        let id = r.id;
+        let restart = HashSet::from([id]);
+        let actions = plan(&spec(1), &[r], &HashMap::new(), &HashMap::new(), &restart, 900);
+        assert!(actions.contains(&Action::MarkLost {
+            replica_id: id,
+            endpoint_id: Some(ep)
+        }));
+        assert!(
+            !actions.iter().any(|a| matches!(a, Action::Cancel { .. })),
+            "no cancel for a gone job: {actions:?}"
+        );
+    }
+
+    #[test]
+    fn operator_restart_is_not_consumed_by_the_self_heal_budget() {
+        // An operator cancel_requested and a self-heal restart in the same tick:
+        // both fire — the budget only limits self-heal cancels.
+        let mut r1 = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
+        r1.cancel_requested = true;
+        let r2 = rv("healthy", "j2", Some(Uuid::new_v4()), 500);
+        let restart = HashSet::from([r1.id, r2.id]);
+        let jobs = HashMap::from([
+            job("j1", JobState::Running, &["n1"]),
+            job("j2", JobState::Running, &["n2"]),
+        ]);
+        let actions = plan(&spec(2), &[r1, r2], &jobs, &HashMap::new(), &restart, 900);
+        let cancels = actions
+            .iter()
+            .filter(|a| matches!(a, Action::Cancel { .. }))
+            .count();
+        assert_eq!(cancels, 2, "operator + one self-heal: {actions:?}");
+    }
+
+    // --- restart_candidates (self-heal restart signals) ---
+
+    fn ep(id: Uuid, status: &str, failures: i64, checked_secs_ago: Option<i64>) -> EndpointView {
+        EndpointView {
+            id,
+            name: "ep".into(),
+            health_status: Some(status.into()),
+            consecutive_failures: failures,
+            checked_secs_ago,
+        }
+    }
+
+    #[test]
+    fn probe_failures_past_threshold_are_candidates() {
+        let r = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
+        let counts = HashMap::from([(r.id, 3i64)]);
+        let set = restart_candidates(&[r.clone()], &counts, 3, &[]);
+        assert!(set.contains(&r.id));
+        // below threshold -> not a candidate
+        let counts = HashMap::from([(r.id, 2i64)]);
+        assert!(restart_candidates(&[r], &counts, 3, &[]).is_empty());
+    }
+
+    #[test]
+    fn gateway_unhealthy_endpoint_is_a_candidate_even_when_get_probe_passes() {
+        // The zombie case from production: Ollama answers /v1/models instantly
+        // (provisioner GET probe passes, counter stays 0) but hangs on real
+        // inference — the gateway's endpoint check says unhealthy. Restart it.
+        let ep_id = Uuid::new_v4();
+        let r = rv("healthy", "j1", Some(ep_id), 600);
+        let eps = [ep(ep_id, "unhealthy", 528, Some(60))];
+        let set = restart_candidates(&[r.clone()], &HashMap::new(), 3, &eps);
+        assert!(set.contains(&r.id));
+    }
+
+    #[test]
+    fn gateway_signal_requires_failures_and_recency() {
+        let ep_id = Uuid::new_v4();
+        let r = rv("healthy", "j1", Some(ep_id), 600);
+        // only one failed check -> not yet
+        let eps = [ep(ep_id, "unhealthy", 1, Some(60))];
+        assert!(restart_candidates(&[r.clone()], &HashMap::new(), 3, &eps).is_empty());
+        // stale verdict (checks disabled long ago) -> ignored
+        let eps = [ep(ep_id, "unhealthy", 528, Some(90_000))];
+        assert!(restart_candidates(&[r.clone()], &HashMap::new(), 3, &eps).is_empty());
+        // never checked -> ignored
+        let mut never = ep(ep_id, "unhealthy", 528, None);
+        never.checked_secs_ago = None;
+        assert!(restart_candidates(&[r.clone()], &HashMap::new(), 3, &[never]).is_empty());
+        // healthy endpoint -> ignored
+        let eps = [ep(ep_id, "healthy", 0, Some(60))];
+        assert!(restart_candidates(&[r], &HashMap::new(), 3, &eps).is_empty());
+    }
+
+    #[test]
+    fn zero_threshold_disables_both_signals() {
+        let ep_id = Uuid::new_v4();
+        let r = rv("healthy", "j1", Some(ep_id), 600);
+        let counts = HashMap::from([(r.id, 99i64)]);
+        let eps = [ep(ep_id, "unhealthy", 528, Some(60))];
+        assert!(restart_candidates(&[r], &counts, 0, &eps).is_empty());
+    }
+
+    #[test]
+    fn non_healthy_replicas_are_never_candidates() {
+        // A starting replica's endpoint doesn't exist yet; a draining one is
+        // already being reconciled away. Only promoted healthy rows restart.
+        let ep_id = Uuid::new_v4();
+        let mut r = rv("draining", "j1", Some(ep_id), 600);
+        let eps = [ep(ep_id, "unhealthy", 528, Some(60))];
+        assert!(restart_candidates(&[r.clone()], &HashMap::new(), 3, &eps).is_empty());
+        r.state = "starting".into();
+        assert!(restart_candidates(&[r], &HashMap::new(), 3, &eps).is_empty());
+    }
+
+    // --- update_probe_failures (self-heal counters) ---
+
+    #[test]
+    fn probe_failure_counter_increments_on_miss_and_resets_on_pass() {
+        let r = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
+        let id = r.id;
+        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
+        let mut counts = HashMap::new();
+
+        // probed, not in health map -> failed -> increments
+        update_probe_failures(&[r.clone()], &jobs, &HashMap::new(), &mut counts);
+        update_probe_failures(&[r.clone()], &jobs, &HashMap::new(), &mut counts);
+        assert_eq!(counts.get(&id), Some(&2));
+
+        // passing probe clears the streak entirely
+        let health = HashMap::from([(id, 8000u16)]);
+        update_probe_failures(&[r], &jobs, &health, &mut counts);
+        assert_eq!(counts.get(&id), None);
+    }
+
+    #[test]
+    fn probe_failure_counter_ignores_unjudgeable_replicas() {
+        // Booting (starting), job not RUNNING, or no nodes reported: a probe
+        // miss there is expected and must not accrue toward a restart.
+        let starting = rv("starting", "j1", None, 30);
+        let pending_job = rv("healthy", "j2", Some(Uuid::new_v4()), 600);
+        let no_nodes = rv("healthy", "j3", Some(Uuid::new_v4()), 600);
+        let gone = rv("healthy", "j4", Some(Uuid::new_v4()), 600);
+        let jobs = HashMap::from([
+            job("j1", JobState::Running, &["n1"]),
+            job("j2", JobState::Pending, &[""]),
+            job("j3", JobState::Running, &[]),
+        ]);
+        let mut counts = HashMap::new();
+        update_probe_failures(
+            &[starting, pending_job, no_nodes, gone],
+            &jobs,
+            &HashMap::new(),
+            &mut counts,
+        );
+        assert!(counts.is_empty(), "got {counts:?}");
+    }
+
+    #[test]
     fn draining_replica_with_pending_job_is_left_alone() {
         // Cancel sent but the job is still queued (Pending) -> wait, don't delete.
         let r = rv("draining", "j1", None, 10);
         let id = r.id;
         let jobs = HashMap::from([job("j1", JobState::Pending, &[""])]);
-        let actions = plan(&spec(0), &[r], &jobs, &HashMap::new(), 900);
+        let actions = plan(&spec(0), &[r], &jobs, &HashMap::new(), &HashSet::new(), 900);
         assert!(
             !actions
                 .iter()
