@@ -2,8 +2,11 @@
 //!
 //! Health is determined by the cheapest trustworthy signal, in order:
 //!
-//! 1. **Passive** — recent real client traffic in the ClickHouse usage ledger
-//!    (window follows the model's check interval).
+//! 1. **Passive** — a recent real 2xx in the ClickHouse usage ledger (window
+//!    follows the model's check interval). Only an observed *success* settles
+//!    the check here; recent errors are never trusted to stand in for a probe
+//!    (they may be stale, and acting on them would suppress the very probe that
+//!    would clear them), so they fall through to step 2.
 //! 2. **Active minimal inference** — a real forward pass per modality: one-token
 //!    chat completion, one-string embedding, one-character speech, or a
 //!    generated 0.1 s silence WAV transcription. Probe tokens are accounted
@@ -506,33 +509,34 @@ async fn passive_signal(
     window_secs: i64,
 ) -> Option<ProbeResult> {
     let row = recent_traffic(state, &model.model_name, window_secs).await?;
-    if row.requests == 0 {
-        // No recent traffic to judge by; fall back to an active probe.
-        return None;
-    }
-    if row.successes > 0 {
-        return Some(ProbeResult::healthy(
+    classify_passive_traffic(&row, window_secs)
+}
+
+/// Turn a window of recent real traffic into a health verdict, or `None` to
+/// defer to an active probe.
+///
+/// **Only a success short-circuits.** A real 2xx in the window proves the model
+/// is currently serving — as trustworthy as an active forward pass, and free.
+///
+/// Server errors deliberately do *not* stand in as the verdict. They may be
+/// stale (piled up before a recovery), and — worse — letting them decide would
+/// skip the very active probe whose success would clear them, deadlocking a
+/// recovered model at "unhealthy" until the window ages out. (Real 4xx are
+/// caller mistakes, not model health, so they're inconclusive too.) So for
+/// anything short of an observed success we return `None` and let the active
+/// probe be the ground truth: if the model really is down, that probe fails and
+/// reports it with a live HTTP status and latency.
+fn classify_passive_traffic(row: &RecentTraffic, window_secs: i64) -> Option<ProbeResult> {
+    (row.successes > 0).then(|| {
+        ProbeResult::healthy(
             None,
             None,
             format!(
                 "passive: {} successful request(s) in the last {window_secs}s",
                 row.successes
             ),
-        ));
-    }
-    if row.server_errors > 0 {
-        return Some(ProbeResult::unhealthy(
-            None,
-            None,
-            format!(
-                "passive: {} upstream server error(s) and no successes in the last {window_secs}s",
-                row.server_errors
-            ),
-        ));
-    }
-    // Only client-side (4xx) errors in the window reflect caller mistakes, not
-    // model health, so the signal is inconclusive — probe actively.
-    None
+        )
+    })
 }
 
 async fn recent_traffic(
@@ -541,9 +545,7 @@ async fn recent_traffic(
     window_secs: i64,
 ) -> Option<RecentTraffic> {
     let since = Utc::now().timestamp_millis() - window_secs.max(1) * 1000;
-    let sql = "select count() as requests, \
-               countIf(status_code >= 200 and status_code < 300) as successes, \
-               countIf(status_code >= 500) as server_errors \
+    let sql = "select countIf(status_code >= 200 and status_code < 300) as successes \
                from usage where model = ? and ts_ms >= ?";
     match state
         .clickhouse
@@ -1111,9 +1113,9 @@ fn build_probe_request(
 
 #[derive(Debug, Clone, Row, Deserialize)]
 struct RecentTraffic {
-    requests: u64,
+    /// Count of 2xx responses in the window — the only signal that short-circuits
+    /// an active probe (see [`classify_passive_traffic`]).
     successes: u64,
-    server_errors: u64,
 }
 
 fn maybe_alert(state: &AdminState, outcome: &ModelHealthRecordOutcome) {
@@ -1290,6 +1292,28 @@ mod tests {
 
     fn ids(models: &[&str]) -> Catalog {
         Catalog::Ids(models.iter().map(|m| m.to_string()).collect())
+    }
+
+    #[test]
+    fn passive_success_short_circuits_to_healthy() {
+        let r = classify_passive_traffic(&RecentTraffic { successes: 3 }, 900)
+            .expect("a success must yield a verdict");
+        assert_eq!(r.status, "healthy");
+        assert!(r.message.as_deref().unwrap_or("").contains("3 successful"));
+    }
+
+    #[test]
+    fn passive_errors_only_defer_to_active_probe() {
+        // Regression pin (2026-07-05): a recovered model was pinned "unhealthy"
+        // because a window of stale server errors (no successes) stood in as the
+        // verdict and skipped the active probe that would have cleared it. Errors
+        // with zero successes must now defer (None), not decide.
+        assert!(classify_passive_traffic(&RecentTraffic { successes: 0 }, 900).is_none());
+    }
+
+    #[test]
+    fn passive_no_traffic_defers_to_active_probe() {
+        assert!(classify_passive_traffic(&RecentTraffic { successes: 0 }, 300).is_none());
     }
 
     #[test]
