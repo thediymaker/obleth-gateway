@@ -585,6 +585,13 @@ export async function toggleTenantTracingAction(id: string, tracing_enabled: boo
   revalidatePath("/tenants");
 }
 
+export async function toggleTenantSyntheticAction(id: string, synthetic: boolean) {
+  const session = await requireAdmin();
+  await obleth.setTenantSynthetic(id, synthetic, { auditActor: session.email });
+  updateTag(CACHE_TAGS.tenants);
+  revalidatePath("/tenants");
+}
+
 export async function deleteKeyAction(id: string) {
   const session = await requireAdmin();
   await obleth.deleteKey(id, { auditActor: session.email });

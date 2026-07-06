@@ -73,7 +73,7 @@ pub async fn seed_fixture(
         // `tokens_per_minute = 0` means unlimited: the demo is a concurrency /
         // fairshare stress test, so we never want the per-minute token bucket to
         // shed traffic (that would mask the in-flight queueing we're measuring).
-        let (id, created) = admin.ensure_tenant(name, *weight, 0, group).await?;
+        let (id, created) = admin.ensure_tenant(name, *weight, 0, group, true).await?;
         if created {
             teardown.tenant_ids.push(id.clone());
         }

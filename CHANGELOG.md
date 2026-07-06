@@ -14,6 +14,7 @@ Reliable health for every model type: real probes for speech and transcription, 
 - **Busy models are no longer probed needlessly.** The passive traffic window now follows the model's check interval, so any model with recent successful traffic is settled from the usage ledger for free.
 - **Pre-flight validation on model save.** Creating or editing a model warns when the upstream doesn't list the model id, the catalog can't be verified (wildcard pass-through), or the model type isn't recognized — the save always succeeds; the warnings tell you what to fix.
 - Wildcard upstream catalogs (`/models` returning `*`) are explicitly treated as unverifiable and can never produce a false healthy badge.
+- **Synthetic-tenant tagging** — tenants can be flagged synthetic (obench seeds its fixture tenants that way); their traffic is recorded as benchmark traffic and, together with health probes, excluded from usage and cost stats by default (`include_internal=true` opts back in). Benchmark traffic never enters the permanent daily rollup.
 
 ## v0.7.2
 

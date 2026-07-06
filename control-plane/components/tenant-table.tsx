@@ -32,6 +32,7 @@ import {
   setTenantGuardrailsAction,
   setTenantScheduleAction,
   setTenantStatusAction,
+  toggleTenantSyntheticAction,
   toggleTenantTracingAction,
   updateTenantAction,
 } from "@/app/actions";
@@ -295,6 +296,9 @@ function TenantBadges({ tenant, schedule }: { tenant: Tenant; schedule: Schedule
   return (
     <>
       <Badge className={STATUS_STYLES[tenant.status] ?? STATUS_STYLES.archived}>{tenant.status}</Badge>
+      {tenant.synthetic && (
+        <Badge className="border-amber-500/40 bg-amber-500/10 text-amber-500">synthetic</Badge>
+      )}
       {schedule && <Badge className={schedule.className}>{schedule.label}</Badge>}
       {(tenant.budget_tokens != null || tenant.budget_cost_usd != null) && (
         <Badge className="border-violet-500/40 bg-violet-500/10 text-violet-500">{budgetLabel(tenant)}</Badge>
@@ -530,6 +534,21 @@ function TenantDetailPanel({
                 onClick={() => start(() => toggleTenantTracingAction(tenant.id, !tenant.tracing_enabled))}
               >
                 {tenant.tracing_enabled ? "⬡ Tracing on" : "Tracing off"}
+              </Button>
+            </SettingRow>
+            <SettingRow
+              label="Synthetic tenant"
+              hint="Tag this tenant's traffic as benchmark/test data. Tagged requests are hidden from usage and cost stats by default."
+            >
+              <Button
+                type="button"
+                variant={tenant.synthetic ? "default" : "outline"}
+                size="sm"
+                disabled={pending}
+                className={tenant.synthetic ? "border border-amber-500/40 bg-amber-950/40 text-amber-400 hover:bg-amber-950/60" : ""}
+                onClick={() => start(() => toggleTenantSyntheticAction(tenant.id, !tenant.synthetic))}
+              >
+                {tenant.synthetic ? "⬡ Synthetic on" : "Synthetic off"}
               </Button>
             </SettingRow>
           </div>

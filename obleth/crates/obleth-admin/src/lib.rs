@@ -122,6 +122,10 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/tenants/:id/tracing",
             put(set_tenant_tracing_handler),
         )
+        .route(
+            "/api/v1/tenants/:id/synthetic",
+            put(set_tenant_synthetic_handler),
+        )
         .route("/api/v1/keys", get(list_keys))
         .route("/api/v1/keys/:id", put(update_key).delete(delete_key))
         .route("/api/v1/keys/:id/disabled", put(set_key_disabled))
@@ -337,6 +341,9 @@ pub struct CreateTenant {
     pub tokens_per_minute: Option<i64>,
     pub max_in_flight: Option<i64>,
     pub fairshare_group: Option<String>,
+    /// Mark the tenant synthetic at creation (benchmark/test traffic).
+    #[serde(default)]
+    pub synthetic: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -353,6 +360,11 @@ pub struct UpdateTenant {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetTenantStatus {
     pub status: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetTenantSynthetic {
+    pub synthetic: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -910,7 +922,7 @@ async fn create_tenant(
     headers: HeaderMap,
     Json(body): Json<CreateTenant>,
 ) -> Result<Json<Tenant>> {
-    let tenant = state
+    let mut tenant = state
         .store
         .create_tenant(
             &body.name,
@@ -920,6 +932,10 @@ async fn create_tenant(
             body.fairshare_group.as_deref(),
         )
         .await?;
+    if body.synthetic == Some(true) {
+        state.store.set_tenant_synthetic(tenant.id, true).await?;
+        tenant.synthetic = true;
+    }
     state
         .store
         .record_audit(
@@ -2471,6 +2487,34 @@ async fn set_tenant_tracing_handler(
 }
 
 #[utoipa::path(
+    put, path = "/api/v1/tenants/{id}/synthetic", tag = "tenants",
+    params(("id" = Uuid, Path, description = "Tenant id")),
+    request_body = SetTenantSynthetic,
+    responses((status = 204))
+)]
+async fn set_tenant_synthetic_handler(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetTenantSynthetic>,
+) -> Result<StatusCode> {
+    state.store.set_tenant_synthetic(id, body.synthetic).await?;
+    // The flag is denormalized into every resolved key; re-push the tenant's keys.
+    sync_tenant_keys(&state, id).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "set_tenant_synthetic",
+            "tenant",
+            &id.to_string(),
+            serde_json::json!({ "synthetic": body.synthetic }),
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
     get, path = "/api/v1/usage", tag = "usage",
     params(usage::UsageQuery),
     responses((status = 200, body = [usage::UsageAgg]))
@@ -2521,23 +2565,24 @@ async fn get_key_usage(
         .next()
         .ok_or(AdminError::NotFound)?;
 
-    let summary = usage::query_key_usage_summary(&state.clickhouse, id, q.since_ms)
-        .await?
-        .unwrap_or(usage::KeyUsageSummary {
-            key_id: id,
-            tenant_id: key.tenant_id,
-            last_used_ms: 0,
-            last_model: String::new(),
-            last_status_code: 0,
-            requests: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            total_tokens: 0,
-            cost_usd: 0.0,
-            energy_wh: 0.0,
-            energy_cost_usd: 0.0,
-            co2_g: 0.0,
-        });
+    let summary =
+        usage::query_key_usage_summary(&state.clickhouse, id, q.since_ms, q.include_internal)
+            .await?
+            .unwrap_or(usage::KeyUsageSummary {
+                key_id: id,
+                tenant_id: key.tenant_id,
+                last_used_ms: 0,
+                last_model: String::new(),
+                last_status_code: 0,
+                requests: 0,
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+                cost_usd: 0.0,
+                energy_wh: 0.0,
+                energy_cost_usd: 0.0,
+                co2_g: 0.0,
+            });
     Ok(Json(summary))
 }
 
@@ -2645,7 +2690,7 @@ async fn get_costs(
         })
         .collect();
     Ok(Json(
-        usage::query_costs(&state.clickhouse, q.since_ms, &costs).await?,
+        usage::query_costs(&state.clickhouse, q.since_ms, q.include_internal, &costs).await?,
     ))
 }
 
@@ -2762,9 +2807,14 @@ async fn get_usage_breakdown(
     State(state): State<AdminState>,
     Query(q): Query<usage::UsageBreakdownQuery>,
 ) -> Result<Json<Vec<UsageBreakdownEntry>>> {
-    let rows =
-        usage::query_usage_breakdown_by_model(&state.clickhouse, &q.model, q.since_ms, q.limit)
-            .await?;
+    let rows = usage::query_usage_breakdown_by_model(
+        &state.clickhouse,
+        &q.model,
+        q.since_ms,
+        q.limit,
+        q.include_internal,
+    )
+    .await?;
 
     let tenant_meta: std::collections::HashMap<Uuid, (String, String)> = state
         .store
