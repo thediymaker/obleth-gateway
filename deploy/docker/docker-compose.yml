@@ -235,6 +235,10 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-obleth}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-obleth}
       BETTER_AUTH_SECRET: ${DASHBOARD_SESSION_SECRET:?set DASHBOARD_SESSION_SECRET (>=32 chars)}
       BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3002}
+      # Extra origins better-auth trusts for login beyond BETTER_AUTH_URL, so the
+      # dashboard is reachable by LAN IP/hostname and not just localhost. See
+      # deploy/docker/.env.example ("Accessing the dashboard from another machine").
+      TRUSTED_ORIGINS: ${TRUSTED_ORIGINS:-}
       DASHBOARD_ADMIN_EMAIL: ${DASHBOARD_ADMIN_EMAIL:-admin@example.com}
       OIDC_PROVIDERS: ${OIDC_PROVIDERS:-}
     ports: ["3002:3000"]

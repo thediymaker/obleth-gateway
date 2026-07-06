@@ -13,6 +13,8 @@ stringData:
   DATABASE_URL: {{ .Values.controlPlane.databaseUrl | default (include "obleth.databaseUrl" .) | quote }}
   BETTER_AUTH_SECRET: {{ required "controlPlane.dashboardSessionSecret is required and must be >=32 chars" .Values.controlPlane.dashboardSessionSecret | quote }}
   BETTER_AUTH_URL: {{ .Values.controlPlane.betterAuthUrl | default "" | quote }}
+  # Comma-separated extra origins better-auth trusts for login, on top of BETTER_AUTH_URL.
+  TRUSTED_ORIGINS: {{ .Values.controlPlane.trustedOrigins | default "" | quote }}
   DASHBOARD_ADMIN_EMAIL: {{ .Values.controlPlane.dashboardAdminEmail | default "admin@example.com" | quote }}
   OIDC_PROVIDERS: {{ .Values.controlPlane.oidcProviders | default "" | quote }}
 ---
