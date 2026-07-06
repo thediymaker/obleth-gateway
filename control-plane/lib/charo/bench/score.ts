@@ -1,4 +1,5 @@
 import type { StepOutcome, BenchResult } from "./types";
+import { kneeConfirmed } from "./knee";
 
 export function gradeFromScore(score: number): BenchResult["grade"] {
   if (score >= 90) return "A";
@@ -32,8 +33,17 @@ export function scoreBench(steps: StepOutcome[], kneeConcurrency: number | null)
 
   const score = Math.round(clamp(0.5 * throughput + 0.3 * latency + 0.2 * cleanliness));
 
-  if (kneeStep) findings.push(`Knee at concurrency ${kneeStep.concurrency} (${kneeStep.reqPerS.toFixed(1)} req/s).`);
-  else findings.push("No knee found: no step held error rate ≤ 1% and p99 TTFT within 4× baseline.");
+  const confirmed = kneeConfirmed(steps, kneeConcurrency);
+  if (kneeStep && confirmed) {
+    findings.push(`Knee at concurrency ${kneeStep.concurrency} (${kneeStep.reqPerS.toFixed(1)} req/s).`);
+  } else if (kneeStep) {
+    findings.push(
+      `Knee not reached — healthy through ${kneeStep.concurrency} concurrent ` +
+        `(${kneeStep.reqPerS.toFixed(1)} req/s). Raise the concurrency/request caps or add higher steps to find the real ceiling.`,
+    );
+  } else {
+    findings.push("No knee found: no step held error rate ≤ 1% and p99 TTFT within 4× baseline.");
+  }
   if (totalErrors > 0) findings.push(`${totalErrors} errored requests across the ramp (${(cleanliness).toFixed(0)}/100 cleanliness).`);
   const anyRejected = steps.some((s) => s.rejected > 0);
   if (anyRejected) findings.push("Some requests were rejected (429) — healthy backpressure, not counted as errors.");

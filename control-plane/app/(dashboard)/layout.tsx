@@ -24,7 +24,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
   });
 
   return (
-    <AppShell username={session.email} version={CONTROL_PLANE_VERSION} charoEnabled={charo.enabled}>
+    <AppShell username={session.email} version={CONTROL_PLANE_VERSION}>
       {charo.enabled ? <CharoShell>{children}</CharoShell> : children}
     </AppShell>
   );

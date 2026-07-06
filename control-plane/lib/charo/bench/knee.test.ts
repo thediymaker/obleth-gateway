@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { detectKnee } from "./knee";
+import { detectKnee, kneeConfirmed } from "./knee";
 import type { StepOutcome } from "./types";
 
 const step = (concurrency: number, p99: number, errorRate = 0): StepOutcome => ({
@@ -23,5 +23,21 @@ describe("detectKnee", () => {
   });
   it("null on empty", () => {
     expect(detectKnee([])).toBeNull();
+  });
+});
+
+describe("kneeConfirmed", () => {
+  it("confirmed when a step above the knee ran (we witnessed degradation)", () => {
+    const steps = [step(1, 100), step(5, 180), step(10, 380), step(20, 900)];
+    expect(detectKnee(steps)).toBe(10);
+    expect(kneeConfirmed(steps, 10)).toBe(true);
+  });
+  it("unconfirmed when the top step still passed (ramp ran out before the knee)", () => {
+    const steps = [step(1, 100), step(5, 150), step(10, 200)];
+    expect(detectKnee(steps)).toBe(10);
+    expect(kneeConfirmed(steps, 10)).toBe(false); // never saw it break — ≥10, not "at 10"
+  });
+  it("false when there is no knee", () => {
+    expect(kneeConfirmed([step(1, 100)], null)).toBe(false);
   });
 });

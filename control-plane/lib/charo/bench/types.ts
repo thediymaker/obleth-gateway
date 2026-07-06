@@ -12,6 +12,7 @@ export interface BenchResult {
   startedAt: string;           // ISO
   steps: StepOutcome[];
   kneeConcurrency: number | null;
+  kneeConfirmed: boolean;      // true only if a higher step degraded above the knee (else knee is a floor, "≥")
   score: number;               // 0–100
   grade: "A" | "B" | "C" | "D" | "F";
   findings: string[];

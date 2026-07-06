@@ -1,8 +1,7 @@
 "use client";
 
 import dynamic from "next/dynamic";
-import { useState } from "react";
-import { useRouter } from "next/navigation";
+import { useCallback, useState } from "react";
 import { CharoLauncher } from "./launcher";
 import { useCharoContext } from "./charo-context";
 
@@ -14,24 +13,25 @@ const CharoPanel = dynamic(() => import("./charo-panel").then((m) => m.CharoPane
 
 export function CharoRoot() {
   const [open, setOpen] = useState(false);
-  const router = useRouter();
+  const [expanded, setExpanded] = useState(false);
   const stream = useCharoContext();
+
+  // Closing always returns to the collapsed dock so the next open is the small
+  // window, not the modal.
+  const close = useCallback(() => {
+    setOpen(false);
+    setExpanded(false);
+  }, []);
 
   return (
     <>
-      {!open && (
-        <CharoLauncher
-          state={stream.state}
-          onOpen={() => setOpen(true)}
-        />
-      )}
+      {!open && <CharoLauncher state={stream.state} onOpen={() => setOpen(true)} />}
       <CharoPanel
         open={open}
-        onClose={() => setOpen(false)}
-        onExpand={() => {
-          setOpen(false);
-          router.push("/charo");
-        }}
+        expanded={expanded}
+        onClose={close}
+        onExpand={() => setExpanded(true)}
+        onCollapse={() => setExpanded(false)}
         stream={stream}
         mascotState={stream.state}
       />

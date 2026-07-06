@@ -1,7 +1,7 @@
 import type { CharoTool, ToolCtx, ToolProgress } from "@/lib/charo/tools/types";
 import type { BenchResult } from "./types";
 import { runRamp } from "./ramp";
-import { detectKnee } from "./knee";
+import { detectKnee, kneeConfirmed } from "./knee";
 import { scoreBench, gradeFromScore } from "./score";
 import { configFingerprint } from "./fingerprint";
 import { obleth } from "@/lib/obleth";
@@ -77,7 +77,8 @@ export const runBenchmarkTool: CharoTool<BenchArgs, BenchResult> = {
       modelName: model.model_name,
       configFingerprint: configFingerprint(model, endpoints),
       startedAt: new Date().toISOString(),
-      steps, kneeConcurrency, score, grade: gradeFromScore(score), findings,
+      steps, kneeConcurrency, kneeConfirmed: kneeConfirmed(steps, kneeConcurrency),
+      score, grade: gradeFromScore(score), findings,
       ...(capped ? { capped } : {}),
     };
   },
