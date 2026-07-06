@@ -14,3 +14,15 @@ export function detectKnee(steps: StepOutcome[]): number | null {
   }
   return knee;
 }
+
+/**
+ * A knee is only *confirmed* if we actually witnessed the model degrade above it —
+ * i.e. some step ran at a higher concurrency (and, being above the knee, necessarily
+ * failed the gate). If the top step that ran still passed, the ramp stopped short of
+ * the real knee (steps exhausted or a cap hit), so the true capacity is `>= knee`,
+ * not `= knee`. Reporting an unconfirmed knee as a verdict is what makes a 32-replica
+ * model look like it "tops out at 10".
+ */
+export function kneeConfirmed(steps: StepOutcome[], knee: number | null): boolean {
+  return knee !== null && steps.some((s) => s.concurrency > knee);
+}

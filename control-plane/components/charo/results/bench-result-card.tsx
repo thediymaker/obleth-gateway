@@ -21,19 +21,30 @@ export function BenchResultCard({ data }: { data: unknown }) {
     concurrency: s.concurrency, p50: s.p50TtfbMs, p99: s.p99TtfbMs, req: Number(s.reqPerS.toFixed(2)),
   }));
 
+  // A knee is only a verdict if we witnessed the model degrade above it. Otherwise the
+  // ramp stopped short (caps/steps), so the number is a floor ("≥"), not a ceiling.
+  const kneeReached = r.kneeConcurrency != null && r.kneeConfirmed === true;
+  const kneeFloor = r.kneeConcurrency != null && !kneeReached;
+  const headline = kneeReached
+    ? `Knee at ${r.kneeConcurrency} concurrent`
+    : kneeFloor
+    ? `Healthy through ${r.kneeConcurrency} concurrent · knee not reached`
+    : "No knee detected";
+
   return (
     <div className="w-full space-y-3 rounded-lg border border-border bg-card p-3">
       <div className="flex items-center justify-between gap-2">
         <div className="min-w-0">
           <div className="truncate text-sm font-semibold">{r.modelName ?? "benchmark"}</div>
-          <div className="text-xs text-muted-foreground">
-            {r.kneeConcurrency != null ? `Knee at ${r.kneeConcurrency} concurrent` : "No knee detected"}
-          </div>
+          <div className="text-xs text-muted-foreground">{headline}</div>
         </div>
         {r.grade && (
-          <Badge className={GRADE_TONE[r.grade] ?? ""}>
-            {r.grade} · {r.score ?? 0}/100
-          </Badge>
+          <div className="flex flex-col items-end gap-0.5">
+            <Badge className={GRADE_TONE[r.grade] ?? ""}>
+              {r.grade} · {r.score ?? 0}/100
+            </Badge>
+            {kneeFloor && <span className="text-[10px] text-muted-foreground">provisional — ramp capped</span>}
+          </div>
         )}
       </div>
 
@@ -47,7 +58,7 @@ export function BenchResultCard({ data }: { data: unknown }) {
             <Tooltip contentStyle={{ fontSize: 12 }} />
             <Legend wrapperStyle={{ fontSize: 11 }} />
             {r.kneeConcurrency != null && (
-              <ReferenceLine yAxisId="lat" x={r.kneeConcurrency} stroke="hsl(267 86% 66%)" strokeDasharray="4 3" label={{ value: "knee", fontSize: 10 }} />
+              <ReferenceLine yAxisId="lat" x={r.kneeConcurrency} stroke="hsl(267 86% 66%)" strokeDasharray="4 3" label={{ value: kneeReached ? "knee" : "≥ tested", fontSize: 10 }} />
             )}
             <Line yAxisId="lat" type="monotone" dataKey="p50" name="p50 TTFT ms" stroke="hsl(189 82% 45%)" dot={false} isAnimationActive={false} />
             <Line yAxisId="lat" type="monotone" dataKey="p99" name="p99 TTFT ms" stroke="hsl(267 86% 66%)" dot={false} isAnimationActive={false} />

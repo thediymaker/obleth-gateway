@@ -34,4 +34,18 @@ describe("scoreBench", () => {
     expect(score).toBeLessThan(45);
     expect(findings.some((f) => f.toLowerCase().includes("no knee"))).toBe(true);
   });
+
+  it("unconfirmed knee (top step healthy) → finding says knee not reached, not a verdict", () => {
+    const steps = [step(1, 100, 1), step(5, 150, 5), step(10, 200, 10)]; // top step passed
+    const { findings } = scoreBench(steps, 10);
+    expect(findings.some((f) => /not reached|healthy through/i.test(f))).toBe(true);
+    expect(findings.some((f) => /^Knee at concurrency/.test(f))).toBe(false);
+  });
+
+  it("confirmed knee (a higher step degraded) → 'Knee at concurrency' verdict", () => {
+    // step 20 is slow (p99 2000 vs baseline 100 → >4x) and dirty, so it fails the gate.
+    const steps = [step(1, 100, 1), step(5, 150, 5), step(10, 200, 10), step(20, 2000, 8, 50)];
+    const { findings } = scoreBench(steps, 10);
+    expect(findings.some((f) => /^Knee at concurrency 10/.test(f))).toBe(true);
+  });
 });
