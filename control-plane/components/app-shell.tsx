@@ -8,6 +8,7 @@ import {
   BookText,
   Boxes,
   BarChart3,
+  Bot,
   ChevronDown,
   Gauge,
   KeyRound,
@@ -51,6 +52,7 @@ const nav = [
   { href: "/logs", label: "Request Logs", icon: Radio },
   { href: "/reports", label: "Reports", icon: BarChart3 },
   { href: "/audit", label: "Audit", icon: ScrollText },
+  { href: "/charo", label: "Charo", icon: Bot },
   { href: "/settings", label: "Settings", icon: Settings },
 ];
 
@@ -103,10 +105,12 @@ export function AppShell({
   children,
   username,
   version,
+  charoEnabled = true,
 }: {
   children: React.ReactNode;
   username: string;
   version: string;
+  charoEnabled?: boolean;
 }) {
   const pathname = usePathname();
   const router = useRouter();
@@ -137,10 +141,14 @@ export function AppShell({
     router.refresh();
   }
 
+  // Hide the Charo workspace link when the assistant is disabled — its page
+  // depends on a provider the dashboard layout only mounts when enabled.
+  const visibleNav = charoEnabled ? nav : nav.filter((n) => n.href !== "/charo");
+
   const pageTitle = useMemo(() => {
-    const match = nav.find(({ href }) => (href === "/" ? pathname === "/" : pathname.startsWith(href)));
+    const match = visibleNav.find(({ href }) => (href === "/" ? pathname === "/" : pathname.startsWith(href)));
     return match?.label ?? "Dashboard";
-  }, [pathname]);
+  }, [pathname, visibleNav]);
 
   const initials = userInitials(username);
   const sidebarCollapsed = hydrated && collapsed;
@@ -171,7 +179,7 @@ export function AppShell({
             )}
           </div>
           <nav className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto p-2">
-            {nav.map(({ href, label, icon }) => {
+            {visibleNav.map(({ href, label, icon }) => {
               const active = href === "/" ? pathname === "/" : pathname.startsWith(href);
               return (
                 <NavItem

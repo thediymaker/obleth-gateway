@@ -10,6 +10,7 @@ import type {
   AutotuneReport,
   AutotuneWorkload,
   ConfigBackup,
+  CharoSettingsView,
   CompressionPolicy,
   EnergyTestResult,
   GuardrailsPolicy,
@@ -1462,11 +1463,11 @@ export async function testEnergyQueryAction(
 }
 
 export async function setCharoSettingsAction(
-  enabled: boolean,
+  next: CharoSettingsView,
 ): Promise<ActionResult> {
   const session = await requireAdmin();
   try {
-    await obleth.setCharoSettings({ enabled }, { auditActor: session.email });
+    await obleth.setCharoSettings(next, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
