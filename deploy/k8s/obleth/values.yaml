@@ -286,6 +286,9 @@ controlPlane:
   databaseUrl: ""   # e.g. postgres://obleth:pass@my-pg:5432/obleth
   # External base URL of the dashboard (used for OIDC redirect URIs).
   betterAuthUrl: ""   # e.g. https://dashboard.example.com
+  # Comma-separated extra origins better-auth trusts for login, on top of
+  # betterAuthUrl (e.g. an alternate hostname). "*" trusts all — private nets only.
+  trustedOrigins: ""   # e.g. https://dash.internal,https://10.0.0.5
   # Break-glass admin email seeded on first boot (paired with dashboardPassword).
   dashboardAdminEmail: admin@example.com
   # JSON array of OIDC providers. Empty = SSO off.
