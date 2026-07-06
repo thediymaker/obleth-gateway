@@ -4,6 +4,14 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.8.1
+
+Health badges you can trust: non-chat models stop showing a false "degraded", recovered models clear themselves, and Charo opens as a pop-out modal from anywhere.
+
+- **Embedding, TTS, transcription, and image models no longer show a false "degraded".** The scheduled health worker was probing every model against the chat completions endpoint regardless of its type, so any non-chat model was rejected (HTTP 404) and left sitting "degraded — model_type may be misconfigured" even when correctly configured and serving. Scheduled checks now probe each model's real modality endpoint. (Manual "Check now" and bulk checks were already correct — only the background sweep was affected.)
+- **Recovered models clear themselves instead of staying stuck "unhealthy".** A window of stale upstream errors with no recent successes could stand in as the health verdict and suppress the very active probe whose success would have cleared it — pinning a recovered model "unhealthy" until the window aged out. Only an observed success now settles a check for free from the usage ledger; anything short of that defers to a live probe as ground truth.
+- **Charo opens as a pop-out modal from anywhere.** The dedicated `/charo` page is replaced by a centered pop-out modal, so the model-testing console can be summoned over whichever dashboard view you're on without navigating away.
+
 ## v0.8.0
 
 Know your deployment is sound, and prove it: an agentic model-testing console (Charo), a graded system scorecard (`obench score`), honest health for every model type, Slurm state you can trust at a glance, and benchmark traffic kept out of your numbers.
