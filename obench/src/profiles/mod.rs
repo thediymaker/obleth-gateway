@@ -60,7 +60,7 @@ struct SeededSetup {
 
 /// Resolve the `LiveConfig` for a live run: either the one the TUI built in
 /// memory (`live_override`) or the headless config file at `cli.config`.
-fn resolve_live_config(
+pub(crate) fn resolve_live_config(
     cli: &Cli,
     live_override: Option<&crate::config::LiveConfig>,
 ) -> Result<crate::config::LiveConfig> {
