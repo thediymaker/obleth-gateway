@@ -1,5 +1,5 @@
 import { AppShell } from "@/components/app-shell";
-import { CharoRoot } from "@/components/charo/charo-root";
+import { CharoShell } from "@/components/charo/charo-shell";
 import { getSession } from "@/lib/auth/session";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
@@ -25,8 +25,7 @@ export default async function DashboardLayout({ children }: { children: React.Re
 
   return (
     <AppShell username={session.email} version={CONTROL_PLANE_VERSION}>
-      {children}
-      {charo.enabled && <CharoRoot />}
+      {charo.enabled ? <CharoShell>{children}</CharoShell> : children}
     </AppShell>
   );
 }
