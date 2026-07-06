@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Send, X, ImagePlus, RotateCcw, Trash2, ChevronDown, Check } from "lucide-react";
+import { Send, X, ImagePlus, RotateCcw, Trash2, ChevronDown, Check, Maximize2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -82,11 +82,13 @@ export function CharoPanel({
   onClose,
   stream,
   mascotState,
+  onExpand,
 }: {
   open: boolean;
   onClose: () => void;
   stream: Stream;
   mascotState: CharoState;
+  onExpand?: () => void;
 }) {
   const { messages, busy, send, reset, runToolDirect } = stream;
   const [models, setModels] = useState<ModelRoute[]>([]);
@@ -240,6 +242,11 @@ export function CharoPanel({
             >
               <RotateCcw className="h-4 w-4" />
             </Button>
+            {onExpand && (
+              <Button variant="ghost" size="icon" title="Open workspace" onClick={onExpand}>
+                <Maximize2 className="h-4 w-4" />
+              </Button>
+            )}
             <Button variant="ghost" size="icon" title="Close" onClick={onClose}>
               <X className="h-4 w-4" />
             </Button>
