@@ -224,6 +224,7 @@ export function ModelManager({
   const [providerImportOpen, setProviderImportOpen] = useState(false);
   const [showBenchmarkRoutes, setShowBenchmarkRoutes] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [createWarnings, setCreateWarnings] = useState<string[] | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
   const [importResult, setImportResult] = useState<ImportModelsResult | null>(null);
   const [importPlan, setImportPlan] = useState<ImportPlanItem[] | null>(null);
@@ -301,6 +302,7 @@ export function ModelManager({
       const result = await createModelAction(formData);
       if (result.ok) {
         setCreateWizardOpen(false);
+        setCreateWarnings(result.warnings ?? null);
       } else {
         setCreateError(result.error);
       }
@@ -345,6 +347,24 @@ export function ModelManager({
       )}
       {providerImportOpen && (
         <ProviderImportWizard models={models} onClose={() => setProviderImportOpen(false)} />
+      )}
+      {(createWarnings?.length ?? 0) > 0 && (
+        <div className="flex items-start justify-between gap-3 rounded-lg border border-amber-500/35 bg-amber-500/10 px-4 py-3 text-xs text-amber-500">
+          <div>
+            <p className="font-medium">Model created, but the upstream disagrees:</p>
+            <ul className="mt-1 list-disc pl-4">
+              {createWarnings?.map((warning) => <li key={warning}>{warning}</li>)}
+            </ul>
+          </div>
+          <button
+            type="button"
+            onClick={() => setCreateWarnings(null)}
+            className="shrink-0 text-amber-500/70 transition-colors hover:text-amber-500"
+            aria-label="Dismiss warnings"
+          >
+            <XCircle className="h-4 w-4" />
+          </button>
+        </div>
       )}
 
       <Card>
@@ -1289,7 +1309,7 @@ function ModelDetailPanel({
             </div>
             <aside className="min-w-0 space-y-3 lg:self-start">
               <ProvisionErrorBanner modelId={model.id} />
-              <ReplicaPanel modelId={model.id} />
+              <ReplicaPanel modelId={model.id} healthStatus={summary.status} />
             </aside>
           </div>
         </TabsContent>
@@ -1372,6 +1392,14 @@ function ConnectionTab({
           </div>
           {state?.ok === false && (
             <p className="border-t border-border/60 bg-destructive/10 px-4 py-2 text-xs text-destructive">{state.error}</p>
+          )}
+          {state?.ok === true && (state.warnings?.length ?? 0) > 0 && (
+            <div className="border-t border-border/60 bg-amber-500/10 px-4 py-2 text-xs text-amber-500">
+              <p className="font-medium">Saved, but the upstream disagrees:</p>
+              <ul className="mt-1 list-disc pl-4">
+                {state.warnings?.map((warning) => <li key={warning}>{warning}</li>)}
+              </ul>
+            </div>
           )}
         </PanelCard>
       </form>

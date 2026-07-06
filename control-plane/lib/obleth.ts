@@ -64,6 +64,7 @@ export interface Tenant {
   guardrails_policy: GuardrailsPolicy | null;
   compression_policy: CompressionPolicy | null;
   tracing_enabled: boolean;
+  synthetic: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -308,6 +309,20 @@ export interface ModelHealthDetail {
 export interface BulkModelHealthResult {
   checked: ModelHealthDetail[];
   skipped: number;
+}
+
+export interface ValidateModelBody {
+  api_base: string;
+  api_key?: string | null;
+  upstream_model: string;
+  model_type?: string | null;
+}
+
+export interface ValidateModelResult {
+  reachable: boolean;
+  wildcard: boolean;
+  listed: boolean | null;
+  warnings: string[];
 }
 
 export interface ModelHealthConfigBody {
@@ -660,6 +675,17 @@ export interface SlurmSettingsView {
   provisioner_version: string | null;
   provisioner_git_sha: string | null;
   provisioner_built_at: string | null;
+  // Outcome of the provisioner's last reconcile tick ("ok" | "idle" | "error").
+  // provisioner_running only proves the process is alive; a provisioner can
+  // poll green while every tick fails and replica state sits frozen. Null until
+  // reported (or for an older provisioner that doesn't send it).
+  provisioner_tick_status: string | null;
+  provisioner_tick_detail: string | null;
+  // Seconds since the last successful reconcile / length of the current non-ok
+  // streak. These — not replica updated_at — are what "states may be stale"
+  // keys off.
+  provisioner_last_ok_secs: number | null;
+  provisioner_held_secs: number | null;
 }
 
 export interface UpdateSlurmSettings {
@@ -769,6 +795,11 @@ export interface CompressorStatusView {
 
 export interface CharoSettingsView {
   enabled: boolean;
+  brain_model: string | null;
+  tools_enabled: Record<string, boolean>;
+  bench_max_concurrency: number;
+  bench_max_duration_s: number;
+  bench_max_requests: number;
 }
 
 export interface EnergySettingsView {
@@ -965,6 +996,7 @@ export const obleth = {
       tokens_per_minute?: number;
       max_in_flight?: number | null;
       fairshare_group?: string;
+      synthetic?: boolean;
     },
     options?: AuditOptions,
   ) =>
@@ -1136,6 +1168,16 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify({ tracing_enabled }),
     }),
+  setTenantSynthetic: (
+    id: string,
+    synthetic: boolean,
+    options?: AuditOptions,
+  ) =>
+    api<void>(`/tenants/${id}/synthetic`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ synthetic }),
+    }),
   deleteKey: (id: string, options?: AuditOptions) =>
     api<void>(`/keys/${id}`, {
       method: "DELETE",
@@ -1172,6 +1214,11 @@ export const obleth = {
     api<void>(`/models/${id}`, {
       method: "DELETE",
       headers: auditActorHeaders(options),
+    }),
+  validateModel: (body: ValidateModelBody) =>
+    api<ValidateModelResult>("/models/validate", {
+      method: "POST",
+      body: JSON.stringify(body),
     }),
   modelHealth: () => api<ModelHealthSummary[]>("/models/health"),
   modelHealthDetail: (id: string) =>

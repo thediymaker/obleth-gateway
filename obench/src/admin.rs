@@ -189,6 +189,7 @@ impl AdminClient {
         weight: u32,
         tokens_per_minute: u64,
         group: &str,
+        synthetic: bool,
     ) -> Result<(String, bool)> {
         let tenants = self.req(reqwest::Method::GET, "/tenants", None).await?;
         let existing = tenants
@@ -217,10 +218,21 @@ impl AdminClient {
                 Some(json!({ "fairshare_group": group })),
             )
             .await?;
+            if synthetic {
+                // Older gateways lack this route; tagging degrades gracefully.
+                let _ = self
+                    .req(
+                        reqwest::Method::PUT,
+                        &format!("/tenants/{id}/synthetic"),
+                        Some(json!({ "synthetic": true })),
+                    )
+                    .await;
+            }
             Ok((id, false))
         } else {
             let created = self.req(reqwest::Method::POST, "/tenants", Some(json!({
                 "name": name, "weight": weight, "tokens_per_minute": tokens_per_minute, "fairshare_group": group,
+                "synthetic": synthetic,
             }))).await?;
             Ok((
                 created["id"].as_str().context("new tenant id")?.to_string(),
@@ -363,6 +375,48 @@ impl AdminClient {
         self.req(reqwest::Method::PUT, "/settings/boons", Some(patch))
             .await?;
         Ok(())
+    }
+
+    pub async fn find_model_id(&self, model_name: &str) -> Result<Option<String>> {
+        let v = self.req(reqwest::Method::GET, "/models", None).await?;
+        Ok(v.as_array().and_then(|a| {
+            a.iter()
+                .find(|m| m["model_name"].as_str() == Some(model_name))
+                .and_then(|m| m["id"].as_str().map(String::from))
+        }))
+    }
+
+    pub async fn model_health(&self) -> Result<Value> {
+        self.req(reqwest::Method::GET, "/models/health", None).await
+    }
+
+    pub async fn set_model_health_config(
+        &self,
+        id: &str,
+        checks_enabled: bool,
+        alerts_enabled: bool,
+        interval_secs: i64,
+        failure_threshold: i64,
+    ) -> Result<()> {
+        self.req(
+            reqwest::Method::PUT,
+            &format!("/models/{id}/health/config"),
+            Some(json!({
+                "checks_enabled": checks_enabled,
+                "alerts_enabled": alerts_enabled,
+                "check_interval_secs": interval_secs,
+                "failure_threshold": failure_threshold,
+                "maintenance_until": Value::Null,
+                "maintenance_note": Value::Null,
+            })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn get_version(&self) -> Result<String> {
+        let v = self.req(reqwest::Method::GET, "/version", None).await?;
+        Ok(v["version"].as_str().unwrap_or("unknown").to_string())
     }
 }
 

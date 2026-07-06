@@ -6,7 +6,9 @@
 use utoipa::OpenApi;
 
 use crate::autotune::{AutotuneReport, AutotuneRequest, AutotuneStep, KneeReason, WorkloadProfile};
-use crate::model_health::{BulkModelHealthResult, UpdateModelHealthConfig};
+use crate::model_health::{
+    BulkModelHealthResult, UpdateModelHealthConfig, ValidateModelRequest, ValidateModelResult,
+};
 use crate::usage::{
     CacheStats, CostAgg, KeyUsageSummary, KeyUsageSummaryQuery, ModelUsageTimePoint,
     TenantUsageTimePoint, UsageAgg, UsageBreakdownQuery, UsageDailyQuery, UsageDailyRow,
@@ -21,11 +23,11 @@ use crate::{
     FairshareLiveView, GroupFairshareView, ListKeysQuery, LiveStats, SetCapacity, SetDisabled,
     SetModelCache, SetModelCapacity, SetModelCapacityMode, SetModelReliability, SetModelWeight,
     SetTenantAllowlist, SetTenantBudget, SetTenantCompression, SetTenantGuardrails,
-    SetTenantSchedule, SetTenantStatus, TenantFairshareView, TestAlertResult, TestEnergyQuery,
-    UpdateAlertSettings, UpdateAutoRouterSettings, UpdateBoonSettings, UpdateEmailSettings,
-    UpdateEnergySettings, UpdateGroupWeight, UpdateKey, UpdateMcpServer, UpdateModel,
-    UpdateModelEndpoint, UpdateQuota, UpdateTenant, UpdateTenantGroup, UpdateUsageRetention,
-    UpdateWeight, UsageRetentionView,
+    SetTenantSchedule, SetTenantStatus, SetTenantSynthetic, TenantFairshareView, TestAlertResult,
+    TestEnergyQuery, UpdateAlertSettings, UpdateAutoRouterSettings, UpdateBoonSettings,
+    UpdateEmailSettings, UpdateEnergySettings, UpdateGroupWeight, UpdateKey, UpdateMcpServer,
+    UpdateModel, UpdateModelEndpoint, UpdateQuota, UpdateTenant, UpdateTenantGroup,
+    UpdateUsageRetention, UpdateWeight, UsageRetentionView,
 };
 use obleth_config::{
     ApiKey, ApiKeyBackup, AppSettingBackup, BackupData, BackupEncryption, CompressionPolicy,
@@ -56,6 +58,7 @@ use obleth_config::{
         crate::patch_tenant_allowlist,
         crate::patch_tenant_guardrails,
         crate::patch_tenant_compression,
+        crate::set_tenant_synthetic_handler,
         crate::patch_weight,
         crate::put_quota,
         crate::patch_tenant_group,
@@ -119,6 +122,7 @@ use obleth_config::{
         crate::model_health::check_one,
         crate::model_health::check_all,
         crate::model_health::update_config,
+        crate::model_health::validate_model,
         // mcp
         crate::create_mcp_server,
         crate::list_mcp_servers,
@@ -171,9 +175,12 @@ use obleth_config::{
         ModelHealthDetail,
         UpdateModelHealthConfig,
         BulkModelHealthResult,
+        ValidateModelRequest,
+        ValidateModelResult,
         CreateTenant,
         UpdateTenant,
         SetTenantStatus,
+        SetTenantSynthetic,
         SetTenantSchedule,
         SetTenantBudget,
         SetTenantAllowlist,

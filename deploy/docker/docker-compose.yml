@@ -209,6 +209,9 @@ services:
     environment:
       OBLETH_ADMIN_BASE_URL: http://obleth:9180
       OBLETH_ADMIN_TOKEN: ${OBLETH_ADMIN_TOKEN:?set OBLETH_ADMIN_TOKEN in deploy/docker/.env}
+      # Self-heal: restart a healthy replica after N consecutive failed health
+      # probes while its Slurm job still reports RUNNING (zombie job). 0 disables.
+      OBLETH_PROVISIONER_RESTART_AFTER_FAILURES: ${OBLETH_PROVISIONER_RESTART_AFTER_FAILURES:-3}
       RUST_LOG: info,obleth_provisioner=debug
     depends_on:
       obleth: { condition: service_started }
@@ -235,6 +238,10 @@ services:
       DATABASE_URL: postgres://${POSTGRES_USER:-obleth}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-obleth}
       BETTER_AUTH_SECRET: ${DASHBOARD_SESSION_SECRET:?set DASHBOARD_SESSION_SECRET (>=32 chars)}
       BETTER_AUTH_URL: ${BETTER_AUTH_URL:-http://localhost:3002}
+      # Extra origins better-auth trusts for login beyond BETTER_AUTH_URL, so the
+      # dashboard is reachable by LAN IP/hostname and not just localhost. See
+      # deploy/docker/.env.example ("Accessing the dashboard from another machine").
+      TRUSTED_ORIGINS: ${TRUSTED_ORIGINS:-}
       DASHBOARD_ADMIN_EMAIL: ${DASHBOARD_ADMIN_EMAIL:-admin@example.com}
       OIDC_PROVIDERS: ${OIDC_PROVIDERS:-}
     ports: ["3002:3000"]

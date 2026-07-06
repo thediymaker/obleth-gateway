@@ -2,8 +2,9 @@
 
 import dynamic from "next/dynamic";
 import { useState } from "react";
+import { useRouter } from "next/navigation";
 import { CharoLauncher } from "./launcher";
-import { useCharoStream } from "./use-charo-stream";
+import { useCharoContext } from "./charo-context";
 
 // Defer the panel out of the initial dashboard bundle; it hydrates on the
 // client only.
@@ -13,7 +14,8 @@ const CharoPanel = dynamic(() => import("./charo-panel").then((m) => m.CharoPane
 
 export function CharoRoot() {
   const [open, setOpen] = useState(false);
-  const stream = useCharoStream();
+  const router = useRouter();
+  const stream = useCharoContext();
 
   return (
     <>
@@ -26,6 +28,10 @@ export function CharoRoot() {
       <CharoPanel
         open={open}
         onClose={() => setOpen(false)}
+        onExpand={() => {
+          setOpen(false);
+          router.push("/charo");
+        }}
         stream={stream}
         mascotState={stream.state}
       />
