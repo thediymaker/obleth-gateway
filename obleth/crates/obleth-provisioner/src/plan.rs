@@ -326,7 +326,14 @@ mod tests {
 
     #[test]
     fn empty_state_submits_target() {
-        let actions = plan(&spec(2), &[], &HashMap::new(), &HashMap::new(), &HashSet::new(), 900);
+        let actions = plan(
+            &spec(2),
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            900,
+        );
         assert_eq!(actions.iter().filter(|a| **a == Action::Submit).count(), 2);
     }
 
@@ -338,7 +345,14 @@ mod tests {
             job("j1", JobState::Running, &["n1"]),
             job("j2", JobState::Running, &["n2"]),
         ]);
-        let actions = plan(&spec(2), &[r1, r2], &jobs, &HashMap::new(), &HashSet::new(), 900);
+        let actions = plan(
+            &spec(2),
+            &[r1, r2],
+            &jobs,
+            &HashMap::new(),
+            &HashSet::new(),
+            900,
+        );
         assert!(actions.is_empty(), "got {actions:?}");
     }
 
@@ -404,7 +418,14 @@ mod tests {
         let r = rv("healthy", "j1", Some(ep), 500);
         let id = r.id;
         // job gone from slurm entirely
-        let actions = plan(&spec(1), &[r], &HashMap::new(), &HashMap::new(), &HashSet::new(), 900);
+        let actions = plan(
+            &spec(1),
+            &[r],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            900,
+        );
         assert!(actions.contains(&Action::MarkLost {
             replica_id: id,
             endpoint_id: Some(ep)
@@ -421,7 +442,14 @@ mod tests {
             job("j1", JobState::Running, &["n1"]),
             job("j2", JobState::Pending, &[""]),
         ]);
-        let actions = plan(&spec(1), &[healthy, pending], &jobs, &HashMap::new(), &HashSet::new(), 900);
+        let actions = plan(
+            &spec(1),
+            &[healthy, pending],
+            &jobs,
+            &HashMap::new(),
+            &HashSet::new(),
+            900,
+        );
         assert_eq!(
             actions,
             vec![Action::Cancel {
@@ -462,7 +490,14 @@ mod tests {
             job("j1", JobState::Running, &["n1"]),
             job("j2", JobState::Running, &["n2"]),
         ]);
-        let actions = plan(&spec(1), &[h1, h2], &jobs, &HashMap::new(), &HashSet::new(), 900);
+        let actions = plan(
+            &spec(1),
+            &[h1, h2],
+            &jobs,
+            &HashMap::new(),
+            &HashSet::new(),
+            900,
+        );
         assert_eq!(
             actions,
             vec![Action::Cancel {
@@ -506,7 +541,14 @@ mod tests {
     fn old_lost_rows_are_gced() {
         let r = rv("lost", "j1", None, 5000);
         let id = r.id;
-        let actions = plan(&spec(0), &[r], &HashMap::new(), &HashMap::new(), &HashSet::new(), 900);
+        let actions = plan(
+            &spec(0),
+            &[r],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            900,
+        );
         assert!(actions.contains(&Action::Delete { replica_id: id }));
     }
 
@@ -553,7 +595,14 @@ mod tests {
         let lost: Vec<ReplicaView> = (0..100)
             .map(|i| rv("lost", &format!("j{i}"), None, 60))
             .collect();
-        let actions = plan(&spec(2), &lost, &HashMap::new(), &HashMap::new(), &HashSet::new(), 900);
+        let actions = plan(
+            &spec(2),
+            &lost,
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            900,
+        );
         assert!(actions.contains(&Action::Submit));
     }
 
@@ -575,7 +624,14 @@ mod tests {
         // Job purged from Slurm entirely (absent from the map) -> delete the row.
         let r = rv("draining", "j1", None, 120);
         let id = r.id;
-        let actions = plan(&spec(1), &[r], &HashMap::new(), &HashMap::new(), &HashSet::new(), 900);
+        let actions = plan(
+            &spec(1),
+            &[r],
+            &HashMap::new(),
+            &HashMap::new(),
+            &HashSet::new(),
+            900,
+        );
         assert!(
             actions.contains(&Action::Delete { replica_id: id }),
             "got {actions:?}"
@@ -636,8 +692,14 @@ mod tests {
             .filter(|a| matches!(a, Action::Cancel { .. }))
             .count();
         let submits = actions.iter().filter(|a| **a == Action::Submit).count();
-        assert_eq!(cancels, 1, "exactly one self-heal restart per tick: {actions:?}");
-        assert_eq!(submits, 1, "one replacement for the one cancel: {actions:?}");
+        assert_eq!(
+            cancels, 1,
+            "exactly one self-heal restart per tick: {actions:?}"
+        );
+        assert_eq!(
+            submits, 1,
+            "one replacement for the one cancel: {actions:?}"
+        );
     }
 
     #[test]
@@ -648,7 +710,14 @@ mod tests {
         let r = rv("healthy", "j1", Some(ep), 600);
         let id = r.id;
         let restart = HashSet::from([id]);
-        let actions = plan(&spec(1), &[r], &HashMap::new(), &HashMap::new(), &restart, 900);
+        let actions = plan(
+            &spec(1),
+            &[r],
+            &HashMap::new(),
+            &HashMap::new(),
+            &restart,
+            900,
+        );
         assert!(actions.contains(&Action::MarkLost {
             replica_id: id,
             endpoint_id: Some(ep)
@@ -695,7 +764,7 @@ mod tests {
     fn probe_failures_past_threshold_are_candidates() {
         let r = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
         let counts = HashMap::from([(r.id, 3i64)]);
-        let set = restart_candidates(&[r.clone()], &counts, 3, &[]);
+        let set = restart_candidates(std::slice::from_ref(&r), &counts, 3, &[]);
         assert!(set.contains(&r.id));
         // below threshold -> not a candidate
         let counts = HashMap::from([(r.id, 2i64)]);
@@ -710,7 +779,7 @@ mod tests {
         let ep_id = Uuid::new_v4();
         let r = rv("healthy", "j1", Some(ep_id), 600);
         let eps = [ep(ep_id, "unhealthy", 528, Some(60))];
-        let set = restart_candidates(&[r.clone()], &HashMap::new(), 3, &eps);
+        let set = restart_candidates(std::slice::from_ref(&r), &HashMap::new(), 3, &eps);
         assert!(set.contains(&r.id));
     }
 
@@ -720,14 +789,16 @@ mod tests {
         let r = rv("healthy", "j1", Some(ep_id), 600);
         // only one failed check -> not yet
         let eps = [ep(ep_id, "unhealthy", 1, Some(60))];
-        assert!(restart_candidates(&[r.clone()], &HashMap::new(), 3, &eps).is_empty());
+        assert!(restart_candidates(std::slice::from_ref(&r), &HashMap::new(), 3, &eps).is_empty());
         // stale verdict (checks disabled long ago) -> ignored
         let eps = [ep(ep_id, "unhealthy", 528, Some(90_000))];
-        assert!(restart_candidates(&[r.clone()], &HashMap::new(), 3, &eps).is_empty());
+        assert!(restart_candidates(std::slice::from_ref(&r), &HashMap::new(), 3, &eps).is_empty());
         // never checked -> ignored
         let mut never = ep(ep_id, "unhealthy", 528, None);
         never.checked_secs_ago = None;
-        assert!(restart_candidates(&[r.clone()], &HashMap::new(), 3, &[never]).is_empty());
+        assert!(
+            restart_candidates(std::slice::from_ref(&r), &HashMap::new(), 3, &[never]).is_empty()
+        );
         // healthy endpoint -> ignored
         let eps = [ep(ep_id, "healthy", 0, Some(60))];
         assert!(restart_candidates(&[r], &HashMap::new(), 3, &eps).is_empty());
@@ -764,8 +835,18 @@ mod tests {
         let mut counts = HashMap::new();
 
         // probed, not in health map -> failed -> increments
-        update_probe_failures(&[r.clone()], &jobs, &HashMap::new(), &mut counts);
-        update_probe_failures(&[r.clone()], &jobs, &HashMap::new(), &mut counts);
+        update_probe_failures(
+            std::slice::from_ref(&r),
+            &jobs,
+            &HashMap::new(),
+            &mut counts,
+        );
+        update_probe_failures(
+            std::slice::from_ref(&r),
+            &jobs,
+            &HashMap::new(),
+            &mut counts,
+        );
         assert_eq!(counts.get(&id), Some(&2));
 
         // passing probe clears the streak entirely

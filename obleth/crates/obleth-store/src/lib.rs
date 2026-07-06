@@ -2633,7 +2633,10 @@ impl Store {
         }
         // Legacy fallback: synthesize from the old boolean key.
         let enabled = self.get_charo_enabled().await?.unwrap_or(true);
-        Ok(obleth_config::CharoSettings { enabled, ..Default::default() })
+        Ok(obleth_config::CharoSettings {
+            enabled,
+            ..Default::default()
+        })
     }
 
     /// Persist the full Charo settings blob (upsert on `charo_settings`). Also keeps

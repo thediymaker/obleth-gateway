@@ -39,7 +39,10 @@ pub trait OblethClient: Send + Sync {
     ) -> anyhow::Result<Uuid>;
     /// List this model's endpoints, including the gateway's health verdict for
     /// each (see `EndpointView` — the real-inference signal self-heal folds in).
-    async fn list_endpoints(&self, model_id: Uuid) -> anyhow::Result<Vec<crate::domain::EndpointView>>;
+    async fn list_endpoints(
+        &self,
+        model_id: Uuid,
+    ) -> anyhow::Result<Vec<crate::domain::EndpointView>>;
     async fn delete_endpoint(&self, model_id: Uuid, endpoint_id: Uuid) -> anyhow::Result<()>;
     /// Record (or clear with `None`) the provisioner's last submit error for a
     /// model, so the dashboard can show it.
