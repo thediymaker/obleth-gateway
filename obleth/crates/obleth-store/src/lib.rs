@@ -2481,6 +2481,32 @@ impl Store {
         Ok(row.try_get("name")?)
     }
 
+    /// Remove an MCP server's name from every model's `tool_servers` grant,
+    /// returning the updated models so the caller can re-sync their resolved
+    /// views. Used when a server is deleted: a grant naming an unregistered
+    /// server fails tool discovery on every request, and the dashboard can no
+    /// longer show (or clear) it once the server's checkbox is gone.
+    pub async fn strip_tool_server_grants(&self, server_name: &str) -> Result<Vec<ModelRoute>> {
+        let rows = sqlx::query(
+            "update models
+                set tool_servers = tool_servers - $1, updated_at = now()
+              where tool_servers ? $1
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+                       input_cost_per_token, output_cost_per_token,
+                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
+                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
+                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
+                       capacity_mode, capacity_tuned_at,
+                       debug_diagnostics, energy_slots_per_node,
+                       created_at, updated_at",
+        )
+        .bind(server_name)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(model_from_row).collect()
+    }
+
     /// All enabled MCP servers as (name, resolved), for warming the cache.
     pub async fn all_resolved_mcp_servers(&self) -> Result<Vec<(String, ResolvedMcpServer)>> {
         let rows = sqlx::query(
@@ -3222,6 +3248,7 @@ pub(crate) mod test_support {
         models: Vec<Uuid>,
         tenants: Vec<Uuid>,
         replicas: Vec<Uuid>,
+        mcp_servers: Vec<Uuid>,
     }
 
     impl FixtureGuard {
@@ -3231,6 +3258,7 @@ pub(crate) mod test_support {
                 models: Vec::new(),
                 tenants: Vec::new(),
                 replicas: Vec::new(),
+                mcp_servers: Vec::new(),
             }
         }
         pub(crate) fn track_model(&mut self, id: Uuid) {
@@ -3242,6 +3270,9 @@ pub(crate) mod test_support {
         pub(crate) fn track_replica(&mut self, id: Uuid) {
             self.replicas.push(id);
         }
+        pub(crate) fn track_mcp_server(&mut self, id: Uuid) {
+            self.mcp_servers.push(id);
+        }
     }
 
     impl Drop for FixtureGuard {
@@ -3250,7 +3281,12 @@ pub(crate) mod test_support {
             let models = std::mem::take(&mut self.models);
             let tenants = std::mem::take(&mut self.tenants);
             let replicas = std::mem::take(&mut self.replicas);
-            if models.is_empty() && tenants.is_empty() && replicas.is_empty() {
+            let mcp_servers = std::mem::take(&mut self.mcp_servers);
+            if models.is_empty()
+                && tenants.is_empty()
+                && replicas.is_empty()
+                && mcp_servers.is_empty()
+            {
                 return;
             }
             // Deletes are best-effort: a row a test already removed returns
@@ -3267,6 +3303,9 @@ pub(crate) mod test_support {
                     }
                     for id in replicas {
                         let _ = store.delete_replica(id).await;
+                    }
+                    for id in mcp_servers {
+                        let _ = store.delete_mcp_server(id).await;
                     }
                 });
             });
@@ -4378,6 +4417,121 @@ mod tests {
 
         // Clean up.
         store.delete_replica(r2.id).await.expect("delete r2");
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Deleting an MCP server must strip its grant from every model without
+    /// touching grants for other servers (the stale-grant bug: a deleted
+    /// server's name lingered in `tool_servers` forever, failing tool
+    /// discovery on every request with no way to clear it from the UI).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn strip_tool_server_grants_removes_only_the_deleted_server() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let doomed = format!("mcp-{}", Uuid::new_v4());
+        let kept = format!("mcp-{}", Uuid::new_v4());
+        let server = store
+            .create_mcp_server(&doomed, "http://127.0.0.1:1/mcp", None)
+            .await
+            .expect("create mcp server");
+        fixtures.track_mcp_server(server.id);
+
+        // One model granted both servers, one granted only the surviving one.
+        let both_name = format!("m-{}", Uuid::new_v4());
+        let args = default_test_model(&both_name);
+        let both = store
+            .create_model(
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &[doomed.clone(), kept.clone()],
+                args.22,
+            )
+            .await
+            .expect("create model with both grants");
+        fixtures.track_model(both.id);
+
+        let kept_only_name = format!("m-{}", Uuid::new_v4());
+        let args = default_test_model(&kept_only_name);
+        let kept_only = store
+            .create_model(
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                std::slice::from_ref(&kept),
+                args.22,
+            )
+            .await
+            .expect("create model with kept grant");
+        fixtures.track_model(kept_only.id);
+
+        store
+            .delete_mcp_server(server.id)
+            .await
+            .expect("delete mcp server");
+        let stripped = store
+            .strip_tool_server_grants(&doomed)
+            .await
+            .expect("strip grants");
+
+        // Only the model that held the doomed grant is touched, and it keeps
+        // its other grant.
+        assert_eq!(stripped.len(), 1, "exactly one model updated");
+        assert_eq!(stripped[0].id, both.id);
+        assert_eq!(stripped[0].tool_servers, vec![kept.clone()]);
+
+        let untouched = store.get_model(kept_only.id).await.expect("get model");
+        assert_eq!(untouched.tool_servers, vec![kept.clone()]);
+
+        // Idempotent: a second strip finds nothing to update.
+        let again = store
+            .strip_tool_server_grants(&doomed)
+            .await
+            .expect("strip again");
+        assert!(again.is_empty(), "second strip is a no-op");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]

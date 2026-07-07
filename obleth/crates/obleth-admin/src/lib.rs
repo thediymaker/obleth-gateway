@@ -4172,6 +4172,13 @@ async fn delete_mcp_server(
         .redis
         .publish_invalidation(&format!("mcp:{}", server.name))
         .await;
+    // Cascade: drop the deleted server from every model's tool grants. A stale
+    // grant fails tool discovery on every request, and the dashboard can no
+    // longer display or clear it once the server's checkbox is gone.
+    let stripped = state.store.strip_tool_server_grants(&server.name).await?;
+    for model in &stripped {
+        sync_model(&state, model).await?;
+    }
     state
         .store
         .record_audit(
@@ -4179,7 +4186,13 @@ async fn delete_mcp_server(
             "delete_mcp_server",
             "mcp_server",
             &id.to_string(),
-            serde_json::json!({ "name": server.name }),
+            serde_json::json!({
+                "name": server.name,
+                "models_ungranted": stripped
+                    .iter()
+                    .map(|m| m.model_name.as_str())
+                    .collect::<Vec<_>>(),
+            }),
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
