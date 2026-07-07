@@ -2,6 +2,7 @@ import type { ComponentType } from "react";
 import { BenchResultCard } from "./bench-result-card";
 import { CapabilityResultCard } from "./capability-result-card";
 import { McpTestCard } from "./mcp-test-card";
+import { DocsResultCard } from "./docs-result-card";
 
 function JsonFallback({ data }: { data: unknown }) {
   return (
@@ -15,6 +16,7 @@ const REGISTRY: Record<string, ComponentType<{ data: unknown }>> = {
   bench_result: BenchResultCard as ComponentType<{ data: unknown }>,
   capability_result: CapabilityResultCard as ComponentType<{ data: unknown }>,
   mcp_test_result: McpTestCard as ComponentType<{ data: unknown }>,
+  docs_result: DocsResultCard as ComponentType<{ data: unknown }>,
   tool_error: ({ data }) => (
     <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
       {String((data as { message?: string })?.message ?? "tool error")}
