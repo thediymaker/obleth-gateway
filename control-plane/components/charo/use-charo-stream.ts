@@ -27,6 +27,8 @@ export interface ChatTurn {
   pendingConfirm?: { name: string; args: unknown };
   /** Set when this assistant turn is an in-progress activity workflow (renders a WorkflowCard). */
   workflowActivityId?: string;
+  /** Set on an assistant turn that should render the activity launcher cards inline. */
+  showLauncher?: boolean;
 }
 
 type WireContent =
@@ -135,6 +137,10 @@ export function useCharoStream() {
   // Background trace polls outlive the stream they belong to; track them so a
   // reset can cancel any still in flight.
   const pollsRef = useRef<Set<AbortController>>(new Set());
+  // The id of the notice turn that opened the current target session, so
+  // `send` can relay only the turns authored after it (the genuine
+  // user<->model exchange), not the notice or any prior brain conversation.
+  const targetStartRef = useRef<string | null>(null);
 
   const patchTurn = useCallback(
     (id: string, fn: (t: ChatTurn) => ChatTurn) =>
@@ -148,6 +154,7 @@ export function useCharoStream() {
     activeTurnRef.current = null;
     pollsRef.current.forEach((c) => c.abort());
     pollsRef.current.clear();
+    targetStartRef.current = null;
     setMessages([]);
     setState("idle");
     setBusy(false);
@@ -261,7 +268,7 @@ export function useCharoStream() {
       event: string,
       parsed: Record<string, unknown>,
       onNoBrain: () => void,
-      flags: { sawError: boolean; noBrain: boolean },
+      flags: { sawError: boolean; noBrain: boolean; openActivity?: string | null },
     ) => {
       if (event === "token") {
         const t = String(parsed.text ?? "");
@@ -294,6 +301,10 @@ export function useCharoStream() {
         if (trace === null && typeof parsed.requestId === "string") {
           void pollTrace(assistantId, parsed.requestId);
         }
+      } else if (event === "activity") {
+        // The brain asked to surface an activity; the caller acts after the
+        // stream ends (startActivity is busy-guarded). "" means "show the menu".
+        flags.openActivity = typeof parsed.id === "string" ? parsed.id : "";
       } else if (event === "error") {
         // The gateway degrades to legacy mode when no brain is configured; the
         // caller retries via runLegacyChat rather than showing an error.
@@ -338,7 +349,14 @@ export function useCharoStream() {
       try {
         if (activeTarget) {
           // Target mode: talk to the chosen model directly, raw (no persona).
-          const sawError = await runLegacyChat(activeTarget, wire, assistantId, ac.signal, { bare: true });
+          // Relay only the turns authored after the target was set — the
+          // client-authored notice turn and any prior brain conversation must
+          // never reach the raw model, or it defeats the bare evaluation.
+          const startIdx = history.findIndex((m) => m.id === targetStartRef.current);
+          const convo = (startIdx >= 0 ? history.slice(startIdx + 1) : history)
+            .filter((m) => !m.showLauncher && !m.workflowActivityId && !m.pendingConfirm);
+          const targetWire = toWire(convo);
+          const sawError = await runLegacyChat(activeTarget, targetWire, assistantId, ac.signal, { bare: true });
           patchTurn(assistantId, (m) => (m.pendingConfirm ? m : { ...m, streaming: false }));
           setState(sawError ? "error" : "result");
         } else {
@@ -349,7 +367,7 @@ export function useCharoStream() {
             signal: ac.signal,
           });
           if (!res.ok || !res.body) throw new Error(`request failed (${res.status})`);
-          const flags = { sawError: false, noBrain: false };
+          const flags = { sawError: false, noBrain: false, openActivity: null as string | null };
           await readSSE(res, ac.signal, (event, parsed) =>
             applyAgentEvent(assistantId, event, parsed, () => {}, flags),
           );
@@ -369,6 +387,21 @@ export function useCharoStream() {
               m.pendingConfirm ? m : { ...m, streaming: false },
             );
             setState(flags.sawError ? "error" : "result");
+
+            if (flags.openActivity != null) {
+              ensureActivitiesRegistered();
+              const openId = flags.openActivity;
+              const cardTurn =
+                openId && getActivity(openId)
+                  ? { id: uid(), role: "assistant" as const, content: "", workflowActivityId: openId }
+                  : { id: uid(), role: "assistant" as const, content: "", showLauncher: true };
+              setMessages((prev) => {
+                const kept = prev
+                  .map((m) => (m.id === assistantId ? { ...m, streaming: false } : m))
+                  .filter((m) => !(m.id === assistantId && !m.content && !m.error));
+                return [...kept, cardTurn];
+              });
+            }
           }
         }
       } catch (e) {
@@ -424,7 +457,7 @@ export function useCharoStream() {
           signal: ac.signal,
         });
         if (!res.ok || !res.body) throw new Error(`tool run failed (${res.status})`);
-        const flags = { sawError: false, noBrain: false };
+        const flags = { sawError: false, noBrain: false, openActivity: null as string | null };
         await readSSE(res, ac.signal, (event, parsed) =>
           applyAgentEvent(assistantId, event, parsed, () => {}, flags),
         );
@@ -614,10 +647,12 @@ export function useCharoStream() {
       if (activity?.kind === "target") {
         const model = typeof args.model === "string" ? args.model : "";
         if (model) {
+          const noticeId = uid();
           setActiveTarget(model);
+          targetStartRef.current = noticeId;
           setMessages((prev) => [
             ...prev,
-            { id: uid(), role: "assistant", content: `Now talking to ${model}. Send a message, or exit to come back to me.` },
+            { id: noticeId, role: "assistant", content: `Now talking to ${model}. Send a message, or exit to come back to me.` },
           ]);
         }
         return;
@@ -642,6 +677,7 @@ export function useCharoStream() {
       }
       return null;
     });
+    targetStartRef.current = null;
   }, []);
 
   const cancelActivity = useCallback((turnId: string) => {

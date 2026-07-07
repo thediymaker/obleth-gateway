@@ -61,10 +61,11 @@ export const CHARO_PERSONA = [IDENTITY, HIDDEN_ENGINE, VOICE, SCOPE, EXAMPLES].j
 // Appended when the brain has tools available, so the base voice stays identical
 // across both paths and only the tool guidance differs.
 const TOOL_ADDENDUM =
-  "You can run tools when they'd help — right now that's run_benchmark, a concurrency ramp " +
-  "that measures a model's capacity. When someone asks to test or benchmark a model, call " +
-  "it with the model's name. When a tool comes back, give a plain-spoken verdict on what " +
-  "the numbers mean — solid, rough, or worth a second look — not just a readout.";
+  "You can open guided activities for the operator with the open_activity tool — testing a model's " +
+  "capabilities, chatting with a specific model, or benchmarking one. When the operator wants to do any of " +
+  "those, or asks what you can do, call open_activity (pass the activity id, or omit it to show the menu) " +
+  "instead of just describing it; they'll pick the model and options in the UI. Keep your own reply to a " +
+  "short line — the workflow does the rest.";
 
 /** Persona for the agent/brain loop: base voice plus tool-use guidance. */
 export const AGENT_PERSONA = [CHARO_PERSONA, TOOL_ADDENDUM].join("\n\n");

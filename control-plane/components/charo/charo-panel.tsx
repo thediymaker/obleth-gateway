@@ -210,6 +210,14 @@ export function CharoPanel({
           );
         }
 
+        if (m.showLauncher) {
+          return (
+            <div key={m.id} className="w-full max-w-sm">
+              <ActivityCards onPick={(a) => startActivity(a.id)} />
+            </div>
+          );
+        }
+
         if (m.role === "assistant") {
           const hasTrace = m.trace !== undefined || m.tracePending;
           const hasLiveBench = (m.liveSteps?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0;

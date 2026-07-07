@@ -17,6 +17,24 @@ export const dynamic = "force-dynamic";
 
 const MAX_ITERS = 4;
 
+// A schema-only capability (NOT a CharoTool): calling it surfaces an activity's
+// guided workflow in the UI. Intercepted below — never executed server-side.
+const OPEN_ACTIVITY_SCHEMA = {
+  type: "function" as const,
+  function: {
+    name: "open_activity",
+    description:
+      "Open a guided activity workflow for the operator, where they pick the model and options in the UI. " +
+      "Call this when the operator wants to test a model's capabilities, chat with a specific model, or benchmark one — " +
+      "or asks what you can do. Pass the activity id, or omit id to show them the activity menu.",
+    parameters: {
+      type: "object",
+      properties: { id: { type: "string", enum: ["test_capabilities", "chat_with_model", "benchmark"] } },
+      additionalProperties: false,
+    },
+  },
+};
+
 interface AgentBody {
   messages?: ChatMessage[];
   subjectModel?: string;
@@ -59,6 +77,7 @@ export async function POST(req: NextRequest) {
         }
 
         let schemas = isAdmin && settings ? toolSchemas(settings) : [];
+        schemas = [...schemas, OPEN_ACTIVITY_SCHEMA];
         const transcript: ChatMessage[] = [{ role: "system", content: AGENT_PERSONA }, ...history];
         const ctx: ToolCtx = { settings: settings!, gatewayChat, signal: req.signal };
 
@@ -133,10 +152,17 @@ export async function POST(req: NextRequest) {
           // (one tool per turn — spec non-goal: no intra-turn parallelism).
           transcript.push({ role: "assistant", content: assistantText });
           const call = calls[0];
-          const tool = getTool(call.name);
           let args: unknown = {};
           try { args = JSON.parse(call.arguments || "{}"); } catch { /* leave {} */ }
 
+          if (call.name === "open_activity") {
+            const rawId = (args as { id?: unknown }).id;
+            const id = typeof rawId === "string" ? rawId : null;
+            send("activity", { id });
+            break;
+          }
+
+          const tool = getTool(call.name);
           if (!tool || !isAdmin) {
             send("tool_result", { type: "tool_error", data: { message: `tool unavailable: ${call.name}` } });
             transcript.push({ role: "tool", content: `tool ${call.name} unavailable` });
