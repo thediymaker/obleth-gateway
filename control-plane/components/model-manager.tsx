@@ -92,6 +92,7 @@ import {
 import type { AutotuneReport, AutotuneWorkload, CacheStats, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelReplica, ModelRoute } from "@/lib/obleth";
 import { providerForModel } from "@/lib/model-providers";
 import { normalizeModelApiNameDraft, normalizeModelApiNameFinal } from "@/lib/model-name";
+import { EditForm } from "@/components/edit-form";
 import { ProviderImportWizard } from "@/components/provider-import-wizard";
 import { RecipeList } from "@/components/recipes/recipe-list";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
@@ -1238,7 +1239,7 @@ function ModelDetailPanel({
 
       <TabsContent value="health">
         <div className="grid gap-4 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)]">
-          <form action={healthAction}>
+          <EditForm action={healthAction}>
             <input type="hidden" name="id" value={model.id} />
             <PanelCard
               className="h-full"
@@ -1259,7 +1260,7 @@ function ModelDetailPanel({
                 </div>
               </div>
             </PanelCard>
-          </form>
+          </EditForm>
 
           <PanelCard
             className="flex h-full flex-col"
@@ -1339,7 +1340,7 @@ function ConnectionTab({
 
   return (
     <TooltipProvider delayDuration={150}>
-      <form action={formAction}>
+      <EditForm action={formAction}>
         <input type="hidden" name="id" value={model.id} />
         <PanelCard
           title="Connection"
@@ -1402,7 +1403,7 @@ function ConnectionTab({
             </div>
           )}
         </PanelCard>
-      </form>
+      </EditForm>
     </TooltipProvider>
   );
 }
@@ -1438,7 +1439,7 @@ function CapabilitiesTab({
 
   return (
     <TooltipProvider delayDuration={150}>
-      <form action={formAction}>
+      <EditForm action={formAction}>
         <input type="hidden" name="id" value={model.id} />
         <PanelCard
           title="Capabilities & routing"
@@ -1455,7 +1456,7 @@ function CapabilitiesTab({
             <p className="border-t border-border/60 bg-destructive/10 px-4 py-2 text-xs text-destructive">{state.error}</p>
           )}
         </PanelCard>
-      </form>
+      </EditForm>
     </TooltipProvider>
   );
 }
@@ -2016,18 +2017,15 @@ function ReliabilityPanel({
   const disabled = pending || busy;
   const addFormRef = useRef<HTMLFormElement>(null);
 
-  // React 19 auto-resets uncontrolled form fields once a `<form action>` action
-  // settles. An uncontrolled <select defaultValue> would snap back to the stale
-  // model prop on save and only show the saved value after a full reload, so we
-  // control it: the chosen value sticks through the reset and re-syncs whenever
-  // fresh model data lands.
+  // Controlled so the value re-syncs whenever fresh model data lands (the
+  // EditForm wrapper already keeps React 19's post-action form reset from
+  // snapping fields back to stale defaults).
   const [selectionMode, setSelectionMode] = useState(model.endpoint_selection_mode);
   useEffect(() => {
     setSelectionMode(model.endpoint_selection_mode);
   }, [model.endpoint_selection_mode]);
 
-  // Controlled for the same reason as the select above: an uncontrolled
-  // checkbox would snap back to the stale model prop on save.
+  // Controlled for the same reason as the select above.
   const [debugDiag, setDebugDiag] = useState(model.debug_diagnostics);
   useEffect(() => {
     setDebugDiag(model.debug_diagnostics);
@@ -2076,7 +2074,7 @@ function ReliabilityPanel({
 
   return (
     <div className="grid gap-4 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)]">
-      <form action={saveReliability}>
+      <EditForm action={saveReliability}>
         <PanelCard
           className="h-full"
           title="Delivery"
@@ -2117,7 +2115,7 @@ function ReliabilityPanel({
             />
           </div>
         </PanelCard>
-      </form>
+      </EditForm>
 
       <PanelCard
         className="flex h-full flex-col"
