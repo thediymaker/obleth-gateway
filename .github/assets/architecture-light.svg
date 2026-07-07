@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 648" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif">
+<defs>
+<marker id="arr-light" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+<path d="M 0 1 L 9 5 L 0 9 z" fill="#8c959f"/>
+</marker>
+</defs>
+<rect x="392" y="42" width="424" height="400" rx="12" fill="#eef1f4" stroke="#d0d7de" stroke-width="1"/>
+<text x="604" y="74" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="16" font-weight="600" fill="#1f2328" text-anchor="middle">obleth gateway</text>
+<text x="604" y="94" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#59636e" text-anchor="middle">single Rust binary · three listeners</text>
+<rect x="416" y="116" width="376" height="116" rx="8" fill="#f6f8fa" stroke="#8250df" stroke-width="1.2"/>
+<circle cx="434" cy="140" r="3" fill="#8250df"/>
+<text x="446" y="145" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Data plane</text>
+<text x="778" y="145" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace" font-size="12" font-weight="400" fill="#8250df" text-anchor="end">:8080</text>
+<text x="434" y="168" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">OpenAI-compatible proxy</text>
+<text x="434" y="188" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#818b98" text-anchor="start">fairshare · auto-router · boons · budgets</text>
+<text x="434" y="208" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#818b98" text-anchor="start">never reads Postgres, never blocks on telemetry</text>
+<rect x="416" y="254" width="376" height="74" rx="8" fill="#f6f8fa" stroke="#0d8a6f" stroke-width="1.2"/>
+<circle cx="434" cy="278" r="3" fill="#0d8a6f"/>
+<text x="446" y="283" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Management API</text>
+<text x="778" y="283" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace" font-size="12" font-weight="400" fill="#0d8a6f" text-anchor="end">:9180</text>
+<text x="434" y="308" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#818b98" text-anchor="start">every config write · audit log · token-gated</text>
+<rect x="416" y="350" width="376" height="66" rx="8" fill="#f6f8fa" stroke="#d8dee4" stroke-width="1"/>
+<circle cx="434" cy="374" r="3" fill="#9a6700"/>
+<text x="446" y="379" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Prometheus metrics</text>
+<text x="778" y="379" font-family="ui-monospace,SFMono-Regular,'SF Mono',Menlo,Consolas,monospace" font-size="12" font-weight="400" fill="#9a6700" text-anchor="end">:9091</text>
+<text x="434" y="402" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#818b98" text-anchor="start">low-cardinality gauges + counters</text>
+<rect x="56" y="116" width="264" height="96" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="76" y="146" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Clients</text>
+<text x="76" y="170" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">OpenAI SDKs · LangChain · curl</text>
+<text x="76" y="190" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#818b98" text-anchor="start">unchanged — point base_url at obleth</text>
+<path d="M 320 164 H 410" fill="none" stroke="#8c959f" stroke-width="1.4" marker-end="url(#arr-light)"/>
+<rect x="56" y="254" width="264" height="96" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="76" y="284" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Control plane</text>
+<text x="76" y="308" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">Next.js dashboard + tenant portal</text>
+<text x="76" y="328" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#818b98" text-anchor="start">browser never holds the admin token</text>
+<path d="M 320 300 H 410" fill="none" stroke="#8c959f" stroke-width="1.4" marker-end="url(#arr-light)"/>
+<rect x="888" y="96" width="264" height="108" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="908" y="126" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">Any OpenAI-compatible backend</text>
+<text x="908" y="150" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">vLLM · SGLang · llama.cpp</text>
+<text x="908" y="170" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">OpenAI · Together · internal endpoints</text>
+<path d="M 792 152 H 882" fill="none" stroke="#8c959f" stroke-width="1.4" marker-end="url(#arr-light)"/>
+<rect x="888" y="236" width="264" height="96" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="908" y="266" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">Slurm-managed replicas</text>
+<text x="908" y="290" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">inference jobs on the cluster,</text>
+<text x="908" y="310" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">promoted into routing when healthy</text>
+<path d="M 792 210 L 882 272" fill="none" stroke="#8c959f" stroke-width="1.4" marker-end="url(#arr-light)"/>
+<rect x="888" y="364" width="264" height="96" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1" stroke-dasharray="5 4"/>
+<text x="908" y="394" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13" font-weight="600" fill="#1f2328" text-anchor="start">Slurm provisioner</text>
+<text x="908" y="418" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">companion binary · slurmrestd</text>
+<text x="908" y="438" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#818b98" text-anchor="start">submits · probes · resubmits · self-heals</text>
+<path d="M 1020 364 V 338" fill="none" stroke="#8c959f" stroke-width="1.4" stroke-dasharray="4 4" marker-end="url(#arr-light)"/>
+<rect x="160" y="508" width="200" height="92" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="180" y="538" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Postgres</text>
+<text x="180" y="562" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">durable config</text>
+<text x="180" y="582" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#818b98" text-anchor="start">written only via the API</text>
+<rect x="420" y="508" width="220" height="92" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="440" y="538" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">Redis</text>
+<text x="440" y="562" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">hot cache + pub/sub</text>
+<text x="440" y="582" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#818b98" text-anchor="start">the only store on the hot path</text>
+<rect x="700" y="508" width="240" height="92" rx="8" fill="#f6f8fa" stroke="#d0d7de" stroke-width="1"/>
+<text x="720" y="538" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="13.5" font-weight="600" fill="#1f2328" text-anchor="start">ClickHouse</text>
+<text x="720" y="562" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="12" font-weight="400" fill="#59636e" text-anchor="start">usage rows · request spans</text>
+<text x="720" y="582" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="11.5" font-weight="400" fill="#818b98" text-anchor="start">append-only ledger, never config</text>
+<path d="M 452 442 V 470 H 260 V 502" fill="none" stroke="#8c959f" stroke-width="1.4" marker-end="url(#arr-light)"/>
+<text x="300" y="462" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="10.5" font-weight="400" fill="#818b98" text-anchor="start">config writes</text>
+<path d="M 360 554 H 414" fill="none" stroke="#8c959f" stroke-width="1.4" marker-end="url(#arr-light)"/>
+<text x="387" y="544" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="10.5" font-weight="400" fill="#818b98" text-anchor="middle">sync</text>
+<path d="M 530 506 V 448" fill="none" stroke="#8c959f" stroke-width="1.4" marker-end="url(#arr-light)"/>
+<text x="542" y="479" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="10.5" font-weight="400" fill="#818b98" text-anchor="start">hot-path reads</text>
+<path d="M 750 442 V 502" fill="none" stroke="#8c959f" stroke-width="1.4" stroke-dasharray="4 4" marker-end="url(#arr-light)"/>
+<text x="762" y="479" font-family="-apple-system,'Segoe UI',Helvetica,Arial,sans-serif" font-size="10.5" font-weight="400" fill="#818b98" text-anchor="start">async telemetry</text>
+</svg>
