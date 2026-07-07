@@ -1,75 +1,21 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
-import { Send, Square, X, ImagePlus, RotateCcw, Trash2, ChevronDown, Check, Maximize2, Minimize2 } from "lucide-react";
-import { Badge } from "@/components/ui/badge";
+import { Send, Square, X, RotateCcw, Maximize2, Minimize2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import {
-  DropdownMenu,
-  DropdownMenuTrigger,
-  DropdownMenuContent,
-  DropdownMenuItem,
-} from "@/components/ui/dropdown-menu";
 import { cn } from "@/lib/utils";
-import type { ModelRoute } from "@/lib/obleth";
 import { TraceCard } from "./trace-card";
 import { resultRenderer } from "./results/registry";
 import { BenchResultCard } from "./results/bench-result-card";
 import { ConfirmCard } from "./results/confirm-card";
+import { WorkflowCard } from "./workflow-card";
+import { ActivityCards, ActivityMenu } from "./activity-launcher";
+import { ensureActivitiesRegistered, getActivity } from "@/lib/charo/activities";
 import type { useCharoStream } from "./use-charo-stream";
 import type { CharoState } from "./sprite";
 
 type Stream = ReturnType<typeof useCharoStream>;
-
-interface Preset {
-  label: string;
-  prompt: string;
-}
-
-// A model can take image input either natively (`supports_vision`) or via the
-// gateway's vision boon, which relays images to a describer model. Either way
-// Charo should offer the image attachment.
-function hasVision(m: ModelRoute | undefined): boolean {
-  return !!m && (m.supports_vision || m.boons.includes("vision"));
-}
-
-function presetsFor(m: ModelRoute | undefined): Preset[] {
-  if (!m) return [];
-  const out: Preset[] = [
-    { label: "Quick ping", prompt: "Reply with a short sentence to confirm you're responding." },
-  ];
-  if (m.tool_servers.length > 0 || m.supports_function_calling) {
-    out.push({
-      label: "Trigger tools / search",
-      prompt:
-        "Search the web for a surprising fact about octopuses and summarise what you find, citing your source.",
-    });
-  }
-  if (m.supports_response_schema || m.boons.includes("structured_output")) {
-    out.push({
-      label: "Force JSON",
-      prompt:
-        'Reply with ONLY this JSON object and nothing else: {"status":"ok","gateway":"obleth"}',
-    });
-  }
-  if (hasVision(m)) {
-    out.push({
-      label: "Describe image",
-      prompt: "Describe the attached image in detail.",
-    });
-  }
-  return out;
-}
-
-function configuredBoons(m: ModelRoute | undefined): string[] {
-  if (!m) return [];
-  const b = new Set<string>(m.boons);
-  if (m.supports_vision) b.add("vision");
-  if (m.tool_servers.length > 0 || m.supports_function_calling) b.add("tool_loop");
-  if (m.supports_response_schema) b.add("structured_output");
-  return [...b];
-}
 
 const MASCOT: Record<CharoState, string> = {
   idle: "/charo/charo-dark-idle.png",
@@ -176,36 +122,10 @@ export function CharoPanel({
   stream: Stream;
   mascotState: CharoState;
 }) {
-  const { messages, busy, send, stop, reset, runToolDirect, confirmRun, confirmCancel } = stream;
-  const [models, setModels] = useState<ModelRoute[]>([]);
-  const [modelId, setModelId] = useState("");
+  const { messages, busy, send, stop, reset, confirmRun, confirmCancel,
+          startActivity, submitActivity, cancelActivity } = stream;
   const [text, setText] = useState("");
-  const [image, setImage] = useState<string | undefined>();
-  const fileRef = useRef<HTMLInputElement>(null);
   const threadRef = useRef<HTMLDivElement>(null);
-
-  const selected = useMemo(
-    () => models.find((m) => m.id === modelId),
-    [models, modelId],
-  );
-
-  // Load the enabled model list once the panel first opens.
-  useEffect(() => {
-    if (!open || models.length > 0) return;
-    let cancelled = false;
-    fetch("/api/live/models")
-      .then((r) => (r.ok ? r.json() : []))
-      .then((list: ModelRoute[]) => {
-        if (cancelled) return;
-        const enabled = list.filter((m) => m.enabled);
-        setModels(enabled);
-        if (enabled[0]) setModelId(enabled[0].id);
-      })
-      .catch(() => {});
-    return () => {
-      cancelled = true;
-    };
-  }, [open, models.length]);
 
   // Auto-scroll the thread on new content, and when toggling dock <-> expanded.
   useEffect(() => {
@@ -213,32 +133,13 @@ export function CharoPanel({
   }, [messages, expanded]);
 
   const onSend = () => {
-    if (!selected || busy) return;
-    send(selected.model_name, text, image);
+    if (!text.trim() || busy) return;
+    send(text);
     setText("");
-    setImage(undefined);
   };
 
-  const onPickImage = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    e.target.value = ""; // allow re-picking the same file after removing it
-    if (!file) return;
-    // Cap the attachment: it's base64-inlined into the JSON request body, so a
-    // large image balloons the payload (and may be rejected upstream).
-    const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
-    if (file.size > MAX_IMAGE_BYTES) {
-      window.alert("Image is too large (max 8 MB).");
-      return;
-    }
-    const r = new FileReader();
-    r.onload = () => setImage(String(r.result));
-    r.readAsDataURL(file);
-  };
-
-  const boons = configuredBoons(selected);
-  const presets = presetsFor(selected);
   const mascot = MASCOT[mascotState];
-  const canSend = !busy && !!selected && (!!text.trim() || !!image);
+  const canSend = !busy && !!text.trim();
 
   // Header: title + reset / expand-collapse / close.
   const header = (
@@ -264,53 +165,6 @@ export function CharoPanel({
     </div>
   );
 
-  const modelBoons = (
-    <div
-      className={cn(
-        "border-b border-border px-4 py-3",
-        expanded ? "flex flex-wrap items-center gap-2 px-5" : "space-y-2",
-      )}
-    >
-      <DropdownMenu>
-        <DropdownMenuTrigger asChild>
-          <button
-            type="button"
-            disabled={busy || models.length === 0}
-            className={cn(
-              "flex h-9 w-full items-center justify-between rounded-md border border-border bg-background px-3 text-sm shadow-sm transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
-              expanded ? "sm:w-[min(30rem,52vw)]" : "max-w-md",
-            )}
-          >
-            <span className="truncate">{selected ? selected.model_name : "No models available"}</span>
-            <ChevronDown className="ml-2 h-4 w-4 shrink-0 opacity-60" />
-          </button>
-        </DropdownMenuTrigger>
-        <DropdownMenuContent
-          align="start"
-          className="z-[70] max-h-72 w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto"
-        >
-          {models.map((m) => (
-            <DropdownMenuItem
-              key={m.id}
-              onSelect={() => setModelId(m.id)}
-              className="cursor-pointer justify-between gap-2"
-            >
-              <span className="truncate">{m.model_name}</span>
-              {m.id === modelId && <Check className="h-4 w-4 shrink-0 text-primary" />}
-            </DropdownMenuItem>
-          ))}
-        </DropdownMenuContent>
-      </DropdownMenu>
-      <div className={cn("flex flex-wrap gap-1.5", expanded && "min-w-0 flex-1")}>
-        {boons.length === 0 ? (
-          <span className="text-xs text-muted-foreground">No boons configured</span>
-        ) : (
-          boons.map((b) => <Badge key={b}>{b}</Badge>)
-        )}
-      </div>
-    </div>
-  );
-
   const thread = (
     <div
       ref={threadRef}
@@ -320,17 +174,31 @@ export function CharoPanel({
       )}
     >
       {messages.length === 0 && (
-        <div className="flex min-h-full items-center justify-center px-2 py-6">
-          <div className="flex max-w-xl flex-col items-center gap-3 text-center">
-            <p className="text-xs text-muted-foreground">
-              Pick a model and send a message to test it. Charo runs it through the
-              gateway so every boon fires for real — the trace shows what happened.
-            </p>
+        <div className="flex min-h-full flex-col items-center justify-center gap-4 px-2 py-6">
+          <p className="text-sm text-muted-foreground">Hey. What are we getting into?</p>
+          <div className="w-full max-w-sm">
+            <ActivityCards onPick={(a) => startActivity(a.id)} />
           </div>
+          <p className="text-xs text-muted-foreground/70">…or just start typing to chat with me.</p>
         </div>
       )}
       {messages.map((m) => {
         const content = m.role === "assistant" ? m.content.replace(/^\s+/, "") : m.content;
+
+        if (m.workflowActivityId) {
+          ensureActivitiesRegistered();
+          const activity = getActivity(m.workflowActivityId);
+          if (!activity) return null;
+          return (
+            <div key={m.id} className="w-full">
+              <WorkflowCard
+                activity={activity}
+                onRun={(args) => submitActivity(m.id, activity.id, args)}
+                onCancel={() => cancelActivity(m.id)}
+              />
+            </div>
+          );
+        }
 
         if (m.role === "assistant") {
           const hasTrace = m.trace !== undefined || m.tracePending;
@@ -363,12 +231,12 @@ export function CharoPanel({
               )}
               {hasTrace && (
                 <div className="w-full">
-                  <TraceCard trace={m.trace} pending={m.tracePending} configured={boons} />
+                  <TraceCard trace={m.trace} pending={m.tracePending} />
                 </div>
               )}
               {hasLiveBench && (
                 <div className="w-full">
-                  <BenchResultCard data={{ modelName: selected?.model_name, steps: m.liveSteps }} />
+                  <BenchResultCard data={{ steps: m.liveSteps }} />
                 </div>
               )}
               {m.toolResults?.map((tr, i) => {
@@ -428,48 +296,6 @@ export function CharoPanel({
         expanded ? "px-5 py-4" : "mx-auto max-w-3xl px-4 py-3",
       )}
     >
-      {presets.length > 0 && (
-        <div className="flex flex-wrap gap-1.5">
-          {presets.map((p) => (
-            <button
-              key={p.label}
-              type="button"
-              onClick={() => setText(p.prompt)}
-              disabled={busy}
-              className="rounded-full border border-border px-2.5 py-0.5 text-xs text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
-            >
-              {p.label}
-            </button>
-          ))}
-          {selected && (
-            <button
-              type="button"
-              onClick={() => selected && runToolDirect("run_benchmark", { model: selected.model_name, steps: [1, 5, 10], step_duration_s: 5 })}
-              disabled={busy || !selected}
-              className="rounded-full border border-violet-400/40 px-2.5 py-0.5 text-xs text-violet-600 transition-colors hover:bg-violet-500/10 disabled:opacity-50 dark:text-violet-300"
-            >
-              Benchmark this model
-            </button>
-          )}
-        </div>
-      )}
-
-      {image && (
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
-          {/* eslint-disable-next-line @next/next/no-img-element */}
-          <img src={image} alt="to send" className="h-10 w-10 rounded object-cover" />
-          <span>image attached</span>
-          <button
-            type="button"
-            title="Remove image"
-            onClick={() => setImage(undefined)}
-            className="text-destructive hover:underline"
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </button>
-        </div>
-      )}
-
       <div className="rounded-lg border border-border bg-background/90 p-2 shadow-[inset_0_1px_0_hsl(240_5%_100%/0.03)] focus-within:ring-1 focus-within:ring-ring">
         <div className="flex items-end gap-2">
           <textarea
@@ -482,29 +308,11 @@ export function CharoPanel({
               }
             }}
             rows={expanded ? 3 : 2}
-            placeholder={selected ? `Message ${selected.model_name}...` : "Select a model..."}
-            // Stay enabled while a response streams (only require a selected
-            // model) so the input keeps focus after Enter; Enter is ignored
-            // mid-stream via the guard above, and the Send button is disabled.
-            disabled={!selected}
+            placeholder="Message Charo…"
             className="min-h-11 flex-1 resize-none border-0 bg-transparent px-2 py-1.5 text-sm leading-5 placeholder:text-muted-foreground/80 focus-visible:outline-none disabled:opacity-50"
           />
           <div className="flex shrink-0 items-center gap-1">
-            {hasVision(selected) && (
-              <>
-                <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={onPickImage} />
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  className="h-9 w-9"
-                  title="Attach image (vision)"
-                  onClick={() => fileRef.current?.click()}
-                  disabled={busy}
-                >
-                  <ImagePlus className="h-4 w-4" />
-                </Button>
-              </>
-            )}
+            <ActivityMenu onPick={(a) => startActivity(a.id)} />
             {busy ? (
               <Button
                 size="icon"
@@ -560,7 +368,6 @@ export function CharoPanel({
               <style>{PANEL_CSS}</style>
               {header}
               <div className="flex min-h-0 flex-1 flex-col">
-                {modelBoons}
                 {thread}
                 {composer}
               </div>
@@ -589,7 +396,6 @@ export function CharoPanel({
         aria-label="Charo"
       >
         {header}
-        {modelBoons}
         {thread}
         {composer}
       </div>
