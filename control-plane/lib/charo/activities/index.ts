@@ -1,10 +1,12 @@
 import { registerActivity, __clearActivities } from "./registry";
+import { testCapabilitiesActivity } from "./test-capabilities";
 import { benchmarkActivity } from "./benchmark";
 
 let done = false;
 export function ensureActivitiesRegistered(): void {
   if (done) return;
   done = true;
+  registerActivity(testCapabilitiesActivity);
   registerActivity(benchmarkActivity);
 }
 

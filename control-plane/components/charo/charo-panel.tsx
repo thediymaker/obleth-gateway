@@ -8,6 +8,7 @@ import { cn } from "@/lib/utils";
 import { TraceCard } from "./trace-card";
 import { resultRenderer } from "./results/registry";
 import { BenchResultCard } from "./results/bench-result-card";
+import { CapabilityResultCard } from "./results/capability-result-card";
 import { ConfirmCard } from "./results/confirm-card";
 import { WorkflowCard } from "./workflow-card";
 import { ActivityCards, ActivityMenu } from "./activity-launcher";
@@ -203,9 +204,10 @@ export function CharoPanel({
         if (m.role === "assistant") {
           const hasTrace = m.trace !== undefined || m.tracePending;
           const hasLiveBench = (m.liveSteps?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0;
+          const hasLiveCaps = (m.liveCapabilities?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0;
           const hasToolResults = (m.toolResults?.length ?? 0) > 0;
           const showBubble = !!content || !!m.image || !!m.error || !m.streaming;
-          if (!showBubble && !hasTrace && !hasLiveBench && !hasToolResults && !m.pendingConfirm) {
+          if (!showBubble && !hasTrace && !hasLiveBench && !hasLiveCaps && !hasToolResults && !m.pendingConfirm) {
             // Streaming but nothing to show yet (waiting on the first token or a
             // tool's first progress event): show the typing indicator, not dead air.
             if (!m.streaming) return null;
@@ -237,6 +239,11 @@ export function CharoPanel({
               {hasLiveBench && (
                 <div className="w-full">
                   <BenchResultCard data={{ steps: m.liveSteps }} />
+                </div>
+              )}
+              {hasLiveCaps && (
+                <div className="w-full">
+                  <CapabilityResultCard data={{ modelName: undefined, tests: m.liveCapabilities }} />
                 </div>
               )}
               {m.toolResults?.map((tr, i) => {
