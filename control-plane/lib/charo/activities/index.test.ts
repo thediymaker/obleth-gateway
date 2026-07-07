@@ -31,4 +31,13 @@ describe("ensureActivitiesRegistered", () => {
     const args = collectArgs(a, { ...initialValues(a), model: "m1" }, model);
     expect(args).toMatchObject({ model: "llama3-70b", step_duration_s: 5 });
   });
+
+  it("registers test_capabilities as the first activity, backed by its tool", () => {
+    ensureActivitiesRegistered();
+    const a = getActivity("test_capabilities");
+    expect(a?.toolName).toBe("test_capabilities");
+    expect(a?.resultType).toBe("capability_result");
+    expect(a?.steps.map((s) => s.type)).toEqual(["model", "checklist"]);
+    expect(listActivities()[0]?.id).toBe("test_capabilities"); // leads the launcher
+  });
 });

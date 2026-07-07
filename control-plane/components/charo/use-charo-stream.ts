@@ -21,6 +21,8 @@ export interface ChatTurn {
   toolResults?: { type: string; data: unknown }[];
   /** Live per-step accumulation while a bench tool runs. */
   liveSteps?: StepOutcome[];
+  /** Live per-test accumulation while test_capabilities runs. */
+  liveCapabilities?: import("@/lib/charo/capabilities/types").TestOutcome[];
   /** Set when a confirmation-gated tool is awaiting the operator. */
   pendingConfirm?: { name: string; args: unknown };
   /** Set when this assistant turn is an in-progress activity workflow (renders a WorkflowCard). */
@@ -45,6 +47,16 @@ function uid(): string {
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// The brain only needs a compact summary to give its read; a full capability
+// result (per-test output + trace) blows past a sane prompt budget.
+function verdictSummary(result: { type: string; data: unknown }): unknown {
+  const d = result.data as { modelName?: string; tests?: Array<{ id: string; status: string; detail: string }> };
+  if (result.type === "capability_result" && Array.isArray(d?.tests)) {
+    return { modelName: d.modelName, tests: d.tests.map((t) => ({ id: t.id, status: t.status, detail: t.detail })) };
+  }
+  return result.data;
 }
 
 // Telemetry flushes to the ledger on a ~1s ticker, so the trace receipt isn't
@@ -261,6 +273,11 @@ export function useCharoStream() {
           ...m,
           liveSteps: [...(m.liveSteps ?? []), parsed.step as StepOutcome],
         }));
+      } else if (event === "tool_progress" && parsed.kind === "capability_test" && parsed.outcome) {
+        patchTurn(assistantId, (m) => ({
+          ...m,
+          liveCapabilities: [...(m.liveCapabilities ?? []), parsed.outcome as import("@/lib/charo/capabilities/types").TestOutcome],
+        }));
       } else if (event === "tool_result") {
         patchTurn(assistantId, (m) => ({
           ...m,
@@ -464,6 +481,11 @@ export function useCharoStream() {
               ...m,
               liveSteps: [...(m.liveSteps ?? []), parsed.step as StepOutcome],
             }));
+          } else if (event === "tool_progress" && parsed.kind === "capability_test" && parsed.outcome) {
+            patchTurn(assistantId, (m) => ({
+              ...m,
+              liveCapabilities: [...(m.liveCapabilities ?? []), parsed.outcome as import("@/lib/charo/capabilities/types").TestOutcome],
+            }));
           } else if (event === "tool_result") {
             lastResult = parsed as { type: string; data: unknown };
             patchTurn(assistantId, (m) => ({
@@ -539,7 +561,7 @@ export function useCharoStream() {
               {
                 role: "user",
                 content:
-                  `A ${result.type} just finished. Result JSON: ${JSON.stringify(result.data).slice(0, 2000)}. ` +
+                  `A ${result.type} just finished. Result JSON: ${JSON.stringify(verdictSummary(result)).slice(0, 2000)}. ` +
                   `Give me a brief plain-language read on it — good, rough, or worth a second look. Do not call any tool.`,
               },
             ],
