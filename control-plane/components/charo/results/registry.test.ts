@@ -8,4 +8,7 @@ describe("resultRenderer", () => {
   it("returns the fallback for an unknown type (never undefined)", () => {
     expect(typeof resultRenderer("nope")).toBe("function");
   });
+  it("returns a dedicated component for mcp_test_result (not the fallback)", () => {
+    expect(resultRenderer("mcp_test_result")).not.toBe(resultRenderer("definitely-unknown"));
+  });
 });

@@ -65,7 +65,9 @@ const TOOL_ADDENDUM =
   "capabilities, chatting with a specific model, or benchmarking one. When the operator wants to do any of " +
   "those, or asks what you can do, call open_activity (pass the activity id, or omit it to show the menu) " +
   "instead of just describing it; they'll pick the model and options in the UI. Keep your own reply to a " +
-  "short line — the workflow does the rest.";
+  "short line — the workflow does the rest. " +
+  "You can also check MCP servers yourself with the test_mcp tool — it runs the MCP handshake through " +
+  "the gateway and lists each server's tools; pass server names, or omit them to sweep all of them.";
 
 /** Persona for the agent/brain loop: base voice plus tool-use guidance. */
 export const AGENT_PERSONA = [CHARO_PERSONA, TOOL_ADDENDUM].join("\n\n");
