@@ -56,6 +56,8 @@ async function fetchTrace(requestId: string): Promise<TraceSummary | null> {
 interface ChatRequestBody {
   model?: string;
   messages?: ChatMessage[];
+  /** When true, relay the model raw — do not prepend Charo's persona. */
+  bare?: boolean;
 }
 
 export async function POST(req: NextRequest) {
@@ -76,11 +78,10 @@ export async function POST(req: NextRequest) {
     return new Response("model and messages are required", { status: 400 });
   }
 
-  // Prepend the persona unless the caller already supplied a system message.
+  // Prepend the persona unless the caller already supplied a system message or bare mode.
   const hasSystem = messages.some((m) => m.role === "system");
-  const outgoing: ChatMessage[] = hasSystem
-    ? messages
-    : [{ role: "system", content: CHARO_PERSONA }, ...messages];
+  const outgoing: ChatMessage[] =
+    body.bare || hasSystem ? messages : [{ role: "system", content: CHARO_PERSONA }, ...messages];
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {

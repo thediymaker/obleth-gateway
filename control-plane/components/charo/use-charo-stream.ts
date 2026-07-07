@@ -125,6 +125,9 @@ export function useCharoStream() {
   const [messages, setMessages] = useState<ChatTurn[]>([]);
   const [state, setState] = useState<CharoState>("idle");
   const [busy, setBusy] = useState(false);
+  // Set when the operator is chatting with a specific model directly (bypassing
+  // the brain/agent loop), e.g. via the chat_with_model activity.
+  const [activeTarget, setActiveTarget] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   // The assistant turn currently being streamed, so stop() can annotate the
   // right bubble without wiping the conversation.
@@ -148,6 +151,7 @@ export function useCharoStream() {
     setMessages([]);
     setState("idle");
     setBusy(false);
+    setActiveTarget(null);
   }, []);
 
   // Halt the in-flight turn (a long/hung benchmark, or a slow stream) without
@@ -215,11 +219,12 @@ export function useCharoStream() {
       wire: WireMessage[],
       assistantId: string,
       signal: AbortSignal,
+      opts?: { bare?: boolean },
     ): Promise<boolean> => {
       const res = await fetch("/api/charo/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages: wire }),
+        body: JSON.stringify({ model, messages: wire, ...(opts?.bare ? { bare: true } : {}) }),
         signal,
       });
       if (!res.ok || !res.body) throw new Error(`request failed (${res.status})`);
@@ -331,33 +336,40 @@ export function useCharoStream() {
       const wire = toWire(history);
 
       try {
-        const res = await fetch("/api/charo/agent", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ messages: wire }),
-          signal: ac.signal,
-        });
-        if (!res.ok || !res.body) throw new Error(`request failed (${res.status})`);
-        const flags = { sawError: false, noBrain: false };
-        await readSSE(res, ac.signal, (event, parsed) =>
-          applyAgentEvent(assistantId, event, parsed, () => {}, flags),
-        );
-
-        if (flags.noBrain) {
-          // Agent route degraded silently (no brain configured); show a hint
-          // instead of leaving the bubble empty.
-          patchTurn(assistantId, (m) => ({
-            ...m,
-            content:
-              "No brain model is configured yet, so I can't free-chat — set one in Settings, or pick an activity above and I'll run it.",
-            streaming: false,
-          }));
-          setState("result");
+        if (activeTarget) {
+          // Target mode: talk to the chosen model directly, raw (no persona).
+          const sawError = await runLegacyChat(activeTarget, wire, assistantId, ac.signal, { bare: true });
+          patchTurn(assistantId, (m) => (m.pendingConfirm ? m : { ...m, streaming: false }));
+          setState(sawError ? "error" : "result");
         } else {
-          patchTurn(assistantId, (m) =>
-            m.pendingConfirm ? m : { ...m, streaming: false },
+          const res = await fetch("/api/charo/agent", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ messages: wire }),
+            signal: ac.signal,
+          });
+          if (!res.ok || !res.body) throw new Error(`request failed (${res.status})`);
+          const flags = { sawError: false, noBrain: false };
+          await readSSE(res, ac.signal, (event, parsed) =>
+            applyAgentEvent(assistantId, event, parsed, () => {}, flags),
           );
-          setState(flags.sawError ? "error" : "result");
+
+          if (flags.noBrain) {
+            // Agent route degraded silently (no brain configured); show a hint
+            // instead of leaving the bubble empty.
+            patchTurn(assistantId, (m) => ({
+              ...m,
+              content:
+                "No brain model is configured yet, so I can't free-chat — set one in Settings, or pick an activity above and I'll run it.",
+              streaming: false,
+            }));
+            setState("result");
+          } else {
+            patchTurn(assistantId, (m) =>
+              m.pendingConfirm ? m : { ...m, streaming: false },
+            );
+            setState(flags.sawError ? "error" : "result");
+          }
         }
       } catch (e) {
         if (!ac.signal.aborted) {
@@ -375,7 +387,7 @@ export function useCharoStream() {
         if (activeTurnRef.current === assistantId) activeTurnRef.current = null;
       }
     },
-    [busy, messages, applyAgentEvent, patchTurn],
+    [busy, messages, applyAgentEvent, patchTurn, activeTarget, runLegacyChat],
   );
 
   // The operator approved a confirmation-gated tool. Resume the agent loop: the
@@ -599,6 +611,17 @@ export function useCharoStream() {
       const activity = getActivity(activityId);
       // Drop the workflow turn (its inputs are now captured in `args`).
       setMessages((prev) => prev.filter((m) => m.id !== turnId));
+      if (activity?.kind === "target") {
+        const model = typeof args.model === "string" ? args.model : "";
+        if (model) {
+          setActiveTarget(model);
+          setMessages((prev) => [
+            ...prev,
+            { id: uid(), role: "assistant", content: `Now talking to ${model}. Send a message, or exit to come back to me.` },
+          ]);
+        }
+        return;
+      }
       if (activity?.kind === "run" && activity.toolName) {
         void runToolDirect(activity.toolName, args).then((result) => {
           if (result && result.type !== "tool_error") void requestVerdict(result);
@@ -608,6 +631,19 @@ export function useCharoStream() {
     [runToolDirect, requestVerdict],
   );
 
+  // Exit target mode: back to talking with Charo's brain.
+  const clearTarget = useCallback(() => {
+    setActiveTarget((cur) => {
+      if (cur) {
+        setMessages((prev) => [
+          ...prev,
+          { id: uid(), role: "assistant", content: "Back with me. What next?" },
+        ]);
+      }
+      return null;
+    });
+  }, []);
+
   const cancelActivity = useCallback((turnId: string) => {
     setMessages((prev) => prev.filter((m) => m.id !== turnId));
   }, []);
@@ -616,6 +652,7 @@ export function useCharoStream() {
     messages,
     state,
     busy,
+    activeTarget,
     send,
     stop,
     reset,
@@ -625,5 +662,6 @@ export function useCharoStream() {
     startActivity,
     submitActivity,
     cancelActivity,
+    clearTarget,
   };
 }

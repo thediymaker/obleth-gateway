@@ -124,7 +124,7 @@ export function CharoPanel({
   mascotState: CharoState;
 }) {
   const { messages, busy, send, stop, reset, confirmRun, confirmCancel,
-          startActivity, submitActivity, cancelActivity } = stream;
+          startActivity, submitActivity, cancelActivity, activeTarget, clearTarget } = stream;
   const [text, setText] = useState("");
   const threadRef = useRef<HTMLDivElement>(null);
 
@@ -165,6 +165,15 @@ export function CharoPanel({
       </div>
     </div>
   );
+
+  const targetBanner = activeTarget ? (
+    <div className="flex items-center justify-between gap-2 border-b border-violet-400/30 bg-violet-500/10 px-4 py-2 text-xs">
+      <span className="truncate">Chatting with <span className="font-semibold">{activeTarget}</span></span>
+      <button type="button" onClick={clearTarget} className="rounded border border-border px-2 py-0.5 text-muted-foreground hover:bg-accent hover:text-accent-foreground">
+        Exit
+      </button>
+    </div>
+  ) : null;
 
   const thread = (
     <div
@@ -315,7 +324,7 @@ export function CharoPanel({
               }
             }}
             rows={expanded ? 3 : 2}
-            placeholder="Message Charo…"
+            placeholder={activeTarget ? `Message ${activeTarget}…` : "Message Charo…"}
             className="min-h-11 flex-1 resize-none border-0 bg-transparent px-2 py-1.5 text-sm leading-5 placeholder:text-muted-foreground/80 focus-visible:outline-none disabled:opacity-50"
           />
           <div className="flex shrink-0 items-center gap-1">
@@ -374,6 +383,7 @@ export function CharoPanel({
             <div className="charo-panel-shell relative z-10 flex h-full w-full flex-col overflow-hidden rounded-lg border border-violet-300/15 bg-card shadow-[0_18px_56px_hsl(267_86%_12%/0.28)] ring-1 ring-violet-200/10 max-sm:rounded-none">
               <style>{PANEL_CSS}</style>
               {header}
+              {targetBanner}
               <div className="flex min-h-0 flex-1 flex-col">
                 {thread}
                 {composer}
@@ -403,6 +413,7 @@ export function CharoPanel({
         aria-label="Charo"
       >
         {header}
+        {targetBanner}
         {thread}
         {composer}
       </div>

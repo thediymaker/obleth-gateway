@@ -40,4 +40,14 @@ describe("ensureActivitiesRegistered", () => {
     expect(a?.steps.map((s) => s.type)).toEqual(["model", "checklist"]);
     expect(listActivities()[0]?.id).toBe("test_capabilities"); // leads the launcher
   });
+
+  it("registers chat_with_model as a target activity with a single model step", () => {
+    ensureActivitiesRegistered();
+    const a = getActivity("chat_with_model");
+    expect(a?.kind).toBe("target");
+    expect(a?.toolName).toBeUndefined();
+    expect(a?.steps.map((s) => s.type)).toEqual(["model"]);
+    // Order: test_capabilities, chat_with_model, benchmark
+    expect(listActivities().map((x) => x.id)).toEqual(["test_capabilities", "chat_with_model", "benchmark"]);
+  });
 });
