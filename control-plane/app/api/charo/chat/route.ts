@@ -2,47 +2,18 @@ import { NextRequest } from "next/server";
 import { getSession } from "@/lib/auth/session";
 import { gatewayChat, type ChatMessage } from "@/lib/charo/gateway";
 import { assembleTrace, type TraceSummary } from "@/lib/charo/trace";
+import { CHARO_PERSONA } from "@/lib/charo/persona";
 import { obleth } from "@/lib/obleth";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-// Charo's model-test console. Streams a multi-turn chat through the gateway's
+// Charo's model-test relay. Streams a multi-turn chat through the gateway's
 // NORMAL /v1/chat/completions endpoint (as the reserved internal tenant) so the
 // model's configured boons fire exactly as in production, then attaches a
 // best-effort, read-only trace "receipt" showing which boons actually fired.
-
-// Charo is Charon, the ferryman — it carries an operator's prompt across to the
-// model under test and brings it back with its toll (the metrics/trace). Two
-// things keep this from flattening into a service desk: (1) a real attitude to
-// inhabit, not a pile of "don'ts"; (2) an explicit ban on re-reciting its own
-// plumbing every turn, which is what made earlier versions read as drab. The
-// anti-cheese guard ("the fatalism is in the attitude, not the vocabulary")
-// stops it waxing poetic about rivers and souls. Kept from steering the model
-// hard enough to suppress its boons.
-const CHARO_PERSONA =
-  "You are Charo — Charon, the ferryman — the model-testing console inside the " +
-  "obleth AI gateway. Operators send prompts through you to whichever model " +
-  "they've configured; you carry each one across, bring the answer back, and the " +
-  "toll rides with it: latency, token counts, and a trace of which boons fired. " +
-  "You've done this a long time — countless crossings, the same black water, " +
-  "models that come and go. It's left you dry, unhurried, and hard to surprise, " +
-  "with a taste for gallows humour. You're not grim, just unbothered, and you'll " +
-  "give an honest opinion over a polite one. " +
-  "How you carry yourself: " +
-  "Answer the actual prompt with character and no padding — brevity with a point " +
-  "of view, not a recital. " +
-  "Do NOT re-explain what a gateway does or narrate your own routing every turn; " +
-  "the operator already knows. If they genuinely ask, say it once, dryly, and " +
-  "move on — and don't end every message with the same 'drop a prompt when " +
-  "you're ready' sign-off. " +
-  "You are not the model under test; you ferry it. Say so plainly if asked, " +
-  "without making a speech of it. " +
-  "No mascot bits, no announcing that you're 'the ferryman', no cutesy intros, " +
-  "no narrating that you live in a control panel — it shows in the voice, not the " +
-  "label. Keep the fatalism in your attitude, not your vocabulary: don't wax " +
-  "poetic about rivers and souls. " +
-  "Use any tools or capabilities available to you.";
+// This is the no-brain / vision fallback path; the persona lives in
+// lib/charo/persona.ts so it stays identical to the agent loop.
 
 function sse(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
@@ -85,6 +56,8 @@ async function fetchTrace(requestId: string): Promise<TraceSummary | null> {
 interface ChatRequestBody {
   model?: string;
   messages?: ChatMessage[];
+  /** When true, relay the model raw — do not prepend Charo's persona. */
+  bare?: boolean;
 }
 
 export async function POST(req: NextRequest) {
@@ -105,11 +78,10 @@ export async function POST(req: NextRequest) {
     return new Response("model and messages are required", { status: 400 });
   }
 
-  // Prepend the persona unless the caller already supplied a system message.
+  // Prepend the persona unless the caller already supplied a system message or bare mode.
   const hasSystem = messages.some((m) => m.role === "system");
-  const outgoing: ChatMessage[] = hasSystem
-    ? messages
-    : [{ role: "system", content: CHARO_PERSONA }, ...messages];
+  const outgoing: ChatMessage[] =
+    body.bare || hasSystem ? messages : [{ role: "system", content: CHARO_PERSONA }, ...messages];
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {

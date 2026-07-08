@@ -1,11 +1,12 @@
 {
   "name": "obleth-control-plane",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "private": true,
   "scripts": {
     "dev": "next dev -p 3000",
     "build": "next build",
     "start": "next start -p 3000",
+    "build:docs-index": "node --import tsx scripts/build-docs-index.mjs",
     "test": "vitest run",
     "test:watch": "vitest"
   },
@@ -34,7 +35,9 @@
     "react": "^19.2.6",
     "react-day-picker": "^9.14.0",
     "react-dom": "^19.2.6",
+    "react-markdown": "^10.1.0",
     "recharts": "^2.15.0",
+    "remark-gfm": "^4.0.1",
     "tailwind-merge": "^2.6.0",
     "yaml": "^2.9.0",
     "zod": "^3.24.1"
@@ -50,6 +53,7 @@
     "jsdom": "^29.1.1",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.17",
+    "tsx": "^4.23.0",
     "typescript": "^5.7.0",
     "vitest": "^4.1.9"
   }

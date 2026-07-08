@@ -28,6 +28,12 @@ COPY --from=builder /app/recipes ./recipes
 # Auth schema SQL (db/auth-schema.sql). Read from cwd at boot by applyAuthSchema()
 # in instrumentation.ts; the standalone build doesn't bundle non-imported files.
 COPY --from=builder /app/db ./db
+# Next.js writes its incremental/fetch cache under .next/cache at runtime. The
+# COPYs above leave .next root-owned, so the non-root user below hits EACCES on
+# every cache write — revalidate/updateTag after a save then fails and the
+# dashboard keeps serving stale data (edits appear to silently revert). Create
+# the cache dir owned by the runtime user.
+RUN mkdir -p .next/cache && chown -R 1000:1000 .next/cache
 # The node:22-slim image ships a non-root `node` user (uid 1000). Declare it
 # numerically so Kubernetes `runAsNonRoot: true` can verify the user is non-root
 # without a pinned `runAsUser` — a username can't be checked and is rejected

@@ -4,6 +4,7 @@ import { useCallback, useRef, useState } from "react";
 import type { CharoState } from "./sprite";
 import type { TraceSummary } from "@/lib/charo/trace";
 import type { StepOutcome } from "@/lib/charo/bench/types";
+import { ensureActivitiesRegistered, getActivity } from "@/lib/charo/activities";
 
 export interface ChatTurn {
   id: string;
@@ -20,8 +21,14 @@ export interface ChatTurn {
   toolResults?: { type: string; data: unknown }[];
   /** Live per-step accumulation while a bench tool runs. */
   liveSteps?: StepOutcome[];
+  /** Live per-test accumulation while test_capabilities runs. */
+  liveCapabilities?: import("@/lib/charo/capabilities/types").TestOutcome[];
   /** Set when a confirmation-gated tool is awaiting the operator. */
   pendingConfirm?: { name: string; args: unknown };
+  /** Set when this assistant turn is an in-progress activity workflow (renders a WorkflowCard). */
+  workflowActivityId?: string;
+  /** Set on an assistant turn that should render the activity launcher cards inline. */
+  showLauncher?: boolean;
 }
 
 type WireContent =
@@ -42,6 +49,16 @@ function uid(): string {
 
 function delay(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+// The brain only needs a compact summary to give its read; a full capability
+// result (per-test output + trace) blows past a sane prompt budget.
+function verdictSummary(result: { type: string; data: unknown }): unknown {
+  const d = result.data as { modelName?: string; tests?: Array<{ id: string; status: string; detail: string }> };
+  if (result.type === "capability_result" && Array.isArray(d?.tests)) {
+    return { modelName: d.modelName, tests: d.tests.map((t) => ({ id: t.id, status: t.status, detail: t.detail })) };
+  }
+  return result.data;
 }
 
 // Telemetry flushes to the ledger on a ~1s ticker, so the trace receipt isn't
@@ -110,10 +127,20 @@ export function useCharoStream() {
   const [messages, setMessages] = useState<ChatTurn[]>([]);
   const [state, setState] = useState<CharoState>("idle");
   const [busy, setBusy] = useState(false);
+  // Set when the operator is chatting with a specific model directly (bypassing
+  // the brain/agent loop), e.g. via the chat_with_model activity.
+  const [activeTarget, setActiveTarget] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  // The assistant turn currently being streamed, so stop() can annotate the
+  // right bubble without wiping the conversation.
+  const activeTurnRef = useRef<string | null>(null);
   // Background trace polls outlive the stream they belong to; track them so a
   // reset can cancel any still in flight.
   const pollsRef = useRef<Set<AbortController>>(new Set());
+  // The id of the notice turn that opened the current target session, so
+  // `send` can relay only the turns authored after it (the genuine
+  // user<->model exchange), not the notice or any prior brain conversation.
+  const targetStartRef = useRef<string | null>(null);
 
   const patchTurn = useCallback(
     (id: string, fn: (t: ChatTurn) => ChatTurn) =>
@@ -123,12 +150,37 @@ export function useCharoStream() {
 
   const reset = useCallback(() => {
     abortRef.current?.abort();
+    abortRef.current = null;
+    activeTurnRef.current = null;
     pollsRef.current.forEach((c) => c.abort());
     pollsRef.current.clear();
+    targetStartRef.current = null;
     setMessages([]);
     setState("idle");
     setBusy(false);
+    setActiveTarget(null);
   }, []);
+
+  // Halt the in-flight turn (a long/hung benchmark, or a slow stream) without
+  // clearing the conversation, so the operator can immediately send again. The
+  // abort propagates through the request signal to the server-side tool/gateway
+  // calls, so an actual benchmark run is cut, not just hidden. Any already-shown
+  // partial output (live bench steps, tokens) is kept.
+  const stop = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    const id = activeTurnRef.current;
+    activeTurnRef.current = null;
+    if (id) {
+      patchTurn(id, (m) => ({
+        ...m,
+        streaming: false,
+        content: m.content || "(stopped)",
+      }));
+    }
+    setBusy(false);
+    setState("idle");
+  }, [patchTurn]);
 
   // Poll the trace endpoint until the receipt flushes (or we give up and clear
   // the pending state). Runs in the background, past the stream's end.
@@ -174,11 +226,12 @@ export function useCharoStream() {
       wire: WireMessage[],
       assistantId: string,
       signal: AbortSignal,
+      opts?: { bare?: boolean },
     ): Promise<boolean> => {
       const res = await fetch("/api/charo/chat", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ model, messages: wire }),
+        body: JSON.stringify({ model, messages: wire, ...(opts?.bare ? { bare: true } : {}) }),
         signal,
       });
       if (!res.ok || !res.body) throw new Error(`request failed (${res.status})`);
@@ -215,7 +268,7 @@ export function useCharoStream() {
       event: string,
       parsed: Record<string, unknown>,
       onNoBrain: () => void,
-      flags: { sawError: boolean; noBrain: boolean },
+      flags: { sawError: boolean; noBrain: boolean; openActivity?: string | null },
     ) => {
       if (event === "token") {
         const t = String(parsed.text ?? "");
@@ -232,6 +285,11 @@ export function useCharoStream() {
           ...m,
           liveSteps: [...(m.liveSteps ?? []), parsed.step as StepOutcome],
         }));
+      } else if (event === "tool_progress" && parsed.kind === "capability_test" && parsed.outcome) {
+        patchTurn(assistantId, (m) => ({
+          ...m,
+          liveCapabilities: [...(m.liveCapabilities ?? []), parsed.outcome as import("@/lib/charo/capabilities/types").TestOutcome],
+        }));
       } else if (event === "tool_result") {
         patchTurn(assistantId, (m) => ({
           ...m,
@@ -243,6 +301,10 @@ export function useCharoStream() {
         if (trace === null && typeof parsed.requestId === "string") {
           void pollTrace(assistantId, parsed.requestId);
         }
+      } else if (event === "activity") {
+        // The brain asked to surface an activity; the caller acts after the
+        // stream ends (startActivity is busy-guarded). "" means "show the menu".
+        flags.openActivity = typeof parsed.id === "string" ? parsed.id : "";
       } else if (event === "error") {
         // The gateway degrades to legacy mode when no brain is configured; the
         // caller retries via runLegacyChat rather than showing an error.
@@ -262,12 +324,12 @@ export function useCharoStream() {
     [patchTurn, pollTrace],
   );
 
-  // Chat entry point. Image turns (vision testing a specific model) and no-brain
-  // deployments use the legacy relay; otherwise the message drives Charo's brain
-  // through the agent loop, which may pause on a `confirm` for a billed tool.
+  // Chat entry point. Plain chat drives Charo's brain through the agent loop,
+  // which may pause on a `confirm` for a billed tool. Phase 1 removes global-
+  // model chat, so there is no subject model — activities own model selection.
   const send = useCallback(
-    async (model: string, text: string, image?: string) => {
-      if (busy || !model || (!text.trim() && !image)) return;
+    async (text: string, image?: string) => {
+      if (busy || (!text.trim() && !image)) return;
 
       const userTurn: ChatTurn = { id: uid(), role: "user", content: text, image };
       const assistantId = uid();
@@ -279,51 +341,86 @@ export function useCharoStream() {
 
       setBusy(true);
       setState("thinking");
+      activeTurnRef.current = assistantId;
       const ac = new AbortController();
       abortRef.current = ac;
       const wire = toWire(history);
 
       try {
-        let sawError = false;
-        if (image) {
-          // Vision testing goes straight to the model under test.
-          sawError = await runLegacyChat(model, wire, assistantId, ac.signal);
+        if (activeTarget) {
+          // Target mode: talk to the chosen model directly, raw (no persona).
+          // Relay only the turns authored after the target was set — the
+          // client-authored notice turn and any prior brain conversation must
+          // never reach the raw model, or it defeats the bare evaluation.
+          const startIdx = history.findIndex((m) => m.id === targetStartRef.current);
+          const convo = (startIdx >= 0 ? history.slice(startIdx + 1) : history)
+            .filter((m) => !m.showLauncher && !m.workflowActivityId && !m.pendingConfirm);
+          const targetWire = toWire(convo);
+          const sawError = await runLegacyChat(activeTarget, targetWire, assistantId, ac.signal, { bare: true });
+          patchTurn(assistantId, (m) => (m.pendingConfirm ? m : { ...m, streaming: false }));
+          setState(sawError ? "error" : "result");
         } else {
           const res = await fetch("/api/charo/agent", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ messages: wire, subjectModel: model }),
+            body: JSON.stringify({ messages: wire }),
             signal: ac.signal,
           });
           if (!res.ok || !res.body) throw new Error(`request failed (${res.status})`);
-          const flags = { sawError: false, noBrain: false };
+          const flags = { sawError: false, noBrain: false, openActivity: null as string | null };
           await readSSE(res, ac.signal, (event, parsed) =>
             applyAgentEvent(assistantId, event, parsed, () => {}, flags),
           );
+
           if (flags.noBrain) {
-            // Gateway has no brain configured: fall back to the legacy tester on
-            // the selected model, reusing the same assistant turn.
-            sawError = await runLegacyChat(model, wire, assistantId, ac.signal);
+            // Agent route degraded silently (no brain configured); show a hint
+            // instead of leaving the bubble empty.
+            patchTurn(assistantId, (m) => ({
+              ...m,
+              content:
+                "No brain model is configured yet, so I can't free-chat — set one in Settings, or pick an activity above and I'll run it.",
+              streaming: false,
+            }));
+            setState("result");
           } else {
-            sawError = flags.sawError;
+            patchTurn(assistantId, (m) =>
+              m.pendingConfirm ? m : { ...m, streaming: false },
+            );
+            setState(flags.sawError ? "error" : "result");
+
+            if (flags.openActivity != null) {
+              ensureActivitiesRegistered();
+              const openId = flags.openActivity;
+              const cardTurn =
+                openId && getActivity(openId)
+                  ? { id: uid(), role: "assistant" as const, content: "", workflowActivityId: openId }
+                  : { id: uid(), role: "assistant" as const, content: "", showLauncher: true };
+              setMessages((prev) => {
+                const kept = prev
+                  .map((m) => (m.id === assistantId ? { ...m, streaming: false } : m))
+                  .filter((m) => !(m.id === assistantId && !m.content && !m.error));
+                return [...kept, cardTurn];
+              });
+            }
           }
         }
-
-        patchTurn(assistantId, (m) =>
-          m.pendingConfirm ? m : { ...m, streaming: false },
-        );
-        setState(sawError ? "error" : "result");
       } catch (e) {
         if (!ac.signal.aborted) {
           patchTurn(assistantId, (m) => ({ ...m, error: String(e), streaming: false }));
           setState("error");
         }
       } finally {
-        setBusy(false);
-        abortRef.current = null;
+        // Only tear down if we still own the active request: stop()/Clear or a
+        // follow-up turn may have already taken over (busy stays owned by that
+        // newer turn).
+        if (abortRef.current === ac) {
+          abortRef.current = null;
+          setBusy(false);
+        }
+        if (activeTurnRef.current === assistantId) activeTurnRef.current = null;
       }
     },
-    [busy, messages, runLegacyChat, applyAgentEvent, patchTurn],
+    [busy, messages, applyAgentEvent, patchTurn, activeTarget, runLegacyChat],
   );
 
   // The operator approved a confirmation-gated tool. Resume the agent loop: the
@@ -348,6 +445,7 @@ export function useCharoStream() {
       ]);
       setBusy(true);
       setState("thinking");
+      activeTurnRef.current = assistantId;
       const ac = new AbortController();
       abortRef.current = ac;
 
@@ -359,7 +457,7 @@ export function useCharoStream() {
           signal: ac.signal,
         });
         if (!res.ok || !res.body) throw new Error(`tool run failed (${res.status})`);
-        const flags = { sawError: false, noBrain: false };
+        const flags = { sawError: false, noBrain: false, openActivity: null as string | null };
         await readSSE(res, ac.signal, (event, parsed) =>
           applyAgentEvent(assistantId, event, parsed, () => {}, flags),
         );
@@ -371,8 +469,14 @@ export function useCharoStream() {
           setState("error");
         }
       } finally {
-        setBusy(false);
-        abortRef.current = null;
+        // Only tear down if we still own the active request: stop()/Clear or a
+        // follow-up turn may have already taken over (busy stays owned by that
+        // newer turn).
+        if (abortRef.current === ac) {
+          abortRef.current = null;
+          setBusy(false);
+        }
+        if (activeTurnRef.current === assistantId) activeTurnRef.current = null;
       }
     },
     [busy, messages, applyAgentEvent, patchTurn],
@@ -390,9 +494,11 @@ export function useCharoStream() {
   );
 
   // Run a tool directly (rail button / quick-action), bypassing the brain.
+  // Resolves with the last `tool_result` envelope (or null) so callers can
+  // chain a follow-up, e.g. requesting a verdict from the brain.
   const runToolDirect = useCallback(
-    async (name: string, args: unknown) => {
-      if (busy) return;
+    async (name: string, args: unknown): Promise<{ type: string; data: unknown } | null> => {
+      if (busy) return null;
       const assistantId = uid();
       setMessages((prev) => [
         ...prev,
@@ -400,6 +506,7 @@ export function useCharoStream() {
       ]);
       setBusy(true);
       setState("thinking");
+      activeTurnRef.current = assistantId;
       const ac = new AbortController();
       abortRef.current = ac;
 
@@ -412,13 +519,20 @@ export function useCharoStream() {
         });
         if (!res.ok || !res.body) throw new Error(`tool run failed (${res.status})`);
         let sawError = false;
+        let lastResult: { type: string; data: unknown } | null = null;
         await readSSE(res, ac.signal, (event, parsed) => {
           if (event === "tool_progress" && parsed.kind === "bench_step" && parsed.step) {
             patchTurn(assistantId, (m) => ({
               ...m,
               liveSteps: [...(m.liveSteps ?? []), parsed.step as StepOutcome],
             }));
+          } else if (event === "tool_progress" && parsed.kind === "capability_test" && parsed.outcome) {
+            patchTurn(assistantId, (m) => ({
+              ...m,
+              liveCapabilities: [...(m.liveCapabilities ?? []), parsed.outcome as import("@/lib/charo/capabilities/types").TestOutcome],
+            }));
           } else if (event === "tool_result") {
+            lastResult = parsed as { type: string; data: unknown };
             patchTurn(assistantId, (m) => ({
               ...m,
               toolResults: [...(m.toolResults ?? []), parsed as { type: string; data: unknown }],
@@ -434,18 +548,156 @@ export function useCharoStream() {
         });
         patchTurn(assistantId, (m) => ({ ...m, streaming: false }));
         setState(sawError ? "error" : "result");
+        return lastResult;
       } catch (e) {
         if (!ac.signal.aborted) {
           patchTurn(assistantId, (m) => ({ ...m, error: String(e), streaming: false }));
           setState("error");
         }
+        return null;
       } finally {
-        setBusy(false);
-        abortRef.current = null;
+        // Only tear down if we still own the active request: stop()/Clear or a
+        // follow-up turn may have already taken over (busy stays owned by that
+        // newer turn).
+        if (abortRef.current === ac) {
+          abortRef.current = null;
+          setBusy(false);
+        }
+        if (activeTurnRef.current === assistantId) activeTurnRef.current = null;
       }
     },
     [busy, patchTurn],
   );
 
-  return { messages, state, busy, send, reset, runToolDirect, confirmRun, confirmCancel };
+  // Launch an activity: drop a workflow-card turn into the thread. The panel
+  // renders WorkflowCard for it; the card collects args and calls submitActivity.
+  const startActivity = useCallback((activityId: string) => {
+    if (busy) return;
+    setMessages((prev) => [
+      ...prev,
+      { id: uid(), role: "assistant", content: "", workflowActivityId: activityId },
+    ]);
+  }, [busy]);
+
+  // After a direct tool run's result lands, ask the brain for a brief
+  // plain-language read on it, streamed into a fresh assistant turn. If no
+  // brain is configured, drop the turn silently — the result card stands
+  // alone. Reuses the same agent route + SSE plumbing as the confirm-resume
+  // path, just with a synthetic user turn instead of the real history.
+  const requestVerdict = useCallback(
+    async (result: { type: string; data: unknown }) => {
+      const assistantId = uid();
+      setMessages((prev) => [
+        ...prev,
+        { id: assistantId, role: "assistant", content: "", streaming: true },
+      ]);
+      setBusy(true);
+      setState("thinking");
+      activeTurnRef.current = assistantId;
+      const ac = new AbortController();
+      abortRef.current = ac;
+
+      try {
+        const res = await fetch("/api/charo/agent", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: [
+              {
+                role: "user",
+                content:
+                  `A ${result.type} just finished. Result JSON: ${JSON.stringify(verdictSummary(result)).slice(0, 2000)}. ` +
+                  `Give me a brief plain-language read on it — good, rough, or worth a second look. Do not call any tool.`,
+              },
+            ],
+          }),
+          signal: ac.signal,
+        });
+        if (!res.ok || !res.body) throw new Error(`verdict failed (${res.status})`);
+        const flags = { sawError: false, noBrain: false };
+        await readSSE(res, ac.signal, (event, parsed) =>
+          applyAgentEvent(assistantId, event, parsed, () => {}, flags),
+        );
+        if (flags.noBrain) {
+          // No brain configured → no verdict; the result card stands alone.
+          setMessages((prev) => prev.filter((m) => m.id !== assistantId));
+        } else {
+          patchTurn(assistantId, (m) => ({ ...m, streaming: false }));
+        }
+      } catch {
+        patchTurn(assistantId, (m) => ({ ...m, streaming: false }));
+      } finally {
+        if (abortRef.current === ac) {
+          abortRef.current = null;
+          setBusy(false);
+        }
+        if (activeTurnRef.current === assistantId) activeTurnRef.current = null;
+      }
+    },
+    [applyAgentEvent, patchTurn],
+  );
+
+  // Operator completed the workflow: retire the card and run the backing tool.
+  const submitActivity = useCallback(
+    (turnId: string, activityId: string, args: Record<string, unknown>) => {
+      ensureActivitiesRegistered();
+      const activity = getActivity(activityId);
+      // Drop the workflow turn (its inputs are now captured in `args`).
+      setMessages((prev) => prev.filter((m) => m.id !== turnId));
+      if (activity?.kind === "target") {
+        const model = typeof args.model === "string" ? args.model : "";
+        if (model) {
+          const noticeId = uid();
+          setActiveTarget(model);
+          targetStartRef.current = noticeId;
+          setMessages((prev) => [
+            ...prev,
+            { id: noticeId, role: "assistant", content: `Now talking to ${model}. Send a message, or exit to come back to me.` },
+          ]);
+        }
+        return;
+      }
+      if (activity?.kind === "run" && activity.toolName) {
+        void runToolDirect(activity.toolName, args).then((result) => {
+          if (result && result.type !== "tool_error") void requestVerdict(result);
+        });
+      }
+    },
+    [runToolDirect, requestVerdict],
+  );
+
+  // Exit target mode: back to talking with Charo's brain.
+  const clearTarget = useCallback(() => {
+    setActiveTarget((cur) => {
+      if (cur) {
+        setMessages((prev) => [
+          ...prev,
+          { id: uid(), role: "assistant", content: "Back with me. What next?" },
+        ]);
+      }
+      return null;
+    });
+    targetStartRef.current = null;
+  }, []);
+
+  const cancelActivity = useCallback((turnId: string) => {
+    setMessages((prev) => prev.filter((m) => m.id !== turnId));
+  }, []);
+
+  return {
+    messages,
+    state,
+    busy,
+    activeTarget,
+    send,
+    stop,
+    reset,
+    runToolDirect,
+    confirmRun,
+    confirmCancel,
+    startActivity,
+    submitActivity,
+    cancelActivity,
+    clearTarget,
+  };
 }
