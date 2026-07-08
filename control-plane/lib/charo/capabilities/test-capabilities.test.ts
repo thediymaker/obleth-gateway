@@ -76,4 +76,20 @@ describe("test_capabilities tool", () => {
     expect(Array.isArray(content)).toBe(true);
     expect(content.some((p: any) => p.type === "image_url")).toBe(true);
   });
+
+  it("parseArgs accepts an operator image only as an image data URL", () => {
+    const img = "data:image/png;base64,AAAA";
+    expect(testCapabilitiesTool.parseArgs({ model: "m", image: img })).toMatchObject({ image: img });
+    expect(testCapabilitiesTool.parseArgs({ model: "m", image: "https://x/y.png" }).image).toBeUndefined();
+    expect(testCapabilitiesTool.parseArgs({ model: "m", image: 42 }).image).toBeUndefined();
+  });
+
+  it("uses the operator's image for the vision test when provided", async () => {
+    const img = "data:image/jpeg;base64,BBBB";
+    let sent: any;
+    const gateway = vi.fn(async (body: any) => { sent = body; return jsonResponse(completion("a cat")); });
+    await testCapabilitiesTool.run({ model: "m", tests: ["vision"], image: img }, ctxWith(gateway as never), () => {});
+    const part = sent.messages[0].content.find((p: any) => p.type === "image_url");
+    expect(part.image_url.url).toBe(img);
+  });
 });

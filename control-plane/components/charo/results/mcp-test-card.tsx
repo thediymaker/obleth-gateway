@@ -4,6 +4,7 @@ import { useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
 import type { McpServerTestRow, McpTestResult, McpTestStatus } from "@/lib/charo/mcp/types";
+import { Rail, MicroLabel } from "@/components/charo/rail";
 
 const PILL: Record<McpTestStatus, string> = {
   pass: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
@@ -50,27 +51,24 @@ export function McpTestRowDetails({ row }: { row: McpServerTestRow }) {
   );
 }
 
+const DOT: Record<McpTestStatus, string> = {
+  pass: "bg-emerald-400",
+  warn: "bg-amber-400",
+  fail: "bg-destructive",
+  skip: "bg-muted-foreground/40",
+};
+
 function Row({ row }: { row: McpServerTestRow }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="border-b border-border last:border-0">
-      <button
-        type="button"
-        onClick={() => setOpen((o) => !o)}
-        className="flex w-full items-center gap-2 py-2 text-left"
-      >
-        <McpStatusPill status={row.status} />
-        <span className="text-sm font-medium">{row.server}</span>
-        <span className="ml-auto truncate text-xs text-muted-foreground">{row.message}</span>
-        <ChevronRight
-          className={cn("h-4 w-4 shrink-0 text-muted-foreground transition-transform", open && "rotate-90")}
-        />
+    <div>
+      <button type="button" onClick={() => setOpen((o) => !o)} className="flex w-full items-center gap-2 py-[5px] text-left">
+        <span className={cn("h-[7px] w-[7px] shrink-0 rounded-full", DOT[row.status])} aria-label={row.status} />
+        <span className="text-[13px] font-medium text-foreground/90">{row.server}</span>
+        <span className="ml-auto truncate text-[11.5px] text-muted-foreground">{row.message}</span>
+        <ChevronRight className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground/70 transition-transform", open && "rotate-90")} />
       </button>
-      {open && (
-        <div className="pb-3">
-          <McpTestRowDetails row={row} />
-        </div>
-      )}
+      {open && <div className="mb-1.5 ml-[15px]"><McpTestRowDetails row={row} /></div>}
     </div>
   );
 }
@@ -79,22 +77,16 @@ export function McpTestCard({ data }: { data: unknown }) {
   const r = (data ?? {}) as Partial<McpTestResult>;
   const servers = Array.isArray(r.servers) ? r.servers : [];
   return (
-    <div className="w-full rounded-lg border border-border bg-card p-3">
-      <div className="mb-1 flex items-center justify-between gap-2">
-        <div className="truncate text-sm font-semibold">MCP servers</div>
-        <span className="rounded-full border border-border px-2 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
-          mcp test
-        </span>
+    <Rail>
+      <div className="mb-1 flex items-baseline gap-2">
+        <span className="text-[13px] font-semibold text-foreground">MCP servers</span>
+        <MicroLabel className="ml-auto shrink-0">MCP test</MicroLabel>
       </div>
       {servers.length === 0 ? (
-        <p className="py-2 text-sm text-muted-foreground">No MCP servers registered.</p>
+        <p className="text-[12px] text-muted-foreground">No MCP servers registered.</p>
       ) : (
-        <div>
-          {servers.map((s) => (
-            <Row key={s.server} row={s} />
-          ))}
-        </div>
+        <div>{servers.map((s) => <Row key={s.server} row={s} />)}</div>
       )}
-    </div>
+    </Rail>
   );
 }

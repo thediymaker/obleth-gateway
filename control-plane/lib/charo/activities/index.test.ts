@@ -37,7 +37,7 @@ describe("ensureActivitiesRegistered", () => {
     const a = getActivity("test_capabilities");
     expect(a?.toolName).toBe("test_capabilities");
     expect(a?.resultType).toBe("capability_result");
-    expect(a?.steps.map((s) => s.type)).toEqual(["model", "checklist"]);
+    expect(a?.steps.map((s) => s.type)).toEqual(["model", "checklist", "image"]);
     expect(listActivities()[0]?.id).toBe("test_capabilities"); // leads the launcher
   });
 

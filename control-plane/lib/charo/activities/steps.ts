@@ -34,11 +34,24 @@ export function initialValues(activity: Activity, model?: ModelRoute): StepValue
   for (const step of activity.steps) {
     if (step.type === "model") vals.model = "";
     else if (step.type === "number") vals[step.key] = step.default;
+    else if (step.type === "image") vals[step.key] = "";
     else if (step.type === "checklist") {
       vals[step.key] = resolveChecklistOptions(step, model).map((o) => o.value);
     }
   }
   return vals;
+}
+
+/**
+ * The steps currently shown by the wizard: conditional image steps only appear
+ * while their trigger checklist value is selected (e.g. the vision test).
+ */
+export function visibleSteps(activity: Activity, values: StepValues): StepSpec[] {
+  return activity.steps.filter((step) => {
+    if (step.type !== "image" || !step.onlyWhen) return true;
+    const selected = values[step.onlyWhen.key];
+    return Array.isArray(selected) && (selected as string[]).includes(step.onlyWhen.includes);
+  });
 }
 
 /** Map collected step values into the backing tool's argument object. */
@@ -49,9 +62,13 @@ export function collectArgs(
 ): Record<string, unknown> {
   const args: Record<string, unknown> = {};
   if (model) args.model = model.model_name;
-  for (const step of activity.steps) {
+  for (const step of visibleSteps(activity, values)) {
     if (step.type === "number") args[step.key] = values[step.key];
     else if (step.type === "checklist") args[step.key] = values[step.key];
+    else if (step.type === "image") {
+      const v = values[step.key];
+      if (typeof v === "string" && v) args[step.key] = v;
+    }
   }
   return args;
 }
