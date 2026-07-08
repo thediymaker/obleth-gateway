@@ -5,6 +5,7 @@ import {
   ResponsiveContainer, ComposedChart, Line, XAxis, YAxis, Tooltip, CartesianGrid, ReferenceLine, Legend,
 } from "recharts";
 import type { BenchResult } from "@/lib/charo/bench/types";
+import { Rail, MicroLabel } from "@/components/charo/rail";
 
 const GRADE_TONE: Record<string, string> = {
   A: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
@@ -32,17 +33,18 @@ export function BenchResultCard({ data }: { data: unknown }) {
     : "No knee detected";
 
   return (
-    <div className="w-full space-y-3 rounded-lg border border-border bg-card p-3">
-      <div className="flex items-center justify-between gap-2">
+    <Rail className="w-full space-y-3">
+      <div className="flex items-baseline justify-between gap-2">
         <div className="min-w-0">
-          <div className="truncate text-sm font-semibold">{r.modelName ?? "benchmark"}</div>
-          <div className="text-xs text-muted-foreground">{headline}</div>
+          <div className="flex items-baseline gap-2">
+            <span className="truncate text-[13px] font-semibold text-foreground">{r.modelName ?? "benchmark"}</span>
+            <MicroLabel className="shrink-0">Benchmark</MicroLabel>
+          </div>
+          <div className="text-[11.5px] text-muted-foreground">{headline}</div>
         </div>
         {r.grade && (
-          <div className="flex flex-col items-end gap-0.5">
-            <Badge className={GRADE_TONE[r.grade] ?? ""}>
-              {r.grade} · {r.score ?? 0}/100
-            </Badge>
+          <div className="flex shrink-0 flex-col items-end gap-0.5">
+            <Badge className={GRADE_TONE[r.grade] ?? ""}>{r.grade} · {r.score ?? 0}/100</Badge>
             {kneeFloor && <span className="text-[10px] text-muted-foreground">provisional — ramp capped</span>}
           </div>
         )}
@@ -67,9 +69,9 @@ export function BenchResultCard({ data }: { data: unknown }) {
         </ResponsiveContainer>
       </div>
 
-      <div className="grid grid-cols-3 gap-2 text-xs">
+      <div className="grid grid-cols-3 gap-2 text-[11.5px]">
         {steps.map((s) => (
-          <div key={s.concurrency} className="rounded-md border border-border/60 bg-muted/30 p-2">
+          <div key={s.concurrency} className="rounded-md bg-white/[0.025] p-2">
             <div className="font-medium">×{s.concurrency}</div>
             <div className="text-muted-foreground">{s.reqPerS.toFixed(1)} req/s</div>
             <div className="text-muted-foreground">p99 {s.p99TtfbMs}ms</div>
@@ -81,10 +83,10 @@ export function BenchResultCard({ data }: { data: unknown }) {
       </div>
 
       {(r.findings?.length ?? 0) > 0 && (
-        <ul className="list-disc space-y-0.5 pl-4 text-xs text-muted-foreground">
+        <ul className="list-disc space-y-0.5 pl-4 text-[12px] text-muted-foreground">
           {r.findings!.map((f, i) => <li key={i}>{f}</li>)}
         </ul>
       )}
-    </div>
+    </Rail>
   );
 }

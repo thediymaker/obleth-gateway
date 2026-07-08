@@ -1,7 +1,5 @@
 "use client";
 
-import { Badge } from "@/components/ui/badge";
-import { cn } from "@/lib/utils";
 import type { TraceSummary } from "@/lib/charo/trace";
 
 const BOON_LABELS: Record<string, string> = {
@@ -31,82 +29,46 @@ export function TraceCard({
 }) {
   if (!trace) {
     return (
-      <div className="mt-2 rounded-md border border-border/60 bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-        {pending ? "Trace pending — telemetry still flushing…" : "No trace available."}
-      </div>
+      <p className="font-mono text-[10.5px] text-muted-foreground/70">
+        {pending ? "trace pending — telemetry still flushing…" : "no trace available"}
+      </p>
     );
   }
 
   const fired = new Set(trace.boonsFired);
-  // Configured-but-not-fired chips (greyed). Map the model's boon catalog names
-  // onto the trace's vocabulary where they differ.
-  const configuredNorm = configured.map((c) =>
-    c === "structured_output" ? "structured_repair" : c,
-  );
+  const configuredNorm = configured.map((c) => (c === "structured_output" ? "structured_repair" : c));
   const notFired = configuredNorm.filter((c) => !fired.has(c));
-
   const isError = trace.statusCode >= 400 || trace.errorStages.length > 0;
 
+  const stats = [
+    `tok ${trace.inputTokens}/${trace.outputTokens}`,
+    `ttft ${ms(trace.ttftMs)}`,
+    `total ${ms(trace.totalMs)}`,
+    `cache ${trace.cacheStatus}`,
+    `$${trace.costUsd.toFixed(5)}`,
+    ...(isError ? [`http ${trace.statusCode || "—"}`] : []),
+  ];
+
   return (
-    <div
-      className={cn(
-        "mt-2 space-y-2 rounded-md border px-3 py-2 text-xs",
-        isError
-          ? "border-destructive/40 bg-destructive/5"
-          : "border-border/60 bg-muted/30",
-      )}
-    >
-      <div className="flex flex-wrap items-center gap-1.5">
-        <span className="text-muted-foreground">boons:</span>
-        {trace.boonsFired.length === 0 && notFired.length === 0 && (
-          <span className="text-muted-foreground">none fired</span>
-        )}
+    <div className="space-y-0.5 font-mono text-[10.5px] leading-relaxed text-muted-foreground/70">
+      <div className="flex flex-wrap gap-x-1.5">
+        {trace.boonsFired.length === 0 && notFired.length === 0 && <span>boons none</span>}
         {trace.boonsFired.map((b) => (
-          <Badge
-            key={b}
-            className="border-emerald-500/40 bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
-          >
-            ✓ {label(b)}
-          </Badge>
+          <span key={b} className="text-emerald-600 dark:text-emerald-400/90">✓ {label(b)}</span>
         ))}
         {notFired.map((b) => (
-          <Badge key={b} className="opacity-60">
-            {label(b)}
-          </Badge>
+          <span key={b} className="text-muted-foreground/50">{label(b)}</span>
         ))}
-      </div>
-
-      {trace.toolLoopIters > 0 && (
-        <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-muted-foreground">
-            {trace.toolLoopIters} tool turn{trace.toolLoopIters === 1 ? "" : "s"}:
+        {trace.toolLoopIters > 0 && (
+          <span>
+            · {trace.toolLoopIters} tool turn{trace.toolLoopIters === 1 ? "" : "s"}: {trace.toolsCalled.join(", ")}
           </span>
-          {trace.toolsCalled.map((t, i) => (
-            <Badge key={`${t}-${i}`} className="font-mono">
-              {t}
-            </Badge>
-          ))}
-        </div>
-      )}
-
-      {trace.errorStages.length > 0 && (
-        <div className="text-destructive">
-          failed at: {trace.errorStages.join(", ")}
-        </div>
-      )}
-
-      <div className="flex flex-wrap gap-x-4 gap-y-1 text-muted-foreground">
-        <span>
-          tok {trace.inputTokens}/{trace.outputTokens}
-        </span>
-        <span>ttft {ms(trace.ttftMs)}</span>
-        <span>total {ms(trace.totalMs)}</span>
-        <span>cache {trace.cacheStatus}</span>
-        <span>${trace.costUsd.toFixed(5)}</span>
-        <span className={cn(isError && "text-destructive")}>
-          http {trace.statusCode || "—"}
-        </span>
+        )}
+        <span>· {stats.join(" · ")}</span>
       </div>
+      {trace.errorStages.length > 0 && (
+        <div className="text-destructive">failed at: {trace.errorStages.join(", ")}</div>
+      )}
     </div>
   );
 }

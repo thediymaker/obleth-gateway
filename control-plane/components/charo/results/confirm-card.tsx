@@ -1,6 +1,7 @@
 "use client";
 
 import { Button } from "@/components/ui/button";
+import { Rail } from "@/components/charo/rail";
 
 // Inline approval card shown when Charo's brain proposes a confirmation-gated
 // tool (e.g. a benchmark, which sends real billed load). Running is a deliberate
@@ -19,22 +20,17 @@ export function ConfirmCard({
   const args = (pending.args ?? {}) as Record<string, unknown>;
   const model = typeof args.model === "string" ? args.model : undefined;
   return (
-    <div className="w-full rounded-lg border border-violet-400/40 bg-violet-500/5 p-3 text-sm">
-      <div className="font-medium">
-        Run {pending.name}
-        {model ? ` on ${model}` : ""}?
+    <Rail className="w-full py-0.5">
+      <div className="text-[13px] font-medium text-foreground">
+        Run {pending.name}{model ? ` on ${model}` : ""}?
       </div>
-      <p className="mt-0.5 text-xs text-muted-foreground">
+      <p className="mt-0.5 text-[12px] text-muted-foreground">
         This sends real load through the gateway, billed to the internal tenant.
       </p>
       <div className="mt-2 flex gap-2">
-        <Button size="sm" onClick={onRun} disabled={disabled}>
-          Run
-        </Button>
-        <Button size="sm" variant="ghost" onClick={onCancel} disabled={disabled}>
-          Cancel
-        </Button>
+        <Button size="sm" onClick={onRun} disabled={disabled}>Run</Button>
+        <Button size="sm" variant="ghost" onClick={onCancel} disabled={disabled}>Cancel</Button>
       </div>
-    </div>
+    </Rail>
   );
 }
