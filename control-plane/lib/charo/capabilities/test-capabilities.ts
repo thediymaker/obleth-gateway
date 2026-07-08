@@ -7,7 +7,12 @@ import type { TestId, CapabilityResult, TestOutcome } from "./types";
 
 const ALL_TESTS: TestId[] = ["ping", "tools", "json", "vision"];
 
-interface Args { model: string; tests: TestId[] }
+interface Args {
+  model: string;
+  tests: TestId[];
+  /** Operator-attached image (data URL) for the vision test; falls back to the bundled fixture. */
+  image?: string;
+}
 
 /** Non-streaming assistant content from an OpenAI-style completion body. */
 function contentOf(body: unknown): string {
@@ -59,7 +64,11 @@ export const testCapabilitiesTool: CharoTool<Args, CapabilityResult> = {
       ? (o.tests as unknown[]).filter((t): t is TestId => ALL_TESTS.includes(t as TestId))
       : (["ping"] as TestId[]);
     const chosen = tests.length ? tests : (["ping"] as TestId[]);
-    return { model, tests: [...new Set(chosen)] };
+    // Only a data URL is accepted: the image comes from the operator's upload,
+    // never a brain-invented remote URL (the arg is absent from the brain schema).
+    const image =
+      typeof o.image === "string" && o.image.startsWith("data:image/") ? o.image : undefined;
+    return { model, tests: [...new Set(chosen)], ...(image ? { image } : {}) };
   },
 
   async run(args: Args, ctx: ToolCtx, emit: (p: ToolProgress) => void): Promise<CapabilityResult> {
@@ -70,7 +79,7 @@ export const testCapabilitiesTool: CharoTool<Args, CapabilityResult> = {
       const content = spec.needsImage
         ? [
             { type: "text" as const, text: spec.prompt },
-            { type: "image_url" as const, image_url: { url: FIXTURE_IMAGE_DATA_URL } },
+            { type: "image_url" as const, image_url: { url: args.image ?? FIXTURE_IMAGE_DATA_URL } },
           ]
         : spec.prompt;
       const messages: ChatMessage[] = [{ role: "user", content }];

@@ -1,9 +1,6 @@
 "use client";
 
-import { Plus } from "lucide-react";
-import {
-  DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem,
-} from "@/components/ui/dropdown-menu";
+import { cn } from "@/lib/utils";
 import type { Activity } from "@/lib/charo/activities/types";
 import { ensureActivitiesRegistered, listActivities } from "@/lib/charo/activities";
 
@@ -12,10 +9,17 @@ function useActivities(): Activity[] {
   return listActivities();
 }
 
+const TINT: Record<string, string> = {
+  test_capabilities: "bg-violet-500/15 text-violet-300",
+  chat_with_model: "bg-sky-400/15 text-sky-300",
+  benchmark: "bg-emerald-400/12 text-emerald-300",
+};
+const DEFAULT_TINT = "bg-violet-500/15 text-violet-300";
+
 export function ActivityCards({ onPick }: { onPick: (a: Activity) => void }) {
   const activities = useActivities();
   return (
-    <div className="w-full space-y-2">
+    <div className="w-full space-y-0.5">
       {activities.map((a) => {
         const Icon = a.icon;
         return (
@@ -23,39 +27,18 @@ export function ActivityCards({ onPick }: { onPick: (a: Activity) => void }) {
             key={a.id}
             type="button"
             onClick={() => onPick(a)}
-            className="flex w-full items-center gap-3 rounded-lg border border-border bg-secondary/20 px-3 py-2.5 text-left transition-colors hover:border-violet-400/40 hover:bg-accent/40"
+            className="flex w-full items-center gap-3 rounded-[10px] px-2.5 py-[9px] text-left transition-colors hover:bg-violet-500/[0.07]"
           >
-            <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md bg-violet-500/15 text-violet-500 dark:text-violet-300">
-              {Icon && <Icon className="h-4 w-4" />}
+            <span className={cn("flex h-[30px] w-[30px] shrink-0 items-center justify-center rounded-lg", TINT[a.id] ?? DEFAULT_TINT)}>
+              {Icon && <Icon className="h-[15px] w-[15px]" />}
             </span>
             <span className="min-w-0">
-              <span className="block text-sm font-semibold">{a.label}</span>
-              <span className="block truncate text-xs text-muted-foreground">{a.blurb}</span>
+              <span className="block text-[13px] font-semibold text-foreground">{a.label}</span>
+              <span className="block text-[11.5px] leading-snug text-muted-foreground">{a.blurb}</span>
             </span>
           </button>
         );
       })}
     </div>
-  );
-}
-
-export function ActivityMenu({ onPick }: { onPick: (a: Activity) => void }) {
-  const activities = useActivities();
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <button type="button" title="Start an activity" className="flex h-9 w-9 items-center justify-center rounded-md border border-border text-muted-foreground hover:bg-accent/40">
-          <Plus className="h-4 w-4" />
-        </button>
-      </DropdownMenuTrigger>
-      <DropdownMenuContent align="start" side="top" className="z-[70] w-56">
-        {activities.map((a) => (
-          <DropdownMenuItem key={a.id} onSelect={() => onPick(a)} className="cursor-pointer flex-col items-start gap-0.5">
-            <span className="text-sm font-medium">{a.label}</span>
-            <span className="text-xs text-muted-foreground">{a.blurb}</span>
-          </DropdownMenuItem>
-        ))}
-      </DropdownMenuContent>
-    </DropdownMenu>
   );
 }

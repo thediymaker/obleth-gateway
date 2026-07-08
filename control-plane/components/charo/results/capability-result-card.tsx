@@ -3,30 +3,46 @@
 import { useState } from "react";
 import { ChevronRight } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { Rail, MicroLabel } from "@/components/charo/rail";
 import { TraceCard } from "@/components/charo/trace-card";
 import type { CapabilityResult, TestOutcome, TestStatus } from "@/lib/charo/capabilities/types";
 
-const PILL: Record<TestStatus, string> = {
-  pass: "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
-  warn: "bg-amber-500/15 text-amber-600 dark:text-amber-400",
-  fail: "bg-destructive/15 text-destructive",
+const DOT: Record<TestStatus, string> = {
+  pass: "bg-emerald-400",
+  warn: "bg-amber-400",
+  fail: "bg-destructive",
 };
+
+function Output({ text }: { text: string }) {
+  const [full, setFull] = useState(false);
+  const long = text.split("\n").length > 3 || text.length > 280;
+  return (
+    <div className="rounded-lg bg-white/[0.025] px-2.5 py-2 text-[12px] leading-normal text-muted-foreground">
+      <pre className={cn("whitespace-pre-wrap font-sans", !full && long && "line-clamp-3", full && "max-h-40 overflow-auto")}>
+        {text}
+      </pre>
+      {long && (
+        <button type="button" onClick={() => setFull((f) => !f)} className="mt-1 text-[11px] text-violet-600 hover:underline dark:text-violet-300">
+          {full ? "collapse" : "show full output"}
+        </button>
+      )}
+    </div>
+  );
+}
 
 function Row({ t }: { t: TestOutcome }) {
   const [open, setOpen] = useState(false);
   return (
-    <div className="border-b border-border last:border-0">
-      <button type="button" onClick={() => setOpen((o) => !o)} className="flex w-full items-center gap-2 py-2 text-left">
-        <span className={cn("rounded-full px-2 py-0.5 text-[10px] font-bold uppercase", PILL[t.status])}>{t.status}</span>
-        <span className="text-sm">{t.label}</span>
-        <span className="ml-auto truncate text-xs text-muted-foreground">{t.detail}</span>
-        <ChevronRight className={cn("h-4 w-4 shrink-0 text-muted-foreground transition-transform", open && "rotate-90")} />
+    <div>
+      <button type="button" onClick={() => setOpen((o) => !o)} className="flex w-full items-center gap-2 py-[5px] text-left">
+        <span className={cn("h-[7px] w-[7px] shrink-0 rounded-full", DOT[t.status])} aria-label={t.status} />
+        <span className="text-[13px] text-foreground/90">{t.label}</span>
+        <span className="ml-auto truncate text-[11.5px] text-muted-foreground">{t.detail}</span>
+        <ChevronRight className={cn("h-3.5 w-3.5 shrink-0 text-muted-foreground/70 transition-transform", open && "rotate-90")} />
       </button>
       {open && (
-        <div className="space-y-2 pb-3">
-          {t.output && (
-            <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded-md border border-border bg-muted/40 p-2 text-xs">{t.output}</pre>
-          )}
+        <div className="mb-1.5 ml-[15px] space-y-2">
+          {t.output && <Output text={t.output} />}
           {t.trace && <TraceCard trace={t.trace} />}
         </div>
       )}
@@ -38,12 +54,12 @@ export function CapabilityResultCard({ data }: { data: unknown }) {
   const r = data as Partial<CapabilityResult>;
   const tests = r.tests ?? [];
   return (
-    <div className="w-full rounded-lg border border-border bg-card p-3">
-      <div className="mb-1 flex items-center justify-between gap-2">
-        <div className="truncate text-sm font-semibold">{r.modelName ?? "capability test"}</div>
-        <span className="rounded-full border border-border px-2 py-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">capability test</span>
+    <Rail>
+      <div className="mb-1 flex items-baseline gap-2">
+        <span className="truncate text-[13px] font-semibold text-foreground">{r.modelName ?? "capability test"}</span>
+        <MicroLabel className="ml-auto shrink-0">Capability test</MicroLabel>
       </div>
       <div>{tests.map((t) => <Row key={t.id} t={t} />)}</div>
-    </div>
+    </Rail>
   );
 }

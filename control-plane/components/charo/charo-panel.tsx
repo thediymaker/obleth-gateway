@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from "react";
 import * as Dialog from "@radix-ui/react-dialog";
-import { Send, Square, X, RotateCcw, Maximize2, Minimize2 } from "lucide-react";
+import { Send, Square, X, RotateCcw, Maximize2, Minimize2, Paperclip } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 import { TraceCard } from "./trace-card";
@@ -11,8 +11,11 @@ import { BenchResultCard } from "./results/bench-result-card";
 import { CapabilityResultCard } from "./results/capability-result-card";
 import { ConfirmCard } from "./results/confirm-card";
 import { WorkflowCard } from "./workflow-card";
-import { ActivityCards, ActivityMenu } from "./activity-launcher";
+import { ActivityCards } from "./activity-launcher";
 import { ensureActivitiesRegistered, getActivity } from "@/lib/charo/activities";
+import { coalesceDocsResults } from "@/lib/charo/docs/coalesce-docs-results";
+import { CharoMarkdown } from "./markdown";
+import { MicroLabel } from "./rail";
 import type { useCharoStream } from "./use-charo-stream";
 import type { CharoState } from "./sprite";
 
@@ -126,26 +129,104 @@ export function CharoPanel({
   const { messages, busy, send, stop, reset, confirmRun, confirmCancel,
           startActivity, submitActivity, cancelActivity, activeTarget, clearTarget } = stream;
   const [text, setText] = useState("");
+  // Pending image attachment (data URL) for the next send — set via the
+  // paperclip picker or by dropping a file anywhere on the panel.
+  const [image, setImage] = useState<string | null>(null);
+  const [attachError, setAttachError] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const dragDepth = useRef(0);
   const threadRef = useRef<HTMLDivElement>(null);
 
-  // Auto-scroll the thread on new content, and when toggling dock <-> expanded.
+  const attachFromFiles = (files: FileList | null) => {
+    const file = files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith("image/")) {
+      setAttachError("Only images can be attached.");
+      return;
+    }
+    if (file.size > 6 * 1024 * 1024) {
+      setAttachError("Image is too large (max 6 MB).");
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => {
+      setImage(String(reader.result));
+      setAttachError(null);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  // Drag-and-drop an image anywhere on the panel. dragenter/leave fire on every
+  // child, so a depth counter decides when the pointer actually left the panel.
+  const hasFiles = (e: React.DragEvent) => Array.from(e.dataTransfer.types).includes("Files");
+  const dropProps = {
+    onDragEnter: (e: React.DragEvent) => {
+      if (!hasFiles(e)) return;
+      e.preventDefault();
+      dragDepth.current += 1;
+      setDragOver(true);
+    },
+    onDragOver: (e: React.DragEvent) => {
+      if (hasFiles(e)) e.preventDefault();
+    },
+    onDragLeave: () => {
+      dragDepth.current = Math.max(0, dragDepth.current - 1);
+      if (dragDepth.current === 0) setDragOver(false);
+    },
+    onDrop: (e: React.DragEvent) => {
+      e.preventDefault();
+      dragDepth.current = 0;
+      setDragOver(false);
+      // A drop on a dedicated dropzone (e.g. the vision test's image field)
+      // is handled there — don't also attach it to the composer.
+      if ((e.target as HTMLElement | null)?.closest?.("[data-charo-dropzone]")) return;
+      attachFromFiles(e.dataTransfer.files);
+    },
+  };
+
+  // Always jump to the bottom when toggling dock <-> expanded (the container
+  // remounts, losing its scroll position).
   useEffect(() => {
     threadRef.current?.scrollTo({ top: threadRef.current.scrollHeight });
-  }, [messages, expanded]);
+  }, [expanded]);
+
+  // Follow new content only while the reader is already near the bottom, so
+  // scrolling up to read mid-stream isn't yanked back down by the next token.
+  useEffect(() => {
+    const el = threadRef.current;
+    if (!el) return;
+    if (el.scrollHeight - el.scrollTop - el.clientHeight < 120) {
+      el.scrollTo({ top: el.scrollHeight });
+    }
+  }, [messages]);
 
   const onSend = () => {
-    if (!text.trim() || busy) return;
-    send(text);
+    if ((!text.trim() && !image) || busy) return;
+    send(text, image ?? undefined);
     setText("");
+    setImage(null);
   };
 
   const mascot = MASCOT[mascotState];
-  const canSend = !busy && !!text.trim();
+  const canSend = !busy && (!!text.trim() || !!image);
+
+  // Shown while a file drag hovers the panel.
+  const dropOverlay = dragOver ? (
+    // position/z-index inline: the shell's `> *` rule forces relative z-3 on
+    // children and would otherwise override the utility classes.
+    <div
+      style={{ position: "absolute", zIndex: 20 }}
+      className="pointer-events-none inset-2 flex items-center justify-center rounded-lg border-2 border-dashed border-violet-400/60 bg-violet-500/10"
+    >
+      <p className="text-[13px] font-medium text-violet-700 dark:text-violet-200">Drop image to attach</p>
+    </div>
+  ) : null;
 
   // Header: title + reset / expand-collapse / close.
   const header = (
     <div className="flex items-center justify-between gap-3 border-b border-border bg-secondary/20 px-4 py-3">
-      <div className="truncate text-sm font-semibold">Charo</div>
+      <div className="truncate text-sm font-semibold">Gateway Chat</div>
       <div className="flex items-center gap-1">
         <Button variant="ghost" size="icon" title="Clear conversation" onClick={reset}>
           <RotateCcw className="h-4 w-4" />
@@ -179,17 +260,17 @@ export function CharoPanel({
     <div
       ref={threadRef}
       className={cn(
-        "w-full flex-1 space-y-3 overflow-y-auto",
+        "w-full flex-1 space-y-4 overflow-y-auto",
         expanded ? "h-full px-5 py-4" : "mx-auto max-w-3xl px-4 py-3",
       )}
     >
       {messages.length === 0 && (
         <div className="flex min-h-full flex-col items-center justify-center gap-4 px-2 py-6">
-          <p className="text-sm text-muted-foreground">Hey. What are we getting into?</p>
+          <p className="text-[15px] font-semibold text-foreground">What can I help with?</p>
           <div className="w-full max-w-sm">
             <ActivityCards onPick={(a) => startActivity(a.id)} />
           </div>
-          <p className="text-xs text-muted-foreground/70">…or just start typing to chat with me.</p>
+          <p className="text-[11.5px] text-muted-foreground/70">…or just start typing.</p>
         </div>
       )}
       {messages.map((m) => {
@@ -230,29 +311,17 @@ export function CharoPanel({
             if (!m.streaming) return null;
             return (
               <div key={m.id} className="flex flex-col items-start">
-                <div className="w-fit rounded-lg rounded-tl-sm bg-muted px-3 py-2">
-                  <TypingDots />
-                </div>
+                <MicroLabel className="mb-1 text-violet-600/70 dark:text-violet-400/70">Charo</MicroLabel>
+                <TypingDots />
               </div>
             );
           }
+          // Children follow ARRIVAL order: tool/live cards land before the
+          // answer tokens, so they render above the streaming text — the text
+          // grows at the bottom, where the sticky auto-scroll keeps the view.
           return (
             <div key={m.id} className="flex flex-col items-start space-y-2">
-              {showBubble && (
-                <div className="w-fit max-w-[min(46rem,100%)] whitespace-pre-wrap rounded-lg rounded-tl-sm bg-muted px-3 py-2 text-sm text-foreground">
-                  {m.image && (
-                    /* eslint-disable-next-line @next/next/no-img-element */
-                    <img src={m.image} alt="attachment" className="mb-1 max-h-40 rounded-md" />
-                  )}
-                  {content}
-                  {m.error && <span className="text-destructive">{m.error}</span>}
-                </div>
-              )}
-              {hasTrace && (
-                <div className="w-full">
-                  <TraceCard trace={m.trace} pending={m.tracePending} />
-                </div>
-              )}
+              <MicroLabel className="-mb-1 text-violet-600/70 dark:text-violet-400/70">Charo</MicroLabel>
               {hasLiveBench && (
                 <div className="w-full">
                   <BenchResultCard data={{ steps: m.liveSteps }} />
@@ -263,10 +332,26 @@ export function CharoPanel({
                   <CapabilityResultCard data={{ modelName: undefined, tests: m.liveCapabilities }} />
                 </div>
               )}
-              {m.toolResults?.map((tr, i) => {
+              {coalesceDocsResults(m.toolResults ?? []).map((tr, i) => {
                 const Renderer = resultRenderer(tr.type);
                 return <div key={i} className="w-full"><Renderer data={tr.data} /></div>;
               })}
+              {showBubble && (
+                <div className="w-full min-w-0">
+                  {m.image && (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img src={m.image} alt="attachment" className="mb-1.5 max-h-40 rounded-md" />
+                  )}
+                  {content && <CharoMarkdown text={content} />}
+                  {m.error && <p className="mt-1 text-[13px] text-destructive">{m.error}</p>}
+                </div>
+              )}
+              {!content && !m.error && m.streaming && <TypingDots />}
+              {hasTrace && (
+                <div className="w-full">
+                  <TraceCard trace={m.trace} pending={m.tracePending} />
+                </div>
+              )}
               {m.pendingConfirm && (
                 <div className="w-full">
                   <ConfirmCard
@@ -285,9 +370,9 @@ export function CharoPanel({
           <div key={m.id} className="flex flex-col items-end">
             <div
               className={cn(
-                "whitespace-pre-wrap rounded-lg px-3 py-2 text-sm",
+                "whitespace-pre-wrap break-words px-3 py-[7px] text-[13.5px] leading-relaxed",
                 expanded ? "max-w-[82%]" : "max-w-[88%]",
-                "rounded-br-sm bg-primary text-primary-foreground",
+                "rounded-[14px] rounded-br-[4px] border border-violet-500/30 bg-violet-500/15 text-violet-950 dark:text-violet-50",
               )}
             >
               {m.image && (
@@ -321,6 +406,23 @@ export function CharoPanel({
       )}
     >
       <div className="rounded-lg border border-border bg-background/90 p-2 shadow-[inset_0_1px_0_hsl(240_5%_100%/0.03)] focus-within:ring-1 focus-within:ring-ring">
+        {image && (
+          <div className="px-1 pb-2 pt-1">
+            <div className="relative inline-block">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={image} alt="pending attachment" className="h-14 rounded-md" />
+              <button
+                type="button"
+                title="Remove image"
+                onClick={() => setImage(null)}
+                className="absolute -right-2 -top-2 flex h-5 w-5 items-center justify-center rounded-full border border-border bg-background text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3 w-3" />
+              </button>
+            </div>
+          </div>
+        )}
+        {attachError && <p className="px-1 pb-1 text-[11.5px] text-destructive">{attachError}</p>}
         <div className="flex items-end gap-2">
           <textarea
             value={text}
@@ -336,7 +438,24 @@ export function CharoPanel({
             className="min-h-11 flex-1 resize-none border-0 bg-transparent px-2 py-1.5 text-sm leading-5 placeholder:text-muted-foreground/80 focus-visible:outline-none disabled:opacity-50"
           />
           <div className="flex shrink-0 items-center gap-1">
-            <ActivityMenu onPick={(a) => startActivity(a.id)} />
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => {
+                attachFromFiles(e.target.files);
+                e.currentTarget.value = "";
+              }}
+            />
+            <button
+              type="button"
+              title="Attach image"
+              onClick={() => fileInputRef.current?.click()}
+              className="flex h-9 w-9 items-center justify-center rounded-md border border-border text-muted-foreground hover:bg-accent/40"
+            >
+              <Paperclip className="h-4 w-4" />
+            </button>
             {busy ? (
               <Button
                 size="icon"
@@ -386,10 +505,14 @@ export function CharoPanel({
               "data-[state=open]:animate-in data-[state=closed]:animate-out data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:zoom-out-95 data-[state=open]:zoom-in-95",
             )}
           >
-            <Dialog.Title className="sr-only">Charo</Dialog.Title>
+            <Dialog.Title className="sr-only">Gateway Chat</Dialog.Title>
             {expandedMascot}
-            <div className="charo-panel-shell relative z-10 flex h-full w-full flex-col overflow-hidden rounded-lg border border-violet-300/15 bg-card shadow-[0_18px_56px_hsl(267_86%_12%/0.28)] ring-1 ring-violet-200/10 max-sm:rounded-none">
+            <div
+              {...dropProps}
+              className="charo-panel-shell relative z-10 flex h-full w-full flex-col overflow-hidden rounded-lg border border-violet-300/15 bg-card shadow-[0_18px_56px_hsl(267_86%_12%/0.28)] ring-1 ring-violet-200/10 max-sm:rounded-none"
+            >
               <style>{PANEL_CSS}</style>
+              {dropOverlay}
               {header}
               {targetBanner}
               <div className="flex min-h-0 flex-1 flex-col">
@@ -416,10 +539,12 @@ export function CharoPanel({
         className="pointer-events-none absolute -top-32 -right-4 z-[5] hidden h-44 w-auto select-none drop-shadow-2xl sm:block lg:-top-36 lg:-right-5 lg:h-48"
       />
       <div
+        {...dropProps}
         className="charo-panel-shell relative z-10 flex h-full flex-col overflow-hidden rounded-lg border border-violet-300/15 bg-card shadow-[0_18px_56px_hsl(267_86%_12%/0.28)] ring-1 ring-violet-200/10"
         role="dialog"
-        aria-label="Charo"
+        aria-label="Gateway Chat"
       >
+        {dropOverlay}
         {header}
         {targetBanner}
         {thread}

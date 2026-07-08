@@ -12,5 +12,6 @@ export const testCapabilitiesActivity: Activity = {
   steps: [
     { type: "model", label: "Model" },
     { type: "checklist", key: "tests", label: "What to test", optionsFrom: "boons" },
+    { type: "image", key: "image", label: "Test image", onlyWhen: { key: "tests", includes: "vision" } },
   ],
 };

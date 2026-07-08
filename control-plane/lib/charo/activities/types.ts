@@ -10,7 +10,14 @@ export type StepSpec =
       /** "boons" derives options from the picked model's boons; otherwise static. */
       optionsFrom: "boons" | { value: string; label: string; hint?: string }[];
     }
-  | { type: "number"; key: string; label: string; default: number; min?: number; max?: number };
+  | { type: "number"; key: string; label: string; default: number; min?: number; max?: number }
+  | {
+      type: "image";
+      key: string;
+      label: string;
+      /** Shown (and required) only while this checklist key has this value selected. */
+      onlyWhen?: { key: string; includes: string };
+    };
 
 /** Collected step values, keyed by step key (model step uses key "model"). */
 export type StepValues = Record<string, unknown>;

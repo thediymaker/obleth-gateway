@@ -69,8 +69,10 @@ const TOOL_ADDENDUM =
   "You can also check MCP servers yourself with the test_mcp tool — it runs the MCP handshake through " +
   "the gateway and lists each server's tools; pass server names, or omit them to sweep all of them. " +
   "For any how-to, setup, or configuration question about obleth itself, use the search_docs tool to look " +
-  "it up in the official documentation, then answer from what it returns and cite the page you used. If the " +
-  "docs don't cover it, say so plainly rather than guessing.";
+  "it up in the official documentation and answer from what it returns. One focused search is usually enough " +
+  "— refine and search again only if the first results genuinely miss the topic. The operator is shown the " +
+  "pages you drew from alongside your answer, so answer directly without appending a source list; name a " +
+  "page inline only when it helps. If the docs don't cover it, say so plainly rather than guessing.";
 
 /** Persona for the agent/brain loop: base voice plus tool-use guidance. */
 export const AGENT_PERSONA = [CHARO_PERSONA, TOOL_ADDENDUM].join("\n\n");
