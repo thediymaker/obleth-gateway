@@ -4,6 +4,19 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.9.0
+
+Charo grows from a testing console into a working colleague: guided activities, direct model chat, MCP verification, documentation-grounded answers with citations, and a redesigned chat panel.
+
+- **Guided activities, opened conversationally.** Testing a model's capabilities, chatting with a specific model, and benchmarking are now step-by-step workflow cards in the chat thread — pick a model and options inline. Ask Charo in plain language ("test gemma4") and it opens the right workflow itself.
+- **Probe a model's capabilities from the chat.** The capability test fires each configured boon through the gateway — quick ping, tools/web search, forced JSON, vision — with live pass/warn/fail rows, per-test output, and the request trace. The vision probe now requires a real image you attach (picker or drag-and-drop) instead of a bundled placeholder.
+- **Chat with any model directly.** A raw, persona-free line to the model you pick — a banner shows who you're talking to, and exiting returns you to Charo.
+- **MCP servers verified end-to-end.** A `test_mcp` tool runs the real MCP handshake through the gateway and lists each server's tools; the dashboard MCP tab auto-probes servers and gains a Test button. Deleting an MCP server now strips its grant from every model that had it.
+- **Ask the docs.** Charo answers how-to and configuration questions grounded in the official documentation, with cited source pages linked under the answer — and says so plainly when the docs don't cover something.
+- **The chat panel, redesigned.** Assistant replies render markdown properly; results hang off a clean rail instead of stacked gray boxes; answers stream below their sources so nothing hides off-screen; scrolling up mid-stream no longer gets yanked back; images attach via paperclip or drag-and-drop; compact type fits more in the small window. The panel is titled Gateway Chat.
+- **Charo sounds like a person.** Personality calibration, a stop button for in-flight runs, a typing indicator, and greetings no longer deflected as chit-chat.
+- **Dashboard fixes.** Model edit forms no longer revert to stale values on save; the container's `.next/cache` is writable by the runtime user.
+
 ## v0.8.1
 
 Health badges you can trust: non-chat models stop showing a false "degraded", recovered models clear themselves, and Charo opens as a pop-out modal from anywhere.
