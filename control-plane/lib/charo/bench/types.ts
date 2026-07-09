@@ -4,6 +4,7 @@ export interface StepOutcome {
   p50TtfbMs: number; p90TtfbMs: number; p99TtfbMs: number;
   p50TotalMs: number; p99TotalMs: number;
   reqPerS: number; tokensPerS: number;
+  p50DecodeTps: number; p10DecodeTps: number;
 }
 export interface BenchResult {
   modelId: string;             // model UUID — future persistence key

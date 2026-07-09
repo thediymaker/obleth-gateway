@@ -6,6 +6,7 @@ const step = (concurrency: number, p99: number, errorRate = 0): StepOutcome => (
   concurrency, completed: 100, rejected: 0, errors: 0, errorRate,
   p50TtfbMs: p99 / 2, p90TtfbMs: p99, p99TtfbMs: p99, p50TotalMs: p99, p99TotalMs: p99,
   reqPerS: concurrency, tokensPerS: concurrency * 10,
+  p50DecodeTps: 0, p10DecodeTps: 0,
 });
 
 describe("detectKnee", () => {

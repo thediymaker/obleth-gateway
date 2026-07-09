@@ -50,6 +50,14 @@ pub fn render_summary(summary: &Summary, ui_base: &str) -> String {
     } else {
         ""
     };
+    let per_stream = if summary.decode_samples > 0 {
+        format!(
+            " · per-stream p50 {:.1} p10 {:.1} tok/s",
+            summary.p50_decode_tps, summary.p10_decode_tps
+        )
+    } else {
+        String::new()
+    };
     format!(
         "verdict: {verdict}\n\
          requests: {} ok / {} attempts  ({:.0} req/s)\n\
@@ -57,6 +65,7 @@ pub fn render_summary(summary: &Summary, ui_base: &str) -> String {
          ttfb ms:  p50={} p90={} p99={}\n\
          total ms: p50={} p99={}\n\
          tokens: in {} out {}{est}\n\
+         throughput: {:.0} tok/s{per_stream}\n\
          watch in the control plane:\n\
          \u{20}\u{20}fairshare   {ui_base}/fairshare\n\
          \u{20}\u{20}accounting  {ui_base}/usage",
@@ -73,6 +82,7 @@ pub fn render_summary(summary: &Summary, ui_base: &str) -> String {
         summary.p99_total_ms,
         summary.in_tokens,
         summary.out_tokens,
+        summary.agg_out_tok_per_s,
     )
 }
 
@@ -132,5 +142,42 @@ mod tests {
         assert!(p.exists());
         assert!(p.to_string_lossy().ends_with("compression-report.md"));
         assert_eq!(std::fs::read_to_string(&p).unwrap(), "# hello\n\nbody");
+    }
+
+    #[test]
+    fn render_includes_throughput_line() {
+        let mut s = Stats::default();
+        s.record(&crate::engine::stats::RequestOutcome {
+            status: 200,
+            ttfb_ms: 100,
+            total_ms: 600,
+            in_tokens: 5,
+            out_tokens: 20,
+            usage_estimated: false,
+            gaps_ms: Vec::new(),
+        });
+        let sum = s.summarize(2.0, 0.05);
+        let out = render_summary(&sum, "http://localhost:3000");
+        assert!(out.contains("throughput: 10 tok/s"));
+        assert!(out.contains("per-stream p50 40.0 p10 40.0 tok/s"));
+    }
+
+    #[test]
+    fn render_omits_per_stream_without_decode_samples() {
+        let mut s = Stats::default();
+        // Embeddings-shaped outcome: no out tokens, no decode window.
+        s.record(&crate::engine::stats::RequestOutcome {
+            status: 200,
+            ttfb_ms: 10,
+            total_ms: 10,
+            in_tokens: 5,
+            out_tokens: 0,
+            usage_estimated: false,
+            gaps_ms: Vec::new(),
+        });
+        let sum = s.summarize(1.0, 0.05);
+        let out = render_summary(&sum, "http://localhost:3000");
+        assert!(out.contains("throughput: 0 tok/s"));
+        assert!(!out.contains("per-stream"));
     }
 }
