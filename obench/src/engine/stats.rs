@@ -37,6 +37,8 @@ pub struct Stats {
     pub stalled: bool,
     pub gaps: Vec<u64>,
     pub stall_events: u64,
+    /// Per-request decode speed (out tokens / decode second), 200s only.
+    pub decode_tps: Vec<f64>,
 }
 
 #[derive(Clone, Debug)]
@@ -60,6 +62,12 @@ pub struct Summary {
     pub p99_gap_ms: u64,
     pub gap_samples: u64,
     pub stall_events: u64,
+    /// Aggregate output-token throughput: out_tokens / elapsed wall time.
+    pub agg_out_tok_per_s: f64,
+    /// Per-stream decode speed percentiles across completed requests.
+    pub p50_decode_tps: f64,
+    pub p10_decode_tps: f64,
+    pub decode_samples: u64,
 }
 
 /// Decide whether a sequence of per-tick completed-request counts constitutes a
@@ -89,6 +97,18 @@ pub fn percentile(values: &[u64], p: f64) -> u64 {
     sorted[idx.min(sorted.len() - 1)]
 }
 
+/// Nearest-rank percentile over unsorted f64 samples. Samples are NaN-free by
+/// construction (finite tokens over a positive-ms window), so total order holds.
+pub fn percentile_f64(values: &[f64], p: f64) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).expect("decode samples are never NaN"));
+    let idx = ((p / 100.0) * sorted.len() as f64).floor() as usize;
+    sorted[idx.min(sorted.len() - 1)]
+}
+
 impl Stats {
     pub fn record(&mut self, r: &RequestOutcome) {
         *self.statuses.entry(r.status).or_insert(0) += 1;
@@ -99,6 +119,11 @@ impl Stats {
                 self.total.push(r.total_ms);
                 self.in_tokens += r.in_tokens;
                 self.out_tokens += r.out_tokens;
+                let decode_ms = r.total_ms.saturating_sub(r.ttfb_ms);
+                if r.out_tokens > 0 && decode_ms > 0 {
+                    self.decode_tps
+                        .push(r.out_tokens as f64 * 1000.0 / decode_ms as f64);
+                }
                 if r.usage_estimated {
                     self.any_estimated = true;
                 }
@@ -146,6 +171,12 @@ impl Stats {
             Verdict::Fail(issues)
         };
 
+        let agg_out_tok_per_s = if elapsed_s > 0.0 {
+            self.out_tokens as f64 / elapsed_s
+        } else {
+            0.0
+        };
+
         Summary {
             attempts,
             completed: self.ok,
@@ -166,6 +197,10 @@ impl Stats {
             p99_gap_ms: percentile(&self.gaps, 99.0),
             gap_samples: self.gaps.len() as u64,
             stall_events: self.stall_events,
+            agg_out_tok_per_s,
+            p50_decode_tps: percentile_f64(&self.decode_tps, 50.0),
+            p10_decode_tps: percentile_f64(&self.decode_tps, 10.0),
+            decode_samples: self.decode_tps.len() as u64,
         }
     }
 }
@@ -347,5 +382,87 @@ mod tests {
         // after progress, not 2 again.
         assert!(stalled, "stall should have been flagged at tick 2");
         assert_eq!(consecutive_zeros, 1, "progress reset the counter");
+    }
+
+    #[test]
+    fn percentile_f64_nearest_rank() {
+        let v = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        assert_eq!(percentile_f64(&v, 50.0), 30.0);
+        assert_eq!(percentile_f64(&v, 99.0), 50.0);
+        assert_eq!(percentile_f64(&v, 10.0), 10.0);
+        assert_eq!(percentile_f64(&[], 50.0), 0.0);
+    }
+
+    #[test]
+    fn decode_tps_computed_from_decode_window() {
+        let mut s = Stats::default();
+        // 20 out tokens over (600 - 100) = 500 ms of decode → 40 tok/s.
+        s.record(&RequestOutcome {
+            status: 200,
+            ttfb_ms: 100,
+            total_ms: 600,
+            in_tokens: 10,
+            out_tokens: 20,
+            usage_estimated: false,
+            gaps_ms: Vec::new(),
+        });
+        let sum = s.summarize(2.0, 0.05);
+        assert_eq!(sum.decode_samples, 1);
+        assert!((sum.p50_decode_tps - 40.0).abs() < 0.001);
+        assert!((sum.p10_decode_tps - 40.0).abs() < 0.001);
+        // aggregate: 20 out tokens over 2 s elapsed → 10 tok/s.
+        assert!((sum.agg_out_tok_per_s - 10.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn zero_out_tokens_and_zero_decode_time_yield_no_decode_sample() {
+        let mut s = Stats::default();
+        // Embeddings-shaped: out_tokens = 0.
+        s.record(&RequestOutcome {
+            status: 200,
+            ttfb_ms: 10,
+            total_ms: 20,
+            in_tokens: 10,
+            out_tokens: 0,
+            usage_estimated: false,
+            gaps_ms: Vec::new(),
+        });
+        // Non-streamed single chunk: ttfb == total, decode time 0.
+        s.record(&RequestOutcome {
+            status: 200,
+            ttfb_ms: 20,
+            total_ms: 20,
+            in_tokens: 10,
+            out_tokens: 4,
+            usage_estimated: false,
+            gaps_ms: Vec::new(),
+        });
+        let sum = s.summarize(1.0, 0.05);
+        assert_eq!(sum.decode_samples, 0);
+        assert_eq!(sum.p50_decode_tps, 0.0);
+        assert_eq!(sum.p10_decode_tps, 0.0);
+        // aggregate still counts the 4 tokens that did arrive.
+        assert!((sum.agg_out_tok_per_s - 4.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn p10_decode_tps_is_slow_tail() {
+        let mut s = Stats::default();
+        for tps_target in [10u64, 20, 30, 40, 50, 60, 70, 80, 90, 100] {
+            // out_tokens = tps_target over exactly 1000 ms of decode.
+            s.record(&RequestOutcome {
+                status: 200,
+                ttfb_ms: 100,
+                total_ms: 1100,
+                in_tokens: 10,
+                out_tokens: tps_target,
+                usage_estimated: false,
+                gaps_ms: Vec::new(),
+            });
+        }
+        let sum = s.summarize(10.0, 0.05);
+        assert_eq!(sum.decode_samples, 10);
+        assert!(sum.p10_decode_tps <= sum.p50_decode_tps);
+        assert!((sum.p10_decode_tps - 20.0).abs() < 0.001); // nearest-rank: idx floor(0.1*10)=1 → 20
     }
 }

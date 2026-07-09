@@ -28,6 +28,10 @@ pub struct StepData {
     pub out_tokens: u64,
     pub elapsed_s: f64,
     pub statuses: BTreeMap<u16, u64>,
+    /// Aggregate output-token throughput for this step (out_tokens / elapsed).
+    pub out_tok_per_s: f64,
+    /// p50 per-stream decode tok/s (0 when non-streaming — no decode window).
+    pub p50_decode_tps: f64,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -36,6 +40,7 @@ pub struct CapacityCard {
     pub sustainable_conc: u32,
     pub peak_req_per_s: f64,
     pub out_tok_per_s: f64,
+    pub p50_decode_tps_at_knee: f64,
     pub p50_ttfb_at_knee_ms: u64,
     pub p99_ttfb_at_knee_ms: u64,
     pub knee_reason: Option<String>,
@@ -49,20 +54,18 @@ pub fn card_from_steps(
     stop: Option<(StepData, String)>,
 ) -> CapacityCard {
     let knee = clean.last();
-    let (sustainable_conc, peak_req_per_s, p50, p99, out_tok_per_s) = match knee {
-        Some(k) => (
-            k.conc,
-            k.req_per_s,
-            k.p50_ttfb_ms,
-            k.p99_ttfb_ms,
-            if k.elapsed_s > 0.0 {
-                k.out_tokens as f64 / k.elapsed_s
-            } else {
-                0.0
-            },
-        ),
-        None => (0, 0.0, 0, 0, 0.0),
-    };
+    let (sustainable_conc, peak_req_per_s, p50, p99, out_tok_per_s, p50_decode_tps_at_knee) =
+        match knee {
+            Some(k) => (
+                k.conc,
+                k.req_per_s,
+                k.p50_ttfb_ms,
+                k.p99_ttfb_ms,
+                k.out_tok_per_s,
+                k.p50_decode_tps,
+            ),
+            None => (0, 0.0, 0, 0, 0.0, 0.0),
+        };
     let (over_knee, knee_reason) = match stop {
         Some((s, r)) => (Some(s), Some(r)),
         None => (None, None),
@@ -72,6 +75,7 @@ pub fn card_from_steps(
         sustainable_conc,
         peak_req_per_s,
         out_tok_per_s,
+        p50_decode_tps_at_knee,
         p50_ttfb_at_knee_ms: p50,
         p99_ttfb_at_knee_ms: p99,
         knee_reason,
@@ -168,11 +172,14 @@ pub async fn run_ramp(
                 out_tokens: sum.out_tokens,
                 elapsed_s: elapsed,
                 statuses: s.statuses.clone(),
+                out_tok_per_s: sum.agg_out_tok_per_s,
+                p50_decode_tps: sum.p50_decode_tps,
             }
         };
         println!(
-            "    {model} conc={conc}: {:.0} req/s  err {:.2}%  p99 {}ms",
+            "    {model} conc={conc}: {:.0} req/s  {:.0} tok/s  err {:.2}%  p99 {}ms",
             step.req_per_s,
+            step.out_tok_per_s,
             step.error_rate * 100.0,
             step.p99_ttfb_ms
         );
@@ -221,6 +228,8 @@ mod tests {
             out_tokens: 4000,
             elapsed_s: STEP_SECS as f64,
             statuses: Default::default(),
+            out_tok_per_s: 500.0, // 4000 out_tokens / 8 s
+            p50_decode_tps: 0.0,  // capacity ramp is non-streaming
         }
     }
 
@@ -235,6 +244,8 @@ mod tests {
         assert!(card.over_knee.is_some());
         assert_eq!(card.knee_reason.as_deref(), Some("error rate crossed"));
         assert!(card.out_tok_per_s > 0.0);
+        assert!((card.out_tok_per_s - 500.0).abs() < 0.001);
+        assert_eq!(card.p50_decode_tps_at_knee, 0.0);
     }
 
     #[test]
@@ -251,6 +262,8 @@ mod tests {
         let card = card_from_steps("m1", vec![], Some((sd(8, 10.0, 0.5, 900), "errors".into())));
         assert_eq!(card.sustainable_conc, 0);
         assert_eq!(card.peak_req_per_s, 0.0);
+        assert_eq!(card.out_tok_per_s, 0.0);
+        assert_eq!(card.p50_decode_tps_at_knee, 0.0);
     }
 
     #[test]

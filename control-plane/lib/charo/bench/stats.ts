@@ -12,10 +12,12 @@ export function percentile(values: number[], p: number): number {
 
 export function summarizeStep(concurrency: number, samples: Sample[], elapsedS: number): StepOutcome {
   let completed = 0, rejected = 0, errors = 0, inTok = 0, outTok = 0;
-  const ttfb: number[] = [], total: number[] = [];
+  const ttfb: number[] = [], total: number[] = [], dec: number[] = [];
   for (const s of samples) {
     if (s.status === 200) {
       completed++; ttfb.push(s.ttfbMs); total.push(s.totalMs); inTok += s.inTokens; outTok += s.outTokens;
+      const decodeMs = s.totalMs - s.ttfbMs;
+      if (s.outTokens > 0 && decodeMs > 0) dec.push((s.outTokens * 1000) / decodeMs);
     } else if (s.status === 429) { rejected++; }
     else { errors++; }
   }
@@ -28,5 +30,6 @@ export function summarizeStep(concurrency: number, samples: Sample[], elapsedS: 
     p50TtfbMs: percentile(ttfb, 50), p90TtfbMs: percentile(ttfb, 90), p99TtfbMs: percentile(ttfb, 99),
     p50TotalMs: percentile(total, 50), p99TotalMs: percentile(total, 99),
     reqPerS, tokensPerS,
+    p50DecodeTps: percentile(dec, 50), p10DecodeTps: percentile(dec, 10),
   };
 }
