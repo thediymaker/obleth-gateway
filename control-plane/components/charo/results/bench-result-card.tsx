@@ -20,6 +20,7 @@ export function BenchResultCard({ data }: { data: unknown }) {
   const steps = r.steps ?? [];
   const chart = steps.map((s) => ({
     concurrency: s.concurrency, p50: s.p50TtfbMs, p99: s.p99TtfbMs, req: Number(s.reqPerS.toFixed(2)),
+    tok: Number((s.tokensPerS ?? 0).toFixed(0)),
   }));
 
   // A knee is only a verdict if we witnessed the model degrade above it. Otherwise the
@@ -31,6 +32,7 @@ export function BenchResultCard({ data }: { data: unknown }) {
     : kneeFloor
     ? `Healthy through ${r.kneeConcurrency} concurrent · knee not reached`
     : "No knee detected";
+  const singleStream = steps.length > 0 && steps[0].concurrency === 1 ? (steps[0].p50DecodeTps ?? 0) : 0;
 
   return (
     <Rail className="w-full space-y-3">
@@ -40,7 +42,10 @@ export function BenchResultCard({ data }: { data: unknown }) {
             <span className="truncate text-[13px] font-semibold text-foreground">{r.modelName ?? "benchmark"}</span>
             <MicroLabel className="shrink-0">Benchmark</MicroLabel>
           </div>
-          <div className="text-[11.5px] text-muted-foreground">{headline}</div>
+          <div className="text-[11.5px] text-muted-foreground">
+            {headline}
+            {singleStream > 0 && ` · single-stream ${singleStream.toFixed(0)} tok/s`}
+          </div>
         </div>
         {r.grade && (
           <div className="flex shrink-0 flex-col items-end gap-0.5">
@@ -57,6 +62,7 @@ export function BenchResultCard({ data }: { data: unknown }) {
             <XAxis dataKey="concurrency" tick={{ fontSize: 11 }} label={{ value: "concurrency", position: "insideBottom", offset: -2, fontSize: 11 }} />
             <YAxis yAxisId="lat" tick={{ fontSize: 11 }} width={44} />
             <YAxis yAxisId="rps" orientation="right" tick={{ fontSize: 11 }} width={40} />
+            <YAxis yAxisId="tok" orientation="right" tick={{ fontSize: 11 }} width={44} />
             <Tooltip contentStyle={{ fontSize: 12 }} />
             <Legend wrapperStyle={{ fontSize: 11 }} />
             {r.kneeConcurrency != null && (
@@ -65,6 +71,7 @@ export function BenchResultCard({ data }: { data: unknown }) {
             <Line yAxisId="lat" type="monotone" dataKey="p50" name="p50 TTFT ms" stroke="hsl(189 82% 45%)" dot={false} isAnimationActive={false} />
             <Line yAxisId="lat" type="monotone" dataKey="p99" name="p99 TTFT ms" stroke="hsl(267 86% 66%)" dot={false} isAnimationActive={false} />
             <Line yAxisId="rps" type="monotone" dataKey="req" name="req/s" stroke="hsl(142 71% 45%)" dot={false} isAnimationActive={false} />
+            <Line yAxisId="tok" type="monotone" dataKey="tok" name="tok/s" stroke="hsl(32 95% 55%)" dot={false} isAnimationActive={false} />
           </ComposedChart>
         </ResponsiveContainer>
       </div>
@@ -75,6 +82,10 @@ export function BenchResultCard({ data }: { data: unknown }) {
             <div className="font-medium">×{s.concurrency}</div>
             <div className="text-muted-foreground">{s.reqPerS.toFixed(1)} req/s</div>
             <div className="text-muted-foreground">p99 {s.p99TtfbMs}ms</div>
+            <div className="text-muted-foreground">
+              {(s.tokensPerS ?? 0).toFixed(0)} tok/s
+              {(s.p50DecodeTps ?? 0) > 0 && ` · ${s.p50DecodeTps.toFixed(0)}/stream`}
+            </div>
             {(s.errors > 0 || s.rejected > 0) && (
               <div className="text-muted-foreground">{s.errors} err · {s.rejected} rej</div>
             )}

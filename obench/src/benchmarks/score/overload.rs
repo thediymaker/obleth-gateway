@@ -100,6 +100,8 @@ mod tests {
             out_tokens: 0,
             elapsed_s: STEP_SECS as f64,
             statuses: map,
+            out_tok_per_s: 0.0,
+            p50_decode_tps: 0.0,
         }
     }
 

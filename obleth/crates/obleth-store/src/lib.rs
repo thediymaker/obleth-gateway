@@ -589,17 +589,29 @@ impl Store {
         let result: Result<()> = async {
             // Reserved tenant: fixed id, default fairshare group, no per-minute
             // rate cap (tokens_per_minute = 0), no model allowlist (null ⇒ every
-            // model + MCP). on-conflict makes this a no-op once provisioned.
+            // model + MCP). Marked synthetic so all of Charo's traffic — the
+            // model-test console and dashboard benchmarks — is tagged
+            // `benchmark` in the ledger and stays out of real usage stats by
+            // default. on-conflict makes this a no-op once provisioned.
             sqlx::query(
                 "insert into tenants
-                     (id, name, fairshare_group, weight, tokens_per_minute, description)
+                     (id, name, fairshare_group, weight, tokens_per_minute, description, synthetic)
                  values ($1, '__control_plane__', 'default', 100, 0,
-                         'Reserved identity for the in-app Charo model test console')
+                         'Reserved identity for the in-app Charo model test console', true)
                  on conflict (id) do nothing",
             )
             .bind(Self::CONTROL_PLANE_TENANT_ID)
             .execute(&self.pool)
             .await?;
+
+            // Existing deployments provisioned before the synthetic flag: flip
+            // it on idempotently so their Charo/benchmark traffic stops
+            // clobbering usage stats. Uses raw sql (not set_tenant_synthetic,
+            // which guards the reserved tenant against external mutation).
+            sqlx::query("update tenants set synthetic = true where id = $1 and synthetic = false")
+                .bind(Self::CONTROL_PLANE_TENANT_ID)
+                .execute(&self.pool)
+                .await?;
 
             // Key secret already stored ⇒ the api key exists; nothing more to do.
             if self.control_plane_key_secret().await?.is_some() {
@@ -3961,6 +3973,14 @@ mod tests {
             .expect("resolve")
             .expect("present");
         assert_eq!(resolved.tenant_id, Store::CONTROL_PLANE_TENANT_ID);
+
+        // The reserved tenant is synthetic, so its traffic is tagged
+        // `benchmark` and excluded from usage stats by default. This must hold
+        // on the resolved hot-path view the proxy actually reads.
+        assert!(
+            resolved.synthetic,
+            "control-plane traffic must resolve as synthetic"
+        );
 
         // Exactly one key under the reserved tenant (idempotent, no duplicates).
         let keys = store

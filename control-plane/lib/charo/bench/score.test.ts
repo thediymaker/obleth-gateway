@@ -6,6 +6,7 @@ const step = (c: number, p99: number, reqPerS: number, errors = 0, completed = 1
   concurrency: c, completed, rejected: 0, errors, errorRate: errors / (completed + errors),
   p50TtfbMs: p99 / 2, p90TtfbMs: p99, p99TtfbMs: p99, p50TotalMs: p99, p99TotalMs: p99,
   reqPerS, tokensPerS: reqPerS * 10,
+  p50DecodeTps: 0, p10DecodeTps: 0,
 });
 
 describe("gradeFromScore (obench thresholds)", () => {

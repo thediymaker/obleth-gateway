@@ -31,4 +31,25 @@ describe("summarizeStep", () => {
     expect(s.reqPerS).toBe(0);
     expect(s.p99TtfbMs).toBe(0);
   });
+
+  it("computes decode tok/s from the post-TTFB window, p50 and p10", () => {
+    // 20 out tokens over (600 - 100) = 500 ms decode → 40 tok/s each.
+    const s = summarizeStep(2, [
+      { status: 200, ttfbMs: 100, totalMs: 600, inTokens: 10, outTokens: 20 },
+      { status: 200, ttfbMs: 100, totalMs: 600, inTokens: 10, outTokens: 20 },
+    ], 2);
+    expect(s.p50DecodeTps).toBeCloseTo(40, 3);
+    expect(s.p10DecodeTps).toBeCloseTo(40, 3);
+    expect(s.tokensPerS).toBeCloseTo(20, 3); // 40 tokens / 2 s aggregate — unchanged
+  });
+
+  it("skips decode samples for zero out-tokens and zero decode time", () => {
+    const s = summarizeStep(1, [
+      { status: 200, ttfbMs: 10, totalMs: 20, inTokens: 10, outTokens: 0 },  // no tokens
+      { status: 200, ttfbMs: 20, totalMs: 20, inTokens: 10, outTokens: 4 },  // no window
+    ], 1);
+    expect(s.p50DecodeTps).toBe(0);
+    expect(s.p10DecodeTps).toBe(0);
+    expect(s.tokensPerS).toBeCloseTo(4, 3); // aggregate still counts arrived tokens
+  });
 });
