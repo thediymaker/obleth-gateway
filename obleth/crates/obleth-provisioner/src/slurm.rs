@@ -305,7 +305,20 @@ impl SlurmClient for Slurmrestd {
             );
         }
         if let Some(t) = &job.time_limit {
-            m.insert("time_limit".into(), serde_json::json!(t));
+            // slurmrestd's `time_limit` is an integer number of minutes, not a
+            // Slurm walltime string: submitting `"0-04:00:00"` fails with
+            // `Expected integer ... Unable to convert Date type` (500). Parse the
+            // operator's Slurm-format walltime into minutes here. If it doesn't
+            // parse, omit the field rather than send a value slurmrestd rejects —
+            // the cluster's partition default applies.
+            if let Some(mins) = time_limit_to_minutes(t) {
+                m.insert("time_limit".into(), serde_json::json!(mins));
+            } else {
+                tracing::warn!(
+                    time_limit = %t,
+                    "unparseable time_limit; omitting so the partition default applies"
+                );
+            }
         }
         if let Some(a) = &job.account {
             m.insert("account".into(), serde_json::json!(a));
@@ -454,6 +467,51 @@ fn time_minutes(v: &serde_json::Value) -> Option<String> {
     v.as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())
 }
 
+/// Convert a Slurm-format walltime into whole minutes for the slurmrestd
+/// `time_limit` field (which wants an integer, not a `D-HH:MM:SS` string).
+///
+/// Accepts every form Slurm's `--time` does: `minutes`, `MM:SS`, `HH:MM:SS`,
+/// `D-HH`, `D-HH:MM`, `D-HH:MM:SS`. Seconds round **up** to the next whole
+/// minute (matching Slurm, and never under-allocating). Returns `None` for an
+/// unparseable or non-positive value so the caller can omit the field and fall
+/// back to the partition default rather than submit something slurmrestd rejects.
+fn time_limit_to_minutes(raw: &str) -> Option<i64> {
+    let s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    // Optional leading `D-` day part; the remainder is a `[[HH:]MM:]SS`-style
+    // colon list whose meaning depends on how many components are present.
+    let (days, rest) = match s.split_once('-') {
+        Some((d, rest)) => (d.trim().parse::<i64>().ok()?, rest.trim()),
+        None => (0, s),
+    };
+    let parts: Vec<i64> = rest
+        .split(':')
+        .map(|p| p.trim().parse::<i64>().ok())
+        .collect::<Option<Vec<_>>>()?;
+    if parts.iter().any(|&n| n < 0) {
+        return None;
+    }
+    // With a day part, a bare number is hours (`D-HH`); without one it is minutes.
+    let (hours, minutes, seconds) = match (days > 0 || s.contains('-'), parts.as_slice()) {
+        (true, [h]) => (*h, 0, 0),
+        (true, [h, m]) => (*h, *m, 0),
+        (true, [h, m, sec]) => (*h, *m, *sec),
+        (false, [m]) => (0, *m, 0),
+        (false, [m, sec]) => (0, *m, *sec),
+        (false, [h, m, sec]) => (*h, *m, *sec),
+        _ => return None,
+    };
+    let total_secs = ((days * 24 + hours) * 60 + minutes) * 60 + seconds;
+    if total_secs <= 0 {
+        return None;
+    }
+    // Round partial minutes up so we never allocate less walltime than asked.
+    // (`total_secs` is > 0 here, so plain ceil arithmetic is safe.)
+    Some((total_secs + 59) / 60)
+}
+
 /// A slurmrestd field that may be a CSV string or an array of strings.
 fn str_list(v: Option<&serde_json::Value>) -> Vec<String> {
     match v {
@@ -597,6 +655,30 @@ mod tests {
         assert!(j
             .script
             .contains("apptainer exec --nv 'vllm.sif' vllm serve nemotron"));
+    }
+
+    #[test]
+    fn time_limit_to_minutes_covers_every_slurm_form() {
+        // minutes / MM:SS / HH:MM:SS
+        assert_eq!(time_limit_to_minutes("120"), Some(120));
+        assert_eq!(time_limit_to_minutes("30:00"), Some(30));
+        assert_eq!(time_limit_to_minutes("4:00:00"), Some(240));
+        // days: D-HH / D-HH:MM / D-HH:MM:SS (the dashboard's default form)
+        assert_eq!(time_limit_to_minutes("0-04:00:00"), Some(240));
+        assert_eq!(time_limit_to_minutes("1-00"), Some(24 * 60));
+        assert_eq!(time_limit_to_minutes("2-12:30"), Some((2 * 24 + 12) * 60 + 30));
+        // seconds round up to the next whole minute (never under-allocate)
+        assert_eq!(time_limit_to_minutes("0:30"), Some(1));
+        assert_eq!(time_limit_to_minutes("1:01"), Some(2));
+    }
+
+    #[test]
+    fn time_limit_to_minutes_rejects_garbage_and_zero() {
+        for bad in ["", "  ", "4h", "abc", "1-", "1:2:3:4", "-5"] {
+            assert_eq!(time_limit_to_minutes(bad), None, "should reject {bad:?}");
+        }
+        assert_eq!(time_limit_to_minutes("0"), None);
+        assert_eq!(time_limit_to_minutes("0:00"), None);
     }
 
     #[test]
