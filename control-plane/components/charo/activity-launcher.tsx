@@ -12,7 +12,7 @@ function useActivities(): Activity[] {
 const TINT: Record<string, string> = {
   test_capabilities: "bg-violet-500/15 text-violet-300",
   chat_with_model: "bg-sky-400/15 text-sky-300",
-  benchmark: "bg-emerald-400/12 text-emerald-300",
+  benchmark: "bg-emerald-400/15 text-emerald-300",
 };
 const DEFAULT_TINT = "bg-violet-500/15 text-violet-300";
 

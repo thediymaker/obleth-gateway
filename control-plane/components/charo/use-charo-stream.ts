@@ -5,6 +5,7 @@ import type { CharoState } from "./sprite";
 import type { TraceSummary } from "@/lib/charo/trace";
 import type { StepOutcome } from "@/lib/charo/bench/types";
 import { ensureActivitiesRegistered, getActivity } from "@/lib/charo/activities";
+import { stripHiddenReasoning } from "@/lib/charo/visible-text";
 
 export interface ChatTurn {
   id: string;
@@ -80,7 +81,10 @@ function toWire(turns: ChatTurn[]): WireMessage[] {
           ],
         };
       }
-      return { role: t.role, content: t.content };
+      return {
+        role: t.role,
+        content: t.role === "assistant" ? stripHiddenReasoning(t.content) : t.content,
+      };
     });
 }
 
@@ -239,7 +243,7 @@ export function useCharoStream() {
       await readSSE(res, signal, (event, parsed) => {
         if (event === "token") {
           const t = String(parsed.text ?? "");
-          patchTurn(assistantId, (m) => ({ ...m, content: m.content + t }));
+          patchTurn(assistantId, (m) => ({ ...m, content: stripHiddenReasoning(m.content + t) }));
         } else if (event === "trace") {
           const trace = (parsed.trace ?? null) as TraceSummary | null;
           patchTurn(assistantId, (m) => ({ ...m, trace, tracePending: trace === null }));
@@ -272,7 +276,7 @@ export function useCharoStream() {
     ) => {
       if (event === "token") {
         const t = String(parsed.text ?? "");
-        patchTurn(assistantId, (m) => ({ ...m, content: m.content + t }));
+        patchTurn(assistantId, (m) => ({ ...m, content: stripHiddenReasoning(m.content + t) }));
       } else if (event === "confirm") {
         const name = String(parsed.name ?? "");
         patchTurn(assistantId, (m) => ({

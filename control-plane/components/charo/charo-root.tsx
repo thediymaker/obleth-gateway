@@ -33,7 +33,6 @@ export function CharoRoot() {
         onExpand={() => setExpanded(true)}
         onCollapse={() => setExpanded(false)}
         stream={stream}
-        mascotState={stream.state}
       />
     </>
   );
