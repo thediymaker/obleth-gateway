@@ -1337,6 +1337,12 @@ export const obleth = {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
+  clearProvisionError: (id: string, options?: AuditOptions) =>
+    api<{ ok: boolean }>(`/models/${id}/managed/provision-error`, {
+      method: "PATCH",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ error: null }),
+    }),
   slurmResources: () => api<ClusterResources>(`/slurm/resources`),
   listRecipes: () => api<Recipe[]>(`/recipes`),
   createRecipe: (
