@@ -666,7 +666,10 @@ mod tests {
         // days: D-HH / D-HH:MM / D-HH:MM:SS (the dashboard's default form)
         assert_eq!(time_limit_to_minutes("0-04:00:00"), Some(240));
         assert_eq!(time_limit_to_minutes("1-00"), Some(24 * 60));
-        assert_eq!(time_limit_to_minutes("2-12:30"), Some((2 * 24 + 12) * 60 + 30));
+        assert_eq!(
+            time_limit_to_minutes("2-12:30"),
+            Some((2 * 24 + 12) * 60 + 30)
+        );
         // seconds round up to the next whole minute (never under-allocate)
         assert_eq!(time_limit_to_minutes("0:30"), Some(1));
         assert_eq!(time_limit_to_minutes("1:01"), Some(2));
