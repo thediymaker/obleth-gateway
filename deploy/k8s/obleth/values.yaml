@@ -212,12 +212,16 @@ provisioner:
   enabled: false
   # Reconcile cadence. Lower = faster reaction, more slurmrestd/API traffic.
   intervalSecs: 15
-  # Self-heal: restart a healthy replica after this many consecutive failed
-  # health probes while its Slurm job still reports RUNNING (a zombie job —
-  # allocation alive, inference server dead). 0 disables. Restarts are also
-  # capped at one per model per tick, so a probe-side network problem rolls
-  # replicas gradually instead of mass-cancelling them.
-  restartAfterFailures: 3
+  # Self-heal: restart a healthy replica after this many net failing
+  # health-probe ticks while its Slurm job still reports RUNNING (a zombie job
+  # — allocation alive, inference server dead). The counter decays on a passing
+  # probe, so brief flaps on a busy single-threaded server don't accumulate;
+  # 20 ticks at the default 15s interval is ~5 minutes of sustained failure.
+  # 0 disables. Restarts are also capped at one per model per tick, so a
+  # probe-side network problem rolls replicas gradually instead of
+  # mass-cancelling them. Keep in sync with the binary default in
+  # crates/obleth-provisioner/src/config.rs.
+  restartAfterFailures: 20
   logLevel: "info,obleth_provisioner=debug"
   resources:
     requests: { cpu: "50m", memory: "64Mi" }
