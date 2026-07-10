@@ -4,6 +4,14 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.9.2
+
+Managed-model config catches bad inputs before Slurm does, provisioning-error notices can be dismissed, and a dead replica pool can no longer ride a stale success to "healthy".
+
+- **Managed-model settings validate before saving.** The Placement and Service fields now check their inputs client-side — time limit format, port range, replica counts, node/CPU numbers — and highlight the offending field with an inline hint, instead of forwarding a malformed value and surfacing an opaque `slurmrestd` 500. Each field also carries a short format hint.
+- **Provisioning-error banners are dismissible.** When the provisioner rejects a job (bad account / partition / QoS), the model's error banner can now be cleared once you've fixed the cause — it returns on its own if the next launch also fails.
+- **A model whose replicas have all died no longer reports "healthy".** For Slurm-provisioned / dynamic-endpoint models, a recent passive success from the usage ledger could stand in as the health verdict even after every replica behind it went away — a success served just before the pool emptied. The passive shortcut now only settles a pool that still has a live endpoint serving; an empty or fully-dead pool reports its own reality.
+
 ## v0.9.1
 
 Benchmarks report tokens-per-second, and benchmark traffic finally stays out of your real usage numbers.

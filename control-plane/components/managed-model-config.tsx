@@ -8,6 +8,10 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useClusterResources } from "@/lib/use-cluster-resources";
 import type { ManagedModelSpec, PutManagedModel } from "@/lib/obleth";
+import {
+  MANAGED_FIELD_HINTS,
+  validateManagedModelForm,
+} from "@/lib/managed-model-schema";
 import { cn } from "@/lib/utils";
 
 type Message = { tone: "success" | "error"; text: string };
@@ -16,6 +20,7 @@ export function ManagedModelConfig({ modelId, onSaved }: { modelId: string; onSa
   const qc = useQueryClient();
   const cluster = useClusterResources();
   const [msg, setMsg] = useState<Message | null>(null);
+  const [errors, setErrors] = useState<Record<string, string>>({});
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
   const { data, isLoading } = useQuery({
@@ -47,9 +52,21 @@ export function ManagedModelConfig({ modelId, onSaved }: { modelId: string; onSa
     if (saving) return;
     setMsg(null);
     setSaved(false);
-    setSaving(true);
     const fd = new FormData(e.currentTarget);
     const s = (k: string) => String(fd.get(k) ?? "");
+
+    // Validate placement/service inputs before touching the API so a bad
+    // time_limit or port is caught here, not as an opaque slurmrestd 500.
+    const raw: Record<string, string> = {};
+    for (const key of Object.keys(MANAGED_FIELD_HINTS)) raw[key] = s(key);
+    const fieldErrors = validateManagedModelForm(raw);
+    if (Object.keys(fieldErrors).length > 0) {
+      setErrors(fieldErrors);
+      setMsg({ tone: "error", text: "Fix the highlighted fields before saving." });
+      return;
+    }
+    setErrors({});
+    setSaving(true);
     const sOrNull = (k: string) => {
       const v = s(k).trim();
       return v ? v : null;
@@ -168,53 +185,53 @@ export function ManagedModelConfig({ modelId, onSaved }: { modelId: string; onSa
 
           <div className="grid divide-y divide-border/60 xl:grid-cols-[minmax(0,1fr)_minmax(300px,0.72fr)] xl:divide-x xl:divide-y-0">
             <FormSection title="Placement">
-              <FieldCell label="Partition" htmlFor="slurm_partition">
-                <Input id="slurm_partition" name="slurm_partition" defaultValue={d.partition} list="slurm-partitions" />
+              <FieldCell label="Partition" htmlFor="slurm_partition" hint={MANAGED_FIELD_HINTS.slurm_partition} error={errors.slurm_partition}>
+                <Input id="slurm_partition" name="slurm_partition" defaultValue={d.partition} list="slurm-partitions" aria-invalid={!!errors.slurm_partition} />
               </FieldCell>
-              <FieldCell label="GRES" htmlFor="slurm_gres">
-                <Input id="slurm_gres" name="slurm_gres" defaultValue={d.gres ?? ""} className="font-mono" />
+              <FieldCell label="GRES" htmlFor="slurm_gres" hint={MANAGED_FIELD_HINTS.slurm_gres} error={errors.slurm_gres}>
+                <Input id="slurm_gres" name="slurm_gres" defaultValue={d.gres ?? ""} className="font-mono" aria-invalid={!!errors.slurm_gres} />
               </FieldCell>
-              <FieldCell label="CPUs per task" htmlFor="slurm_cpus_per_task">
-                <Input id="slurm_cpus_per_task" name="slurm_cpus_per_task" defaultValue={d.cpus_per_task != null ? String(d.cpus_per_task) : ""} />
+              <FieldCell label="CPUs per task" htmlFor="slurm_cpus_per_task" hint={MANAGED_FIELD_HINTS.slurm_cpus_per_task} error={errors.slurm_cpus_per_task}>
+                <Input id="slurm_cpus_per_task" name="slurm_cpus_per_task" defaultValue={d.cpus_per_task != null ? String(d.cpus_per_task) : ""} aria-invalid={!!errors.slurm_cpus_per_task} />
               </FieldCell>
-              <FieldCell label="Memory" htmlFor="slurm_mem">
-                <Input id="slurm_mem" name="slurm_mem" defaultValue={d.mem ?? ""} />
+              <FieldCell label="Memory" htmlFor="slurm_mem" hint={MANAGED_FIELD_HINTS.slurm_mem} error={errors.slurm_mem}>
+                <Input id="slurm_mem" name="slurm_mem" defaultValue={d.mem ?? ""} aria-invalid={!!errors.slurm_mem} />
               </FieldCell>
-              <FieldCell label="Nodes" htmlFor="slurm_nodes">
-                <Input id="slurm_nodes" name="slurm_nodes" defaultValue={String(d.nodes ?? 1)} />
+              <FieldCell label="Nodes" htmlFor="slurm_nodes" hint={MANAGED_FIELD_HINTS.slurm_nodes} error={errors.slurm_nodes}>
+                <Input id="slurm_nodes" name="slurm_nodes" defaultValue={String(d.nodes ?? 1)} aria-invalid={!!errors.slurm_nodes} />
               </FieldCell>
-              <FieldCell label="QoS" htmlFor="slurm_qos">
-                <Input id="slurm_qos" name="slurm_qos" defaultValue={d.qos ?? ""} list="slurm-qos" />
+              <FieldCell label="QoS" htmlFor="slurm_qos" hint={MANAGED_FIELD_HINTS.slurm_qos} error={errors.slurm_qos}>
+                <Input id="slurm_qos" name="slurm_qos" defaultValue={d.qos ?? ""} list="slurm-qos" aria-invalid={!!errors.slurm_qos} />
               </FieldCell>
-              <FieldCell label="Account" htmlFor="slurm_account">
-                <Input id="slurm_account" name="slurm_account" defaultValue={d.account ?? ""} list="slurm-accounts" />
+              <FieldCell label="Account" htmlFor="slurm_account" hint={MANAGED_FIELD_HINTS.slurm_account} error={errors.slurm_account}>
+                <Input id="slurm_account" name="slurm_account" defaultValue={d.account ?? ""} list="slurm-accounts" aria-invalid={!!errors.slurm_account} />
               </FieldCell>
-              <FieldCell label="Time limit" htmlFor="slurm_time_limit">
-                <Input id="slurm_time_limit" name="slurm_time_limit" defaultValue={d.time_limit ?? ""} />
+              <FieldCell label="Time limit" htmlFor="slurm_time_limit" hint={MANAGED_FIELD_HINTS.slurm_time_limit} error={errors.slurm_time_limit}>
+                <Input id="slurm_time_limit" name="slurm_time_limit" defaultValue={d.time_limit ?? ""} placeholder="0-04:00:00" aria-invalid={!!errors.slurm_time_limit} />
               </FieldCell>
-              <FieldCell label="Constraints" htmlFor="slurm_constraints">
-                <Input id="slurm_constraints" name="slurm_constraints" defaultValue={d.constraints ?? ""} />
+              <FieldCell label="Constraints" htmlFor="slurm_constraints" hint={MANAGED_FIELD_HINTS.slurm_constraints} error={errors.slurm_constraints}>
+                <Input id="slurm_constraints" name="slurm_constraints" defaultValue={d.constraints ?? ""} aria-invalid={!!errors.slurm_constraints} />
               </FieldCell>
-              <FieldCell label="Exclude" htmlFor="slurm_exclude">
-                <Input id="slurm_exclude" name="slurm_exclude" defaultValue={d.exclude ?? ""} />
+              <FieldCell label="Exclude" htmlFor="slurm_exclude" hint={MANAGED_FIELD_HINTS.slurm_exclude} error={errors.slurm_exclude}>
+                <Input id="slurm_exclude" name="slurm_exclude" defaultValue={d.exclude ?? ""} aria-invalid={!!errors.slurm_exclude} />
               </FieldCell>
             </FormSection>
 
             <FormSection title="Service" columns={2}>
-              <FieldCell label="Serving port" htmlFor="slurm_serving_port">
-                <Input id="slurm_serving_port" name="slurm_serving_port" defaultValue={String(d.serving_port)} />
+              <FieldCell label="Serving port" htmlFor="slurm_serving_port" hint={MANAGED_FIELD_HINTS.slurm_serving_port} error={errors.slurm_serving_port}>
+                <Input id="slurm_serving_port" name="slurm_serving_port" defaultValue={String(d.serving_port)} aria-invalid={!!errors.slurm_serving_port} />
               </FieldCell>
-              <FieldCell label="Health path" htmlFor="slurm_health_path">
-                <Input id="slurm_health_path" name="slurm_health_path" defaultValue={d.health_path} className="font-mono" />
+              <FieldCell label="Health path" htmlFor="slurm_health_path" hint={MANAGED_FIELD_HINTS.slurm_health_path} error={errors.slurm_health_path}>
+                <Input id="slurm_health_path" name="slurm_health_path" defaultValue={d.health_path} className="font-mono" aria-invalid={!!errors.slurm_health_path} />
               </FieldCell>
-              <FieldCell label="Min replicas" htmlFor="slurm_min_replicas">
-                <Input id="slurm_min_replicas" name="slurm_min_replicas" defaultValue={String(d.min_replicas ?? 1)} />
+              <FieldCell label="Min replicas" htmlFor="slurm_min_replicas" hint={MANAGED_FIELD_HINTS.slurm_min_replicas} error={errors.slurm_min_replicas}>
+                <Input id="slurm_min_replicas" name="slurm_min_replicas" defaultValue={String(d.min_replicas ?? 1)} aria-invalid={!!errors.slurm_min_replicas} />
               </FieldCell>
-              <FieldCell label="Target replicas" htmlFor="slurm_target_replicas">
-                <Input id="slurm_target_replicas" name="slurm_target_replicas" defaultValue={String(d.target_replicas ?? 2)} />
+              <FieldCell label="Target replicas" htmlFor="slurm_target_replicas" hint={MANAGED_FIELD_HINTS.slurm_target_replicas} error={errors.slurm_target_replicas}>
+                <Input id="slurm_target_replicas" name="slurm_target_replicas" defaultValue={String(d.target_replicas ?? 2)} aria-invalid={!!errors.slurm_target_replicas} />
               </FieldCell>
-              <FieldCell label="Max job failures" htmlFor="slurm_max_job_failures">
-                <Input id="slurm_max_job_failures" name="slurm_max_job_failures" defaultValue={String(d.max_job_failures ?? 0)} />
+              <FieldCell label="Max job failures" htmlFor="slurm_max_job_failures" hint={MANAGED_FIELD_HINTS.slurm_max_job_failures} error={errors.slurm_max_job_failures}>
+                <Input id="slurm_max_job_failures" name="slurm_max_job_failures" defaultValue={String(d.max_job_failures ?? 0)} aria-invalid={!!errors.slurm_max_job_failures} />
               </FieldCell>
             </FormSection>
           </div>
@@ -324,16 +341,29 @@ function FormSection({
 function FieldCell({
   label,
   htmlFor,
+  hint,
+  error,
   children,
 }: {
   label: string;
   htmlFor: string;
+  hint?: string;
+  error?: string;
   children: React.ReactNode;
 }) {
   return (
     <div className="min-w-0 space-y-1.5">
       <Label htmlFor={htmlFor}>{label}</Label>
       {children}
+      {error ? (
+        <p id={`${htmlFor}-error`} className="text-[11px] leading-snug text-destructive">
+          {error}
+        </p>
+      ) : hint ? (
+        <p id={`${htmlFor}-hint`} className="text-[11px] leading-snug text-muted-foreground">
+          {hint}
+        </p>
+      ) : null}
     </div>
   );
 }

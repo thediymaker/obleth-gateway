@@ -453,18 +453,15 @@ async fn run_model_health_check(
             message: Some("model route is disabled".to_string()),
             response_excerpt: None,
         }
-    } else if let Some(passive) = passive_signal(
-        state,
-        &model,
-        passive_window_secs(summary.check_interval_secs),
-    )
-    .await
-    {
-        passive
     } else if model.api_base.trim().is_empty() {
-        // No static api_base (Slurm-provisioned / dynamic endpoints): the model
-        // is only as healthy as its live endpoint pool. Probing the empty base
-        // would always report "unreachable" and flap the model to "down".
+        // No static api_base (Slurm-provisioned / dynamic endpoints): the live
+        // endpoint pool is the ground truth. A passive 2xx is only trustworthy
+        // while the pool that served it still exists — once every replica dies a
+        // recent success is stale (traffic served just before they went away) and
+        // must not mask an empty pool as "healthy". So derive the pool verdict
+        // first and only let a free passive success settle a pool that is still
+        // serving. Probing the empty base directly would always report
+        // "unreachable" and flap the model to "down".
         // Use min_replicas from the managed spec as the health floor; fall back
         // to 1 when the spec is absent (e.g. a transient race or data gap).
         let min_replicas = state
@@ -474,7 +471,26 @@ async fn run_model_health_check(
             .ok()
             .flatten()
             .unwrap_or(1);
-        aggregate_endpoint_health(&endpoint_results, min_replicas)
+        let pool = aggregate_endpoint_health(&endpoint_results, min_replicas);
+        if pool_is_serving(&pool.status) {
+            passive_signal(
+                state,
+                &model,
+                passive_window_secs(summary.check_interval_secs),
+            )
+            .await
+            .unwrap_or(pool)
+        } else {
+            pool
+        }
+    } else if let Some(passive) = passive_signal(
+        state,
+        &model,
+        passive_window_secs(summary.check_interval_secs),
+    )
+    .await
+    {
+        passive
     } else {
         liveness_probe(state, &model).await
     };
@@ -942,6 +958,15 @@ async fn probe_endpoints(state: &AdminState, model: &ModelRoute) -> Vec<ProbeRes
         results.push(result);
     }
     results
+}
+
+/// True when a dynamic-endpoint pool has at least one live endpoint answering
+/// (`healthy` or `degraded`). Only a serving pool may be settled by a free
+/// passive success; an empty or fully-dead/unverified pool must report its own
+/// reality so a model whose replicas have all died can't ride a stale 2xx to
+/// "healthy".
+fn pool_is_serving(status: &str) -> bool {
+    matches!(status, "healthy" | "degraded")
 }
 
 /// Derive a model-level status from its endpoint pool, for models with no static
@@ -1447,6 +1472,18 @@ mod tests {
     fn aggregate_empty_pool_is_unhealthy() {
         let agg = aggregate_endpoint_health(&[], 1);
         assert_eq!(agg.status, "unhealthy");
+    }
+
+    #[test]
+    fn pool_serving_gates_passive_override() {
+        // A serving pool (healthy/degraded) may be settled by a passive success…
+        assert!(pool_is_serving("healthy"));
+        assert!(pool_is_serving("degraded"));
+        // …but an empty/dead/unverified pool must report its own reality, so a
+        // stale passive 2xx can't mask a model whose replicas have all died.
+        assert!(!pool_is_serving("unhealthy"));
+        assert!(!pool_is_serving("unknown"));
+        assert!(!pool_is_serving("disabled"));
     }
 
     #[test]
