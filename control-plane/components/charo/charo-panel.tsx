@@ -15,19 +15,9 @@ import { ActivityCards } from "./activity-launcher";
 import { ensureActivitiesRegistered, getActivity } from "@/lib/charo/activities";
 import { coalesceDocsResults } from "@/lib/charo/docs/coalesce-docs-results";
 import { CharoMarkdown } from "./markdown";
-import { MicroLabel } from "./rail";
 import type { useCharoStream } from "./use-charo-stream";
-import type { CharoState } from "./sprite";
 
 type Stream = ReturnType<typeof useCharoStream>;
-
-const MASCOT: Record<CharoState, string> = {
-  idle: "/charo/charo-dark-idle.png",
-  held: "/charo/charo-dark-idle.png",
-  thinking: "/charo/charo-dark-thinking.png",
-  result: "/charo/charo-dark-result.png",
-  error: "/charo/charo-dark-error.png",
-};
 
 // Animated aura + rotating border, shared by the docked and expanded frames.
 const PANEL_CSS = `
@@ -96,7 +86,7 @@ const PANEL_CSS = `
 // first token, so a pending response never reads as dead air.
 function TypingDots() {
   return (
-    <span className="flex items-center gap-1 py-1" role="status" aria-label="Charo is thinking">
+    <span className="flex h-5 items-center gap-1" role="status" aria-label="Charo is thinking">
       {[0, 160, 320].map((d) => (
         <span
           key={d}
@@ -115,7 +105,6 @@ export function CharoPanel({
   onExpand,
   onCollapse,
   stream,
-  mascotState,
 }: {
   open: boolean;
   /** When true the panel renders as a large centered modal instead of the dock. */
@@ -124,7 +113,6 @@ export function CharoPanel({
   onExpand: () => void;
   onCollapse: () => void;
   stream: Stream;
-  mascotState: CharoState;
 }) {
   const { messages, busy, send, stop, reset, confirmRun, confirmCancel,
           startActivity, submitActivity, cancelActivity, activeTarget, clearTarget } = stream;
@@ -208,8 +196,11 @@ export function CharoPanel({
     setImage(null);
   };
 
-  const mascot = MASCOT[mascotState];
   const canSend = !busy && (!!text.trim() || !!image);
+  const assistantBubbleClass = cn(
+    "min-w-0 max-w-full rounded-[14px] rounded-bl-[4px] border border-border/70 bg-secondary/45 px-3 py-[7px] shadow-[0_1px_0_hsl(240_5%_100%/0.03)]",
+    expanded ? "sm:max-w-[82%]" : "sm:max-w-[88%]",
+  );
 
   // Shown while a file drag hovers the panel.
   const dropOverlay = dragOver ? (
@@ -304,15 +295,16 @@ export function CharoPanel({
           const hasLiveBench = (m.liveSteps?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0;
           const hasLiveCaps = (m.liveCapabilities?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0;
           const hasToolResults = (m.toolResults?.length ?? 0) > 0;
-          const showBubble = !!content || !!m.image || !!m.error || !m.streaming;
+          const showBubble = !!content || !!m.image || !!m.error;
           if (!showBubble && !hasTrace && !hasLiveBench && !hasLiveCaps && !hasToolResults && !m.pendingConfirm) {
             // Streaming but nothing to show yet (waiting on the first token or a
             // tool's first progress event): show the typing indicator, not dead air.
             if (!m.streaming) return null;
             return (
               <div key={m.id} className="flex flex-col items-start">
-                <MicroLabel className="mb-1 text-violet-600/70 dark:text-violet-400/70">Charo</MicroLabel>
-                <TypingDots />
+                <div className={assistantBubbleClass}>
+                  <TypingDots />
+                </div>
               </div>
             );
           }
@@ -321,7 +313,6 @@ export function CharoPanel({
           // grows at the bottom, where the sticky auto-scroll keeps the view.
           return (
             <div key={m.id} className="flex flex-col items-start space-y-2">
-              <MicroLabel className="-mb-1 text-violet-600/70 dark:text-violet-400/70">Charo</MicroLabel>
               {hasLiveBench && (
                 <div className="w-full">
                   <BenchResultCard data={{ steps: m.liveSteps }} />
@@ -337,7 +328,7 @@ export function CharoPanel({
                 return <div key={i} className="w-full"><Renderer data={tr.data} /></div>;
               })}
               {showBubble && (
-                <div className="w-full min-w-0">
+                <div className={assistantBubbleClass}>
                   {m.image && (
                     /* eslint-disable-next-line @next/next/no-img-element */
                     <img src={m.image} alt="attachment" className="mb-1.5 max-h-40 rounded-md" />
@@ -346,7 +337,11 @@ export function CharoPanel({
                   {m.error && <p className="mt-1 text-[13px] text-destructive">{m.error}</p>}
                 </div>
               )}
-              {!content && !m.error && m.streaming && <TypingDots />}
+              {!content && !m.error && m.streaming && (
+                <div className={assistantBubbleClass}>
+                  <TypingDots />
+                </div>
+              )}
               {hasTrace && (
                 <div className="w-full">
                   <TraceCard trace={m.trace} pending={m.tracePending} />
@@ -386,16 +381,6 @@ export function CharoPanel({
         );
       })}
     </div>
-  );
-
-  const expandedMascot = expanded && (
-    /* eslint-disable-next-line @next/next/no-img-element */
-    <img
-      src={mascot}
-      alt=""
-      draggable={false}
-      className="pointer-events-none absolute -top-32 -right-4 z-[5] hidden h-44 w-auto select-none drop-shadow-2xl sm:block lg:-top-36 lg:-right-5 lg:h-48"
-    />
   );
 
   const composer = (
@@ -506,7 +491,6 @@ export function CharoPanel({
             )}
           >
             <Dialog.Title className="sr-only">Gateway Chat</Dialog.Title>
-            {expandedMascot}
             <div
               {...dropProps}
               className="charo-panel-shell relative z-10 flex h-full w-full flex-col overflow-hidden rounded-lg border border-violet-300/15 bg-card shadow-[0_18px_56px_hsl(267_86%_12%/0.28)] ring-1 ring-violet-200/10 max-sm:rounded-none"
@@ -526,18 +510,11 @@ export function CharoPanel({
     );
   }
 
-  // Docked: the corner chat window with the large mascot peeking over it.
+  // Docked: the corner chat window.
   if (!open) return null;
   return (
     <div className="charo-panel-frame fixed bottom-4 right-4 isolate z-[60] h-[34rem] max-h-[80vh] w-[27rem] max-w-[calc(100vw-1rem)] sm:bottom-8 sm:right-8">
       <style>{PANEL_CSS}</style>
-      {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img
-        src={mascot}
-        alt=""
-        draggable={false}
-        className="pointer-events-none absolute -top-32 -right-4 z-[5] hidden h-44 w-auto select-none drop-shadow-2xl sm:block lg:-top-36 lg:-right-5 lg:h-48"
-      />
       <div
         {...dropProps}
         className="charo-panel-shell relative z-10 flex h-full flex-col overflow-hidden rounded-lg border border-violet-300/15 bg-card shadow-[0_18px_56px_hsl(267_86%_12%/0.28)] ring-1 ring-violet-200/10"
