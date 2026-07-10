@@ -178,10 +178,21 @@ fn endpoint_api_base(node: &str, serving_port: i64) -> String {
 /// Advance the per-replica consecutive-probe-failure counters after one tick's
 /// probes, for self-heal. Only `healthy` replicas whose job reports RUNNING
 /// with a known node are judged: those are the rows the tick actually probed,
-/// so a missing `health` entry means the probe failed. A passing probe clears
-/// the counter. Everything else (booting replicas, jobs without nodes, jobs the
-/// planner is already reconciling away) is left untouched — probe failures
-/// there are expected, not evidence of a zombie.
+/// so a missing `health` entry means the probe failed. Everything else (booting
+/// replicas, jobs without nodes, jobs the planner is already reconciling away)
+/// is left untouched — probe failures there are expected, not evidence of a
+/// zombie.
+///
+/// A miss **increments** the counter; a pass **decays** it by one (saturating at
+/// zero, dropping the entry when it reaches zero) rather than resetting it to
+/// zero outright. This is the crux of not killing a *flapping* replica: a
+/// single-threaded server (e.g. llama.cpp) that is briefly busy will miss the
+/// occasional probe and pass the next, oscillating healthy ↔ not-yet-healthy on
+/// the tick beat. A hard reset let those flaps keep re-arming from zero so a
+/// perfectly-fine replica eventually lost the coin flip and got cancelled. With
+/// decay the counter tracks *sustained net* failure: a truly-dead server climbs
+/// steadily toward the restart threshold, while a flapping-but-serving one hovers
+/// near zero and never trips it.
 pub fn update_probe_failures(
     replicas: &[ReplicaView],
     jobs: &HashMap<String, JobInfo>,
@@ -199,7 +210,15 @@ pub fn update_probe_failures(
             continue;
         }
         if health.contains_key(&r.id) {
-            counts.remove(&r.id);
+            // Passing probe: decay one step toward zero instead of resetting, so
+            // an intermittent flap can't keep re-arming the counter from scratch.
+            match counts.get_mut(&r.id) {
+                Some(n) if *n > 1 => *n -= 1,
+                Some(_) => {
+                    counts.remove(&r.id);
+                }
+                None => {}
+            }
         } else {
             *counts.entry(r.id).or_insert(0) += 1;
         }
@@ -221,9 +240,10 @@ const GATEWAY_CHECK_MAX_AGE_SECS: i64 = 3600;
 /// Which healthy replicas self-heal should restart this tick. Two independent
 /// signals, either suffices:
 ///
-/// 1. the provisioner's own port-window probe has failed `probe_threshold`
-///    consecutive ticks (`probe_failures`, maintained by
-///    `update_probe_failures`) — the server is not answering at all;
+/// 1. the provisioner's own port-window probe has been failing for
+///    `probe_threshold` net ticks (`probe_failures`, maintained by
+///    `update_probe_failures`, which decays on a pass) — the server is not
+///    answering at all, sustained rather than a transient flap;
 /// 2. the gateway's health check of the replica's registered endpoint is
 ///    `unhealthy` with at least `GATEWAY_UNHEALTHY_CHECKS` consecutive
 ///    failures and a recent check — the server answers GETs but fails real
@@ -828,7 +848,7 @@ mod tests {
     // --- update_probe_failures (self-heal counters) ---
 
     #[test]
-    fn probe_failure_counter_increments_on_miss_and_resets_on_pass() {
+    fn probe_failure_counter_increments_on_miss_and_decays_on_pass() {
         let r = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
         let id = r.id;
         let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
@@ -849,10 +869,54 @@ mod tests {
         );
         assert_eq!(counts.get(&id), Some(&2));
 
-        // passing probe clears the streak entirely
+        // passing probe decays by one (not a full reset), so an intermittent
+        // flap can't keep re-arming the counter from zero.
         let health = HashMap::from([(id, 8000u16)]);
+        update_probe_failures(std::slice::from_ref(&r), &jobs, &health, &mut counts);
+        assert_eq!(counts.get(&id), Some(&1));
+
+        // decaying past one drops the entry entirely.
         update_probe_failures(&[r], &jobs, &health, &mut counts);
         assert_eq!(counts.get(&id), None);
+    }
+
+    #[test]
+    fn flapping_replica_never_reaches_restart_threshold() {
+        // A single-threaded server that alternates miss/pass on the tick beat
+        // must not accumulate toward a restart: increments and decays cancel out.
+        let r = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
+        let id = r.id;
+        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
+        let miss: HashMap<Uuid, u16> = HashMap::new();
+        let pass = HashMap::from([(id, 8000u16)]);
+        let mut counts = HashMap::new();
+        for i in 0..40 {
+            let health = if i % 2 == 0 { &miss } else { &pass };
+            update_probe_failures(std::slice::from_ref(&r), &jobs, health, &mut counts);
+            assert!(
+                counts.get(&id).copied().unwrap_or(0) <= 1,
+                "flap must stay near zero, got {counts:?} at i={i}"
+            );
+        }
+    }
+
+    #[test]
+    fn sustained_failure_climbs_to_threshold() {
+        // A genuinely dead server misses every probe -> the counter climbs one
+        // per tick and crosses the default self-heal threshold.
+        let r = rv("healthy", "j1", Some(Uuid::new_v4()), 600);
+        let id = r.id;
+        let jobs = HashMap::from([job("j1", JobState::Running, &["n1"])]);
+        let mut counts = HashMap::new();
+        for _ in 0..20 {
+            update_probe_failures(
+                std::slice::from_ref(&r),
+                &jobs,
+                &HashMap::new(),
+                &mut counts,
+            );
+        }
+        assert_eq!(counts.get(&id), Some(&20));
     }
 
     #[test]

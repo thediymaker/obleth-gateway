@@ -55,9 +55,11 @@ Every tick (`OBLETH_PROVISIONER_INTERVAL_SECS`, default 15s):
        and detach their endpoint; the next pass resubmits to restore target.
      - **Self-heal zombie jobs.** A `healthy` replica whose job still reports
        RUNNING is restarted (endpoint deregistered, job cancelled, fresh
-       replica submitted) on either of two signals: it fails
-       `OBLETH_PROVISIONER_RESTART_AFTER_FAILURES` consecutive provisioner
-       probes (default 3; `0` disables self-heal entirely), **or** the
+       replica submitted) on either of two signals: its provisioner probe has
+       been failing for `OBLETH_PROVISIONER_RESTART_AFTER_FAILURES` net ticks
+       (default 20 — the counter decays on a passing probe, so this is a
+       ~5-minute sustained outage at the 15s interval, not a transient flap;
+       `0` disables self-heal entirely), **or** the
        gateway's own health check of its registered endpoint — a real 1-token
        inference — has been `unhealthy` for 2+ consecutive recent checks. The
        second signal catches servers that still answer metadata GETs but hang
@@ -106,7 +108,7 @@ endpoint/token and cadence knobs come from the environment:
 | `OBLETH_PROVISIONER_HEALTH_TIMEOUT_SECS` | optional | `5` | per-replica health probe timeout |
 | `OBLETH_PROVISIONER_WARMUP_TIMEOUT_SECS` | optional | `600` | budget for the post-promotion warmup inference; `0` disables warmup |
 | `OBLETH_PROVISIONER_LOST_RETENTION_SECS` | optional | `900` | how long `lost` replica rows are kept before GC |
-| `OBLETH_PROVISIONER_RESTART_AFTER_FAILURES` | optional | `3` | restart a healthy replica after this many consecutive failed probes while its job reports RUNNING (zombie job); `0` disables self-heal |
+| `OBLETH_PROVISIONER_RESTART_AFTER_FAILURES` | optional | `20` | restart a healthy replica after this many net failing probes (counter decays on a pass → ~5 min sustained at the default interval) while its job reports RUNNING (zombie job); `0` disables self-heal |
 | `OBLETH_PORT_SPAN` | optional | `8` | width of each replica's port window (`serving_port + slot*span`) |
 | `OBLETH_PROVISIONER_JOB_PREFIX` | optional | `obleth-` | job-name prefix used to tag this gateway's jobs |
 
