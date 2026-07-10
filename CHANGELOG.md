@@ -4,6 +4,15 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.9.1
+
+Benchmarks report tokens-per-second, and benchmark traffic finally stays out of your real usage numbers.
+
+- **Tokens-per-second across the benchmark suite.** Every concurrency step now reports aggregate output tok/s and per-stream decode rate (p50/p10) — in the `obench` CLI summary, the live TUI, the capacity scorecard, and Charo's inline benchmark card.
+- **Benchmark and test traffic no longer pollutes usage stats.** Charo's model-test console and in-dashboard benchmarks reach the gateway through a reserved internal identity, which is now marked synthetic — so its requests are tagged as benchmark traffic and excluded by default from the overview's request, token, and tokens-per-second figures. Previously a single capacity run could bury a model's real numbers under thousands of synthetic requests. Existing pre-upgrade rows age out of the rolling window on their own; internal traffic stays viewable on demand.
+- **Charo hides models' hidden reasoning.** Chain-of-thought that some models emit inline (`<think>…</think>`) is now stripped from Charo's answers and from the transcript sent back upstream, so you see the reply and its tool cards, not the scratchpad.
+- **The chat panel, refined.** Assistant replies render as clean chat bubbles, the mascot imagery is retired for a tighter layout, and the typing indicator sits in-bubble so a pending reply never reads as dead air.
+
 ## v0.9.0
 
 Charo grows from a testing console into a working colleague: guided activities, direct model chat, MCP verification, documentation-grounded answers with citations, and a redesigned chat panel.

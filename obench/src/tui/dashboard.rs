@@ -55,7 +55,7 @@ fn fmt_clock(secs: u64) -> String {
 /// One-line secondary readout: token throughput + TTFB latency percentiles.
 fn draw_strip(f: &mut Frame, area: Rect, s: &Summary) {
     let est = if s.any_estimated { " ~" } else { "" };
-    let strip = Paragraph::new(Line::from(vec![
+    let mut spans = vec![
         Span::styled("tokens ", Style::default().fg(theme::MUTED)),
         Span::styled(
             format!("in {}", s.in_tokens),
@@ -65,7 +65,20 @@ fn draw_strip(f: &mut Frame, area: Rect, s: &Summary) {
             format!(" · out {}{est}   ", s.out_tokens),
             Style::default().fg(theme::FG),
         ),
-        Span::styled("ttfb ", Style::default().fg(theme::MUTED)),
+        Span::styled("tok/s ", Style::default().fg(theme::MUTED)),
+        Span::styled(
+            format!("{:.0}", s.agg_out_tok_per_s),
+            Style::default().fg(theme::FG),
+        ),
+    ];
+    if s.decode_samples > 0 {
+        spans.push(Span::styled(
+            format!(" · stream p50 {:.0}", s.p50_decode_tps),
+            Style::default().fg(theme::MUTED),
+        ));
+    }
+    spans.extend([
+        Span::styled("   ttfb ", Style::default().fg(theme::MUTED)),
         Span::styled(
             format!("p50 {}ms", s.p50_ttfb_ms),
             Style::default().fg(theme::FG),
@@ -78,7 +91,8 @@ fn draw_strip(f: &mut Frame, area: Rect, s: &Summary) {
             format!(" · p99 {}ms", s.p99_ttfb_ms),
             Style::default().fg(theme::MUTED),
         ),
-    ]));
+    ]);
+    let strip = Paragraph::new(Line::from(spans));
     f.render_widget(strip, area);
 }
 

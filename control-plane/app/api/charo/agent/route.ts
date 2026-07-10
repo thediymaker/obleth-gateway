@@ -10,6 +10,7 @@ import { runTool } from "@/lib/charo/tools/executor";
 import { ToolCallAccumulator } from "@/lib/charo/tools/tool-call-accumulator";
 import { deltaText, deltaToolCalls, finishReason } from "@/lib/charo/relay";
 import { AGENT_PERSONA } from "@/lib/charo/persona";
+import { stripHiddenReasoning } from "@/lib/charo/visible-text";
 import type { ToolCtx } from "@/lib/charo/tools/types";
 
 export const runtime = "nodejs";
@@ -150,7 +151,7 @@ export async function POST(req: NextRequest) {
 
           // Record the assistant's tool-call turn, then handle the FIRST call
           // (one tool per turn — spec non-goal: no intra-turn parallelism).
-          transcript.push({ role: "assistant", content: assistantText });
+          transcript.push({ role: "assistant", content: stripHiddenReasoning(assistantText) });
           const call = calls[0];
           let args: unknown = {};
           try { args = JSON.parse(call.arguments || "{}"); } catch { /* leave {} */ }
