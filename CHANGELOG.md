@@ -4,6 +4,13 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.9.4
+
+The v0.9.3 self-heal fix now actually reaches deployments, and failed job cancellations say why.
+
+- **Deployment defaults no longer undo the v0.9.3 self-heal fix.** The docker-compose fallback, the Helm chart default, and the env example all still pinned `OBLETH_PROVISIONER_RESTART_AFTER_FAILURES=3`, silently overriding the binary's new default — so provisioners deployed from them kept cancelling healthy replicas after ~45 seconds of probe flaps. All three now default to 20 (~5 minutes of sustained failure at the default tick interval). If you set the variable to 3 yourself, remove or raise it when upgrading.
+- **Cancel failures report the real reason.** When slurmrestd refuses to cancel a job, the provisioner now logs the response body (e.g. `Access/permission denied` from `slurm_kill_job2`) instead of only the HTTP status — a bare 500 previously hid actionable causes like a JWT user / job owner mismatch.
+
 ## v0.9.3
 
 Slurm-provisioned replicas stop getting killed in a loop, and jobs with a walltime submit cleanly.
