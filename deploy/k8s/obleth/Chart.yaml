@@ -2,5 +2,5 @@ apiVersion: v2
 name: obleth
 description: obleth fairshare AI gateway (data plane + management API + control plane)
 type: application
-version: 0.9.0
-appVersion: "0.9.0"
+version: 0.9.1
+appVersion: "0.9.1"
