@@ -4,6 +4,13 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.9.3
+
+Slurm-provisioned replicas stop getting killed in a loop, and jobs with a walltime submit cleanly.
+
+- **Healthy replicas are no longer cancelled on transient probe blips.** A busy single-threaded inference server (e.g. llama.cpp) that briefly missed a health probe and passed the next used to accumulate toward the self-heal threshold and get cancelled — then resubmitted, flap, and die again in a loop. The failure counter now decays on every passing probe, so only a *sustained* outage restarts a replica; the default window is ~5 minutes (`OBLETH_PROVISIONER_RESTART_AFTER_FAILURES`, now 20). The gateway's separate inference-based zombie check is unchanged.
+- **Jobs with a time limit submit without a `slurmrestd` error.** A managed model's walltime (e.g. `0-04:00:00`) is now converted to the integer minutes `slurmrestd` expects, instead of being sent as a date string that failed the submit with a 500. Unparseable values are omitted so the partition default applies.
+
 ## v0.9.2
 
 Managed-model config catches bad inputs before Slurm does, provisioning-error notices can be dismissed, and a dead replica pool can no longer ride a stale success to "healthy".
