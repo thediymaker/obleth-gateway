@@ -377,8 +377,12 @@ impl SlurmClient for Slurmrestd {
     async fn cancel(&self, job_id: &str) -> anyhow::Result<()> {
         let url = format!("{}/slurm/{}/job/{}", self.base, self.version, job_id);
         let resp = self.auth(self.http.delete(&url)).send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("slurmrestd cancel {job_id} failed: {}", resp.status());
+        let status = resp.status();
+        if !status.is_success() {
+            // Include the body: slurmrestd reports the real reason (permission
+            // denied, invalid job state, …) there, not in the status line.
+            let body = resp.text().await.unwrap_or_default();
+            anyhow::bail!("slurmrestd cancel {job_id} failed ({status}): {body}");
         }
         Ok(())
     }
