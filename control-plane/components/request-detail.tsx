@@ -3,7 +3,8 @@
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { useQuery } from "@tanstack/react-query";
 import type { SpanEntry, UsageLogEntry } from "@/lib/obleth";
-import { cn } from "@/lib/utils";
+import { formatDurationMs } from "@/lib/format";
+import { cn, formatCurrency } from "@/lib/utils";
 import { formatWh } from "@/components/request-logs";
 
 interface Props {
@@ -316,7 +317,7 @@ function TraceView({ spans }: { spans: SpanEntry[] }) {
           Request Flow
         </p>
         <span className="text-[10px] tabular-nums text-muted-foreground">
-          {flowNodes.length} {flowNodes.length === 1 ? "node" : "nodes"} / {fmtMs(totalMs)} total
+          {flowNodes.length} {flowNodes.length === 1 ? "node" : "nodes"} / {formatDurationMs(totalMs)} total
         </span>
       </div>
 
@@ -411,7 +412,7 @@ function FlowNode({
           </div>
           {hint && <div className="trace-node-hint">{hint}</div>}
         </div>
-        <span className="trace-node-time">{fmtMs(span.duration_ms)}</span>
+        <span className="trace-node-time">{formatDurationMs(span.duration_ms)}</span>
       </div>
 
       <div className="trace-node-meter">
@@ -469,7 +470,7 @@ function SpanExpandDetail({ node, onClose }: { node: SpanNode; onClose: () => vo
             )}
           </span>
           <span className="font-mono text-[10px] tabular-nums text-muted-foreground/70">
-            {fmtMs(span.duration_ms)}
+            {formatDurationMs(span.duration_ms)}
           </span>
         </div>
         <button
@@ -536,9 +537,9 @@ function SpanExpandDetail({ node, onClose }: { node: SpanNode; onClose: () => vo
                     </div>
                   </div>
                   <div className="flex w-80 shrink-0 items-center gap-1.5 text-[10px] tabular-nums">
-                    <span className="shrink-0 text-amber-400/80">{fmtMs(toolMs)}</span>
+                    <span className="shrink-0 text-amber-400/80">{formatDurationMs(toolMs)}</span>
                     <span className="shrink-0 text-muted-foreground/40">+</span>
-                    <span className="shrink-0 text-blue-400/70">{fmtMs(modelMs)}</span>
+                    <span className="shrink-0 text-blue-400/70">{formatDurationMs(modelMs)}</span>
                     {tools && (
                       <span
                         className="ml-1 truncate text-muted-foreground/55"
@@ -578,15 +579,15 @@ function UsageDetailCard({ row, withTrace }: { row: UsageLogEntry; withTrace?: b
         <DetailRow label="Input tokens" value={row.input_tokens.toLocaleString()} mono />
         <DetailRow label="Output tokens" value={row.output_tokens.toLocaleString()} mono />
         <DetailRow label="Total tokens" value={row.total_tokens.toLocaleString()} mono />
-        <DetailRow label="Queue wait" value={fmtMs(row.queue_wait_ms)} mono />
-        <DetailRow label="TTFB" value={fmtMs(row.ttft_ms)} mono />
-        <DetailRow label="Duration" value={fmtMs(row.total_ms)} mono />
+        <DetailRow label="Queue wait" value={formatDurationMs(row.queue_wait_ms)} mono />
+        <DetailRow label="TTFB" value={formatDurationMs(row.ttft_ms)} mono />
+        <DetailRow label="Duration" value={formatDurationMs(row.total_ms)} mono />
         <DetailRow label="Cache" value={row.cache_status} />
         <DetailRow label="Admission" value={row.admission} />
         {row.energy_wh > 0 && (
           <>
             <DetailRow label="Energy" value={formatWh(row.energy_wh)} mono />
-            <DetailRow label="Energy cost" value={`$${row.energy_cost_usd.toFixed(4)}`} mono />
+            <DetailRow label="Energy cost" value={formatCurrency(row.energy_cost_usd)} mono />
             <DetailRow label="CO₂" value={`${row.co2_g.toFixed(2)} g`} mono />
           </>
         )}
@@ -604,7 +605,3 @@ function DetailRow({ label, value, mono }: { label: string; value: string; mono?
   );
 }
 
-function fmtMs(ms: number): string {
-  if (!ms || ms <= 0) return "--";
-  return ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(2)}s`;
-}

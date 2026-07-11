@@ -1,5 +1,11 @@
 // Server-side client for the obleth Management API.
 
+// React's request-scoped memo: no-arg settings getters are wrapped in
+// `reactCache` so a layout and page reading the same setting in one render
+// tree cost one admin round-trip. Freshness is unchanged — the memo does not
+// outlive the request.
+import { cache as reactCache } from "react";
+
 const BASE = process.env.OBLETH_ADMIN_BASE_URL ?? "http://localhost:9180";
 const AUDIT_ACTOR_HEADER = "X-Obleth-Audit-Actor";
 
@@ -539,6 +545,19 @@ export interface LiveStats {
   in_flight: number;
   queued: number;
   max_in_flight: number;
+}
+
+/** Wire shape of GET /overview/summary (config counts + windowed usage totals). */
+export interface OverviewSummaryView {
+  requests: number;
+  tokens: number;
+  cost: number;
+  has_pricing: boolean;
+  tenant_count: number;
+  active_tenants: number;
+  model_count: number;
+  enabled_models: number;
+  key_count: number;
 }
 
 export interface TenantFairshareView {
@@ -1335,6 +1354,7 @@ export const obleth = {
     api<ModelEndpoint[]>(`/models/${id}/endpoints`),
   getManagedModel: (id: string) =>
     api<ManagedModelSpec | null>(`/models/${id}/managed`),
+  listManagedModels: () => api<ManagedModelSpec[]>("/managed"),
   putManagedModel: (
     id: string,
     body: PutManagedModel,
@@ -1570,7 +1590,7 @@ export const obleth = {
   // system key secret so it can call the data plane as the protected internal tenant.
   controlPlaneKey: () =>
     api<{ secret: string }>("/system/control-plane-key"),
-  getUsageRetention: () => api<UsageRetentionView>("/settings/usage-retention"),
+  getUsageRetention: reactCache(() => api<UsageRetentionView>("/settings/usage-retention")),
   setUsageRetention: (days: number, options?: AuditOptions) =>
     api<UsageRetentionView>("/settings/usage-retention", {
       method: "PUT",
@@ -1583,6 +1603,8 @@ export const obleth = {
       headers: auditActorHeaders(options),
     }),
   stats: () => api<LiveStats>("/stats"),
+  overviewSummary: (sinceMs?: number) =>
+    api<OverviewSummaryView>(`/overview/summary${qs({ since_ms: sinceMs })}`),
   fairshareLive: () => api<FairshareLiveView>("/fairshare/live"),
   audit: (limit = 100) => api<AuditEntry[]>(`/audit?limit=${limit}`),
   getCapacity: () => api<{ max_in_flight: number }>("/capacity"),
@@ -1592,7 +1614,7 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify({ max_in_flight }),
     }),
-  getAlertSettings: () => api<AlertSettingsView>("/settings/alerts"),
+  getAlertSettings: reactCache(() => api<AlertSettingsView>("/settings/alerts")),
   setAlertSettings: (body: UpdateAlertSettings, options?: AuditOptions) =>
     api<AlertSettingsView>("/settings/alerts", {
       method: "PUT",
@@ -1601,8 +1623,9 @@ export const obleth = {
     }),
   testAlert: () =>
     api<TestAlertResult>("/settings/alerts/test", { method: "POST" }),
-  getAutoRouterSettings: () =>
+  getAutoRouterSettings: reactCache(() =>
     api<AutoRouterSettingsView>("/settings/auto-router"),
+  ),
   setAutoRouterSettings: (
     body: UpdateAutoRouterSettings,
     options?: AuditOptions,
@@ -1612,22 +1635,22 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  getBoonSettings: () => api<BoonSettingsView>("/settings/boons"),
+  getBoonSettings: reactCache(() => api<BoonSettingsView>("/settings/boons")),
   setBoonSettings: (body: UpdateBoonSettings, options?: AuditOptions) =>
     api<BoonSettingsView>("/settings/boons", {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  getCompressorStatus: () => api<CompressorStatusView>("/settings/compressor"),
-  getCharoSettings: () => api<CharoSettingsView>("/settings/charo"),
+  getCompressorStatus: reactCache(() => api<CompressorStatusView>("/settings/compressor")),
+  getCharoSettings: reactCache(() => api<CharoSettingsView>("/settings/charo")),
   setCharoSettings: (body: CharoSettingsView, options?: AuditOptions) =>
     api<CharoSettingsView>("/settings/charo", {
       method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
-  getEnergySettings: () => api<EnergySettingsView>("/settings/energy"),
+  getEnergySettings: reactCache(() => api<EnergySettingsView>("/settings/energy")),
   setEnergySettings: (body: UpdateEnergySettings, options?: AuditOptions) =>
     api<EnergySettingsView>("/settings/energy", {
       method: "PUT",
@@ -1639,7 +1662,7 @@ export const obleth = {
       method: "POST",
       body: JSON.stringify({ prometheus_url, power_query }),
     }),
-  getSlurmSettings: () => api<SlurmSettingsView>("/settings/slurm"),
+  getSlurmSettings: reactCache(() => api<SlurmSettingsView>("/settings/slurm")),
   setSlurmSettings: (body: UpdateSlurmSettings, options?: AuditOptions) =>
     api<SlurmSettingsView>("/settings/slurm", {
       method: "PUT",

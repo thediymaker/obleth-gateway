@@ -1,16 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState, useTransition, type ReactNode } from "react";
+import { useEffect, useMemo, useState, useTransition } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Activity, BarChart3, Check, LayoutDashboard, Network, Pencil, RefreshCw, Search, Users, X } from "lucide-react";
+import { Activity, Check, LayoutDashboard, Network, Pencil, RefreshCw, Search, Users, X } from "lucide-react";
 import {
   Area,
   AreaChart,
-  Bar,
-  BarChart,
   CartesianGrid,
-  Cell,
   ComposedChart,
   Legend,
   Line,
@@ -20,14 +17,23 @@ import {
   XAxis,
   YAxis,
 } from "recharts";
-import { setWeightAction, toggleKeyAction } from "@/app/actions";
+import { setWeightAction } from "@/app/actions";
 import { axisTick, chartGrid, ChartShell, compactAxis, tip, timeCursor } from "@/components/chart-tooltip";
-import { ModelCapacityControl, ModelWeightControl } from "@/components/model-manager";
+import {
+  EmptyState,
+  MetricCard,
+  MetricToggle,
+  type MetricTile,
+  type MetricTone,
+} from "@/components/dashboard-primitives";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
+import { colorForGroup, OTHERS_COLOR, PALETTE } from "@/lib/chart-palette";
+import { isWaitingBelowShare } from "@/lib/fairshare";
+import { clamp, formatCompact, formatDecimal, formatDelta, formatPct, formatScore } from "@/lib/format";
 import type { ModelRoute } from "@/lib/obleth";
 import { cn, formatNumber } from "@/lib/utils";
 
@@ -67,21 +73,6 @@ export interface FairshareLiveView {
   model_queued?: Record<string, number>;
 }
 
-interface UsageKeyRow {
-  key_id: string;
-  tenant_id: string;
-  requests: number;
-  total_tokens: number;
-}
-
-interface UsageModelRow {
-  model: string;
-  requests: number;
-  input_tokens: number;
-  output_tokens: number;
-  total_tokens: number;
-}
-
 interface TenantSeriesRow {
   bucket_ms: number;
   tenant_id: string;
@@ -89,39 +80,18 @@ interface TenantSeriesRow {
   total_tokens: number;
 }
 
-const FAIRSHARE_POLL_MS = 1000;
+const FAIRSHARE_POLL_MS = 2000;
 const THROUGHPUT_POLL_MS = 15_000;
-const KEY_USAGE_POLL_MS = 30_000;
+const ROUTES_POLL_MS = 30_000;
 
 const TOP_SERIES = 7;
-const TOP_KEYS = 25;
-const TOP_MODELS = 12;
 const TENANT_PAGE = 120;
 const MAX_HISTORY_POINTS = 120;
-
-const PALETTE = [
-  "hsl(210 8% 70%)",
-  "hsl(205 13% 58%)",
-  "hsl(165 11% 56%)",
-  "hsl(235 8% 60%)",
-  "hsl(35 12% 58%)",
-  "hsl(190 9% 56%)",
-  "hsl(260 8% 62%)",
-];
-
-const GROUP_PALETTE: Record<string, string> = {
-  chatbot: "hsl(160 13% 58%)",
-  api: "hsl(205 13% 62%)",
-  analytics: "hsl(35 13% 58%)",
-  batch: "hsl(260 9% 62%)",
-  default: "hsl(240 6% 62%)",
-};
 
 const QUEUED_COLOR = "hsl(38 75% 60%)";
 const STARVED_COLOR = "hsl(350 65% 60%)";
 const HEALTHY_COLOR = "hsl(210 8% 70%)";
 const UNDER_COLOR = "hsl(205 18% 58%)";
-const OTHERS_COLOR = "hsl(240 6% 42%)";
 
 type ThroughputMetric = "requests" | "tokens";
 type TenantSort = "pressure" | "queued" | "deficit" | "served" | "score" | "weight" | "share";
@@ -133,16 +103,12 @@ type TenantScope = "all" | "active" | "waiting" | "starved";
 
 export function FairshareDashboard({
   tenantNames,
-  tenantGroups,
 }: {
   tenantNames: Record<string, string>;
-  tenantGroups: Record<string, string>;
 }) {
   const queryClient = useQueryClient();
   const { data: view, groupHistory, groupKeys, isFetching } = useFairshareLive();
   const { data: tenantSeries } = useThroughputSeries();
-  const { data: keyUsage } = useKeyUsage();
-  const { data: modelUsage } = useModelUsage();
   const { data: modelRoutes } = useModelRoutes();
   const [throughputMetric, setThroughputMetric] = useState<ThroughputMetric>("requests");
 
@@ -151,17 +117,9 @@ export function FairshareDashboard({
     () => buildThroughput(tenantSeries ?? [], tenantNames, throughputMetric),
     [tenantSeries, tenantNames, throughputMetric],
   );
-  const keyRows = useMemo(
-    () => buildKeyUsageRows(keyUsage ?? [], tenantNames, tenantGroups, view),
-    [keyUsage, tenantNames, tenantGroups, view],
-  );
-  const modelRows = useMemo(() => buildModelUsageRows(modelUsage ?? [], modelRoutes ?? []), [modelUsage, modelRoutes]);
-
   const refresh = () => {
     queryClient.invalidateQueries({ queryKey: ["fairshare-live"] });
     queryClient.invalidateQueries({ queryKey: ["usage-series-tenants"] });
-    queryClient.invalidateQueries({ queryKey: ["usage-keys-top"] });
-    queryClient.invalidateQueries({ queryKey: ["usage-models-top"] });
     queryClient.invalidateQueries({ queryKey: ["model-routes"] });
   };
 
@@ -207,26 +165,12 @@ export function FairshareDashboard({
         />
         <FairshareBalance view={view} />
         <TenantOperations view={view} />
-      </section>
-
-      <section id="workload" className="scroll-mt-20 space-y-4">
-        <SectionHeader
-          eyebrow="Workload"
-          title="Traffic evidence"
-          description="Request streams, models, and keys that are driving scheduler state."
+        <ThroughputPanel
+          data={throughput.data}
+          series={throughput.series}
+          metric={throughputMetric}
+          onMetricChange={setThroughputMetric}
         />
-        <div className="space-y-4">
-          <ThroughputPanel
-            data={throughput.data}
-            series={throughput.series}
-            metric={throughputMetric}
-            onMetricChange={setThroughputMetric}
-          />
-          <div className="grid gap-4 lg:grid-cols-2">
-            <ModelUsagePanel rows={modelRows} />
-            <KeyUsagePanel rows={keyRows} />
-          </div>
-        </div>
       </section>
     </div>
   );
@@ -312,32 +256,6 @@ function useThroughputSeries() {
   });
 }
 
-function useKeyUsage() {
-  return useQuery({
-    queryKey: ["usage-keys-top"],
-    queryFn: async () => {
-      const since = Date.now() - 3_600_000;
-      const res = await fetch(`/api/live/usage/keys?since_ms=${since}&limit=${TOP_KEYS}`);
-      if (!res.ok) throw new Error("key usage unavailable");
-      return (await res.json()) as UsageKeyRow[];
-    },
-    refetchInterval: KEY_USAGE_POLL_MS,
-  });
-}
-
-function useModelUsage() {
-  return useQuery({
-    queryKey: ["usage-models-top"],
-    queryFn: async () => {
-      const since = Date.now() - 3_600_000;
-      const res = await fetch(`/api/live/usage/models?since_ms=${since}`);
-      if (!res.ok) throw new Error("model usage unavailable");
-      return (await res.json()) as UsageModelRow[];
-    },
-    refetchInterval: KEY_USAGE_POLL_MS,
-  });
-}
-
 function useModelRoutes() {
   return useQuery({
     queryKey: ["model-routes"],
@@ -346,7 +264,7 @@ function useModelRoutes() {
       if (!res.ok) throw new Error("models unavailable");
       return (await res.json()) as ModelRoute[];
     },
-    refetchInterval: KEY_USAGE_POLL_MS,
+    refetchInterval: ROUTES_POLL_MS,
   });
 }
 
@@ -384,7 +302,7 @@ function summarizeFairshare(view?: FairshareLiveView): FairshareSummary {
   const activeTenants = view.tenants.filter((t) => isTenantActive(t)).length;
   const activeGroups = view.groups.filter((g) => g.in_flight + g.queued > 0).length;
   const waiting = view.tenants.filter((t) => t.queued > 0);
-  const starved = waiting.filter(isStarved);
+  const starved = waiting.filter(isWaitingBelowShare);
   const nextTenant = [...waiting].sort((a, b) => tenantDebt(view, a) - tenantDebt(view, b))[0];
   const largestDeficit = [...view.tenants]
     .filter((t) => t.queued > 0 || fairnessGap(t) < 0)
@@ -464,76 +382,6 @@ function buildThroughput(
   return { data, series };
 }
 
-interface KeyUsageDisplayRow {
-  keyId: string;
-  keyLabel: string;
-  tenantId: string;
-  tenant: string;
-  group: string;
-  requests: number;
-  tokens: number;
-  tenantWeight?: number;
-  tenantInFlight?: number;
-  tenantQueued?: number;
-  tenantExpectedSlots?: number;
-  color: string;
-}
-
-interface ModelUsageDisplayRow {
-  model: string;
-  requests: number;
-  inputTokens: number;
-  outputTokens: number;
-  tokens: number;
-  route?: ModelRoute;
-}
-
-function buildKeyUsageRows(
-  usage: UsageKeyRow[],
-  tenantNames: Record<string, string>,
-  tenantGroups: Record<string, string>,
-  view?: FairshareLiveView,
-): KeyUsageDisplayRow[] {
-  const tenantState = new Map((view?.tenants ?? []).map((tenant) => [tenant.tenant_id, tenant]));
-
-  return usage
-    .map((u) => {
-      const group = tenantGroups[u.tenant_id] ?? "default";
-      const tenant = tenantState.get(u.tenant_id);
-      return {
-        keyId: u.key_id,
-        keyLabel: u.key_id.slice(0, 8),
-        tenantId: u.tenant_id,
-        tenant: tenantNames[u.tenant_id] ?? u.tenant_id.slice(0, 8),
-        group,
-        requests: Number(u.requests),
-        tokens: Number(u.total_tokens),
-        tenantWeight: tenant?.weight,
-        tenantInFlight: tenant?.in_flight,
-        tenantQueued: tenant?.queued,
-        tenantExpectedSlots: tenant?.expected_slots,
-        color: colorForGroup(group),
-      };
-    })
-    .sort((a, b) => b.requests - a.requests)
-    .slice(0, TOP_KEYS);
-}
-
-function buildModelUsageRows(usage: UsageModelRow[], routes: ModelRoute[]): ModelUsageDisplayRow[] {
-  const routeByName = new Map(routes.map((route) => [route.model_name, route]));
-
-  return usage
-    .map((u) => ({
-      model: u.model,
-      requests: Number(u.requests),
-      inputTokens: Number(u.input_tokens),
-      outputTokens: Number(u.output_tokens),
-      tokens: Number(u.total_tokens),
-      route: routeByName.get(u.model),
-    }))
-    .sort((a, b) => b.requests - a.requests || b.tokens - a.tokens);
-}
-
 // ---------------------------------------------------------------------------
 // Header and pressure strip
 // ---------------------------------------------------------------------------
@@ -566,7 +414,9 @@ function LiveConsoleHeader({
     <div className="rounded-md border border-border bg-card px-4 py-3">
       <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div className="min-w-0">
-          <div className="flex flex-wrap items-center gap-2">
+          <h1 className="text-lg font-semibold tracking-tight">Fairshare</h1>
+          <p className="mt-0.5 text-sm text-muted-foreground">Live admission, allocation, and tenant contention in one scheduler workspace.</p>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
             <Badge
               className={cn(
                 "gap-1.5",
@@ -604,10 +454,9 @@ function LiveConsoleHeader({
 
 function FairshareSectionNav() {
   const items = [
-    { href: "#live", label: "Live", icon: Activity },
+    { href: "#live", label: "Live pressure", icon: Activity },
     { href: "#allocation", label: "Allocation", icon: Network },
     { href: "#tenants", label: "Tenants", icon: Users },
-    { href: "#workload", label: "Workload", icon: BarChart3 },
   ];
 
   return (
@@ -687,32 +536,6 @@ function PressureStrip({ view, summary }: { view?: FairshareLiveView; summary: F
       {items.map((item) => (
         <MetricCard key={item.label} item={item} />
       ))}
-    </div>
-  );
-}
-
-type MetricTone = "ok" | "warn" | "hot" | "neutral";
-
-interface MetricTile {
-  label: string;
-  value: string;
-  sub: string;
-  tone: MetricTone;
-}
-
-function MetricCard({ item }: { item: MetricTile }) {
-  const valueTone = {
-    ok: "text-foreground",
-    warn: "text-[hsl(38_65%_62%)]",
-    hot: "text-[hsl(350_55%_64%)]",
-    neutral: "text-foreground",
-  }[item.tone];
-
-  return (
-    <div className="rounded-md border border-border bg-card/55 px-4 py-3">
-      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{item.label}</p>
-      <p className={cn("mt-1 truncate text-xl font-semibold tabular-nums", valueTone)}>{item.value}</p>
-      <p className="mt-0.5 truncate text-[11px] tabular-nums text-muted-foreground/75">{item.sub}</p>
     </div>
   );
 }
@@ -848,7 +671,7 @@ function SchedulerNow({ view, summary }: { view?: FairshareLiveView; summary: Fa
           tenant={deficit}
           empty="No active deficit"
           valueLabel={deficit ? formatDelta(fairnessGap(deficit)) : ""}
-          highlight={deficit ? isStarved(deficit) : false}
+          highlight={deficit ? isWaitingBelowShare(deficit) : false}
         />
       </CardContent>
     </Card>
@@ -1110,7 +933,7 @@ function FairshareBalance({ view }: { view?: FairshareLiveView }) {
   const rows = useMemo(() => {
     const tenants = (view?.tenants ?? [])
       .filter((t) => t.in_flight + t.queued > 0)
-      .map((t) => ({ t, gap: fairnessGap(t), starved: isStarved(t) }))
+      .map((t) => ({ t, gap: fairnessGap(t), starved: isWaitingBelowShare(t) }))
       .sort((a, b) => a.gap - b.gap)
       .slice(0, 12);
     const maxAbs = tenants.reduce((m, r) => Math.max(m, Math.abs(r.gap), r.t.expected_slots), 1);
@@ -1182,7 +1005,7 @@ function TenantOperations({ view }: { view?: FairshareLiveView }) {
     if (groupFilter !== "all") out = out.filter((t) => t.fairshare_group === groupFilter);
     if (scope === "active") out = out.filter(isTenantActive);
     if (scope === "waiting") out = out.filter((t) => t.queued > 0);
-    if (scope === "starved") out = out.filter(isStarved);
+    if (scope === "starved") out = out.filter(isWaitingBelowShare);
     if (q) {
       out = out.filter(
         (t) =>
@@ -1216,10 +1039,10 @@ function TenantOperations({ view }: { view?: FairshareLiveView }) {
   }, [view, query, groupFilter, scope, sort]);
 
   const shown = rows.slice(0, TENANT_PAGE);
-  const starved = useMemo(() => rows.filter(isStarved).length, [rows]);
+  const starved = useMemo(() => rows.filter(isWaitingBelowShare).length, [rows]);
   const totalActive = view?.tenants.filter(isTenantActive).length ?? 0;
   const totalWaiting = view?.tenants.filter((t) => t.queued > 0).length ?? 0;
-  const totalStarved = view?.tenants.filter(isStarved).length ?? 0;
+  const totalStarved = view?.tenants.filter(isWaitingBelowShare).length ?? 0;
 
   return (
     <Card className="rounded-md">
@@ -1315,7 +1138,7 @@ function TenantOperations({ view }: { view?: FairshareLiveView }) {
 }
 
 function TenantRow({ tenant, view }: { tenant: TenantFairshareView; view?: FairshareLiveView }) {
-  const starved = isStarved(tenant);
+  const starved = isWaitingBelowShare(tenant);
   const color = colorForGroup(tenant.fairshare_group);
 
   return (
@@ -1387,7 +1210,7 @@ function FairnessBar({ tenant }: { tenant: TenantFairshareView }) {
       </div>
       <span
         className="w-16 shrink-0 text-right font-mono text-[10px] tabular-nums"
-        style={{ color: isStarved(tenant) ? STARVED_COLOR : "hsl(240 6% 64%)" }}
+        style={{ color: isWaitingBelowShare(tenant) ? STARVED_COLOR : "hsl(240 6% 64%)" }}
       >
         {formatDelta(delta)} / {formatDecimal(entitled)}
       </span>
@@ -1494,7 +1317,7 @@ function ScopeToggle({
 }
 
 // ---------------------------------------------------------------------------
-// Throughput and keys
+// Throughput
 // ---------------------------------------------------------------------------
 
 function ThroughputPanel({
@@ -1591,313 +1414,9 @@ function ThroughputPanel({
   );
 }
 
-function MetricToggle({
-  active,
-  onClick,
-  label,
-}: {
-  active: boolean;
-  onClick: () => void;
-  label: string;
-}) {
-  return (
-    <button
-      type="button"
-      aria-pressed={active}
-      onClick={onClick}
-      className={cn(
-        "inline-flex h-7 items-center rounded-sm px-2.5 text-xs transition-colors",
-        active ? "bg-muted text-foreground" : "text-muted-foreground hover:text-foreground",
-      )}
-    >
-      {label}
-    </button>
-  );
-}
-
-function ModelUsagePanel({ rows }: { rows: ModelUsageDisplayRow[] }) {
-  const [selectedModel, setSelectedModel] = useState<string | null>(null);
-  const top = rows.slice(0, TOP_MODELS);
-  const selected = top.find((row) => row.model === selectedModel) ?? null;
-  const maxRequests = top.reduce((max, row) => Math.max(max, row.requests), 0);
-  const totals = rows.reduce(
-    (acc, row) => ({
-      requests: acc.requests + row.requests,
-      tokens: acc.tokens + row.tokens,
-    }),
-    { requests: 0, tokens: 0 },
-  );
-
-  return (
-    <Card className="rounded-md">
-      <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <CardTitle>Models receiving requests</CardTitle>
-          <CardDescription>
-            Last hour / top {Math.min(TOP_MODELS, rows.length)} of {formatNumber(rows.length || 0)}
-          </CardDescription>
-        </div>
-        <div className="text-right text-xs tabular-nums text-muted-foreground">
-          <p>{formatNumber(totals.requests)} requests</p>
-          <p>{formatCompact(totals.tokens)} tokens</p>
-        </div>
-      </CardHeader>
-      <CardContent>
-        {top.length === 0 ? (
-          <EmptyState className="h-48">No model requests in the last hour</EmptyState>
-        ) : (
-          <div className="space-y-3">
-            <div className="max-h-72 space-y-2 overflow-auto pr-1">
-              {top.map((row, i) => (
-                <button
-                  key={row.model}
-                  type="button"
-                  aria-pressed={selectedModel === row.model}
-                  onClick={() => setSelectedModel((current) => (current === row.model ? null : row.model))}
-                  className={cn(
-                    "w-full rounded-sm border border-border bg-background/30 px-3 py-2 text-left transition-colors hover:bg-muted/20",
-                    selectedModel === row.model && "border-muted-foreground/40 bg-muted/15",
-                  )}
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="truncate text-xs font-medium">{row.model}</p>
-                      <p className="mt-0.5 text-[11px] tabular-nums text-muted-foreground">
-                        in {formatCompact(row.inputTokens)} / out {formatCompact(row.outputTokens)}
-                      </p>
-                    </div>
-                    <div className="text-right">
-                      <p className="text-xs font-medium tabular-nums">{formatNumber(row.requests)}</p>
-                      <p className="text-[11px] tabular-nums text-muted-foreground">{formatCompact(row.tokens)}</p>
-                    </div>
-                  </div>
-                  <div className="mt-2 h-1.5 overflow-hidden rounded-sm bg-muted/35">
-                    <div
-                      className="h-full rounded-sm"
-                      style={{
-                        width: `${maxRequests > 0 ? (row.requests / maxRequests) * 100 : 0}%`,
-                        background: PALETTE[i % PALETTE.length],
-                      }}
-                    />
-                  </div>
-                </button>
-              ))}
-            </div>
-            {selected && <ModelDetail row={selected} />}
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function ModelDetail({ row }: { row: ModelUsageDisplayRow }) {
-  const avgTokens = row.requests > 0 ? row.tokens / row.requests : 0;
-  const route = row.route;
-
-  return (
-    <div className="rounded-sm border border-border bg-background/35 px-3 py-3">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <p className="truncate text-sm font-medium">{row.model}</p>
-          <p className="mt-0.5 text-xs text-muted-foreground">
-            {formatNumber(row.requests)} requests / {formatCompact(row.tokens)} tokens / avg {formatCompact(avgTokens)}
-          </p>
-        </div>
-        <Link href={`/models?model=${encodeURIComponent(row.model)}`} className="shrink-0 text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground">
-          Models
-        </Link>
-      </div>
-      {route ? (
-        <div className="mt-3 grid grid-cols-2 gap-2 text-xs md:grid-cols-4">
-          <DetailStat label="Context" value={formatNumber(route.context_window)} />
-          <DetailStat label="Status" value={route.enabled ? "enabled" : "disabled"} />
-          <DetailStat label="Cache" value={route.cache_enabled ? `${route.cache_ttl_secs}s` : "off"} />
-          <DetailStat className="md:col-span-2" label="Upstream" value={route.upstream_model} />
-          <DetailStat className="md:col-span-2" label="Base URL" value={route.api_base} />
-          <div className="rounded-sm border border-border/70 bg-card/35 px-2 py-1.5 md:col-span-2">
-            <p className="mb-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">Model weight</p>
-            <ModelWeightControl id={route.id} initial={route.admission_weight} />
-          </div>
-          <div className="rounded-sm border border-border/70 bg-card/35 px-2 py-1.5 md:col-span-4">
-            <p className="mb-1.5 text-[10px] uppercase tracking-wider text-muted-foreground">Model slots</p>
-            <ModelCapacityControl id={route.id} initial={route.max_in_flight} />
-          </div>
-        </div>
-      ) : (
-        <p className="mt-3 text-xs text-muted-foreground">
-          No configured model route matched this usage row. It may be served by the default upstream path.
-        </p>
-      )}
-    </div>
-  );
-}
-
-function KeyUsagePanel({ rows }: { rows: KeyUsageDisplayRow[] }) {
-  const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null);
-  const [pending, start] = useTransition();
-  const queryClient = useQueryClient();
-  const selected = rows.find((row) => row.keyId === selectedKeyId) ?? null;
-  const maxRequests = rows.reduce((max, row) => Math.max(max, row.requests), 0);
-  const totals = rows.reduce(
-    (acc, row) => ({
-      requests: acc.requests + row.requests,
-      tokens: acc.tokens + row.tokens,
-    }),
-    { requests: 0, tokens: 0 },
-  );
-
-  function disableSelectedKey() {
-    if (!selected) return;
-    if (!window.confirm(`Disable key ${selected.keyLabel}? Existing clients using it will stop authenticating.`)) return;
-    start(async () => {
-      await toggleKeyAction(selected.keyId, true);
-      queryClient.invalidateQueries({ queryKey: ["usage-keys-top"] });
-    });
-  }
-
-  return (
-    <Card className="rounded-md">
-      <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <CardTitle>Busiest keys</CardTitle>
-          <CardDescription>Last hour / top {TOP_KEYS} by request volume</CardDescription>
-        </div>
-        <div className="text-right text-xs tabular-nums text-muted-foreground">
-          <p>{formatNumber(totals.requests)} requests</p>
-          <p>{formatCompact(totals.tokens)} tokens</p>
-        </div>
-      </CardHeader>
-      <CardContent>
-        {rows.length === 0 ? (
-          <EmptyState className="h-72">No key traffic in the last hour</EmptyState>
-        ) : (
-          <div className="space-y-4">
-            <div className="max-h-72 space-y-2 overflow-auto pr-1">
-              {rows.map((row) => (
-                <button
-                  key={row.keyId}
-                  type="button"
-                  aria-pressed={selectedKeyId === row.keyId}
-                  onClick={() => setSelectedKeyId((current) => (current === row.keyId ? null : row.keyId))}
-                  className={cn(
-                    "w-full rounded-sm border border-border bg-background/30 px-3 py-2 text-left transition-colors hover:bg-muted/20",
-                    selectedKeyId === row.keyId && "border-muted-foreground/40 bg-muted/15",
-                  )}
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="min-w-0">
-                      <p className="truncate font-mono text-xs">key {row.keyLabel}</p>
-                      <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
-                        {row.tenant} / {row.group}
-                      </p>
-                    </div>
-                    <div className="text-right">
-                      <p className="text-xs font-medium tabular-nums">{formatNumber(row.requests)}</p>
-                      <p className="text-[11px] tabular-nums text-muted-foreground">{formatCompact(row.tokens)}</p>
-                    </div>
-                  </div>
-                  <div className="mt-2 h-1.5 overflow-hidden rounded-sm bg-muted/35">
-                    <div
-                      className="h-full rounded-sm"
-                      style={{ width: `${maxRequests > 0 ? (row.requests / maxRequests) * 100 : 0}%`, background: row.color }}
-                    />
-                  </div>
-                </button>
-              ))}
-            </div>
-            {selected && <KeyDetail row={selected} pending={pending} onDisable={disableSelectedKey} />}
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
-
-function KeyDetail({
-  row,
-  pending,
-  onDisable,
-}: {
-  row: KeyUsageDisplayRow;
-  pending: boolean;
-  onDisable: () => void;
-}) {
-  const avgTokens = row.requests > 0 ? row.tokens / row.requests : 0;
-
-  return (
-    <div className="rounded-sm border border-border bg-background/35 px-3 py-3">
-      <div className="flex items-start justify-between gap-3">
-        <div className="min-w-0">
-          <p className="truncate font-mono text-sm">key {row.keyLabel}</p>
-          <p className="mt-0.5 truncate text-xs text-muted-foreground">
-            {row.tenant} / {row.group} / avg {formatCompact(avgTokens)} tokens
-          </p>
-        </div>
-        <Link href={`/keys?key=${encodeURIComponent(row.keyLabel)}`} className="shrink-0 text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground">
-          Keys
-        </Link>
-      </div>
-
-      <div className="mt-3 grid grid-cols-2 gap-2 text-xs md:grid-cols-4">
-        <DetailStat label="Requests" value={formatNumber(row.requests)} />
-        <DetailStat label="Tokens" value={formatCompact(row.tokens)} />
-        <DetailStat label="In flight" value={row.tenantInFlight === undefined ? "--" : formatNumber(row.tenantInFlight)} />
-        <DetailStat label="Queued" value={row.tenantQueued === undefined ? "--" : formatNumber(row.tenantQueued)} />
-      </div>
-
-      <div className="mt-3 rounded-sm border border-border/70 bg-card/35 px-3 py-2">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
-            <p className="text-xs font-medium">Tenant fairshare lever</p>
-            <p className="mt-0.5 text-[11px] text-muted-foreground">
-              Keys share their tenant pool; lower the tenant weight or disable the key to reduce pressure.
-            </p>
-          </div>
-          {row.tenantWeight !== undefined ? (
-            <WeightCell id={row.tenantId} weight={row.tenantWeight} />
-          ) : (
-            <span className="text-xs text-muted-foreground">tenant inactive</span>
-          )}
-        </div>
-      </div>
-
-      <div className="mt-3 flex flex-wrap items-center gap-2">
-        <Button type="button" variant="outline" size="sm" disabled={pending} onClick={onDisable}>
-          {pending ? "Disabling..." : "Disable key"}
-        </Button>
-        <Link href={`/tenants?tenant=${encodeURIComponent(row.tenantId)}`} className="text-xs text-muted-foreground underline underline-offset-2 hover:text-foreground">
-          Open tenant
-        </Link>
-      </div>
-    </div>
-  );
-}
-
-function DetailStat({ label, value, className }: { label: string; value: string; className?: string }) {
-  return (
-    <div className={cn("min-w-0 rounded-sm border border-border/70 bg-card/35 px-2 py-1.5", className)}>
-      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
-      <p className="mt-0.5 truncate font-mono text-[11px] text-foreground">{value}</p>
-    </div>
-  );
-}
-
 // ---------------------------------------------------------------------------
 // Shared helpers
 // ---------------------------------------------------------------------------
-
-function EmptyState({ children, className = "h-64" }: { children: ReactNode; className?: string }) {
-  return (
-    <p className={cn("flex items-center justify-center text-center text-sm text-muted-foreground", className)}>
-      {children}
-    </p>
-  );
-}
-
-function colorForGroup(name: string, index = 0) {
-  return GROUP_PALETTE[name] ?? PALETTE[index % PALETTE.length];
-}
 
 function slotAxisMax(max: number) {
   if (!Number.isFinite(max) || max <= 0) return 8;
@@ -1919,16 +1438,12 @@ function isTenantActive(t: TenantFairshareView) {
   return t.in_flight + t.queued > 0;
 }
 
-function isStarved(t: TenantFairshareView): boolean {
-  return t.queued > 0 && t.in_flight < Math.floor(t.expected_slots);
-}
-
 function fairnessGap(t: TenantFairshareView): number {
   return t.in_flight - t.expected_slots;
 }
 
 function fairnessColor(t: TenantFairshareView): string {
-  if (isStarved(t)) return STARVED_COLOR;
+  if (isWaitingBelowShare(t)) return STARVED_COLOR;
   return fairnessGap(t) >= -0.5 ? HEALTHY_COLOR : UNDER_COLOR;
 }
 
@@ -1942,110 +1457,3 @@ function pressureStatus(utilization: number, queued: number): MetricTone {
   return "ok";
 }
 
-function clamp(n: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, n));
-}
-
-function formatPct(n: number): string {
-  if (!Number.isFinite(n)) return "0%";
-  if (Math.abs(n) < 10 && n !== 0) return `${n.toFixed(1)}%`;
-  return `${Math.round(n)}%`;
-}
-
-function formatDecimal(n: number): string {
-  if (!Number.isFinite(n)) return "0";
-  if (Math.abs(n) >= 10 || Number.isInteger(n)) return formatNumber(Math.round(n));
-  return n.toFixed(1);
-}
-
-function formatDelta(delta: number): string {
-  const rounded = Math.abs(delta) < 0.05 ? 0 : delta;
-  if (rounded === 0) return "0";
-  const sign = rounded > 0 ? "+" : "-";
-  const mag = Math.abs(rounded);
-  return `${sign}${mag >= 10 || Number.isInteger(mag) ? formatNumber(Math.round(mag)) : mag.toFixed(1)}`;
-}
-
-function formatCompact(n: number): string {
-  if (!Number.isFinite(n)) return "0";
-  const sign = n < 0 ? "-" : "";
-  const abs = Math.abs(n);
-  if (abs < 1000) return `${sign}${abs < 10 ? String(Math.round(abs * 10) / 10) : String(Math.round(abs))}`;
-  if (abs < 1_000_000) return `${sign}${(abs / 1000).toFixed(abs < 10_000 ? 1 : 0)}k`;
-  if (abs < 1_000_000_000) return `${sign}${(abs / 1_000_000).toFixed(abs < 10_000_000 ? 1 : 0)}M`;
-  return `${sign}${(abs / 1_000_000_000).toFixed(1)}B`;
-}
-
-function formatScore(n: number): string {
-  if (!Number.isFinite(n)) return "0";
-  if (Math.abs(n) >= 1000) return formatCompact(n);
-  if (Math.abs(n) >= 10) return n.toFixed(0);
-  return n.toFixed(2);
-}
-
-// ---------------------------------------------------------------------------
-// Standalone key chart used by the keys page
-// ---------------------------------------------------------------------------
-
-export function KeyUsageChart({
-  keys,
-  usageByKey,
-  tenantNames,
-}: {
-  keys: { id: string; key_prefix: string; tenant_id: string; name: string }[];
-  usageByKey: { key_id: string; requests: number; total_tokens: number }[];
-  tenantNames: Record<string, string>;
-}) {
-  const data = useMemo(() => {
-    const usage = new Map(usageByKey.map((u) => [u.key_id, u]));
-    return keys
-      .map((k, i) => ({
-        label: `${k.key_prefix}...`,
-        tenant: tenantNames[k.tenant_id] ?? k.tenant_id.slice(0, 8),
-        requests: Number(usage.get(k.id)?.requests ?? 0),
-        tokens: Number(usage.get(k.id)?.total_tokens ?? 0),
-        fill: PALETTE[i % PALETTE.length],
-      }))
-      .filter((d) => d.requests > 0)
-      .sort((a, b) => b.requests - a.requests)
-      .slice(0, TOP_KEYS);
-  }, [keys, usageByKey, tenantNames]);
-
-  return (
-    <Card className="rounded-md">
-      <CardHeader>
-        <CardTitle>Busiest keys</CardTitle>
-        <CardDescription>Highest-volume API keys in the selected window</CardDescription>
-      </CardHeader>
-      <CardContent>
-        {data.length === 0 ? (
-          <EmptyState className="h-72">No key traffic yet</EmptyState>
-        ) : (
-          <ChartShell heightClass="h-72">
-            <ResponsiveContainer width="100%" height="100%">
-              <BarChart data={data} layout="vertical" margin={{ left: 4, right: 16, top: 4, bottom: 4 }}>
-                <CartesianGrid {...chartGrid} horizontal={false} />
-                <XAxis type="number" tick={axisTick} axisLine={false} tickLine={false} allowDecimals={false} />
-                <YAxis type="category" dataKey="label" width={130} tick={axisTick} axisLine={false} tickLine={false} interval={0} />
-                <Tooltip
-                  cursor={false}
-                  content={tip({
-                    labelFormatter: (label, payload) => {
-                      const row = payload[0]?.payload as { tenant?: string; tokens?: number } | undefined;
-                      return row ? `${label} / ${row.tenant} / ${formatCompact(Number(row.tokens ?? 0))} tokens` : String(label);
-                    },
-                  })}
-                />
-                <Bar dataKey="requests" name="Requests" radius={[0, 2, 2, 0]} barSize={12}>
-                  {data.map((d) => (
-                    <Cell key={d.label} fill={d.fill} />
-                  ))}
-                </Bar>
-              </BarChart>
-            </ResponsiveContainer>
-          </ChartShell>
-        )}
-      </CardContent>
-    </Card>
-  );
-}

@@ -11,17 +11,10 @@ export default async function FairsharePage() {
   const tenants = await safe(obleth.listTenants(), []);
 
   const tenantNames = Object.fromEntries(tenants.map((t) => [t.id, t.name]));
-  const tenantGroups = Object.fromEntries(tenants.map((t) => [t.id, t.fairshare_group]));
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-lg font-semibold tracking-tight">Fairshare</h1>
-        <p className="max-w-2xl text-sm text-muted-foreground">
-          Live scheduler state for group pools, tenant contention, and the workload driving it.
-        </p>
-      </div>
-      <FairshareDashboard tenantNames={tenantNames} tenantGroups={tenantGroups} />
+    <div>
+      <FairshareDashboard tenantNames={tenantNames} />
     </div>
   );
 }

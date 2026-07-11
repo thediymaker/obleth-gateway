@@ -322,6 +322,40 @@ pub struct UsageDailyRow {
     pub co2_g: f64,
 }
 
+/// Whole-gateway usage totals for the overview strip: one aggregate row over
+/// the window instead of per-tenant/per-model groupings.
+#[derive(Debug, Clone, Default, Row, Serialize, Deserialize, ToSchema)]
+pub struct UsageTotals {
+    pub requests: u64,
+    pub total_tokens: u64,
+    /// Sum of each request's frozen `cost_usd` — never recomputed from
+    /// current prices.
+    pub cost_usd: f64,
+    /// Distinct tenants with at least one request in the window.
+    pub active_tenants: u64,
+}
+
+pub async fn query_usage_totals(
+    client: &clickhouse::Client,
+    since_ms: Option<i64>,
+    include_internal: Option<bool>,
+) -> Result<UsageTotals, clickhouse::error::Error> {
+    let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let filter = internal_filter(include_internal);
+    let sql = format!(
+        "select count() as requests, \
+         sum(input_tokens) + sum(output_tokens) as total_tokens, \
+         sum(cost_usd) as cost_usd, \
+         uniqExact(tenant_id) as active_tenants \
+         from usage where ts_ms >= ?{filter}"
+    );
+    client
+        .query(&sql)
+        .bind(since)
+        .fetch_one::<UsageTotals>()
+        .await
+}
+
 /// Per-tenant usage aggregate.
 #[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
 pub struct UsageAgg {

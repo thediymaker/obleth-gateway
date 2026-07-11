@@ -10,6 +10,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { CodeBlock, CopyButton } from "@/components/portal/copy-button";
 import type { KeyUsageSummary, UsageAgg, UsageLogEntry } from "@/lib/obleth";
+import { formatDurationMs } from "@/lib/format";
 import { cn, formatCurrency, formatNumber } from "@/lib/utils";
 
 export function PortalUsage({
@@ -174,7 +175,7 @@ function RecentRow({ row }: { row: UsageLogEntry }) {
         <span className="block max-w-[12rem] truncate text-xs">{row.key_name || row.key_prefix || "unknown"}</span>
       </td>
       <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatNumber(row.total_tokens)}</td>
-      <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatSeconds(row.total_ms)}</td>
+      <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{formatDurationMs(row.total_ms)}</td>
       <td className="px-4 py-2">
         <div className="flex items-center gap-2">
           <span className="font-mono text-xs text-muted-foreground">{row.request_id.slice(0, 8)}</span>
@@ -201,7 +202,7 @@ function RecentCard({ row }: { row: UsageLogEntry }) {
       </div>
       <div className="mt-3 grid grid-cols-2 gap-2 text-xs">
         <MiniMetric label="Tokens" value={formatNumber(row.total_tokens)} />
-        <MiniMetric label="Duration" value={formatSeconds(row.total_ms)} />
+        <MiniMetric label="Duration" value={formatDurationMs(row.total_ms)} />
         <MiniMetric label="Cost" value={formatCurrency(row.cost_usd)} />
         <MiniMetric label="Key" value={row.key_name || row.key_prefix || "unknown"} />
       </div>
@@ -302,11 +303,6 @@ function TimeStamp({ ms, align = "left" }: { ms: number; align?: "left" | "right
       <span>{date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}</span>
     </span>
   );
-}
-
-function formatSeconds(ms: number): string {
-  if (!ms || ms <= 0) return "--";
-  return `${(ms / 1000).toFixed(2)}s`;
 }
 
 function formatLastUsed(ms?: number): string {

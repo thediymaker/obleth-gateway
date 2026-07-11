@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { Label } from "@/components/ui/label";
 import type { AdminUser } from "@/lib/auth/users";
+import { truncateId } from "@/lib/format";
 import { cn, formatNumber } from "@/lib/utils";
 
 interface TenantOption {
@@ -119,7 +120,7 @@ function UserRow({
                 {user.email}
               </p>
               <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground" title={user.id}>
-                ID {shortId(user.id)}
+                ID {truncateId(user.id)}
               </p>
               <div className="mt-2 flex flex-wrap items-center gap-1.5 md:hidden">
                 <UserBadges user={user} tenantName={tenantName} />
@@ -454,8 +455,4 @@ function EmptyState() {
       <p className="mt-1 text-xs">Approved and pending accounts will appear here.</p>
     </div>
   );
-}
-
-function shortId(id: string) {
-  return id.length > 12 ? `${id.slice(0, 8)}...${id.slice(-4)}` : id;
 }

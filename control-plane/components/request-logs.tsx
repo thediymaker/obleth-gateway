@@ -10,6 +10,7 @@ import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { RequestDetail } from "@/components/request-detail";
 import type { UsageLogEntry } from "@/lib/obleth";
+import { formatDurationMs, truncateId } from "@/lib/format";
 import { cn, formatCurrency, formatNumber } from "@/lib/utils";
 
 const LIVE_POLL_MS = 15_000;
@@ -507,10 +508,10 @@ function LogRow({
         {formatNumber(row.total_tokens)}
       </td>
       <td className="hidden px-3 py-1.5 text-right tabular-nums text-muted-foreground xl:table-cell">
-        {formatSeconds(row.ttft_ms)}
+        {formatDurationMs(row.ttft_ms)}
       </td>
       <td className="px-3 py-1.5 text-right tabular-nums text-muted-foreground">
-        {formatSeconds(row.total_ms)}
+        {formatDurationMs(row.total_ms)}
       </td>
       <td className="hidden px-3 py-1.5 2xl:table-cell">
         <span className="block max-w-[10rem] truncate">
@@ -569,10 +570,10 @@ function LogCard({
 
         <div className="mt-3 grid grid-cols-2 gap-3 text-xs">
           <MobileMetric label="Model" value={row.model} mono />
-          <MobileMetric label="Duration" value={formatSeconds(row.total_ms)} mono />
+          <MobileMetric label="Duration" value={formatDurationMs(row.total_ms)} mono />
           <MobileMetric label="Tokens" value={formatNumber(row.total_tokens)} mono />
           <MobileMetric label="Cost" value={formatCurrency(row.cost_usd)} mono />
-          <MobileMetric label="TTFB" value={formatSeconds(row.ttft_ms)} mono />
+          <MobileMetric label="TTFB" value={formatDurationMs(row.ttft_ms)} mono />
           <MobileMetric label="Team" value={row.tenant_name || row.tenant_id.slice(0, 8)} />
         </div>
       </button>
@@ -672,18 +673,8 @@ function formatTimeParts(ms: number): { date: string; time: string } {
   };
 }
 
-function formatSeconds(ms: number): string {
-  if (!ms || ms <= 0) return "--";
-  return `${(ms / 1000).toFixed(2)}s`;
-}
-
 export function formatWh(wh: number): string {
   if (wh <= 0) return "—";
   if (wh < 0.01) return "< 0.01 Wh";
   return `${wh.toFixed(2)} Wh`;
-}
-
-function truncateId(id: string): string {
-  if (!id) return "";
-  return id.length > 12 ? `${id.slice(0, 12)}...` : id;
 }

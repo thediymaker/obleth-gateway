@@ -13,7 +13,8 @@ import {
 } from "recharts";
 import { axisTick, chartGrid, ChartShell, compactAxis, tip, timeCursor } from "@/components/chart-tooltip";
 import type { ModelUsageTimePoint, UsageBreakdownEntry } from "@/lib/obleth";
-import { cn, formatNumber } from "@/lib/utils";
+import { formatCompact, formatDecimal } from "@/lib/format";
+import { cn, formatNumber, getJson } from "@/lib/utils";
 
 export type ModelWindow = "5m" | "15m" | "1h" | "6h" | "24h";
 
@@ -46,28 +47,6 @@ const GEN_COLOR = "hsl(205 60% 58%)";
 const PROMPT_COLOR = "hsl(350 55% 62%)";
 const P50_COLOR = "hsl(160 45% 55%)";
 const AVG_COLOR = "hsl(38 65% 60%)";
-
-async function getJson<T>(url: string): Promise<T> {
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`fetch failed: ${url}`);
-  return (await res.json()) as T;
-}
-
-function formatCompact(n: number): string {
-  if (!Number.isFinite(n)) return "0";
-  const sign = n < 0 ? "-" : "";
-  const abs = Math.abs(n);
-  if (abs < 1000) return `${sign}${abs < 10 ? String(Math.round(abs * 10) / 10) : String(Math.round(abs))}`;
-  if (abs < 1_000_000) return `${sign}${(abs / 1000).toFixed(abs < 10_000 ? 1 : 0)}k`;
-  if (abs < 1_000_000_000) return `${sign}${(abs / 1_000_000).toFixed(abs < 10_000_000 ? 1 : 0)}M`;
-  return `${sign}${(abs / 1_000_000_000).toFixed(1)}B`;
-}
-
-function formatDecimal(n: number): string {
-  if (!Number.isFinite(n)) return "0";
-  if (Math.abs(n) >= 10 || Number.isInteger(n)) return formatNumber(Math.round(n));
-  return n.toFixed(1);
-}
 
 function EmptyMessage({ children, className = "h-24" }: { children: React.ReactNode; className?: string }) {
   return (

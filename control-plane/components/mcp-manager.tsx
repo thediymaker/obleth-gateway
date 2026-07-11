@@ -10,6 +10,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import type { McpServer } from "@/lib/obleth";
@@ -20,6 +21,7 @@ export function McpManager({ servers }: { servers: McpServer[] }) {
   const [pending, start] = useTransition();
   const [createError, setCreateError] = useState<string | null>(null);
   const createFormRef = useRef<HTMLFormElement>(null);
+  const { confirm, confirmElement } = useConfirm();
 
   type ProbeState = { pending: true } | { pending: false; row: McpServerTestRow };
   const [probes, setProbes] = useState<Record<string, ProbeState>>({});
@@ -45,8 +47,13 @@ export function McpManager({ servers }: { servers: McpServer[] }) {
     setProbes((p) => ({ ...p, [name]: { pending: false, row } }));
   }
 
-  function removeServer(server: McpServer) {
-    if (!window.confirm(`Remove MCP server "${server.name}"? This cannot be undone.`)) return;
+  async function removeServer(server: McpServer) {
+    const ok = await confirm({
+      title: "Remove MCP server",
+      description: `Remove MCP server "${server.name}"? Models using its tools lose them immediately. This cannot be undone.`,
+      confirmLabel: "Remove",
+    });
+    if (!ok) return;
     start(() => deleteMcpServerAction(server.id));
   }
 
@@ -66,6 +73,7 @@ export function McpManager({ servers }: { servers: McpServer[] }) {
 
   return (
     <div className="space-y-6">
+      {confirmElement}
       <Card>
         <CardHeader>
           <CardTitle>Register MCP server</CardTitle>

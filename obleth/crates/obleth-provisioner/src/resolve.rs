@@ -67,12 +67,7 @@ impl HostResolver {
             return None;
         }
         // 1. Operator override wins outright — no DNS at all.
-        if let Some(ip) = self
-            .aliases
-            .lock()
-            .ok()
-            .and_then(|a| a.get(host).cloned())
-        {
+        if let Some(ip) = self.aliases.lock().ok().and_then(|a| a.get(host).cloned()) {
             return Some(ip);
         }
         // 2. Already an address literal: nothing to resolve.
@@ -158,7 +153,10 @@ mod tests {
     #[tokio::test]
     async fn alias_overrides_dns_entirely() {
         let r = resolver();
-        r.set_aliases(HashMap::from([("scgh001".to_string(), "10.0.0.7".to_string())]));
+        r.set_aliases(HashMap::from([(
+            "scgh001".to_string(),
+            "10.0.0.7".to_string(),
+        )]));
         assert_eq!(r.resolve("scgh001").await.as_deref(), Some("10.0.0.7"));
     }
 
@@ -171,7 +169,10 @@ mod tests {
     #[tokio::test]
     async fn resolve_url_host_swaps_hostname_for_alias_ip_keeping_port_and_path() {
         let r = resolver();
-        r.set_aliases(HashMap::from([("scgh002".to_string(), "10.0.0.9".to_string())]));
+        r.set_aliases(HashMap::from([(
+            "scgh002".to_string(),
+            "10.0.0.9".to_string(),
+        )]));
         assert_eq!(
             r.resolve_url_host("http://scgh002:8016/v1").await,
             "http://10.0.0.9:8016/v1"

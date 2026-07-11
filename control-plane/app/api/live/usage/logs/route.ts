@@ -31,6 +31,7 @@ export async function GET(req: NextRequest) {
     beforeMs: num("before_ms"),
     beforeRequestId: str("before_request_id"),
     limit: num("limit"),
+    tracedOnly: sp.get("traced_only") === "true" ? true : undefined,
     includeInternal: sp.get("include_internal") === "true" ? true : undefined,
   };
 

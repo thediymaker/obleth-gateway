@@ -39,20 +39,28 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 
 const SIDEBAR_STORAGE_KEY = "obleth-sidebar-collapsed";
 
-const nav = [
-  { href: "/", label: "Overview", icon: LayoutDashboard },
-  { href: "/fairshare", label: "Fairshare", icon: Gauge },
-  { href: "/models", label: "Models", icon: Boxes },
-  { href: "/recipes", label: "Recipes", icon: BookText },
-  { href: "/users", label: "Users", icon: UserCog },
-  { href: "/mcp", label: "MCP Servers", icon: Plug },
-  { href: "/tenants", label: "Tenants", icon: Users },
-  { href: "/keys", label: "API Keys", icon: KeyRound },
-  { href: "/logs", label: "Request Logs", icon: Radio },
-  { href: "/reports", label: "Reports", icon: BarChart3 },
-  { href: "/audit", label: "Audit", icon: ScrollText },
-  { href: "/settings", label: "Settings", icon: Settings },
+const navGroups = [
+  { label: "Overview", items: [{ href: "/", label: "Overview", icon: LayoutDashboard }] },
+  { label: "Operations", items: [
+    { href: "/fairshare", label: "Fairshare", icon: Gauge },
+    { href: "/models", label: "Models", icon: Boxes },
+    { href: "/logs", label: "Request Logs", icon: Radio },
+    { href: "/reports", label: "Reports", icon: BarChart3 },
+  ] },
+  { label: "Access", items: [
+    { href: "/tenants", label: "Tenants", icon: Users },
+    { href: "/keys", label: "API Keys", icon: KeyRound },
+    { href: "/users", label: "Users", icon: UserCog },
+  ] },
+  { label: "Configuration", items: [
+    { href: "/recipes", label: "Recipes", icon: BookText },
+    { href: "/mcp", label: "MCP Servers", icon: Plug },
+    { href: "/settings", label: "Settings", icon: Settings },
+    { href: "/audit", label: "Audit", icon: ScrollText },
+  ] },
 ];
+
+const nav = navGroups.flatMap((group) => group.items);
 
 function userInitials(name: string) {
   const parts = name.trim().split(/[\s._-]+/).filter(Boolean);
@@ -170,20 +178,18 @@ export function AppShell({
               </div>
             )}
           </div>
-          <nav className="flex min-h-0 flex-1 flex-col gap-0.5 overflow-y-auto p-2">
-            {nav.map(({ href, label, icon }) => {
-              const active = href === "/" ? pathname === "/" : pathname.startsWith(href);
-              return (
-                <NavItem
-                  key={href}
-                  href={href}
-                  label={label}
-                  icon={icon}
-                  active={active}
-                  collapsed={sidebarCollapsed}
-                />
-              );
-            })}
+          <nav className="flex min-h-0 flex-1 flex-col overflow-y-auto p-2" aria-label="Dashboard navigation">
+            {navGroups.map((group, groupIndex) => (
+              <div key={group.label} className={cn(groupIndex > 0 && "mt-3 border-t border-border/70 pt-3")}>
+                {!sidebarCollapsed && <p className="mb-1 px-3 text-[10px] font-medium uppercase tracking-wider text-muted-foreground/70">{group.label}</p>}
+                <div className="space-y-0.5">
+                  {group.items.map(({ href, label, icon }) => {
+                    const active = href === "/" ? pathname === "/" : pathname.startsWith(href);
+                    return <NavItem key={href} href={href} label={label} icon={icon} active={active} collapsed={sidebarCollapsed} />;
+                  })}
+                </div>
+              </div>
+            ))}
           </nav>
         </aside>
 

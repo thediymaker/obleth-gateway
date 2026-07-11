@@ -1,6 +1,8 @@
 "use client";
 
 import type { TraceSummary } from "@/lib/charo/trace";
+import { formatDurationMs } from "@/lib/format";
+import { formatCurrency } from "@/lib/utils";
 
 const BOON_LABELS: Record<string, string> = {
   vision: "vision",
@@ -14,9 +16,6 @@ function label(b: string): string {
   return BOON_LABELS[b] ?? b;
 }
 
-function ms(n: number): string {
-  return n >= 1000 ? `${(n / 1000).toFixed(2)}s` : `${Math.round(n)}ms`;
-}
 
 export function TraceCard({
   trace,
@@ -42,10 +41,10 @@ export function TraceCard({
 
   const stats = [
     `tok ${trace.inputTokens}/${trace.outputTokens}`,
-    `ttft ${ms(trace.ttftMs)}`,
-    `total ${ms(trace.totalMs)}`,
+    `ttft ${formatDurationMs(trace.ttftMs)}`,
+    `total ${formatDurationMs(trace.totalMs)}`,
     `cache ${trace.cacheStatus}`,
-    `$${trace.costUsd.toFixed(5)}`,
+    formatCurrency(trace.costUsd),
     ...(isError ? [`http ${trace.statusCode || "—"}`] : []),
   ];
 

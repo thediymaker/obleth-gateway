@@ -194,7 +194,10 @@ fn endpoint_api_base(node: &str, serving_port: i64) -> String {
 /// transient error would strip every replica's endpoint at once.
 pub fn clear_dangling_endpoints(replicas: &mut [ReplicaView], known_endpoints: &HashSet<Uuid>) {
     for r in replicas.iter_mut() {
-        if r.state == "healthy" && r.endpoint_id.is_some_and(|ep| !known_endpoints.contains(&ep)) {
+        if r.state == "healthy"
+            && r.endpoint_id
+                .is_some_and(|ep| !known_endpoints.contains(&ep))
+        {
             r.endpoint_id = None;
         }
     }

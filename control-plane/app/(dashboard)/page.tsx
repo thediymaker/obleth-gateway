@@ -1,7 +1,6 @@
-import Link from "next/link";
 import { OverviewDashboard } from "@/components/overview-dashboard";
-import { computeOverviewSummary } from "@/lib/overview-summary";
-import { obleth, type CacheStats, type FairshareLiveView, type LiveStats, type ModelHealthSummary } from "@/lib/obleth";
+import { EMPTY_OVERVIEW_SUMMARY, fetchOverviewSummary } from "@/lib/overview-summary";
+import { obleth, type FairshareLiveView, type LiveStats, type ModelHealthSummary } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
@@ -15,59 +14,33 @@ export default async function OverviewPage() {
   const hourAgo = now - HOUR_MS;
 
   const [
-    tenants,
-    keys,
+    summary,
     models,
-    usage,
     usageByModel,
-    usageByKey,
-    costs,
     volumeSeries,
     tenantSeries,
-    cacheStats,
     health,
     fairshare,
     stats,
   ] = await Promise.all([
-    safe(obleth.listTenants(), []),
-    safe(obleth.listKeys(), []),
+    safe(fetchOverviewSummary(), EMPTY_OVERVIEW_SUMMARY),
     safe(obleth.listModels(), []),
-    safe(obleth.usage(dayAgo), []),
     safe(obleth.usageByModel(hourAgo), []),
-    safe(obleth.usageByKey(hourAgo, 10), []),
-    safe(obleth.costs(dayAgo), []),
     safe(obleth.usageSeries(300_000, dayAgo), []),
     safe(obleth.usageSeriesByTenant(60_000, hourAgo), []),
-    safe<CacheStats | undefined>(obleth.cacheStats(dayAgo), undefined),
     safe<ModelHealthSummary[]>(obleth.modelHealth(), []),
     safe<FairshareLiveView | undefined>(obleth.fairshareLive(), undefined),
     safe<LiveStats | undefined>(obleth.stats(), undefined),
   ]);
 
-  const summary = computeOverviewSummary(tenants, keys, models, usage, costs);
-
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-lg font-semibold tracking-tight">Overview</h1>
-        <p className="text-sm text-muted-foreground">
-          At-a-glance gateway health, traffic, and route posture. For scheduler details see{" "}
-          <Link href="/fairshare" className="underline underline-offset-2 hover:text-foreground">
-            Fairshare
-          </Link>
-        </p>
-      </div>
-
+    <div>
       <OverviewDashboard
-        tenants={tenants}
         models={models}
         initialSummary={summary}
         initialVolumeSeries={volumeSeries}
-        initialTenantUsage={usage}
         initialTenantSeries={tenantSeries}
         initialModelUsage={usageByModel}
-        initialKeyUsage={usageByKey}
-        initialCacheStats={cacheStats}
         initialHealth={health}
         initialFairshare={fairshare}
         initialStats={stats}

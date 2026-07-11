@@ -17,3 +17,9 @@ export function formatCurrency(n: number) {
     maximumFractionDigits: 6,
   }).format(n);
 }
+
+export async function getJson<T>(url: string): Promise<T> {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`fetch failed: ${url}`);
+  return (await res.json()) as T;
+}
