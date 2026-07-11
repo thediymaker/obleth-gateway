@@ -40,6 +40,7 @@ import type {
   CharoSettingsView,
   CompressorStatusView,
   ModelRoute,
+  NodeAlias,
   SlurmHealthView,
   SlurmSettingsView,
   UpdateAlertSettings,
@@ -1319,6 +1320,7 @@ export function SlurmSettingsForm({ settings }: { settings: SlurmSettingsView | 
   const jwtSet = settings?.jwt_set ?? false;
   const jwtLast4 = settings?.jwt_last4 ?? null;
   const [jwt, setJwt] = useState("");
+  const [aliases, setAliases] = useState<NodeAlias[]>(settings?.node_aliases ?? []);
 
   function save() {
     setStatus(null);
@@ -1328,6 +1330,9 @@ export function SlurmSettingsForm({ settings }: { settings: SlurmSettingsView | 
       slurmrestd_url: url.trim(),
       slurmrestd_api_version: version.trim() || "v0.0.40",
       slurm_user: user.trim(),
+      node_aliases: aliases
+        .map((a) => ({ host: a.host.trim(), ip: a.ip.trim() }))
+        .filter((a) => a.host || a.ip),
     };
     if (jwt.trim()) body.slurm_jwt = jwt.trim();
     start(async () => {
@@ -1502,6 +1507,68 @@ export function SlurmSettingsForm({ settings }: { settings: SlurmSettingsView | 
               autoComplete="new-password"
             />
           </div>
+        </div>
+
+        <div className="space-y-2 rounded-md border border-border bg-muted/20 p-3">
+          <div className="space-y-0.5">
+            <Label>Node address overrides</Label>
+            <p className="text-xs text-muted-foreground">
+              Map Slurm node hostnames to IPs for clusters where the pods running obleth resolve
+              node names unreliably. The provisioner then registers each replica&apos;s endpoint by
+              IP and probes by IP, so neither health checks nor proxied requests depend on
+              per-request DNS. Leave empty to resolve node names through DNS.
+            </p>
+          </div>
+          {aliases.length > 0 && (
+            <div className="space-y-2">
+              {aliases.map((a, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <Input
+                    aria-label="Node hostname"
+                    value={a.host}
+                    onChange={(e) =>
+                      setAliases((prev) =>
+                        prev.map((x, j) => (j === i ? { ...x, host: e.target.value } : x)),
+                      )
+                    }
+                    placeholder="scgh001"
+                    className="font-mono"
+                    autoComplete="off"
+                  />
+                  <span className="shrink-0 text-muted-foreground">→</span>
+                  <Input
+                    aria-label="IP address"
+                    value={a.ip}
+                    onChange={(e) =>
+                      setAliases((prev) =>
+                        prev.map((x, j) => (j === i ? { ...x, ip: e.target.value } : x)),
+                      )
+                    }
+                    placeholder="10.139.125.25"
+                    className="font-mono"
+                    autoComplete="off"
+                  />
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => setAliases((prev) => prev.filter((_, j) => j !== i))}
+                    aria-label="Remove override"
+                  >
+                    Remove
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={() => setAliases((prev) => [...prev, { host: "", ip: "" }])}
+          >
+            Add node override
+          </Button>
         </div>
 
         <div className="flex flex-wrap items-center gap-3">

@@ -666,6 +666,10 @@ export interface SlurmSettingsView {
   slurm_user: string;
   jwt_set: boolean;
   jwt_last4: string | null;
+  // Operator hostname → IP overrides. When the pods running obleth resolve Slurm
+  // node names unreliably, these take DNS out of the loop (endpoints register by
+  // IP). Echoed back in full so the form can render and edit them.
+  node_aliases: NodeAlias[];
   // Seconds since the provisioner last polled, or null if never seen since the
   // gateway started. provisioner_running is true within the freshness window.
   provisioner_last_seen_secs: number | null;
@@ -695,6 +699,15 @@ export interface UpdateSlurmSettings {
   slurm_user: string;
   // Write-only: omit/empty to keep the stored JWT, send a value to replace it.
   slurm_jwt?: string | null;
+  // Full replacement set of node hostname → IP overrides. Blank rows are dropped
+  // server-side; a non-blank host must map to a real IP literal.
+  node_aliases?: NodeAlias[];
+}
+
+// One compute-node hostname → IP override for the Slurm provisioner.
+export interface NodeAlias {
+  host: string;
+  ip: string;
 }
 
 export interface SlurmJwtHealth {

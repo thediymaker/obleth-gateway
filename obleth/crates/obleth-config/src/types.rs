@@ -819,6 +819,39 @@ pub struct SlurmSettings {
     /// Slurm JWT sent in `X-SLURM-USER-TOKEN`. Encrypted at rest by the store.
     #[serde(default)]
     pub slurm_jwt: String,
+    /// Operator-supplied compute-node hostname → IP overrides. When the pods
+    /// running obleth resolve Slurm node names (`scgh001`, …) unreliably, these
+    /// take DNS out of the loop: the provisioner registers replica endpoints by
+    /// IP and probes by IP, so neither the health checker nor the data-plane
+    /// proxy depends on per-request name resolution. Empty = pure DNS (the
+    /// default). Entries whose host or ip is blank are ignored.
+    #[serde(default)]
+    pub node_aliases: Vec<NodeAlias>,
+}
+
+/// One compute-node hostname → IP override for `SlurmSettings::node_aliases`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct NodeAlias {
+    /// Slurm node hostname as it appears in job allocations (e.g. `scgh001`).
+    pub host: String,
+    /// The address to use instead — normally an IPv4/IPv6 literal.
+    pub ip: String,
+}
+
+impl SlurmSettings {
+    /// Collapse `node_aliases` into a lookup map, dropping blank/whitespace-only
+    /// entries. Later entries win on a duplicate host (last-write-wins), matching
+    /// how the UI list reads top-to-bottom.
+    pub fn node_alias_map(&self) -> std::collections::HashMap<String, String> {
+        self.node_aliases
+            .iter()
+            .filter_map(|a| {
+                let host = a.host.trim();
+                let ip = a.ip.trim();
+                (!host.is_empty() && !ip.is_empty()).then(|| (host.to_string(), ip.to_string()))
+            })
+            .collect()
+    }
 }
 
 fn default_slurm_api_version() -> String {
@@ -1835,6 +1868,31 @@ pub struct RestoreReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slurm_settings_defaults_have_no_node_aliases() {
+        // A pre-existing `slurm` app_settings blob (no node_aliases key) must
+        // still deserialize, with an empty override map.
+        let s: SlurmSettings = serde_json::from_str("{}").expect("legacy blob deserializes");
+        assert!(s.node_aliases.is_empty());
+        assert!(s.node_alias_map().is_empty());
+    }
+
+    #[test]
+    fn node_alias_map_drops_blanks_and_takes_last_on_dupes() {
+        let s = SlurmSettings {
+            node_aliases: vec![
+                NodeAlias { host: " scgh001 ".into(), ip: " 10.0.0.1 ".into() }, // trimmed
+                NodeAlias { host: "".into(), ip: "10.0.0.9".into() },            // blank host → drop
+                NodeAlias { host: "scgh002".into(), ip: "".into() },             // blank ip → drop
+                NodeAlias { host: "scgh001".into(), ip: "10.0.0.2".into() },     // dupe → wins
+            ],
+            ..Default::default()
+        };
+        let map = s.node_alias_map();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("scgh001").map(String::as_str), Some("10.0.0.2"));
+    }
 
     #[test]
     fn compression_code_compaction_defaults_false() {

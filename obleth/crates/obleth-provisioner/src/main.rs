@@ -3,6 +3,7 @@ mod executor;
 mod obleth_client;
 mod plan;
 mod probe;
+mod resolve;
 mod warmup;
 
 // `domain` and `slurm` live in the crate's library half (lib.rs) so obleth-admin
@@ -24,6 +25,11 @@ enum Tick {
     Idle(&'static str),
 }
 
+/// How long a resolved node address is cached before re-resolving. Node IPs are
+/// stable for a job's lifetime; a few minutes catches the rare case of a node
+/// rebooting onto a new address without hammering DNS.
+const RESOLVE_TTL_SECS: u64 = 300;
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
@@ -39,8 +45,11 @@ async fn main() -> anyhow::Result<()> {
     // merely resets the streaks (worst case: remediation is delayed by
     // `restart_after_failures` ticks). No schema for a transient counter.
     let mut probe_failures: HashMap<uuid::Uuid, i64> = HashMap::new();
+    // Long-lived so its success cache survives across ticks: once a node name is
+    // resolved (or aliased) the provisioner stops touching DNS for it.
+    let resolver = resolve::HostResolver::new(Duration::from_secs(RESOLVE_TTL_SECS));
     loop {
-        match run_once(&cfg, &obleth, &http, &mut probe_failures).await {
+        match run_once(&cfg, &obleth, &http, &resolver, &mut probe_failures).await {
             Ok(Tick::Ran) => {
                 obleth.set_last_tick(TickReport::ok());
                 if last_idle.take().is_some() {
@@ -74,6 +83,7 @@ async fn run_once(
     cfg: &ProvisionerConfig,
     obleth: &dyn OblethClient,
     http: &reqwest::Client,
+    resolver: &resolve::HostResolver,
     probe_failures: &mut HashMap<uuid::Uuid, i64>,
 ) -> anyhow::Result<Tick> {
     let settings = match obleth.get_slurm_settings().await? {
@@ -86,6 +96,9 @@ async fn run_once(
     if settings.slurmrestd_url.trim().is_empty() {
         return Ok(Tick::Idle("slurm enabled but slurmrestd_url is empty"));
     }
+    // Refresh operator hostname→IP overrides from settings each tick, so edits in
+    // the dashboard take effect without restarting the provisioner.
+    resolver.set_aliases(settings.node_alias_map());
     let slurm = Slurmrestd::new(
         http.clone(),
         &settings.slurmrestd_url,
@@ -93,7 +106,7 @@ async fn run_once(
         &settings.slurm_user,
         &settings.slurm_jwt,
     );
-    tick(cfg, &slurm, obleth, http, probe_failures).await?;
+    tick(cfg, &slurm, obleth, http, resolver, probe_failures).await?;
     Ok(Tick::Ran)
 }
 
@@ -102,6 +115,7 @@ async fn tick(
     slurm: &dyn SlurmClient,
     obleth: &dyn OblethClient,
     http: &reqwest::Client,
+    resolver: &resolve::HostResolver,
     probe_failures: &mut HashMap<uuid::Uuid, i64>,
 ) -> anyhow::Result<()> {
     let specs = obleth.list_managed_models().await?; // obleth down -> bail (held). enabled only.
@@ -168,7 +182,7 @@ async fn tick(
     for spec in &specs {
         // Claim this model's replicas so the drain pass below ignores them, even
         // if we end up skipping this model for a transient reason.
-        let replicas = by_model.remove(&spec.model_id).unwrap_or_default();
+        let mut replicas = by_model.remove(&spec.model_id).unwrap_or_default();
         let model_name = match obleth.model_name(spec.model_id).await {
             Ok(n) if !n.is_empty() => n,
             Ok(_) => {
@@ -208,6 +222,12 @@ async fn tick(
                                 );
                             }
                             Some(node) => {
+                                // Resolve the node name to an address ONCE per tick
+                                // (cached across ticks) and probe by that address,
+                                // so a flaky resolver can't make a live replica
+                                // flap unhealthy. Falls back to the name on a miss.
+                                let probe_host =
+                                    resolver.resolve(node).await.unwrap_or_else(|| node.clone());
                                 // Probe the whole window concurrently rather than
                                 // sequentially: a not-yet-up replica otherwise costs
                                 // port_span * health_timeout of serial waits every
@@ -221,11 +241,11 @@ async fn tick(
                                         continue;
                                     }
                                     let http = http.clone();
-                                    let node = node.clone();
+                                    let host = probe_host.clone();
                                     let health_path = spec.health_path.clone();
                                     let timeout = cfg.health_timeout_secs;
                                     set.spawn(async move {
-                                        let api_base = format!("http://{node}:{p}");
+                                        let api_base = format!("http://{host}:{p}");
                                         (
                                             p,
                                             probe::is_healthy(
@@ -278,19 +298,30 @@ async fn tick(
         // best-effort: without it the GET-probe signal still works.
         plan::update_probe_failures(&replicas, &jobs, &health, probe_failures);
         let endpoints = match obleth.list_endpoints(spec.model_id).await {
-            Ok(e) => e,
+            Ok(e) => Some(e),
             Err(e) => {
                 tracing::warn!(model_id = %spec.model_id, error = %e,
                     "endpoint health lookup failed; self-heal using probe signal only");
-                Vec::new()
+                None
             }
         };
+        let endpoints_slice = endpoints.as_deref().unwrap_or(&[]);
         let restart = plan::restart_candidates(
             &replicas,
             probe_failures,
             cfg.restart_after_failures,
-            &endpoints,
+            endpoints_slice,
         );
+        // If the endpoint list came back cleanly this tick, null out any healthy
+        // replica whose endpoint_id is dangling — the endpoint was removed out of
+        // band and there is no FK to null it for us — so the planner re-promotes
+        // and relinks a fresh endpoint instead of leaving the model short one (the
+        // "2 healthy replicas, 1 endpoint" split). Skipped when the fetch failed,
+        // so a transient error can't strip the whole fleet's endpoints at once.
+        if let Some(eps) = &endpoints {
+            let live: HashSet<uuid::Uuid> = eps.iter().map(|ep| ep.id).collect();
+            plan::clear_dangling_endpoints(&mut replicas, &live);
+        }
 
         let mut live_port_bases: Vec<i64> = replicas
             .iter()
@@ -332,6 +363,7 @@ async fn tick(
                 port_base,
                 slurm,
                 obleth,
+                resolver,
             )
             .await
             {
@@ -344,7 +376,9 @@ async fn tick(
                     if cfg.warmup_timeout_secs > 0 {
                         if let domain::Action::Promote { api_base, .. } = action {
                             let http = http.clone();
-                            let api_base = api_base.clone();
+                            // Warm up against the resolved IP too, so the slow cold
+                            // first token isn't paid on a DNS miss.
+                            let api_base = resolver.resolve_url_host(api_base).await;
                             let model_name = model_name.clone();
                             let budget = Duration::from_secs(cfg.warmup_timeout_secs);
                             tokio::spawn(async move {
@@ -360,6 +394,42 @@ async fn tick(
                                 }
                             });
                         }
+                    }
+                }
+            }
+        }
+
+        // Migrate any already-registered endpoint that still points at a node
+        // *name* to its resolved IP, so existing healthy replicas stop depending
+        // on per-request DNS without waiting to be re-promoted. resolve_url_host
+        // returns the URL unchanged when the host is already an IP or can't be
+        // resolved, so this only fires on a real name→IP change. Best-effort: a
+        // failure here never holds the tick. Only runs on a good endpoint
+        // snapshot (fetch succeeded above).
+        if let Some(eps) = &endpoints {
+            for r in &replicas {
+                if r.state != "healthy" {
+                    continue;
+                }
+                let Some(ep_id) = r.endpoint_id else { continue };
+                let Some(ep) = eps.iter().find(|e| e.id == ep_id) else {
+                    continue;
+                };
+                let desired = resolver.resolve_url_host(&ep.api_base).await;
+                if desired != ep.api_base {
+                    match obleth
+                        .update_endpoint_api_base(spec.model_id, ep, &desired)
+                        .await
+                    {
+                        Ok(()) => tracing::info!(
+                            model_id = %spec.model_id, endpoint_id = %ep_id,
+                            from = %ep.api_base, to = %desired,
+                            "migrated endpoint to resolved IP"
+                        ),
+                        Err(e) => tracing::warn!(
+                            model_id = %spec.model_id, endpoint_id = %ep_id, error = %e,
+                            "failed to migrate endpoint to resolved IP"
+                        ),
                     }
                 }
             }
@@ -397,6 +467,7 @@ async fn tick(
                 0,
                 slurm,
                 obleth,
+                resolver,
             )
             .await
             {

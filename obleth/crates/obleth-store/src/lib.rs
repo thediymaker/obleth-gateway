@@ -4344,6 +4344,10 @@ mod tests {
             slurmrestd_api_version: "v0.0.40".into(),
             slurm_user: "obleth".into(),
             slurm_jwt: "header.payload.sig-secret".into(),
+            node_aliases: vec![obleth_config::NodeAlias {
+                host: "scgh001".into(),
+                ip: "10.0.0.1".into(),
+            }],
         };
         store.put_slurm_settings(&settings).await.expect("put");
 
@@ -4357,6 +4361,7 @@ mod tests {
         assert_eq!(got.slurmrestd_url, settings.slurmrestd_url);
         assert_eq!(got.slurm_user, settings.slurm_user);
         assert_eq!(got.slurm_jwt, settings.slurm_jwt);
+        assert_eq!(got.node_aliases, settings.node_aliases);
 
         // the JWT must be ciphertext at rest whenever a cipher is configured
         let raw: sqlx::types::Json<serde_json::Value> =

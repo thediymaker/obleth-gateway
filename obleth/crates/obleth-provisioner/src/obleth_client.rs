@@ -44,6 +44,14 @@ pub trait OblethClient: Send + Sync {
         model_id: Uuid,
     ) -> anyhow::Result<Vec<crate::domain::EndpointView>>;
     async fn delete_endpoint(&self, model_id: Uuid, endpoint_id: Uuid) -> anyhow::Result<()>;
+    /// Rewrite an endpoint's `api_base` (used to migrate a name-based endpoint to
+    /// its resolved IP), preserving the endpoint's other fields.
+    async fn update_endpoint_api_base(
+        &self,
+        model_id: Uuid,
+        ep: &crate::domain::EndpointView,
+        api_base: &str,
+    ) -> anyhow::Result<()>;
     /// Record (or clear with `None`) the provisioner's last submit error for a
     /// model, so the dashboard can show it.
     async fn set_provision_error(&self, model_id: Uuid, error: Option<&str>) -> anyhow::Result<()>;
@@ -406,6 +414,14 @@ impl OblethClient for HttpObleth {
                 out.push(crate::domain::EndpointView {
                     id,
                     name,
+                    api_base: e
+                        .get("api_base")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    priority: e.get("priority").and_then(|x| x.as_i64()).unwrap_or(100),
+                    weight: e.get("weight").and_then(|x| x.as_i64()).unwrap_or(100),
+                    enabled: e.get("enabled").and_then(|x| x.as_bool()).unwrap_or(true),
                     health_status: e
                         .get("health_status")
                         .and_then(|x| x.as_str())
@@ -430,6 +446,32 @@ impl OblethClient for HttpObleth {
             reqwest::Method::DELETE,
             &format!("/models/{model_id}/endpoints/{endpoint_id}"),
         )
+        .send()
+        .await?
+        .error_for_status()?;
+        Ok(())
+    }
+
+    async fn update_endpoint_api_base(
+        &self,
+        model_id: Uuid,
+        ep: &crate::domain::EndpointView,
+        api_base: &str,
+    ) -> anyhow::Result<()> {
+        // Full-object PUT: re-send the endpoint's own name/priority/weight/enabled
+        // so only api_base changes. api_key is omitted, which the admin handler
+        // reads as "keep the stored secret".
+        self.req(
+            reqwest::Method::PUT,
+            &format!("/models/{model_id}/endpoints/{}", ep.id),
+        )
+        .json(&serde_json::json!({
+            "name": ep.name,
+            "api_base": api_base,
+            "priority": ep.priority,
+            "weight": ep.weight,
+            "enabled": ep.enabled,
+        }))
         .send()
         .await?
         .error_for_status()?;
@@ -482,6 +524,7 @@ pub struct MockObleth {
     pub created_replicas: std::sync::Mutex<Vec<(Uuid, String, i64)>>, // (model_id, slurm_job_id, port_base)
     pub created_endpoints: std::sync::Mutex<Vec<(Uuid, String, String)>>, // (model_id, name, api_base)
     pub deleted_endpoints: std::sync::Mutex<Vec<Uuid>>,
+    pub updated_endpoints: std::sync::Mutex<Vec<(Uuid, String)>>, // (endpoint_id, new api_base)
     pub deleted_replicas: std::sync::Mutex<Vec<Uuid>>,
     pub patched: std::sync::Mutex<Vec<(Uuid, Option<String>)>>, // (replica_id, state)
     pub provision_errors: std::sync::Mutex<Vec<(Uuid, Option<String>)>>,
@@ -564,6 +607,18 @@ impl OblethClient for MockObleth {
     }
     async fn delete_endpoint(&self, _model_id: Uuid, endpoint_id: Uuid) -> anyhow::Result<()> {
         self.deleted_endpoints.lock().unwrap().push(endpoint_id);
+        Ok(())
+    }
+    async fn update_endpoint_api_base(
+        &self,
+        _model_id: Uuid,
+        ep: &crate::domain::EndpointView,
+        api_base: &str,
+    ) -> anyhow::Result<()> {
+        self.updated_endpoints
+            .lock()
+            .unwrap()
+            .push((ep.id, api_base.to_string()));
         Ok(())
     }
     async fn set_provision_error(&self, model_id: Uuid, error: Option<&str>) -> anyhow::Result<()> {

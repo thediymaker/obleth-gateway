@@ -1,5 +1,6 @@
 use crate::domain::*;
 use crate::obleth_client::OblethClient;
+use crate::resolve::HostResolver;
 use crate::slurm::{job_submit_from_spec, SlurmClient};
 use obleth_config::ManagedModelSpec;
 
@@ -25,6 +26,7 @@ pub async fn apply(
     port_base: i64,
     slurm: &dyn SlurmClient,
     obleth: &dyn OblethClient,
+    resolver: &HostResolver,
 ) -> anyhow::Result<()> {
     match action {
         Action::Submit => {
@@ -62,17 +64,31 @@ pub async fn apply(
             replica_id,
             api_base,
         } => {
-            tracing::info!(%replica_id, %api_base, model = model_name, "promoting replica to healthy");
+            // Register the endpoint by resolved IP so neither the gateway's
+            // health check nor the data-plane proxy has to resolve the node name
+            // per request — that per-request DNS is exactly what turns a flaky
+            // resolver into intermittent 502s. The replica keeps the hostname for
+            // display. Resolution failure falls back to the name (prior behaviour).
+            let node = host_from_api_base(api_base);
+            let ip_api_base = resolver.resolve_url_host(api_base).await;
+            tracing::info!(%replica_id, %ip_api_base, node = %node, model = model_name, "promoting replica to healthy");
             let name = format!("{job_prefix}{model_name}-{replica_id}");
             // Idempotent: reuse an existing endpoint with this deterministic name
             // (e.g. when a prior tick created it but failed to patch the replica),
-            // otherwise create one.
+            // otherwise create one. If the existing one still points at the node
+            // name (or a stale IP), migrate it to the resolved address in place.
             let existing = obleth.list_endpoints(model_id).await?;
             let ep = match existing.into_iter().find(|e| e.name == name) {
-                Some(e) => e.id,
-                None => obleth.create_endpoint(model_id, &name, api_base).await?,
+                Some(e) => {
+                    if e.api_base != ip_api_base {
+                        obleth
+                            .update_endpoint_api_base(model_id, &e, &ip_api_base)
+                            .await?;
+                    }
+                    e.id
+                }
+                None => obleth.create_endpoint(model_id, &name, &ip_api_base).await?,
             };
-            let node = host_from_api_base(api_base);
             obleth
                 .patch_replica(
                     *replica_id,
@@ -240,6 +256,12 @@ mod tests {
         }
     }
 
+    /// A resolver with no overrides — non-promote actions never call it, and a
+    /// bare hostname won't resolve in CI, so promotion falls back to the name.
+    fn resolver() -> HostResolver {
+        HostResolver::new(std::time::Duration::from_secs(300))
+    }
+
     #[tokio::test]
     async fn submit_creates_job_then_replica() {
         let slurm = mock_slurm();
@@ -255,6 +277,7 @@ mod tests {
             8000,
             &slurm,
             &obleth,
+            &resolver(),
         )
         .await
         .unwrap();
@@ -282,6 +305,7 @@ mod tests {
             8000,
             &slurm,
             &obleth,
+            &resolver(),
         )
         .await;
         assert!(err.is_err(), "Submit must propagate the record failure");
@@ -306,6 +330,7 @@ mod tests {
             8000,
             &slurm,
             &obleth,
+            &resolver(),
         )
         .await;
         assert!(err.is_err(), "Submit must fail without a spec");
@@ -313,15 +338,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn promote_registers_endpoint_and_marks_healthy() {
+    async fn promote_registers_endpoint_by_resolved_ip_and_marks_healthy() {
         let slurm = mock_slurm();
         let obleth = MockObleth::default();
         let s = spec();
         let rid = Uuid::new_v4();
+        // Alias the node so promotion registers the endpoint by IP, not by name —
+        // the whole point of the resolver: keep DNS off the proxy's hot path.
+        let resolver = HostResolver::new(std::time::Duration::from_secs(300));
+        resolver.set_aliases(std::collections::HashMap::from([(
+            "gpu7".to_string(),
+            "10.9.9.9".to_string(),
+        )]));
         apply(
             &Action::Promote {
                 replica_id: rid,
-                api_base: "http://gpu7:8000".into(),
+                api_base: "http://gpu7:8000/v1".into(),
             },
             s.model_id,
             "nemotron",
@@ -331,10 +363,16 @@ mod tests {
             8000,
             &slurm,
             &obleth,
+            &resolver,
         )
         .await
         .unwrap();
-        assert_eq!(obleth.created_endpoints.lock().unwrap().len(), 1);
+        let eps = obleth.created_endpoints.lock().unwrap();
+        assert_eq!(eps.len(), 1);
+        assert_eq!(
+            eps[0].2, "http://10.9.9.9:8000/v1",
+            "endpoint registered by resolved IP, not hostname"
+        );
         let patched = obleth.patched.lock().unwrap();
         assert!(patched
             .iter()
@@ -369,6 +407,7 @@ mod tests {
             8000,
             &slurm,
             &obleth,
+            &resolver(),
         )
         .await
         .unwrap();
@@ -401,6 +440,7 @@ mod tests {
             8000,
             &slurm,
             &obleth,
+            &resolver(),
         )
         .await
         .unwrap();
@@ -433,6 +473,7 @@ mod tests {
             8000,
             &slurm,
             &obleth,
+            &resolver(),
         )
         .await
         .unwrap();
@@ -458,6 +499,7 @@ mod tests {
             8000,
             &slurm,
             &obleth,
+            &resolver(),
         )
         .await;
         assert!(err.is_err(), "submit rejection propagates");
@@ -483,6 +525,7 @@ mod tests {
             8000,
             &slurm,
             &obleth,
+            &resolver(),
         )
         .await
         .unwrap();
