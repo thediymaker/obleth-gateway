@@ -87,7 +87,11 @@ pub async fn apply(
                     }
                     e.id
                 }
-                None => obleth.create_endpoint(model_id, &name, &ip_api_base).await?,
+                None => {
+                    obleth
+                        .create_endpoint(model_id, &name, &ip_api_base)
+                        .await?
+                }
             };
             obleth
                 .patch_replica(

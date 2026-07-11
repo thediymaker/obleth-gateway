@@ -7,12 +7,14 @@ import { timeAgo } from "@/lib/relative-time";
 
 /** Shows the provisioner's last submit failure for a model (e.g. a Slurm
  *  account/partition rejection). Polls the managed spec so it clears itself
- *  once a submit succeeds. Renders nothing when there's no error. */
+ *  once a submit succeeds. Renders nothing when there's no error. The payload
+ *  is the full sbatch spec, so the poll stays coarse; submits take tens of
+ *  seconds anyway. */
 export function ProvisionErrorBanner({ modelId }: { modelId: string }) {
   const qc = useQueryClient();
   const { data } = useQuery({
     queryKey: ["managed", modelId],
-    refetchInterval: 5000,
+    refetchInterval: 15_000,
     queryFn: async (): Promise<ManagedModelSpec | null> => {
       const r = await fetch(`/api/live/models/${modelId}/managed`);
       if (!r.ok) throw new Error("failed to load managed spec");

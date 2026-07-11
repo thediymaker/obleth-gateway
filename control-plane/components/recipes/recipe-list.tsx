@@ -24,6 +24,7 @@ import { deployRecipeAction, deleteTemplateAction } from "@/app/actions";
 import { TemplateEditor } from "./template-editor";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import {
@@ -194,6 +195,7 @@ export function RecipeList({
     undefined,
   );
   const [deletePending, startDeleteTransition] = useTransition();
+  const { confirm, confirmElement } = useConfirm();
 
   function openNewEditor() {
     setEditorInitial(undefined);
@@ -226,8 +228,12 @@ export function RecipeList({
     setEditorOpen(true);
   }
 
-  function handleDelete(recipe: RecipeCard) {
-    if (!window.confirm(`Delete the "${recipe.name ?? recipe.id}" template? This cannot be undone.`)) return;
+  async function handleDelete(recipe: RecipeCard) {
+    const ok = await confirm({
+      title: "Delete template",
+      description: `Delete the "${recipe.name ?? recipe.id}" template? This cannot be undone.`,
+    });
+    if (!ok) return;
     const id = recipe.recipeId;
     if (!id) return;
     startDeleteTransition(async () => {
@@ -320,6 +326,7 @@ export function RecipeList({
 
   return (
     <>
+      {confirmElement}
       <div className="flex justify-end mb-3">
         <Button type="button" size="sm" variant="outline" onClick={openNewEditor} className="gap-1.5">
           <Plus className="h-3.5 w-3.5" />

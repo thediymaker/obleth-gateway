@@ -1,6 +1,7 @@
 "use client";
 
 import type { ReactNode } from "react";
+import { formatCompact } from "@/lib/format";
 import { formatNumber } from "@/lib/utils";
 
 /** Fixed-height wrapper — Recharts needs an explicit pixel height on the parent. */
@@ -10,12 +11,7 @@ export function ChartShell({ heightClass = "h-64", children }: { heightClass?: s
 
 /** Compact axis labels so large token counts don't crush the plot area. */
 export function compactAxis(value: number) {
-  const n = Number(value);
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-  if (n >= 10_000) return `${(n / 1_000).toFixed(0)}k`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-  return formatNumber(n);
+  return formatCompact(Number(value));
 }
 
 /** Shared chart primitives so hover/axis styling is identical across pages. */

@@ -39,6 +39,8 @@ import {
   DialogTitle,
   DialogTrigger,
 } from "@/components/ui/dialog";
+import { useConfirm } from "@/components/ui/confirm-dialog";
+import { DestructiveConfirm } from "@/components/ui/destructive-confirm";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
@@ -89,6 +91,8 @@ export function KeyManager({
   const [createOpen, setCreateOpen] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
   const [rowMessages, setRowMessages] = useState<Record<string, RowMessage>>({});
+  const { confirm, confirmElement } = useConfirm();
+  const [filterDeleteOpen, setFilterDeleteOpen] = useState(false);
 
   const [query, setQuery] = useState("");
   const [tenantFilter, setTenantFilter] = useState("all");
@@ -201,8 +205,12 @@ export function KeyManager({
     });
   }
 
-  function removeKey(key: ApiKey) {
-    if (!window.confirm(`Delete API key "${key.name}"? This cannot be undone.`)) return;
+  async function removeKey(key: ApiKey) {
+    const ok = await confirm({
+      title: "Delete API key",
+      description: `Delete API key "${key.name}"? Clients using it stop authenticating immediately. This cannot be undone.`,
+    });
+    if (!ok) return;
     start(() => deleteKeyAction(key.id));
   }
 
@@ -227,10 +235,15 @@ export function KeyManager({
     });
   }
 
-  function deleteSelectedKeys() {
+  async function deleteSelectedKeys() {
     const ids = [...selectedIds];
     if (ids.length === 0) return;
-    if (!window.confirm(`Delete ${ids.length} selected API keys? This cannot be undone.`)) return;
+    const ok = await confirm({
+      title: "Delete selected API keys",
+      description: `Delete ${formatNumber(ids.length)} selected API key${ids.length === 1 ? "" : "s"}? Clients using them stop authenticating immediately. This cannot be undone.`,
+      confirmLabel: `Delete ${formatNumber(ids.length)}`,
+    });
+    if (!ok) return;
     start(async () => {
       const result = await deleteKeysAction(ids);
       setSelectedIds(new Set());
@@ -240,9 +253,14 @@ export function KeyManager({
     });
   }
 
+  // Deleting by filter has an invisible blast radius (everything matching,
+  // not just what's on screen), so it keeps the heavy typed confirmation.
   function deleteFilteredKeys() {
     if (!hasActiveFilter || sorted.length === 0) return;
-    if (!window.confirm(`Delete ${sorted.length} filtered API keys? This cannot be undone.`)) return;
+    setFilterDeleteOpen(true);
+  }
+
+  function confirmDeleteFilteredKeys() {
     start(async () => {
       const result = await deleteFilteredKeysAction({
         query,
@@ -250,6 +268,7 @@ export function KeyManager({
         status: statusFilter,
         budget: budgetFilter,
       });
+      setFilterDeleteOpen(false);
       setSelectedIds(new Set());
       if (result.failed > 0) {
         window.alert(`Deleted ${result.deleted} of ${result.matched} matched keys; ${result.failed} failed.`);
@@ -266,6 +285,25 @@ export function KeyManager({
   return (
     <TooltipProvider delayDuration={150}>
       <div className="space-y-5">
+        {confirmElement}
+        <DestructiveConfirm
+          open={filterDeleteOpen}
+          onOpenChange={setFilterDeleteOpen}
+          title="Delete all filtered keys"
+          description={
+            <p>
+              This deletes every API key matching the current filters —{" "}
+              <span className="font-semibold text-foreground">{formatNumber(sorted.length)}</span>{" "}
+              key{sorted.length === 1 ? "" : "s"}, not just the visible page. Clients using them stop
+              authenticating immediately. This cannot be undone.
+            </p>
+          }
+          confirmWord="DELETE"
+          checkboxLabel="I understand every matching key will be permanently deleted."
+          confirmLabel={`Delete ${formatNumber(sorted.length)} keys`}
+          pending={pending}
+          onConfirm={confirmDeleteFilteredKeys}
+        />
         {secret && (
           <Card className="border-foreground/25">
             <CardContent className="pt-6">
@@ -859,10 +897,14 @@ function SortHeader({
   const active = sort.key === sortKey;
   const Icon = active ? (sort.direction === "asc" ? ArrowUp : ArrowDown) : ArrowUpDown;
   return (
-    <th className={cn("px-3 py-2 font-medium", align === "right" && "text-right", className)}>
+    <th
+      className={cn("px-3 py-2 font-medium", align === "right" && "text-right", className)}
+      aria-sort={active ? (sort.direction === "asc" ? "ascending" : "descending") : "none"}
+    >
       <button
         type="button"
         onClick={() => onSort(sortKey)}
+        aria-label={`Sort by ${label}${active ? `, currently ${sort.direction === "asc" ? "ascending" : "descending"}` : ""}`}
         className={cn("inline-flex items-center gap-1 hover:text-foreground", align === "right" && "justify-end")}
       >
         {label}

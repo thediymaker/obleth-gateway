@@ -35,6 +35,7 @@ import {
 } from "@/components/ui/dialog";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { CodeBlock, CopyButton } from "@/components/portal/copy-button";
 import type { ApiKey, KeyUsageSummary } from "@/lib/obleth";
 import { cn, formatCurrency, formatNumber } from "@/lib/utils";
@@ -55,6 +56,7 @@ export function PortalKeys({
   const [createError, setCreateError] = useState<string | null>(null);
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
   const [pending, start] = useTransition();
+  const { confirm, confirmElement } = useConfirm();
 
   const usageByKey = useMemo(
     () => new Map(keyUsage.map((usage) => [usage.key_id, usage])),
@@ -92,8 +94,12 @@ export function PortalKeys({
     });
   }
 
-  function handleDelete(key: ApiKey) {
-    if (!window.confirm(`Delete API key "${key.name}"? This cannot be undone.`)) return;
+  async function handleDelete(key: ApiKey) {
+    const ok = await confirm({
+      title: "Delete API key",
+      description: `Delete API key "${key.name}"? Clients using it stop authenticating immediately. This cannot be undone.`,
+    });
+    if (!ok) return;
     setRowErrors((prev) => ({ ...prev, [key.id]: "" }));
     start(async () => {
       const fd = new FormData();
@@ -107,6 +113,7 @@ export function PortalKeys({
 
   return (
     <div className="space-y-6">
+      {confirmElement}
       <div className="flex flex-col gap-3 lg:flex-row lg:items-end lg:justify-between">
         <div>
           <h1 className="text-lg font-semibold tracking-tight">Keys</h1>

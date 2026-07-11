@@ -38,6 +38,7 @@ import {
   DialogTrigger,
 } from "@/components/ui/dialog";
 import { Calendar } from "@/components/ui/calendar";
+import { OTHERS_COLOR } from "@/lib/chart-palette";
 import { formatNumber } from "@/lib/utils";
 import { Select } from "@/components/ui/select";
 import type { ApiKey, Tenant, UsageDailyGroupBy, UsageDailyRow } from "@/lib/obleth";
@@ -65,7 +66,6 @@ const PALETTE = [
   "hsl(350 50% 60%)",
   "hsl(185 42% 52%)",
 ];
-const OTHERS_COLOR = "hsl(240 6% 42%)";
 
 const TOP_MODELS = 8;
 
@@ -515,6 +515,7 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
                     fill={REQUESTS_COLOR}
                     radius={[3, 3, 0, 0]}
                     barSize={barSize}
+                    isAnimationActive={false}
                   />
                   <Line
                     yAxisId="right"
@@ -524,6 +525,7 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
                     stroke={TOKENS_COLOR}
                     strokeWidth={2}
                     dot={false}
+                    isAnimationActive={false}
                   />
                 </ComposedChart>
               </ResponsiveContainer>
@@ -563,6 +565,7 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
                       name="Input"
                       fill={INPUT_COLOR}
                       barSize={barSize}
+                      isAnimationActive={false}
                     />
                     <Bar
                       stackId="tok"
@@ -571,6 +574,7 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
                       fill={OUTPUT_COLOR}
                       radius={[3, 3, 0, 0]}
                       barSize={barSize}
+                      isAnimationActive={false}
                     />
                   </BarChart>
                 </ResponsiveContainer>
@@ -612,6 +616,7 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
                       stroke={TTFT_COLOR}
                       strokeWidth={2}
                       dot={false}
+                      isAnimationActive={false}
                     />
                     <Line
                       type="monotone"
@@ -620,6 +625,7 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
                       stroke={TOTAL_COLOR}
                       strokeWidth={2}
                       dot={false}
+                      isAnimationActive={false}
                     />
                   </ComposedChart>
                 </ResponsiveContainer>
@@ -671,7 +677,7 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
                         },
                       })}
                     />
-                    <Bar dataKey="total_tokens" name="Total tokens" radius={[0, 4, 4, 0]} barSize={14}>
+                    <Bar dataKey="total_tokens" name="Total tokens" radius={[0, 4, 4, 0]} barSize={14} isAnimationActive={false}>
                       {topModels.map((d) => (
                         <Cell key={d.name} fill={d.fill} />
                       ))}
@@ -704,6 +710,7 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
                       outerRadius="80%"
                       paddingAngle={2}
                       strokeWidth={0}
+                      isAnimationActive={false}
                     >
                       {outcomes.map((o) => (
                         <Cell key={o.name} fill={o.fill} />
@@ -757,7 +764,7 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
               {breakdownRows.length === 0 ? (
                 <tr>
                   <td colSpan={11} className="py-8 text-center text-muted-foreground">
-                    No data
+                    No usage recorded for the selected range and filters.
                   </td>
                 </tr>
               ) : (

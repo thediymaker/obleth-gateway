@@ -1,13 +1,14 @@
 import { requireAdmin } from "@/lib/auth/roles";
 import { listUsers } from "@/lib/auth/users";
 import { obleth } from "@/lib/obleth";
+import { safe } from "@/lib/safe";
 import { UsersManager } from "@/components/users-manager";
 
 export const dynamic = "force-dynamic";
 
 export default async function UsersPage() {
   await requireAdmin();
-  const [users, tenants] = await Promise.all([listUsers(), obleth.listTenants()]);
+  const [users, tenants] = await Promise.all([listUsers(), safe(obleth.listTenants(), [])]);
   return (
     <div className="space-y-6">
       <div>

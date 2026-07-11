@@ -42,6 +42,7 @@ import { WeightControl } from "@/components/weight-control";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import {
   Dialog,
   DialogContent,
@@ -60,6 +61,7 @@ import { Label } from "@/components/ui/label";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { GuardrailsPolicy, Tenant, WeeklyWindow } from "@/lib/obleth";
+import { formatCompact } from "@/lib/format";
 import { cn, formatNumber } from "@/lib/utils";
 
 const SaveFlashContext = createContext<() => void>(() => {});
@@ -81,14 +83,6 @@ function budgetLabel(t: Tenant): string {
   if (t.budget_tokens != null) parts.push(`${formatCompact(t.budget_tokens)} tok`);
   if (t.budget_cost_usd != null) parts.push(`$${t.budget_cost_usd}`);
   return `${parts.join(" / ")} ${period}`.trim();
-}
-
-/** Compact human number (e.g. 1.2M, 15K). */
-function formatCompact(n: number): string {
-  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(n % 1_000_000_000 === 0 ? 0 : 1)}B`;
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}M`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(n % 1_000 === 0 ? 0 : 1)}K`;
-  return String(n);
 }
 
 type ScheduleBadge = { label: string; className: string };
@@ -401,6 +395,7 @@ function TenantDetailPanel({
   start: (cb: () => void) => void;
 }) {
   const flashSaved = useContext(SaveFlashContext);
+  const { confirm, confirmElement } = useConfirm();
 
   function changeStatus(status: string) {
     start(async () => {
@@ -409,19 +404,18 @@ function TenantDetailPanel({
     });
   }
 
-  function remove() {
-    if (
-      !window.confirm(
-        `Permanently delete tenant "${tenant.name}"? This removes all of its API keys and cannot be undone. Usage history is retained.`,
-      )
-    ) {
-      return;
-    }
+  async function remove() {
+    const ok = await confirm({
+      title: "Delete tenant",
+      description: `Permanently delete tenant "${tenant.name}"? This removes all of its API keys and cannot be undone. Usage history is retained.`,
+    });
+    if (!ok) return;
     start(() => deleteTenantAction(tenant.id));
   }
 
   return (
     <Tabs defaultValue="profile">
+      {confirmElement}
       <div className="flex flex-wrap items-center justify-between gap-3">
         <TabsList className="h-auto flex-wrap justify-start">
           <TabsTrigger value="profile">Profile</TabsTrigger>

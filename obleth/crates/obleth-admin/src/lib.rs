@@ -152,6 +152,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/usage/compact", post(compact_usage))
         .route("/api/v1/costs", get(get_costs))
         .route("/api/v1/stats", get(get_stats))
+        .route("/api/v1/overview/summary", get(get_overview_summary))
         .route("/api/v1/fairshare/live", get(get_fairshare_live))
         .route(
             "/api/v1/fairshare/groups",
@@ -552,6 +553,22 @@ pub struct LiveStats {
     pub in_flight: usize,
     pub queued: i64,
     pub max_in_flight: usize,
+}
+
+/// At-a-glance dashboard summary: config counts from Postgres plus usage
+/// totals over the window from ClickHouse. Backs the overview/footer poll
+/// without deserializing the full tenant/key/model lists per tick.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct OverviewSummaryView {
+    pub requests: u64,
+    pub tokens: u64,
+    pub cost: f64,
+    pub has_pricing: bool,
+    pub tenant_count: i64,
+    pub active_tenants: u64,
+    pub model_count: i64,
+    pub enabled_models: i64,
+    pub key_count: i64,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -3003,6 +3020,38 @@ async fn compact_usage(
     Ok(Json(CompactUsageResult {
         retention_days: result.retention_days,
         partitions_dropped: result.partitions_dropped,
+    }))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/overview/summary", tag = "usage",
+    params(usage::UsageQuery),
+    responses((status = 200, body = OverviewSummaryView))
+)]
+async fn get_overview_summary(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::UsageQuery>,
+) -> Result<Json<OverviewSummaryView>> {
+    let counts = state.store.overview_counts().await?;
+    // ClickHouse being down degrades the usage totals to zero rather than
+    // failing the whole summary — the config counts are still useful and this
+    // read backs a poll on every dashboard page.
+    let totals = usage::query_usage_totals(&state.clickhouse, q.since_ms, q.include_internal)
+        .await
+        .unwrap_or_default();
+    // The ledger keeps rows for since-deleted tenants; clamp so the summary
+    // can never report more active tenants than currently exist.
+    let active_tenants = totals.active_tenants.min(counts.tenant_count.max(0) as u64);
+    Ok(Json(OverviewSummaryView {
+        requests: totals.requests,
+        tokens: totals.total_tokens,
+        cost: totals.cost_usd,
+        has_pricing: counts.has_pricing,
+        tenant_count: counts.tenant_count,
+        active_tenants,
+        model_count: counts.model_count,
+        enabled_models: counts.enabled_models,
+        key_count: counts.key_count,
     }))
 }
 

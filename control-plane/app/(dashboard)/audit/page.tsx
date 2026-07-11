@@ -13,7 +13,7 @@ export default async function AuditPage() {
   return (
     <div className="space-y-6">
       <div>
-        <h1 className="text-lg font-semibold">Audit</h1>
+        <h1 className="text-lg font-semibold tracking-tight">Audit</h1>
         <p className="max-w-2xl text-sm text-muted-foreground">
           Configuration and control-plane changes, newest first. Filter by actor, action, or target to follow what changed across users.
         </p>

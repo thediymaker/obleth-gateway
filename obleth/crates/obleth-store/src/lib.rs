@@ -88,6 +88,16 @@ pub struct Recipe {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Config-side counts for the dashboard overview (see `overview_counts`).
+pub struct OverviewCounts {
+    pub tenant_count: i64,
+    pub key_count: i64,
+    pub model_count: i64,
+    pub enabled_models: i64,
+    /// True when any model has a nonzero per-token price configured.
+    pub has_pricing: bool,
+}
+
 pub struct UpsertRecipe {
     pub id: Option<Uuid>,
     pub name: String,
@@ -279,6 +289,30 @@ impl Store {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(tenant_from_row).collect()
+    }
+
+    /// Cheap dashboard counts: one aggregate row instead of deserializing the
+    /// full tenant/key/model lists (the key fleet alone can be 100k+ rows and
+    /// this backs a poll that fires on every dashboard page).
+    pub async fn overview_counts(&self) -> Result<OverviewCounts> {
+        let row = sqlx::query(
+            "select
+               (select count(*) from tenants) as tenant_count,
+               (select count(*) from api_keys) as key_count,
+               (select count(*) from models) as model_count,
+               (select count(*) from models where enabled) as enabled_models,
+               (select coalesce(bool_or(input_cost_per_token > 0 or output_cost_per_token > 0), false)
+                  from models) as has_pricing",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(OverviewCounts {
+            tenant_count: row.try_get("tenant_count")?,
+            key_count: row.try_get("key_count")?,
+            model_count: row.try_get("model_count")?,
+            enabled_models: row.try_get("enabled_models")?,
+            has_pricing: row.try_get("has_pricing")?,
+        })
     }
 
     pub async fn get_tenant(&self, id: Uuid) -> Result<Tenant> {
@@ -3877,6 +3911,37 @@ mod tests {
             still_healthy.health_status, "healthy",
             "degraded must not downgrade a confirmed healthy"
         );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn overview_counts_track_entities() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let before = store.overview_counts().await.expect("counts before");
+
+        let tenant = store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 0, None, None)
+            .await
+            .expect("create tenant");
+        fixtures.track_tenant(tenant.id);
+        store
+            .create_api_key(tenant.id, "k", "", None, None, None, None)
+            .await
+            .expect("create key");
+
+        let after = store.overview_counts().await.expect("counts after");
+        assert_eq!(after.tenant_count, before.tenant_count + 1);
+        assert_eq!(after.key_count, before.key_count + 1);
+        assert_eq!(after.model_count, before.model_count);
+        assert_eq!(after.enabled_models, before.enabled_models);
     }
 
     // A positional bundle of column values for a model insert; test-only, so the

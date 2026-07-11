@@ -1882,10 +1882,22 @@ mod tests {
     fn node_alias_map_drops_blanks_and_takes_last_on_dupes() {
         let s = SlurmSettings {
             node_aliases: vec![
-                NodeAlias { host: " scgh001 ".into(), ip: " 10.0.0.1 ".into() }, // trimmed
-                NodeAlias { host: "".into(), ip: "10.0.0.9".into() },            // blank host → drop
-                NodeAlias { host: "scgh002".into(), ip: "".into() },             // blank ip → drop
-                NodeAlias { host: "scgh001".into(), ip: "10.0.0.2".into() },     // dupe → wins
+                NodeAlias {
+                    host: " scgh001 ".into(),
+                    ip: " 10.0.0.1 ".into(),
+                }, // trimmed
+                NodeAlias {
+                    host: "".into(),
+                    ip: "10.0.0.9".into(),
+                }, // blank host → drop
+                NodeAlias {
+                    host: "scgh002".into(),
+                    ip: "".into(),
+                }, // blank ip → drop
+                NodeAlias {
+                    host: "scgh001".into(),
+                    ip: "10.0.0.2".into(),
+                }, // dupe → wins
             ],
             ..Default::default()
         };

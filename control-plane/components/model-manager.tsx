@@ -1,7 +1,7 @@
 ﻿"use client";
 
 import { createContext, useActionState, useContext, useEffect, useMemo, useRef, useState, useTransition, type ChangeEvent, type ReactNode } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
   Check,
@@ -58,6 +58,7 @@ import {
 import { ChartShell, axisTick, chartGrid, compactAxis, tip, timeCursor } from "@/components/chart-tooltip";
 import { ModelMetricsDetail } from "@/components/model-metrics-detail";
 import { ManagedModelConfig } from "@/components/managed-model-config";
+import { useConfirm } from "@/components/ui/confirm-dialog";
 import { ReplicaPanel } from "@/components/replica-panel";
 import { ProvisionErrorBanner } from "@/components/provision-error-banner";
 import { Badge } from "@/components/ui/badge";
@@ -96,7 +97,7 @@ import { EditForm } from "@/components/edit-form";
 import { ProviderImportWizard } from "@/components/provider-import-wizard";
 import { RecipeList } from "@/components/recipes/recipe-list";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
-import { cn, formatNumber } from "@/lib/utils";
+import { cn, formatNumber, getJson } from "@/lib/utils";
 import { useSearchParams } from "next/navigation";
 
 // Lets any control inside a model's detail panel signal a successful save so the
@@ -188,8 +189,6 @@ export function ModelManager({
   models,
   cacheStats,
   health,
-  healthDetails,
-  endpoints,
   mcpServers = [],
   managed = {},
   slurmEnabled = false,
@@ -198,8 +197,6 @@ export function ModelManager({
   models: ModelRoute[];
   cacheStats?: CacheStats;
   health: ModelHealthSummary[];
-  healthDetails: Record<string, ModelHealthDetail | undefined>;
-  endpoints: Record<string, ModelEndpoint[]>;
   mcpServers?: McpServer[];
   managed?: Record<string, boolean>;
   slurmEnabled?: boolean;
@@ -219,8 +216,14 @@ export function ModelManager({
   // Bumps a counter scoped to a model id so its card replays the save-glow on
   // every successful save (the changing `n` remounts the overlay to restart CSS).
   const [saveFlash, setSaveFlash] = useState<{ id: string; n: number } | null>(null);
-  const flashSaved = (id: string) =>
+  const queryClient = useQueryClient();
+  const { confirm, confirmElement } = useConfirm();
+  const flashSaved = (id: string) => {
     setSaveFlash((prev) => ({ id, n: prev?.id === id ? prev.n + 1 : 1 }));
+    // The expanded card lazy-loads these; a save may have changed either.
+    queryClient.invalidateQueries({ queryKey: ["model-endpoints", id] });
+    queryClient.invalidateQueries({ queryKey: ["model-health-detail", id] });
+  };
   const [createWizardOpen, setCreateWizardOpen] = useState(false);
   const [providerImportOpen, setProviderImportOpen] = useState(false);
   const [showBenchmarkRoutes, setShowBenchmarkRoutes] = useState(false);
@@ -235,8 +238,13 @@ export function ModelManager({
   const benchmarkRouteCount = models.filter(isBenchmarkRoute).length;
   const visibleModels = showBenchmarkRoutes ? models : models.filter((model) => !isBenchmarkRoute(model));
 
-  function removeModel(model: ModelRoute) {
-    if (!window.confirm(`Remove model route "${model.model_name}"? This cannot be undone.`)) return;
+  async function removeModel(model: ModelRoute) {
+    const ok = await confirm({
+      title: "Remove model route",
+      description: `Remove model route "${model.model_name}"? Requests naming it start failing immediately. This cannot be undone.`,
+      confirmLabel: "Remove",
+    });
+    if (!ok) return;
     start(() => deleteModelAction(model.id));
   }
 
@@ -334,6 +342,7 @@ export function ModelManager({
 
   return (
     <div className="space-y-6">
+      {confirmElement}
       <FleetStats models={models} health={health} cacheStats={cacheStats} />
       {createWizardOpen && (
         <CreateModelWizard
@@ -583,8 +592,6 @@ export function ModelManager({
                             <ModelDetailPanel
                               model={model}
                               summary={summary}
-                              detail={healthDetails[model.id]}
-                              endpoints={endpoints[model.id] ?? []}
                               mcpServers={mcpServers}
                               isManaged={managed[model.id] ?? false}
                               pending={pending}
@@ -1054,8 +1061,6 @@ function PreviewRow({ label, value, muted }: { label: string; value: string; mut
 function ModelDetailPanel({
   model,
   summary,
-  detail,
-  endpoints,
   mcpServers = [],
   isManaged = false,
   pending,
@@ -1063,13 +1068,25 @@ function ModelDetailPanel({
 }: {
   model: ModelRoute;
   summary: ModelHealthSummary;
-  detail?: ModelHealthDetail;
-  endpoints: ModelEndpoint[];
   mcpServers?: McpServer[];
   isManaged?: boolean;
   pending: boolean;
   onCacheToggle: () => void;
 }) {
+  // The panel only mounts for the expanded card, so per-model detail loads
+  // lazily here instead of the page fanning out 3 admin calls per model.
+  const { data: detail } = useQuery({
+    queryKey: ["model-health-detail", model.id],
+    queryFn: () => getJson<ModelHealthDetail>(`/api/live/models/${model.id}/health`),
+    staleTime: 15_000,
+  });
+  const { data: endpointData } = useQuery({
+    queryKey: ["model-endpoints", model.id],
+    queryFn: () => getJson<ModelEndpoint[]>(`/api/live/models/${model.id}/endpoints`),
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  });
+  const endpoints = endpointData ?? [];
   const flashSaved = useContext(SaveFlashContext);
   const [editType, setEditType] = useState<string>(model.model_type || "chat");
   const [, healthAction, healthPending] = useActionState(
@@ -2016,6 +2033,7 @@ function ReliabilityPanel({
   const [busy, start] = useTransition();
   const disabled = pending || busy;
   const addFormRef = useRef<HTMLFormElement>(null);
+  const { confirm, confirmElement } = useConfirm();
 
   // Controlled so the value re-syncs whenever fresh model data lands (the
   // EditForm wrapper already keeps React 19's post-action form reset from
@@ -2074,6 +2092,7 @@ function ReliabilityPanel({
 
   return (
     <div className="grid gap-4 lg:grid-cols-[minmax(0,380px)_minmax(0,1fr)]">
+      {confirmElement}
       <EditForm action={saveReliability}>
         <PanelCard
           className="h-full"
@@ -2203,8 +2222,13 @@ function ReliabilityPanel({
                           size="sm"
                           variant="ghost"
                           disabled={disabled}
-                          onClick={() => {
-                            if (!window.confirm(`Remove endpoint "${ep.name}"?`)) return;
+                          onClick={async () => {
+                            const ok = await confirm({
+                              title: "Remove endpoint",
+                              description: `Remove endpoint "${ep.name}"? Traffic shifts to the model's remaining endpoints.`,
+                              confirmLabel: "Remove",
+                            });
+                            if (!ok) return;
                             start(() => deleteModelEndpointAction(model.id, ep.id));
                           }}
                         >
