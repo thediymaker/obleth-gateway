@@ -4,6 +4,18 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.9.6
+
+A faster, tidier dashboard: the overview leads with what needs attention, heavy pages load lighter, and destructive actions confirm consistently.
+
+- **Overview redesigned around action.** The landing page leads with gateway health, live work, and 24-hour traffic and cost tiles, plus a "Needs attention" panel listing unhealthy routes, admission backlog, and tenants below fair share — each linking straight to the right page. Top models keep the latency signals needed for quick triage, and the sidebar groups pages into Overview, Operations, Access, and Configuration.
+- **The dashboard's summary poll is far lighter.** A new aggregate endpoint returns entity counts and windowed usage totals in one call, so the status footer's 30-second poll on every page no longer downloads the full tenant, key, and model lists — a large key fleet was previously deserialized just to display a count.
+- **The models page opens fast on large fleets.** Per-model health history and endpoint lists load when a model card is expanded instead of three-requests-per-model up front, and the settings page fetches all of its sections in parallel.
+- **Smoother live pages.** The fast scheduler poll no longer re-renders the traffic chart and model tables every two seconds, report charts stop re-animating on every filter change, navigation shows a loading skeleton instead of freezing on the previous page, and an unexpected render failure lands on a styled error screen with a retry.
+- **Destructive actions confirm consistently.** Deleting keys, tenants, models, endpoints, MCP servers, and templates now uses a styled in-app dialog stating the consequence; deleting every key matching a filter keeps the typed two-step confirmation.
+- **The request log's "traced only" filter now applies.** It previously returned unfiltered rows.
+- **Numbers read the same everywhere.** Compact counts, durations, and shortened IDs share one format across pages, replacing per-page variants that disagreed on casing and thresholds.
+
 ## v0.9.5
 
 Slurm replica endpoints stop depending on flaky per-request DNS, and replicas whose endpoint vanished out-of-band now heal themselves.
