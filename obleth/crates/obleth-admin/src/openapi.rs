@@ -261,6 +261,7 @@ use obleth_config::{
         CompressorStatusView,
         CharoSettingsView,
         obleth_config::SlurmSettings,
+        obleth_config::NodeAlias,
         crate::slurm_settings::SlurmSettingsView,
         crate::slurm_settings::UpdateSlurmSettings,
         crate::slurm_settings::SlurmHealthView,

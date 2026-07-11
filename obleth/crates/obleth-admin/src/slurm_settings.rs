@@ -14,7 +14,7 @@ use axum::http::HeaderMap;
 use axum::Json;
 use base64::Engine;
 use chrono::{DateTime, Utc};
-use obleth_config::SlurmSettings;
+use obleth_config::{NodeAlias, SlurmSettings};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
@@ -30,6 +30,9 @@ pub struct SlurmSettingsView {
     pub slurm_user: String,
     pub jwt_set: bool,
     pub jwt_last4: Option<String>,
+    /// Operator-supplied node hostname → IP overrides. Echoed back in full (no
+    /// secret) so the dashboard can render and edit the list.
+    pub node_aliases: Vec<NodeAlias>,
     /// Seconds since the provisioner last polled the gateway, or null if it has
     /// not been seen since this gateway process started. The provisioner is a
     /// separate plugin process — when it isn't running, Slurm can be "enabled"
@@ -85,6 +88,7 @@ impl SlurmSettingsView {
             slurm_user: s.slurm_user.clone(),
             jwt_set: !jwt.is_empty(),
             jwt_last4,
+            node_aliases: s.node_aliases.clone(),
             // Filled in by the GET handler, which has the heartbeat; the masked
             // view itself only knows the persisted settings.
             provisioner_last_seen_secs: None,
@@ -223,6 +227,10 @@ pub struct UpdateSlurmSettings {
     /// New JWT. Empty/omitted keeps the existing stored value.
     #[serde(default)]
     pub slurm_jwt: Option<String>,
+    /// Full replacement set of node hostname → IP overrides. Blank rows are
+    /// dropped; a non-blank host with a non-IP address is rejected.
+    #[serde(default)]
+    pub node_aliases: Vec<NodeAlias>,
 }
 
 /// Result of the "test connection" probe: JWT expiry + a slurmrestd ping.
@@ -453,12 +461,40 @@ pub async fn put_slurm_settings(
         ));
     }
 
+    // Node aliases: drop fully-blank rows the UI may submit; a host with no IP
+    // (or vice versa) is a mistake worth surfacing, and the address must be a
+    // real IP literal — a hostname here would just push the flaky DNS lookup
+    // back onto the proxy, defeating the point of the override.
+    let mut node_aliases = Vec::with_capacity(body.node_aliases.len());
+    for a in &body.node_aliases {
+        let host = a.host.trim();
+        let ip = a.ip.trim();
+        if host.is_empty() && ip.is_empty() {
+            continue;
+        }
+        if host.is_empty() {
+            return Err(AdminError::BadRequest(
+                "a node alias has an address but no hostname".into(),
+            ));
+        }
+        if ip.parse::<std::net::IpAddr>().is_err() {
+            return Err(AdminError::BadRequest(format!(
+                "node alias for '{host}' must be an IP address, got '{ip}'"
+            )));
+        }
+        node_aliases.push(NodeAlias {
+            host: host.to_string(),
+            ip: ip.to_string(),
+        });
+    }
+
     let settings = SlurmSettings {
         enabled: body.enabled,
         slurmrestd_url,
         slurmrestd_api_version: api_version,
         slurm_user,
         slurm_jwt,
+        node_aliases,
     };
 
     state.store.put_slurm_settings(&settings).await?;
@@ -475,6 +511,7 @@ pub async fn put_slurm_settings(
                 "slurmrestd_api_version": settings.slurmrestd_api_version,
                 "slurm_user": settings.slurm_user,
                 "jwt_set": !settings.slurm_jwt.is_empty(),
+                "node_aliases": settings.node_aliases.len(),
             }),
         )
         .await?;

@@ -76,6 +76,14 @@ pub struct ReplicaView {
 pub struct EndpointView {
     pub id: Uuid,
     pub name: String,
+    /// Registered upstream base URL (e.g. `http://10.0.0.7:8016/v1`). Used to
+    /// detect when a name-based endpoint should be rewritten to its resolved IP.
+    pub api_base: String,
+    /// Priority / weight / enabled, carried so a convergence rewrite of
+    /// `api_base` can PUT them back unchanged instead of clobbering operator edits.
+    pub priority: i64,
+    pub weight: i64,
+    pub enabled: bool,
     /// Gateway-recorded health status ("healthy" | "unhealthy" | "degraded" |
     /// …); `None` when the gateway has never checked this endpoint.
     pub health_status: Option<String>,

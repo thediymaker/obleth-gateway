@@ -111,8 +111,10 @@ pub fn plan(
                 // for the job to leave Slurm-PENDING — so treat them like
                 // "starting") AND self-heals a replica stranded as "healthy" with
                 // no endpoint linked (e.g. a prior promote whose endpoint write
-                // failed): the planner would otherwise never re-promote a
-                // "healthy" row, leaving the model permanently unhealthy.
+                // failed, or one whose endpoint was removed out of band — see
+                // `clear_dangling_endpoints`, which nulls that reference before
+                // planning): the planner would otherwise never re-promote a
+                // "healthy" row, leaving the model permanently short an endpoint.
                 let needs_promote = r.state == "starting"
                     || r.state == "pending"
                     || (r.state == "healthy" && r.endpoint_id.is_none());
@@ -173,6 +175,29 @@ pub fn plan(
 /// `health_path` against the bare node — that is a separate, native check.)
 fn endpoint_api_base(node: &str, serving_port: i64) -> String {
     format!("http://{node}:{serving_port}/v1")
+}
+
+/// Null out a `healthy` replica's `endpoint_id` when it points at an endpoint
+/// the gateway no longer has registered.
+///
+/// `model_replicas` has no foreign key to `model_endpoints` (it was dropped), so
+/// when an endpoint is removed out of band — a manual "Disable"/delete in the
+/// dashboard's Reliability tab, or a cancel/mark-lost whose endpoint delete
+/// landed but whose replica patch didn't — the replica keeps a *dangling*
+/// reference. The planner's re-promote path fires only on `endpoint_id.is_none()`,
+/// so such a row would sit "healthy" forever, serving a phantom the model no
+/// longer has (the classic "2 healthy replicas, 1 endpoint" split). Nulling the
+/// dangling id here lets that path relink a fresh endpoint next.
+///
+/// `known_endpoints` MUST be a reliable snapshot from a successful fetch this
+/// tick — never call this with an empty set derived from a failed lookup, or a
+/// transient error would strip every replica's endpoint at once.
+pub fn clear_dangling_endpoints(replicas: &mut [ReplicaView], known_endpoints: &HashSet<Uuid>) {
+    for r in replicas.iter_mut() {
+        if r.state == "healthy" && r.endpoint_id.is_some_and(|ep| !known_endpoints.contains(&ep)) {
+            r.endpoint_id = None;
+        }
+    }
 }
 
 /// Advance the per-replica consecutive-probe-failure counters after one tick's
@@ -420,6 +445,46 @@ mod tests {
         let health = HashMap::from([(id, 8000u16)]);
         let actions = plan(&spec(1), &[r], &jobs, &health, &HashSet::new(), 900);
         assert!(actions.is_empty(), "got {actions:?}");
+    }
+
+    #[test]
+    fn clear_dangling_endpoints_nulls_only_missing_healthy_refs() {
+        let live_ep = Uuid::new_v4();
+        let dead_ep = Uuid::new_v4();
+        let mut replicas = vec![
+            rv("healthy", "j1", Some(live_ep), 100), // still registered -> kept
+            rv("healthy", "j2", Some(dead_ep), 100), // removed out of band -> nulled
+            rv("healthy", "j3", None, 100),          // already none -> unchanged
+            rv("starting", "j4", Some(dead_ep), 100), // not healthy -> left alone
+        ];
+        clear_dangling_endpoints(&mut replicas, &HashSet::from([live_ep]));
+        assert_eq!(replicas[0].endpoint_id, Some(live_ep));
+        assert_eq!(replicas[1].endpoint_id, None);
+        assert_eq!(replicas[2].endpoint_id, None);
+        assert_eq!(replicas[3].endpoint_id, Some(dead_ep));
+    }
+
+    #[test]
+    fn dangling_endpoint_is_repromoted_after_clear() {
+        // End-to-end for the "2 healthy replicas, 1 endpoint" split: a healthy
+        // replica whose endpoint was removed out of band is nulled by
+        // clear_dangling_endpoints, then re-promoted by the planner so it relinks
+        // a fresh endpoint instead of serving a phantom forever.
+        let dead_ep = Uuid::new_v4();
+        let mut replicas = vec![rv("healthy", "j1", Some(dead_ep), 300)];
+        let id = replicas[0].id;
+        let jobs = HashMap::from([job("j1", JobState::Running, &["gpu7"])]);
+        let health = HashMap::from([(id, 8000u16)]);
+        // Gateway no longer has that endpoint registered.
+        clear_dangling_endpoints(&mut replicas, &HashSet::new());
+        let actions = plan(&spec(1), &replicas, &jobs, &health, &HashSet::new(), 900);
+        assert_eq!(
+            actions,
+            vec![Action::Promote {
+                replica_id: id,
+                api_base: "http://gpu7:8000/v1".into()
+            }]
+        );
     }
 
     #[test]
@@ -774,6 +839,10 @@ mod tests {
         EndpointView {
             id,
             name: "ep".into(),
+            api_base: "http://node:8000/v1".into(),
+            priority: 100,
+            weight: 100,
+            enabled: true,
             health_status: Some(status.into()),
             consecutive_failures: failures,
             checked_secs_ago,

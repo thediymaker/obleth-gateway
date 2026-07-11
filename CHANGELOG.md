@@ -4,6 +4,15 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v0.9.5
+
+Slurm replica endpoints stop depending on flaky per-request DNS, and replicas whose endpoint vanished out-of-band now heal themselves.
+
+- **Node address overrides.** Slurm settings gain a node hostname → IP override list, editable in the dashboard, for clusters where the pods running obleth resolve compute-node names unreliably. The provisioner registers each replica's endpoint by IP and probes by IP, so neither health checks nor proxied requests depend on per-request DNS — a single missed lookup previously surfaced as an instant `502 upstream request failed`. Edits take effect on the next provisioner tick without a restart; leave the list empty to keep resolving node names through DNS.
+- **Existing endpoints migrate to their resolved address in place.** Endpoints already registered by node name are rewritten to the resolved IP on the next tick — keeping their name, priority, weight, and enabled flag — so running replicas stop depending on DNS immediately after upgrading, without being re-provisioned.
+- **Node names resolve with retry and a cache even without overrides.** Un-aliased hostnames are resolved at promotion with a short retry, a per-node success cache, and a last-known-address fallback, so one transient DNS miss no longer decides where an endpoint points. Model warm-up requests also target the resolved address.
+- **Replicas with a vanished endpoint re-register instead of serving a phantom.** A replica marked healthy whose endpoint was removed out of band — a manual delete in the Reliability tab, or a cancellation that only half-landed — used to sit "healthy" forever while the model ran one endpoint short. The provisioner now detects the dangling reference and registers a fresh endpoint on the next tick.
+
 ## v0.9.4
 
 The v0.9.3 self-heal fix now actually reaches deployments, and failed job cancellations say why.
