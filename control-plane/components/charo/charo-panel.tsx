@@ -295,7 +295,7 @@ export function CharoPanel({
           const hasLiveBench = (m.liveSteps?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0;
           const hasLiveCaps = (m.liveCapabilities?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0;
           const hasToolResults = (m.toolResults?.length ?? 0) > 0;
-          const showBubble = !!content || !!m.image || !!m.error;
+          const showBubble = !!content || !!m.image || (m.images?.length ?? 0) > 0 || !!m.error;
           if (!showBubble && !hasTrace && !hasLiveBench && !hasLiveCaps && !hasToolResults && !m.pendingConfirm) {
             // Streaming but nothing to show yet (waiting on the first token or a
             // tool's first progress event): show the typing indicator, not dead air.
@@ -333,6 +333,15 @@ export function CharoPanel({
                     /* eslint-disable-next-line @next/next/no-img-element */
                     <img src={m.image} alt="attachment" className="mb-1.5 max-h-40 rounded-md" />
                   )}
+                  {m.images?.map((src, i) => (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img
+                      key={i}
+                      src={src}
+                      alt={`generated image ${i + 1}`}
+                      className="my-1 max-h-80 rounded-md"
+                    />
+                  ))}
                   {content && <CharoMarkdown text={content} />}
                   {m.error && <p className="mt-1 text-[13px] text-destructive">{m.error}</p>}
                 </div>
