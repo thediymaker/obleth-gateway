@@ -2154,8 +2154,10 @@ fn maybe_alert_key_budget(
 /// default base plus each model's endpoints) for its own `/v1/models` and union
 /// the entries **verbatim** — each model keeps the real `id` and `owned_by` its
 /// serving engine reports (litellm `openai`, vLLM `vllm`, llama.cpp `llamacpp`,
-/// Ollama `library`, …). Nothing is synthesized. Lookups are best-effort and
-/// concurrent, so a slow or down upstream is simply skipped.
+/// Ollama `library`, …). The one addition: entries whose id matches a
+/// registered model are annotated with that route's modality (`model_type` +
+/// `mode`) so clients don't have to guess it from the id. Lookups are
+/// best-effort and concurrent, so a slow or down upstream is simply skipped.
 async fn models_list_response(state: &AppState) -> Response<Body> {
     let candidates = state.model_registry.load();
 
@@ -2203,7 +2205,59 @@ async fn models_list_response(state: &AppState) -> Response<Body> {
             .map(|(base, key)| fetch_upstream_models(state, base, key.as_deref())),
     )
     .await;
-    (StatusCode::OK, axum::Json(merge_upstream_models(results))).into_response()
+
+    // Ids the gateway can vouch for: a client-facing `model_name` always wins
+    // over an `upstream_model` alias, because `model_name` is what request
+    // resolution actually matches on.
+    let mut types_by_id: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for c in candidates.iter() {
+        if !c.model.upstream_model.is_empty() {
+            types_by_id
+                .entry(c.model.upstream_model.clone())
+                .or_insert_with(|| c.model.model_type.clone());
+        }
+    }
+    for c in candidates.iter() {
+        types_by_id.insert(c.model.model_name.clone(), c.model.model_type.clone());
+    }
+
+    let mut merged = merge_upstream_models(results);
+    annotate_model_types(&mut merged, &types_by_id);
+    (StatusCode::OK, axum::Json(merged)).into_response()
+}
+
+/// Annotate aggregated `/v1/models` entries with the registered route's
+/// modality, so clients can group models (chat vs. image vs. audio) from
+/// gateway-reported fact instead of guessing from the id. Each matched entry
+/// gains `model_type` (obleth's [`MODEL_TYPES`](obleth_config::MODEL_TYPES)
+/// vocabulary) and `mode` (the LiteLLM-convention alias many clients already
+/// read, where `image` is spelled `image_generation`). Entries whose id
+/// matches no registered model — wildcard passthroughs — stay verbatim.
+fn annotate_model_types(
+    list: &mut serde_json::Value,
+    types_by_id: &std::collections::HashMap<String, String>,
+) {
+    let Some(data) = list.get_mut("data").and_then(|d| d.as_array_mut()) else {
+        return;
+    };
+    for entry in data {
+        let Some(model_type) = entry
+            .get("id")
+            .and_then(|i| i.as_str())
+            .and_then(|id| types_by_id.get(id))
+        else {
+            continue;
+        };
+        let mode = match model_type.as_str() {
+            "image" => "image_generation",
+            other => other,
+        };
+        if let Some(obj) = entry.as_object_mut() {
+            obj.insert("model_type".into(), model_type.clone().into());
+            obj.insert("mode".into(), mode.into());
+        }
+    }
 }
 
 /// Union upstream `/v1/models` entries into one OpenAI `{object:"list", data:[…]}`
@@ -3250,6 +3304,44 @@ mod tests {
         assert_eq!(owner_of("gemma4-31b-it"), "openai"); // first upstream wins over the dup
         assert_eq!(owner_of("glm-5.2"), "library");
         assert_eq!(owner_of("minimax-m2-7-fast"), "openai");
+    }
+
+    #[test]
+    fn models_listing_annotates_registered_modalities() {
+        use super::annotate_model_types;
+        let mut list = serde_json::json!({
+            "object": "list",
+            "data": [
+                {"id": "flux-2-dev", "object": "model", "owned_by": "vllm"},
+                {"id": "gemma4-31b-it", "object": "model", "owned_by": "openai"},
+                {"id": "wildcard-passthrough", "object": "model", "owned_by": "library"},
+            ]
+        });
+        let types: std::collections::HashMap<String, String> = [
+            ("flux-2-dev".to_string(), "image".to_string()),
+            ("gemma4-31b-it".to_string(), "chat".to_string()),
+        ]
+        .into();
+        annotate_model_types(&mut list, &types);
+
+        let field = |id: &str, key: &str| {
+            list["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|m| m["id"] == id)
+                .unwrap()[key]
+                .clone()
+        };
+        // Registered models gain both the obleth vocabulary and the
+        // LiteLLM-convention alias (`image` is spelled `image_generation`).
+        assert_eq!(field("flux-2-dev", "model_type"), "image");
+        assert_eq!(field("flux-2-dev", "mode"), "image_generation");
+        assert_eq!(field("gemma4-31b-it", "model_type"), "chat");
+        assert_eq!(field("gemma4-31b-it", "mode"), "chat");
+        // An id no route claims stays verbatim — no guessed fields.
+        assert!(field("wildcard-passthrough", "model_type").is_null());
+        assert!(field("wildcard-passthrough", "mode").is_null());
     }
 
     fn model_with(endpoints: Vec<ResolvedEndpoint>) -> obleth_config::ResolvedModel {
