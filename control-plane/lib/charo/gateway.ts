@@ -45,6 +45,14 @@ export interface GatewayChatBody {
   [k: string]: unknown;
 }
 
+export interface GatewayImagesBody {
+  model: string;
+  prompt: string;
+  n?: number;
+  response_format?: string;
+  [k: string]: unknown;
+}
+
 /**
  * POST a chat-completions request to the data plane as the reserved tenant.
  * Returns the raw `fetch` Response so callers can read the
@@ -54,8 +62,28 @@ export async function gatewayChat(
   body: GatewayChatBody,
   signal?: AbortSignal,
 ): Promise<Response> {
+  return gatewayPost("/v1/chat/completions", body, signal);
+}
+
+/**
+ * POST an image-generation request to the data plane as the reserved tenant.
+ * Used when the chat target is an `image`-type model — those backends serve
+ * /v1/images/generations, not /v1/chat/completions.
+ */
+export async function gatewayImages(
+  body: GatewayImagesBody,
+  signal?: AbortSignal,
+): Promise<Response> {
+  return gatewayPost("/v1/images/generations", body, signal);
+}
+
+async function gatewayPost(
+  path: string,
+  body: unknown,
+  signal?: AbortSignal,
+): Promise<Response> {
   const secret = await getControlPlaneKey();
-  return fetch(`${PROXY_BASE}/v1/chat/completions`, {
+  return fetch(`${PROXY_BASE}${path}`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${secret}`,
