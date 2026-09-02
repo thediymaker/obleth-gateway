@@ -327,6 +327,20 @@ async fn proxy_handler_inner(
             return error_json(StatusCode::FORBIDDEN, "model is disabled");
         }
     }
+    // ---- reject unmapped passthrough (noise / info-leak guard) ----
+    // A request that resolved to no registered model (`route` is None) and whose
+    // path is not a recognized OpenAI endpoint would otherwise be forwarded
+    // opaquely to the default upstream (`state.upstream_base`). That turns stray
+    // probes and scans (`/props`, `/health`, favicons, vulnerability scanners)
+    // into real upstream round-trips and noisy `unknown`/`other` request-log rows
+    // that also leak the internal upstream URL. Reject them here — before any
+    // dispatch or telemetry — so they never reach the ledger. The OpenAI model
+    // discovery endpoints are the only model-less passthroughs the gateway
+    // serves, so they stay allowed. A request that DID name a registered model on
+    // an unusual path (`route` is Some) is still forwarded untouched.
+    if route.is_none() && request_type_for_path(&path) == "other" && !is_models_endpoint(&path) {
+        return error_json(StatusCode::NOT_FOUND, "unknown endpoint");
+    }
     // ---- per-tenant model allowlist (Phase 4) ----
     if !resolved.internal {
         if let Some(allowed) = &resolved.allowed_models {
@@ -2317,6 +2331,14 @@ async fn fetch_upstream_models(
     inner(state, base, api_key).await.unwrap_or_default()
 }
 
+/// The OpenAI model-discovery endpoints: `GET /v1/models` (list) and the
+/// `GET /v1/models/{id}` / `{"model": …}` detail probe. These are the only
+/// paths the gateway proxies without resolving to a registered model, so they
+/// are exempt from the unmapped-path rejection.
+fn is_models_endpoint(path: &str) -> bool {
+    path == "/v1/models" || path.starts_with("/v1/models/")
+}
+
 fn requires_registered_model(path: &str) -> bool {
     matches!(
         path,
@@ -3061,8 +3083,8 @@ fn now_ms() -> i64 {
 mod tests {
     use super::{
         backoff_for, build_targets, build_upstream_url, effective_request_type, has_path_traversal,
-        is_retryable_status, prepare_upstream_body, resolve_conversation, session_hash_order,
-        tenant_active_now, weighted_order,
+        is_models_endpoint, is_retryable_status, prepare_upstream_body, request_type_for_path,
+        resolve_conversation, session_hash_order, tenant_active_now, weighted_order,
     };
     use axum::http::HeaderMap;
     use chrono::{DateTime, TimeZone, Utc};
@@ -3147,6 +3169,32 @@ mod tests {
             build_upstream_url("https://openai.rc.asu.edu/v1", "/v1/chat/completions", ""),
             "https://openai.rc.asu.edu/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn unmapped_paths_are_rejected_not_forwarded() {
+        // The handler rejects a request when it resolved to no registered model
+        // (route None), the path is not a recognized OpenAI endpoint, and it is
+        // not a model-discovery endpoint. These predicates encode that rule.
+        let is_unmapped = |path: &str| {
+            request_type_for_path(path) == "other" && !is_models_endpoint(path)
+        };
+
+        // Stray probes / scans -> unmapped -> rejected instead of forwarded.
+        assert!(is_unmapped("/props"));
+        assert!(is_unmapped("/health"));
+        assert!(is_unmapped("/favicon.ico"));
+        assert!(is_unmapped("/"));
+
+        // Model-discovery endpoints stay allowed (served without a model).
+        assert!(!is_unmapped("/v1/models"));
+        assert!(!is_unmapped("/v1/models/gpt-4o"));
+
+        // Recognized OpenAI endpoints are never treated as unmapped.
+        assert!(!is_unmapped("/v1/chat/completions"));
+        assert!(!is_unmapped("/v1/embeddings"));
+        assert!(!is_unmapped("/v1/rerank"));
+        assert!(!is_unmapped("/v1/moderations"));
     }
 
     #[test]
