@@ -295,6 +295,25 @@ controlPlane:
     [{"providerId":"globus","displayName":"Globus","discoveryUrl":"https://auth.globus.org/.well-known/openid-configuration","clientId":"ID","clientSecret":"SECRET","scopes":["openid","email","profile"]}]
 ```
 
+An optional `authentication` field selects how the client authenticates to the
+IdP's **token** endpoint: omit it for the default, which sends
+`client_id`/`client_secret` in the request body (`client_secret_post`), or set
+`"basic"` for an IdP that only accepts HTTP Basic (`client_secret_basic`).
+
+Most providers accept both regardless of what their discovery document
+advertises — Globus, for one, advertises only `client_secret_basic` but
+authenticates body credentials fine, so the example above needs no override.
+Reach for this only when a provider genuinely refuses.
+
+The symptom that points here is distinctive: the IdP login succeeds, the
+browser comes back to the dashboard, and *then* the callback errors — because
+the failure is in the server-to-server code exchange, not in anything visible
+in the browser flow. If you see that, check the provider's
+`token_endpoint_auth_methods_supported` and set `authentication` to match. Only
+`"basic"` and `"post"` are accepted; the discovery-document spellings
+(`client_secret_basic` / `client_secret_post`) are rejected with an explicit
+error rather than silently falling back to the body.
+
 Register this redirect URI with your identity provider (one per `providerId`):
 
 ```

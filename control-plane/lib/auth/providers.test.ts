@@ -87,4 +87,46 @@ describe("oidcProviders", () => {
     const cfgs = oidcProviders();
     expect(cfgs[0].scopes).toEqual(["openid", "email", "profile"]);
   });
+
+  it("passes the token-endpoint authentication method through when set", async () => {
+    process.env.OIDC_PROVIDERS = JSON.stringify([{
+      providerId: "globus",
+      displayName: "Globus",
+      discoveryUrl: "https://auth.globus.org/.well-known/openid-configuration",
+      clientId: "id",
+      clientSecret: "secret",
+      authentication: "basic",
+    }]);
+    const { oidcProviders } = await import("./providers");
+    expect(oidcProviders()[0].authentication).toBe("basic");
+  });
+
+  it("leaves authentication undefined when unset, so better-auth keeps its default", async () => {
+    process.env.OIDC_PROVIDERS = JSON.stringify([{
+      providerId: "dex",
+      displayName: "Dex",
+      discoveryUrl: "https://dex.example/.well-known/openid-configuration",
+      clientId: "id",
+      clientSecret: "secret",
+    }]);
+    const { oidcProviders } = await import("./providers");
+    expect(oidcProviders()[0].authentication).toBeUndefined();
+  });
+
+  it("throws on an unrecognised authentication method instead of silently using the body", async () => {
+    // "client_secret_basic" is the discovery-document spelling, and an easy
+    // thing to copy in by mistake. better-auth would treat it as "not basic"
+    // and post the credentials in the body -- the exact bug this field exists
+    // to prevent -- so it must not be accepted.
+    process.env.OIDC_PROVIDERS = JSON.stringify([{
+      providerId: "globus",
+      displayName: "Globus",
+      discoveryUrl: "https://auth.globus.org/.well-known/openid-configuration",
+      clientId: "id",
+      clientSecret: "secret",
+      authentication: "client_secret_basic",
+    }]);
+    const { oidcProviders } = await import("./providers");
+    expect(() => oidcProviders()).toThrow(/expected one of "basic", "post"/);
+  });
 });
