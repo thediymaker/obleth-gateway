@@ -3,6 +3,33 @@ export type TokenAuthMethod = "basic" | "post";
 
 const TOKEN_AUTH_METHODS: readonly TokenAuthMethod[] = ["basic", "post"];
 
+/**
+ * Which OIDC claim to read each user field from, overriding the standard claim
+ * of the same name.
+ *
+ * Institutional IdPs routinely release an `email` that is not the identifier
+ * the institution actually keys accounts on. Globus is a clear example: for an
+ * ASU identity it sends `email: "Johnathan.Lee@asu.edu"` (a display alias)
+ * while `preferred_username` carries the canonical `jlee379@asu.edu`. Without a
+ * mapping, obleth keys the account on the alias, so the same human arrives as a
+ * second, unrecognised user.
+ *
+ *     "claims": { "email": "preferred_username" }
+ *
+ * Only these three fields are mappable, because they are the only profile
+ * fields better-auth writes onto a user. An unset field keeps the standard
+ * claim; a claim that is missing or non-string in a given token falls back to
+ * the standard claim rather than writing null.
+ */
+export interface ClaimMapping {
+  email?: string;
+  name?: string;
+  image?: string;
+}
+
+const MAPPABLE_FIELDS = ["email", "name", "image"] as const;
+type MappableField = (typeof MAPPABLE_FIELDS)[number];
+
 interface ProviderEnv {
   providerId: string;
   displayName: string;
@@ -34,6 +61,18 @@ interface ProviderEnv {
    * failure is in the server-to-server code exchange, not in the browser flow.
    */
   authentication?: TokenAuthMethod;
+  /** See {@link ClaimMapping}. */
+  claims?: ClaimMapping;
+  /**
+   * Re-apply the profile (and therefore the claim mapping) to an EXISTING user
+   * on every sign-in, instead of only at sign-up. Off by default, matching
+   * better-auth.
+   *
+   * Turn this on when correcting a mapping after users already exist: without
+   * it, a fixed `claims.email` only affects accounts created from then on, and
+   * everyone who already signed in keeps the wrong address forever.
+   */
+  overrideUserInfo?: boolean;
 }
 
 export interface GenericOAuthConfig {
@@ -43,6 +82,35 @@ export interface GenericOAuthConfig {
   clientSecret: string;
   scopes: string[];
   authentication?: TokenAuthMethod;
+  /** Built from `claims`; better-auth calls this with the raw OIDC profile. */
+  mapProfileToUser?: (profile: Record<string, unknown>) => Record<string, unknown>;
+  overrideUserInfo?: boolean;
+}
+
+/**
+ * Turn a declarative {@link ClaimMapping} into the `mapProfileToUser` callback
+ * better-auth expects. Returns undefined when nothing is mapped, so the
+ * provider config stays exactly as it was before this feature existed.
+ *
+ * OIDC_PROVIDERS is JSON and cannot carry a function, which is why the mapping
+ * is declarative and the callback is synthesised here.
+ */
+function buildProfileMapper(
+  claims: ClaimMapping | undefined,
+): ((profile: Record<string, unknown>) => Record<string, unknown>) | undefined {
+  const entries = Object.entries(claims ?? {}).filter(([, claim]) => Boolean(claim));
+  if (entries.length === 0) return undefined;
+  return (profile) => {
+    const mapped: Record<string, unknown> = {};
+    for (const [field, claim] of entries) {
+      const value = profile[claim as string];
+      // Only override with a usable string. A missing or non-string claim must
+      // fall through to better-auth's standard handling -- writing undefined
+      // here would blank out a field the IdP did supply.
+      if (typeof value === "string" && value.trim() !== "") mapped[field] = value;
+    }
+    return mapped;
+  };
 }
 
 export interface OidcProviderLabel {
@@ -89,6 +157,23 @@ export function oidcProviders(): GenericOAuthConfig[] {
           `expected one of ${TOKEN_AUTH_METHODS.map((m) => `"${m}"`).join(", ")}.`,
       );
     }
+    // Same reasoning as `authentication`: an unrecognised key in `claims` would
+    // otherwise be accepted and do nothing, which is indistinguishable from a
+    // mapping that silently failed. Name the bad key.
+    for (const field of Object.keys(p.claims ?? {})) {
+      if (!MAPPABLE_FIELDS.includes(field as MappableField)) {
+        throw new Error(
+          `OIDC_PROVIDERS: provider "${p.providerId}" maps unknown claim field "${field}"; ` +
+            `expected one of ${MAPPABLE_FIELDS.map((f) => `"${f}"`).join(", ")}.`,
+        );
+      }
+      const claim = (p.claims as Record<string, unknown>)[field];
+      if (typeof claim !== "string" || claim.trim() === "") {
+        throw new Error(
+          `OIDC_PROVIDERS: provider "${p.providerId}" maps "${field}" to a non-string claim name.`,
+        );
+      }
+    }
     return {
       providerId: p.providerId,
       discoveryUrl: p.discoveryUrl,
@@ -98,6 +183,8 @@ export function oidcProviders(): GenericOAuthConfig[] {
       // Passed through verbatim (undefined included) so better-auth keeps its
       // own default when unset.
       authentication: p.authentication,
+      mapProfileToUser: buildProfileMapper(p.claims),
+      overrideUserInfo: p.overrideUserInfo,
     };
   });
 }
