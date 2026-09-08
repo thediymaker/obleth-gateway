@@ -87,4 +87,122 @@ describe("oidcProviders", () => {
     const cfgs = oidcProviders();
     expect(cfgs[0].scopes).toEqual(["openid", "email", "profile"]);
   });
+
+  it("passes the token-endpoint authentication method through when set", async () => {
+    process.env.OIDC_PROVIDERS = JSON.stringify([{
+      providerId: "globus",
+      displayName: "Globus",
+      discoveryUrl: "https://auth.globus.org/.well-known/openid-configuration",
+      clientId: "id",
+      clientSecret: "secret",
+      authentication: "basic",
+    }]);
+    const { oidcProviders } = await import("./providers");
+    expect(oidcProviders()[0].authentication).toBe("basic");
+  });
+
+  it("leaves authentication undefined when unset, so better-auth keeps its default", async () => {
+    process.env.OIDC_PROVIDERS = JSON.stringify([{
+      providerId: "dex",
+      displayName: "Dex",
+      discoveryUrl: "https://dex.example/.well-known/openid-configuration",
+      clientId: "id",
+      clientSecret: "secret",
+    }]);
+    const { oidcProviders } = await import("./providers");
+    expect(oidcProviders()[0].authentication).toBeUndefined();
+  });
+
+  it("throws on an unrecognised authentication method instead of silently using the body", async () => {
+    // "client_secret_basic" is the discovery-document spelling, and an easy
+    // thing to copy in by mistake. better-auth would treat it as "not basic"
+    // and post the credentials in the body -- the exact bug this field exists
+    // to prevent -- so it must not be accepted.
+    process.env.OIDC_PROVIDERS = JSON.stringify([{
+      providerId: "globus",
+      displayName: "Globus",
+      discoveryUrl: "https://auth.globus.org/.well-known/openid-configuration",
+      clientId: "id",
+      clientSecret: "secret",
+      authentication: "client_secret_basic",
+    }]);
+    const { oidcProviders } = await import("./providers");
+    expect(() => oidcProviders()).toThrow(/expected one of "basic", "post"/);
+  });
+
+  it("maps email from a configured claim, so an IdP alias does not become the account key", async () => {
+    // Globus for an ASU identity: `email` is a display alias, and
+    // `preferred_username` is the canonical institutional id.
+    process.env.OIDC_PROVIDERS = JSON.stringify([{
+      providerId: "globus",
+      displayName: "Globus",
+      discoveryUrl: "https://auth.globus.org/.well-known/openid-configuration",
+      clientId: "id",
+      clientSecret: "secret",
+      claims: { email: "preferred_username" },
+    }]);
+    const { oidcProviders } = await import("./providers");
+    const map = oidcProviders()[0].mapProfileToUser!;
+    expect(map({
+      email: "Johnathan.Lee@asu.edu",
+      preferred_username: "jlee379@asu.edu",
+    })).toEqual({ email: "jlee379@asu.edu" });
+  });
+
+  it("falls back to the standard claim when the mapped claim is absent or not a string", async () => {
+    process.env.OIDC_PROVIDERS = JSON.stringify([{
+      providerId: "globus",
+      displayName: "Globus",
+      discoveryUrl: "https://d/.well-known/openid-configuration",
+      clientId: "id",
+      clientSecret: "secret",
+      claims: { email: "preferred_username" },
+    }]);
+    const { oidcProviders } = await import("./providers");
+    const map = oidcProviders()[0].mapProfileToUser!;
+    // Absent, empty, and non-string must all leave the field alone rather than
+    // blanking out an address the IdP did supply.
+    expect(map({ email: "real@example.edu" })).toEqual({});
+    expect(map({ email: "real@example.edu", preferred_username: "   " })).toEqual({});
+    expect(map({ email: "real@example.edu", preferred_username: 42 })).toEqual({});
+  });
+
+  it("leaves mapProfileToUser undefined when no claims are mapped", async () => {
+    process.env.OIDC_PROVIDERS = JSON.stringify([{
+      providerId: "dex",
+      displayName: "Dex",
+      discoveryUrl: "https://d/.well-known/openid-configuration",
+      clientId: "id",
+      clientSecret: "secret",
+    }]);
+    const { oidcProviders } = await import("./providers");
+    expect(oidcProviders()[0].mapProfileToUser).toBeUndefined();
+  });
+
+  it("throws on an unknown claim field rather than silently mapping nothing", async () => {
+    process.env.OIDC_PROVIDERS = JSON.stringify([{
+      providerId: "globus",
+      displayName: "Globus",
+      discoveryUrl: "https://d/.well-known/openid-configuration",
+      clientId: "id",
+      clientSecret: "secret",
+      claims: { mail: "preferred_username" },
+    }]);
+    const { oidcProviders } = await import("./providers");
+    expect(() => oidcProviders()).toThrow(/unknown claim field "mail"/);
+  });
+
+  it("passes overrideUserInfo through so a corrected mapping can reach existing users", async () => {
+    process.env.OIDC_PROVIDERS = JSON.stringify([{
+      providerId: "globus",
+      displayName: "Globus",
+      discoveryUrl: "https://d/.well-known/openid-configuration",
+      clientId: "id",
+      clientSecret: "secret",
+      claims: { email: "preferred_username" },
+      overrideUserInfo: true,
+    }]);
+    const { oidcProviders } = await import("./providers");
+    expect(oidcProviders()[0].overrideUserInfo).toBe(true);
+  });
 });
