@@ -4,9 +4,11 @@
 //! a Prometheus metrics endpoint. Wires Postgres (config SoT), Redis (hot cache
 //! + budgets), ClickHouse (usage ledger) and the fairshare scheduler together.
 
+mod completion;
 mod energy;
 mod mcp;
 mod metrics;
+mod output_monitor;
 mod proxy;
 mod router;
 mod state;
@@ -238,7 +240,7 @@ async fn main() -> anyhow::Result<()> {
                     .await;
             }
             tracing::info!(count = models.len(), "warmed model cache");
-            model_registry.store(build_candidates(&store, models).await);
+            install_candidates(&model_registry, build_candidates(&store, models).await);
         }
         Err(e) => tracing::warn!(error = %e, "failed to load models for warming"),
     }
@@ -384,19 +386,13 @@ async fn metrics_handler(
 async fn build_candidates(
     store: &Store,
     models: Vec<(String, obleth_config::ResolvedModel)>,
-) -> Vec<router::Candidate> {
+) -> Result<Vec<router::Candidate>, obleth_store::StoreError> {
     let now = chrono::Utc::now();
-    let health = store
-        .list_model_health_summaries()
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(error = %e, "failed to load model health for auto router");
-            Vec::new()
-        });
+    let health = store.list_model_health_summaries().await?;
     let health_by_name: std::collections::HashMap<String, &obleth_config::ModelHealthSummary> =
         health.iter().map(|h| (h.model_name.clone(), h)).collect();
 
-    models
+    Ok(models
         .into_iter()
         .map(|(name, model)| {
             let healthy = match health_by_name.get(&name) {
@@ -407,7 +403,19 @@ async fn build_candidates(
             };
             router::Candidate { model, healthy }
         })
-        .collect()
+        .collect())
+}
+
+fn install_candidates(
+    registry: &router::ModelRegistry,
+    candidates: Result<Vec<router::Candidate>, obleth_store::StoreError>,
+) {
+    match candidates {
+        Ok(candidates) => registry.store(candidates),
+        Err(e) => {
+            tracing::warn!(error = %e, "auto-router health refresh failed; retaining previous snapshot")
+        }
+    }
 }
 
 /// Periodically rebuild the `auto`-router candidate list so enable/disable,
@@ -428,7 +436,7 @@ fn spawn_model_registry_refresh(
         loop {
             tick.tick().await;
             match store.all_resolved_models().await {
-                Ok(models) => registry.store(build_candidates(&store, models).await),
+                Ok(models) => install_candidates(&registry, build_candidates(&store, models).await),
                 Err(e) => tracing::warn!(error = %e, "auto-router model refresh failed"),
             }
             match store.get_auto_router_settings().await {
@@ -649,4 +657,19 @@ where
         }
     }
     anyhow::bail!("could not connect to {name} after retries: {last}")
+}
+
+#[cfg(test)]
+mod registry_refresh_tests {
+    use super::*;
+
+    #[test]
+    fn failed_health_query_retains_snapshot_and_success_replaces_it() {
+        let registry = router::ModelRegistry::new();
+        let before = registry.load();
+        install_candidates(&registry, Err(obleth_store::StoreError::NotFound));
+        assert!(Arc::ptr_eq(&before, &registry.load()));
+        install_candidates(&registry, Ok(Vec::new()));
+        assert!(!Arc::ptr_eq(&before, &registry.load()));
+    }
 }

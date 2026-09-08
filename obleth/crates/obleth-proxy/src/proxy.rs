@@ -1232,6 +1232,20 @@ async fn proxy_handler_inner(
     // Cache only successful responses.
     let store_in_cache = cache_key.clone();
 
+    // Extract guardrails policy for log_only output scanning (evaluated after stream drains).
+    let scan_policy = resolved
+        .guardrails_policy
+        .as_ref()
+        .filter(|p| {
+            status_code == 200
+                && !p.output_scanners.is_empty()
+                && matches!(p.action, obleth_config::GuardrailsAction::LogOnly)
+        })
+        .cloned();
+    let mut output_monitor = scan_policy.as_ref().map(|_| {
+        crate::output_monitor::OutputMonitor::new(content_type_str.contains("text/event-stream"))
+    });
+
     // ---- streaming gateway tool loop ----
     // When the only response transform is the tool loop and the client asked to
     // stream, drive the loop live (see `stream_tap`): the model's content and
@@ -1262,15 +1276,32 @@ async fn proxy_handler_inner(
                     stats.clone(),
                 );
 
-                let stream_state = state.clone();
-                let resolved_for_stream = resolved.clone();
-                let meta_for_stream = req_meta.clone();
-                let model_for_stream = model.clone();
-                let term_for_stream = term_period.clone();
-                let key_term_for_stream = key_term_period.clone();
+                let accounting = StreamAccounting {
+                    state: state.clone(),
+                    request_id,
+                    resolved: resolved.clone(),
+                    meta: req_meta.clone(),
+                    model: model.clone(),
+                    admission,
+                    est,
+                    queue_wait_ms,
+                    request_start,
+                    cache_status: cache_status_label.to_string(),
+                    capacity,
+                    term_period: term_period.clone(),
+                    key_term_period: key_term_period.clone(),
+                    in_cost_rate,
+                    out_cost_rate,
+                    modality_cost,
+                    energy_slots,
+                };
+                let completion = accounting.cancellation_guard();
                 let body_stream = async_stream::stream! {
                     futures_util::pin_mut!(driver);
                     while let Some(item) = driver.next().await {
+                        if let (Some(monitor), Ok(chunk)) = (output_monitor.as_mut(), &item) {
+                            monitor.push(chunk);
+                        }
                         yield item;
                     }
                     drop(permit);
@@ -1284,31 +1315,10 @@ async fn proxy_handler_inner(
                         (s.ttft_ms, toks.0, toks.1)
                     };
                     let total_ms = request_start.elapsed().as_millis() as u32;
-                    settle_request(
-                        &stream_state,
-                        request_id,
-                        &resolved_for_stream,
-                        &meta_for_stream,
-                        &model_for_stream,
-                        admission,
-                        est,
-                        input_tokens,
-                        output_tokens,
-                        queue_wait_ms,
-                        ttft_ms,
-                        total_ms,
-                        status_code,
-                        cache_status_label,
-                        capacity,
-                        term_for_stream.as_deref(),
-                        key_term_for_stream.as_deref(),
-                        in_cost_rate,
-                        out_cost_rate,
-                        modality_cost,
-                        energy_slots,
-                        None,
-                    )
-                    .await;
+                    accounting.monitor(scan_policy.as_ref(), output_monitor);
+                    let _ = completion.complete(accounting.settle(
+                        (input_tokens, output_tokens), ttft_ms, total_ms, status_code, None,
+                    )).await;
                 };
                 if let Some(t) = tracer.take() {
                     t.finish(if status_code < 400 { "ok" } else { "error" });
@@ -1518,21 +1528,28 @@ async fn proxy_handler_inner(
         t.finish(if status_code < 400 { "ok" } else { "error" });
     }
 
-    // Extract guardrails policy for log_only output scanning (evaluated after stream drains).
-    let scan_policy = resolved
-        .guardrails_policy
-        .as_ref()
-        .filter(|p| {
-            !p.output_scanners.is_empty()
-                && matches!(p.action, obleth_config::GuardrailsAction::LogOnly)
-        })
-        .cloned();
-    let scan_output = scan_policy.is_some();
-
     // ---- stream back, inspecting for actual usage, then reconcile ----
-    let stream_state = state.clone();
-    let resolved_for_stream = resolved.clone();
-    let meta_for_stream = req_meta.clone();
+
+    let accounting = StreamAccounting {
+        state: state.clone(),
+        request_id,
+        resolved: resolved.clone(),
+        meta: req_meta.clone(),
+        model: model.clone(),
+        admission,
+        est,
+        queue_wait_ms,
+        request_start,
+        cache_status: cache_status_label.to_string(),
+        capacity,
+        term_period: term_period.clone(),
+        key_term_period: key_term_period.clone(),
+        in_cost_rate,
+        out_cost_rate,
+        modality_cost,
+        energy_slots,
+    };
+    let completion = accounting.cancellation_guard();
     let body_stream = async_stream::stream! {
         let mut byte_stream = upstream.bytes_stream();
         let mut first = true;
@@ -1549,12 +1566,12 @@ async fn proxy_handler_inner(
                         first = false;
                     }
                     append_tail(&mut tail, &chunk);
-                    if cacheable || scan_output {
+                    if let Some(monitor) = output_monitor.as_mut() { monitor.push(&chunk); }
+                    if cacheable {
                         if full.len() + chunk.len() <= CACHE_MAX_BYTES {
                             full.extend_from_slice(&chunk);
                         } else {
                             cacheable = false;
-                            // Response exceeded cache cap; clear so the log_only scan is skipped.
                             full = Vec::new();
                         }
                     }
@@ -1562,12 +1579,12 @@ async fn proxy_handler_inner(
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "upstream stream error");
-                    stream_state.alerts.issue(
+                    accounting.state.alerts.issue(
                         "upstream_stream_error",
                         "Upstream stream failed",
                         format!(
                             "tenant `{}` model `{model}` status `{status_code}`: {e}",
-                            resolved_for_stream.tenant_name
+                            accounting.resolved.tenant_name
                         ),
                     );
                     cacheable = false;
@@ -1587,13 +1604,6 @@ async fn proxy_handler_inner(
             .unwrap_or((est.input_tokens, est.estimated_output_tokens));
         let total_ms = request_start.elapsed().as_millis() as u32;
 
-        // Capture for log_only scan before cache_put potentially consumes full.
-        let scan_full: Vec<u8> = if scan_output && !full.is_empty() && status_code == 200 {
-            full.clone()
-        } else {
-            Vec::new()
-        };
-
         // store the full response for identical future requests
         let cache_put = if cacheable && status_code == 200 {
             store_in_cache.as_deref().map(|ck| {
@@ -1602,60 +1612,16 @@ async fn proxy_handler_inner(
                 // JSON/SSE bodies this cache is meant for).
                 let body = String::from_utf8(std::mem::take(&mut full))
                     .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-                (ck, cache_ttl, content_type_str.as_str(), body)
+                (ck.to_string(), cache_ttl, content_type_str.clone(), body)
             })
         } else {
             None
         };
 
-        settle_request(
-            &stream_state,
-            request_id,
-            &resolved_for_stream,
-            &meta_for_stream,
-            &model,
-            admission,
-            est,
-            input_tokens,
-            output_tokens,
-            queue_wait_ms,
-            ttft_ms,
-            total_ms,
-            status_code,
-            cache_status_label,
-            capacity,
-            term_period.as_deref(),
-            key_term_period.as_deref(),
-            in_cost_rate,
-            out_cost_rate,
-            modality_cost,
-            energy_slots,
-            cache_put,
-        )
-        .await;
-
-        // log_only guardrails output scan — fire-and-forget after stream drains.
-        // tier-1 detection runs inline (microseconds); the harm scan, if armed,
-        // is dispatched async by `monitor_output`.
-        if let Some(policy_clone) = scan_policy {
-            if !scan_full.is_empty() {
-                if let Ok(completion) =
-                    serde_json::from_slice::<serde_json::Value>(&scan_full)
-                {
-                    let guardrails_settings =
-                        stream_state.boons.settings().guardrails.clone();
-                    crate::boons::guardrails::monitor_output(
-                        &stream_state,
-                        &guardrails_settings,
-                        &policy_clone,
-                        &resolved_for_stream,
-                        &meta_for_stream.session_id,
-                        request_id,
-                        &completion,
-                    );
-                }
-            }
-        }
+        accounting.monitor(scan_policy.as_ref(), output_monitor);
+        let _ = completion.complete(accounting.settle(
+            (input_tokens, output_tokens), ttft_ms, total_ms, status_code, cache_put,
+        )).await;
     };
 
     let mut builder = Response::builder().status(status_code);
@@ -1672,6 +1638,106 @@ async fn proxy_handler_inner(
     builder
         .body(Body::from_stream(body_stream))
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+}
+
+/// Owned admission snapshot: cancellation bookkeeping must not borrow the body
+/// that is being dropped. Prices and periods are the same as normal settlement.
+#[derive(Clone)]
+struct StreamAccounting {
+    state: AppState,
+    request_id: Uuid,
+    resolved: Arc<ResolvedKey>,
+    meta: RequestMeta,
+    model: String,
+    admission: Admission,
+    est: CostEstimate,
+    queue_wait_ms: u32,
+    request_start: Instant,
+    cache_status: String,
+    capacity: i64,
+    term_period: Option<String>,
+    key_term_period: Option<String>,
+    in_cost_rate: f64,
+    out_cost_rate: f64,
+    modality_cost: f64,
+    energy_slots: i64,
+}
+
+impl StreamAccounting {
+    fn monitor(
+        &self,
+        policy: Option<&obleth_config::GuardrailsPolicy>,
+        monitor: Option<crate::output_monitor::OutputMonitor>,
+    ) {
+        if let (Some(policy), Some(monitor)) = (policy, monitor) {
+            match monitor.finish() {
+                Ok(completion) => crate::boons::guardrails::monitor_output(
+                    &self.state,
+                    &self.state.boons.settings().guardrails,
+                    policy,
+                    &self.resolved,
+                    &self.meta.session_id,
+                    self.request_id,
+                    &completion,
+                ),
+                Err(reason) => {
+                    tracing::warn!(request_id = %self.request_id, reason, "output monitoring skipped")
+                }
+            }
+        }
+    }
+
+    fn cancellation_guard(&self) -> crate::completion::CompletionGuard {
+        let accounting = self.clone();
+        crate::completion::CompletionGuard::new(move || {
+            let tokens = (
+                accounting.est.input_tokens,
+                accounting.est.estimated_output_tokens,
+            );
+            let elapsed = accounting.request_start.elapsed().as_millis() as u32;
+            // No final usage was delivered. Keep the estimate explicit through
+            // status 499; never cache a partial answer. Runtime shutdown remains
+            // best-effort, just like the existing asynchronous telemetry sink.
+            tokio::spawn(accounting.settle(tokens, 0, elapsed, 499, None));
+        })
+    }
+
+    async fn settle(
+        self,
+        tokens: (u32, u32),
+        ttft_ms: u32,
+        total_ms: u32,
+        status_code: u16,
+        cache_put: Option<(String, i64, String, String)>,
+    ) {
+        let cache_enabled = cache_put.is_some();
+        let (key, ttl, content_type, body) = cache_put.unwrap_or_default();
+        settle_request(
+            &self.state,
+            self.request_id,
+            &self.resolved,
+            &self.meta,
+            &self.model,
+            self.admission,
+            self.est,
+            tokens.0,
+            tokens.1,
+            self.queue_wait_ms,
+            ttft_ms,
+            total_ms,
+            status_code,
+            &self.cache_status,
+            self.capacity,
+            self.term_period.as_deref(),
+            self.key_term_period.as_deref(),
+            self.in_cost_rate,
+            self.out_cost_rate,
+            self.modality_cost,
+            self.energy_slots,
+            cache_enabled.then_some((key.as_str(), ttl, content_type.as_str(), body)),
+        )
+        .await;
+    }
 }
 
 /// End-of-request bookkeeping shared by the streaming pass-through path and
@@ -3176,9 +3242,8 @@ mod tests {
         // The handler rejects a request when it resolved to no registered model
         // (route None), the path is not a recognized OpenAI endpoint, and it is
         // not a model-discovery endpoint. These predicates encode that rule.
-        let is_unmapped = |path: &str| {
-            request_type_for_path(path) == "other" && !is_models_endpoint(path)
-        };
+        let is_unmapped =
+            |path: &str| request_type_for_path(path) == "other" && !is_models_endpoint(path);
 
         // Stray probes / scans -> unmapped -> rejected instead of forwarded.
         assert!(is_unmapped("/props"));

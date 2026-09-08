@@ -18,6 +18,16 @@ Point your clients at obleth and register your models. The gateway adds identity
 
 The design keeps the request path independent of everything that can fail around it: the data plane reads configuration only from Redis and in-process caches (never Postgres), telemetry is written asynchronously and spills to a local WAL if ClickHouse is down, and optional helpers fail open. A Postgres, ClickHouse, or sidecar outage degrades freshness or accounting — never request serving.
 
+Telemetry spill is stored beside `OBLETH_WAL_PATH` in a `.segments` directory;
+persist that directory together with the original WAL when configuring volumes.
+Replay reads at most 500 records / 1 MiB per batch and backs off up to 60 seconds
+after failures. New spill is capped at 256 MiB or 1,024 files; rejected spill is
+logged and counted in `obleth_telemetry_dropped`. Existing WAL files are replayed
+first and are never truncated to enforce the cap. Corrupt or oversized legacy
+records are retained with an error for operator repair; they do not prevent new
+usage from being inserted when ClickHouse is healthy. Replay is at-least-once:
+a crash after insertion but before checkpointing can duplicate the last batch.
+
 ## Scheduling and routing
 
 **Weighted fairshare admission.** A purpose-built weighted fair-queuing scheduler controls admission. Each tenant has a weight; when demand exceeds capacity, throughput divides proportionally, so no tenant can starve another. Tenants can be organized into groups — capacity splits between groups first, then among tenants within each group. Weights and group assignments update live, with no restart.
