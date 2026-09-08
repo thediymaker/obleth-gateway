@@ -1,8 +1,11 @@
 # Build context: control-plane/
 FROM node:22-slim AS deps
 WORKDIR /app
-COPY package.json ./
-RUN npm install --no-audit --no-fund
+# Install from the lockfile: reproducible, and it matches what CI runs. Without
+# package-lock.json the deps stage re-resolves every floating range against the
+# live registry, which both drifts from CI and can trip npm's tree builder.
+COPY package.json package-lock.json ./
+RUN npm ci --no-audit --no-fund
 
 FROM node:22-slim AS builder
 WORKDIR /app
