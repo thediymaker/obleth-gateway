@@ -4,6 +4,13 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## Unreleased
+
+- **Disconnected streams remain accounted for.** Client cancellation records a 499 usage entry and reconciles budgets using the admission estimate when final usage is unavailable. Completion bookkeeping continues if the client disconnects during settlement.
+- **Streaming output monitoring works across token boundaries.** Log-only guardrails decode SSE content and reasoning, including streamed tool-loop responses, with bounded buffers and explicit warnings when scanning is skipped.
+- **Telemetry recovery uses bounded memory and disk.** Spill segments replay in checkpointed batches with retry backoff. New spill stops at 256 MiB or 1,024 files, with errors and dropped-record counters when storage is exhausted. Existing WAL files remain readable.
+- **Routing preserves known health during refresh failures.** A failed health query no longer re-enables unhealthy models or models under maintenance.
+
 ## v0.9.6
 
 A faster, tidier dashboard: the overview leads with what needs attention, heavy pages load lighter, and destructive actions confirm consistently.
