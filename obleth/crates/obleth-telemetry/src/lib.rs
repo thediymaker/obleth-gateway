@@ -13,7 +13,7 @@ use std::time::Duration;
 use clickhouse::{Client, Row};
 use obleth_config::UsageRecord;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
+mod wal;
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
@@ -26,6 +26,8 @@ pub enum TelemetryError {
     Click(#[from] clickhouse::error::Error),
     #[error("invalid clickhouse database name: {0:?}")]
     InvalidDatabase(String),
+    #[error("clickhouse insert timed out")]
+    InsertTimeout,
 }
 
 /// Borrowed ClickHouse row mirror of [`UsageRecord`], so a batch insert
@@ -171,7 +173,9 @@ impl TelemetrySink {
         let stats = Arc::new(TelemetryStats::default());
         let flusher = Flusher {
             client: client.clone(),
-            wal_path: wal_path.to_string(),
+            wal: wal::Wal::new(wal_path),
+            backoff: Backoff::default(),
+            replay_backoff: Backoff::default(),
             fail_open,
             stats: stats.clone(),
         };
@@ -214,15 +218,18 @@ impl TelemetrySink {
 
 struct Flusher {
     client: Client,
-    wal_path: String,
+    wal: wal::Wal,
+    backoff: Backoff,
+    replay_backoff: Backoff,
     fail_open: bool,
     stats: Arc<TelemetryStats>,
 }
 
 impl Flusher {
-    async fn run(self, mut rx: mpsc::Receiver<UsageRecord>) {
+    async fn run(mut self, mut rx: mpsc::Receiver<UsageRecord>) {
         let mut buf: Vec<UsageRecord> = Vec::with_capacity(BATCH_MAX);
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 maybe = rx.recv() => {
@@ -247,77 +254,128 @@ impl Flusher {
         }
     }
 
-    async fn flush(&self, buf: &mut Vec<UsageRecord>) {
+    async fn flush(&mut self, buf: &mut Vec<UsageRecord>) {
         if buf.is_empty() {
             return;
         }
-        let batch = std::mem::take(buf);
+        let mut batch = std::mem::take(buf);
+        if !self.backoff.ready() {
+            if self.fail_open {
+                self.write_wal(&batch).await;
+            } else {
+                self.stats
+                    .dropped
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+            }
+            batch.clear();
+            *buf = batch;
+            return;
+        }
         match self.insert(&batch).await {
-            Ok(()) => {}
+            Ok(()) => self.backoff.reset(),
             Err(e) => {
+                self.backoff.fail();
                 tracing::warn!(error = %e, count = batch.len(), "clickhouse insert failed");
                 if self.fail_open {
                     self.write_wal(&batch).await;
+                } else {
+                    self.stats
+                        .dropped
+                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
                 }
             }
         }
+        batch.clear();
+        *buf = batch;
     }
 
     async fn insert(&self, batch: &[UsageRecord]) -> Result<(), TelemetryError> {
-        let mut insert = self.client.insert("usage")?;
-        for rec in batch {
-            insert.write(&UsageRow::from(rec)).await?;
-        }
-        insert.end().await?;
-        Ok(())
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut insert = self.client.insert("usage")?;
+            for rec in batch {
+                insert.write(&UsageRow::from(rec)).await?;
+            }
+            insert.end().await?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| TelemetryError::InsertTimeout)?
     }
 
     async fn write_wal(&self, batch: &[UsageRecord]) {
-        let mut lines = String::new();
-        for rec in batch {
-            if let Ok(json) = serde_json::to_string(rec) {
-                lines.push_str(&json);
-                lines.push('\n');
-            }
-        }
-        let res = async {
-            let mut f = tokio::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.wal_path)
-                .await?;
-            f.write_all(lines.as_bytes()).await?;
-            f.flush().await
-        }
-        .await;
-        match res {
+        match self.wal.append(batch).await {
             Ok(()) => {
                 self.stats
                     .waled
                     .fetch_add(batch.len() as u64, Ordering::Relaxed);
             }
-            Err(e) => tracing::error!(error = %e, "failed to write telemetry WAL"),
+            Err(e) => {
+                self.stats
+                    .dropped
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                tracing::error!(error = %e, count = batch.len(), "telemetry WAL spill failed; records dropped");
+            }
         }
     }
 
-    /// Best-effort replay of any WAL'd records, then truncate on success.
-    async fn replay_wal(&self) {
-        let content = match tokio::fs::read_to_string(&self.wal_path).await {
-            Ok(c) if !c.trim().is_empty() => c,
-            _ => return,
-        };
-        let batch: Vec<UsageRecord> = content
-            .lines()
-            .filter_map(|l| serde_json::from_str(l).ok())
-            .collect();
-        if batch.is_empty() {
-            let _ = tokio::fs::remove_file(&self.wal_path).await;
+    async fn replay_wal(&mut self) {
+        if !self.backoff.ready() || !self.replay_backoff.ready() {
             return;
         }
-        if self.insert(&batch).await.is_ok() {
-            let _ = tokio::fs::remove_file(&self.wal_path).await;
-            tracing::info!(count = batch.len(), "replayed telemetry WAL");
+        let batch = match self.wal.next_batch().await {
+            Ok(Some(batch)) => batch,
+            Ok(None) => return,
+            Err(e) => {
+                self.replay_backoff.fail();
+                tracing::error!(error = %e, "telemetry WAL read failed; retaining spill");
+                return;
+            }
+        };
+        if !batch.records.is_empty() {
+            if let Err(e) = self.insert(&batch.records).await {
+                self.backoff.fail();
+                tracing::warn!(error = %e, "telemetry WAL replay failed");
+                return;
+            }
         }
+        match self.wal.commit(&batch).await {
+            Ok(()) => {
+                self.backoff.reset();
+                self.replay_backoff.reset();
+                tracing::info!(count = batch.records.len(), "replayed telemetry WAL batch");
+            }
+            Err(e) => {
+                self.replay_backoff.fail();
+                tracing::error!(error = %e, "telemetry WAL checkpoint failed; batch may replay again");
+            }
+        }
+    }
+}
+
+struct Backoff {
+    next: tokio::time::Instant,
+    delay: Duration,
+}
+
+impl Default for Backoff {
+    fn default() -> Self {
+        Self {
+            next: tokio::time::Instant::now(),
+            delay: Duration::from_secs(1),
+        }
+    }
+}
+
+impl Backoff {
+    fn ready(&self) -> bool {
+        tokio::time::Instant::now() >= self.next
+    }
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+    fn fail(&mut self) {
+        self.next = tokio::time::Instant::now() + self.delay;
+        self.delay = (self.delay * 2).min(Duration::from_secs(60));
     }
 }
 
@@ -660,6 +718,19 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
 #[cfg(test)]
 mod conv_tests {
     use super::*;
+    #[test]
+    fn replay_backoff_grows_to_one_minute_and_resets() {
+        let mut backoff = Backoff::default();
+        assert!(backoff.ready());
+        for _ in 0..10 {
+            backoff.fail();
+        }
+        assert!(!backoff.ready());
+        assert_eq!(backoff.delay, Duration::from_secs(60));
+        backoff.reset();
+        assert!(backoff.ready());
+        assert_eq!(backoff.delay, Duration::from_secs(1));
+    }
     #[test]
     fn usage_row_mirrors_session_source() {
         let rec = UsageRecord {
