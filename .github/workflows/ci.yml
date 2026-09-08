@@ -95,7 +95,9 @@ jobs:
         with:
           node-version: 22
       - working-directory: control-plane
-        run: npm install --no-audit --no-fund
+        run: npm ci --no-audit --no-fund
+      - working-directory: control-plane
+        run: npm test
       - working-directory: control-plane
         run: npm run build
 

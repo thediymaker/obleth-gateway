@@ -1,3 +1,7 @@
+# =============================================================
+# Build output & dependencies
+# =============================================================
+
 # ---- Rust ----
 **/target/
 **/*.rs.bk
@@ -17,30 +21,57 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# ---- obleth runtime / bench artifacts ----
-*.wal
-/obleth-telemetry.wal
-/bench/*.log
-/bench/.keys.json
-/bench/.run-meta.json
-/bench/.fairshare-samples.jsonl
+# ---- Python (compressor sidecar) ----
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
 
-# ---- internal planning (canonical plan lives in .cursor/plans) ----
-/plan.md
-docs/superpowers
-.claude
-.superpowers
+# =============================================================
+# Secrets & per-machine configuration
+# =============================================================
 
 # ---- env / secrets ----
 .env
 .env.*
 !.env.example
 
-# ---- local per-machine compose overrides (may contain cluster node IPs) ----
+# ---- local compose overrides (may contain cluster node IPs) ----
 docker-compose.override.yml
 docker-compose.override.yaml
+deploy/docker/docker-compose.override.yml
 
-# ---- editor / OS ----
+# =============================================================
+# Runtime & local artifacts
+# =============================================================
+
+# ---- telemetry WAL ----
+*.wal
+*.wal.segments/
+/obleth-telemetry.wal
+
+# ---- bench harness state ----
+/bench/*.log
+/bench/.keys.json
+/bench/.run-meta.json
+/bench/.fairshare-samples.jsonl
+
+# =============================================================
+# Local-only tooling, planning & scratch
+# =============================================================
+
+/plan.md
+/asset-tools
+docs/superpowers
+.agents
+.claude
+.codex
+.superpowers
+
+# =============================================================
+# Editor / OS
+# =============================================================
+
 .DS_Store
 Thumbs.db
 .idea/
@@ -48,13 +79,3 @@ Thumbs.db
 *.swp
 *.swo
 *~
-
-deploy/docker/docker-compose.override.yml
-
-obench/.obench.json
-
-/asset-tools
-
-# ---- compressor sidecar ----
-compressor/.venv/
-compressor/**/__pycache__/
