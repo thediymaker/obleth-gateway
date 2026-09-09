@@ -1,7 +1,7 @@
 "use client";
 
 import { useMemo, useRef, useState, useTransition, type ReactNode } from "react";
-import { CalendarClock, Check, Info, Plus, RefreshCw, X } from "lucide-react";
+import { CalendarClock, Check, ChevronLeft, ChevronRight, Info, Plus, RefreshCw, X } from "lucide-react";
 import { createTenantAction } from "@/app/actions";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -13,6 +13,14 @@ import { cn } from "@/lib/utils";
 
 const DAY_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 const BUDGET_PERIODS = ["lifetime", "monthly", "term"] as const;
+const SECTIONS = [
+  { id: "profile", label: "Basics", detail: "Name and ownership" },
+  { id: "controls", label: "Traffic limits", detail: "Priority and capacity" },
+  { id: "schedule", label: "Schedule", detail: "When access is allowed" },
+  { id: "budget", label: "Budgets", detail: "Token and spending caps" },
+  { id: "models", label: "Models", detail: "Allowed models" },
+  { id: "lifecycle", label: "Status", detail: "Initial access state" },
+];
 const STATUS_OPTIONS = ["active", "suspended", "archived"] as const;
 
 export function CreateTenant({
@@ -26,6 +34,8 @@ export function CreateTenant({
   onCreated?: () => void;
   className?: string;
 }) {
+  const [section, setSection] = useState("profile");
+  const sectionIndex = SECTIONS.findIndex((item) => item.id === section);
   const formRef = useRef<HTMLFormElement>(null);
   const [pending, start] = useTransition();
   const [error, setError] = useState<string | null>(null);
@@ -71,18 +81,28 @@ export function CreateTenant({
   return (
     <form
       ref={formRef}
-      action={(fd) =>
+      noValidate
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (pending) return;
+        const form = event.currentTarget;
+        const invalid = form.querySelector<HTMLInputElement>("input:invalid, select:invalid, textarea:invalid");
+        if (invalid) {
+          const panel = invalid.closest<HTMLElement>("[data-section]");
+          if (panel?.dataset.section) setSection(panel.dataset.section);
+          requestAnimationFrame(() => { invalid.focus(); invalid.reportValidity(); });
+          return;
+        }
+        const fd = new FormData(form);
         start(async () => {
           setError(null);
-          const result = await createTenantAction(fd);
-          if (result.ok) {
-            resetLocalState();
-            onCreated?.();
-          } else {
-            setError(result.error);
-          }
-        })
-      }
+          try {
+            const result = await createTenantAction(fd);
+            if (result.ok) { resetLocalState(); setSection("profile"); onCreated?.(); }
+            else setError(result.error);
+          } catch { setError("Could not create the tenant. Your draft is still here; please try again."); }
+        });
+      }}
       className={cn("flex min-h-0 flex-col", className)}
     >
       <input type="hidden" name="status" value={status} />
@@ -93,17 +113,16 @@ export function CreateTenant({
         <input key={model} type="hidden" name="allowed_models" value={model} />
       ))}
 
-      <Tabs defaultValue="profile" className="flex min-h-0 flex-1 flex-col">
-        <TabsList className="h-auto flex-wrap justify-start">
-          <TabsTrigger value="profile">Profile</TabsTrigger>
-          <TabsTrigger value="controls">Controls</TabsTrigger>
-          <TabsTrigger value="schedule">Access</TabsTrigger>
-          <TabsTrigger value="budget">Budgets</TabsTrigger>
-          <TabsTrigger value="models">Models</TabsTrigger>
-          <TabsTrigger value="lifecycle">Lifecycle</TabsTrigger>
+      <p className="mb-4 text-sm text-muted-foreground">Start with a name. Limits, schedules, and model restrictions are optional.</p>
+      <fieldset disabled={pending} className="flex min-h-0 flex-1 flex-col">
+      <Tabs value={section} onValueChange={setSection} className="grid min-h-0 flex-1 grid-rows-[auto_minmax(0,1fr)] gap-4 md:grid-cols-[11rem_minmax(0,1fr)] md:grid-rows-1">
+        <TabsList aria-label="Tenant setup sections" className="h-auto justify-start overflow-x-auto md:flex-col md:items-stretch md:justify-start md:self-start md:p-1">
+          {SECTIONS.map((item) => <TabsTrigger key={item.id} value={item.id} className="justify-start px-3 py-2.5 text-left">
+            <span><span className="block">{item.label}</span><span className="mt-0.5 hidden text-[11px] font-normal text-muted-foreground md:block">{item.detail}</span></span>
+          </TabsTrigger>)}
         </TabsList>
 
-        <TabsContent value="profile" className="min-h-0 flex-1 overflow-y-auto pr-1">
+        <TabsContent value="profile" data-section="profile" forceMount className="mt-0 min-h-0 overflow-y-auto pr-1 data-[state=inactive]:hidden">
           <PanelCard title="Profile" description="Human-readable ownership details.">
             <div className="grid gap-x-4 gap-y-3 p-4 md:grid-cols-2">
               <Field label="Name" id="tenant-name" name="name" required placeholder="chatbot" />
@@ -132,7 +151,7 @@ export function CreateTenant({
           </PanelCard>
         </TabsContent>
 
-        <TabsContent value="controls" className="min-h-0 flex-1 overflow-y-auto pr-1">
+        <TabsContent value="controls" data-section="controls" forceMount className="mt-0 min-h-0 overflow-y-auto pr-1 data-[state=inactive]:hidden">
           <PanelCard title="Traffic controls" description="Optional tuning knobs. Leave caps blank for unlimited.">
             <div className="grid gap-x-4 gap-y-3 p-4 md:grid-cols-2">
               <Field label="Fairshare group" id="tenant-group" name="fairshare_group" placeholder="default" />
@@ -194,7 +213,7 @@ export function CreateTenant({
           </PanelCard>
         </TabsContent>
 
-        <TabsContent value="schedule" className="min-h-0 flex-1 overflow-y-auto pr-1">
+        <TabsContent value="schedule" data-section="schedule" forceMount className="mt-0 min-h-0 overflow-y-auto pr-1 data-[state=inactive]:hidden">
           <PanelCard title="Access schedule" description="Optional date range and weekly local windows.">
             <div className="space-y-4 p-4">
               <div className="grid gap-4 md:grid-cols-3">
@@ -245,7 +264,7 @@ export function CreateTenant({
           </PanelCard>
         </TabsContent>
 
-        <TabsContent value="budget" className="min-h-0 flex-1 overflow-y-auto pr-1">
+        <TabsContent value="budget" data-section="budget" forceMount className="mt-0 min-h-0 overflow-y-auto pr-1 data-[state=inactive]:hidden">
           <PanelCard title="Cumulative budget caps" description="Optional token or dollar ceilings.">
             <div className="grid gap-x-4 gap-y-3 p-4 md:grid-cols-3">
               <Field label="Token cap" id="tenant-budget-tokens" name="budget_tokens" type="number" min={0} placeholder="unlimited" />
@@ -277,7 +296,7 @@ export function CreateTenant({
           </PanelCard>
         </TabsContent>
 
-        <TabsContent value="models" className="min-h-0 flex-1 overflow-y-auto pr-1">
+        <TabsContent value="models" data-section="models" forceMount className="mt-0 min-h-0 overflow-y-auto pr-1 data-[state=inactive]:hidden">
           <PanelCard title="Model allowlist" description="Leave empty to allow every registered model.">
             <div className="p-4">
               {models.length === 0 ? (
@@ -291,6 +310,7 @@ export function CreateTenant({
                         key={model}
                         type="button"
                         onClick={() => toggleModel(model)}
+                        aria-pressed={on}
                         className={cn(
                           "inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1 text-xs transition-colors",
                           on
@@ -309,7 +329,7 @@ export function CreateTenant({
           </PanelCard>
         </TabsContent>
 
-        <TabsContent value="lifecycle" className="min-h-0 flex-1 overflow-y-auto pr-1">
+        <TabsContent value="lifecycle" data-section="lifecycle" forceMount className="mt-0 min-h-0 overflow-y-auto pr-1 data-[state=inactive]:hidden">
           <PanelCard title="Lifecycle" description="Initial tenant admission state.">
             <div className="flex flex-wrap gap-2 p-4">
               {STATUS_OPTIONS.map((option) => (
@@ -317,6 +337,7 @@ export function CreateTenant({
                   key={option}
                   type="button"
                   onClick={() => setStatus(option)}
+                  aria-pressed={status === option}
                   className={cn(
                     "inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium transition-colors",
                     status === option
@@ -332,14 +353,19 @@ export function CreateTenant({
           </PanelCard>
         </TabsContent>
       </Tabs>
+      </fieldset>
 
       {error && (
-        <div className="mt-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+        <div role="alert" className="mt-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
           {error}
         </div>
       )}
 
-      <div className="mt-4 flex shrink-0 justify-end">
+      <div className="mt-4 flex shrink-0 items-center justify-between gap-3 border-t border-border pt-4">
+        <div className="flex items-center gap-1">
+          <Button type="button" variant="ghost" disabled={pending || sectionIndex === 0} onClick={() => setSection(SECTIONS[sectionIndex - 1].id)}><ChevronLeft className="h-4 w-4" />Back</Button>
+          <Button type="button" variant="ghost" disabled={pending || sectionIndex === SECTIONS.length - 1} onClick={() => setSection(SECTIONS[sectionIndex + 1].id)}>Next<ChevronRight className="h-4 w-4" /></Button>
+        </div>
         <Button type="submit" disabled={pending}>
           {pending ? (
             <RefreshCw className="h-3.5 w-3.5 animate-spin" aria-hidden />
