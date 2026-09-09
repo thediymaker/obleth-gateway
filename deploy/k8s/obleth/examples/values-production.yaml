@@ -12,8 +12,9 @@
 #                      cold-start latency spikes.
 #   * Secrets are sourced from PRE-CREATED Kubernetes Secrets (existingSecret),
 #     so real credentials never touch values files, git, or --set/CLI history.
-#   * The data plane runs ≥3 replicas, spread across nodes (anti-affinity),
-#     autoscaled (HPA), and protected by a PodDisruptionBudget.
+#   * The data plane runs 3 replicas, spread across nodes (anti-affinity) and
+#     protected by a PodDisruptionBudget, with the concurrency ceiling divided
+#     across them (fairshare admission is per-process — see obleth below).
 #
 # -----------------------------------------------------------------------------
 # 1. Create the Secrets out-of-band (example — use your secrets manager / SOPS /
@@ -45,7 +46,13 @@
 # -----------------------------------------------------------------------------
 
 obleth:
+  # Three replicas for redundancy. Fairshare admission state is per-process, so
+  # each replica enforces globalMaxInFlight independently and the ceiling that
+  # reaches the upstream is replicas x globalMaxInFlight. Divide it by the
+  # replica count to keep the aggregate at the intended 256. Replicas cannot
+  # lend each other idle capacity, so a quiet pod's 85 slots go unused.
   replicas: 3
+  globalMaxInFlight: 85
   # All credentials come from the pre-created Secret above; no secret values are
   # set inline. The Secret MUST contain every key listed in step 1.
   existingSecret: obleth-secrets
@@ -82,9 +89,15 @@ clickhouse:
 benchmarkBackend:
   enabled: false
 
-# Stateless data plane: spread, autoscale, and protect against disruptions.
+# Stateless data plane: spread across nodes and protected against disruptions.
+#
+# Autoscaling is off because the replica count is load-bearing here:
+# globalMaxInFlight is divided by it above, so a replica count that moves on its
+# own moves the aggregate concurrency limit reaching the upstream. To autoscale
+# anyway, divide globalMaxInFlight by maxReplicas instead (256/20 = 12) and
+# accept that the upstream is under-subscribed below full scale-out.
 hpa:
-  enabled: true
+  enabled: false
   minReplicas: 3
   maxReplicas: 20
   targetCPUUtilizationPercentage: 70

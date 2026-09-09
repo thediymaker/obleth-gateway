@@ -21,7 +21,11 @@
 #     --set obleth.encryptionKey="$(openssl rand -base64 32)"
 
 obleth:
+  # Fairshare admission is per-process: each replica enforces globalMaxInFlight
+  # on its own, so divide the intended aggregate ceiling (256) by the replica
+  # count. Replicas cannot lend each other idle capacity.
   replicas: 3
+  globalMaxInFlight: 85
   adminToken: ""        # REQUIRED
   encryptionKey: ""     # recommended — base64 of 32 bytes
   upstreamBaseUrl: "https://my-vllm-or-aibrix-endpoint/v1"

@@ -19,7 +19,11 @@
 #     --set controlPlane.dashboardSessionSecret="$(openssl rand -hex 32)"
 
 obleth:
-  replicas: 3
+  # One replica keeps globalMaxInFlight meaningful: fairshare admission is
+  # per-process, so each replica enforces the ceiling independently. This
+  # profile targets durability, not redundancy — for the latter, raise this and
+  # divide globalMaxInFlight by the same number (see values-production.yaml).
+  replicas: 1
   adminToken: ""        # REQUIRED — set via --set or a Secret
   encryptionKey: ""     # recommended — base64 of 32 bytes
   # Point at your real inference upstream; leave benchmarkBackend enabled only
