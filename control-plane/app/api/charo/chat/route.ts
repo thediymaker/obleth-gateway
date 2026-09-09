@@ -1,5 +1,6 @@
 import { NextRequest } from "next/server";
-import { getSession } from "@/lib/auth/session";
+import { guardAdmin } from "@/lib/auth/guard";
+import { chatRequestSchema } from "@/lib/charo/chat-request";
 import { gatewayChat, gatewayImages, type ChatMessage } from "@/lib/charo/gateway";
 import { imageUrls, promptFromMessages } from "@/lib/charo/images";
 import { assembleTrace, type TraceSummary } from "@/lib/charo/trace";
@@ -80,35 +81,22 @@ async function fetchTrace(requestId: string): Promise<TraceSummary | null> {
   return null;
 }
 
-interface ChatRequestBody {
-  model?: string;
-  messages?: ChatMessage[];
-  /** When true, relay the model raw — do not prepend Charo's persona. */
-  bare?: boolean;
-}
-
 export async function POST(req: NextRequest) {
-  if (!(await getSession())) {
-    return new Response("unauthorized", { status: 401 });
-  }
-
-  let body: ChatRequestBody;
-  try {
-    body = (await req.json()) as ChatRequestBody;
-  } catch {
-    return new Response("invalid JSON body", { status: 400 });
-  }
-
-  const model = body.model?.trim();
-  const messages = body.messages;
-  if (!model || !Array.isArray(messages) || messages.length === 0) {
-    return new Response("model and messages are required", { status: 400 });
-  }
+  const denied = await guardAdmin();
+  if (denied) return denied;
+  let input: unknown;
+  try { input = await req.json(); } catch { return new Response("invalid JSON body", { status: 400 }); }
+  const validated = chatRequestSchema.safeParse(input);
+  if (!validated.success) return Response.json({ error: validated.error.issues[0]?.message ?? "invalid request" }, { status: 400 });
+  const body = validated.data;
+  const { model, messages, generation } = body;
 
   // Prepend the persona unless the caller already supplied a system message or bare mode.
   const hasSystem = messages.some((m) => m.role === "system");
   const outgoing: ChatMessage[] =
-    body.bare || hasSystem ? messages : [{ role: "system", content: CHARO_PERSONA }, ...messages];
+    generation?.systemPrompt
+      ? [{ role: "system", content: generation.systemPrompt }, ...messages.filter((m) => m.role !== "system")]
+      : body.bare || hasSystem ? messages : [{ role: "system", content: CHARO_PERSONA }, ...messages];
 
   // The endpoint follows the model's modality: image models serve
   // /v1/images/generations, so a chat-completions POST would just 404 upstream.
@@ -128,6 +116,15 @@ export async function POST(req: NextRequest) {
           clientGone = true;
         }
       };
+      const started = performance.now();
+      let ttftMs: number | undefined;
+      let inputTokens: number | undefined;
+      let outputTokens: number | undefined;
+      const observe = (payload: unknown) => {
+        const value = payload as { usage?: { prompt_tokens?: number; completion_tokens?: number } };
+        if (typeof value?.usage?.prompt_tokens === "number") inputTokens = value.usage.prompt_tokens;
+        if (typeof value?.usage?.completion_tokens === "number") outputTokens = value.usage.completion_tokens;
+      };
 
       try {
         if (modelKind === "image") {
@@ -137,6 +134,7 @@ export async function POST(req: NextRequest) {
             req.signal,
           );
           const requestId = res.headers.get("x-obleth-request-id");
+          if (requestId) send("request", { requestId });
           const text = await res.text().catch(() => "");
           let parsed: unknown = null;
           try {
@@ -169,10 +167,11 @@ export async function POST(req: NextRequest) {
         }
 
         const res = await gatewayChat(
-          { model, messages: outgoing, stream: true },
+          { model, messages: outgoing, stream: true, stream_options: { include_usage: true }, ...(generation?.temperature !== undefined ? { temperature: generation.temperature } : {}), ...(generation?.maxTokens !== undefined ? { max_tokens: generation.maxTokens } : {}) },
           req.signal,
         );
         const requestId = res.headers.get("x-obleth-request-id");
+        if (requestId) send("request", { requestId });
 
         const contentType = res.headers.get("content-type") ?? "";
         if (!res.ok || !contentType.includes("text/event-stream")) {
@@ -187,7 +186,9 @@ export async function POST(req: NextRequest) {
             /* not JSON */
           }
           const content = messageContent(parsed);
+          observe(parsed);
           if (res.ok && content) {
+            ttftMs = performance.now() - started;
             send("token", { text: content });
           } else {
             send("error", {
@@ -205,6 +206,7 @@ export async function POST(req: NextRequest) {
             const { value, done: streamDone } = await reader.read();
             if (streamDone) break;
             buffer += decoder.decode(value, { stream: true });
+            buffer = buffer.replace(/\r\n/g, "\n");
             let sep: number;
             while ((sep = buffer.indexOf("\n\n")) !== -1) {
               const frame = buffer.slice(0, sep);
@@ -218,8 +220,10 @@ export async function POST(req: NextRequest) {
                   break;
                 }
                 try {
-                  const text = deltaText(JSON.parse(payload));
-                  if (text) send("token", { text });
+                  const parsed = JSON.parse(payload);
+                  observe(parsed);
+                  const text = deltaText(parsed);
+                  if (text) { ttftMs ??= performance.now() - started; send("token", { text }); }
                 } catch {
                   /* ignore non-JSON keep-alive frames */
                 }
@@ -228,6 +232,7 @@ export async function POST(req: NextRequest) {
           }
         }
 
+        send("metrics", { inputTokens, outputTokens, ttftMs, totalMs: performance.now() - started });
         // Best-effort, non-blocking trace receipt.
         if (requestId) {
           const trace = await fetchTrace(requestId);

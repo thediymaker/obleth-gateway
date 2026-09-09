@@ -4,7 +4,8 @@ import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
 
-export default async function LogsPage() {
+export default async function LogsPage({ searchParams }: { searchParams: Promise<{ requestId?: string }> }) {
+  const { requestId } = await searchParams;
   // Filter option metadata is loaded server-side (tenants are bounded; models
   // are a small registry). The log rows themselves stream in client-side from
   // the live, paginated feed so the page stays responsive under heavy volume.
@@ -27,7 +28,7 @@ export default async function LogsPage() {
           or pause it to filter and page back through history.
         </p>
       </div>
-      <RequestLogs tenants={tenantOptions} models={modelOptions} />
+      <RequestLogs key={requestId ?? "all"} tenants={tenantOptions} models={modelOptions} initialRequestId={requestId} />
     </div>
   );
 }

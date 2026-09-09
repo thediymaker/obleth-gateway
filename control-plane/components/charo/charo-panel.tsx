@@ -105,6 +105,9 @@ export function CharoPanel({
   onExpand,
   onCollapse,
   stream,
+  embedded = false,
+  hideComposer = false,
+  inline = false,
 }: {
   open: boolean;
   /** When true the panel renders as a large centered modal instead of the dock. */
@@ -113,6 +116,9 @@ export function CharoPanel({
   onExpand: () => void;
   onCollapse: () => void;
   stream: Stream;
+  embedded?: boolean;
+  hideComposer?: boolean;
+  inline?: boolean;
 }) {
   const { messages, busy, send, stop, reset, confirmRun, confirmCancel,
           startActivity, submitActivity, cancelActivity, activeTarget, clearTarget } = stream;
@@ -199,7 +205,7 @@ export function CharoPanel({
   const canSend = !busy && (!!text.trim() || !!image);
   const assistantBubbleClass = cn(
     "min-w-0 max-w-full rounded-[14px] rounded-bl-[4px] border border-border/70 bg-secondary/45 px-3 py-[7px] shadow-[0_1px_0_hsl(240_5%_100%/0.03)]",
-    expanded ? "sm:max-w-[82%]" : "sm:max-w-[88%]",
+    inline ? "w-full" : expanded ? "sm:max-w-[82%]" : "sm:max-w-[88%]",
   );
 
   // Shown while a file drag hovers the panel.
@@ -251,11 +257,16 @@ export function CharoPanel({
     <div
       ref={threadRef}
       className={cn(
-        "w-full flex-1 space-y-4 overflow-y-auto",
-        expanded ? "h-full px-5 py-4" : "mx-auto max-w-3xl px-4 py-3",
+        inline ? "w-full space-y-3" : "w-full flex-1 space-y-4 overflow-y-auto",
+        inline ? "p-3" : expanded ? "h-full px-5 py-4" : "mx-auto max-w-3xl px-4 py-3",
       )}
     >
-      {messages.length === 0 && (
+      {messages.length === 0 && hideComposer ? (
+        <div className="flex min-h-full flex-col items-center justify-center gap-2 px-4 text-center">
+          <p className="text-sm font-medium">A fresh perspective</p>
+          <p className="max-w-xs text-xs text-muted-foreground">Send a shared prompt below. Each model keeps its own conversation.</p>
+        </div>
+      ) : messages.length === 0 && (
         <div className="flex min-h-full flex-col items-center justify-center gap-4 px-2 py-6">
           <p className="text-[15px] font-semibold text-foreground">What can I help with?</p>
           <div className="w-full max-w-sm">
@@ -291,7 +302,7 @@ export function CharoPanel({
         }
 
         if (m.role === "assistant") {
-          const hasTrace = m.trace !== undefined || m.tracePending;
+          const hasTrace = m.trace !== undefined || m.tracePending || m.metrics || m.requestId;
           const hasLiveBench = (m.liveSteps?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0;
           const hasLiveCaps = (m.liveCapabilities?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0;
           const hasToolResults = (m.toolResults?.length ?? 0) > 0;
@@ -353,7 +364,7 @@ export function CharoPanel({
               )}
               {hasTrace && (
                 <div className="w-full">
-                  <TraceCard trace={m.trace} pending={m.tracePending} />
+                  <TraceCard trace={m.trace} pending={m.tracePending} requestId={m.requestId} metrics={m.metrics} />
                 </div>
               )}
               {m.pendingConfirm && (
@@ -422,7 +433,7 @@ export function CharoPanel({
             value={text}
             onChange={(e) => setText(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter" && !e.shiftKey) {
+              if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 if (!busy) onSend();
               }
@@ -479,6 +490,19 @@ export function CharoPanel({
       </div>
     </div>
   );
+
+  if (inline) return <>{thread}</>;
+
+  if (embedded) {
+    return (
+      <section {...dropProps} className="relative flex h-full min-h-0 flex-col overflow-hidden" aria-label={activeTarget ? `Conversation with ${activeTarget}` : "Conversation"}>
+        <style>{PANEL_CSS}</style>
+        {dropOverlay}
+        {stream.persistenceError && <p role="alert" className="px-4 py-2 text-xs text-amber-600">{stream.persistenceError}</p>}
+        {!stream.ready ? <p className="p-6 text-sm text-muted-foreground">Loading conversation…</p> : <>{targetBanner}{thread}{!hideComposer && composer}</>}
+      </section>
+    );
+  }
 
   // Expanded: large centered modal (Radix gives backdrop, focus-trap, scroll
   // lock, and Esc). Collapse returns to the dock without losing conversation or
