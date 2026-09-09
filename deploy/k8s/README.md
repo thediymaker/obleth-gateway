@@ -71,9 +71,18 @@ hardened and made redundant):
 | Profile | Datastores | Durability / HA | obleth replicas | Secrets | Use case |
 | --- | --- | --- | --- | --- | --- |
 | Ephemeral | Bundled, emptyDir | None — wiped on restart | 1 | `--set` | Demos, CI |
-| Persistent | Bundled, PVC | Survives restarts; **no backups/HA** | 3 + HPA | `--set` | Single-cluster self-host |
-| External | Yours | Whatever you operate | 3 + HPA | `--set` | Self-host w/ managed DBs |
-| Production | Yours (operator/managed) | Backups + HA + PITR (your tooling) | 3 + HPA + PDB + anti-affinity | **existingSecret** | Redundant production |
+| Persistent | Bundled, PVC | Survives restarts; **no backups/HA** | 1 | `--set` | Single-cluster self-host |
+| External | Yours | Whatever you operate | 3, ceiling divided | `--set` | Self-host w/ managed DBs |
+| Production | Yours (operator/managed) | Backups + HA + PITR (your tooling) | 3, ceiling divided + PDB + anti-affinity | **existingSecret** | Redundant production |
+
+> **Replica count is load-bearing.** Fairshare admission state lives in each
+> gateway process, so every replica enforces `obleth.globalMaxInFlight`
+> independently: N replicas admit up to N × the configured ceiling. The chart
+> therefore defaults to one replica. For redundancy, raise `obleth.replicas` and
+> divide `obleth.globalMaxInFlight` by the same number, accepting that replicas
+> cannot lend each other idle capacity. The HPA is off by default for the same
+> reason — an autoscaled replica count moves the aggregate ceiling with no
+> config change.
 
 > The bundled datastores are single plain Deployments with no replication or
 > backups — intentionally. Making them HA is the job of purpose-built operators
@@ -191,7 +200,7 @@ A self-contained demo install brings up:
 
 | Workload | Purpose |
 | --- | --- |
-| obleth (3 replicas + HPA) | Data plane, Management API, metrics |
+| obleth | Data plane, Management API, metrics |
 | control-plane | Dashboard |
 | postgres, redis, clickhouse | Bundled datastores |
 | benchmark-backend | Default upstream when no models are registered |
