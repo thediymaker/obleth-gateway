@@ -40,7 +40,7 @@ pub struct RunHandles {
 // ── shared seed → guard → capacity → make_req helper ────────────────────────
 
 struct SeededSetup {
-    make_req: Box<dyn Fn() -> ProxyRequest + Send + Sync + 'static>,
+    make_req: Box<dyn Fn(usize) -> ProxyRequest + Send + Sync + 'static>,
     plan: plan::ProfilePlan,
     profile_name: String,
     teardown: crate::admin::Teardown,
@@ -179,19 +179,17 @@ async fn build_setup(
             .collect(),
     );
 
+    let equal_tenant_load = cli.equal_tenant_load;
     let make_req = {
         let seeded_arc = seeded_arc.clone();
         let proxy_base = req_base.clone();
         let key_counts = key_counts.clone();
-        move || -> ProxyRequest {
+        move |worker: usize| -> ProxyRequest {
             let mut rng = rand::thread_rng();
-            // Pick a tenant by traffic share.
-            let tweights: Vec<u32> = seeded_arc
-                .tenants
-                .iter()
-                .map(|t| t.traffic_share.max(1))
-                .collect();
-            let ti = fleet::weighted_index(&tweights, rng.gen::<f64>());
+            // Pick a tenant: pinned one-per-worker under equal load, otherwise
+            // sampled per request by the fixture's traffic shares.
+            let shares: Vec<u32> = seeded_arc.tenants.iter().map(|t| t.traffic_share).collect();
+            let ti = fleet::tenant_for_worker(worker, &shares, equal_tenant_load, rng.gen::<f64>());
             let tenant = &seeded_arc.tenants[ti];
             if let Some(c) = key_counts.get(ti) {
                 c.fetch_add(1, Ordering::Relaxed);
@@ -321,6 +319,62 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
         });
     }
 
+    // Per-tenant fairshare sampling, on its own tick so the convergence series
+    // is fine-grained independently of the 10 s stall watchdog below.
+    let fs_interval_ms = crate::engine::fairshare::sample_interval_ms(
+        cli.fairshare_sample_ms,
+        &profile_name,
+        gateway_observable,
+    );
+    let fs_acc = Arc::new(Mutex::new(
+        crate::engine::fairshare::FairshareAccumulator::new(),
+    ));
+    let fs_sampler = (fs_interval_ms > 0).then(|| {
+        let admin_base = cli.admin_base.clone();
+        let admin_token = cli.admin_token.clone();
+        let stop = stop.clone();
+        let acc = fs_acc.clone();
+        let pname = profile_name.clone();
+        tokio::spawn(async move {
+            let a = AdminClient::new(admin_base, admin_token);
+            let dt = Duration::from_millis(fs_interval_ms);
+            let dt_s = dt.as_secs_f64();
+            let started = std::time::Instant::now();
+            let mut ticker = tokio::time::interval(dt);
+            // A slow admin response must not compress later ticks into a burst
+            // that would over-weight the occupancy integral.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            while !stop.load(Ordering::Relaxed) {
+                ticker.tick().await;
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let Ok(live) = a.fairshare_live().await else {
+                    continue;
+                };
+                let t_s = started.elapsed().as_secs_f64();
+                // Tenants the scheduler still tracks but that were deleted runs
+                // ago are dropped here rather than downstream: left in, they
+                // dilute every entitlement and bury the real rows in the series.
+                let samples: Vec<_> = live
+                    .tenant_samples()
+                    .into_iter()
+                    .filter(crate::engine::fairshare::TenantSample::is_participating)
+                    .collect();
+                if let Ok(mut acc) = acc.lock() {
+                    acc.note_config(&live.algorithm, live.max_in_flight);
+                    acc.observe(&samples, dt_s);
+                }
+                for sample in &samples {
+                    let _ = report::append_fairshare_row(&pname, t_s, sample);
+                }
+                for group in live.group_samples().iter().filter(|g| g.is_participating()) {
+                    let _ = report::append_fairshare_group_row(&pname, t_s, group);
+                }
+            }
+        })
+    });
+
     // Sample fairshare into the timeline + run the stall watchdog.
     // Watchdog: after warmup, if ≥2 consecutive 10-second ticks see zero new
     // completions while concurrency is active and the run is not winding down,
@@ -388,7 +442,7 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
     };
 
     let started = std::time::Instant::now();
-    crate::engine::load::run_closed_loop(
+    crate::engine::load::run_closed_loop_pinned(
         client,
         make_req,
         RunConfig {
@@ -402,6 +456,9 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
     .await;
     stop.store(true, Ordering::Relaxed);
     let _ = sampler.await;
+    if let Some(fs) = fs_sampler {
+        let _ = fs.await;
+    }
 
     // Tear down the synthetic models/tenants/keys we created. Runs on every exit
     // path (normal completion, stall, Ctrl-C drain) so no credentials linger.
@@ -409,11 +466,28 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
 
     // Summarize + report.
     let elapsed = started.elapsed().as_secs_f64().max(1.0);
-    let summary = stats
+    let mut summary = stats
         .lock()
         .unwrap()
         .summarize(elapsed, plan.max_error_rate);
+
+    let fs_summary = fs_acc
+        .lock()
+        .map(|acc| acc.summarize())
+        .unwrap_or_else(|e| e.into_inner().summarize());
+    if fs_summary.samples > 0 {
+        summary.verdict =
+            crate::engine::fairshare::apply_starvation_verdict(summary.verdict, &fs_summary);
+    }
+
     println!("\n{}", report::render_summary(&summary, &ui_base));
+    if fs_summary.samples > 0 {
+        println!("\n{}", report::render_fairshare(&fs_summary));
+        match report::write_fairshare_summary_csv(&profile_name, &fs_summary) {
+            Ok(p) => println!("  fairshare csv: {}", p.display()),
+            Err(e) => eprintln!("  fairshare csv unavailable: {e}"),
+        }
+    }
     report::write_meta(
         &profile_name,
         &serde_json::json!({
@@ -423,6 +497,21 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
             "p50_ttfb_ms": summary.p50_ttfb_ms, "p99_ttfb_ms": summary.p99_ttfb_ms,
             "in_tokens": summary.in_tokens, "out_tokens": summary.out_tokens,
             "verdict": match &summary.verdict { Verdict::Pass => "PASS".to_string(), Verdict::Fail(v) => format!("FAIL: {}", v.join("; ")) },
+            "fairshare": (fs_summary.samples > 0).then(|| serde_json::json!({
+                "algorithm": fs_summary.algorithm,
+                "max_in_flight": fs_summary.max_in_flight,
+                "samples": fs_summary.samples,
+                "sample_interval_ms": fs_interval_ms,
+                "jain_index": fs_summary.jain_index,
+                "starved": fs_summary.starved,
+                "tenants": fs_summary.tenants.iter().map(|t| serde_json::json!({
+                    "name": t.name, "group": t.group, "weight": t.weight,
+                    "expected_share": t.expected_share, "realized_share": t.realized_share,
+                    "share_ratio": t.share_ratio, "token_share": t.token_share,
+                    "slot_seconds": t.slot_seconds, "peak_queued": t.peak_queued,
+                    "starved": t.starved,
+                })).collect::<Vec<_>>(),
+            })),
         }),
     )?;
 
@@ -475,7 +564,8 @@ pub async fn start_run(
             warmup_s: plan.warmup_s,
         };
         tokio::spawn(async move {
-            crate::engine::load::run_closed_loop(client, make_req, cfg, stop.clone(), stats).await;
+            crate::engine::load::run_closed_loop_pinned(client, make_req, cfg, stop.clone(), stats)
+                .await;
             // Signal natural completion (duration elapsed) so watchers — like the
             // TUI dashboard — see the run is done and stop ticking.
             stop.store(true, Ordering::Relaxed);

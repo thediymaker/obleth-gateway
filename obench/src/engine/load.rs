@@ -268,6 +268,22 @@ pub async fn run_closed_loop<F>(
 ) where
     F: Fn() -> ProxyRequest + Send + Sync + 'static,
 {
+    run_closed_loop_pinned(client, move |_| make_req(), cfg, stop, stats).await
+}
+
+/// As [`run_closed_loop`], but the request builder is told which worker is
+/// asking, so callers can pin a worker to one tenant instead of re-sampling
+/// per request. Pinning is what makes per-tenant offered load independent —
+/// see [`crate::engine::fleet::tenant_for_worker`].
+pub async fn run_closed_loop_pinned<F>(
+    client: Arc<LoadClient>,
+    make_req: F,
+    cfg: RunConfig,
+    stop: Arc<AtomicBool>,
+    stats: Arc<Mutex<Stats>>,
+) where
+    F: Fn(usize) -> ProxyRequest + Send + Sync + 'static,
+{
     let make_req = Arc::new(make_req);
     let started = Instant::now();
     let warmup = Duration::from_secs(cfg.warmup_s);
@@ -278,7 +294,7 @@ pub async fn run_closed_loop<F>(
     };
 
     let mut handles = Vec::new();
-    for _ in 0..cfg.conc {
+    for worker in 0..cfg.conc {
         let client = client.clone();
         let make_req = make_req.clone();
         let stop = stop.clone();
@@ -293,7 +309,7 @@ pub async fn run_closed_loop<F>(
                         break;
                     }
                 }
-                let req = make_req();
+                let req = make_req(worker as usize);
                 let outcome = client.dispatch(&req).await;
                 if started.elapsed() >= warmup {
                     stats.lock().unwrap().record(&outcome);

@@ -84,6 +84,17 @@ pub struct Cli {
     pub capacity: Option<u32>,
     #[arg(long)]
     pub max_error_rate: Option<f64>,
+    /// Interval between per-tenant fairshare samples, in milliseconds. `0`
+    /// disables sampling. Always off for `--profile extreme`, whose purpose is
+    /// measuring gateway overhead, and for `--target live` (no admin token).
+    #[arg(long, default_value_t = 1000)]
+    pub fairshare_sample_ms: u64,
+    /// Give every tenant identical offered load, ignoring the fixture's traffic
+    /// shares. Required for a fairness measurement: with unequal shares a tenant
+    /// can under-realize because it asked for less, not because it was not
+    /// admitted, and the two are indistinguishable in the result.
+    #[arg(long)]
+    pub equal_tenant_load: bool,
     /// Path to live config for headless `--target live` (remote obleth proxy
     /// URL + tenant keys + models). The interactive TUI builds this for you.
     #[arg(long, default_value = "live.config.json", global = true)]

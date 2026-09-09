@@ -40,6 +40,195 @@ pub fn append_timeline(profile: &str, row: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+/// Append one per-tenant observation to `{profile}-fairshare.csv`, writing the
+/// header on first use. This is the plotting series for the convergence figure.
+pub fn append_fairshare_row(
+    profile: &str,
+    t_s: f64,
+    sample: &crate::engine::fairshare::TenantSample,
+) -> Result<()> {
+    const HEADER: &str = "t_s,tenant,group,weight,in_flight,queued,served_tokens,weight_share";
+    let path = out_dir().join(format!("{profile}-fairshare.csv"));
+    let need_header = std::fs::metadata(&path)
+        .map(|m| m.len() == 0)
+        .unwrap_or(true);
+    let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+    if need_header {
+        writeln!(f, "{HEADER}")?;
+    }
+    writeln!(
+        f,
+        "{:.3},{},{},{},{},{},{:.1},{:.6}",
+        t_s,
+        csv_field(&sample.name),
+        csv_field(&sample.group),
+        sample.weight,
+        sample.in_flight,
+        sample.queued,
+        sample.served_tokens,
+        sample.weight_share,
+    )?;
+    Ok(())
+}
+
+/// Append one per-group observation to `{profile}-fairshare-groups.csv`.
+pub fn append_fairshare_group_row(
+    profile: &str,
+    t_s: f64,
+    sample: &crate::engine::fairshare::GroupSample,
+) -> Result<()> {
+    const HEADER: &str =
+        "t_s,group,weight,in_flight,queued,slot_cap,borrowed,served_tokens,weight_share";
+    let path = out_dir().join(format!("{profile}-fairshare-groups.csv"));
+    let need_header = std::fs::metadata(&path)
+        .map(|m| m.len() == 0)
+        .unwrap_or(true);
+    let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+    if need_header {
+        writeln!(f, "{HEADER}")?;
+    }
+    writeln!(
+        f,
+        "{:.3},{},{},{},{},{},{},{:.1},{:.6}",
+        t_s,
+        csv_field(&sample.name),
+        sample.weight,
+        sample.in_flight,
+        sample.queued,
+        sample.slot_cap,
+        sample.borrowed,
+        sample.served_tokens,
+        sample.weight_share,
+    )?;
+    Ok(())
+}
+
+/// Write the whole-run per-tenant results to `{profile}-fairshare-summary.csv`.
+pub fn write_fairshare_summary_csv(
+    profile: &str,
+    summary: &crate::engine::fairshare::FairshareSummary,
+) -> Result<PathBuf> {
+    let path = out_dir().join(format!("{profile}-fairshare-summary.csv"));
+    let mut f = File::create(&path)?;
+    writeln!(
+        f,
+        "tenant,group,weight,slot_seconds,active_seconds,realized_share,\
+         expected_share_raw,expected_share,share_ratio,\
+         served_tokens_delta,token_share,peak_queued,backlogged_ticks,starved"
+    )?;
+    for t in summary.competed() {
+        writeln!(
+            f,
+            "{},{},{},{:.3},{:.3},{:.6},{:.6},{:.6},{:.6},{:.1},{:.6},{},{},{}",
+            csv_field(&t.name),
+            csv_field(&t.group),
+            t.weight,
+            t.slot_seconds,
+            t.active_seconds,
+            t.realized_share,
+            t.expected_share,
+            t.normalized_expected_share,
+            t.share_ratio,
+            t.served_tokens_delta,
+            t.token_share,
+            t.peak_queued,
+            t.backlogged_ticks,
+            t.starved,
+        )?;
+    }
+    Ok(path)
+}
+
+/// Quote a CSV field only when it would otherwise break the row.
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// Truncate to `w` display characters so table columns cannot drift.
+fn fit(s: &str, w: usize) -> String {
+    if s.chars().count() <= w {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(w.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+/// Render the fairshare convergence block for the terminal report.
+pub fn render_fairshare(summary: &crate::engine::fairshare::FairshareSummary) -> String {
+    let competed = summary.competed();
+    if summary.samples == 0 || competed.is_empty() {
+        return "fairshare: no fairshare samples collected".to_string();
+    }
+    let algorithm = if summary.algorithm.is_empty() {
+        "unknown"
+    } else {
+        &summary.algorithm
+    };
+    const NAME_W: usize = 20;
+    const GROUP_W: usize = 18;
+    let mut out = format!(
+        "fairshare convergence — {algorithm}, max_in_flight {}, {} samples over {:.1}s\n\
+         \u{20}\u{20}{:<NAME_W$}{:<GROUP_W$}{:>7}{:>11}{:>11}{:>8}{:>8}\n",
+        summary.max_in_flight,
+        summary.samples,
+        summary.elapsed_s,
+        "tenant",
+        "group",
+        "weight",
+        "expected",
+        "realized",
+        "ratio",
+        "peak q",
+    );
+
+    // Largest realized share first: the contended tenants are what a reader
+    // checks, and it puts any starved tenant at the bottom where it stands out.
+    let mut rows = competed;
+    rows.sort_by(|a, b| {
+        b.realized_share
+            .partial_cmp(&a.realized_share)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    for t in &rows {
+        out.push_str(&format!(
+            "\u{20}\u{20}{:<NAME_W$}{:<GROUP_W$}{:>7}{:>10.1}%{:>10.1}%{:>8.2}{:>8}\n",
+            fit(&t.name, NAME_W),
+            fit(&t.group, GROUP_W),
+            t.weight,
+            t.normalized_expected_share * 100.0,
+            t.realized_share * 100.0,
+            t.share_ratio,
+            t.peak_queued,
+        ));
+    }
+
+    let starvation = if summary.starved.is_empty() {
+        "none".to_string()
+    } else {
+        summary.starved.join(", ")
+    };
+    out.push_str(&format!(
+        "\u{20}\u{20}Jain's index (weight-normalized): {:.3} · starvation: {starvation}\n\
+         \u{20}\u{20}capacity utilization: {:.1}%{}",
+        summary.jain_index,
+        summary.utilization * 100.0,
+        // Shares only describe the scheduler when the pool is full. Below that,
+        // they describe offered load, and saying so beats a silent footnote.
+        if summary.utilization < 0.95 {
+            "  — under-saturated: shares reflect offered load, not admission"
+        } else {
+            ""
+        }
+    ));
+    out
+}
+
 pub fn render_summary(summary: &Summary, ui_base: &str) -> String {
     let verdict = match &summary.verdict {
         Verdict::Pass => "PASS — deployment stayed up and served the load".to_string(),
@@ -160,6 +349,234 @@ mod tests {
         let out = render_summary(&sum, "http://localhost:3000");
         assert!(out.contains("throughput: 10 tok/s"));
         assert!(out.contains("per-stream p50 40.0 p10 40.0 tok/s"));
+    }
+
+    // ── fairshare convergence reporting ───────────────────────────────────────
+
+    use crate::engine::fairshare::{FairshareAccumulator, TenantSample};
+
+    fn sample(name: &str, group: &str, in_flight: u64, ws: f64) -> TenantSample {
+        TenantSample {
+            name: name.into(),
+            group: group.into(),
+            weight: 100,
+            in_flight,
+            queued: 2,
+            served_tokens: 1000.0,
+            weight_share: ws,
+        }
+    }
+
+    fn two_tenant_summary() -> crate::engine::fairshare::FairshareSummary {
+        let mut acc = FairshareAccumulator::new();
+        acc.note_config("hierarchical", 8);
+        for _ in 0..10 {
+            acc.observe(
+                &[
+                    sample("chatbot", "prod", 7, 0.909),
+                    sample("api-batch", "dev", 1, 0.0909),
+                ],
+                1.0,
+            );
+        }
+        acc.summarize()
+    }
+
+    #[test]
+    fn fairshare_csv_writes_a_header_once_then_one_row_per_call() {
+        let _guard = crate::report::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("obench-fs-csv");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("BENCH_OUT_DIR", dir.to_str().unwrap());
+
+        append_fairshare_row("unit", 0.0, &sample("chatbot", "prod", 7, 0.909)).unwrap();
+        append_fairshare_row("unit", 1.0, &sample("chatbot", "prod", 6, 0.909)).unwrap();
+
+        let body = std::fs::read_to_string(out_dir().join("unit-fairshare.csv")).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 rows, got {body:?}");
+        assert_eq!(
+            lines[0],
+            "t_s,tenant,group,weight,in_flight,queued,served_tokens,weight_share"
+        );
+        assert!(lines[1].starts_with("0.000,chatbot,prod,100,7,2,"));
+        assert!(lines[2].starts_with("1.000,chatbot,prod,100,6,2,"));
+    }
+
+    #[test]
+    fn fairshare_group_csv_records_the_slot_cap_series() {
+        let _guard = crate::report::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("obench-fs-groups");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("BENCH_OUT_DIR", dir.to_str().unwrap());
+
+        let g = crate::engine::fairshare::GroupSample {
+            name: "prod".into(),
+            weight: 500,
+            in_flight: 7,
+            queued: 4,
+            slot_cap: 7,
+            borrowed: 0,
+            served_tokens: 91000.0,
+            weight_share: 0.909,
+        };
+        append_fairshare_group_row("unit", 0.0, &g).unwrap();
+        append_fairshare_group_row("unit", 1.0, &g).unwrap();
+
+        let body = std::fs::read_to_string(out_dir().join("unit-fairshare-groups.csv")).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 rows, got {body:?}");
+        assert_eq!(
+            lines[0],
+            "t_s,group,weight,in_flight,queued,slot_cap,borrowed,served_tokens,weight_share"
+        );
+        assert!(lines[1].starts_with("0.000,prod,500,7,4,7,0,"));
+    }
+
+    #[test]
+    fn fairshare_summary_csv_has_a_row_per_tenant() {
+        let _guard = crate::report::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("obench-fs-sum");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("BENCH_OUT_DIR", dir.to_str().unwrap());
+
+        let p = write_fairshare_summary_csv("unit", &two_tenant_summary()).unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 tenants");
+        assert!(lines[0].starts_with("tenant,group,weight,slot_seconds,"));
+        assert!(body.contains("api-batch"));
+        assert!(body.contains("chatbot"));
+    }
+
+    #[test]
+    fn render_fairshare_shows_expected_versus_realized_and_jain() {
+        let out = render_fairshare(&two_tenant_summary());
+        assert!(out.contains("hierarchical"), "{out}");
+        assert!(out.contains("chatbot"), "{out}");
+        // realized 7/8 against an entitlement of 90.9%
+        assert!(out.contains("87.5%"), "{out}");
+        assert!(out.contains("90.9%"), "{out}");
+        assert!(out.to_lowercase().contains("jain"), "{out}");
+    }
+
+    #[test]
+    fn render_fairshare_omits_tenants_that_never_competed() {
+        let mut acc = FairshareAccumulator::new();
+        acc.note_config("hierarchical", 64);
+        for _ in 0..5 {
+            acc.observe(
+                &[
+                    sample("worker", "prod", 4, 0.5),
+                    TenantSample {
+                        in_flight: 0,
+                        queued: 0,
+                        weight_share: 0.0,
+                        ..sample("__control_plane__", "default", 0, 0.0)
+                    },
+                ],
+                1.0,
+            );
+        }
+        let out = render_fairshare(&acc.summarize());
+        assert!(out.contains("worker"), "{out}");
+        assert!(!out.contains("__control_plane__"), "{out}");
+    }
+
+    #[test]
+    fn render_fairshare_rows_stay_aligned_with_over_long_names() {
+        let mut acc = FairshareAccumulator::new();
+        acc.note_config("hierarchical", 64);
+        acc.observe(
+            &[
+                sample("a", "g", 4, 0.5),
+                sample(
+                    "a-very-long-tenant-name-that-overflows",
+                    "a-very-long-group-name",
+                    4,
+                    0.5,
+                ),
+            ],
+            1.0,
+        );
+        let out = render_fairshare(&acc.summarize());
+        let rows: Vec<&str> = out
+            .lines()
+            .filter(|l| l.starts_with("  ") && !l.contains("Jain") && !l.contains("utilization"))
+            .collect();
+        assert_eq!(rows.len(), 3, "header + 2 tenants: {out}");
+        let widths: Vec<usize> = rows.iter().map(|r| r.chars().count()).collect();
+        assert!(
+            widths.iter().all(|w| *w == widths[0]),
+            "columns misaligned: {widths:?}\n{out}"
+        );
+    }
+
+    #[test]
+    fn fairshare_summary_csv_only_includes_competing_tenants() {
+        let _guard = crate::report::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("obench-fs-filter");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("BENCH_OUT_DIR", dir.to_str().unwrap());
+
+        let mut acc = FairshareAccumulator::new();
+        acc.note_config("hierarchical", 64);
+        acc.observe(
+            &[
+                sample("worker", "prod", 4, 0.5),
+                TenantSample {
+                    in_flight: 0,
+                    queued: 0,
+                    weight_share: 0.0,
+                    ..sample("__control_plane__", "default", 0, 0.0)
+                },
+            ],
+            1.0,
+        );
+        let p = write_fairshare_summary_csv("unit", &acc.summarize()).unwrap();
+        let body = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(body.lines().count(), 2, "header + 1 competing tenant");
+        assert!(!body.contains("__control_plane__"));
+    }
+
+    #[test]
+    fn render_fairshare_reports_no_starvation_when_all_tenants_progress() {
+        let out = render_fairshare(&two_tenant_summary());
+        assert!(out.contains("starvation: none"), "{out}");
+    }
+
+    #[test]
+    fn render_fairshare_names_starved_tenants() {
+        let mut acc = FairshareAccumulator::new();
+        acc.note_config("weighted", 8);
+        for _ in 0..10 {
+            acc.observe(
+                &[
+                    TenantSample {
+                        served_tokens: 0.0,
+                        ..sample("victim", "dev", 0, 0.5)
+                    },
+                    sample("hog", "prod", 8, 0.5),
+                ],
+                1.0,
+            );
+        }
+        let out = render_fairshare(&acc.summarize());
+        assert!(out.contains("starvation: victim"), "{out}");
+    }
+
+    #[test]
+    fn render_fairshare_handles_a_run_with_no_samples() {
+        let out = render_fairshare(&FairshareAccumulator::new().summarize());
+        assert!(out.contains("no fairshare samples"), "{out}");
     }
 
     #[test]

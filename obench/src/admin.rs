@@ -32,12 +32,97 @@ pub struct ModelSpec {
     pub admission_weight: u32,
 }
 
-#[derive(Debug, Deserialize)]
+/// One tenant's row in a `/fairshare/live` response.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct TenantLive {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub fairshare_group: String,
+    #[serde(default)]
+    pub weight: i64,
+    #[serde(default)]
+    pub in_flight: u64,
+    #[serde(default)]
+    pub queued: u64,
+    #[serde(default)]
+    pub served_tokens: f64,
+    #[serde(default)]
+    pub weight_share: f64,
+}
+
+/// One fairshare group's row in a `/fairshare/live` response.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct GroupLive {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub weight: i64,
+    #[serde(default)]
+    pub in_flight: u64,
+    #[serde(default)]
+    pub queued: u64,
+    #[serde(default)]
+    pub slot_cap: u64,
+    #[serde(default)]
+    pub borrowed: u64,
+    #[serde(default)]
+    pub served_tokens: f64,
+    #[serde(default)]
+    pub weight_share: f64,
+}
+
+/// Every field defaults so a gateway on a different version degrades to partial
+/// data rather than failing the whole poll.
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct FairshareLive {
+    #[serde(default)]
+    pub algorithm: String,
+    #[serde(default)]
+    pub max_in_flight: u64,
     #[serde(default)]
     pub global_in_flight: u64,
     #[serde(default)]
     pub global_queued: u64,
+    #[serde(default)]
+    pub groups: Vec<GroupLive>,
+    #[serde(default)]
+    pub tenants: Vec<TenantLive>,
+}
+
+impl FairshareLive {
+    /// Project the tenant rows into accumulator samples.
+    pub fn tenant_samples(&self) -> Vec<crate::engine::fairshare::TenantSample> {
+        self.tenants
+            .iter()
+            .map(|t| crate::engine::fairshare::TenantSample {
+                name: t.name.clone(),
+                group: t.fairshare_group.clone(),
+                weight: t.weight,
+                in_flight: t.in_flight,
+                queued: t.queued,
+                served_tokens: t.served_tokens,
+                weight_share: t.weight_share,
+            })
+            .collect()
+    }
+
+    /// Project the group rows into accumulator samples.
+    pub fn group_samples(&self) -> Vec<crate::engine::fairshare::GroupSample> {
+        self.groups
+            .iter()
+            .map(|g| crate::engine::fairshare::GroupSample {
+                name: g.name.clone(),
+                weight: g.weight,
+                in_flight: g.in_flight,
+                queued: g.queued,
+                slot_cap: g.slot_cap,
+                borrowed: g.borrowed,
+                served_tokens: g.served_tokens,
+                weight_share: g.weight_share,
+            })
+            .collect()
+    }
 }
 
 impl AdminClient {
@@ -329,10 +414,7 @@ impl AdminClient {
         let v = self
             .req(reqwest::Method::GET, "/fairshare/live", None)
             .await?;
-        Ok(serde_json::from_value(v).unwrap_or(FairshareLive {
-            global_in_flight: 0,
-            global_queued: 0,
-        }))
+        Ok(serde_json::from_value(v).unwrap_or_default())
     }
 
     pub async fn list_model_names(&self) -> anyhow::Result<Vec<String>> {
@@ -462,4 +544,86 @@ pub async fn fetch_upstream_models(base: &str, key: &str) -> Result<Vec<String>>
         anyhow::bail!("{url} returned no models — check the base URL and key");
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Shaped exactly like `get_fairshare_live` in obleth-admin.
+    const LIVE_PAYLOAD: &str = r#"{
+        "algorithm": "hierarchical",
+        "max_in_flight": 8,
+        "global_in_flight": 8,
+        "global_queued": 12,
+        "groups": [
+            {"name":"prod","weight":500,"in_flight":7,"queued":4,"slot_cap":7,
+             "served_tokens":91000.0,"share_score":182.0,"weight_share":0.909,
+             "expected_slots":7.27},
+            {"name":"dev","weight":50,"in_flight":1,"queued":8,"slot_cap":1,
+             "served_tokens":9000.0,"share_score":180.0,"weight_share":0.0909,
+             "expected_slots":0.73}
+        ],
+        "tenants": [
+            {"tenant_id":"11111111-1111-1111-1111-111111111111","name":"chatbot",
+             "fairshare_group":"prod","weight":500,"in_flight":7,"queued":4,
+             "served_tokens":91000.0,"share_score":182.0,"weight_share":0.909,
+             "expected_slots":7.27},
+            {"tenant_id":"22222222-2222-2222-2222-222222222222","name":"api-batch",
+             "fairshare_group":"dev","weight":50,"in_flight":1,"queued":8,
+             "served_tokens":9000.0,"share_score":180.0,"weight_share":0.0909,
+             "expected_slots":0.73}
+        ],
+        "model_in_flight": {"obench-base": 8},
+        "model_queued": {"obench-base": 12}
+    }"#;
+
+    #[test]
+    fn live_payload_keeps_per_tenant_rows() {
+        let live: FairshareLive = serde_json::from_str(LIVE_PAYLOAD).unwrap();
+        assert_eq!(live.algorithm, "hierarchical");
+        assert_eq!(live.max_in_flight, 8);
+        assert_eq!(live.tenants.len(), 2);
+        assert_eq!(live.groups.len(), 2);
+    }
+
+    #[test]
+    fn tenant_samples_project_every_field_the_accumulator_needs() {
+        let live: FairshareLive = serde_json::from_str(LIVE_PAYLOAD).unwrap();
+        let samples = live.tenant_samples();
+        assert_eq!(samples.len(), 2);
+        let chatbot = samples.iter().find(|s| s.name == "chatbot").unwrap();
+        assert_eq!(chatbot.group, "prod");
+        assert_eq!(chatbot.weight, 500);
+        assert_eq!(chatbot.in_flight, 7);
+        assert_eq!(chatbot.queued, 4);
+        assert!((chatbot.served_tokens - 91000.0).abs() < 1e-9);
+        assert!((chatbot.weight_share - 0.909).abs() < 1e-9);
+    }
+
+    #[test]
+    fn group_samples_carry_the_slot_cap_tenants_cannot_supply() {
+        let live: FairshareLive = serde_json::from_str(LIVE_PAYLOAD).unwrap();
+        let groups = live.group_samples();
+        assert_eq!(groups.len(), 2);
+        let prod = groups.iter().find(|g| g.name == "prod").unwrap();
+        assert_eq!(prod.slot_cap, 7);
+        assert_eq!(prod.weight, 500);
+        assert_eq!(prod.in_flight, 7);
+        let dev = groups.iter().find(|g| g.name == "dev").unwrap();
+        assert_eq!(dev.slot_cap, 1);
+        assert_eq!(dev.queued, 8);
+    }
+
+    #[test]
+    fn unknown_and_missing_fields_degrade_to_defaults() {
+        // A gateway that predates the per-tenant rows, plus a field obench
+        // does not know about: neither may fail the poll.
+        let live: FairshareLive =
+            serde_json::from_str(r#"{"global_in_flight":3,"future_field":true}"#).unwrap();
+        assert_eq!(live.global_in_flight, 3);
+        assert_eq!(live.max_in_flight, 0);
+        assert!(live.tenants.is_empty());
+        assert!(live.tenant_samples().is_empty());
+    }
 }

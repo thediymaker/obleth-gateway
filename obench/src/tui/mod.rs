@@ -1144,10 +1144,7 @@ async fn run_dashboard(
 ) -> Result<()> {
     let started = Instant::now();
     let mut last_live_refresh = Instant::now();
-    let mut live = crate::admin::FairshareLive {
-        global_in_flight: 0,
-        global_queued: 0,
-    };
+    let mut live = crate::admin::FairshareLive::default();
 
     // Destructure so we can move `handle` out after the loop.
     let crate::profiles::RunHandles {
