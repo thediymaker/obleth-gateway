@@ -38,6 +38,10 @@ pub struct GroupFairshare {
     pub in_flight: usize,
     pub queued: usize,
     pub slot_cap: usize,
+    /// Occupancy above this group's apportioned cap, i.e. slots borrowed from
+    /// siblings that were leaving capacity idle. Reported separately so a run
+    /// can show that lending fired rather than leaving it to be inferred.
+    pub borrowed: usize,
     pub served_tokens: f64,
     pub share_score: f64,
     pub weight_share: f64,
@@ -63,6 +67,9 @@ pub struct FairshareSnapshot {
     pub max_in_flight: usize,
     pub global_in_flight: usize,
     pub global_queued: usize,
+    /// Total occupancy across all groups that sits above their apportioned
+    /// caps. Zero whenever every group is inside its share.
+    pub global_borrowed: usize,
     pub groups: Vec<GroupFairshare>,
     pub tenants: Vec<TenantFairshare>,
     /// Live in-flight request count per model name. Used by the `auto` router
@@ -555,12 +562,15 @@ impl Scheduler {
                         } else {
                             0.0
                         };
+                    let in_flight = self.group_in_flight(&name);
+                    let slot_cap = group_caps.get(&name).copied().unwrap_or(0);
                     GroupFairshare {
                         name: name.clone(),
                         weight,
-                        in_flight: self.group_in_flight(&name),
+                        in_flight,
                         queued: self.group_queued(&name),
-                        slot_cap: group_caps.get(&name).copied().unwrap_or(0),
+                        slot_cap,
+                        borrowed: in_flight.saturating_sub(slot_cap),
                         served_tokens,
                         share_score,
                         weight_share,
@@ -605,10 +615,12 @@ impl Scheduler {
                     .cloned()
                     .unwrap_or_else(|| "default".into());
                 let served_tokens = self.served.get(&tenant_id).copied().unwrap_or(0.0);
-                let share_score = match self.algorithm {
-                    FairshareAlgorithm::Weighted => served_tokens / weight as f64,
-                    FairshareAlgorithm::Hierarchical => served_tokens,
-                };
+                // Weight-adjusted in both modes. Hierarchical admission ranks
+                // tenants inside the winning group on `served / weight` too
+                // (see `pick_tenant_hierarchical`), so reporting the raw token
+                // count here named the scheduler's key after a value it does
+                // not use.
+                let share_score = served_tokens / weight as f64;
                 let weight_share = match self.algorithm {
                     FairshareAlgorithm::Weighted => {
                         if total_weight > 0 {
@@ -659,6 +671,7 @@ impl Scheduler {
             max_in_flight: max,
             global_in_flight: self.in_flight,
             global_queued: self.queued_total,
+            global_borrowed: groups.iter().map(|g| g.borrowed).sum(),
             groups,
             tenants,
             model_in_flight: self.model_in_flight.clone(),
@@ -773,6 +786,9 @@ impl Scheduler {
         let mut tenant_caps_by_group: HashMap<String, HashMap<Uuid, usize>> = HashMap::new();
 
         let mut eligible: Vec<(Uuid, f64)> = Vec::new();
+        // Candidates that are over their group or tenant cap but could still be
+        // served from capacity a sibling group is leaving idle.
+        let mut borrowable: Vec<(Uuid, f64)> = Vec::new();
 
         for (tenant, queue) in &self.queues {
             if queue.is_empty() {
@@ -789,6 +805,11 @@ impl Scheduler {
                 .get(tenant)
                 .cloned()
                 .unwrap_or_else(|| waiter.group.clone());
+            let group_weight = self.group_weight.get(&group).copied().unwrap_or(100).max(1) as f64;
+            let group_score =
+                served_by_group.get(group.as_str()).copied().unwrap_or(0.0) / group_weight;
+            borrowable.push((*tenant, group_score));
+
             let cap = caps.get(&group).copied().unwrap_or(max);
             if in_flight_by_group.get(group.as_str()).copied().unwrap_or(0) >= cap {
                 continue;
@@ -802,23 +823,31 @@ impl Scheduler {
             if self.tenant_in_flight.get(tenant).copied().unwrap_or(0) >= tenant_cap {
                 continue;
             }
-            let group_weight = self.group_weight.get(&group).copied().unwrap_or(100).max(1) as f64;
-            let group_score =
-                served_by_group.get(group.as_str()).copied().unwrap_or(0.0) / group_weight;
             eligible.push((*tenant, group_score));
         }
 
-        if eligible.is_empty() {
+        // Group caps are ceilings on *contended* demand, not reservations. When
+        // nobody is within their cap but the pool still has a free slot, lend it
+        // rather than idling: the caller only calls in when `in_flight < max`.
+        // Under two-sided contention `eligible` is non-empty, so this never
+        // fires and the guaranteed split is untouched. Because permits are held
+        // for the whole stream, a lender reclaims as borrowed streams finish.
+        let pool = if eligible.is_empty() {
+            borrowable
+        } else {
+            eligible
+        };
+        if pool.is_empty() {
             return None;
         }
 
-        let min_group_score = eligible
+        let min_group_score = pool
             .iter()
             .map(|(_, score)| *score)
             .fold(f64::INFINITY, f64::min);
 
         let mut best: Option<(Uuid, f64)> = None;
-        for (tenant, group_score) in eligible {
+        for (tenant, group_score) in pool {
             if (group_score - min_group_score).abs() > f64::EPSILON && group_score > min_group_score
             {
                 continue;

@@ -6,10 +6,18 @@ workflow falls back to auto-generated notes.
 
 ## Unreleased
 
+- **Dependency security refresh.** Update dashboard packages, Rust telemetry, and benchmark dependencies; use Node 24 LTS for dashboard images and CI, and HAProxy 3.2 for the Compose edge proxy. Keep authentication on the patched 1.6 series pending its separate account migration.
+
+- **Tenant creation preserves your draft.** Moving between setup sections keeps all inputs, submits the full configuration, and retains your work after a failed request. Clearer section navigation and validation bring you to fields that need attention.
+
+- **A dedicated Playground for chat and model comparison.** Select one to four models in a shared conversation, with each question followed by independent response cards. Keep Charo’s guided tools, image support, capability checks, and benchmarks; save sessions in your browser, adjust generation settings, retry or stop responses, and continue with a chosen model.
+
 - **Disconnected streams remain accounted for.** Client cancellation records a 499 usage entry and reconciles budgets using the admission estimate when final usage is unavailable. Completion bookkeeping continues if the client disconnects during settlement.
 - **Streaming output monitoring works across token boundaries.** Log-only guardrails decode SSE content and reasoning, including streamed tool-loop responses, with bounded buffers and explicit warnings when scanning is skipped.
 - **Telemetry recovery uses bounded memory and disk.** Spill segments replay in checkpointed batches with retry backoff. New spill stops at 256 MiB or 1,024 files, with errors and dropped-record counters when storage is exhausted. Existing WAL files remain readable.
 - **Routing preserves known health during refresh failures.** A failed health query no longer re-enables unhealthy models or models under maintenance.
+- **Idle group capacity is redistributed instead of sitting unused.** Hierarchical group shares were hard ceilings: a backlogged group could not use slots a quieter group was leaving idle, so a contended gateway ran well below its concurrency limit with requests waiting. Shares now cap contended demand only, and spare capacity goes to whoever is queued. A group returning to demand reclaims its share as the borrowed requests finish. On a five-tenant benchmark this lifted utilization from 62% to 99% and throughput by roughly 60%. Weighted mode was already unaffected.
+- **Fair-share debt is weight-adjusted in every mode.** The per-tenant `share_score` on the fairshare view divided served tokens by tenant weight under the weighted algorithm but returned the raw token count under the hierarchical default, even though admission ranks tenants inside a group on the weight-adjusted value. The field now reports the score the scheduler actually uses, matching its documented definition.
 
 ## v0.9.6
 
