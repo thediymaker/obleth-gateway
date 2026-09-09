@@ -304,6 +304,84 @@ controlPlane:
     [{"providerId":"globus","displayName":"Globus","discoveryUrl":"https://auth.globus.org/.well-known/openid-configuration","clientId":"ID","clientSecret":"SECRET","scopes":["openid","email","profile"]}]
 ```
 
+### Mapping user fields from non-standard claims
+
+An optional `claims` object chooses which OIDC claim each user field is read
+from, overriding the standard claim of the same name:
+
+```yaml
+controlPlane:
+  oidcProviders: |
+    [{"providerId":"globus","displayName":"Globus",
+      "discoveryUrl":"https://auth.globus.org/.well-known/openid-configuration",
+      "clientId":"ID","clientSecret":"SECRET",
+      "scopes":["openid","email","profile"],
+      "claims":{"email":"preferred_username"}}]
+```
+
+Mappable fields are `email`, `name` and `image` — the only profile fields
+better-auth writes onto a user.
+
+**Why you will probably want this.** Institutional IdPs routinely release an
+`email` that is not the identifier the institution keys accounts on. Globus is
+a clear case: for an Arizona State University identity it sends
+
+```
+email               Johnathan.Lee@asu.edu     <- a display alias
+preferred_username  jlee379@asu.edu           <- the canonical institutional id
+```
+
+Without a mapping, obleth keys the account on the alias, so the same human
+signs in and arrives as a second, unrecognised user — and if a local admin
+already exists under the canonical address, the two never connect.
+
+To see what your IdP actually sends, decode the stored ID token rather than
+guessing:
+
+```bash
+psql "$DATABASE_URL" -At -c \
+  "select \"idToken\" from account where \"providerId\"='globus' limit 1" \
+  | cut -d. -f2 | base64 -d 2>/dev/null | python3 -m json.tool
+```
+
+A missing, empty, or non-string mapped claim falls back to the standard claim,
+so a mapping can never blank out a field the IdP did supply. An unknown field
+name is rejected with an explicit error rather than accepted and ignored.
+
+`overrideUserInfo: true` re-applies the profile (and therefore the mapping) to
+an **existing** user on every sign-in, instead of only at sign-up. Set it when
+correcting a mapping after users already exist — otherwise the fix only applies
+to accounts created from then on, and anyone who already signed in keeps the
+wrong address.
+
+> Changing `claims.email` changes the identity users are keyed on. Existing
+> accounts are **not** merged: obleth finds a returning user by the provider's
+> `sub`, so they keep their original row and (unless `overrideUserInfo` is set)
+> their original email. Linking an SSO login to a pre-existing local account
+> with the same address is a separate feature — better-auth's
+> `account.accountLinking`, which obleth does not enable, and which deserves
+> care because auto-linking on an unverified email is an account-takeover
+> vector.
+
+An optional `authentication` field selects how the client authenticates to the
+IdP's **token** endpoint: omit it for the default, which sends
+`client_id`/`client_secret` in the request body (`client_secret_post`), or set
+`"basic"` for an IdP that only accepts HTTP Basic (`client_secret_basic`).
+
+Most providers accept both regardless of what their discovery document
+advertises — Globus, for one, advertises only `client_secret_basic` but
+authenticates body credentials fine, so the example above needs no override.
+Reach for this only when a provider genuinely refuses.
+
+The symptom that points here is distinctive: the IdP login succeeds, the
+browser comes back to the dashboard, and *then* the callback errors — because
+the failure is in the server-to-server code exchange, not in anything visible
+in the browser flow. If you see that, check the provider's
+`token_endpoint_auth_methods_supported` and set `authentication` to match. Only
+`"basic"` and `"post"` are accepted; the discovery-document spellings
+(`client_secret_basic` / `client_secret_post`) are rejected with an explicit
+error rather than silently falling back to the body.
+
 Register this redirect URI with your identity provider (one per `providerId`):
 
 ```
