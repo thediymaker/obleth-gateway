@@ -1,5 +1,5 @@
 # Build context: control-plane/
-FROM node:22-slim AS deps
+FROM node:24-slim AS deps
 WORKDIR /app
 # Install from the lockfile: reproducible, and it matches what CI runs. Without
 # package-lock.json the deps stage re-resolves every floating range against the
@@ -7,13 +7,13 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci --no-audit --no-fund
 
-FROM node:22-slim AS builder
+FROM node:24-slim AS builder
 WORKDIR /app
 COPY --from=deps /app/node_modules ./node_modules
 COPY . .
 RUN npm run build
 
-FROM node:22-slim AS runner
+FROM node:24-slim AS runner
 LABEL org.opencontainers.image.source="https://github.com/thediymaker/obleth-gateway"
 WORKDIR /app
 ENV NODE_ENV=production
@@ -37,7 +37,7 @@ COPY --from=builder /app/db ./db
 # dashboard keeps serving stale data (edits appear to silently revert). Create
 # the cache dir owned by the runtime user.
 RUN mkdir -p .next/cache && chown -R 1000:1000 .next/cache
-# The node:22-slim image ships a non-root `node` user (uid 1000). Declare it
+# The node:24-slim image ships a non-root `node` user (uid 1000). Declare it
 # numerically so Kubernetes `runAsNonRoot: true` can verify the user is non-root
 # without a pinned `runAsUser` — a username can't be checked and is rejected
 # with CreateContainerConfigError.
