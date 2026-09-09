@@ -44,6 +44,7 @@ import { DestructiveConfirm } from "@/components/ui/destructive-confirm";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
+import { FormSelect } from "@/components/ui/form-select";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ApiKey, KeyUsageSummary, Tenant } from "@/lib/obleth";
 import { cn, formatCurrency, formatNumber } from "@/lib/utils";
@@ -601,7 +602,7 @@ function CreateKeyDialog({
           New key
         </Button>
       </DialogTrigger>
-      <DialogContent className="grid h-[min(680px,85vh)] max-h-[85vh] max-w-3xl grid-rows-[auto_minmax(0,1fr)] overflow-hidden">
+      <DialogContent className="grid max-h-[85vh] max-w-3xl grid-rows-[auto_minmax(0,1fr)] overflow-hidden">
         <DialogHeader>
           <DialogTitle>Create API key</DialogTitle>
           <DialogDescription>Issue a tenant-scoped key with optional per-key caps.</DialogDescription>
@@ -610,13 +611,7 @@ function CreateKeyDialog({
           <div className="min-h-0 space-y-5 overflow-y-auto pr-1">
             <div className="grid gap-4 md:grid-cols-2">
               <Field label="Tenant" htmlFor="new-key-tenant">
-                <Select id="new-key-tenant" name="tenant_id" required disabled={tenants.length === 0}>
-                  {tenants.map((t) => (
-                    <option key={t.id} value={t.id}>
-                      {t.name}
-                    </option>
-                  ))}
-                </Select>
+                <FormSelect id="new-key-tenant" name="tenant_id" required disabled={pending || tenants.length === 0} defaultValue={tenants[0]?.id} options={tenants.map((t) => ({ value: t.id, label: t.name }))} />
               </Field>
               <Field label="Key name" htmlFor="new-key-name">
                 <Input id="new-key-name" name="name" placeholder="prod-chat" required />
@@ -626,9 +621,9 @@ function CreateKeyDialog({
               <textarea
                 id="new-key-description"
                 name="description"
-                rows={4}
+                rows={3}
                 placeholder="Owner, workload, environment, or rotation notes"
-                className="min-h-24 w-full rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none transition-colors placeholder:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring"
+                className="min-h-20 w-full resize-y rounded-md border border-input bg-background px-3 py-2 text-sm shadow-sm outline-none transition-colors placeholder:text-muted-foreground focus-visible:ring-1 focus-visible:ring-ring"
               />
             </Field>
             <BudgetFields />
@@ -925,15 +920,11 @@ function BudgetFields() {
         <Field label="Token cap" htmlFor="new-key-budget-tokens">
           <Input id="new-key-budget-tokens" name="budget_tokens" type="number" min={0} step={1} placeholder="Unlimited" />
         </Field>
-        <Field label="Cost cap" htmlFor="new-key-budget-cost">
+        <Field label="Cost cap (USD)" htmlFor="new-key-budget-cost">
           <Input id="new-key-budget-cost" name="budget_cost_usd" type="number" min={0} step="0.01" placeholder="Unlimited" />
         </Field>
         <Field label="Period" htmlFor="new-key-budget-period">
-          <Select id="new-key-budget-period" name="budget_period" defaultValue="lifetime">
-            <option value="lifetime">Lifetime</option>
-            <option value="monthly">Monthly</option>
-            <option value="term">Term</option>
-          </Select>
+          <FormSelect id="new-key-budget-period" name="budget_period" defaultValue="lifetime" options={[{ value: "lifetime", label: "Lifetime" }, { value: "monthly", label: "Monthly" }, { value: "term", label: "Term" }]} />
         </Field>
       </div>
     </div>
