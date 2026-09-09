@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { getSession } from "@/lib/auth/session";
+import { guardAdmin } from "@/lib/auth/guard";
 import { assembleTrace } from "@/lib/charo/trace";
 import { obleth } from "@/lib/obleth";
 
@@ -14,9 +14,8 @@ export async function GET(
   _req: NextRequest,
   { params }: { params: Promise<{ requestId: string }> },
 ) {
-  if (!(await getSession())) {
-    return NextResponse.json({ error: "unauthorized" }, { status: 401 });
-  }
+  const denied = await guardAdmin();
+  if (denied) return denied;
   const { requestId } = await params;
   const [spans, logs] = await Promise.all([
     obleth.getRequestSpans(requestId).catch(() => []),

@@ -1,0 +1,113 @@
+"use client";
+
+import { useEffect, useState } from "react";
+import { z } from "zod";
+import { ArrowDownToLine, FlaskConical, PanelLeft, MessageSquare, Plus, SlidersHorizontal, Trash2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { generationSchema } from "@/lib/charo/chat-request";
+import { useEnabledModels } from "@/components/charo/use-enabled-models";
+import { UnifiedWorkspace } from "./workspaces";
+import { migrateLegacySessions } from "./session-migration";
+import { cn } from "@/lib/utils";
+
+const sessionSchema = z.object({
+  id: z.string(), title: z.string(), mode: z.enum(["chat", "compare"]),
+  models: z.array(z.string()).min(1).max(4), generation: generationSchema,
+  recipients: z.array(z.number().int().min(0).max(3)).optional(),
+});
+export type PlaygroundSession = z.infer<typeof sessionSchema>;
+const fresh = (): PlaygroundSession => ({ id: crypto.randomUUID(), title: "Untitled session", mode: "compare", models: ["charo"], generation: { systemPrompt: "" } });
+
+export function Playground({ scope }: { scope: string }) {
+  const root = `obleth-playground:${encodeURIComponent(scope)}`;
+  const [sessions, setSessions] = useState<PlaygroundSession[]>([]);
+  const [active, setActive] = useState("");
+  const [storageError, setStorageError] = useState<string | null>(null);
+  const [showSessions, setShowSessions] = useState(true);
+  const [showSettings, setShowSettings] = useState(false);
+  const { models, loading, error, reload } = useEnabledModels();
+  useEffect(() => {
+    try {
+      const parsed = z.array(sessionSchema).max(100).safeParse(JSON.parse(localStorage.getItem(root) ?? "[]"));
+      const stored = parsed.success && parsed.data.length ? parsed.data : [fresh()];
+      migrateLegacySessions(stored, root, localStorage);
+      setSessions(stored); setActive(stored[0].id);
+    } catch { const session = fresh(); setSessions([session]); setActive(session.id); setStorageError("Browser storage is unavailable. Sessions will last only until you leave."); }
+  }, [root]);
+  useEffect(() => {
+    if (!sessions.length) return;
+    try { localStorage.setItem(root, JSON.stringify(sessions)); }
+    catch { setStorageError("Session settings could not be saved. Export important conversations before leaving."); }
+  }, [root, sessions]);
+  const session = sessions.find((s) => s.id === active);
+  const update = (patch: Partial<PlaygroundSession>) => setSessions((all) => all.map((s) => s.id === active ? { ...s, ...patch } : s));
+  const create = () => {
+    const next = fresh(); setSessions((all) => [next, ...all]); setActive(next.id);
+  };
+  const remove = (id: string) => {
+    const remaining = sessions.filter((s) => s.id !== id);
+    const next = remaining.length ? remaining : [fresh()];
+    setSessions(next);
+    if (id === active) setActive(next[0].id);
+    // Delay cleanup until the outgoing workspace's unmount save has finished.
+    setTimeout(() => {
+      try { Object.keys(localStorage).filter((k) => k.startsWith(`${root}:${id}:`)).forEach((k) => localStorage.removeItem(k)); }
+      catch { /* storage warning already displayed */ }
+    }, 0);
+  };
+  const exportSession = () => {
+    const conversations: Record<string, unknown> = {};
+    try {
+      Object.keys(localStorage).filter((k) => k.startsWith(`${root}:${active}:`)).forEach((k) => { conversations[k.slice(root.length + active.length + 2)] = JSON.parse(localStorage.getItem(k) ?? "null"); });
+    } catch { setStorageError("Only the open conversations could be exported; browser storage is unavailable."); }
+    const live: Record<string, unknown> = {};
+    window.dispatchEvent(new CustomEvent("playground-export", { detail: live }));
+    Object.entries(live).filter(([k]) => k.startsWith(`${root}:${active}:`)).forEach(([k, value]) => { conversations[k.slice(root.length + active.length + 2)] = value; });
+    const url = URL.createObjectURL(new Blob([JSON.stringify({ session, conversations }, null, 2)], { type: "application/json" }));
+    const link = document.createElement("a"); link.href = url; link.download = "playground-session.json"; link.click(); URL.revokeObjectURL(url);
+  };
+  if (!session) return <p className="p-6 text-sm text-muted-foreground">Loading Playground…</p>;
+  return (
+    <div className="flex h-full min-h-[36rem] flex-col">
+      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
+        <div><h1 className="flex items-center gap-2 text-lg font-semibold"><FlaskConical className="h-5 w-5 text-violet-500" />Playground</h1><p className="mt-1 text-xs text-muted-foreground">Explore models, compare answers, and test your gateway.</p></div>
+        <div className="flex items-center gap-2">
+          <Button variant="ghost" size="icon" title="Toggle sessions" aria-expanded={showSessions} onClick={() => setShowSessions(!showSessions)}><PanelLeft className="h-4 w-4" /></Button>
+          <Button variant="outline" size="sm" onClick={() => setShowSettings(!showSettings)} aria-expanded={showSettings}><SlidersHorizontal className="mr-2 h-4 w-4" />Parameters</Button>
+          <Button variant="ghost" size="icon" title="Export saved session" onClick={exportSession}><ArrowDownToLine className="h-4 w-4" /></Button>
+        </div>
+      </header>
+      {storageError && <p role="alert" className="px-5 py-2 text-xs text-amber-600">{storageError}</p>}
+      {error && <div role="alert" className="flex items-center gap-3 px-5 py-2 text-sm text-destructive">{error}<Button variant="outline" size="sm" onClick={reload}>Retry loading models</Button></div>}
+      {showSettings && <div className="grid gap-3 border-b border-border bg-secondary/20 p-4 sm:grid-cols-[1fr_9rem_10rem]">
+        <label className="text-xs font-medium">System prompt<textarea aria-label="System prompt" value={session.generation.systemPrompt} maxLength={32000} onChange={(e) => update({ generation: { ...session.generation, systemPrompt: e.target.value } })} className="mt-1 w-full resize-y rounded-md border border-border bg-background p-2 text-sm" rows={2} placeholder="Instructions for direct chat and comparison" /></label>
+        <label className="text-xs font-medium">Temperature<Input aria-label="Temperature" className="mt-1" type="number" min={0} max={2} step={0.1} placeholder="Model default" value={session.generation.temperature ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (n >= 0 && n <= 2)) update({ generation: { ...session.generation, temperature: e.target.value ? n : undefined } }); }} /></label>
+        <label className="text-xs font-medium">Max output tokens<Input aria-label="Max output tokens" className="mt-1" type="number" min={1} max={131072} placeholder="Model default" value={session.generation.maxTokens ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 131072)) update({ generation: { ...session.generation, maxTokens: e.target.value ? n : undefined } }); }} /></label>
+      </div>}
+      <div className="flex min-h-0 flex-1 flex-col md:flex-row">
+        {showSessions && <aside className="flex shrink-0 flex-col gap-3 border-b border-border bg-secondary/10 p-3 md:w-52 md:border-b-0 md:border-r">
+          <Button variant="outline" size="sm" onClick={create} disabled={sessions.length >= 50}><Plus className="mr-2 h-4 w-4" />New session</Button>
+
+          <div className="max-h-40 min-h-0 flex-1 space-y-1 overflow-y-auto md:max-h-none">{sessions.map((s) => <div key={s.id} className={cn("group flex w-full items-center rounded-md", active === s.id ? "bg-secondary text-foreground" : "text-muted-foreground hover:bg-accent")}>
+            <button onClick={() => setActive(s.id)} aria-current={active === s.id ? "true" : undefined} className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-2 text-left text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+              <MessageSquare className="h-3.5 w-3.5 shrink-0" /><span className="truncate">{s.title}</span>
+            </button>
+            <Button variant="ghost" size="icon" className="mr-1 h-7 w-7 shrink-0 text-muted-foreground hover:text-destructive" title="Delete session" aria-label={`Delete session: ${s.title}`} onClick={() => remove(s.id)}><Trash2 className="h-3.5 w-3.5" /></Button>
+          </div>)}</div>
+          <p className="hidden text-[11px] text-muted-foreground md:block">Sessions are saved in this browser for your account.</p>
+        </aside>}
+        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+          <div className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-2">
+
+            {!showSessions && <Button variant="ghost" size="icon" title="New session" onClick={create} disabled={sessions.length >= 50}><Plus className="h-4 w-4" /></Button>}
+            <input aria-label="Session name" maxLength={100} className="min-w-0 flex-1 bg-transparent text-sm outline-none focus:ring-1 focus:ring-ring" value={session.title} onChange={(e) => update({ title: e.target.value })} />
+          </div>
+          <div className="min-h-0 flex-1" key={`${session.id}:${session.mode}`}>
+            <UnifiedWorkspace storageKey={`${root}:${session.id}:compare`} session={session} update={update} models={models} loading={loading} />
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { getSession } from "@/lib/auth/session";
+import { guardAdmin } from "@/lib/auth/guard";
 import { requireAdmin } from "@/lib/auth/roles";
 import { obleth } from "@/lib/obleth";
 import { gatewayChat, type ChatMessage } from "@/lib/charo/gateway";
@@ -44,8 +44,8 @@ interface AgentBody {
 }
 
 export async function POST(req: NextRequest) {
-  const session = await getSession();
-  if (!session) return new Response("unauthorized", { status: 401 });
+  const denied = await guardAdmin();
+  if (denied) return denied;
 
   ensureToolsRegistered();
 

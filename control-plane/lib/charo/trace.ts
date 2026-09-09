@@ -7,6 +7,8 @@ import type { UsageLogEntry, SpanEntry } from "@/lib/obleth";
 //   boon:vision, boon:guardrails_input, boon:guardrails_output,
 //   boon:structured_repair, boon:tool_loop, boon:tool_loop:iter:<n>
 export interface TraceSummary {
+  accountingAvailable?: boolean;
+  energyWh?: number;
   model: string;
   /** Canonical boon labels that actually fired (e.g. "vision", "tool_loop"). */
   boonsFired: string[];
@@ -71,6 +73,8 @@ export function assembleTrace(
   }
 
   return {
+    accountingAvailable: log !== null,
+    energyWh: log?.energy_wh,
     model: log?.model ?? "",
     boonsFired: [...fired],
     toolLoopIters,

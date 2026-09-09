@@ -1230,7 +1230,7 @@ export function CharoSettingsForm({
       <CardHeader>
         <CardTitle>Charo assistant</CardTitle>
         <CardDescription>
-          Charo is an on-screen operator companion. Give it a brain model to let it run
+          Charo is the guided assistant in Playground. Give it a brain model to let it run
           tools (like the capacity benchmark) and answer with live results. Without a brain
           model it stays a plain model-tester: the persona rides the model under test and no
           tools are offered. Every token is billed to the reserved internal tenant.
@@ -1239,7 +1239,7 @@ export function CharoSettingsForm({
       <CardContent className="space-y-5">
         <label className="flex items-center gap-2 text-sm">
           <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4" />
-          Show Charo in the dashboard
+          Enable Playground in the dashboard
         </label>
 
         <div className="space-y-1.5">

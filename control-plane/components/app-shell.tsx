@@ -10,6 +10,7 @@ import {
   BarChart3,
   ChevronDown,
   Gauge,
+  FlaskConical,
   KeyRound,
   LayoutDashboard,
   LogOut,
@@ -44,6 +45,7 @@ const navGroups = [
   { label: "Operations", items: [
     { href: "/fairshare", label: "Fairshare", icon: Gauge },
     { href: "/models", label: "Models", icon: Boxes },
+    { href: "/playground", label: "Playground", icon: FlaskConical },
     { href: "/logs", label: "Request Logs", icon: Radio },
     { href: "/reports", label: "Reports", icon: BarChart3 },
   ] },
@@ -241,7 +243,7 @@ export function AppShell({
               </DropdownMenuContent>
             </DropdownMenu>
           </header>
-          <main className="min-h-0 flex-1 overflow-y-auto p-4 sm:p-6 lg:p-8">{children}</main>
+          <main className={cn("min-h-0 flex-1", pathname.startsWith("/playground") ? "overflow-auto" : "overflow-y-auto p-4 sm:p-6 lg:p-8")}>{children}</main>
           <StatusFooter />
         </div>
       </div>

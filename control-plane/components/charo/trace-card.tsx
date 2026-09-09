@@ -3,6 +3,8 @@
 import type { TraceSummary } from "@/lib/charo/trace";
 import { formatDurationMs } from "@/lib/format";
 import { formatCurrency } from "@/lib/utils";
+import Link from "next/link";
+import type { ChatTurn } from "./use-charo-stream";
 
 const BOON_LABELS: Record<string, string> = {
   vision: "vision",
@@ -21,15 +23,21 @@ export function TraceCard({
   trace,
   pending,
   configured = [],
+  requestId,
+  metrics,
 }: {
   trace: TraceSummary | null | undefined;
   pending?: boolean;
   configured?: string[];
+  requestId?: string;
+  metrics?: ChatTurn["metrics"];
 }) {
   if (!trace) {
     return (
       <p className="font-mono text-[10.5px] text-muted-foreground/70">
         {pending ? "trace pending — telemetry still flushing…" : "no trace available"}
+        {metrics && <span className="block">{metrics.outputTokens ?? "—"} output tokens · TTFT {metrics.ttftMs === undefined ? "—" : formatDurationMs(metrics.ttftMs)} · {formatDurationMs(metrics.totalMs)} total</span>}
+        {requestId && <Link className="ml-2 underline" href={`/logs?requestId=${encodeURIComponent(requestId)}`}>Inspect request</Link>}
       </p>
     );
   }
@@ -40,16 +48,18 @@ export function TraceCard({
   const isError = trace.statusCode >= 400 || trace.errorStages.length > 0;
 
   const stats = [
-    `tok ${trace.inputTokens}/${trace.outputTokens}`,
-    `ttft ${formatDurationMs(trace.ttftMs)}`,
-    `total ${formatDurationMs(trace.totalMs)}`,
+    `tok ${metrics?.inputTokens ?? trace.inputTokens}/${metrics?.outputTokens ?? trace.outputTokens}`,
+    `ttft ${formatDurationMs(metrics?.ttftMs ?? trace.ttftMs)}`,
+    `total ${formatDurationMs(metrics?.totalMs ?? trace.totalMs)}`,
     `cache ${trace.cacheStatus}`,
-    formatCurrency(trace.costUsd),
+    trace.accountingAvailable === false ? "cost unavailable" : formatCurrency(trace.costUsd),
+    ...(trace.energyWh === undefined ? [] : [`${trace.energyWh.toFixed(4)} Wh`]),
     ...(isError ? [`http ${trace.statusCode || "—"}`] : []),
   ];
 
   return (
     <div className="space-y-0.5 font-mono text-[10.5px] leading-relaxed text-muted-foreground/70">
+      {requestId && <Link className="inline-block text-foreground underline" href={`/logs?requestId=${encodeURIComponent(requestId)}`}>Inspect request</Link>}
       <div className="flex flex-wrap gap-x-1.5">
         {trace.boonsFired.length === 0 && notFired.length === 0 && <span>boons none</span>}
         {trace.boonsFired.map((b) => (

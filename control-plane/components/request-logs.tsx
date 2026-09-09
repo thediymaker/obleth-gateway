@@ -77,14 +77,14 @@ interface Cursor {
   beforeRequestId: string;
 }
 
-export function RequestLogs({ tenants, models }: { tenants: TenantOption[]; models: string[] }) {
-  const [filters, setFilters] = useState<Filters>(DEFAULT_FILTERS);
-  const [requestIdDraft, setRequestIdDraft] = useState("");
-  const [liveTail, setLiveTail] = useState(true);
+export function RequestLogs({ tenants, models, initialRequestId = "" }: { tenants: TenantOption[]; models: string[]; initialRequestId?: string }) {
+  const [filters, setFilters] = useState<Filters>({ ...DEFAULT_FILTERS, requestId: initialRequestId, includeInternal: !!initialRequestId, ...(initialRequestId ? { windowMs: 90 * DAY_MS } : {}) });
+  const [requestIdDraft, setRequestIdDraft] = useState(initialRequestId);
+  const [liveTail, setLiveTail] = useState(!initialRequestId);
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
   const [cursor, setCursor] = useState<Cursor | undefined>(undefined);
   const [cursorStack, setCursorStack] = useState<Cursor[]>([]);
-  const [expandedRequestId, setExpandedRequestId] = useState<string | null>(null);
+  const [expandedRequestId, setExpandedRequestId] = useState<string | null>(initialRequestId || null);
 
   const toggleExpand = (id: string) =>
     setExpandedRequestId((prev) => (prev === id ? null : id));
