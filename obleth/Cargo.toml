@@ -53,11 +53,11 @@ moka = { version = "0.12", features = ["future"] }
 # observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-prometheus = "0.13"
-opentelemetry = "0.31"
-opentelemetry_sdk = "0.31"
-opentelemetry-otlp = { version = "0.31", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
-tracing-opentelemetry = "0.32"
+prometheus = "0.14"
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32.1"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client"] }
+tracing-opentelemetry = "0.33"
 
 # openapi
 utoipa = { version = "4", features = ["axum_extras", "uuid", "chrono"] }

@@ -274,7 +274,7 @@ services:
 
   haproxy:
     profiles: ["edge"]
-    image: haproxy:2.9
+    image: haproxy:3.2
     volumes:
       - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
     environment:

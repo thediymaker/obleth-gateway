@@ -143,12 +143,15 @@ export function recipesDir(): string {
 /** `{ id }` for every `*.recipe` file in the directory, sorted by id. Never
  *  throws (a missing/unreadable directory yields []). Shared scan so the two
  *  public listers below can't drift in ordering or directory handling. */
+// Recipes are runtime assets, copied explicitly by the Dockerfile or mounted
+// through OBLETH_RECIPES_DIR. Do not trace an operator-selected directory into
+// the standalone bundle (it can cause the entire source tree to be included).
 function recipeFileIds(): { id: string; name: string }[] {
   const dir = recipesDir();
   let entries: string[];
   try {
-    if (!statSync(dir).isDirectory()) return [];
-    entries = readdirSync(dir);
+    if (!statSync(/* turbopackIgnore: true */ dir).isDirectory()) return [];
+    entries = readdirSync(/* turbopackIgnore: true */ dir);
   } catch {
     return [];
   }
@@ -164,7 +167,7 @@ export function listRecipes(): ParsedRecipe[] {
   const out: ParsedRecipe[] = [];
   for (const { id, name } of recipeFileIds()) {
     try {
-      out.push(parseRecipe(id, readFileSync(path.join(dir, name), "utf8")));
+      out.push(parseRecipe(id, readFileSync(/* turbopackIgnore: true */ path.join(/* turbopackIgnore: true */ dir, name), "utf8")));
     } catch (e) {
       out.push({ id, valid: false, error: (e as Error).message, warnings: [] });
     }
@@ -180,7 +183,7 @@ export function listRecipeDocs(): { id: string; text: string }[] {
   const out: { id: string; text: string }[] = [];
   for (const { id, name } of recipeFileIds()) {
     try {
-      out.push({ id, text: readFileSync(path.join(dir, name), "utf8") });
+      out.push({ id, text: readFileSync(/* turbopackIgnore: true */ path.join(/* turbopackIgnore: true */ dir, name), "utf8") });
     } catch {
       // skip unreadable files; listRecipes already surfaces them as invalid entries
     }
@@ -192,7 +195,7 @@ export function listRecipeDocs(): { id: string; text: string }[] {
 export function getRecipe(id: string): ParsedRecipe | null {
   const full = path.join(recipesDir(), `${id}.recipe`);
   try {
-    return parseRecipe(id, readFileSync(full, "utf8"));
+    return parseRecipe(id, readFileSync(/* turbopackIgnore: true */ full, "utf8"));
   } catch {
     return null;
   }
