@@ -337,3 +337,311 @@ async fn snapshot_reports_per_model_queued() {
     let _ = tokio::time::timeout(Duration::from_secs(1), w1).await;
     let _ = tokio::time::timeout(Duration::from_secs(1), w2).await;
 }
+
+/// `share_score` is the paper's Equation 1, `served_tokens / weight`, and the
+/// Management API documents it as such. It must not vary by scheduler mode:
+/// hierarchical admission ranks tenants inside the winning group on exactly
+/// that weight-adjusted value, so reporting the raw token count under the same
+/// name misrepresents the key the scheduler actually uses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn tenant_share_score_is_weight_adjusted_in_both_modes() {
+    for algorithm in [
+        FairshareAlgorithm::Hierarchical,
+        FairshareAlgorithm::Weighted,
+    ] {
+        let cap = Arc::new(StaticCapacity::new(8));
+        let fs = FairShare::start(cap, algorithm);
+        let heavy = Uuid::new_v4();
+        let light = Uuid::new_v4();
+
+        let req = |tenant: Uuid, weight: i64, cost: u32| AdmitRequest {
+            tenant,
+            weight,
+            group: "shared".into(),
+            group_weight: 100,
+            model: "m".into(),
+            model_max_in_flight: None,
+            cost,
+        };
+
+        // Same 1000 tokens of service, weights 500 and 50.
+        let a = fs.admit(req(heavy, 500, 1000)).await.expect("heavy admit");
+        let b = fs.admit(req(light, 50, 1000)).await.expect("light admit");
+
+        let snap = fs.snapshot().await.expect("snapshot");
+        let score = |id: Uuid| {
+            snap.tenants
+                .iter()
+                .find(|t| t.tenant_id == id)
+                .map(|t| t.share_score)
+                .expect("tenant in snapshot")
+        };
+
+        assert!(
+            (score(heavy) - 2.0).abs() < 1e-9,
+            "{algorithm:?}: heavy tenant 1000/500 should score 2.0, got {}",
+            score(heavy)
+        );
+        assert!(
+            (score(light) - 20.0).abs() < 1e-9,
+            "{algorithm:?}: light tenant 1000/50 should score 20.0, got {}",
+            score(light)
+        );
+
+        drop(a);
+        drop(b);
+    }
+}
+
+/// A group apportioned fewer slots than it has active tenants caps the surplus
+/// tenants at zero, and the dispatch guard `in_flight >= tenant_cap` excludes
+/// them at 0 >= 0. That exclusion must stay transient: caps are recomputed on
+/// every dispatch against the currently-active set, so a zero-capped tenant
+/// rotates back in rather than being shut out for the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn group_with_more_tenants_than_slots_still_serves_every_tenant() {
+    let cap = Arc::new(StaticCapacity::new(1));
+    let fs = FairShare::start(cap, FairshareAlgorithm::Hierarchical);
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+
+    let req = |tenant: Uuid| AdmitRequest {
+        tenant,
+        weight: 100,
+        group: "shared".into(),
+        group_weight: 100,
+        model: "m".into(),
+        model_max_in_flight: None,
+        cost: 10,
+    };
+
+    // Occupy the only slot so every later request must queue.
+    let held = fs.admit(req(a)).await.expect("seed admit").permit;
+
+    let seen: Arc<Mutex<Vec<Uuid>>> = Arc::new(Mutex::new(Vec::new()));
+    let mut workers = Vec::new();
+    for tenant in [a, b, a, b, a, b, a, b] {
+        let fs = fs.clone();
+        let seen = seen.clone();
+        workers.push(tokio::spawn(async move {
+            if let Some(ok) = fs.admit(req(tenant)).await {
+                seen.lock().unwrap().push(tenant);
+                tokio::time::sleep(Duration::from_millis(15)).await;
+                drop(ok.permit);
+            }
+        }));
+    }
+
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    drop(held);
+    for w in workers {
+        let _ = tokio::time::timeout(Duration::from_millis(800), w).await;
+    }
+
+    let got = seen.lock().unwrap().clone();
+    let a_count = got.iter().filter(|t| **t == a).count();
+    let b_count = got.iter().filter(|t| **t == b).count();
+    // Service is bursty rather than strictly interleaved (observed BBBAABAA),
+    // because the zero-capped tenant only becomes eligible once the active set
+    // changes. Both tenants must nonetheless be fully served.
+    assert_eq!(a_count, 4, "tenant A short-served: {got:?}");
+    assert_eq!(b_count, 4, "tenant B short-served: {got:?}");
+}
+
+/// Group caps are ceilings on *contended* demand, not reservations: a
+/// backlogged group borrows slots a sibling group is leaving idle, so the
+/// scheduler is work-conserving.
+///
+/// Here the high-weight group is apportioned 7 of 8 slots but holds only 1.
+/// The low-weight group, capped at 1, must be lent the rest rather than
+/// queueing behind six idle slots.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hierarchical_backlogged_group_borrows_idle_sibling_slots() {
+    let cap = Arc::new(StaticCapacity::new(8));
+    let fs = FairShare::start(cap, FairshareAlgorithm::Hierarchical);
+    let big = Uuid::new_v4();
+    let small = Uuid::new_v4();
+
+    let req = |tenant: Uuid, group: &'static str, gw: i64| AdmitRequest {
+        tenant,
+        weight: 100,
+        group: group.into(),
+        group_weight: gw,
+        model: "m".into(),
+        model_max_in_flight: None,
+        cost: 10,
+    };
+
+    // High-weight group: active, but holding only 1 of the ~7 slots it is due.
+    let _big = fs
+        .admit(req(big, "big", 500))
+        .await
+        .expect("big admit")
+        .permit;
+
+    // Low-weight group floods with 10 requests.
+    let mut waiters = Vec::new();
+    for _ in 0..10 {
+        let fs = fs.clone();
+        waiters.push(tokio::spawn(async move {
+            if let Some(a) = fs.admit(req(small, "small", 50)).await {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(a.permit);
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(120)).await;
+
+    let snap = fs.snapshot().await.expect("snapshot");
+    let big_g = snap.groups.iter().find(|g| g.name == "big").expect("big");
+    let small_g = snap
+        .groups
+        .iter()
+        .find(|g| g.name == "small")
+        .expect("small");
+
+    assert_eq!(big_g.slot_cap, 7, "high-weight group is due 7 of 8 slots");
+    assert_eq!(big_g.in_flight, 1, "but is only using one of them");
+    assert_eq!(
+        snap.global_in_flight, 8,
+        "every slot must be working: {} still queued",
+        snap.global_queued
+    );
+    assert_eq!(
+        small_g.in_flight, 7,
+        "low-weight group borrows the six idle slots on top of its cap of 1"
+    );
+    // Borrowed occupancy is reported separately so a run can show that lending
+    // fired, rather than leaving it to be inferred from cap vs in_flight.
+    assert_eq!(small_g.borrowed, 6, "6 of small's 7 slots are borrowed");
+    assert_eq!(big_g.borrowed, 0, "the lender borrows nothing");
+    assert_eq!(snap.global_borrowed, 6);
+
+    for w in waiters {
+        w.abort();
+    }
+}
+
+/// A group that has borrowed heavily must yield as its lender's demand
+/// returns. Borrowed slots are not preemptible — permits are held for the whole
+/// stream — so the lender reclaims as borrowed streams complete, and crucially
+/// the borrower must not keep winning fresh slots ahead of the waiting lender.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn lender_reclaims_borrowed_slots_as_they_drain() {
+    let cap = Arc::new(StaticCapacity::new(8));
+    let fs = FairShare::start(cap, FairshareAlgorithm::Hierarchical);
+    let big = Uuid::new_v4();
+    let small = Uuid::new_v4();
+
+    let req = |tenant: Uuid, group: &'static str, gw: i64| AdmitRequest {
+        tenant,
+        weight: 100,
+        group: group.into(),
+        group_weight: gw,
+        model: "m".into(),
+        model_max_in_flight: None,
+        cost: 10,
+    };
+
+    // The low-weight group arrives first and borrows the whole pool.
+    let mut borrowed = Vec::new();
+    for _ in 0..8 {
+        borrowed.push(
+            fs.admit(req(small, "small", 50))
+                .await
+                .expect("small admit")
+                .permit,
+        );
+    }
+    let snap = fs.snapshot().await.expect("snapshot");
+    assert_eq!(snap.global_in_flight, 8, "small should hold the whole pool");
+
+    // The lender's demand returns: queue the high-weight group, plus more
+    // low-weight work that must NOT jump ahead of it.
+    let fs_big = fs.clone();
+    let big_wait =
+        tokio::spawn(async move { fs_big.admit(req(big, "big", 500)).await.map(|a| a.permit) });
+    let mut small_more = Vec::new();
+    for _ in 0..4 {
+        let fs = fs.clone();
+        small_more.push(tokio::spawn(async move {
+            fs.admit(req(small, "small", 50)).await.map(|a| a.permit)
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+
+    // Free exactly one borrowed slot. It must go to the lender, not the
+    // borrower that is already far above its cap.
+    drop(borrowed.pop());
+
+    let reclaimed = tokio::time::timeout(Duration::from_secs(2), big_wait)
+        .await
+        .expect("lender must not wait indefinitely")
+        .expect("join")
+        .expect("lender admitted");
+
+    let snap = fs.snapshot().await.expect("snapshot");
+    let big_g = snap.groups.iter().find(|g| g.name == "big").expect("big");
+    assert_eq!(big_g.in_flight, 1, "the freed slot went to the lender");
+
+    drop(reclaimed);
+    for w in small_more {
+        w.abort();
+    }
+    drop(borrowed);
+}
+
+/// Borrowed service is still service: a tenant that borrows idle capacity
+/// accrues `served_tokens` for it, so timing luck does not earn free share.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn borrowed_slots_accrue_served_tokens() {
+    let cap = Arc::new(StaticCapacity::new(8));
+    let fs = FairShare::start(cap, FairshareAlgorithm::Hierarchical);
+    let big = Uuid::new_v4();
+    let small = Uuid::new_v4();
+
+    let req = |tenant: Uuid, group: &'static str, gw: i64, cost: u32| AdmitRequest {
+        tenant,
+        weight: 100,
+        group: group.into(),
+        group_weight: gw,
+        model: "m".into(),
+        model_max_in_flight: None,
+        cost,
+    };
+
+    let _big = fs
+        .admit(req(big, "big", 500, 10))
+        .await
+        .expect("big admit")
+        .permit;
+
+    // Spawned, not awaited in sequence: before borrowing exists these block
+    // forever at small's cap of 1, and the test must fail rather than hang.
+    let mut waiters = Vec::new();
+    for _ in 0..7 {
+        let fs = fs.clone();
+        waiters.push(tokio::spawn(async move {
+            if let Some(a) = fs.admit(req(small, "small", 50, 100)).await {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(a.permit);
+            }
+        }));
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let snap = fs.snapshot().await.expect("snapshot");
+    let small_t = snap
+        .tenants
+        .iter()
+        .find(|t| t.tenant_id == small)
+        .expect("small tenant");
+    assert_eq!(
+        small_t.served_tokens, 700.0,
+        "7 borrowed admissions at cost 100 must all be charged"
+    );
+
+    for w in waiters {
+        w.abort();
+    }
+}

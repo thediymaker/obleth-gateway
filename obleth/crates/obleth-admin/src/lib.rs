@@ -578,6 +578,9 @@ pub struct GroupFairshareView {
     pub in_flight: usize,
     pub queued: usize,
     pub slot_cap: usize,
+    /// Slots held above this group's cap, borrowed from siblings leaving
+    /// capacity idle. Non-zero only while some other group is under-demand.
+    pub borrowed: usize,
     pub served_tokens: f64,
     pub share_score: f64,
     pub weight_share: f64,
@@ -606,6 +609,8 @@ pub struct FairshareLiveView {
     pub max_in_flight: usize,
     pub global_in_flight: usize,
     pub global_queued: i64,
+    /// Total occupancy above the apportioned group caps.
+    pub global_borrowed: usize,
     pub groups: Vec<GroupFairshareView>,
     pub tenants: Vec<TenantFairshareView>,
     /// Live in-flight request count per model name.
@@ -3096,6 +3101,7 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         max_in_flight: snap.max_in_flight,
         global_in_flight: snap.global_in_flight.saturating_sub(hidden_in_flight),
         global_queued: snap.global_queued.saturating_sub(hidden_queued) as i64,
+        global_borrowed: snap.global_borrowed,
         groups: snap
             .groups
             .into_iter()
@@ -3106,6 +3112,7 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
                 in_flight: g.in_flight,
                 queued: g.queued,
                 slot_cap: g.slot_cap,
+                borrowed: g.borrowed,
                 served_tokens: g.served_tokens,
                 share_score: g.share_score,
                 weight_share: g.weight_share,

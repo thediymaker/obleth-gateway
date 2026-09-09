@@ -85,6 +85,27 @@ where
 mod tests {
     use super::*;
 
+    /// The obench fixture's group weights across the capacity sweep. Largest
+    /// remainder must allocate every slot at each level: an unallocated
+    /// remainder would leave capacity permanently idle under contention.
+    #[test]
+    fn fixture_group_caps_allocate_every_slot_across_the_sweep() {
+        let groups = vec![
+            ("chatbot".to_string(), 500i64),
+            ("api".to_string(), 50),
+            ("analytics".to_string(), 100),
+        ];
+        for max in [8usize, 16, 32, 64] {
+            let caps = group_slot_caps(max, &groups);
+            let total: usize = caps.values().sum();
+            println!(
+                "SWEEP max={max:>2} chatbot={} api={} analytics={} total={total}",
+                caps["chatbot"], caps["api"], caps["analytics"]
+            );
+            assert_eq!(total, max, "max={max}: caps must allocate every slot");
+        }
+    }
+
     #[test]
     fn caps_split_500_50_with_min_one() {
         let groups = vec![("chatbot".into(), 500), ("api".into(), 50)];
@@ -109,6 +130,27 @@ mod tests {
         let caps = weighted_caps(10, &tenants);
         assert_eq!(caps.get(&1).copied(), Some(8));
         assert_eq!(caps.get(&2).copied(), Some(2));
+    }
+
+    /// Characterises what happens when a group is apportioned fewer slots than
+    /// it has active tenants: the min-one guarantee is conditional on
+    /// `max >= items.len()`, so below that some tenants are capped at zero.
+    #[test]
+    fn caps_below_tenant_count_leave_some_tenants_at_zero() {
+        for (cap, n) in [(1usize, 2usize), (1, 3), (1, 5), (2, 3), (2, 5)] {
+            let items: Vec<(usize, i64)> = (0..n).map(|i| (i, 100)).collect();
+            let caps = weighted_caps(cap, &items);
+            let mut got: Vec<usize> = (0..n).map(|i| caps.get(&i).copied().unwrap_or(0)).collect();
+            got.sort();
+            let zeros = got.iter().filter(|c| **c == 0).count();
+            assert_eq!(
+                zeros,
+                n - cap,
+                "cap={cap} n={n}: expected {} tenants capped at zero, got {got:?}",
+                n - cap
+            );
+            assert_eq!(got.iter().sum::<usize>(), cap, "caps must sum to the pool");
+        }
     }
 
     #[test]
