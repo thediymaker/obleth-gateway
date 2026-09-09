@@ -317,6 +317,21 @@ controlPlane:
   # Break-glass admin email seeded on first boot (paired with dashboardPassword).
   dashboardAdminEmail: admin@example.com
   # JSON array of OIDC providers. Empty = SSO off.
+  #
+  # Per-provider keys: providerId, displayName, discoveryUrl, clientId,
+  # clientSecret, scopes, plus three optional ones:
+  #   claims            -- read a user field from a non-standard claim, e.g.
+  #                        {"email":"preferred_username"} for an IdP whose
+  #                        `email` is a display alias rather than the canonical
+  #                        institutional id (Globus does this). Mappable
+  #                        fields: email, name, image.
+  #   overrideUserInfo  -- re-apply the profile to EXISTING users on each
+  #                        sign-in, not just at sign-up. Needed to correct a
+  #                        claim mapping after users already exist.
+  #   authentication    -- "basic" for an IdP that only accepts HTTP Basic at
+  #                        the token endpoint. Rarely needed; most accept the
+  #                        default body credentials.
+  # See deploy/k8s/README.md for the full explanation of each.
   oidcProviders: ""   # e.g. '[{"providerId":"dex","displayName":"Dev SSO (Dex)","discoveryUrl":"...","clientId":"...","clientSecret":"...","scopes":["openid","email","profile"]}]'
   resources:
     requests: { cpu: "100m", memory: "256Mi" }
