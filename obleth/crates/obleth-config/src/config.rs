@@ -61,6 +61,9 @@ pub struct Config {
     pub model_health_timeout_secs: u64,
     pub model_health_retention_days: i64,
 
+    /// Trusted JWT issuers for data-plane bearer auth. Empty = JWT path off.
+    pub jwt_issuers: Vec<crate::jwt::JwtIssuerConfig>,
+
     /// Default days of raw per-request `usage` history to keep before pruning.
     /// A runtime setting saved from the control plane overrides this.
     pub usage_retention_days: i64,
@@ -130,6 +133,7 @@ impl Config {
             model_health_interval_secs: parse_or("OBLETH_MODEL_HEALTH_INTERVAL_SECS", 900),
             model_health_timeout_secs: parse_or("OBLETH_MODEL_HEALTH_TIMEOUT_SECS", 30),
             model_health_retention_days: parse_or("OBLETH_MODEL_HEALTH_RETENTION_DAYS", 30),
+            jwt_issuers: crate::jwt::jwt_issuers_from_env(),
             usage_retention_days: parse_or("OBLETH_USAGE_RETENTION_DAYS", 180),
             otel_endpoint: env::var("OBLETH_OTEL_ENDPOINT")
                 .ok()

@@ -24,6 +24,7 @@ const log: UsageLogEntry = {
   request_type: "chat",
   session_id: "",
   session_id_source: "",
+  device_id: "",
   admission: "ok",
   status_code: 200,
   input_tokens: 12,

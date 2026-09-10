@@ -26,7 +26,12 @@
 #      --from-literal=OBLETH_CLICKHOUSE_PASSWORD="CLICKHOUSE_PASS" \
 #      --from-literal=OBLETH_ENCRYPTION_KEY="$(openssl rand -base64 32)" \
 #      --from-literal=OBLETH_API_KEY_PEPPER="$(openssl rand -hex 32)" \
-#      --from-literal=OBLETH_SLACK_WEBHOOK_URL=""
+#      --from-literal=OBLETH_SLACK_WEBHOOK_URL="" \
+#      --from-literal=OBLETH_JWT_ISSUERS=""
+#    OBLETH_JWT_ISSUERS is optional: a JSON array of trusted issuers for the
+#    data-plane JWT bearer path (see the "Identity Tokens" guide). Empty/unset
+#    disables the JWT path entirely; the two lines above still cover every key
+#    the chart would otherwise render.
 #
 #    With existingSecret set, the chart renders NO control-plane Secret, so this
 #    Secret MUST carry every key the dashboard needs — including the auth DB and

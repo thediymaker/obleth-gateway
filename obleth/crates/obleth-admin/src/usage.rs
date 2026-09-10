@@ -125,6 +125,8 @@ pub struct UsageLogQuery {
     /// Coarse request class (`chat`, `embedding`, `audio`, ...).
     pub request_type: Option<String>,
     pub session_id: Option<String>,
+    /// Exact match on the token device id (identity-key traffic).
+    pub device_id: Option<String>,
     /// Status filter: `success` (2xx/3xx), `error` (>=400), or all (default).
     pub status: Option<String>,
     /// Case-insensitive prefix match on the request id, for the search box.
@@ -167,6 +169,7 @@ pub struct UsageLogRow {
     pub request_type: String,
     pub session_id: String,
     pub session_id_source: String,
+    pub device_id: String,
     pub admission: String,
     pub status_code: u16,
     pub input_tokens: u32,
@@ -193,7 +196,7 @@ pub async fn query_usage_logs(
     let limit = q.limit.unwrap_or(50).clamp(1, 200);
 
     let mut sql = String::from(
-        "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, session_id_source, \
+        "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, session_id_source, device_id, \
          admission, status_code, input_tokens, output_tokens, \
          toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
          queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
@@ -217,6 +220,9 @@ pub async fn query_usage_logs(
     }
     if q.session_id.is_some() {
         sql.push_str(" and session_id = ?");
+    }
+    if q.device_id.is_some() {
+        sql.push_str(" and device_id = ?");
     }
     sql.push_str(&internal_filter(q.include_internal));
     match q.status.as_deref() {
@@ -272,6 +278,9 @@ pub async fn query_usage_logs(
     }
     if let Some(sid) = &q.session_id {
         query = query.bind(sid.clone());
+    }
+    if let Some(d) = &q.device_id {
+        query = query.bind(d.clone());
     }
     if let Some(rid) = &q.request_id {
         query = query.bind(rid.clone());

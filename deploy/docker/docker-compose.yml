@@ -115,6 +115,9 @@ services:
       OBLETH_ALLOWED_PRIVATE_CIDRS: ${OBLETH_ALLOWED_PRIVATE_CIDRS:-}
       # Optional server-side pepper mixed into API-key hashes.
       OBLETH_API_KEY_PEPPER: ${OBLETH_API_KEY_PEPPER:-}
+      # Trusted JWT issuers for data-plane bearer auth (JSON array). Empty = off.
+      # See the "Identity Tokens" guide.
+      OBLETH_JWT_ISSUERS: ${OBLETH_JWT_ISSUERS:-}
       OBLETH_GLOBAL_MAX_IN_FLIGHT: "64"
       OBLETH_FAIRSHARE_ALGORITHM: hierarchical
       OBLETH_FAIL_OPEN: "true"

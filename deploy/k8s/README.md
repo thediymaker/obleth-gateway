@@ -182,7 +182,8 @@ toggles in `values.yaml`, on by sensible defaults.
   created out-of-band so real credentials never enter values files or
   `--set`/CLI history. `obleth.existingSecret` must carry `OBLETH_ADMIN_TOKEN`,
   `OBLETH_DATABASE_URL`, `OBLETH_CLICKHOUSE_PASSWORD`, `OBLETH_ENCRYPTION_KEY`,
-  `OBLETH_API_KEY_PEPPER`, `OBLETH_SLACK_WEBHOOK_URL`;
+  `OBLETH_API_KEY_PEPPER`, `OBLETH_SLACK_WEBHOOK_URL`, and (optional — only if
+  you want the JWT bearer path) `OBLETH_JWT_ISSUERS`;
   `controlPlane.existingSecret` must carry `DASHBOARD_PASSWORD`,
   `DASHBOARD_SESSION_SECRET`, `DATABASE_URL`, and (for the break-glass admin and
   SSO) `DASHBOARD_ADMIN_EMAIL`, `BETTER_AUTH_URL`, `OIDC_PROVIDERS`. See

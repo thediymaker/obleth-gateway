@@ -6,6 +6,8 @@ workflow falls back to auto-generated notes.
 
 ## Unreleased
 
+- **Sign in with your identity provider's tokens.** The data plane accepts short-lived JWT access tokens from configured OIDC issuers (`OBLETH_JWT_ISSUERS`) alongside API keys. Tokens are verified offline against the issuer's cached signing keys; a verified identity maps to a per-user identity key under the configured tenant, created on first use, so tenant budgets, schedules, model allowlists, and disable all apply as they do to any key. Usage rows record the token's device id. Identity keys appear on the Keys pages with an `identity` badge.
+
 - **Additional security hardening.** Recipe lookup and exports reject paths and symlinks outside the configured directory. AWS's IPv6 metadata endpoint is blocked even under broad upstream allowlists.
 
 - **Dashboard scripts run by nonce.** Every dashboard page now carries a per-request Content Security Policy that allows scripts only by nonce; inline script and eval permissions are gone from production. Development keeps eval for live reload only.

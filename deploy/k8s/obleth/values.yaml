@@ -31,12 +31,17 @@ obleth:
   # Optional server-side pepper mixed into API-key hashes. Keep secret/stable;
   # changing it invalidates issued keys. Supply via an external Secret.
   apiKeyPepper: ""
+  # Trusted JWT issuers for data-plane bearer auth: a JSON array string.
+  # Empty disables the JWT path. Treated as secret-valued (it names trust
+  # anchors). See the "Identity Tokens" guide.
+  jwtIssuers: ""
   # PRODUCTION: reference a pre-created Secret instead of letting the chart
   # build one from the values above (so real secrets never touch values files or
   # --set/CLI history). When set, the chart does NOT render its own Secret and
   # the named Secret MUST provide every key the chart would have: OBLETH_ADMIN_TOKEN,
   # OBLETH_DATABASE_URL, OBLETH_CLICKHOUSE_PASSWORD, OBLETH_ENCRYPTION_KEY,
-  # OBLETH_API_KEY_PEPPER, OBLETH_SLACK_WEBHOOK_URL. See examples/values-production.yaml.
+  # OBLETH_API_KEY_PEPPER, OBLETH_SLACK_WEBHOOK_URL, and (optional — only if you
+  # want the JWT path) OBLETH_JWT_ISSUERS. See examples/values-production.yaml.
   existingSecret: ""
   # SSRF allowlist for admin-registered upstream URLs (comma-separated CIDRs).
   # Default SSRF policy permits private/LAN targets (RFC1918, loopback, etc.) so

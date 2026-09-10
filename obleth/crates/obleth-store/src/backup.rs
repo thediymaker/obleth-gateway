@@ -90,13 +90,16 @@ impl Store {
         let api_keys = sqlx::query(
             "select id, tenant_id, name, description, key_prefix, key_hash,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, created_at
+                    disabled, created_at,
+                    kind, identity_issuer, identity_subject, identity_claims
              from api_keys order by created_at",
         )
         .fetch_all(&self.pool)
         .await?
         .iter()
         .map(|row| {
+            let claims: Option<sqlx::types::Json<serde_json::Value>> =
+                row.try_get("identity_claims").unwrap_or(None);
             Ok(ApiKeyBackup {
                 id: row.try_get("id")?,
                 tenant_id: row.try_get("tenant_id")?,
@@ -104,6 +107,12 @@ impl Store {
                 description: row.try_get("description")?,
                 key_prefix: row.try_get("key_prefix")?,
                 key_hash: row.try_get("key_hash")?,
+                kind: row
+                    .try_get("kind")
+                    .unwrap_or_else(|_| obleth_config::API_KEY_KIND_SECRET.to_string()),
+                identity_issuer: row.try_get("identity_issuer").unwrap_or(None),
+                identity_subject: row.try_get("identity_subject").unwrap_or(None),
+                identity_claims: claims.map(|j| j.0),
                 budget_tokens: row.try_get("budget_tokens")?,
                 budget_cost_usd: row.try_get("budget_cost_usd")?,
                 budget_period: row.try_get("budget_period")?,
@@ -289,11 +298,37 @@ impl Store {
         }
 
         for k in &data.api_keys {
+            // A restore upserts by id, but a row that collides on `key_hash`
+            // (unique) or on the partial identity index `(identity_issuer,
+            // identity_subject) where kind = 'identity'` under a *different*
+            // id is not a primary-key conflict -- it's a leftover from
+            // before the backup was taken (e.g. the identity was deleted and
+            // re-provisioned locally, minting a fresh id for the same
+            // issuer/subject). Left in place, the insert below would abort
+            // the whole restore on a unique-constraint violation instead of
+            // restoring the backup's row. NULL identity columns on a secret
+            // key never match the identity half of this predicate, so this
+            // is a no-op for ordinary keys.
+            sqlx::query(
+                "delete from api_keys
+                 where (key_hash = $2
+                        or (kind = 'identity' and identity_issuer = $3 and identity_subject = $4))
+                   and id <> $1",
+            )
+            .bind(k.id)
+            .bind(&k.key_hash)
+            .bind(&k.identity_issuer)
+            .bind(&k.identity_subject)
+            .execute(&mut *tx)
+            .await
+            .map_err(restore_db_error)?;
+
             let row = sqlx::query(
                 "insert into api_keys (id, tenant_id, name, description, key_prefix, key_hash,
                         budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                        disabled, created_at)
-                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                        disabled, created_at, kind, identity_issuer, identity_subject,
+                        identity_claims)
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
                  on conflict (id) do update set
                         tenant_id = excluded.tenant_id,
                         name = excluded.name,
@@ -305,6 +340,10 @@ impl Store {
                         budget_period = excluded.budget_period,
                         budget_started_at = excluded.budget_started_at,
                         disabled = excluded.disabled,
+                        kind = excluded.kind,
+                        identity_issuer = excluded.identity_issuer,
+                        identity_subject = excluded.identity_subject,
+                        identity_claims = excluded.identity_claims,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -320,6 +359,10 @@ impl Store {
             .bind(k.budget_started_at)
             .bind(k.disabled)
             .bind(k.created_at)
+            .bind(&k.kind)
+            .bind(&k.identity_issuer)
+            .bind(&k.identity_subject)
+            .bind(k.identity_claims.clone().map(sqlx::types::Json))
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -675,12 +718,17 @@ mod tests {
     /// throwaway Postgres. Skips silently otherwise so unit runs stay hermetic.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn backup_export_restore_roundtrip() {
-        use crate::test_support::{test_db_url, FixtureGuard};
+        use crate::test_support::{serial, test_db_url, FixtureGuard};
 
         let Some(url) = test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
             return;
         };
+        // `export_backup_data`/`restore_backup_data` operate on every row in
+        // the instance, not just this test's own fixtures, so this must not
+        // run concurrently with any other DB-backed test in the crate --
+        // shared with every `serial()` caller in `lib.rs`'s test module too.
+        let _g = serial().lock().await;
         let store = Store::connect(&url).await.expect("connect");
         store.migrate().await.expect("migrate");
         let mut fixtures = FixtureGuard::new(&store);
@@ -735,5 +783,78 @@ mod tests {
             .expect("resolve")
             .expect("present");
         assert_eq!(resolved.tenant_id, tenant.id);
+
+        // A restore must not abort when a *different* row already occupies
+        // the backed-up identity key's `key_hash` / `(issuer, subject)` slot
+        // -- the exact situation after an identity key is deleted and the
+        // same IdP subject signs in again before the restore runs, minting a
+        // fresh id for the same issuer/subject (see the `delete from
+        // api_keys ... and id <> $1` step added ahead of the upsert in
+        // `restore_backup_data`). Reuses this test's own store/fixtures
+        // rather than a second, concurrently-running whole-database
+        // export/restore test, since `export_backup_data` and
+        // `restore_backup_data` operate on every row in the instance, not
+        // just this test's own -- two such tests running in parallel against
+        // the same database can otherwise race each other's snapshots.
+        use obleth_config::IdentityProvision;
+        let issuer = "https://idp.example.com";
+        let subject = format!("alice-{}", uuid::Uuid::new_v4());
+
+        let provisioned = store
+            .provision_identity_key(IdentityProvision {
+                issuer,
+                subject: &subject,
+                tenant_name: &tenant.name,
+                claims: serde_json::Value::Null,
+            })
+            .await
+            .expect("provision identity");
+        let original_key_id = provisioned.resolved.key_id;
+
+        // Export carries the identity key under its original id.
+        let data = store.export_backup_data().await.expect("export 3");
+        let exported = data
+            .api_keys
+            .iter()
+            .find(|k| k.id == original_key_id)
+            .expect("identity key in export");
+        assert_eq!(exported.kind, obleth_config::API_KEY_KIND_IDENTITY);
+        assert_eq!(exported.identity_subject.as_deref(), Some(subject.as_str()));
+
+        // Simulate "fresh state": delete the row, then re-provision the same
+        // identity. The partial unique index has no competing row anymore, so
+        // this mints a brand new id for the same (issuer, subject) -- and
+        // since the key_hash is `identity_key_hash(issuer, subject)`, the new
+        // row carries the *same* key_hash as the one in the backup.
+        store.delete_key(original_key_id).await.expect("delete key");
+        let reprovisioned = store
+            .provision_identity_key(IdentityProvision {
+                issuer,
+                subject: &subject,
+                tenant_name: &tenant.name,
+                claims: serde_json::Value::Null,
+            })
+            .await
+            .expect("re-provision identity");
+        assert_ne!(reprovisioned.resolved.key_id, original_key_id);
+        assert_eq!(reprovisioned.hash, exported.key_hash);
+
+        // Restoring the export must succeed (not abort on the key_hash /
+        // identity unique-index collision) and leave exactly one row for
+        // this identity, matching the backup's original id.
+        let report = store.restore_backup_data(&data).await.expect("restore 3");
+        assert!(report.api_keys.inserted >= 1);
+
+        let keys = store.list_keys(Some(tenant.id)).await.expect("list keys");
+        let matching: Vec<_> = keys
+            .iter()
+            .filter(|k| k.identity_subject.as_deref() == Some(subject.as_str()))
+            .collect();
+        assert_eq!(
+            matching.len(),
+            1,
+            "expected exactly one row for the identity"
+        );
+        assert_eq!(matching[0].id, original_key_id);
     }
 }

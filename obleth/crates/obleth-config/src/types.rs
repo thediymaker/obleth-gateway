@@ -136,6 +136,14 @@ pub struct WeeklyWindow {
     pub end_min: u16,
 }
 
+/// `api_keys.kind`: a minted secret, or an identity resolved from a verified JWT.
+pub const API_KEY_KIND_SECRET: &str = "secret";
+pub const API_KEY_KIND_IDENTITY: &str = "identity";
+
+fn default_key_kind() -> String {
+    API_KEY_KIND_SECRET.to_string()
+}
+
 /// An API key. The raw secret is never stored; only its hash + a display prefix.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKey {
@@ -147,6 +155,23 @@ pub struct ApiKey {
     pub description: String,
     /// Display-only prefix, e.g. `sk_a1b2...` for dashboards.
     pub key_prefix: String,
+    /// `secret` (minted, hashed secret) or `identity` (stands for a verified
+    /// external identity; no secret exists).
+    #[serde(default = "default_key_kind")]
+    pub kind: String,
+    /// Issuer URL of the identity this key stands for (identity keys only).
+    #[serde(default)]
+    pub identity_issuer: Option<String>,
+    /// Subject claim of the identity this key stands for (identity keys only).
+    /// Contract field: external account systems join it to their own user
+    /// records. Do not rename.
+    #[serde(default)]
+    pub identity_subject: Option<String>,
+    /// Extra claims captured at provision time (`identity_claims` in the
+    /// issuer config), e.g. an immutable user id.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub identity_claims: Option<serde_json::Value>,
     /// Optional cumulative token budget for this key's current term. `None` = no cap.
     #[serde(default)]
     pub budget_tokens: Option<i64>,
@@ -163,6 +188,25 @@ pub struct ApiKey {
     pub tracing_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Input to `Store::provision_identity_key` (obleth-store).
+#[derive(Debug, Clone)]
+pub struct IdentityProvision<'a> {
+    pub issuer: &'a str,
+    pub subject: &'a str,
+    pub tenant_name: &'a str,
+    pub claims: serde_json::Value,
+}
+
+/// Result of provisioning: the hot-path handle and view, plus whether the
+/// call created anything (so the caller can alert on tenant creation).
+#[derive(Debug, Clone)]
+pub struct ProvisionedIdentity {
+    pub hash: String,
+    pub resolved: ResolvedKey,
+    pub tenant_created: bool,
+    pub key_created: bool,
 }
 
 /// The compact, hot-path view resolved from an API key. This is what the data
@@ -738,6 +782,12 @@ pub struct UsageRecord {
     /// `#[serde(default)]` keeps older WAL records replayable.
     #[serde(default)]
     pub request_type: String,
+    /// Device identifier carried by the bearer token (identity-key requests
+    /// only; empty for secret keys). Sanitised before it gets here
+    /// (`sanitize_device_id`). `#[serde(default)]` keeps older WAL records
+    /// replayable.
+    #[serde(default)]
+    pub device_id: String,
 }
 
 /// Runtime-configurable retention for the raw per-request `usage` ledger.
@@ -1730,6 +1780,23 @@ pub struct ApiKeyBackup {
     pub description: String,
     pub key_prefix: String,
     pub key_hash: String,
+    /// `secret` (minted, hashed secret) or `identity` (stands for a verified
+    /// external identity; no secret exists).
+    #[serde(default = "default_key_kind")]
+    pub kind: String,
+    /// Issuer URL of the identity this key stands for (identity keys only).
+    #[serde(default)]
+    pub identity_issuer: Option<String>,
+    /// Subject claim of the identity this key stands for (identity keys only).
+    /// Contract field: external account systems join it to their own user
+    /// records. Do not rename.
+    #[serde(default)]
+    pub identity_subject: Option<String>,
+    /// Extra claims captured at provision time (`identity_claims` in the
+    /// issuer config), e.g. an immutable user id.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub identity_claims: Option<serde_json::Value>,
     #[serde(default)]
     pub budget_tokens: Option<i64>,
     #[serde(default)]

@@ -38,6 +38,7 @@ import { Label } from "@/components/ui/label";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { CodeBlock, CopyButton } from "@/components/portal/copy-button";
 import type { ApiKey, KeyUsageSummary } from "@/lib/obleth";
+import { describeIdentityKey } from "@/lib/key-kind";
 import { cn, formatCurrency, formatNumber } from "@/lib/utils";
 
 export function PortalKeys({
@@ -252,6 +253,7 @@ function KeyRow({
   onDelete: () => void;
 }) {
   const active = !apiKey.disabled;
+  const identity = describeIdentityKey(apiKey);
 
   return (
     <div
@@ -273,8 +275,22 @@ function KeyRow({
             </Badge>
           </div>
           <div className="mt-1 flex min-w-0 flex-wrap items-center gap-2">
-            <span className="font-mono text-xs text-muted-foreground">{apiKey.key_prefix}...</span>
-            <CopyButton value={apiKey.key_prefix} label="Copy prefix" size="icon" variant="ghost" />
+            {identity.isIdentity ? (
+              <div className="flex min-w-0 items-center gap-1">
+                <Badge className="border-sky-500/40 text-sky-500">identity</Badge>
+                <span
+                  className="truncate font-mono text-xs text-muted-foreground"
+                  title={`${identity.subject} · ${identity.issuerHost}`}
+                >
+                  {identity.subject} · {identity.issuerHost}
+                </span>
+              </div>
+            ) : (
+              <>
+                <span className="font-mono text-xs text-muted-foreground">{apiKey.key_prefix}...</span>
+                <CopyButton value={apiKey.key_prefix} label="Copy prefix" size="icon" variant="ghost" />
+              </>
+            )}
           </div>
           {error && <p className="mt-1 text-xs text-destructive">{error}</p>}
         </div>

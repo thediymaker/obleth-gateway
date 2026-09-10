@@ -45,3 +45,8 @@ obleth-telemetry.workspace = true
 obleth-tokenizer.workspace = true
 obleth-admin.workspace = true
 regex.workspace = true
+jsonwebtoken.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+ring = "0.17"
