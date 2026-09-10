@@ -382,6 +382,12 @@ in the browser flow. If you see that, check the provider's
 (`client_secret_basic` / `client_secret_post`) are rejected with an explicit
 error rather than silently falling back to the body.
 
+An optional `pkce: true` sends a PKCE code challenge with the authorization
+request and the matching verifier at the token exchange (RFC 7636), so an
+intercepted authorization code cannot be redeemed on its own. It is off by
+default, matching better-auth; turn it on for any provider that supports it
+(Dex, Keycloak, Globus, Entra ID, and Okta all do).
+
 Register this redirect URI with your identity provider (one per `providerId`):
 
 ```

@@ -205,4 +205,15 @@ describe("oidcProviders", () => {
     const { oidcProviders } = await import("./providers");
     expect(oidcProviders()[0].overrideUserInfo).toBe(true);
   });
+
+  it("passes pkce through and leaves it unset by default", async () => {
+    process.env.OIDC_PROVIDERS = JSON.stringify([
+      { providerId: "a", displayName: "A", discoveryUrl: "https://d/", clientId: "id", clientSecret: "s", pkce: true },
+      { providerId: "b", displayName: "B", discoveryUrl: "https://d/", clientId: "id", clientSecret: "s" },
+    ]);
+    const { oidcProviders } = await import("./providers");
+    const [a, b] = oidcProviders();
+    expect(a.pkce).toBe(true);
+    expect(b.pkce).toBeUndefined();
+  });
 });

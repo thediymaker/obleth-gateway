@@ -9,7 +9,8 @@
 //!
 //! What we still block by default is the genuinely dangerous class with no
 //! legitimate "local upstream" use: **link-local / cloud-metadata**
-//! (`169.254.0.0/16`, incl. `169.254.169.254`, and `fe80::/10`), the
+//! (`169.254.0.0/16`, incl. `169.254.169.254`, `fe80::/10`, and AWS's
+//! IPv6 IMDS endpoint `fd00:ec2::254`), the
 //! unspecified address, and broadcast/documentation ranges. Hostnames are
 //! resolved, so a public name that maps to a blocked address is still rejected.
 //!
@@ -18,6 +19,7 @@
 //! private/internal targets unless their exact range is listed in
 //! `OBLETH_ALLOWED_PRIVATE_CIDRS` (comma-separated), e.g.
 //! `OBLETH_ALLOWED_PRIVATE_CIDRS=10.0.0.0/8,192.168.0.0/16`.
+//! Link-local/cloud-metadata addresses remain blocked even when allowlisted.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 
@@ -33,7 +35,7 @@ pub enum SsrfError {
     NoHost,
     #[error("could not resolve host '{0}'")]
     Unresolvable(String),
-    #[error("host '{host}' resolves to {ip}, a blocked link-local/cloud-metadata or otherwise unsafe address. If this is a trusted internal upstream, add its range to OBLETH_ALLOWED_PRIVATE_CIDRS")]
+    #[error("host '{host}' resolves to blocked address {ip}. Private upstreams may be allowed with OBLETH_ALLOWED_PRIVATE_CIDRS; link-local/cloud-metadata addresses cannot be allowed")]
     Blocked { host: String, ip: IpAddr },
 }
 
@@ -82,6 +84,17 @@ impl SsrfPolicy {
 
     fn ip_allowed(&self, ip: IpAddr) -> bool {
         let ip = unmap(ip);
+        // An overly broad allowlist must never reopen metadata endpoints.
+        let metadata_or_link_local = match ip {
+            IpAddr::V4(v4) => v4.is_link_local(),
+            IpAddr::V6(v6) => {
+                (v6.segments()[0] & 0xffc0) == 0xfe80
+                    || v6 == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
+            }
+        };
+        if metadata_or_link_local {
+            return false;
+        }
         if self.allow.iter().any(|net| net.contains(&ip)) {
             return true;
         }
@@ -137,6 +150,12 @@ impl SsrfPolicy {
         }
         Ok(())
     }
+}
+
+/// Registered upstreams must not redirect requests (or their bodies) to an
+/// unvalidated destination. Configure the final endpoint URL instead.
+pub fn upstream_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
 }
 
 /// Collapse IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) to their IPv4 form so
@@ -241,6 +260,71 @@ mod tests {
         let policy = SsrfPolicy::default();
         let err = policy.validate("http://169.254.169.254/latest/meta-data/");
         assert!(matches!(err, Err(SsrfError::Blocked { .. })));
+        assert!(matches!(
+            policy.validate("http://[fd00:ec2::254]/latest/meta-data/"),
+            Err(SsrfError::Blocked { .. })
+        ));
+    }
+
+    #[test]
+    fn allowlists_cannot_reopen_metadata_addresses() {
+        for allow_private in [true, false] {
+            let policy = SsrfPolicy {
+                allow: parse_cidrs("0.0.0.0/0,::/0,169.254.0.0/16,fe80::/10"),
+                allow_private,
+            };
+            for url in [
+                "http://169.254.169.254/latest/meta-data/",
+                "http://169.254.170.2/",
+                "http://[fe80::1]/",
+                "http://[fd00:ec2::254]/latest/meta-data/",
+                "http://[::ffff:169.254.169.254]/",
+            ] {
+                assert!(
+                    matches!(policy.validate(url), Err(SsrfError::Blocked { .. })),
+                    "{url}"
+                );
+            }
+            assert!(policy.validate("http://10.1.2.3:8080").is_ok());
+        }
+    }
+
+    #[tokio::test]
+    async fn upstream_client_does_not_follow_redirects() {
+        use axum::{routing::get, Router};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let target_hits = hits.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new()
+            .route(
+                "/redirect",
+                get(|| async { axum::response::Redirect::temporary("/target") }),
+            )
+            .route(
+                "/target",
+                get(move || async move {
+                    target_hits.fetch_add(1, Ordering::SeqCst);
+                    "unexpected target"
+                }),
+            );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let response = upstream_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(format!("http://{addr}/redirect"))
+            .send()
+            .await
+            .unwrap();
+        server.abort();
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
     #[test]

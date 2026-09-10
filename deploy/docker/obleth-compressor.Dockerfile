@@ -11,6 +11,9 @@
 #   --build-arg MODEL_ID=microsoft/llmlingua-2-bert-base-multilingual-cased-meetingbank
 FROM python:3.12-slim AS fetch
 WORKDIR /build
+# Refresh pip before installing: the base image ships an older pip with
+# published extraction/index advisories.
+RUN pip install --no-cache-dir --upgrade pip
 ARG COMPRESSOR_SOURCE=onnx
 ARG MODEL_ID=chopratejas/kompress-v2-base
 # For source=onnx: swap to onnx/kompress-int8-wo.onnx for a smaller/faster image.
@@ -36,7 +39,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && useradd --system --uid 10001 --gid compressor --no-create-home compressor
 WORKDIR /app
 COPY compressor/requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir -r requirements.txt
 COPY --from=fetch /models /models
 COPY compressor/app.py compressor/model.py ./
 # Report the baked model in /health (surfaced in the dashboard sidecar status).

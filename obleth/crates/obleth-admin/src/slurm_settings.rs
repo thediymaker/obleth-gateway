@@ -319,7 +319,7 @@ async fn ping_slurm(s: &SlurmSettings) -> SlurmPingHealth {
         s.slurmrestd_url.trim_end_matches('/'),
         s.slurmrestd_api_version
     );
-    let client = match reqwest::Client::builder()
+    let client = match crate::ssrf::upstream_client_builder()
         .timeout(Duration::from_secs(5))
         .build()
     {
@@ -434,6 +434,9 @@ pub async fn put_slurm_settings(
                 "slurm_user is required when Slurm is enabled".into(),
             ));
         }
+        // The provisioner and status probes send the JWT to this URL; hold it
+        // to the same destination policy as registered upstreams.
+        state.ssrf.validate(&slurmrestd_url)?;
     }
 
     // JWT: replace when a non-empty value is supplied, otherwise keep existing.

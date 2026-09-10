@@ -6,7 +6,21 @@ workflow falls back to auto-generated notes.
 
 ## Unreleased
 
-- **Dependency security refresh.** Update dashboard packages, Rust telemetry, and benchmark dependencies; use Node 24 LTS for dashboard images and CI, and HAProxy 3.2 for the Compose edge proxy. Keep authentication on the patched 1.6 series pending its separate account migration.
+- **Additional security hardening.** Recipe lookup and exports reject paths and symlinks outside the configured directory. AWS's IPv6 metadata endpoint is blocked even under broad upstream allowlists.
+
+- **Dashboard scripts run by nonce.** Every dashboard page now carries a per-request Content Security Policy that allows scripts only by nonce; inline script and eval permissions are gone from production. Development keeps eval for live reload only.
+
+- **Destination policy covers every save and restore.** The energy Prometheus URL, Slack webhook, and slurmrestd URL are checked against the upstream destination policy when saved, and a configuration restore is rejected before any write if a model, endpoint, or MCP server in it points at a blocked address. The Slurm status, resource, and provisioner clients no longer follow redirects.
+
+- **PKCE for SSO providers.** Set `pkce: true` on an `OIDC_PROVIDERS` entry to send a code challenge with the authorization request.
+
+- **`DASHBOARD_PASSWORD_HASH` removed.** The setting was offered in the example environment files but was never read; the break-glass password has always come from `DASHBOARD_PASSWORD`, which the dashboard stores hashed. Nothing to change unless you set the unused variable, which had no effect.
+
+- **Compose binds management and telemetry ports to localhost.** The Management API, metrics, Prometheus, and Jaeger host ports are published on 127.0.0.1 only; the data plane, dashboard, and edge proxy are unchanged. The compressor image refreshes pip before installing packages.
+
+- **Security review fixes.** Pending administrators can no longer use the built-in authentication admin API. Upstream CIDR allowlists cannot reopen link-local/cloud-metadata addresses, and the shared gateway HTTP client and energy test client no longer follow redirects to unvalidated destinations. Configure final upstream URLs directly.
+
+- **Dependency security refresh.** Update dashboard packages, Rust telemetry, and benchmark dependencies; use Node 24 LTS for dashboard images and CI, and HAProxy 3.2 for the Compose edge proxy. Keep authentication on the patched 1.6 series pending its separate OAuth callback/client migration.
 
 - **Tenant creation preserves your draft.** Moving between setup sections keeps all inputs, submits the full configuration, and retains your work after a failed request. Clearer section navigation and validation bring you to fields that need attention.
 

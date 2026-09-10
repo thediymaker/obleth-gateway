@@ -123,7 +123,8 @@ async fn main() -> anyhow::Result<()> {
     // live connections from being dropped by NAT/LBs. The data-plane dispatch
     // loop additionally retries a connection-level send error once on a fresh
     // connection (see proxy.rs), which absorbs the residual race.
-    let mut http_builder = reqwest::Client::builder().pool_max_idle_per_host(256);
+    let mut http_builder =
+        obleth_admin::ssrf::upstream_client_builder().pool_max_idle_per_host(256);
     if cfg.upstream_pool_idle_secs > 0 {
         http_builder =
             http_builder.pool_idle_timeout(Duration::from_secs(cfg.upstream_pool_idle_secs));

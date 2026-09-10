@@ -2,6 +2,7 @@ import { betterAuth } from "better-auth";
 import { admin, genericOAuth } from "better-auth/plugins";
 import { getDb } from "@/lib/db";
 import { oidcProviders } from "@/lib/auth/providers";
+import { requireActiveAccountForAdminApi } from "@/lib/auth/admin-access";
 
 function secret(): string {
   const s = process.env.BETTER_AUTH_SECRET ?? process.env.DASHBOARD_SESSION_SECRET;
@@ -52,6 +53,7 @@ function createAuth() {
     baseURL: process.env.BETTER_AUTH_URL ?? "http://localhost:3000",
     trustedOrigins: trustedOrigins(),
     emailAndPassword: { enabled: true },
+    hooks: { before: requireActiveAccountForAdminApi },
     user: {
       additionalFields: {
         role: { type: "string", defaultValue: "user", input: false },

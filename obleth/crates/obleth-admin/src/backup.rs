@@ -16,6 +16,7 @@ use obleth_config::{
 };
 use obleth_store::CryptoError;
 
+use crate::ssrf::SsrfPolicy;
 use crate::{
     audit_actor, resync_all_keys, sync_mcp_server, sync_model, AdminError, AdminState, Result,
 };
@@ -111,6 +112,11 @@ pub(crate) async fn restore_backup(
         }
     }
 
+    // Restored rows are dispatched to by the data plane and boons without any
+    // further check, so hold the whole document to the same destination policy
+    // the individual forms enforce — before the first write.
+    validate_backup_destinations(&state.ssrf, &body.data)?;
+
     let mut report = state.store.restore_backup_data(&body.data).await?;
 
     // A pepper mismatch can't be detected from the opaque hashes; surface it
@@ -182,4 +188,81 @@ fn contains_ciphertext(data: &BackupData) -> bool {
     data.models.iter().any(|m| enc(&m.api_key))
         || data.model_endpoints.iter().any(|e| enc(&e.api_key))
         || data.mcp_servers.iter().any(|s| enc(&s.auth_header))
+}
+
+/// Every outbound destination a restore would register, checked against the
+/// SSRF policy the create/update forms use. The first blocked entry fails the
+/// whole restore so nothing is written.
+fn validate_backup_destinations(policy: &SsrfPolicy, data: &BackupData) -> Result<()> {
+    let models = data
+        .models
+        .iter()
+        .map(|m| (format!("model '{}'", m.model_name), m.api_base.as_str()));
+    let endpoints = data
+        .model_endpoints
+        .iter()
+        .map(|e| (format!("endpoint '{}'", e.name), e.api_base.as_str()));
+    let mcp = data
+        .mcp_servers
+        .iter()
+        .map(|s| (format!("MCP server '{}'", s.name), s.upstream_url.as_str()));
+    validate_destinations(policy, models.chain(endpoints).chain(mcp))
+}
+
+fn validate_destinations<'a>(
+    policy: &SsrfPolicy,
+    targets: impl Iterator<Item = (String, &'a str)>,
+) -> Result<()> {
+    for (label, url) in targets {
+        // An empty URL is not a destination; older exports may carry one for
+        // rows that were never dispatched to.
+        if url.trim().is_empty() {
+            continue;
+        }
+        policy
+            .validate(url)
+            .map_err(|e| AdminError::BadRequest(format!("backup {label}: {e}")))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn check(url: &str) -> Result<()> {
+        validate_destinations(
+            &SsrfPolicy::default(),
+            std::iter::once(("model 'm'".to_string(), url)),
+        )
+    }
+
+    #[test]
+    fn metadata_destinations_fail_the_restore_with_the_entry_named() {
+        let err = check("http://169.254.169.254/latest/meta-data/").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("model 'm'"), "{msg}");
+        assert!(matches!(err, AdminError::BadRequest(_)));
+    }
+
+    #[test]
+    fn local_upstreams_and_empty_urls_pass() {
+        assert!(check("http://127.0.0.1:8000/v1").is_ok());
+        assert!(check("http://10.1.2.3:8000/v1").is_ok());
+        assert!(check("").is_ok());
+        assert!(check("   ").is_ok());
+    }
+
+    #[test]
+    fn stops_at_the_first_blocked_entry() {
+        let targets = vec![
+            ("model 'ok'".to_string(), "http://127.0.0.1:8000"),
+            ("endpoint 'bad'".to_string(), "http://[fe80::1]/"),
+            ("MCP server 'later'".to_string(), "http://169.254.169.254/"),
+        ];
+        let msg = validate_destinations(&SsrfPolicy::default(), targets.into_iter())
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("endpoint 'bad'"), "{msg}");
+    }
 }
