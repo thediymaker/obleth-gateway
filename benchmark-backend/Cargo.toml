@@ -1,6 +1,6 @@
 [package]
 name = "benchmark-backend"
-version = "0.9.6"
+version = "1.0.0"
 edition = "2021"
 license = "Apache-2.0"
 

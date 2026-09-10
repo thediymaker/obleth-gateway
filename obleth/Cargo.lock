@@ -1656,7 +1656,7 @@ dependencies = [
 
 [[package]]
 name = "obleth-admin"
-version = "0.9.6"
+version = "1.0.0"
 dependencies = [
  "arc-swap",
  "axum",
@@ -1687,7 +1687,7 @@ dependencies = [
 
 [[package]]
 name = "obleth-config"
-version = "0.9.6"
+version = "1.0.0"
 dependencies = [
  "chrono",
  "hex",
@@ -1702,7 +1702,7 @@ dependencies = [
 
 [[package]]
 name = "obleth-fairshare"
-version = "0.9.6"
+version = "1.0.0"
 dependencies = [
  "obleth-config",
  "serde",
@@ -1713,7 +1713,7 @@ dependencies = [
 
 [[package]]
 name = "obleth-provisioner"
-version = "0.9.6"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1730,7 +1730,7 @@ dependencies = [
 
 [[package]]
 name = "obleth-proxy"
-version = "0.9.6"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "obleth-redis"
-version = "0.9.6"
+version = "1.0.0"
 dependencies = [
  "futures-util",
  "obleth-config",
@@ -1790,7 +1790,7 @@ dependencies = [
 
 [[package]]
 name = "obleth-store"
-version = "0.9.6"
+version = "1.0.0"
 dependencies = [
  "aes-gcm",
  "base64 0.22.1",
@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "obleth-telemetry"
-version = "0.9.6"
+version = "1.0.0"
 dependencies = [
  "clickhouse",
  "obleth-config",
@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "obleth-tokenizer"
-version = "0.9.6"
+version = "1.0.0"
 dependencies = [
  "serde",
  "serde_json",

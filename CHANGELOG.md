@@ -4,7 +4,11 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
-## Unreleased
+## v1.0.0
+
+The 1.0 release: identity-provider tokens on the data plane, a security hardening pass across egress, filesystem, and browser policy, and a dedicated Playground for model comparison.
+
+> **⚠️ Required action when upgrading.** The Compose stack now publishes the Management API (9180), metrics (9091), Prometheus, and Jaeger host ports on 127.0.0.1 only. If you reached any of those from another machine, add your own port mapping in `docker-compose.override.yml` or route through the edge proxy. The data plane, dashboard, and edge proxy ports are unchanged. Kubernetes deployments are unaffected.
 
 - **Sign in with your identity provider's tokens.** The data plane accepts short-lived JWT access tokens from configured OIDC issuers (`OBLETH_JWT_ISSUERS`) alongside API keys. Tokens are verified offline against the issuer's cached signing keys; a verified identity maps to a per-user identity key under the configured tenant, created on first use, so tenant budgets, schedules, model allowlists, and disable all apply as they do to any key. Usage rows record the token's device id. Identity keys appear on the Keys pages with an `identity` badge.
 
