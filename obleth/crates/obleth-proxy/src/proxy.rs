@@ -15,9 +15,7 @@ use axum::extract::State;
 use axum::http::{header, HeaderMap, Method, Request, Response, StatusCode};
 use axum::response::IntoResponse;
 use futures_util::StreamExt;
-use obleth_config::{
-    hash_api_key, Admission, ResolvedEndpoint, ResolvedKey, ResolvedModel, UsageRecord,
-};
+use obleth_config::{Admission, ResolvedEndpoint, ResolvedKey, ResolvedModel, UsageRecord};
 use obleth_tokenizer::{CostEstimate, Tokenizer};
 use tokio::time::timeout;
 use tracing::Instrument;
@@ -98,12 +96,15 @@ async fn proxy_handler_inner(
     let Some(secret) = bearer(&headers) else {
         return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
     };
-    let hash = hash_api_key(&secret);
     let auth_start = crate::tracer::now_ms();
-    let resolved = match resolve_key(&state, &hash).await {
-        Some(r) => r,
-        None => return error_json(StatusCode::UNAUTHORIZED, "invalid api key"),
-    };
+    // Shared with the MCP handler (`crate::mcp::mcp_handler`) so both surfaces
+    // authenticate identically: JWT path when the feature is on and the
+    // credential looks like a JWT, else the existing secret-key path.
+    let (resolved, device_id, auth_kind) =
+        match crate::jwt_auth::authenticate_credential(&state, &secret).await {
+            Ok(cred) => (cred.resolved, cred.device_id, cred.auth_kind),
+            Err(resp) => return resp,
+        };
     let auth_duration = (crate::tracer::now_ms() - auth_start) as u32;
     if resolved.disabled {
         return error_json(StatusCode::FORBIDDEN, "api key disabled");
@@ -158,6 +159,7 @@ async fn proxy_handler_inner(
             serde_json::json!({
                 "tenant": resolved.tenant_name,
                 "tenant_id": resolved.tenant_id.to_string(),
+                "auth": auth_kind,
             }),
         );
     }
@@ -229,6 +231,7 @@ async fn proxy_handler_inner(
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
         request_type: effective_request_type(&resolved, &path),
+        device_id,
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
     // grouping (the field is declared Empty on the #[instrument] below).
@@ -1900,16 +1903,25 @@ async fn settle_request(
 /// Resolve a key via moka, falling back to Redis and caching the result.
 #[tracing::instrument(skip_all, name = "auth_resolve")]
 pub(crate) async fn resolve_key(state: &AppState, hash: &str) -> Option<Arc<ResolvedKey>> {
+    try_resolve_key(state, hash).await.unwrap_or(None)
+}
+
+/// Like [`resolve_key`], but distinguishes a Redis error from a miss so callers
+/// that would otherwise treat "unknown" as "first sight" can fail closed instead.
+pub(crate) async fn try_resolve_key(
+    state: &AppState,
+    hash: &str,
+) -> Result<Option<Arc<ResolvedKey>>, ()> {
     if let Some(r) = state.key_cache.get(hash).await {
-        return Some(r);
+        return Ok(Some(r));
     }
     match state.redis.get_resolved_key(hash).await {
         Ok(Some(r)) => {
             let r = Arc::new(r);
             state.key_cache.insert(hash.to_string(), r.clone()).await;
-            Some(r)
+            Ok(Some(r))
         }
-        Ok(None) => None,
+        Ok(None) => Ok(None),
         Err(e) => {
             tracing::warn!(error = %e, "redis key lookup failed");
             state.alerts.issue(
@@ -1917,7 +1929,7 @@ pub(crate) async fn resolve_key(state: &AppState, hash: &str) -> Option<Arc<Reso
                 "Redis key lookup failed",
                 format!("API key resolution failed against Redis: {e}"),
             );
-            None
+            Err(())
         }
     }
 }
@@ -2872,6 +2884,8 @@ struct RequestMeta {
     /// tenants' requests are stamped `benchmark` instead (see
     /// [`effective_request_type`]).
     request_type: &'static str,
+    /// Device id from the bearer token (identity-key requests), else empty.
+    device_id: String,
 }
 
 /// Classify a request by its OpenAI-style path suffix. Matching the suffix (not
@@ -3109,6 +3123,7 @@ fn finalize(
         session_id: meta.session_id.clone(),
         session_id_source: meta.session_id_source.to_string(),
         request_type: meta.request_type.to_string(),
+        device_id: meta.device_id.clone(),
     });
 }
 
@@ -3150,7 +3165,7 @@ mod tests {
     use super::{
         backoff_for, build_targets, build_upstream_url, effective_request_type, has_path_traversal,
         is_models_endpoint, is_retryable_status, prepare_upstream_body, request_type_for_path,
-        resolve_conversation, session_hash_order, tenant_active_now, weighted_order,
+        resolve_conversation, session_hash_order, tenant_active_now, weighted_order, RequestMeta,
     };
     use axum::http::HeaderMap;
     use chrono::{DateTime, TimeZone, Utc};
@@ -3873,5 +3888,27 @@ mod tests {
             after[0].base, survivor,
             "re-pinned to the survivor, not the global fallback"
         );
+    }
+
+    #[test]
+    fn credential_routing_prefers_key_path_for_secret_keys() {
+        // A minted secret must never be mistaken for a JWT even if it were to
+        // contain dots; and a JWT must never be hashed as a secret.
+        let secret = obleth_config::generate_api_key().secret;
+        assert!(!crate::jwt_auth::looks_like_jwt(&secret));
+        assert!(crate::jwt_auth::looks_like_jwt(
+            "eyJhbGciOiJFUzI1NiJ9.eyJpc3MiOiJ4In0.c2ln"
+        ));
+    }
+
+    #[test]
+    fn request_meta_carries_device_id_into_usage_record() {
+        let meta = RequestMeta {
+            session_id: String::new(),
+            session_id_source: "none",
+            request_type: "chat",
+            device_id: "dev-1".into(),
+        };
+        assert_eq!(meta.device_id, "dev-1");
     }
 }

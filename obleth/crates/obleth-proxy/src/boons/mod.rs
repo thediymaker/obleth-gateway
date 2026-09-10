@@ -731,6 +731,7 @@ pub(crate) fn bill_helper_call(
         session_id: session_id.to_string(),
         session_id_source: "none".to_string(),
         request_type: request_type.to_string(),
+        device_id: String::new(),
     });
 }
 

@@ -12,6 +12,7 @@ stringData:
   OBLETH_SLACK_WEBHOOK_URL: {{ .Values.obleth.slackWebhookUrl | quote }}
   OBLETH_ENCRYPTION_KEY: {{ .Values.obleth.encryptionKey | quote }}
   OBLETH_API_KEY_PEPPER: {{ .Values.obleth.apiKeyPepper | quote }}
+  OBLETH_JWT_ISSUERS: {{ .Values.obleth.jwtIssuers | quote }}
 ---
 {{- end }}
 apiVersion: apps/v1

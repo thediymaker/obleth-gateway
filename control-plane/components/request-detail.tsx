@@ -574,6 +574,7 @@ function UsageDetailCard({ row, withTrace }: { row: UsageLogEntry; withTrace?: b
       <dl className="grid grid-cols-2 gap-x-8 gap-y-1 text-xs sm:grid-cols-3 lg:grid-cols-4">
         <DetailRow label="Request ID" value={row.request_id} mono />
         <DetailRow label="Session" value={row.session_id} mono />
+        {row.device_id && <DetailRow label="Device" value={row.device_id} mono />}
         <DetailRow label="Model" value={row.model} />
         <DetailRow label="Status" value={String(row.status_code)} />
         <DetailRow label="Input tokens" value={row.input_tokens.toLocaleString()} mono />

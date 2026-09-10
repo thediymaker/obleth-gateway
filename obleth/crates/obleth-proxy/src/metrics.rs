@@ -23,6 +23,8 @@ pub struct Metrics {
     pub(crate) compression_tokens_saved: IntCounter,
     mcp_requests: IntCounterVec,
     upstream_attempts: IntCounterVec,
+    jwt_verify: IntCounterVec,
+    jwks_refresh: IntCounterVec,
 }
 
 impl Metrics {
@@ -106,6 +108,22 @@ impl Metrics {
             &["outcome"],
         )
         .unwrap();
+        let jwt_verify = IntCounterVec::new(
+            Opts::new(
+                "obleth_jwt_verify_total",
+                "JWT bearer verification outcomes; not_provisioned/provision_failed are post-verification outcomes counted in addition to ok",
+            ),
+            &["result"],
+        )
+        .unwrap();
+        let jwks_refresh = IntCounterVec::new(
+            Opts::new(
+                "obleth_jwks_refresh_total",
+                "JWKS fetch outcomes per configured issuer index",
+            ),
+            &["issuer_index", "result"],
+        )
+        .unwrap();
 
         registry.register(Box::new(requests.clone())).unwrap();
         registry.register(Box::new(tokens_in.clone())).unwrap();
@@ -126,6 +144,8 @@ impl Metrics {
         registry
             .register(Box::new(upstream_attempts.clone()))
             .unwrap();
+        registry.register(Box::new(jwt_verify.clone())).unwrap();
+        registry.register(Box::new(jwks_refresh.clone())).unwrap();
 
         Metrics {
             registry,
@@ -142,6 +162,8 @@ impl Metrics {
             compression_tokens_saved,
             mcp_requests,
             upstream_attempts,
+            jwt_verify,
+            jwks_refresh,
         }
     }
 
@@ -189,6 +211,16 @@ impl Metrics {
         self.telemetry_dropped.set(telemetry_dropped as i64);
     }
 
+    pub fn record_jwt_verify(&self, result: &str) {
+        self.jwt_verify.with_label_values(&[result]).inc();
+    }
+
+    pub fn record_jwks_refresh(&self, issuer_idx: usize, result: &str) {
+        self.jwks_refresh
+            .with_label_values(&[&issuer_idx.to_string(), result])
+            .inc();
+    }
+
     pub fn encode(&self) -> String {
         let encoder = TextEncoder::new();
         encoder
@@ -214,5 +246,17 @@ mod tests {
         m.record_compression_saved(30);
         // Exposed via the gather/encode path; assert the counter value directly.
         assert_eq!(m.compression_tokens_saved.get(), 150);
+    }
+
+    #[test]
+    fn jwt_counters_render() {
+        let m = Metrics::new();
+        m.record_jwt_verify("ok");
+        m.record_jwt_verify("expired");
+        m.record_jwks_refresh(0, "ok");
+        let text = m.encode();
+        assert!(text.contains("obleth_jwt_verify_total{result=\"ok\"} 1"));
+        assert!(text.contains("obleth_jwt_verify_total{result=\"expired\"} 1"));
+        assert!(text.contains("obleth_jwks_refresh_total{issuer_index=\"0\",result=\"ok\"} 1"));
     }
 }

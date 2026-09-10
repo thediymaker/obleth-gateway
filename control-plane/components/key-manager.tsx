@@ -47,6 +47,7 @@ import { Select } from "@/components/ui/select";
 import { FormSelect } from "@/components/ui/form-select";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ApiKey, KeyUsageSummary, Tenant } from "@/lib/obleth";
+import { describeIdentityKey } from "@/lib/key-kind";
 import { cn, formatCurrency, formatNumber } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 
@@ -132,7 +133,8 @@ export function KeyManager({
         key.key_prefix.toLowerCase().includes(q) ||
         key.name.toLowerCase().includes(q) ||
         description.toLowerCase().includes(q) ||
-        tenantName.toLowerCase().includes(q)
+        tenantName.toLowerCase().includes(q) ||
+        (key.identity_subject ?? "").toLowerCase().includes(q)
       );
     });
   }, [rows, query, tenantFilter, statusFilter, budgetFilter]);
@@ -472,6 +474,7 @@ export function KeyManager({
                   {pageRows.map((row) => {
                     const { key } = row;
                     const expanded = expandedId === key.id;
+                    const identity = describeIdentityKey(key);
                     return (
                       <Fragment key={key.id}>
                         <tr className={cn("border-b border-border/70", expanded && "bg-foreground/[0.03]")}>
@@ -503,7 +506,16 @@ export function KeyManager({
                           </td>
                           <td className="px-3 py-2">
                             <p className="truncate font-medium">{key.name}</p>
-                            <p className="truncate font-mono text-[11px] text-muted-foreground">{key.key_prefix}...</p>
+                            {identity.isIdentity ? (
+                              <div className="flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground">
+                                <Badge className="border-sky-500/40 text-sky-500">identity</Badge>
+                                <span className="truncate" title={`${identity.subject} · ${identity.issuerHost}`}>
+                                  {identity.subject} · {identity.issuerHost}
+                                </span>
+                              </div>
+                            ) : (
+                              <p className="truncate font-mono text-[11px] text-muted-foreground">{key.key_prefix}...</p>
+                            )}
                           </td>
                           <td className="px-3 py-2">
                             <Badge className={key.disabled ? "opacity-50" : "border-emerald-500/40 text-emerald-500"}>

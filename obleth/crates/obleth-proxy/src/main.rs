@@ -6,6 +6,7 @@
 
 mod completion;
 mod energy;
+mod jwt_auth;
 mod mcp;
 mod metrics;
 mod output_monitor;
@@ -200,6 +201,67 @@ async fn main() -> anyhow::Result<()> {
         tracing::info!("alerting enabled");
     }
 
+    // JWT bearer auth: trusted issuers from OBLETH_JWT_ISSUERS. JWKS URLs pass
+    // the same destination policy as any operator-supplied upstream, discovery
+    // resolves `jwks_uri` for issuers configured without one, and the first
+    // fetch happens here so the path is live before the listener opens. A
+    // fetch failure at boot is logged (and alerted) but does not abort: the
+    // background refresh keeps retrying and the key path is unaffected.
+    let jwt = if cfg.jwt_issuers.is_empty() {
+        None
+    } else {
+        let ssrf = obleth_admin::ssrf::SsrfPolicy::from_env();
+        let mut issuers = cfg.jwt_issuers.clone();
+        for i in issuers.iter_mut() {
+            if i.jwks_url.is_none() {
+                let url = format!(
+                    "{}/.well-known/openid-configuration",
+                    i.issuer.trim_end_matches('/')
+                );
+                if let Err(e) = ssrf.validate(&url) {
+                    anyhow::bail!(
+                        "OBLETH_JWT_ISSUERS: issuer {} rejected by destination policy: {e}",
+                        i.issuer
+                    );
+                }
+                let doc = http
+                    .get(&url)
+                    .timeout(Duration::from_secs(10))
+                    .send()
+                    .await
+                    .and_then(|r| r.error_for_status());
+                match doc {
+                    Ok(r) => match r.json::<serde_json::Value>().await {
+                        Ok(v) => match v.get("jwks_uri").and_then(|u| u.as_str()) {
+                            Some(u) => i.jwks_url = Some(u.to_string()),
+                            None => anyhow::bail!("OBLETH_JWT_ISSUERS: discovery document for {} has no jwks_uri; set jwks_url explicitly", i.issuer),
+                        },
+                        Err(e) => anyhow::bail!("OBLETH_JWT_ISSUERS: discovery document for {} unreadable ({e}); set jwks_url explicitly", i.issuer),
+                    },
+                    Err(e) => anyhow::bail!("OBLETH_JWT_ISSUERS: discovery fetch for {} failed ({e}); set jwks_url explicitly", i.issuer),
+                }
+            }
+            let jwks_url = i.jwks_url.as_deref().expect("resolved above");
+            if let Err(e) = ssrf.validate(jwks_url) {
+                anyhow::bail!(
+                    "OBLETH_JWT_ISSUERS: jwks_url {jwks_url} rejected by destination policy: {e}"
+                );
+            }
+        }
+        let verifier =
+            jwt_auth::JwksVerifier::new(issuers, http.clone(), metrics.clone(), alerts.clone());
+        for idx in 0..cfg.jwt_issuers.len() {
+            if verifier.refresh_issuer(idx).await {
+                tracing::info!(issuer = %cfg.jwt_issuers[idx].issuer, "jwks loaded");
+            } else {
+                tracing::warn!(issuer = %cfg.jwt_issuers[idx].issuer, "jwks not loaded at boot; tokens from this issuer are rejected until the next successful refresh");
+            }
+        }
+        verifier.spawn_refresh();
+        tracing::info!(issuers = cfg.jwt_issuers.len(), "jwt bearer auth enabled");
+        Some(jwt_auth::JwtAuth::new(verifier, store.clone()))
+    };
+
     let app_state = AppState {
         redis: redis.clone(),
         fairshare: fairshare.clone(),
@@ -228,6 +290,7 @@ async fn main() -> anyhow::Result<()> {
             .unwrap_or(true),
         compressor: crate::boons::compressor::CompressorClient::from_env(),
         energy: energy.clone(),
+        jwt,
     };
 
     match store.all_resolved_models().await {

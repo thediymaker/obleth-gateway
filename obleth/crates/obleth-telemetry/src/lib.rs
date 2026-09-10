@@ -60,6 +60,7 @@ struct UsageRow<'a> {
     session_id: &'a str,
     session_id_source: &'a str,
     request_type: &'a str,
+    device_id: &'a str,
 }
 
 impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
@@ -87,6 +88,7 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             session_id: &r.session_id,
             session_id_source: &r.session_id_source,
             request_type: &r.request_type,
+            device_id: &r.device_id,
         }
     }
 }
@@ -484,6 +486,7 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
             session_id String DEFAULT '',
             session_id_source LowCardinality(String) DEFAULT '',
             request_type LowCardinality(String) DEFAULT '',
+            device_id String DEFAULT '',
             ts DateTime64(3) MATERIALIZED fromUnixTimestamp64Milli(ts_ms),
             INDEX idx_ts_ms ts_ms TYPE minmax GRANULARITY 4
         ) ENGINE = MergeTree()
@@ -547,6 +550,13 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
     client
         .query(&format!(
             "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS request_type LowCardinality(String) DEFAULT ''"
+        ))
+        .execute()
+        .await?;
+    // Idempotent add for databases created before per-device attribution.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage ADD COLUMN IF NOT EXISTS device_id String DEFAULT ''"
         ))
         .execute()
         .await?;
@@ -756,9 +766,11 @@ mod conv_tests {
             session_id: "abc".into(),
             session_id_source: "derived".into(),
             request_type: "chat".into(),
+            device_id: "dev-1".into(),
         };
         let row = UsageRow::from(&rec);
         assert_eq!(row.session_id_source, "derived");
+        assert_eq!(row.device_id, "dev-1");
     }
 
     #[test]
@@ -786,6 +798,7 @@ mod conv_tests {
             session_id: "abc".into(),
             session_id_source: "derived".into(),
             request_type: "chat".into(),
+            device_id: "dev-1".into(),
         };
         rec.energy_wh = 1.5;
         rec.energy_cost_usd = 0.0002;

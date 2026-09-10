@@ -81,6 +81,12 @@ export interface ApiKey {
   name: string;
   description: string;
   key_prefix: string;
+  /** `secret` (minted) or `identity` (stands for a verified JWT identity; no secret exists). */
+  kind: "secret" | "identity";
+  identity_issuer: string | null;
+  /** Contract field: external account systems join on it. */
+  identity_subject: string | null;
+  identity_claims: Record<string, unknown> | null;
   budget_tokens: number | null;
   budget_cost_usd: number | null;
   budget_period: string | null;
@@ -453,6 +459,7 @@ export interface UsageLogEntry {
   request_type: string;
   session_id: string;
   session_id_source: string;
+  device_id: string;
   admission: string;
   status_code: number;
   input_tokens: number;
@@ -491,6 +498,7 @@ export interface UsageLogParams {
   model?: string;
   requestType?: string;
   sessionId?: string;
+  deviceId?: string;
   status?: UsageLogStatus;
   requestId?: string;
   sinceMs?: number;
@@ -1573,6 +1581,7 @@ export const obleth = {
         model: params.model,
         request_type: params.requestType,
         session_id: params.sessionId,
+        device_id: params.deviceId,
         status: params.status,
         request_id: params.requestId,
         since_ms: params.sinceMs,

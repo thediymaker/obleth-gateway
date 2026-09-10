@@ -18,7 +18,7 @@ use futures_util::StreamExt;
 use obleth_config::ResolvedMcpServer;
 use std::sync::Arc;
 
-use crate::proxy::{bearer, error_json, forward_headers, has_path_traversal, resolve_key};
+use crate::proxy::{bearer, error_json, forward_headers, has_path_traversal};
 use crate::state::AppState;
 
 const MCP_BODY_LIMIT: usize = 16 * 1024 * 1024;
@@ -40,13 +40,14 @@ pub async fn mcp_handler(
         }
     }
 
-    // ---- auth (same obleth API key as the data plane) ----
+    // ---- auth: same bearer credential the data plane accepts, JWT or
+    // secret key (`crate::jwt_auth::authenticate_credential`) ----
     let Some(secret) = bearer(&headers) else {
         return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
     };
-    let hash = obleth_config::hash_api_key(&secret);
-    let Some(resolved) = resolve_key(&state, &hash).await else {
-        return error_json(StatusCode::UNAUTHORIZED, "invalid api key");
+    let resolved = match crate::jwt_auth::authenticate_credential(&state, &secret).await {
+        Ok(cred) => cred.resolved,
+        Err(resp) => return resp,
     };
     if resolved.disabled {
         return error_json(StatusCode::FORBIDDEN, "api key disabled");

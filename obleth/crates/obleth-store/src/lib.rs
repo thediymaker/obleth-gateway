@@ -6,9 +6,10 @@
 
 use chrono::{DateTime, Utc};
 use obleth_config::{
-    generate_api_key, ApiKey, FairshareGroup, ManagedModelSpec, McpServer, ModelEndpoint,
-    ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelReplica, ModelRoute,
-    ResolvedEndpoint, ResolvedKey, ResolvedMcpServer, ResolvedModel, Tenant, WeeklyWindow,
+    generate_api_key, ApiKey, FairshareGroup, IdentityProvision, ManagedModelSpec, McpServer,
+    ModelEndpoint, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelReplica,
+    ModelRoute, ProvisionedIdentity, ResolvedEndpoint, ResolvedKey, ResolvedMcpServer,
+    ResolvedModel, Tenant, WeeklyWindow,
 };
 use sqlx::postgres::{PgPool, PgPoolOptions, PgRow};
 use sqlx::Row;
@@ -71,6 +72,7 @@ const SCHEMA_V12: &str =
 const SCHEMA_V13: &str = include_str!("../../../../schema/postgres/0013_compression_policy.sql");
 const SCHEMA_V14: &str = include_str!("../../../../schema/postgres/0014_model_energy_slots.sql");
 const SCHEMA_V15: &str = include_str!("../../../../schema/postgres/0015_tenant_synthetic.sql");
+const SCHEMA_V16: &str = include_str!("../../../../schema/postgres/0016_api_keys_identity.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -183,6 +185,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V13).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V14).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V15).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V16).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -325,6 +328,17 @@ impl Store {
         .await?
         .ok_or(StoreError::NotFound)?;
         tenant_from_row(&row)
+    }
+
+    pub async fn tenant_by_name(&self, name: &str) -> Result<Option<Tenant>> {
+        let row = sqlx::query(
+            "select id, name, fairshare_group, weight, tokens_per_minute, max_in_flight, description, organization, contact_email, status, timezone, active_from, active_until, weekly_windows, budget_tokens, budget_cost_usd, budget_period, budget_started_at, allowed_models, guardrails_policy, compression_policy, tracing_enabled, synthetic, created_at, updated_at
+             from tenants where name = $1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.as_ref().map(tenant_from_row).transpose()
     }
 
     pub async fn update_tenant_weight(&self, id: Uuid, weight: i64) -> Result<Tenant> {
@@ -582,7 +596,8 @@ impl Store {
              values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
              returning id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, tracing_enabled, created_at, updated_at",
+                    disabled, tracing_enabled, created_at, updated_at,
+                    kind, identity_issuer, identity_subject, identity_claims",
         )
         .bind(Uuid::new_v4())
         .bind(tenant_id)
@@ -597,6 +612,179 @@ impl Store {
         .fetch_one(&self.pool)
         .await?;
         Ok((api_key_from_row(&row)?, gen.secret))
+    }
+
+    /// Ensure the identity key for (issuer, subject) exists under `tenant_name`
+    /// and return its hot-path view. Idempotent and safe under concurrency:
+    /// the tenant lookup-or-create runs under an advisory lock keyed by the
+    /// tenant name, and the key insert conflicts on the partial unique index
+    /// `(identity_issuer, identity_subject) where kind = 'identity'`.
+    pub async fn provision_identity_key(
+        &self,
+        p: IdentityProvision<'_>,
+    ) -> Result<ProvisionedIdentity> {
+        // `tenant_name` comes straight from `OBLETH_JWT_ISSUERS` config, not
+        // from anything validated at boot against reserved names. Without
+        // this check, a config value equal to the reserved control-plane
+        // tenant's name would try to fold externally authenticated CLI/IdP
+        // traffic into Charo's reserved identity (`ensure_control_plane_identity`),
+        // whose tenant is hidden from and protected against the normal
+        // management surfaces -- exactly the kind of silent misrouting this
+        // whole feature's tenant-mismatch alerting exists to catch.
+        if let Some(existing) = self.tenant_by_name(p.tenant_name).await? {
+            if existing.id == Self::CONTROL_PLANE_TENANT_ID {
+                return Err(StoreError::Protected(
+                    "identity keys cannot be provisioned into the reserved control-plane tenant"
+                        .into(),
+                ));
+            }
+        }
+
+        let hash = obleth_config::identity_key_hash(p.issuer, p.subject);
+
+        // Fast path: already provisioned.
+        if let Some(resolved) = self.resolved_key_by_hash(&hash).await? {
+            return Ok(ProvisionedIdentity {
+                hash,
+                resolved,
+                tenant_created: false,
+                key_created: false,
+            });
+        }
+
+        let mut tx = self.pool.begin().await?;
+        // Serialise tenant lookup-or-create per name so racing first requests
+        // cannot both insert (tenants.name is unique; this avoids surfacing
+        // that as an error to one of them).
+        sqlx::query("select pg_advisory_xact_lock(hashtext($1))")
+            .bind(p.tenant_name)
+            .execute(&mut *tx)
+            .await?;
+        let existing: Option<Uuid> = sqlx::query("select id from tenants where name = $1")
+            .bind(p.tenant_name)
+            .fetch_optional(&mut *tx)
+            .await?
+            .map(|r| r.try_get("id"))
+            .transpose()?;
+        let (tenant_id, tenant_created) = match existing {
+            Some(id) => {
+                // Re-check inside the transaction: the pre-transaction lookup
+                // above is not atomic with this one, so a rename racing this
+                // call could otherwise slip an identity key into the reserved
+                // tenant between the two reads.
+                if id == Self::CONTROL_PLANE_TENANT_ID {
+                    return Err(StoreError::Protected(
+                        "identity keys cannot be provisioned into the reserved control-plane tenant"
+                            .into(),
+                    ));
+                }
+                (id, false)
+            }
+            None => {
+                let id = Uuid::new_v4();
+                sqlx::query(
+                    "insert into tenants (id, name, fairshare_group, weight, tokens_per_minute)
+                     values ($1, $2, 'default', 100, 0)",
+                )
+                .bind(id)
+                .bind(p.tenant_name)
+                .execute(&mut *tx)
+                .await?;
+                Self::record_audit_tx(
+                    &mut tx,
+                    "identity-provisioning",
+                    "create_tenant",
+                    "tenant",
+                    &id.to_string(),
+                    serde_json::json!({
+                        "name": p.tenant_name,
+                        "issuer": p.issuer,
+                        "source": "jwt_jit",
+                    }),
+                )
+                .await?;
+                (id, true)
+            }
+        };
+        let prefix = truncate_chars(&format!("jwt:{}", p.subject), 64);
+        let name = format!("{}-cli", p.subject);
+        let claims = match p.claims {
+            serde_json::Value::Null => None,
+            v => Some(sqlx::types::Json(v)),
+        };
+        let key_row = sqlx::query(
+            "insert into api_keys (id, tenant_id, name, description, key_prefix, key_hash,
+                    kind, identity_issuer, identity_subject, identity_claims)
+             values ($1, $2, $3, '', $4, $5, 'identity', $6, $7, $8)
+             on conflict (identity_issuer, identity_subject) where kind = 'identity'
+             do update set key_hash = excluded.key_hash, updated_at = now()
+             returning id, (xmax = 0) as inserted",
+        )
+        .bind(Uuid::new_v4())
+        .bind(tenant_id)
+        .bind(&name)
+        .bind(&prefix)
+        .bind(&hash)
+        .bind(p.issuer)
+        .bind(p.subject)
+        .bind(claims)
+        .fetch_one(&mut *tx)
+        .await?;
+        let key_id: Uuid = key_row.try_get("id")?;
+        let inserted: bool = key_row.try_get("inserted")?;
+        if inserted {
+            Self::record_audit_tx(
+                &mut tx,
+                "identity-provisioning",
+                "create_key",
+                "api_key",
+                &key_id.to_string(),
+                serde_json::json!({
+                    "tenant_id": tenant_id,
+                    "kind": "identity",
+                    "issuer": p.issuer,
+                    "subject": p.subject,
+                }),
+            )
+            .await?;
+        }
+        tx.commit().await?;
+
+        let resolved = self
+            .resolved_key_by_hash(&hash)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        Ok(ProvisionedIdentity {
+            hash,
+            resolved,
+            tenant_created,
+            key_created: inserted,
+        })
+    }
+
+    /// Same insert as [`Store::record_audit`], but runs inside the caller's
+    /// transaction so the audit row commits atomically with the mutation it
+    /// describes (or rolls back with it).
+    async fn record_audit_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        actor: &str,
+        action: &str,
+        entity_type: &str,
+        entity_id: &str,
+        detail: serde_json::Value,
+    ) -> Result<()> {
+        sqlx::query(
+            "insert into audit_log (actor, action, entity_type, entity_id, detail)
+             values ($1, $2, $3, $4, $5)",
+        )
+        .bind(actor)
+        .bind(action)
+        .bind(entity_type)
+        .bind(entity_id)
+        .bind(detail)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 
     /// Well-known id for the reserved control-plane tenant that powers Charo,
@@ -735,7 +923,8 @@ impl Store {
                 sqlx::query(
                     "select id, tenant_id, name, description, key_prefix,
                             budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                            disabled, tracing_enabled, created_at, updated_at
+                            disabled, tracing_enabled, created_at, updated_at,
+                            kind, identity_issuer, identity_subject, identity_claims
                      from api_keys where tenant_id = $1 order by created_at",
                 )
                 .bind(t)
@@ -746,7 +935,8 @@ impl Store {
                 sqlx::query(
                     "select id, tenant_id, name, description, key_prefix,
                             budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                            disabled, tracing_enabled, created_at, updated_at
+                            disabled, tracing_enabled, created_at, updated_at,
+                            kind, identity_issuer, identity_subject, identity_claims
                      from api_keys order by created_at",
                 )
                 .fetch_all(&self.pool)
@@ -766,7 +956,8 @@ impl Store {
         let rows = sqlx::query(
             "select id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, tracing_enabled, created_at, updated_at
+                    disabled, tracing_enabled, created_at, updated_at,
+                    kind, identity_issuer, identity_subject, identity_claims
              from api_keys where id = any($1)",
         )
         .bind(ids)
@@ -799,7 +990,8 @@ impl Store {
              where id = $1
              returning key_hash, id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
-                    disabled, tracing_enabled, created_at, updated_at",
+                    disabled, tracing_enabled, created_at, updated_at,
+                    kind, identity_issuer, identity_subject, identity_claims",
         )
         .bind(id)
         .bind(name)
@@ -2956,13 +3148,32 @@ fn fairshare_group_from_row(row: &PgRow) -> Result<FairshareGroup> {
     })
 }
 
+/// Truncate to at most `max` chars without splitting a multi-byte character.
+/// `str::truncate` panics on a byte index that isn't a char boundary, which a
+/// naive `prefix.truncate(64)` risks when the source is an IdP-controlled
+/// `sub` claim (not guaranteed ASCII).
+fn truncate_chars(s: &str, max: usize) -> String {
+    s.char_indices()
+        .nth(max)
+        .map(|(i, _)| s[..i].to_string())
+        .unwrap_or_else(|| s.to_string())
+}
+
 fn api_key_from_row(row: &PgRow) -> Result<ApiKey> {
+    let claims: Option<sqlx::types::Json<serde_json::Value>> =
+        row.try_get("identity_claims").unwrap_or(None);
     Ok(ApiKey {
         id: row.try_get("id")?,
         tenant_id: row.try_get("tenant_id")?,
         name: row.try_get("name")?,
         description: row.try_get("description")?,
         key_prefix: row.try_get("key_prefix")?,
+        kind: row
+            .try_get("kind")
+            .unwrap_or_else(|_| obleth_config::API_KEY_KIND_SECRET.to_string()),
+        identity_issuer: row.try_get("identity_issuer").unwrap_or(None),
+        identity_subject: row.try_get("identity_subject").unwrap_or(None),
+        identity_claims: claims.map(|j| j.0),
         budget_tokens: row.try_get("budget_tokens")?,
         budget_cost_usd: row.try_get("budget_cost_usd")?,
         budget_period: row.try_get("budget_period")?,
@@ -3255,6 +3466,23 @@ fn model_health_claim_from_row(row: &PgRow) -> Result<ModelHealthClaim> {
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
+    use std::sync::OnceLock;
+
+    /// Serialises integration tests so DDL from `migrate()` never races with
+    /// DML from a concurrently running test, and so two tests that each touch
+    /// every row in a table (`export_backup_data`/`restore_backup_data` are
+    /// whole-database, not scoped to one test's own fixtures) can't race each
+    /// other's snapshots. Shared across every `#[cfg(test)] mod tests` in this
+    /// crate (this module, `lib.rs`, and `backup.rs`) rather than one static
+    /// per file, since a private static per module does not serialise across
+    /// modules -- exactly the gap that let `backup.rs`'s DB tests run
+    /// concurrently with `lib.rs`'s despite the latter already holding a lock.
+    /// Each DB-backed test must hold this for its full duration, including
+    /// the `migrate()` call.
+    static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    pub(crate) fn serial() -> &'static tokio::sync::Mutex<()> {
+        SERIAL.get_or_init(tokio::sync::Mutex::default)
+    }
 
     /// Reads OBLETH_TEST_DATABASE_URL for an integration test. Returns None when
     /// unset (the test skips). Panics if it IS set but the database name doesn't
@@ -3363,16 +3591,29 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use obleth_config::hash_api_key;
-    use std::sync::OnceLock;
 
-    use super::test_support::FixtureGuard;
+    use obleth_config::API_KEY_KIND_IDENTITY;
 
-    // Serialise integration tests so DDL from migrate() never races with DML
-    // from a concurrently running test. Each test must hold this guard for its
-    // full duration (including the migrate() call).
-    static SERIAL: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-    fn serial() -> &'static tokio::sync::Mutex<()> {
-        SERIAL.get_or_init(tokio::sync::Mutex::default)
+    use super::test_support::{serial, FixtureGuard};
+
+    /// No DB needed. `truncate_chars` must never split a multi-byte char —
+    /// `p.subject` in `provision_identity_key` is an IdP-controlled `sub`
+    /// claim with no guarantee of being ASCII.
+    #[test]
+    fn truncate_chars_respects_char_boundaries() {
+        assert_eq!(truncate_chars("short", 64), "short");
+        let exactly_64 = "a".repeat(64);
+        assert_eq!(truncate_chars(&exactly_64, 64), exactly_64);
+        let long_ascii = "a".repeat(100);
+        assert_eq!(truncate_chars(&long_ascii, 64), "a".repeat(64));
+
+        // 70 multi-byte chars ('é' is 2 bytes in UTF-8): truncating at byte
+        // index 64 would split the 33rd char and panic; truncating at char
+        // index 64 must not.
+        let multibyte = "é".repeat(70);
+        let truncated = truncate_chars(&multibyte, 64);
+        assert_eq!(truncated.chars().count(), 64);
+        assert_eq!(truncated, "é".repeat(64));
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` points at a
@@ -5116,5 +5357,164 @@ mod tests {
             .execute(&store.pool)
             .await
             .ok();
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Verifies `provision_identity_key` is idempotent (same identity ⇒ same
+    /// key, no duplicate tenant) and safe under concurrent first-sight
+    /// provisioning of the same identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provision_identity_key_is_idempotent_and_concurrent_safe() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        let mut guard = FixtureGuard::new(&store);
+        let tenant_name = format!("t-idp-{}", Uuid::new_v4());
+        let issuer = "https://idp.example.com";
+        let subject = format!("alice-{}", Uuid::new_v4());
+
+        let first = store
+            .provision_identity_key(IdentityProvision {
+                issuer,
+                subject: &subject,
+                tenant_name: &tenant_name,
+                claims: serde_json::json!({ "uid": "u-1" }),
+            })
+            .await
+            .unwrap();
+        guard.track_tenant(first.resolved.tenant_id);
+        assert!(first.tenant_created);
+        assert!(first.key_created);
+        assert_eq!(
+            first.hash,
+            obleth_config::identity_key_hash(issuer, &subject)
+        );
+        assert_eq!(first.resolved.tenant_name, tenant_name);
+
+        // Same identity again: no new tenant, no new key, same key id.
+        let second = store
+            .provision_identity_key(IdentityProvision {
+                issuer,
+                subject: &subject,
+                tenant_name: &tenant_name,
+                claims: serde_json::json!({ "uid": "u-1" }),
+            })
+            .await
+            .unwrap();
+        assert!(!second.tenant_created);
+        assert!(!second.key_created);
+        assert_eq!(second.resolved.key_id, first.resolved.key_id);
+
+        // Concurrent first-sight of a *different* subject yields exactly one row.
+        let subject2 = format!("bob-{}", Uuid::new_v4());
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let tenant_name = tenant_name.clone();
+            let subject2 = subject2.clone();
+            handles.push(tokio::spawn(async move {
+                store
+                    .provision_identity_key(IdentityProvision {
+                        issuer,
+                        subject: &subject2,
+                        tenant_name: &tenant_name,
+                        claims: serde_json::Value::Null,
+                    })
+                    .await
+                    .unwrap()
+                    .resolved
+                    .key_id
+            }));
+        }
+        let mut ids = std::collections::HashSet::new();
+        for h in handles {
+            ids.insert(h.await.unwrap());
+        }
+        assert_eq!(ids.len(), 1, "concurrent upserts must converge on one key");
+
+        // The row is a real key: list_keys shows kind = identity with the subject.
+        let keys = store
+            .list_keys(Some(first.resolved.tenant_id))
+            .await
+            .unwrap();
+        let k = keys.iter().find(|k| k.id == first.resolved.key_id).unwrap();
+        assert_eq!(k.kind, API_KEY_KIND_IDENTITY);
+        assert_eq!(k.identity_issuer.as_deref(), Some(issuer));
+        assert_eq!(k.identity_subject.as_deref(), Some(subject.as_str()));
+        assert_eq!(k.key_prefix, format!("jwt:{subject}"));
+        assert_eq!(k.identity_claims, Some(serde_json::json!({ "uid": "u-1" })));
+
+        // JIT provisioning audits both the tenant creation and the key
+        // creation, scoped to the right entity, and only on first sight --
+        // the idempotent `second` call above must not add more rows.
+        let audit = store.list_audit(500).await.unwrap();
+        let tenant_audits: Vec<_> = audit
+            .iter()
+            .filter(|a| {
+                a.entity_type == "tenant" && a.entity_id == first.resolved.tenant_id.to_string()
+            })
+            .collect();
+        assert_eq!(
+            tenant_audits.len(),
+            1,
+            "tenant creation must be audited exactly once, not duplicated on repeat provisioning"
+        );
+        assert_eq!(tenant_audits[0].actor, "identity-provisioning");
+        assert_eq!(tenant_audits[0].action, "create_tenant");
+        assert_eq!(tenant_audits[0].detail["issuer"], issuer);
+
+        let key_audits: Vec<_> = audit
+            .iter()
+            .filter(|a| {
+                a.entity_type == "api_key" && a.entity_id == first.resolved.key_id.to_string()
+            })
+            .collect();
+        assert_eq!(
+            key_audits.len(),
+            1,
+            "key creation must be audited exactly once, not duplicated on repeat provisioning"
+        );
+        assert_eq!(key_audits[0].actor, "identity-provisioning");
+        assert_eq!(key_audits[0].action, "create_key");
+        assert_eq!(key_audits[0].detail["kind"], "identity");
+        assert_eq!(key_audits[0].detail["subject"], subject);
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Identity keys are JIT-provisioned into whatever tenant name
+    /// `OBLETH_JWT_ISSUERS` configures; a config value that names the
+    /// reserved control-plane tenant must be rejected rather than folding
+    /// externally authenticated traffic into Charo's reserved identity.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn provision_identity_key_rejects_reserved_tenant() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.unwrap();
+        store.migrate().await.unwrap();
+        store
+            .ensure_control_plane_identity()
+            .await
+            .expect("ensure control plane identity");
+
+        let err = store
+            .provision_identity_key(IdentityProvision {
+                issuer: "https://idp.example.com",
+                subject: &format!("carol-{}", Uuid::new_v4()),
+                tenant_name: "__control_plane__",
+                claims: serde_json::Value::Null,
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, StoreError::Protected(_)),
+            "expected Protected, got {err:?}"
+        );
     }
 }

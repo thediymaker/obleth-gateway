@@ -58,4 +58,9 @@ pub struct AppState {
     /// Energy & carbon accounting: hot-swappable settings + latest cluster
     /// power reading from the background Prometheus poller.
     pub energy: crate::energy::EnergyEngine,
+    /// JWT bearer authentication. `None` when `OBLETH_JWT_ISSUERS` is unset;
+    /// the key path is then byte-identical to a build without this feature.
+    /// This is the only handle on the request path that can reach Postgres
+    /// (single-flight identity provisioning, once per identity).
+    pub jwt: Option<Arc<crate::jwt_auth::JwtAuth>>,
 }
