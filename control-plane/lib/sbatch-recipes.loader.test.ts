@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, symlinkSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { listRecipes, listRecipeDocs, getRecipe, loadRecipeCards, resolveRecipeById } from "./sbatch-recipes";
@@ -61,6 +61,27 @@ describe("listRecipes / getRecipe", () => {
     writeFileSync(path.join(dir, "glm.recipe"), VALID);
     expect(getRecipe("glm")?.header?.api_model_name).toBe("glm");
     expect(getRecipe("nope")).toBeNull();
+  });
+
+  it("does not read recipes outside the configured directory", () => {
+    const root = path.join(dir, "allowed");
+    mkdirSync(root);
+    writeFileSync(path.join(dir, "outside.recipe"), VALID);
+    process.env.OBLETH_RECIPES_DIR = root;
+    expect(getRecipe("../outside")).toBeNull();
+    expect(getRecipe("..\\outside")).toBeNull();
+  });
+
+  it("does not expose an outside recipe through a symlink in any loader", () => {
+    const root = path.join(dir, "allowed");
+    mkdirSync(root);
+    const outside = path.join(dir, "outside.recipe");
+    writeFileSync(outside, VALID);
+    symlinkSync(outside, path.join(root, "linked.recipe"), "file");
+    process.env.OBLETH_RECIPES_DIR = root;
+    expect(getRecipe("linked")).toBeNull();
+    expect(listRecipeDocs()).toEqual([]);
+    expect(listRecipes()).toMatchObject([{ id: "linked", valid: false }]);
   });
 
   it("returns entries sorted by id regardless of disk order", () => {

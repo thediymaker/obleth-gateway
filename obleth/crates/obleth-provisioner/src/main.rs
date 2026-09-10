@@ -34,7 +34,11 @@ const RESOLVE_TTL_SECS: u64 = 300;
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
     let cfg = ProvisionerConfig::from_env()?;
-    let http = reqwest::Client::new();
+    // slurmrestd and node probes carry the Slurm JWT; never let a redirect carry
+    // it to an unvalidated destination.
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
     let obleth = HttpObleth::new(&cfg, http.clone());
     tracing::info!(interval = cfg.interval_secs, "obleth-provisioner started");
 

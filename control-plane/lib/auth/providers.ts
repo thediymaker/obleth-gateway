@@ -73,6 +73,13 @@ interface ProviderEnv {
    * everyone who already signed in keeps the wrong address forever.
    */
   overrideUserInfo?: boolean;
+  /**
+   * Send a PKCE code challenge with the authorization request and the
+   * matching verifier at the token exchange (RFC 7636). Off by default,
+   * matching better-auth. Turn it on for any IdP that supports it — an
+   * intercepted authorization code is then useless without the verifier.
+   */
+  pkce?: boolean;
 }
 
 export interface GenericOAuthConfig {
@@ -82,6 +89,7 @@ export interface GenericOAuthConfig {
   clientSecret: string;
   scopes: string[];
   authentication?: TokenAuthMethod;
+  pkce?: boolean;
   /** Built from `claims`; better-auth calls this with the raw OIDC profile. */
   mapProfileToUser?: (profile: Record<string, unknown>) => Record<string, unknown>;
   overrideUserInfo?: boolean;
@@ -183,6 +191,7 @@ export function oidcProviders(): GenericOAuthConfig[] {
       // Passed through verbatim (undefined included) so better-auth keeps its
       // own default when unset.
       authentication: p.authentication,
+      pkce: p.pkce,
       mapProfileToUser: buildProfileMapper(p.claims),
       overrideUserInfo: p.overrideUserInfo,
     };

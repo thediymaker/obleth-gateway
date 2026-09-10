@@ -22,7 +22,7 @@ pub async fn get_slurm_resources(
     if !s.enabled || s.slurmrestd_url.trim().is_empty() {
         return Ok(Json(ClusterResources::default()));
     }
-    let http = reqwest::Client::builder()
+    let http = crate::ssrf::upstream_client_builder()
         .timeout(std::time::Duration::from_secs(8))
         .build()
         .map_err(|e| crate::AdminError::Internal(e.to_string()))?;

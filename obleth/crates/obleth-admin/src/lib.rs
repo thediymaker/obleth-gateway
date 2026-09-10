@@ -1378,7 +1378,12 @@ async fn put_alert_settings(
 
     // Slack webhook: set / keep / clear.
     let slack_webhook_url = match body.slack_webhook_url.as_deref().map(str::trim) {
-        Some(url) if !url.is_empty() => Some(url.to_string()),
+        Some(url) if !url.is_empty() => {
+            // Alert dispatch POSTs to this URL from the gateway; hold it to the
+            // same destination policy as registered upstreams.
+            state.ssrf.validate(url)?;
+            Some(url.to_string())
+        }
         _ if body.clear_slack_webhook => None,
         _ => existing.slack_webhook_url.clone(),
     };
@@ -1927,6 +1932,13 @@ async fn put_energy_settings(
     Json(body): Json<UpdateEnergySettings>,
 ) -> Result<Json<EnergySettingsView>> {
     let existing = state.store.get_energy_settings().await?.unwrap_or_default();
+    // The poller queries this URL from the gateway; apply the same destination
+    // policy the test route enforces so a save can't bypass it.
+    if let Some(url) = body.prometheus_url.as_deref().map(str::trim) {
+        if !url.is_empty() {
+            state.ssrf.validate(url)?;
+        }
+    }
     let settings = merge_energy_settings(&existing, &body);
     state.store.put_energy_settings(&settings).await?;
     state
@@ -1974,7 +1986,9 @@ async fn test_energy_query(
     state.ssrf.validate(&body.prometheus_url)?;
     let q = body.power_query.trim();
     let base = body.prometheus_url.trim();
-    let http = reqwest::Client::new();
+    let http = ssrf::upstream_client_builder()
+        .build()
+        .map_err(|e| AdminError::BadRequest(format!("could not initialize HTTP client: {e}")))?;
     let watts = crate::energy_probe::instant_query(&http, base, &format!("sum({q})"))
         .await
         .map_err(AdminError::BadRequest)?;

@@ -1,8 +1,8 @@
 const path = require("path");
 
-// Security headers applied to every response. CSP is intentionally strict;
-// 'unsafe-inline'/'unsafe-eval' are required by Next.js's runtime in dev and
-// for its inlined bootstrap scripts/styles in production.
+// Static security headers. Content-Security-Policy is deliberately absent
+// here: it carries a per-request script nonce and is set in proxy.ts
+// (see lib/csp.ts).
 const securityHeaders = [
   { key: "X-Frame-Options", value: "DENY" },
   { key: "X-Content-Type-Options", value: "nosniff" },
@@ -15,21 +15,6 @@ const securityHeaders = [
   {
     key: "Strict-Transport-Security",
     value: "max-age=63072000; includeSubDomains; preload",
-  },
-  {
-    key: "Content-Security-Policy",
-    value: [
-      "default-src 'self'",
-      "script-src 'self' 'unsafe-inline' 'unsafe-eval'",
-      "style-src 'self' 'unsafe-inline'",
-      "img-src 'self' data: blob:",
-      "font-src 'self' data:",
-      "connect-src 'self'",
-      "frame-ancestors 'none'",
-      "base-uri 'self'",
-      "form-action 'self'",
-      "object-src 'none'",
-    ].join("; "),
   },
 ];
 

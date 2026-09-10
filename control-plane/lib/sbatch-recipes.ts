@@ -6,7 +6,7 @@
 //
 // This module owns the new `*.recipe` files (distinct from the former
 // wizard yaml definitions).
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { readdirSync, readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { parse as parseYaml } from "yaml";
 import { z } from "zod";
@@ -161,13 +161,26 @@ function recipeFileIds(): { id: string; name: string }[] {
     .map((name) => ({ id: name.slice(0, -".recipe".length), name }));
 }
 
+/** Read only an immediate child of the canonical recipe directory. */
+function readRecipeText(id: string): string {
+  // IDs are filename stems, never paths. Check both separator styles even on
+  // Linux so a saved ID cannot become a traversal when moved to Windows.
+  if (!id || id === "." || id === ".." || /[/\\:\0]/.test(id)) {
+    throw new Error("Invalid recipe id");
+  }
+  const root = realpathSync(/* turbopackIgnore: true */ recipesDir());
+  const file = realpathSync(/* turbopackIgnore: true */ path.join(/* turbopackIgnore: true */ root, `${id}.recipe`));
+  // Resolve symlinks before reading; a link must not escape the recipe root.
+  if (path.dirname(file) !== root) throw new Error("Recipe is outside the recipe directory");
+  return readFileSync(/* turbopackIgnore: true */ file, "utf8");
+}
+
 /** Every `*.recipe` in the directory, valid and invalid, sorted by id. Never throws. */
 export function listRecipes(): ParsedRecipe[] {
-  const dir = recipesDir();
   const out: ParsedRecipe[] = [];
-  for (const { id, name } of recipeFileIds()) {
+  for (const { id } of recipeFileIds()) {
     try {
-      out.push(parseRecipe(id, readFileSync(/* turbopackIgnore: true */ path.join(/* turbopackIgnore: true */ dir, name), "utf8")));
+      out.push(parseRecipe(id, readRecipeText(id)));
     } catch (e) {
       out.push({ id, valid: false, error: (e as Error).message, warnings: [] });
     }
@@ -179,11 +192,10 @@ export function listRecipes(): ParsedRecipe[] {
  *  error-handling semantics as `listRecipes` — unreadable files are silently
  *  skipped, never throws. */
 export function listRecipeDocs(): { id: string; text: string }[] {
-  const dir = recipesDir();
   const out: { id: string; text: string }[] = [];
-  for (const { id, name } of recipeFileIds()) {
+  for (const { id } of recipeFileIds()) {
     try {
-      out.push({ id, text: readFileSync(/* turbopackIgnore: true */ path.join(/* turbopackIgnore: true */ dir, name), "utf8") });
+      out.push({ id, text: readRecipeText(id) });
     } catch {
       // skip unreadable files; listRecipes already surfaces them as invalid entries
     }
@@ -193,9 +205,8 @@ export function listRecipeDocs(): { id: string; text: string }[] {
 
 /** One recipe by id (filename stem), or null when no such `*.recipe` file. */
 export function getRecipe(id: string): ParsedRecipe | null {
-  const full = path.join(recipesDir(), `${id}.recipe`);
   try {
-    return parseRecipe(id, readFileSync(/* turbopackIgnore: true */ full, "utf8"));
+    return parseRecipe(id, readRecipeText(id));
   } catch {
     return null;
   }

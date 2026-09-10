@@ -62,7 +62,11 @@ deploy/docker/docker-compose.override.yml
 
 /plan.md
 /asset-tools
-docs/superpowers
+# Nothing under the top-level docs/ is committed: documentation lives in the
+# obleth-docs site. Local specs, plans, and review notes stay on this machine.
+# Anchored with a leading slash so it cannot swallow nested dirs such as
+# control-plane/lib/charo/docs/.
+/docs/
 .agents
 .claude
 .codex
