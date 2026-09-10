@@ -3247,8 +3247,8 @@ mod tests {
     #[test]
     fn avoids_duplicate_v1_prefix() {
         assert_eq!(
-            build_upstream_url("https://openai.rc.asu.edu/v1", "/v1/chat/completions", ""),
-            "https://openai.rc.asu.edu/v1/chat/completions"
+            build_upstream_url("https://inference.example.com/v1", "/v1/chat/completions", ""),
+            "https://inference.example.com/v1/chat/completions"
         );
     }
 
@@ -3290,19 +3290,19 @@ mod tests {
         // Operator pasted the full endpoint URL as api_base instead of the base.
         assert_eq!(
             build_upstream_url(
-                "https://openai.rc.asu.edu/v1/embeddings",
+                "https://inference.example.com/v1/embeddings",
                 "/v1/embeddings",
                 ""
             ),
-            "https://openai.rc.asu.edu/v1/embeddings"
+            "https://inference.example.com/v1/embeddings"
         );
         assert_eq!(
             build_upstream_url(
-                "https://openai.rc.asu.edu/v1/audio/speech",
+                "https://inference.example.com/v1/audio/speech",
                 "/v1/audio/speech",
                 ""
             ),
-            "https://openai.rc.asu.edu/v1/audio/speech"
+            "https://inference.example.com/v1/audio/speech"
         );
     }
 
