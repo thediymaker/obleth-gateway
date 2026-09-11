@@ -115,6 +115,36 @@ describe("RouteExplainPanel", () => {
     expect(host.querySelector('[role="status"]')).toBeNull();
   });
 
+  it("shows each survivor's tier level against the floor when tiering is on", async () => {
+    await render({
+      ...untagged,
+      weights: { ...untagged.weights, difficulty_enabled: true },
+      tier_domains: ["coding"],
+      tier_floor: 1,
+    });
+    expect(host.textContent).toContain("tier 2");
+    await act(async () => clickModel("gpt-oss-120b"));
+    expect(host.textContent).toMatch(/tier level.*in coding.*floor 1.*cleared the floor/i);
+  });
+
+  it("renders the synthetic all-models domain as prose, not the sentinel", async () => {
+    await render({
+      ...untagged,
+      weights: { ...untagged.weights, difficulty_enabled: true },
+      tier_domains: ["*"],
+      tier_floor: 1,
+    });
+    expect(host.textContent).toContain("all models");
+    expect(host.textContent).not.toContain("Domains *");
+  });
+
+  it("says nothing about tiers when the tier stage did not run", async () => {
+    await render(untagged); // difficulty_enabled: false
+    expect(host.textContent).not.toMatch(/tier 2/i);
+    await act(async () => clickModel("gpt-oss-120b"));
+    expect(host.textContent).not.toMatch(/tier level/i);
+  });
+
   it("marks the model the live weights would have chosen", async () => {
     await render(edited, untagged);
     expect(host.textContent).toMatch(/was chosen/i);
