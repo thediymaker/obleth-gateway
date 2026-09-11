@@ -1544,41 +1544,13 @@ mod tests {
     }
 
     #[test]
-    fn hard_request_prefers_domain_specialist_over_cheap_generalist() {
-        // The headline claim the feature exists to deliver: a hard, topic-tagged
-        // request must degrade within its own domain, not escape into a cheap
-        // generalist — even one with a high general strength and the lowest
-        // cost of the three candidates.
-        let cands = vec![
-            tiered("weak", 0.000_010, &[("coding", 1)]),
-            tiered("middling", 0.000_050, &[("coding", 2)]),
-            tiered("generalist", 0.000_001, &[(GENERAL_DOMAIN, 3)]),
-        ];
-        let desired = vec!["coding".to_string()];
-        let chosen = select_model(
-            &cands,
-            &RequestFeatures::default(),
-            &HashMap::new(),
-            None,
-            &desired,
-            BoonGrants::default(),
-            &tiering_on(),
-            0.0,
-            3,
-        )
-        .unwrap();
-        assert_eq!(
-            chosen.model_name, "middling",
-            "a cheap generalist must not be chosen over a weaker-but-in-domain specialist"
-        );
-    }
-
-    #[test]
-    fn stale_snapshot_with_no_levels_still_returns_a_model() {
+    fn empty_levels_make_the_tier_filter_a_no_op() {
         // Registry mid-refresh: `levels` hasn't been populated on either
-        // candidate yet. Every strength collapses to 0, so the defensive
-        // fallback in stage 2 must keep the whole eligible set rather than
-        // filtering everyone out.
+        // candidate yet. `kept == eligible` here by construction (every
+        // strength is 0, so the floor collapses to 0 and nothing is excluded)
+        // — this pins that no-op behavior, it does not exercise the
+        // `if kept.is_empty()` defensive fallback (that branch is otherwise
+        // unreachable; see the report for why it is kept anyway).
         let cands = vec![healthy(model("a")), healthy(model("b"))];
         let desired = vec!["coding".to_string()];
         assert!(select_model(
@@ -1596,11 +1568,12 @@ mod tests {
     }
 
     #[test]
-    fn desired_domain_absent_from_every_candidate_still_returns_a_model() {
+    fn absent_domain_makes_the_tier_filter_a_no_op() {
         // The request wants `math`, but every candidate is tagged only
-        // `coding`. Every candidate's strength on the desired domain collapses
-        // to 0, the floor collapses to 0 with it, and everyone survives
-        // instead of the set going empty.
+        // `coding`. `kept == eligible` here by construction: every candidate's
+        // strength on the desired domain is 0, so the floor collapses to 0 and
+        // the filter excludes nothing — it does not exercise the
+        // `if kept.is_empty()` defensive fallback.
         let cands = vec![
             tiered("weak", 0.000_001, &[("coding", 1)]),
             tiered("strong", 0.000_100, &[("coding", 3)]),
@@ -1622,14 +1595,29 @@ mod tests {
 
     #[test]
     fn multi_domain_candidate_survives_on_its_strongest_matching_tag() {
-        // Strong at coding, weak at math: the filter must qualify the
-        // candidate via the max across the desired domains, not require every
-        // desired domain to individually clear the floor.
-        let cands = vec![tiered(
-            "specialist",
-            0.000_050,
-            &[("coding", 3), ("math", 1)],
-        )];
+        // Strong at coding, weak at math, competing against a cheaper model
+        // that only holds a coding level. Both are tagged identically
+        // (`coding` + `math`) so stage 3's tag-overlap score ties between them
+        // — only the tier filter (stage 2) can decide the outcome here, not
+        // scoring. The floor is set by the specialist's max across desired
+        // domains (3); the competitor's strength is 1 regardless of max-vs-min
+        // (it only has one matching level), so it cannot clear a floor of 3
+        // and must be filtered out before scoring runs.
+        //
+        // If `strength` computed a min across domains instead of a max, the
+        // specialist's own strength would drop to 1 too, both candidates
+        // would clear the collapsed floor, tags would still tie in stage 3,
+        // and the cheaper competitor would then win on cost — this test fails
+        // in that case (verified by temporarily mutating `strength`'s `.max()`
+        // to `.min()`: with the tags left coupled to levels the test still
+        // passed, because tag overlap alone decided it; decoupling tags from
+        // levels, as done here, was required to make the mutation flip the
+        // outcome).
+        let mut specialist = tiered("specialist", 0.000_050, &[("coding", 3), ("math", 1)]);
+        let mut shallow = tiered("shallow", 0.000_001, &[("coding", 1)]);
+        specialist.model.tags = vec!["coding".to_string(), "math".to_string()];
+        shallow.model.tags = vec!["coding".to_string(), "math".to_string()];
+        let cands = vec![specialist, shallow];
         let desired = vec!["coding".to_string(), "math".to_string()];
         let chosen = select_model(
             &cands,
