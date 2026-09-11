@@ -670,9 +670,10 @@ pub fn select_model(
 ///
 /// See [`explain_selection`] for what `intent` supplies and why `classifier_ms`
 /// is `0`.
-// Not yet called outside tests: the `auto_route` span writer is the consumer,
-// and it lands after this.
-#[allow(dead_code)]
+///
+/// Called from the data plane's `auto` branch only when a request is traced;
+/// the untraced path calls [`select_model`] instead so narration is never
+/// built for a span nobody records.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn route(
     candidates: &[Candidate],
