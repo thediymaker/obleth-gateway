@@ -4,6 +4,10 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## Unreleased
+
+- **Auto-routing is now tunable and inspectable.** Scoring weights, a routing temperature, and a per-model routing bias are editable from Settings and take effect without a restart. A new Router mode in the Playground shows why a prompt routes where it does and previews the effect of a change before you apply it. Optional difficulty tiering routes harder requests to stronger models, ranking strength by price within each topic unless a model declares its own level.
+
 ## v1.0.0
 
 The 1.0 release: identity-provider tokens on the data plane, a security hardening pass across egress, filesystem, and browser policy, and a dedicated Playground for model comparison.
