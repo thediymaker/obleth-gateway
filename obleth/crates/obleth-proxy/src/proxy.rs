@@ -3509,6 +3509,7 @@ mod tests {
             supports_tool_choice: true,
             supports_vision: false,
             tags: Vec::new(),
+            declared_levels: Vec::new(),
             boons: Vec::new(),
             tool_servers: Vec::new(),
             request_timeout_secs: None,

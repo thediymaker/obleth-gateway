@@ -516,6 +516,11 @@ pub struct ResolvedModel {
     /// Routing tags from the fixed [`MODEL_TAGS`] vocabulary.
     #[serde(default)]
     pub tags: Vec<String>,
+    /// Declared per-topic strength, parsed from `tag:level` suffixes. This is what
+    /// the operator typed; the effective level after cost-rank derivation lives on
+    /// `router::Candidate`. `#[serde(default)]` keeps older cached payloads readable.
+    #[serde(default)]
+    pub declared_levels: Vec<(String, u8)>,
     /// Gateway boons enabled for this model from the fixed [`MODEL_BOONS`]
     /// vocabulary. `#[serde(default)]` keeps older cached payloads readable.
     #[serde(default)]
@@ -1073,6 +1078,30 @@ pub fn is_valid_tag(tag: &str) -> bool {
     MODEL_TAGS.contains(&tag)
 }
 
+/// Highest strength level in the tier ladder.
+pub const MAX_TIER_LEVEL: u8 = 3;
+
+/// Split an optional `:1|2|3` strength suffix off a tag and validate the base
+/// against [`MODEL_TAGS`]. A bare tag is level 1, so every configuration
+/// written before tiering existed keeps its meaning. An unparseable or
+/// out-of-range level clamps into the ladder rather than rejecting the tag —
+/// a typo should not silently drop a model's topic.
+pub fn parse_tag_level(raw: &str) -> Option<(String, u8)> {
+    let raw = raw.trim().to_ascii_lowercase();
+    let (base, level) = match raw.split_once(':') {
+        Some((b, l)) => {
+            let parsed = l.trim().parse::<u8>().unwrap_or(1);
+            (b.trim().to_string(), parsed.clamp(1, MAX_TIER_LEVEL))
+        }
+        None => (raw, 1),
+    };
+    if is_valid_tag(&base) {
+        Some((base, level))
+    } else {
+        None
+    }
+}
+
 /// Fixed vocabulary of gateway boons. A boon grants a capability a model lacks
 /// natively; the data plane applies a model's enabled boons before dispatch.
 /// `vision` relays image parts to a configured describer model.
@@ -1212,9 +1241,11 @@ pub fn normalize_model_type(model_type: &str) -> String {
     }
 }
 
-/// Normalize an arbitrary list of tag strings to the canonical form used in
-/// storage and matching: trimmed, lowercased, restricted to the known
-/// vocabulary, de-duplicated, and order-stable by first appearance.
+/// Normalize an arbitrary list of tag strings to the canonical form used for
+/// matching: trimmed, lowercased, restricted to the known vocabulary,
+/// de-duplicated, and order-stable by first appearance. Any `:1|2|3` strength
+/// suffix is stripped so the existing overlap match in the router keeps
+/// working untouched; use [`normalize_tag_levels`] to recover the ladder.
 pub fn normalize_tags<I, S>(tags: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
@@ -1222,9 +1253,29 @@ where
 {
     let mut out: Vec<String> = Vec::new();
     for tag in tags {
-        let t = tag.as_ref().trim().to_ascii_lowercase();
-        if is_valid_tag(&t) && !out.contains(&t) {
-            out.push(t);
+        if let Some((base, _)) = parse_tag_level(tag.as_ref()) {
+            if !out.contains(&base) {
+                out.push(base);
+            }
+        }
+    }
+    out
+}
+
+/// The declared strength ladder: one entry per valid tag, first occurrence
+/// wins. Companion to [`normalize_tags`], which returns the same tags stripped
+/// down to their bare vocabulary form for overlap matching.
+pub fn normalize_tag_levels<I, S>(tags: I) -> Vec<(String, u8)>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<(String, u8)> = Vec::new();
+    for tag in tags {
+        if let Some((base, level)) = parse_tag_level(tag.as_ref()) {
+            if !out.iter().any(|(b, _)| b == &base) {
+                out.push((base, level));
+            }
         }
     }
     out
@@ -2092,6 +2143,48 @@ mod tests {
         assert_eq!(settings.structured_output.max_repair_attempts, 1);
         assert_eq!(settings.structured_output.timeout_ms, 30_000);
         assert_eq!(settings.guardrails.timeout_ms, 5_000);
+    }
+
+    #[test]
+    fn bare_tag_is_level_one() {
+        assert_eq!(parse_tag_level("coding"), Some(("coding".to_string(), 1)));
+    }
+
+    #[test]
+    fn suffixed_tag_parses_its_level() {
+        assert_eq!(parse_tag_level("coding:3"), Some(("coding".to_string(), 3)));
+    }
+
+    #[test]
+    fn unknown_base_is_rejected_with_or_without_a_suffix() {
+        assert_eq!(parse_tag_level("astrology"), None);
+        assert_eq!(parse_tag_level("astrology:3"), None);
+    }
+
+    #[test]
+    fn out_of_range_level_clamps_into_the_ladder() {
+        assert_eq!(parse_tag_level("coding:0"), Some(("coding".to_string(), 1)));
+        assert_eq!(parse_tag_level("coding:9"), Some(("coding".to_string(), 3)));
+        assert_eq!(parse_tag_level("coding:x"), Some(("coding".to_string(), 1)));
+    }
+
+    #[test]
+    fn normalize_keeps_bare_tags_so_overlap_match_is_unchanged() {
+        let got = normalize_tags(["Coding:3", "  MATH ", "astrology"]);
+        assert_eq!(
+            got,
+            vec!["coding".to_string(), "math".to_string()],
+            "normalize_tags must still yield the bare vocabulary for overlap matching"
+        );
+    }
+
+    #[test]
+    fn normalize_levels_extracts_the_ladder() {
+        let got = normalize_tag_levels(["coding:3", "math", "astrology:2"]);
+        assert_eq!(
+            got,
+            vec![("coding".to_string(), 3), ("math".to_string(), 1)]
+        );
     }
 
     #[test]

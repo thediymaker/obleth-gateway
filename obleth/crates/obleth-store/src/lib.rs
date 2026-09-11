@@ -135,6 +135,30 @@ pub struct UpsertManagedModel {
     pub launcher_spec: Option<serde_json::Value>,
 }
 
+/// Validate a caller-supplied tag list and re-serialize what survives to the
+/// storage form: bare `base` when the declared level is 1 (the untiered
+/// case, byte-identical to pre-tiering storage), `base:level` otherwise. Any
+/// tag whose base falls outside [`obleth_config::MODEL_TAGS`] is dropped, same
+/// as the old bare-only `normalize_tags` write path. Storing the suffixed
+/// form (rather than the bare-only [`obleth_config::normalize_tags`] output)
+/// is what lets a declared strength level survive a save.
+fn serialize_tag_levels<I, S>(tags: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    obleth_config::normalize_tag_levels(tags)
+        .into_iter()
+        .map(|(base, level)| {
+            if level == 1 {
+                base
+            } else {
+                format!("{base}:{level}")
+            }
+        })
+        .collect()
+}
+
 #[derive(Clone)]
 pub struct Store {
     pool: PgPool,
@@ -1291,7 +1315,7 @@ impl Store {
         .bind(supports_response_schema)
         .bind(supports_tool_choice)
         .bind(supports_vision)
-        .bind(sqlx::types::Json(obleth_config::normalize_tags(tags)))
+        .bind(sqlx::types::Json(serialize_tag_levels(tags)))
         .bind(sqlx::types::Json(obleth_config::normalize_boons(boons)))
         .bind(sqlx::types::Json(obleth_config::normalize_tool_servers(
             tool_servers,
@@ -1433,7 +1457,7 @@ impl Store {
         .bind(supports_response_schema)
         .bind(supports_tool_choice)
         .bind(enabled)
-        .bind(sqlx::types::Json(obleth_config::normalize_tags(tags)))
+        .bind(sqlx::types::Json(serialize_tag_levels(tags)))
         .bind(obleth_config::normalize_model_type(model_type))
         .bind(cost_per_image.max(0.0))
         .bind(cost_per_audio_second.max(0.0))
@@ -1615,6 +1639,13 @@ impl Store {
             let name: String = row.try_get("model_name")?;
             let model_id: Uuid = row.try_get("id")?;
             let endpoints = endpoints_by_model.remove(&model_id).unwrap_or_default();
+            // Raw tags jsonb may carry `tag:level` strength suffixes; `tags`
+            // below strips them to the bare vocabulary the router's overlap
+            // match expects, while `declared_levels` keeps the parsed ladder.
+            let raw_tags: Vec<String> = row
+                .try_get::<sqlx::types::Json<Vec<String>>, _>("tags")
+                .map(|j| j.0)
+                .unwrap_or_default();
             out.push((
                 name.clone(),
                 ResolvedModel {
@@ -1641,10 +1672,8 @@ impl Store {
                     supports_response_schema: row.try_get("supports_response_schema")?,
                     supports_tool_choice: row.try_get("supports_tool_choice")?,
                     supports_vision: row.try_get("supports_vision").unwrap_or(false),
-                    tags: row
-                        .try_get::<sqlx::types::Json<Vec<String>>, _>("tags")
-                        .map(|j| j.0)
-                        .unwrap_or_default(),
+                    tags: obleth_config::normalize_tags(&raw_tags),
+                    declared_levels: obleth_config::normalize_tag_levels(&raw_tags),
                     boons: row
                         .try_get::<sqlx::types::Json<Vec<String>>, _>("boons")
                         .map(|j| j.0)
@@ -4259,6 +4288,116 @@ mod tests {
             0,
             1.0,
         )
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    ///
+    /// Proves the round trip Controller ruling F6 requires: a declared
+    /// `tag:level` suffix must survive a save (through the `tags` jsonb
+    /// column) and a subsequent read, both via the admin-facing `ModelRoute`
+    /// (`get_model`, which reflects exactly what's stored) and via the
+    /// data-plane `ResolvedModel` cache view (`all_resolved_models`, which
+    /// must see the same suffix decoded into `declared_levels` while `tags`
+    /// itself stays bare for the router's overlap match). Also proves the
+    /// two behaviors that must NOT change: an unknown tag base is dropped,
+    /// and a level-1 (untiered) tag is stored bare, byte-identical to every
+    /// row written before tiering existed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn declared_tag_level_survives_save_then_read() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let model_name = format!("m-{}", Uuid::new_v4());
+        let args = default_test_model(&model_name);
+        let created_tags = vec![
+            "coding:3".to_string(),  // declared, tiered
+            "math".to_string(),      // declared, untiered -> level 1, stored bare
+            "astrology:2".to_string(), // invalid base -> dropped, as today
+        ];
+        let model = store
+            .create_model(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
+                &created_tags, &args.20, &args.21, args.22, args.23,
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+
+        // The write path re-serializes what survives validation: the invalid
+        // `astrology:2` tag is gone, `coding:3` keeps its suffix, and the
+        // untiered `math` is bare -- not `math:1`.
+        assert_eq!(model.tags, vec!["coding:3".to_string(), "math".to_string()]);
+
+        // Reading the model back (as the admin UI would on open-to-edit)
+        // must see the same suffixed form, or a save-without-touching-tags
+        // would silently drop the declared level on the next edit.
+        let reread = store.get_model(model.id).await.expect("get model");
+        assert_eq!(reread.tags, model.tags);
+
+        // The data-plane cache view must decode the suffix into
+        // `declared_levels` while keeping `tags` bare, since the router's
+        // exact-match overlap logic (`router::select_model`) compares against
+        // bare vocabulary strings.
+        let resolved = store
+            .all_resolved_models()
+            .await
+            .expect("all resolved models")
+            .into_iter()
+            .find(|(name, _)| name == &model_name)
+            .map(|(_, r)| r)
+            .expect("resolved model present");
+        assert_eq!(
+            resolved.tags,
+            vec!["coding".to_string(), "math".to_string()]
+        );
+        assert_eq!(
+            resolved.declared_levels,
+            vec![("coding".to_string(), 3), ("math".to_string(), 1)]
+        );
+
+        // A save that lowers the declared level back to 1 must store the bare
+        // tag, byte-identical to every model saved before tiering existed.
+        let updated_tags = vec!["coding:1".to_string()];
+        let updated = store
+            .update_model(
+                model.id,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                true,
+                &updated_tags,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
+            )
+            .await
+            .expect("update model");
+        assert_eq!(updated.tags, vec!["coding".to_string()]);
+        let reread_after_update = store.get_model(model.id).await.expect("get model");
+        assert_eq!(reread_after_update.tags, vec!["coding".to_string()]);
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.

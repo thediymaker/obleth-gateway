@@ -776,6 +776,7 @@ mod tests {
             supports_tool_choice: false,
             supports_vision: false,
             tags: vec![],
+            declared_levels: vec![],
             boons: vec![],
             tool_servers: vec![],
             request_timeout_secs: None,
