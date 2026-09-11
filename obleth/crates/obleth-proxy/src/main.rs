@@ -305,7 +305,11 @@ async fn main() -> anyhow::Result<()> {
                     .await;
             }
             tracing::info!(count = models.len(), "warmed model cache");
-            install_candidates(&model_registry, build_candidates(&store, models).await);
+            let tier_source = classifier.settings().tier_source;
+            install_candidates(
+                &model_registry,
+                build_candidates(&store, models, tier_source).await,
+            );
         }
         Err(e) => tracing::warn!(error = %e, "failed to load models for warming"),
     }
@@ -451,13 +455,14 @@ async fn metrics_handler(
 async fn build_candidates(
     store: &Store,
     models: Vec<(String, obleth_config::ResolvedModel)>,
+    tier_source: obleth_config::TierSource,
 ) -> Result<Vec<router::Candidate>, obleth_store::StoreError> {
     let now = chrono::Utc::now();
     let health = store.list_model_health_summaries().await?;
     let health_by_name: std::collections::HashMap<String, &obleth_config::ModelHealthSummary> =
         health.iter().map(|h| (h.model_name.clone(), h)).collect();
 
-    Ok(models
+    let mut candidates: Vec<router::Candidate> = models
         .into_iter()
         .map(|(name, model)| {
             let healthy = match health_by_name.get(&name) {
@@ -466,9 +471,18 @@ async fn build_candidates(
                 }
                 None => true,
             };
-            router::Candidate { model, healthy }
+            router::Candidate {
+                model,
+                healthy,
+                levels: Vec::new(),
+            }
         })
-        .collect())
+        .collect();
+    // Derived here, off the request path, so routing only ever reads the
+    // result: deriving cost quantiles per request would be an O(n log n) sort
+    // in the hot path.
+    router::derive_levels(&mut candidates, tier_source);
+    Ok(candidates)
 }
 
 fn install_candidates(
@@ -500,14 +514,20 @@ fn spawn_model_registry_refresh(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            match store.all_resolved_models().await {
-                Ok(models) => install_candidates(&registry, build_candidates(&store, models).await),
-                Err(e) => tracing::warn!(error = %e, "auto-router model refresh failed"),
-            }
+            // Refresh auto-router settings (including `tier_source`) before
+            // rebuilding candidates, so a tier-source change takes effect on
+            // this tick's `derive_levels` call rather than one tick late.
             match store.get_auto_router_settings().await {
                 Ok(Some(settings)) => classifier.update(settings),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(error = %e, "auto-router settings refresh failed"),
+            }
+            match store.all_resolved_models().await {
+                Ok(models) => {
+                    let tier_source = classifier.settings().tier_source;
+                    install_candidates(&registry, build_candidates(&store, models, tier_source).await)
+                }
+                Err(e) => tracing::warn!(error = %e, "auto-router model refresh failed"),
             }
             match store.get_boon_settings().await {
                 Ok(Some(settings)) => boons.update(settings),
