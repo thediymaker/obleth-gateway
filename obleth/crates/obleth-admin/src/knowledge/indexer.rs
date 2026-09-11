@@ -22,7 +22,7 @@
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use obleth_config::KnowledgeBoonSettings;
+use obleth_config::{BoonSettings, KnowledgeBoonSettings};
 use obleth_store::knowledge::{ChunkInsert, KnowledgeDocument};
 use obleth_store::Store;
 use obleth_tokenizer::HeuristicTokenizer;
@@ -159,15 +159,26 @@ pub async fn index_document(
 /// refreshed settings source that could drift from the one the boon actually
 /// reads. Reading Postgres here is fine — this loop already polls every 5s and
 /// is explicitly allowed to read Postgres (unlike the request hot path).
+///
+/// Deliberately ignores `knowledge.enabled`: that flag gates request-path
+/// injection (the boon), not corpus preparation. An administrator must be
+/// able to upload and index documents before switching the boon on, or
+/// enabling it would appear to do nothing while a backlog of documents
+/// drained through — so this loop always indexes pending documents
+/// regardless of `enabled`.
 pub fn spawn_indexer(store: Store, client: reqwest::Client) {
     tokio::spawn(async move {
         loop {
-            let knowledge = store
-                .get_boon_settings()
-                .await
-                .unwrap_or_default()
-                .unwrap_or_default()
-                .knowledge;
+            let knowledge = match store.get_boon_settings().await {
+                Ok(settings) => settings.unwrap_or_default().knowledge,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "knowledge indexer: boon settings read failed; using defaults for this iteration"
+                    );
+                    BoonSettings::default().knowledge
+                }
+            };
             match store
                 .claim_pending_document(knowledge.index_stale_after_secs)
                 .await

@@ -768,17 +768,25 @@ pub struct Scored {
 /// Returned hits are sorted in descending score order -- callers (the admin
 /// preview's `would_inject` token-budget walk, and the boon's own packing)
 /// rely on that ordering rather than re-sorting themselves.
-pub fn score_against(
-    query: &[f32],
-    vectors: &[Vec<f32>],
-    top_k: usize,
-    min_score: f32,
-) -> Vec<Scored> {
-    if query.is_empty() || vectors.is_empty() || top_k == 0 {
+///
+/// `vectors` is generic over any iterator of `&[f32]` rather than
+/// `&[Vec<f32>]` so a caller holding vectors behind another layer of
+/// indirection (the proxy's `SlabChunk::embedding`) can pass borrowed slices
+/// straight through — at the collection chunk cap (100k chunks x 768 dims)
+/// materializing an intermediate `Vec<Vec<f32>>` on every request-path
+/// retrieval would allocate and copy ~300MB per call for no reason.
+pub fn score_against<'a, I>(query: &[f32], vectors: I, top_k: usize, min_score: f32) -> Vec<Scored>
+where
+    I: IntoIterator<Item = &'a [f32]>,
+{
+    // No `vectors.is_empty()` guard here: an arbitrary `IntoIterator` cannot
+    // report emptiness up front, and an empty iterator already falls out of
+    // the chain below with an empty result, so the guard would be redundant.
+    if query.is_empty() || top_k == 0 {
         return Vec::new();
     }
     let mut scored: Vec<Scored> = vectors
-        .iter()
+        .into_iter()
         .enumerate()
         .filter(|(_, v)| v.len() == query.len())
         .map(|(index, v)| {
@@ -1600,12 +1608,12 @@ mod tests {
     fn scores_rank_by_cosine_similarity() {
         let query = vec![1.0f32, 0.0];
         let diag = std::f32::consts::FRAC_1_SQRT_2;
-        let vectors = vec![
+        let vectors = [
             vec![0.0, 1.0], // orthogonal
             vec![1.0, 0.0], // identical
             vec![diag, diag],
         ];
-        let out = super::score_against(&query, &vectors, 3, -1.0);
+        let out = super::score_against(&query, vectors.iter().map(|v| v.as_slice()), 3, -1.0);
         assert_eq!(out[0].index, 1, "identical vector ranks first");
         assert_eq!(out[1].index, 2);
         assert_eq!(out[2].index, 0);
@@ -1614,8 +1622,8 @@ mod tests {
     #[test]
     fn min_score_drops_weak_matches() {
         let query = vec![1.0f32, 0.0];
-        let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
-        let out = super::score_against(&query, &vectors, 5, 0.5);
+        let vectors = [vec![1.0, 0.0], vec![0.0, 1.0]];
+        let out = super::score_against(&query, vectors.iter().map(|v| v.as_slice()), 5, 0.5);
         assert_eq!(out.len(), 1, "the orthogonal vector is below threshold");
         assert_eq!(out[0].index, 0);
     }
@@ -1624,7 +1632,10 @@ mod tests {
     fn top_k_truncates() {
         let query = vec![1.0f32, 0.0];
         let vectors = vec![vec![1.0, 0.0]; 10];
-        assert_eq!(super::score_against(&query, &vectors, 3, -1.0).len(), 3);
+        assert_eq!(
+            super::score_against(&query, vectors.iter().map(|v| v.as_slice()), 3, -1.0).len(),
+            3
+        );
     }
 
     #[test]
@@ -1632,14 +1643,20 @@ mod tests {
         // Comparing across embedding spaces is silently wrong, not an error,
         // so mismatched vectors must be excluded rather than scored.
         let query = vec![1.0f32, 0.0];
-        let vectors = vec![vec![1.0, 0.0, 0.0]];
-        assert!(super::score_against(&query, &vectors, 5, -1.0).is_empty());
+        let vectors = [vec![1.0, 0.0, 0.0]];
+        assert!(
+            super::score_against(&query, vectors.iter().map(|v| v.as_slice()), 5, -1.0).is_empty()
+        );
     }
 
     #[test]
     fn empty_inputs_score_nothing() {
-        assert!(super::score_against(&[], &[vec![1.0]], 5, -1.0).is_empty());
-        assert!(super::score_against(&[1.0], &[], 5, -1.0).is_empty());
+        let one = [vec![1.0f32]];
+        assert!(super::score_against(&[], one.iter().map(|v| v.as_slice()), 5, -1.0).is_empty());
+        let none: Vec<Vec<f32>> = Vec::new();
+        assert!(
+            super::score_against(&[1.0], none.iter().map(|v| v.as_slice()), 5, -1.0).is_empty()
+        );
     }
 
     #[test]
@@ -1648,12 +1665,12 @@ mod tests {
         // unfiltered NaN from a corrupt stored vector would rank first and be
         // injected ahead of every genuine match.
         let query = vec![1.0f32, 0.0];
-        let vectors = vec![
+        let vectors = [
             vec![f32::NAN, 0.0],
             vec![f32::INFINITY, 0.0],
             vec![1.0, 0.0],
         ];
-        let out = super::score_against(&query, &vectors, 5, -1.0);
+        let out = super::score_against(&query, vectors.iter().map(|v| v.as_slice()), 5, -1.0);
         assert_eq!(
             out.len(),
             1,

@@ -589,7 +589,12 @@ pub async fn search_collection(
     let chunks = state.store.load_active_chunks(id).await?;
     let vectors: Vec<Vec<f32>> = chunks.iter().map(|c| c.embedding.clone()).collect();
     let top_k = body.top_k.unwrap_or(settings.top_k) as usize;
-    let scored = score_against(&query_vec, &vectors, top_k, settings.min_score);
+    let scored = score_against(
+        &query_vec,
+        vectors.iter().map(|v| v.as_slice()),
+        top_k,
+        settings.min_score,
+    );
 
     // Mirror the boon's packing so `would_inject` tells the truth about what
     // would actually be injected, not merely what scored well: walk hits in
