@@ -183,6 +183,7 @@ pub struct KnowledgeDocument {
     pub chunk_count: i32,
     pub active_generation: i32,
     pub indexed_embedding_model: String,
+    pub indexing_started_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// One chunk awaiting insert. `embedding` is already normalized by the indexer.
@@ -205,7 +206,8 @@ pub struct KnowledgeChunk {
 }
 
 const DOC_COLS: &str = "id, collection_id, title, filename, content_type, content, \
-    byte_size, status, error, chunk_count, active_generation, indexed_embedding_model";
+    byte_size, status, error, chunk_count, active_generation, indexed_embedding_model, \
+    indexing_started_at";
 
 fn row_to_document(row: &sqlx::postgres::PgRow) -> KnowledgeDocument {
     KnowledgeDocument {
@@ -221,6 +223,7 @@ fn row_to_document(row: &sqlx::postgres::PgRow) -> KnowledgeDocument {
         chunk_count: row.get("chunk_count"),
         active_generation: row.get("active_generation"),
         indexed_embedding_model: row.get("indexed_embedding_model"),
+        indexing_started_at: row.get("indexing_started_at"),
     }
 }
 
@@ -277,19 +280,40 @@ impl Store {
         Ok(rows.iter().map(row_to_document).collect())
     }
 
-    /// Atomically take one pending document for indexing. `for update skip
-    /// locked` means a second indexer (or a replica) never picks the same row.
-    pub async fn claim_pending_document(&self) -> Result<Option<KnowledgeDocument>> {
+    /// Atomically take one document for indexing.
+    ///
+    /// Matches `pending` rows, and also `indexing` rows whose claim is older than
+    /// `stale_after_secs` — a document stranded by a crash or deploy is otherwise
+    /// unreachable, because claiming already moved it off `pending`.
+    ///
+    /// Recovery is timeout-based rather than a reset at startup: with more than
+    /// one gateway replica, a booting replica would otherwise yank a document
+    /// another replica is actively embedding. Double-claiming a genuinely slow
+    /// document is wasteful but not corrupting — both workers derive the same
+    /// generation from `doc.active_generation + 1`, and
+    /// `commit_document_generation` replaces that generation's rows wholesale.
+    pub async fn claim_pending_document(
+        &self,
+        stale_after_secs: i64,
+    ) -> Result<Option<KnowledgeDocument>> {
         let row = sqlx::query(&format!(
-            "update knowledge_documents set status = 'indexing'
+            "update knowledge_documents
+                set status = 'indexing', indexing_started_at = now()
               where id = (
                   select id from knowledge_documents
                    where status = 'pending'
+                      or (
+                          status = 'indexing'
+                          and indexing_started_at is not null
+                          and indexing_started_at
+                              < now() - make_interval(secs => $1::double precision)
+                      )
                    order by created_at
                    for update skip locked
                    limit 1
               ) returning {DOC_COLS}"
         ))
+        .bind(stale_after_secs)
         .fetch_optional(self.pool())
         .await?;
         Ok(row.as_ref().map(row_to_document))
@@ -313,20 +337,52 @@ impl Store {
         Ok(row.get("collection_id"))
     }
 
-    /// Write one document's chunks into `generation`, replacing anything
-    /// already written there for that document. Retrieval is unaffected until
-    /// `flip_document_generation` runs.
-    pub async fn write_generation(
+    /// Commit one document's freshly embedded chunks and make them live, in a
+    /// single transaction.
+    ///
+    /// This is deliberately ONE method rather than a write step followed by a
+    /// flip step. When those were separate (`write_generation` then
+    /// `flip_document_generation`), a crash in between left the document
+    /// `ready` with its generation un-promoted — neither `pending` nor
+    /// `indexing`, so no retry path could ever reclaim it, while retrieval saw
+    /// either nothing (first index) or permanently stale content (re-index).
+    ///
+    /// Because everything commits together, a crash anywhere leaves the
+    /// document still `indexing`, which the staleness reclaim in
+    /// `claim_pending_document` picks up.
+    ///
+    /// The delete below is scoped to `document_id`, not `collection_id`:
+    /// generation numbers are per-document, so a collection-wide delete on
+    /// `generation <> $2` would drop every other document's chunks too — that
+    /// was the Task 2 round-1 defect. `<>` rather than `<` is intentional and
+    /// safe here: it also garbage-collects a higher generation orphaned by a
+    /// crashed indexer, and two indexers can never hold the same document
+    /// concurrently because `claim_pending_document` flips it to `indexing`
+    /// under `for update skip locked` first.
+    ///
+    /// The collection-level `indexed_embedding_model` advances only once EVERY
+    /// document in the collection has been built with the collection's desired
+    /// `embedding_model`. That gate is what keeps a collection-wide re-embed
+    /// from ever exposing two embedding spaces at once: documents already moved
+    /// to the new embedder are excluded from the slab (see
+    /// `load_active_chunks`) until the last one lands, so retrieval serves the
+    /// complete old set throughout and switches atomically.
+    pub async fn commit_document_generation(
         &self,
         collection_id: Uuid,
         document_id: Uuid,
         generation: i32,
+        embedding_model: &str,
+        embedding_dim: i32,
         chunks: &[ChunkInsert],
     ) -> Result<()> {
         if chunks.is_empty() {
             return Err(StoreError::Conflict("document produced no chunks".into()));
         }
         let mut tx = self.pool().begin().await?;
+
+        // Replace anything already written for this generation, so a retry
+        // after a partial run is idempotent.
         sqlx::query("delete from knowledge_chunks where document_id = $1 and generation = $2")
             .bind(document_id)
             .bind(generation)
@@ -351,64 +407,30 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         }
-        sqlx::query(
-            "update knowledge_documents
-                set status = 'ready', error = null, chunk_count = $2, indexed_at = now()
-              where id = $1",
-        )
-        .bind(document_id)
-        .bind(chunks.len() as i32)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        Ok(())
-    }
 
-    /// Promote `generation` to active for ONE document, record the embedder that
-    /// built it, drop that document's other generations, and bump the collection
-    /// `version` so proxies rebuild their slab.
-    ///
-    /// The delete below is scoped to `document_id`, not `collection_id`: generation
-    /// numbers are per-document, so a collection-wide delete on `generation <> $2`
-    /// would drop every other document's chunks too — that was the Task 2
-    /// round-1 defect. `<>` rather than `<` is intentional and safe here: it also
-    /// garbage-collects a higher generation orphaned by a crashed indexer, and two
-    /// indexers can never hold the same document concurrently because
-    /// `claim_pending_document` flips it to `indexing` under `for update skip
-    /// locked` first.
-    ///
-    /// The collection-level `indexed_embedding_model` advances only once EVERY
-    /// document in the collection has been built with the collection's desired
-    /// `embedding_model`. That gate is what keeps a collection-wide re-embed from
-    /// ever exposing two embedding spaces at once: documents already moved to the
-    /// new embedder are excluded from the slab (see `load_active_chunks`) until
-    /// the last one lands, so retrieval serves the complete old set throughout and
-    /// switches atomically.
-    pub async fn flip_document_generation(
-        &self,
-        collection_id: Uuid,
-        document_id: Uuid,
-        generation: i32,
-        embedding_model: &str,
-        embedding_dim: i32,
-    ) -> Result<()> {
-        let mut tx = self.pool().begin().await?;
-        sqlx::query(
-            "update knowledge_documents
-                set active_generation = $2, indexed_embedding_model = $3
-              where id = $1",
-        )
-        .bind(document_id)
-        .bind(generation)
-        .bind(embedding_model)
-        .execute(&mut *tx)
-        .await?;
-        // Scoped to this document: other documents' chunks are untouched.
+        // Drop this document's other generations. Scoped to `document_id`:
+        // other documents' chunks are untouched.
         sqlx::query("delete from knowledge_chunks where document_id = $1 and generation <> $2")
             .bind(document_id)
             .bind(generation)
             .execute(&mut *tx)
             .await?;
+
+        // Promote the generation and mark the document ready together.
+        sqlx::query(
+            "update knowledge_documents
+                set active_generation = $2, indexed_embedding_model = $3,
+                    status = 'ready', error = null, chunk_count = $4,
+                    indexed_at = now()
+              where id = $1",
+        )
+        .bind(document_id)
+        .bind(generation)
+        .bind(embedding_model)
+        .bind(chunks.len() as i32)
+        .execute(&mut *tx)
+        .await?;
+
         // Advance the collection's embedder only when no document lags behind.
         // Deliberately does NOT touch `version` — see the unconditional bump below.
         sqlx::query(
@@ -427,6 +449,7 @@ impl Store {
         .bind(embedding_dim)
         .execute(&mut *tx)
         .await?;
+
         // Bump `version` unconditionally and exactly once. This document's chunks
         // changed, so every proxy must rebuild its slab regardless of whether the
         // collection's embedder advanced. (An earlier two-conditional-statement
@@ -439,6 +462,7 @@ impl Store {
         .bind(collection_id)
         .execute(&mut *tx)
         .await?;
+
         tx.commit().await?;
         Ok(())
     }
@@ -458,8 +482,8 @@ impl Store {
     /// Chunks retrievable right now: each document's own active generation,
     /// gated to documents whose embedder matches the collection's — a document
     /// mid-reindex to a new embedder is excluded until the whole collection has
-    /// caught up (see `flip_document_generation`), so the count never includes a
-    /// mixed embedding space.
+    /// caught up (see `commit_document_generation`), so the count never includes
+    /// a mixed embedding space.
     pub async fn collection_chunk_count(&self, collection_id: Uuid) -> Result<i64> {
         let row = sqlx::query(
             "select count(*) as n
@@ -504,7 +528,7 @@ impl Store {
     /// Load a collection's retrievable chunks for the proxy slab: each
     /// document's own active generation, gated to documents whose embedder
     /// matches the collection's (the mixed-embedding-space guard — see
-    /// `flip_document_generation`). Ordered by document then ordinal so chunk
+    /// `commit_document_generation`). Ordered by document then ordinal so chunk
     /// order is stable within a document.
     /// Background-loop use only — never call this from the request path.
     pub async fn load_active_chunks(&self, collection_id: Uuid) -> Result<Vec<KnowledgeChunk>> {
@@ -678,10 +702,12 @@ mod tests {
             .expect("doc b");
 
         store
-            .write_generation(
+            .commit_document_generation(
                 c.id,
                 a.id,
                 1,
+                "embed-a",
+                2,
                 &[super::ChunkInsert {
                     ordinal: 0,
                     text: "chunk a".into(),
@@ -690,17 +716,15 @@ mod tests {
                 }],
             )
             .await
-            .expect("write a");
-        store
-            .flip_document_generation(c.id, a.id, 1, "embed-a", 2)
-            .await
-            .expect("flip a");
+            .expect("commit a");
 
         store
-            .write_generation(
+            .commit_document_generation(
                 c.id,
                 b.id,
                 1,
+                "embed-a",
+                2,
                 &[super::ChunkInsert {
                     ordinal: 0,
                     text: "chunk b".into(),
@@ -709,11 +733,7 @@ mod tests {
                 }],
             )
             .await
-            .expect("write b");
-        store
-            .flip_document_generation(c.id, b.id, 1, "embed-a", 2)
-            .await
-            .expect("flip b");
+            .expect("commit b");
 
         // The original defect: indexing Doc B deleted Doc A's chunks.
         let chunks = store.load_active_chunks(c.id).await.expect("load");
@@ -740,10 +760,12 @@ mod tests {
             .expect("doc a");
 
         store
-            .write_generation(
+            .commit_document_generation(
                 c.id,
                 a.id,
                 1,
+                "embed-a",
+                2,
                 &[super::ChunkInsert {
                     ordinal: 0,
                     text: "old".into(),
@@ -753,15 +775,13 @@ mod tests {
             )
             .await
             .expect("gen 1");
-        store
-            .flip_document_generation(c.id, a.id, 1, "embed-a", 2)
-            .await
-            .expect("flip 1");
 
         store
-            .write_generation(
+            .commit_document_generation(
                 c.id,
                 a.id,
+                2,
+                "embed-a",
                 2,
                 &[super::ChunkInsert {
                     ordinal: 0,
@@ -772,10 +792,6 @@ mod tests {
             )
             .await
             .expect("gen 2");
-        store
-            .flip_document_generation(c.id, a.id, 2, "embed-a", 2)
-            .await
-            .expect("flip 2");
 
         let chunks = store.load_active_chunks(c.id).await.expect("load");
         assert_eq!(chunks.len(), 1, "the old generation must be gone");
@@ -798,10 +814,12 @@ mod tests {
             .await
             .expect("doc a");
         store
-            .write_generation(
+            .commit_document_generation(
                 c.id,
                 a.id,
                 1,
+                "embed-a",
+                2,
                 &[super::ChunkInsert {
                     ordinal: 0,
                     text: "a".into(),
@@ -810,20 +828,18 @@ mod tests {
                 }],
             )
             .await
-            .expect("write");
-        store
-            .flip_document_generation(c.id, a.id, 1, "embed-a", 2)
-            .await
-            .expect("flip 1");
+            .expect("commit 1");
         let after_first = store.get_collection(c.id).await.expect("get").version;
 
-        // Second flip with identical embedder and dimension: the collection's
+        // Second commit with identical embedder and dimension: the collection's
         // embedder cannot advance, but version MUST still move or the proxy
         // never rebuilds its slab.
         store
-            .write_generation(
+            .commit_document_generation(
                 c.id,
                 a.id,
+                2,
+                "embed-a",
                 2,
                 &[super::ChunkInsert {
                     ordinal: 0,
@@ -833,17 +849,95 @@ mod tests {
                 }],
             )
             .await
-            .expect("write 2");
-        store
-            .flip_document_generation(c.id, a.id, 2, "embed-a", 2)
-            .await
-            .expect("flip 2");
+            .expect("commit 2");
         let after_second = store.get_collection(c.id).await.expect("get").version;
 
         assert!(
             after_second > after_first,
-            "version must bump on every flip"
+            "version must bump on every commit"
         );
+
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn a_stranded_indexing_document_is_reclaimed_after_the_window() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(&format!("stranded-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("collection");
+        let doc = store
+            .upsert_document(c.id, "Doc", "d.md", "text/markdown", "body")
+            .await
+            .expect("doc");
+
+        // Claim it, then simulate the worker dying: the row stays `indexing`.
+        let claimed = store.claim_pending_document(1_800).await.expect("claim");
+        assert_eq!(claimed.expect("claimed").id, doc.id);
+
+        // With a long window it is NOT reclaimable — no double-processing of a
+        // document that is merely slow.
+        assert!(
+            store
+                .claim_pending_document(1_800)
+                .await
+                .expect("claim")
+                .is_none(),
+            "a fresh claim must not be stealable"
+        );
+
+        // With a zero window the stranded row is reclaimed rather than lost.
+        let reclaimed = store.claim_pending_document(0).await.expect("reclaim");
+        assert_eq!(
+            reclaimed.expect("reclaimed").id,
+            doc.id,
+            "a stranded indexing row must be reclaimable on timeout"
+        );
+
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn commit_is_atomic_so_a_document_is_never_ready_without_live_chunks() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(&format!("atomic-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("collection");
+        let doc = store
+            .upsert_document(c.id, "Doc", "d.md", "text/markdown", "body")
+            .await
+            .expect("doc");
+
+        store
+            .commit_document_generation(
+                c.id,
+                doc.id,
+                1,
+                "embed-a",
+                2,
+                &[super::ChunkInsert {
+                    ordinal: 0,
+                    text: "live".into(),
+                    token_count: 1,
+                    embedding: vec![1.0, 0.0],
+                }],
+            )
+            .await
+            .expect("commit");
+
+        // `ready` and retrievable must become true together, never separately.
+        let docs = store.list_documents(c.id).await.expect("list");
+        assert_eq!(docs[0].status, "ready");
+        assert_eq!(docs[0].chunk_count, 1);
+        let chunks = store.load_active_chunks(c.id).await.expect("load");
+        assert_eq!(chunks.len(), 1, "a ready document must have live chunks");
+        assert_eq!(chunks[0].text, "live");
 
         store.delete_collection(c.id).await.ok();
     }

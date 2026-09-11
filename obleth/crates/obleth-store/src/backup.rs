@@ -130,7 +130,7 @@ impl Store {
                     max_in_flight, capacity_mode, capacity_tuned_at, supports_function_calling,
                     supports_system_messages, supports_response_schema, supports_tool_choice,
                     supports_vision, enabled, cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                    route_bias, request_timeout_secs, max_retries, retry_backoff_ms,
+                    route_bias, auto_eligible, request_timeout_secs, max_retries, retry_backoff_ms,
                     endpoint_selection_mode,
                     health_checks_enabled, health_alerts_enabled, health_check_interval_secs,
                     health_failure_threshold, health_maintenance_until, health_maintenance_note,
@@ -379,6 +379,7 @@ impl Store {
                         supports_function_calling, supports_system_messages,
                         supports_response_schema, supports_tool_choice, supports_vision, enabled,
                         cache_enabled, cache_ttl_secs, tags, boons, tool_servers, route_bias,
+                        auto_eligible,
                         request_timeout_secs,
                         max_retries, retry_backoff_ms, endpoint_selection_mode,
                         health_checks_enabled, health_alerts_enabled, health_check_interval_secs,
@@ -386,7 +387,7 @@ impl Store {
                         health_maintenance_note, created_at)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-                        $32, $33, $34, $35, $36, $37, $38, $39, $40)
+                        $32, $33, $34, $35, $36, $37, $38, $39, $40, $41)
                  on conflict (id) do update set
                         model_name = excluded.model_name,
                         description = excluded.description,
@@ -416,6 +417,7 @@ impl Store {
                         boons = excluded.boons,
                         tool_servers = excluded.tool_servers,
                         route_bias = excluded.route_bias,
+                        auto_eligible = excluded.auto_eligible,
                         request_timeout_secs = excluded.request_timeout_secs,
                         max_retries = excluded.max_retries,
                         retry_backoff_ms = excluded.retry_backoff_ms,
@@ -458,6 +460,7 @@ impl Store {
             .bind(sqlx::types::Json(&m.boons))
             .bind(sqlx::types::Json(&m.tool_servers))
             .bind(m.route_bias)
+            .bind(m.auto_eligible)
             .bind(m.request_timeout_secs)
             .bind(m.max_retries)
             .bind(m.retry_backoff_ms)
@@ -673,6 +676,7 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
             .map(|j| j.0)
             .unwrap_or_default(),
         route_bias: row.try_get("route_bias")?,
+        auto_eligible: row.try_get("auto_eligible")?,
         request_timeout_secs: row.try_get("request_timeout_secs")?,
         max_retries: row.try_get("max_retries")?,
         retry_backoff_ms: row.try_get("retry_backoff_ms")?,
@@ -780,6 +784,9 @@ mod tests {
                 &[],
                 0,
                 2.5,
+                // Excluded from auto, so the export/restore assertions below
+                // distinguish a carried value from the eligible default.
+                false,
             )
             .await
             .expect("create model");
@@ -806,6 +813,10 @@ mod tests {
             .find(|m| m.id == model.id)
             .expect("model in export");
         assert_eq!(exported_model.route_bias, 2.5, "export carries route_bias");
+        assert!(
+            !exported_model.auto_eligible,
+            "export carries auto_eligible"
+        );
         assert_eq!(exported_model.tags, vec!["coding:3".to_string()]);
 
         // Drift the tenant, then restore: the backup wins and counts as an
@@ -815,17 +826,21 @@ mod tests {
             .await
             .expect("update weight");
         // Drift the model's bias the same way, through the same restore.
-        sqlx::query("update models set route_bias = 1.0 where id = $1")
+        sqlx::query("update models set route_bias = 1.0, auto_eligible = true where id = $1")
             .bind(model.id)
             .execute(&store.pool)
             .await
-            .expect("drift route_bias");
+            .expect("drift route_bias and auto_eligible");
         let report = store.restore_backup_data(&data).await.expect("restore");
         assert!(report.tenants.updated >= 1);
         let restored_model = store.get_model(model.id).await.expect("get model");
         assert_eq!(
             restored_model.route_bias, 2.5,
             "restore must not reset route_bias to the neutral default"
+        );
+        assert!(
+            !restored_model.auto_eligible,
+            "restore must not re-include a model the backup had excluded"
         );
         assert_eq!(restored_model.tags, vec!["coding:3".to_string()]);
         assert_eq!(report.tenants.inserted, 0);

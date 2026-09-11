@@ -270,8 +270,9 @@ impl BoonGrants {
 /// Every hard-filter reason string, in the order the filters are applied. A
 /// candidate is attributed to the *first* filter it fails, so this order is
 /// part of the explanation's contract, not just presentation.
-const REJECTION_REASONS: [&str; 9] = [
+const REJECTION_REASONS: [&str; 10] = [
     "disabled",
+    "auto_excluded",
     "unhealthy",
     "model_type",
     "context_window",
@@ -400,6 +401,12 @@ fn evaluate<'a>(
     let hard_reject = |c: &Candidate| -> Option<&'static str> {
         if !c.model.enabled {
             return Some("disabled");
+        }
+        // Operator policy, checked ahead of health so the explanation reads as
+        // a deliberate exclusion rather than a transient outage. The model stays
+        // addressable by name; only `auto` skips it.
+        if !c.model.auto_eligible {
+            return Some("auto_excluded");
         }
         if !c.healthy {
             return Some("unhealthy");
@@ -1033,6 +1040,7 @@ mod tests {
             debug_diagnostics: false,
             energy_slots_per_node: 0,
             route_bias: 1.0,
+            auto_eligible: true,
             endpoints: Vec::new(),
         }
     }
@@ -1141,6 +1149,82 @@ mod tests {
         .unwrap();
         // Without bias, the name tie-break would pick "alpha".
         assert_eq!(chosen.model_name, "beta");
+    }
+
+    #[test]
+    fn auto_ineligible_model_is_never_selected() {
+        let mut a = model("alpha");
+        // "alpha" would win the name tie-break, and carries a bias high enough
+        // that no scoring weight could demote it — only the hard filter keeps
+        // it out.
+        a.route_bias = 3.0;
+        a.auto_eligible = false;
+        let candidates = vec![healthy(a), healthy(model("beta"))];
+        let chosen = select_model(
+            &candidates,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(chosen.model_name, "beta");
+    }
+
+    #[test]
+    fn excluding_every_model_leaves_auto_with_no_pick() {
+        let mut a = model("alpha");
+        let mut b = model("beta");
+        a.auto_eligible = false;
+        b.auto_eligible = false;
+        let candidates = vec![healthy(a), healthy(b)];
+        let chosen = select_model(
+            &candidates,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            1,
+        );
+        // Excluding the whole fleet is operator error, but it must surface as
+        // "auto has nothing to pick" rather than falling back to an excluded
+        // model.
+        assert!(chosen.is_none());
+    }
+
+    #[test]
+    fn exclusion_is_reported_as_operator_policy_not_a_health_problem() {
+        let mut a = model("alpha");
+        a.auto_eligible = false;
+        // Unhealthy *as well*, to pin the filter order: operator intent is the
+        // reported reason even when a transient condition also applies.
+        let mut cand = healthy(a);
+        cand.healthy = false;
+        let explain = explain_selection(
+            &[cand, healthy(model("beta"))],
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            &Intent::default(),
+        );
+        let reason = explain
+            .rejected
+            .iter()
+            .find(|r| r.models.iter().any(|m| m == "alpha"))
+            .map(|r| r.reason)
+            .expect("alpha must appear in the rejection list");
+        assert_eq!(reason, "auto_excluded");
     }
 
     #[test]
