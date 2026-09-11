@@ -734,6 +734,51 @@ impl Store {
     }
 }
 
+/// One scored candidate: an index into the caller's vector slice, and its
+/// cosine similarity to the query.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Scored {
+    pub index: usize,
+    pub score: f32,
+}
+
+/// Rank `vectors` against `query` by cosine similarity, keeping the best
+/// `top_k` at or above `min_score`.
+///
+/// Both sides are expected to be unit-normalized at write time, so this is a
+/// plain dot product. Vectors whose dimension differs from the query are
+/// skipped: they come from a different embedding space, where a similarity
+/// score is meaningless rather than merely low. This is a pure function that
+/// cannot fail, so it takes no `Result`; the proxy's retrieval path uses it
+/// too (a later task), which is why it lives here rather than in
+/// `obleth-admin`.
+pub fn score_against(
+    query: &[f32],
+    vectors: &[Vec<f32>],
+    top_k: usize,
+    min_score: f32,
+) -> Vec<Scored> {
+    if query.is_empty() || vectors.is_empty() || top_k == 0 {
+        return Vec::new();
+    }
+    let mut scored: Vec<Scored> = vectors
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.len() == query.len())
+        .map(|(index, v)| {
+            let score = query.iter().zip(v).map(|(a, b)| a * b).sum::<f32>();
+            Scored { index, score }
+        })
+        .filter(|s| s.score >= min_score)
+        .collect();
+    // `total_cmp` rather than `partial_cmp().unwrap()`: a NaN score (which a
+    // corrupt or non-normalized vector could produce) must order predictably
+    // rather than panic the sort.
+    scored.sort_by(|a, b| b.score.total_cmp(&a.score));
+    scored.truncate(top_k);
+    scored
+}
+
 #[cfg(test)]
 mod tests {
     /// Migrate the test database exactly once per test binary.
@@ -1488,5 +1533,51 @@ mod tests {
         assert_eq!(chunks[0].text, "chunk");
 
         store.delete_collection(c.id).await.ok();
+    }
+
+    #[test]
+    fn scores_rank_by_cosine_similarity() {
+        let query = vec![1.0f32, 0.0];
+        let diag = std::f32::consts::FRAC_1_SQRT_2;
+        let vectors = vec![
+            vec![0.0, 1.0], // orthogonal
+            vec![1.0, 0.0], // identical
+            vec![diag, diag],
+        ];
+        let out = super::score_against(&query, &vectors, 3, -1.0);
+        assert_eq!(out[0].index, 1, "identical vector ranks first");
+        assert_eq!(out[1].index, 2);
+        assert_eq!(out[2].index, 0);
+    }
+
+    #[test]
+    fn min_score_drops_weak_matches() {
+        let query = vec![1.0f32, 0.0];
+        let vectors = vec![vec![1.0, 0.0], vec![0.0, 1.0]];
+        let out = super::score_against(&query, &vectors, 5, 0.5);
+        assert_eq!(out.len(), 1, "the orthogonal vector is below threshold");
+        assert_eq!(out[0].index, 0);
+    }
+
+    #[test]
+    fn top_k_truncates() {
+        let query = vec![1.0f32, 0.0];
+        let vectors = vec![vec![1.0, 0.0]; 10];
+        assert_eq!(super::score_against(&query, &vectors, 3, -1.0).len(), 3);
+    }
+
+    #[test]
+    fn dimension_mismatch_scores_nothing() {
+        // Comparing across embedding spaces is silently wrong, not an error,
+        // so mismatched vectors must be excluded rather than scored.
+        let query = vec![1.0f32, 0.0];
+        let vectors = vec![vec![1.0, 0.0, 0.0]];
+        assert!(super::score_against(&query, &vectors, 5, -1.0).is_empty());
+    }
+
+    #[test]
+    fn empty_inputs_score_nothing() {
+        assert!(super::score_against(&[], &[vec![1.0]], 5, -1.0).is_empty());
+        assert!(super::score_against(&[1.0], &[], 5, -1.0).is_empty());
     }
 }
