@@ -16,27 +16,36 @@ create table if not exists knowledge_collections (
     -- bumped on any content change; the proxy compares this to decide whether
     -- to rebuild its in-memory slab.
     version                  bigint not null default 0,
-    active_generation        integer not null default 0,
     created_at               timestamptz not null default now(),
     updated_at               timestamptz not null default now()
 );
 
 create table if not exists knowledge_documents (
-    id            uuid primary key,
-    collection_id uuid not null references knowledge_collections(id) on delete cascade,
-    title         text not null,
-    filename      text not null default '',
-    content_type  text not null default 'text/plain',
-    content       text not null,
-    content_hash  text not null,
-    byte_size     bigint not null default 0,
-    status        text not null default 'pending'
-                    check (status in ('pending','indexing','ready','failed')),
-    error         text,
-    chunk_count   integer not null default 0,
-    created_at    timestamptz not null default now(),
-    indexed_at    timestamptz
+    id                       uuid primary key,
+    collection_id            uuid not null references knowledge_collections(id) on delete cascade,
+    title                    text not null,
+    filename                 text not null default '',
+    content_type             text not null default 'text/plain',
+    content                  text not null,
+    content_hash             text not null,
+    byte_size                bigint not null default 0,
+    status                   text not null default 'pending'
+                               check (status in ('pending','indexing','ready','failed')),
+    error                    text,
+    chunk_count              integer not null default 0,
+    -- generation is scoped to the DOCUMENT, not the collection: each document
+    -- advances its own generation as it is (re)indexed, independently of every
+    -- other document, so indexing one never invalidates another's chunks.
+    active_generation        integer not null default 0,
+    indexed_embedding_model  text not null default '',
+    created_at               timestamptz not null default now(),
+    indexed_at               timestamptz
 );
+
+-- Idempotent guards so this file stays re-runnable against a database that
+-- already created the table in its earlier (pre-correction) shape.
+alter table knowledge_documents add column if not exists active_generation integer not null default 0;
+alter table knowledge_documents add column if not exists indexed_embedding_model text not null default '';
 
 create unique index if not exists knowledge_documents_hash_uq
     on knowledge_documents (collection_id, content_hash);

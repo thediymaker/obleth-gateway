@@ -8,7 +8,7 @@
 use sqlx::Row;
 use uuid::Uuid;
 
-use crate::{Result, Store};
+use crate::{Result, Store, StoreError};
 
 #[derive(Debug, Clone)]
 pub struct KnowledgeCollection {
@@ -21,7 +21,6 @@ pub struct KnowledgeCollection {
     pub chunk_tokens: i32,
     pub chunk_overlap_tokens: i32,
     pub version: i64,
-    pub active_generation: i32,
 }
 
 impl KnowledgeCollection {
@@ -45,13 +44,12 @@ fn row_to_collection(row: &sqlx::postgres::PgRow) -> KnowledgeCollection {
         chunk_tokens: row.get("chunk_tokens"),
         chunk_overlap_tokens: row.get("chunk_overlap_tokens"),
         version: row.get("version"),
-        active_generation: row.get("active_generation"),
     }
 }
 
 const COLLECTION_COLS: &str = "id, name, description, embedding_model, \
     indexed_embedding_model, embedding_dim, chunk_tokens, chunk_overlap_tokens, \
-    version, active_generation";
+    version";
 
 impl Store {
     pub async fn create_collection(
@@ -183,6 +181,8 @@ pub struct KnowledgeDocument {
     pub status: String,
     pub error: Option<String>,
     pub chunk_count: i32,
+    pub active_generation: i32,
+    pub indexed_embedding_model: String,
 }
 
 /// One chunk awaiting insert. `embedding` is already normalized by the indexer.
@@ -205,7 +205,7 @@ pub struct KnowledgeChunk {
 }
 
 const DOC_COLS: &str = "id, collection_id, title, filename, content_type, content, \
-    byte_size, status, error, chunk_count";
+    byte_size, status, error, chunk_count, active_generation, indexed_embedding_model";
 
 fn row_to_document(row: &sqlx::postgres::PgRow) -> KnowledgeDocument {
     KnowledgeDocument {
@@ -219,6 +219,8 @@ fn row_to_document(row: &sqlx::postgres::PgRow) -> KnowledgeDocument {
         status: row.get("status"),
         error: row.get("error"),
         chunk_count: row.get("chunk_count"),
+        active_generation: row.get("active_generation"),
+        indexed_embedding_model: row.get("indexed_embedding_model"),
     }
 }
 
@@ -313,7 +315,7 @@ impl Store {
 
     /// Write one document's chunks into `generation`, replacing anything
     /// already written there for that document. Retrieval is unaffected until
-    /// `flip_generation` runs.
+    /// `flip_document_generation` runs.
     pub async fn write_generation(
         &self,
         collection_id: Uuid,
@@ -321,6 +323,9 @@ impl Store {
         generation: i32,
         chunks: &[ChunkInsert],
     ) -> Result<()> {
+        if chunks.is_empty() {
+            return Err(StoreError::Conflict("document produced no chunks".into()));
+        }
         let mut tx = self.pool().begin().await?;
         sqlx::query("delete from knowledge_chunks where document_id = $1 and generation = $2")
             .bind(document_id)
@@ -359,36 +364,85 @@ impl Store {
         Ok(())
     }
 
-    /// Promote `generation` to active, record the embedder that built it, bump
-    /// `version` to trigger a slab rebuild, and drop every older generation —
-    /// all in one transaction, so no reader ever observes mixed vectors.
-    pub async fn flip_generation(
+    /// Promote `generation` to active for ONE document, record the embedder that
+    /// built it, drop that document's other generations, and bump the collection
+    /// `version` so proxies rebuild their slab.
+    ///
+    /// The delete below is scoped to `document_id`, not `collection_id`: generation
+    /// numbers are per-document, so a collection-wide delete on `generation <> $2`
+    /// would drop every other document's chunks too — that was the Task 2
+    /// round-1 defect. `<>` rather than `<` is intentional and safe here: it also
+    /// garbage-collects a higher generation orphaned by a crashed indexer, and two
+    /// indexers can never hold the same document concurrently because
+    /// `claim_pending_document` flips it to `indexing` under `for update skip
+    /// locked` first.
+    ///
+    /// The collection-level `indexed_embedding_model` advances only once EVERY
+    /// document in the collection has been built with the collection's desired
+    /// `embedding_model`. That gate is what keeps a collection-wide re-embed from
+    /// ever exposing two embedding spaces at once: documents already moved to the
+    /// new embedder are excluded from the slab (see `load_active_chunks`) until
+    /// the last one lands, so retrieval serves the complete old set throughout and
+    /// switches atomically.
+    pub async fn flip_document_generation(
         &self,
         collection_id: Uuid,
+        document_id: Uuid,
         generation: i32,
         embedding_model: &str,
         embedding_dim: i32,
-    ) -> Result<KnowledgeCollection> {
+    ) -> Result<()> {
         let mut tx = self.pool().begin().await?;
-        let row = sqlx::query(&format!(
-            "update knowledge_collections
-                set active_generation = $2, indexed_embedding_model = $3,
-                    embedding_dim = $4, version = version + 1, updated_at = now()
-              where id = $1 returning {COLLECTION_COLS}"
-        ))
-        .bind(collection_id)
+        sqlx::query(
+            "update knowledge_documents
+                set active_generation = $2, indexed_embedding_model = $3
+              where id = $1",
+        )
+        .bind(document_id)
         .bind(generation)
         .bind(embedding_model)
-        .bind(embedding_dim)
-        .fetch_one(&mut *tx)
+        .execute(&mut *tx)
         .await?;
-        sqlx::query("delete from knowledge_chunks where collection_id = $1 and generation <> $2")
-            .bind(collection_id)
+        // Scoped to this document: other documents' chunks are untouched.
+        sqlx::query("delete from knowledge_chunks where document_id = $1 and generation <> $2")
+            .bind(document_id)
             .bind(generation)
             .execute(&mut *tx)
             .await?;
+        // Advance the collection's embedder only when no document lags behind.
+        sqlx::query(
+            "update knowledge_collections c
+                set indexed_embedding_model = $2, embedding_dim = $3,
+                    version = version + 1, updated_at = now()
+              where c.id = $1
+                and not exists (
+                    select 1 from knowledge_documents d
+                     where d.collection_id = c.id
+                       and d.status = 'ready'
+                       and d.indexed_embedding_model <> c.embedding_model
+                )",
+        )
+        .bind(collection_id)
+        .bind(embedding_model)
+        .bind(embedding_dim)
+        .execute(&mut *tx)
+        .await?;
+        // Always bump version, even when the embedder did not advance, so the
+        // proxy still picks up this document's new chunks. Mutually exclusive
+        // with the update above by its `where` clause, so `version` increases
+        // exactly once per call either way.
+        sqlx::query(
+            "update knowledge_collections set version = version + 1, updated_at = now()
+              where id = $1
+                and not (indexed_embedding_model = $2 and embedding_dim = $3)",
+        )
+        .bind(collection_id)
+        .bind(embedding_model)
+        .bind(embedding_dim)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await?;
-        Ok(row_to_collection(&row))
+        Ok(())
     }
 
     /// Bump `version` without a generation change, for deletes.
@@ -403,11 +457,20 @@ impl Store {
         Ok(())
     }
 
+    /// Chunks retrievable right now: each document's own active generation,
+    /// gated to documents whose embedder matches the collection's — a document
+    /// mid-reindex to a new embedder is excluded until the whole collection has
+    /// caught up (see `flip_document_generation`), so the count never includes a
+    /// mixed embedding space.
     pub async fn collection_chunk_count(&self, collection_id: Uuid) -> Result<i64> {
         let row = sqlx::query(
-            "select count(*) as n from knowledge_chunks
-              where collection_id = $1
-                and generation = (select active_generation from knowledge_collections where id = $1)",
+            "select count(*) as n
+               from knowledge_chunks k
+               join knowledge_documents d on d.id = k.document_id
+               join knowledge_collections c on c.id = k.collection_id
+              where k.collection_id = $1
+                and k.generation = d.active_generation
+                and d.indexed_embedding_model = c.indexed_embedding_model",
         )
         .bind(collection_id)
         .fetch_one(self.pool())
@@ -416,15 +479,20 @@ impl Store {
     }
 
     /// Chunk count and approximate stored bytes per collection, for the
-    /// dashboard's size display.
+    /// dashboard's size display. Same per-document-generation, embedder-matched
+    /// scope as `collection_chunk_count`, so the reported size matches what is
+    /// actually retrievable.
     pub async fn collection_sizes(&self) -> Result<Vec<(Uuid, i64, i64)>> {
         let rows = sqlx::query(
             "select c.id as id,
                     count(k.id) as chunks,
                     coalesce(sum(length(k.text) + octet_length(k.embedding)), 0) as bytes
                from knowledge_collections c
+               left join knowledge_documents d on d.collection_id = c.id
                left join knowledge_chunks k
-                 on k.collection_id = c.id and k.generation = c.active_generation
+                 on k.document_id = d.id
+                and k.generation = d.active_generation
+                and d.indexed_embedding_model = c.indexed_embedding_model
               group by c.id",
         )
         .fetch_all(self.pool())
@@ -435,16 +503,23 @@ impl Store {
             .collect())
     }
 
-    /// Load a collection's active-generation chunks for the proxy slab.
+    /// Load a collection's retrievable chunks for the proxy slab: each
+    /// document's own active generation, gated to documents whose embedder
+    /// matches the collection's (the mixed-embedding-space guard — see
+    /// `flip_document_generation`). Ordered by document then ordinal so chunk
+    /// order is stable within a document.
     /// Background-loop use only — never call this from the request path.
     pub async fn load_active_chunks(&self, collection_id: Uuid) -> Result<Vec<KnowledgeChunk>> {
         let rows = sqlx::query(
             "select k.id as id, k.document_id as document_id, k.text as text,
                     k.token_count as token_count, k.embedding as embedding
                from knowledge_chunks k
+               join knowledge_documents d on d.id = k.document_id
                join knowledge_collections c on c.id = k.collection_id
-              where k.collection_id = $1 and k.generation = c.active_generation
-              order by k.ordinal",
+              where k.collection_id = $1
+                and k.generation = d.active_generation
+                and d.indexed_embedding_model = c.indexed_embedding_model
+              order by k.document_id, k.ordinal",
         )
         .bind(collection_id)
         .fetch_all(self.pool())
@@ -498,7 +573,6 @@ mod tests {
         assert_eq!(created.name, name);
         assert_eq!(created.embedding_model, "qwen4-embedding");
         assert_eq!(created.version, 0);
-        assert_eq!(created.active_generation, 0);
         // Not yet indexed, so there is no embedder on record and no dimension.
         assert_eq!(created.indexed_embedding_model, "");
         assert_eq!(created.embedding_dim, 0);
@@ -588,54 +662,126 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn flip_generation_swaps_atomically_and_drops_the_old() {
+    async fn indexing_a_second_document_preserves_the_first() {
         let Some(store) = test_store().await else {
             return;
         };
         let c = store
-            .create_collection(&format!("gen-{}", uuid::Uuid::new_v4()), "", "e")
+            .create_collection(&format!("multi-{}", uuid::Uuid::new_v4()), "", "embed-a")
             .await
             .expect("collection");
-        let doc = store
-            .upsert_document(c.id, "Doc", "d.md", "text/markdown", "body")
+        let a = store
+            .upsert_document(c.id, "Doc A", "a.md", "text/markdown", "body a")
             .await
-            .expect("doc");
+            .expect("doc a");
+        let b = store
+            .upsert_document(c.id, "Doc B", "b.md", "text/markdown", "body b")
+            .await
+            .expect("doc b");
 
         store
             .write_generation(
                 c.id,
-                doc.id,
+                a.id,
                 1,
                 &[super::ChunkInsert {
                     ordinal: 0,
-                    text: "generation one".into(),
-                    token_count: 3,
+                    text: "chunk a".into(),
+                    token_count: 2,
                     embedding: vec![1.0, 0.0],
                 }],
             )
             .await
-            .expect("write gen 1");
-
-        // Before the flip the active generation is still 0, so the slab loader
-        // sees nothing — this is what keeps a crashed re-index invisible.
-        assert!(store
-            .load_active_chunks(c.id)
+            .expect("write a");
+        store
+            .flip_document_generation(c.id, a.id, 1, "embed-a", 2)
             .await
-            .expect("load")
-            .is_empty());
+            .expect("flip a");
 
-        let c = store.flip_generation(c.id, 1, "e", 2).await.expect("flip");
-        assert_eq!(c.active_generation, 1);
-        assert_eq!(c.embedding_dim, 2);
-        assert!(
-            c.version > 0,
-            "flip must bump version to trigger a slab rebuild"
-        );
+        store
+            .write_generation(
+                c.id,
+                b.id,
+                1,
+                &[super::ChunkInsert {
+                    ordinal: 0,
+                    text: "chunk b".into(),
+                    token_count: 2,
+                    embedding: vec![0.0, 1.0],
+                }],
+            )
+            .await
+            .expect("write b");
+        store
+            .flip_document_generation(c.id, b.id, 1, "embed-a", 2)
+            .await
+            .expect("flip b");
+
+        // The original defect: indexing Doc B deleted Doc A's chunks.
+        let chunks = store.load_active_chunks(c.id).await.expect("load");
+        assert_eq!(chunks.len(), 2, "both documents must remain retrievable");
+        let texts: Vec<&str> = chunks.iter().map(|k| k.text.as_str()).collect();
+        assert!(texts.contains(&"chunk a"));
+        assert!(texts.contains(&"chunk b"));
+
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn a_documents_own_reindex_replaces_only_its_chunks() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(&format!("reidx-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("collection");
+        let a = store
+            .upsert_document(c.id, "Doc A", "a.md", "text/markdown", "body a")
+            .await
+            .expect("doc a");
+
+        store
+            .write_generation(
+                c.id,
+                a.id,
+                1,
+                &[super::ChunkInsert {
+                    ordinal: 0,
+                    text: "old".into(),
+                    token_count: 1,
+                    embedding: vec![1.0, 0.0],
+                }],
+            )
+            .await
+            .expect("gen 1");
+        store
+            .flip_document_generation(c.id, a.id, 1, "embed-a", 2)
+            .await
+            .expect("flip 1");
+
+        store
+            .write_generation(
+                c.id,
+                a.id,
+                2,
+                &[super::ChunkInsert {
+                    ordinal: 0,
+                    text: "new".into(),
+                    token_count: 1,
+                    embedding: vec![0.0, 1.0],
+                }],
+            )
+            .await
+            .expect("gen 2");
+        store
+            .flip_document_generation(c.id, a.id, 2, "embed-a", 2)
+            .await
+            .expect("flip 2");
 
         let chunks = store.load_active_chunks(c.id).await.expect("load");
-        assert_eq!(chunks.len(), 1);
-        assert_eq!(chunks[0].text, "generation one");
-        assert_eq!(chunks[0].embedding, vec![1.0, 0.0]);
+        assert_eq!(chunks.len(), 1, "the old generation must be gone");
+        assert_eq!(chunks[0].text, "new");
 
         store.delete_collection(c.id).await.ok();
     }
