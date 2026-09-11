@@ -752,6 +752,10 @@ pub struct Scored {
 /// cannot fail, so it takes no `Result`; the proxy's retrieval path uses it
 /// too (a later task), which is why it lives here rather than in
 /// `obleth-admin`.
+///
+/// Returned hits are sorted in descending score order -- callers (the admin
+/// preview's `would_inject` token-budget walk, and the boon's own packing)
+/// rely on that ordering rather than re-sorting themselves.
 pub fn score_against(
     query: &[f32],
     vectors: &[Vec<f32>],
@@ -769,6 +773,12 @@ pub fn score_against(
             let score = query.iter().zip(v).map(|(a, b)| a * b).sum::<f32>();
             Scored { index, score }
         })
+        // A NaN sorts ABOVE every real number under `total_cmp`, so an
+        // unfiltered NaN from a corrupt stored vector would rank first and be
+        // injected ahead of every genuine match. Skip it instead. (An
+        // infinite score, e.g. from an infinite component in a corrupt
+        // vector, is caught by the same check.)
+        .filter(|s| s.score.is_finite())
         .filter(|s| s.score >= min_score)
         .collect();
     // `total_cmp` rather than `partial_cmp().unwrap()`: a NaN score (which a
@@ -776,6 +786,11 @@ pub fn score_against(
     // rather than panic the sort.
     scored.sort_by(|a, b| b.score.total_cmp(&a.score));
     scored.truncate(top_k);
+    debug_assert!(
+        scored.windows(2).all(|w| w[0].score >= w[1].score),
+        "score_against must return hits in descending score order; \
+         `would_inject` packing and the boon's token budget both rely on it"
+    );
     scored
 }
 
@@ -1579,5 +1594,25 @@ mod tests {
     fn empty_inputs_score_nothing() {
         assert!(super::score_against(&[], &[vec![1.0]], 5, -1.0).is_empty());
         assert!(super::score_against(&[1.0], &[], 5, -1.0).is_empty());
+    }
+
+    #[test]
+    fn non_finite_scores_are_skipped_not_ranked_first() {
+        // A NaN sorts ABOVE every real number under `total_cmp`, so an
+        // unfiltered NaN from a corrupt stored vector would rank first and be
+        // injected ahead of every genuine match.
+        let query = vec![1.0f32, 0.0];
+        let vectors = vec![
+            vec![f32::NAN, 0.0],
+            vec![f32::INFINITY, 0.0],
+            vec![1.0, 0.0],
+        ];
+        let out = super::score_against(&query, &vectors, 5, -1.0);
+        assert_eq!(
+            out.len(),
+            1,
+            "the NaN and infinite vectors must both be skipped entirely"
+        );
+        assert_eq!(out[0].index, 2, "the real match must rank first");
     }
 }
