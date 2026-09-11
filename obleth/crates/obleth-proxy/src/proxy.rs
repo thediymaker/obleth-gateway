@@ -3592,6 +3592,7 @@ mod tests {
             debug_diagnostics: false,
             energy_slots_per_node: 0,
             route_bias: 1.0,
+            auto_eligible: true,
             endpoints,
         }
     }
@@ -4035,6 +4036,7 @@ mod tests {
             debug_diagnostics: false,
             energy_slots_per_node: 0,
             route_bias: 1.0,
+            auto_eligible: true,
             endpoints: Vec::new(),
         }
     }

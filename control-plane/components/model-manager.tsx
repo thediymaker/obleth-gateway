@@ -998,6 +998,16 @@ function CreateModelWizard({
                   max={3}
                   hint="Multiplier on this model's auto-routing score. 1.0 is neutral."
                 />
+                <ChipGroup
+                  label="Auto routing"
+                  info="Whether the auto router may pick this model. Excluding it leaves the model fully available by name — unlike disabling the model, which removes it everywhere."
+                >
+                  <ChipCheckbox
+                    name="auto_eligible"
+                    label="Eligible for auto"
+                    defaultChecked
+                  />
+                </ChipGroup>
               </section>
 
               <section className={cn("space-y-3", step !== 4 && "hidden")}>
@@ -1429,6 +1439,16 @@ function ConnectionTab({
                 max={3}
                 hint="Multiplier on this model's auto-routing score. 1.0 is neutral."
               />
+              <ChipGroup
+                label="Auto routing"
+                info="Whether the auto router may pick this model. Excluding it leaves the model fully available by name — unlike disabling the model, which removes it everywhere."
+              >
+                <ChipCheckbox
+                  name="auto_eligible"
+                  label="Eligible for auto"
+                  defaultChecked={model.auto_eligible}
+                />
+              </ChipGroup>
             </FormSection>
           </div>
           {state?.ok === false && (

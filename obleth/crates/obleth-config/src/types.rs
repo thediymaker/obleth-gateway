@@ -419,6 +419,13 @@ pub struct ModelRoute {
     /// deserializable as neutral rather than the score-zeroing `0.0`.
     #[serde(default = "default_route_bias")]
     pub route_bias: f64,
+    /// Whether the `auto` router may select this model. `false` removes it from
+    /// auto's candidate pool while leaving it addressable by name — the
+    /// distinction from `enabled = false`, which removes it everywhere.
+    /// Defaults to `true`, not `bool::default()`, so an older payload never
+    /// reads as an exclusion.
+    #[serde(default = "default_auto_eligible")]
+    pub auto_eligible: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -561,6 +568,13 @@ pub struct ResolvedModel {
     /// payloads deserializable as neutral rather than the score-zeroing `0.0`.
     #[serde(default = "default_route_bias")]
     pub route_bias: f64,
+    /// Whether the `auto` router may select this model. `false` removes it from
+    /// auto's candidate pool while leaving it addressable by name — the
+    /// distinction from `enabled = false`, which removes it everywhere.
+    /// Defaults to `true`, not `bool::default()`: a cached payload written
+    /// before this field existed must not read as an exclusion.
+    #[serde(default = "default_auto_eligible")]
+    pub auto_eligible: bool,
     /// Upstream endpoints for this model. When empty, the data plane falls back
     /// to the legacy single `api_base`/`api_key` pair above (older cached
     /// payloads and un-migrated rows).
@@ -1211,6 +1225,13 @@ pub const DEFAULT_ROUTE_BIAS: f64 = 1.0;
 
 fn default_route_bias() -> f64 {
     DEFAULT_ROUTE_BIAS
+}
+
+/// Models participate in `auto` routing unless an operator opts them out.
+pub const DEFAULT_AUTO_ELIGIBLE: bool = true;
+
+fn default_auto_eligible() -> bool {
+    DEFAULT_AUTO_ELIGIBLE
 }
 
 /// True when `mode` is part of the fixed [`ENDPOINT_SELECTION_MODES`] vocabulary.
@@ -2104,6 +2125,10 @@ pub struct ModelBackup {
     /// required so backups taken before the column existed still restore.
     #[serde(default = "default_route_bias")]
     pub route_bias: f64,
+    /// Whether `auto` may select this model. Defaulted to eligible so backups
+    /// taken before the column existed restore without excluding anything.
+    #[serde(default = "default_auto_eligible")]
+    pub auto_eligible: bool,
     #[serde(default)]
     pub request_timeout_secs: Option<i64>,
     #[serde(default)]

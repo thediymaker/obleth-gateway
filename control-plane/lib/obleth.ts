@@ -118,6 +118,11 @@ export interface ModelRoute {
   energy_slots_per_node: number;
   /** Multiplier on this model's auto-routing score. 1.0 is neutral. */
   route_bias: number;
+  /**
+   * Whether the auto router may select this model. False removes it from auto's
+   * candidate pool while leaving it addressable by name.
+   */
+  auto_eligible: boolean;
   context_window: number;
   admission_weight: number;
   max_in_flight: number | null;

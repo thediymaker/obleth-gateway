@@ -8,6 +8,8 @@ workflow falls back to auto-generated notes.
 
 - **Auto-routing is now tunable and inspectable.** Scoring weights, a routing temperature, and a per-model routing bias are editable from Settings and take effect without a restart. A new Router mode in the Playground shows why a prompt routes where it does and previews the effect of a change before you apply it. Optional difficulty tiering routes harder requests to stronger models, ranking strength by price within each topic unless a model declares its own level.
 
+- **Models can be excluded from auto-routing.** An "Eligible for auto" switch on each model keeps it out of the auto router's candidate pool while leaving it callable by name — for a model you want available on request but never chosen on your behalf. Every model is eligible by default, so existing routing is unchanged. Excluded models appear in the Playground's routing explanation under `auto_excluded`.
+
 ## v1.0.0
 
 The 1.0 release: identity-provider tokens on the data plane, a security hardening pass across egress, filesystem, and browser policy, and a dedicated Playground for model comparison.
