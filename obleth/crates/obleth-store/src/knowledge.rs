@@ -1072,49 +1072,66 @@ mod tests {
             .create_collection(&format!("stranded-{}", uuid::Uuid::new_v4()), "", "embed-a")
             .await
             .expect("collection");
-        let doc = store
-            .upsert_document(c.id, "Doc", "d.md", "text/markdown", "body")
+        let first = store
+            .upsert_document(c.id, "First", "a.md", "text/markdown", "body a")
             .await
-            .expect("doc");
+            .expect("first");
+        let second = store
+            .upsert_document(c.id, "Second", "b.md", "text/markdown", "body b")
+            .await
+            .expect("second");
 
-        // Claim it, then simulate the worker dying: the row stays `indexing`.
-        //
-        // `claim_pending_document` is an UNSCOPED whole-table scan (the oldest
-        // pending/stale-indexing row, full stop) — it can never be assumed to
-        // return *this* document specifically. An earlier version of this test
-        // "handled" that by retrying and calling `mark_document_failed` on
-        // whatever else it claimed, on the theory that anything else must be a
-        // stale orphan. That theory is false: a claim landing here can just as
-        // easily be a different, currently-running test's own live `pending`
-        // document, and marking it `failed` silently corrupts that test rather
-        // than merely flaking this one. A test must never call
-        // `claim_pending_document` for cleanup, and must never call
-        // `mark_document_failed` on a document it did not itself create — the
-        // schema cascades `delete_collection` -> documents -> chunks, so this
-        // test's own rows are already cleaned up correctly below without
-        // touching anything global. If this occasionally claims a different
-        // test's document, that shows up as a flake to fix at the source
-        // (see `test_store`'s `MIGRATED` once-cell, which removed the dominant
-        // cause), not to paper over here.
+        // `claim_pending_document` is deliberately global and oldest-first: a
+        // production worker drains every collection, so an unscoped queue is
+        // correct there — it is this test that was wrong to assume the claim
+        // could be scoped to a document it didn't otherwise own. Backdate OUR
+        // two rows so they are the two oldest pending documents in the whole
+        // table, making every claim below deterministic and guaranteeing we
+        // never claim — and so never disturb — a document belonging to a test
+        // running in parallel. Do NOT restore or touch any document this test
+        // did not create, and do not reintroduce a claim-and-cleanup loop:
+        // `delete_collection`'s cascade (documents -> chunks) is sufficient.
+        sqlx::query(
+            "update knowledge_documents set created_at = now() - interval '2 days'
+              where id = $1",
+        )
+        .bind(first.id)
+        .execute(store.pool())
+        .await
+        .expect("backdate first");
+        sqlx::query(
+            "update knowledge_documents set created_at = now() - interval '1 day'
+              where id = $1",
+        )
+        .bind(second.id)
+        .execute(store.pool())
+        .await
+        .expect("backdate second");
+
+        // Oldest first: this must be `first`, and it becomes `indexing` with a
+        // fresh `indexing_started_at`.
         let claimed = store.claim_pending_document(1_800).await.expect("claim");
-        assert_eq!(claimed.expect("claimed").id, doc.id);
+        assert_eq!(claimed.expect("claimed").id, first.id);
 
-        // With a long window it is NOT reclaimable — no double-processing of a
-        // document that is merely slow.
-        assert!(
-            store
-                .claim_pending_document(1_800)
-                .await
-                .expect("claim")
-                .is_none(),
-            "a fresh claim must not be stealable"
+        // A FRESH claim must not be stealable. With a long window `first` is
+        // excluded by its recent stamp, so the next-oldest of our own rows
+        // comes back instead — proving `first` was skipped without consuming
+        // anyone else's document.
+        let next = store.claim_pending_document(1_800).await.expect("claim");
+        assert_eq!(
+            next.expect("second").id,
+            second.id,
+            "a freshly claimed document must not be reclaimable"
         );
 
-        // With a zero window the stranded row is reclaimed rather than lost.
+        // Both of our rows are now `indexing`. With a zero window both are
+        // stale, so oldest-first must still pick `first` (backdated a full day
+        // further than `second`) — the stranded row is reclaimed rather than
+        // lost, and reclaim order is not ambiguous between our own two rows.
         let reclaimed = store.claim_pending_document(0).await.expect("reclaim");
         assert_eq!(
             reclaimed.expect("reclaimed").id,
-            doc.id,
+            first.id,
             "a stranded indexing row must be reclaimable on timeout"
         );
 
