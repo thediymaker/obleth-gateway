@@ -7,15 +7,23 @@
 //! The boon runs in two phases inside `enrich_request`, not one block:
 //! - **Phase 1** (before compression) captures the retrieval query from the
 //!   untouched messages.
-//! - **Phase 2** (after compression) retrieves, packs, and injects.
+//! - **Phase 2** (after compression AND after guardrails) retrieves, packs,
+//!   and injects.
 //!
-//! This split matters because the compression boon's dedup/lossy passes
-//! iterate every message regardless of role and gate purely on a token-count
-//! floor: an injected knowledge block, or the trailing user turn the query is
-//! drawn from, are both eligible compression targets. Extracting the query
-//! late risks embedding a `[ref:HASH]` marker instead of the user's actual
-//! words; injecting before compression risks the block itself being
-//! paraphrased or collapsed to a reference on later turns.
+//! Phase 1 sits before compression because the compression boon's dedup/lossy
+//! passes iterate every message regardless of role and gate purely on a
+//! token-count floor: the trailing user turn the query is drawn from is an
+//! eligible compression target, and extracting the query late risks embedding
+//! a `[ref:HASH]` marker instead of the user's actual words.
+//!
+//! Phase 2 sits after compression for the mirror-image reason: the injected
+//! block would itself be an eligible compression target (paraphrased by lossy
+//! compression, or collapsed to a reference on a later turn). It also sits
+//! after guardrails' input scan, not before: guardrails scans every message
+//! including system content, so injecting first would let retrieved
+//! institutional text (an email address in a policy doc, the literal phrase
+//! "prompt injection" in an AI-use policy) trip a tenant's own scanner and
+//! block a request the boon must never fail.
 
 use obleth_config::{KnowledgeBoonSettings, ResolvedKey, ResolvedModel};
 use serde_json::{json, Value};
@@ -63,7 +71,10 @@ pub fn extract_query(json: &Value, turns: u32) -> Option<String> {
         return None;
     }
     let mut query = parts.join("\n");
-    // Long queries embed poorly and cost latency; the tail carries the intent.
+    // Long queries embed poorly and cost latency. `parts` is newest-first, so
+    // keeping the head (the first 2000 chars) and dropping the tail discards
+    // the *older* turns first — the intent lives in the most recent turns,
+    // which sit at the front of the joined string, not at the end of it.
     if query.chars().count() > 2000 {
         query = query.chars().take(2000).collect();
     }
@@ -100,15 +111,30 @@ pub fn available_budget(max_context_tokens: u32, context_window: i64, estimated:
     (max_context_tokens as i64).min(room) as u32
 }
 
-/// Keep hits in score order while they fit the budget.
+/// Fixed token cost of `render_block`'s preamble and closing tag. No
+/// tokenizer is available in this pure function, so this is an approximation
+/// (roughly the true cost of the header sentence + `<knowledge>`/
+/// `</knowledge>` tags) charged once against the budget up front, rather than
+/// relying entirely on `OUTPUT_RESERVE_TOKENS` to absorb it.
+const RENDER_PREAMBLE_TOKENS: u32 = 30;
+/// Approximate token cost of each hit's own `[N] Title` label line and
+/// surrounding newlines in the rendered block, charged per hit on top of its
+/// `token_count`.
+const RENDER_PER_HIT_OVERHEAD_TOKENS: u32 = 8;
+
+/// Keep hits in score order while they fit the budget. Accounts for
+/// `render_block`'s own overhead (preamble + per-hit label lines), not just
+/// each hit's raw `token_count`, so the rendered block does not overrun the
+/// budget it was packed against.
 pub fn pack(hits: Vec<Hit>, budget: u32) -> Vec<Hit> {
-    let mut remaining = budget as i64;
+    let mut remaining = budget as i64 - RENDER_PREAMBLE_TOKENS as i64;
     let mut out = Vec::new();
     for h in hits {
-        if remaining < h.token_count as i64 {
+        let cost = h.token_count as i64 + RENDER_PER_HIT_OVERHEAD_TOKENS as i64;
+        if remaining < cost {
             continue;
         }
-        remaining -= h.token_count as i64;
+        remaining -= cost;
         out.push(h);
     }
     out
@@ -129,7 +155,11 @@ pub fn render_block(hits: &[Hit]) -> String {
 }
 
 /// Place the block. Many models honor only the first system message, so an
-/// existing one is extended rather than joined by a second.
+/// existing one is extended rather than joined by a second — that holds
+/// whether its content is a plain string or an OpenAI-style array of parts;
+/// treating an array as "no content" and falling through to insert a *second*
+/// system message would silently demote the tenant's own system prompt to
+/// second place (several chat templates reject two system messages outright).
 pub fn inject(json: &mut Value, block: &str, supports_system: bool) -> bool {
     let Some(messages) = json.get_mut("messages").and_then(Value::as_array_mut) else {
         return false;
@@ -137,24 +167,44 @@ pub fn inject(json: &mut Value, block: &str, supports_system: bool) -> bool {
     if supports_system {
         if let Some(first) = messages.first_mut() {
             if first.get("role").and_then(Value::as_str) == Some("system") {
-                if let Some(existing) = first.get("content").and_then(Value::as_str) {
-                    let merged = format!("{existing}\n\n{block}");
-                    first["content"] = json!(merged);
-                    return true;
+                match first.get_mut("content") {
+                    Some(Value::String(existing)) => {
+                        existing.push_str("\n\n");
+                        existing.push_str(block);
+                        return true;
+                    }
+                    Some(Value::Array(parts)) => {
+                        parts.push(json!({"type": "text", "text": block}));
+                        return true;
+                    }
+                    _ => {}
                 }
             }
         }
         messages.insert(0, json!({"role": "system", "content": block}));
         return true;
     }
-    // No system-message support: prepend to the first user turn instead.
-    for msg in messages.iter_mut() {
-        if msg.get("role").and_then(Value::as_str) == Some("user") {
-            if let Some(existing) = msg.get("content").and_then(Value::as_str) {
+    // No system-message support: prepend to the LATEST user turn instead —
+    // that is the turn the retrieval query was drawn from (see
+    // `extract_query`), so the grounding must attach there. Scanning forward
+    // for the first user turn with string content would find an *older* turn
+    // whenever the latest one happens to carry array content, attaching the
+    // block to the wrong message.
+    for msg in messages.iter_mut().rev() {
+        if msg.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        match msg.get_mut("content") {
+            Some(Value::String(existing)) => {
                 let merged = format!("{block}\n\n{existing}");
-                msg["content"] = json!(merged);
+                *existing = merged;
                 return true;
             }
+            Some(Value::Array(parts)) => {
+                parts.insert(0, json!({"type": "text", "text": block}));
+                return true;
+            }
+            _ => return false,
         }
     }
     false
@@ -182,8 +232,11 @@ pub async fn apply(
 ) -> Retrieval {
     let slabs = state.knowledge.snapshot();
 
-    // One embedding call per distinct embedder, not per collection.
-    let mut vectors: std::collections::HashMap<String, Vec<f32>> = Default::default();
+    // One embedding *attempt* per distinct embedder, not per collection —
+    // `None` is cached just like `Some`, so a dead embedder shared by several
+    // collections pays `embed_timeout_ms` once per request, not once per
+    // collection.
+    let mut vectors: std::collections::HashMap<String, Option<Vec<f32>>> = Default::default();
     let mut all: Vec<Hit> = Vec::new();
     // Did at least one attached collection have data, and did every embed
     // attempt for it fail? That is the "error" outcome (an outage), distinct
@@ -196,23 +249,25 @@ pub async fn apply(
             continue;
         }
         any_nonempty_slab = true;
-        let vector = match vectors.get(&slab.embedding_model) {
-            Some(v) => {
-                any_embed_succeeded = true;
-                v.clone()
+        let vector = if let Some(cached) = vectors.get(&slab.embedding_model) {
+            match cached {
+                Some(v) => v.clone(),
+                None => continue, // this embedder already failed this request
             }
-            None => {
-                let Some(v) =
-                    crate::knowledge::embed_query(state, &slab.embedding_model, query, settings)
-                        .await
-                else {
+        } else {
+            match crate::knowledge::embed_query(state, &slab.embedding_model, query, settings).await
+            {
+                Some(v) => {
+                    vectors.insert(slab.embedding_model.clone(), Some(v.clone()));
+                    v
+                }
+                None => {
+                    vectors.insert(slab.embedding_model.clone(), None);
                     continue;
-                };
-                any_embed_succeeded = true;
-                vectors.insert(slab.embedding_model.clone(), v.clone());
-                v
+                }
             }
         };
+        any_embed_succeeded = true;
         all.extend(slab.retrieve(&vector, settings.top_k as usize, settings.min_score));
     }
 
@@ -353,6 +408,52 @@ mod tests {
         assert!(sys.starts_with("be helpful"));
         assert!(sys.contains("<knowledge>x</knowledge>"));
         assert_eq!(body["messages"].as_array().expect("arr").len(), 2);
+    }
+
+    #[test]
+    fn inject_appends_a_text_part_to_an_array_content_system_message() {
+        // An array-content system message must not be treated as "no
+        // content" and get a second system message inserted ahead of it —
+        // that would silently demote the tenant's own system prompt and
+        // several chat templates reject two system messages outright.
+        let mut body = json!({"messages": [
+            {"role": "system", "content": [{"type": "text", "text": "be helpful"}]},
+            {"role": "user", "content": "q"}
+        ]});
+        assert!(inject(&mut body, "BLOCK", true));
+        assert_eq!(
+            body["messages"].as_array().expect("arr").len(),
+            2,
+            "still one system message, not two"
+        );
+        let parts = body["messages"][0]["content"]
+            .as_array()
+            .expect("array content");
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["text"], "be helpful");
+        assert_eq!(parts[1]["text"], "BLOCK");
+    }
+
+    #[test]
+    fn inject_targets_the_latest_user_turn_even_with_array_content_when_system_is_unsupported() {
+        // The retrieval query is drawn from the LATEST user turn, so the
+        // block must attach there — not to an older turn that merely happens
+        // to have string content while the latest turn has array content.
+        let mut body = json!({"messages": [
+            {"role": "user", "content": "older turn"},
+            {"role": "assistant", "content": "..."},
+            {"role": "user", "content": [{"type": "text", "text": "latest turn"}]}
+        ]});
+        assert!(inject(&mut body, "BLOCK", false));
+        let parts = body["messages"][2]["content"]
+            .as_array()
+            .expect("array content");
+        assert_eq!(parts[0]["text"], "BLOCK");
+        assert_eq!(parts[1]["text"], "latest turn");
+        assert_eq!(
+            body["messages"][0]["content"], "older turn",
+            "the older turn must be untouched"
+        );
     }
 
     #[test]
