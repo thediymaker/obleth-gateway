@@ -1658,6 +1658,7 @@ dependencies = [
 name = "obleth-admin"
 version = "1.0.0"
 dependencies = [
+ "anyhow",
  "arc-swap",
  "axum",
  "base64 0.22.1",
