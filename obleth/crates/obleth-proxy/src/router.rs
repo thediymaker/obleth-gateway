@@ -16,11 +16,14 @@
 //!    are not busy) and cost (prefer cheaper models), then picks the best with
 //!    a deterministic tie-break on model name.
 //!
-//! All three stages live in one private function, [`evaluate`]. [`select_model`]
-//! takes its verdict and [`explain_selection`] narrates it, so the routing
-//! explanation shown in traces and the tuner cannot describe a decision the
-//! router would not actually make. Both are pure and synchronous, so they can
-//! be unit-tested without any of the data-plane wiring.
+//! All three stages live in one private function, [`evaluate`], and three thin
+//! entry points sit over it: [`select_model`] takes the verdict and serves,
+//! [`explain_selection`] narrates without serving (the simulate endpoint), and
+//! [`route`] does both from a single evaluation — which is how a traced request
+//! gets an explanation of the pick it actually served rather than of a second,
+//! independently sampled one. The routing explanation therefore cannot describe
+//! a decision the router would not make. All are pure and synchronous, so they
+//! can be unit-tested without any of the data-plane wiring.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -300,19 +303,39 @@ struct Evaluation<'a> {
     ordered: Vec<ScoredRef<'a>>,
     /// Index into `ordered`. `None` only when no candidate cleared stage 1.
     chosen: Option<usize>,
+    /// Narration only; empty under [`Narration::Off`].
     rejected: Vec<crate::route_explain::Rejection>,
+    /// Drives the tier filter when tiering is on, and is reported either way.
+    /// Empty only when tiering is off *and* nobody asked for narration.
     tier_domains: Vec<String>,
     tier_floor: u8,
     tier_floor_clamped: bool,
 }
 
+/// Whether an evaluation should build its explanation.
+///
+/// Narration — the rejection strings, the tier-domain list when tiering is off,
+/// and each survivor's level — costs a `String` per rejected model on a path
+/// that discards them. The serving hot path asks for [`Narration::Off`].
+///
+/// This is strictly additive output. Nothing computed only under
+/// [`Narration::On`] is read by any stage that decides the outcome, so
+/// `Evaluation::chosen` and `Evaluation::ordered` are identical either way;
+/// `narration_cannot_move_the_verdict` pins that across the knob matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Narration {
+    Off,
+    On,
+}
+
 /// The one implementation of `auto` selection.
 ///
-/// [`select_model`] and [`explain_selection`] are both thin wrappers over this
-/// function and share every filter, weight and tie-break by construction, so
-/// the explanation cannot describe a decision the router would not make. Do not
-/// reimplement any stage in a caller: a tuned threshold that lives here changes
-/// both, and a tuned threshold that lives in a caller is a drift bug.
+/// [`select_model`], [`explain_selection`] and [`route`] are all thin wrappers
+/// over this function and share every filter, weight and tie-break by
+/// construction, so the explanation cannot describe a decision the router would
+/// not make. Do not reimplement any stage in a caller: a tuned threshold that
+/// lives here changes all three, and a tuned threshold that lives in a caller is
+/// a drift bug.
 #[allow(clippy::too_many_arguments)]
 fn evaluate<'a>(
     candidates: &'a [Candidate],
@@ -324,7 +347,9 @@ fn evaluate<'a>(
     weights: &RouterWeights,
     uniform: f64,
     difficulty: u8,
+    narration: Narration,
 ) -> Evaluation<'a> {
+    let narrating = narration == Narration::On;
     let required_context = features
         .est_input_tokens
         .saturating_add(features.max_tokens);
@@ -336,18 +361,27 @@ fn evaluate<'a>(
         grants.structured_active && c.model.boons.iter().any(|b| b == "structured_output")
     };
 
-    // Which domains the tier filter reasons over. Computed even when tiering is
-    // off, because the explanation reports each survivor's level either way.
-    let tier_domains: Vec<String> = if desired_tags.is_empty() {
-        vec![GENERAL_DOMAIN.to_string()]
+    // Which domains the tier filter reasons over. Needed for the verdict when
+    // tiering is on, and reported when narrating; skipped entirely otherwise so
+    // the serving path does not allocate a list nobody reads.
+    let tier_domains: Vec<String> = if weights.difficulty_enabled || narrating {
+        if desired_tags.is_empty() {
+            vec![GENERAL_DOMAIN.to_string()]
+        } else {
+            desired_tags.to_vec()
+        }
     } else {
-        desired_tags.to_vec()
+        Vec::new()
     };
 
     // Rejections collapse by reason rather than one row per model, so the
-    // payload stays small enough to ride a trace span.
+    // payload stays small enough to ride a trace span. Under `Narration::Off`
+    // nothing is recorded and no model name is ever cloned.
     let mut buckets: Vec<Vec<String>> = vec![Vec::new(); REJECTION_REASONS.len()];
     let mut reject = |reason: &str, name: &str| {
+        if !narrating {
+            return;
+        }
         let slot = REJECTION_REASONS
             .iter()
             .position(|r| *r == reason)
@@ -504,7 +538,12 @@ fn evaluate<'a>(
         let bias = cand.model.route_bias.clamp(0.1, 3.0);
         scored.push(ScoredRef {
             cand,
-            level: cand.strength(&tier_domains),
+            // Narration only — no stage reads it. Skipped on the serving path.
+            level: if narrating {
+                cand.strength(&tier_domains)
+            } else {
+                0
+            },
             spare,
             cost_score,
             tag_score,
@@ -583,9 +622,15 @@ fn pick_index(scored: &[ScoredRef<'_>], weights: &RouterWeights, uniform: f64) -
 /// only has an effect when `weights.difficulty_enabled` is set; see stage 2 of
 /// [`evaluate`] for the clamp-down floor it drives.
 ///
-/// All of the logic lives in [`evaluate`], which [`explain_selection`] also
-/// calls — that shared core is what makes the two answers identical by
-/// construction rather than by review.
+/// All of the logic lives in [`evaluate`], which [`explain_selection`] and
+/// [`route`] also call — that shared core is what makes all three answers
+/// identical by construction rather than by review.
+///
+/// Use this on the serving path when nothing will consume an explanation; it
+/// asks [`evaluate`] for [`Narration::Off`] and so allocates nothing for one.
+/// When the caller wants both the model and its explanation, call [`route`]
+/// instead of calling this and [`explain_selection`] in turn — two calls would
+/// mean two `uniform` draws and, above temperature 0, two different answers.
 #[allow(clippy::too_many_arguments)]
 pub fn select_model(
     candidates: &[Candidate],
@@ -608,15 +653,61 @@ pub fn select_model(
         weights,
         uniform,
         difficulty,
+        Narration::Off,
     );
     ev.chosen.map(|i| ev.ordered[i].cand.model.clone())
 }
 
-/// Explain the same decision [`select_model`] would make for these inputs.
+/// Serve *and* explain one `auto` request from a single evaluation.
 ///
-/// Both functions delegate to [`evaluate`], so the verdict here is the verdict
-/// there — the explanation records the losers instead of discarding them, and
-/// adds nothing that could disagree.
+/// The pick and the explanation come out of the same [`Evaluation`], built from
+/// one `uniform` draw, so `RouteExplain::chosen` names the model actually
+/// returned — by identity, not by a test. A caller that instead called
+/// [`select_model`] and [`explain_selection`] separately would have to pass a
+/// draw to each; above temperature 0 those are two independent samples, and the
+/// trace would describe a request the gateway did not serve. That is why this
+/// function exists rather than a note telling callers to be careful.
+///
+/// See [`explain_selection`] for what `intent` supplies and why `classifier_ms`
+/// is `0`.
+// Not yet called outside tests: the `auto_route` span writer is the consumer,
+// and it lands after this.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn route(
+    candidates: &[Candidate],
+    features: &RequestFeatures,
+    busyness: &HashMap<String, usize>,
+    allowed_models: Option<&[String]>,
+    desired_tags: &[String],
+    grants: BoonGrants,
+    weights: &RouterWeights,
+    uniform: f64,
+    intent: &Intent,
+) -> (Option<ResolvedModel>, crate::route_explain::RouteExplain) {
+    let ev = evaluate(
+        candidates,
+        features,
+        busyness,
+        allowed_models,
+        desired_tags,
+        grants,
+        weights,
+        uniform,
+        intent.difficulty,
+        Narration::On,
+    );
+    let picked = ev.chosen.map(|i| ev.ordered[i].cand.model.clone());
+    (picked, narrate(ev, desired_tags, weights, intent))
+}
+
+/// Explain the decision [`select_model`] would make for these inputs, without
+/// making it. This is the simulate endpoint's entry point: it answers "what
+/// would happen" for hypothetical weights, so it explains without serving.
+///
+/// Every function here delegates to [`evaluate`], so the verdict described is
+/// the verdict taken — the explanation records the losers instead of discarding
+/// them, and adds nothing that could disagree.
 ///
 /// `intent` supplies the difficulty *and* its provenance: `intent.source` is
 /// reported as both `difficulty_source` and `tag_source`, because a request's
@@ -625,8 +716,8 @@ pub fn select_model(
 /// `classifier_ms` is always `0` here. Only the data-plane call site times the
 /// classifier, so the proxy overwrites the field before recording the span;
 /// a `0` from the simulate endpoint is correct, not a missing measurement.
-// Not yet called outside tests: the `auto_route` span writer and the admin
-// simulate endpoint are the two consumers, and both land after this.
+// Not yet called outside tests: the admin simulate endpoint is the consumer,
+// and it lands after this.
 #[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn explain_selection(
@@ -650,8 +741,20 @@ pub fn explain_selection(
         weights,
         uniform,
         intent.difficulty,
+        Narration::On,
     );
+    narrate(ev, desired_tags, weights, intent)
+}
 
+/// Render a finished [`Evaluation`] as the wire shape. Pure presentation: it
+/// decides nothing, and is the single place both explaining entry points build
+/// their output so they cannot describe the same evaluation differently.
+fn narrate(
+    ev: Evaluation<'_>,
+    desired_tags: &[String],
+    weights: &RouterWeights,
+    intent: &Intent,
+) -> crate::route_explain::RouteExplain {
     crate::route_explain::RouteExplain {
         chosen: ev
             .chosen
@@ -674,8 +777,8 @@ pub fn explain_selection(
             difficulty_enabled: weights.difficulty_enabled,
         },
         temperature: weights.temperature,
-        // The list is in descending-score order, so anything but index 0 can
-        // only have been reached by a softmax draw.
+        // Index-based: the draw moved the pick off the head of the list. See
+        // the field's own docs for why that is not quite "beat the argmax".
         sampled: ev.chosen.is_some_and(|i| i != 0),
         scored: ev
             .ordered
@@ -1892,6 +1995,92 @@ mod tests {
         }
     }
 
+    /// An explanation must agree with itself: exactly one scored row is marked
+    /// `chosen`, and it names the model in `chosen`. `explain_agrees_with_
+    /// select_model` only checks the top-level field, so an off-by-one in the
+    /// per-row marking would otherwise slip through.
+    fn assert_self_consistent(ex: &crate::route_explain::RouteExplain) {
+        assert_eq!(
+            ex.scored.iter().find(|s| s.chosen).map(|s| &s.model),
+            ex.chosen.as_ref(),
+            "the marked row and the `chosen` field must name the same model"
+        );
+        assert_eq!(
+            ex.scored.iter().filter(|s| s.chosen).count(),
+            usize::from(ex.chosen.is_some()),
+            "exactly one row may be marked chosen, and none when nothing was picked"
+        );
+    }
+
+    /// A candidate set with enough spread — costs, tags, tier levels and a bias
+    /// — that every knob in the agreement matrix can actually change the pick.
+    fn varied_candidates() -> Vec<Candidate> {
+        let mut cheap = tiered("cheap", 0.000_001, &[("coding", 1)]);
+        cheap.levels.push((GENERAL_DOMAIN.to_string(), 1));
+        let mut mid = tiered("mid", 0.000_010, &[("coding", 2), ("math", 2)]);
+        mid.levels.push((GENERAL_DOMAIN.to_string(), 2));
+        let mut dear = tiered("dear", 0.000_100, &[("coding", 3), ("math", 3)]);
+        dear.levels.push((GENERAL_DOMAIN.to_string(), 3));
+        dear.model.route_bias = 1.4;
+        let mut plain = healthy(model("plain"));
+        plain.model.input_cost_per_token = 0.000_050;
+        plain.levels = vec![(GENERAL_DOMAIN.to_string(), 2)];
+        vec![cheap, mid, dear, plain]
+    }
+
+    /// One cell of the agreement matrix: every input that can move a decision.
+    struct Knobs {
+        weights: RouterWeights,
+        uniform: f64,
+        tags: Vec<String>,
+        difficulty: u8,
+        allowed: Option<Vec<String>>,
+    }
+
+    impl Knobs {
+        /// Names the cell, so a failure says which combination broke.
+        fn label(&self) -> String {
+            format!(
+                "temp={} uniform={} tags={:?} difficulty={} allowed={:?} tiering={}",
+                self.weights.temperature,
+                self.uniform,
+                self.tags,
+                self.difficulty,
+                self.allowed,
+                self.weights.difficulty_enabled,
+            )
+        }
+    }
+
+    /// Every combination of the knobs that can move a decision: 216 cells.
+    fn knob_matrix() -> Vec<Knobs> {
+        let mut out = Vec::new();
+        for temperature in [0.0, 0.5, 2.0] {
+            for uniform in [0.0, 0.4, 0.999] {
+                for tags in [vec![], vec!["coding".to_string()]] {
+                    for difficulty in 1..=3u8 {
+                        for allowed in [None, Some(vec!["cheap".to_string(), "dear".to_string()])] {
+                            for difficulty_enabled in [false, true] {
+                                out.push(Knobs {
+                                    weights: RouterWeights {
+                                        temperature,
+                                        difficulty_enabled,
+                                        ..Default::default()
+                                    },
+                                    uniform,
+                                    tags: tags.clone(),
+                                    difficulty,
+                                    allowed: allowed.clone(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn explain_collapses_rejections_by_reason() {
         let mut small = model("small");
@@ -1916,6 +2105,7 @@ mod tests {
             0.0,
             &Intent::default(),
         );
+        assert_self_consistent(&ex);
         assert_eq!(ex.chosen.as_deref(), Some("ok"));
         assert_eq!(ex.scored.len(), 1);
         let ctx = ex
@@ -1932,39 +2122,149 @@ mod tests {
 
     #[test]
     fn explain_agrees_with_select_model() {
-        let mut cheap = model("cheap");
-        cheap.input_cost_per_token = 0.000_001;
-        let mut pricey = model("pricey");
-        pricey.input_cost_per_token = 0.000_100;
-        let cands = vec![healthy(pricey), healthy(cheap)];
-        let w = RouterWeights::default();
-        let picked = select_model(
-            &cands,
-            &RequestFeatures::default(),
-            &HashMap::new(),
-            None,
-            &[],
-            BoonGrants::default(),
-            &w,
-            0.0,
-            1,
+        let cands = varied_candidates();
+        let mut outcomes: Vec<Option<String>> = Vec::new();
+        for k in knob_matrix() {
+            let label = k.label();
+            let picked = select_model(
+                &cands,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                k.allowed.as_deref(),
+                &k.tags,
+                BoonGrants::default(),
+                &k.weights,
+                k.uniform,
+                k.difficulty,
+            );
+            let ex = explain_selection(
+                &cands,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                k.allowed.as_deref(),
+                &k.tags,
+                BoonGrants::default(),
+                &k.weights,
+                k.uniform,
+                &intent_at(k.difficulty),
+            );
+            assert_eq!(
+                ex.chosen,
+                picked.as_ref().map(|m| m.model_name.clone()),
+                "the explanation must never disagree with the real selection [{label}]"
+            );
+            assert_self_consistent(&ex);
+            outcomes.push(ex.chosen);
+        }
+        outcomes.sort();
+        outcomes.dedup();
+        assert!(
+            outcomes.len() >= 3,
+            "the matrix must actually move the pick around, else it proves nothing; got {outcomes:?}"
         );
-        let ex = explain_selection(
-            &cands,
-            &RequestFeatures::default(),
-            &HashMap::new(),
-            None,
-            &[],
-            BoonGrants::default(),
-            &w,
-            0.0,
-            &Intent::default(),
-        );
-        assert_eq!(
-            ex.chosen,
-            picked.map(|m| m.model_name),
-            "the explanation must never disagree with the real selection"
-        );
+    }
+
+    #[test]
+    fn route_serves_and_explains_from_one_draw() {
+        let cands = varied_candidates();
+        for k in knob_matrix() {
+            let (picked, ex) = route(
+                &cands,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                k.allowed.as_deref(),
+                &k.tags,
+                BoonGrants::default(),
+                &k.weights,
+                k.uniform,
+                &intent_at(k.difficulty),
+            );
+            assert_eq!(
+                ex.chosen,
+                picked.as_ref().map(|m| m.model_name.clone()),
+                "the served model and its explanation come from one evaluation"
+            );
+            assert_self_consistent(&ex);
+            // And the same inputs through the serving-only path agree too.
+            let alone = select_model(
+                &cands,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                k.allowed.as_deref(),
+                &k.tags,
+                BoonGrants::default(),
+                &k.weights,
+                k.uniform,
+                k.difficulty,
+            );
+            assert_eq!(
+                picked.map(|m| m.model_name),
+                alone.map(|m| m.model_name),
+                "route must serve exactly what select_model would"
+            );
+        }
+    }
+
+    #[test]
+    fn narration_cannot_move_the_verdict() {
+        let cands = varied_candidates();
+        for k in knob_matrix() {
+            let quiet = evaluate(
+                &cands,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                k.allowed.as_deref(),
+                &k.tags,
+                BoonGrants::default(),
+                &k.weights,
+                k.uniform,
+                k.difficulty,
+                Narration::Off,
+            );
+            let loud = evaluate(
+                &cands,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                k.allowed.as_deref(),
+                &k.tags,
+                BoonGrants::default(),
+                &k.weights,
+                k.uniform,
+                k.difficulty,
+                Narration::On,
+            );
+            let names = |ev: &Evaluation<'_>| -> Vec<String> {
+                ev.ordered
+                    .iter()
+                    .map(|s| s.cand.model.model_name.clone())
+                    .collect()
+            };
+            assert_eq!(
+                quiet.chosen, loud.chosen,
+                "narration moved the chosen index"
+            );
+            assert_eq!(names(&quiet), names(&loud), "narration reordered the field");
+            assert_eq!(quiet.tier_floor, loud.tier_floor);
+            assert_eq!(quiet.tier_floor_clamped, loud.tier_floor_clamped);
+            let scores =
+                |ev: &Evaluation<'_>| -> Vec<f64> { ev.ordered.iter().map(|s| s.score).collect() };
+            assert_eq!(
+                scores(&quiet),
+                scores(&loud),
+                "narration changed a score; it must be output-only"
+            );
+            // ...and the quiet path really did skip the narration allocations.
+            assert!(
+                quiet.rejected.is_empty(),
+                "the serving path must not build rejection strings it discards"
+            );
+            if !k.weights.difficulty_enabled {
+                assert!(
+                    quiet.tier_domains.is_empty(),
+                    "with tiering off the serving path must not allocate tier domains"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1985,6 +2285,7 @@ mod tests {
             0.0,
             &Intent::default(),
         );
+        assert_self_consistent(&ex);
         assert_eq!(ex.scored[0].model, "cheap");
         assert!(ex.scored[0].chosen);
         assert!(!ex.scored[1].chosen);
@@ -2013,6 +2314,7 @@ mod tests {
             0.0,
             &intent_at(2),
         );
+        assert_self_consistent(&reachable);
         assert!(!reachable.tier_floor_clamped);
         assert_eq!(reachable.tier_floor, 2);
         assert_eq!(reachable.tier_domains, desired);
@@ -2035,6 +2337,7 @@ mod tests {
             0.0,
             &intent_at(3),
         );
+        assert_self_consistent(&clamped);
         assert!(
             clamped.tier_floor_clamped,
             "asking for a level nothing holds must report the clamp"
@@ -2068,12 +2371,14 @@ mod tests {
             )
         };
         let argmax = explain_with(0.0);
+        assert_self_consistent(&argmax);
         assert_eq!(argmax.chosen.as_deref(), Some("cheap"));
         assert!(
             !argmax.sampled,
             "landing on the argmax is not a sampled pick"
         );
         let drawn = explain_with(0.999);
+        assert_self_consistent(&drawn);
         assert_eq!(drawn.chosen.as_deref(), Some("pricey"));
         assert!(drawn.sampled);
         assert!(drawn.scored[1].chosen, "the marked row follows the draw");
@@ -2100,6 +2405,7 @@ mod tests {
             0.0,
             &Intent::default(),
         );
+        assert_self_consistent(&ex);
         assert!(ex.chosen.is_none());
         assert!(ex.scored.is_empty());
         assert_eq!(ex.rejected.len(), 1);
@@ -2136,6 +2442,7 @@ mod tests {
             0.0,
             &Intent::default(),
         );
+        assert_self_consistent(&ex);
         assert_eq!(ex.rejected.len(), 1);
         assert_eq!(ex.rejected[0].reason, "disabled");
         assert_eq!(ex.rejected[0].models, vec!["broken".to_string()]);
@@ -2160,6 +2467,7 @@ mod tests {
             0.0,
             &intent,
         );
+        assert_self_consistent(&ex);
         assert_eq!(ex.difficulty, 2);
         assert_eq!(ex.difficulty_source, IntentSource::Classifier);
         assert_eq!(ex.tag_source, IntentSource::Classifier);
