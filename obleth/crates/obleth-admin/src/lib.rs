@@ -1454,7 +1454,28 @@ async fn put_alert_settings(
 
 // ---- auto router settings ----
 
-/// View of the persisted `auto` router classifier settings.
+/// Convert a persisted `TierSource` to the lowercase string used on the wire.
+fn tier_source_as_str(t: obleth_config::TierSource) -> &'static str {
+    match t {
+        obleth_config::TierSource::Hybrid => "hybrid",
+        obleth_config::TierSource::Derived => "derived",
+        obleth_config::TierSource::Declared => "declared",
+    }
+}
+
+/// Parse a wire string into a `TierSource`. Returns `None` for anything
+/// unrecognized so callers can fall back to the existing value instead of
+/// erroring the request.
+fn parse_tier_source(s: &str) -> Option<obleth_config::TierSource> {
+    match s {
+        "hybrid" => Some(obleth_config::TierSource::Hybrid),
+        "derived" => Some(obleth_config::TierSource::Derived),
+        "declared" => Some(obleth_config::TierSource::Declared),
+        _ => None,
+    }
+}
+
+/// View of the persisted `auto` router classifier and scoring settings.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AutoRouterSettingsView {
     pub classifier_enabled: bool,
@@ -1462,6 +1483,14 @@ pub struct AutoRouterSettingsView {
     pub classifier_timeout_ms: u64,
     /// The fixed tag vocabulary, surfaced so the UI can render tag pickers.
     pub available_tags: Vec<String>,
+    pub capacity_weight: f64,
+    pub cost_weight: f64,
+    pub tag_weight: f64,
+    pub default_soft_cap: u32,
+    pub temperature: f64,
+    pub difficulty_enabled: bool,
+    /// `"hybrid" | "derived" | "declared"`.
+    pub tier_source: String,
 }
 
 impl AutoRouterSettingsView {
@@ -1474,11 +1503,18 @@ impl AutoRouterSettingsView {
                 .iter()
                 .map(|t| t.to_string())
                 .collect(),
+            capacity_weight: s.capacity_weight,
+            cost_weight: s.cost_weight,
+            tag_weight: s.tag_weight,
+            default_soft_cap: s.default_soft_cap,
+            temperature: s.temperature,
+            difficulty_enabled: s.difficulty_enabled,
+            tier_source: tier_source_as_str(s.tier_source).to_string(),
         }
     }
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, ToSchema, Default)]
 pub struct UpdateAutoRouterSettings {
     #[serde(default)]
     pub classifier_enabled: Option<bool>,
@@ -1487,6 +1523,63 @@ pub struct UpdateAutoRouterSettings {
     pub classifier_model: Option<String>,
     #[serde(default)]
     pub classifier_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub capacity_weight: Option<f64>,
+    #[serde(default)]
+    pub cost_weight: Option<f64>,
+    #[serde(default)]
+    pub tag_weight: Option<f64>,
+    #[serde(default)]
+    pub default_soft_cap: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub difficulty_enabled: Option<bool>,
+    /// `"hybrid" | "derived" | "declared"`. Unrecognized or absent values
+    /// leave the persisted `tier_source` untouched.
+    #[serde(default)]
+    pub tier_source: Option<String>,
+}
+
+/// Merge an update over the persisted settings, clamping out-of-range values.
+/// Weights are clamped to [0,1]; temperature to [0,2]; soft cap must be >= 1.
+/// Fields absent from the update (or unrecognized, for `tier_source`) keep
+/// their existing persisted value rather than resetting to a default.
+fn merge_auto_router(
+    existing: &AutoRouterSettings,
+    body: &UpdateAutoRouterSettings,
+) -> AutoRouterSettings {
+    let unit = |v: Option<f64>, cur: f64| v.map(|x| x.clamp(0.0, 1.0)).unwrap_or(cur);
+    let classifier_model = match body.classifier_model.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.classifier_model.clone(),
+    };
+    AutoRouterSettings {
+        classifier_enabled: body.classifier_enabled.unwrap_or(existing.classifier_enabled),
+        classifier_model,
+        classifier_timeout_ms: body
+            .classifier_timeout_ms
+            .filter(|ms| *ms > 0)
+            .unwrap_or(existing.classifier_timeout_ms),
+        capacity_weight: unit(body.capacity_weight, existing.capacity_weight),
+        cost_weight: unit(body.cost_weight, existing.cost_weight),
+        tag_weight: unit(body.tag_weight, existing.tag_weight),
+        default_soft_cap: body
+            .default_soft_cap
+            .filter(|c| *c > 0)
+            .unwrap_or(existing.default_soft_cap),
+        temperature: body
+            .temperature
+            .map(|t| t.clamp(0.0, 2.0))
+            .unwrap_or(existing.temperature),
+        difficulty_enabled: body.difficulty_enabled.unwrap_or(existing.difficulty_enabled),
+        tier_source: body
+            .tier_source
+            .as_deref()
+            .and_then(parse_tier_source)
+            .unwrap_or(existing.tier_source),
+    }
 }
 
 #[utoipa::path(
@@ -1520,25 +1613,7 @@ async fn put_auto_router_settings(
         .await?
         .unwrap_or_default();
 
-    let classifier_model = match body.classifier_model.as_deref().map(str::trim) {
-        Some("") => None,
-        Some(m) => Some(m.to_string()),
-        None => existing.classifier_model.clone(),
-    };
-
-    let settings = AutoRouterSettings {
-        classifier_enabled: body
-            .classifier_enabled
-            .unwrap_or(existing.classifier_enabled),
-        classifier_model,
-        classifier_timeout_ms: body
-            .classifier_timeout_ms
-            .filter(|ms| *ms > 0)
-            .unwrap_or(existing.classifier_timeout_ms),
-        // Scoring weights aren't editable through this endpoint yet; carry the
-        // existing values forward untouched.
-        ..existing
-    };
+    let settings = merge_auto_router(&existing, &body);
 
     state.store.put_auto_router_settings(&settings).await?;
     state
@@ -1552,6 +1627,13 @@ async fn put_auto_router_settings(
                 "classifier_enabled": settings.classifier_enabled,
                 "classifier_model": settings.classifier_model,
                 "classifier_timeout_ms": settings.classifier_timeout_ms,
+                "capacity_weight": settings.capacity_weight,
+                "cost_weight": settings.cost_weight,
+                "tag_weight": settings.tag_weight,
+                "default_soft_cap": settings.default_soft_cap,
+                "temperature": settings.temperature,
+                "difficulty_enabled": settings.difficulty_enabled,
+                "tier_source": tier_source_as_str(settings.tier_source),
             }),
         )
         .await?;
@@ -4420,6 +4502,94 @@ async fn sync_tenant_keys(state: &AdminState, tenant_id: Uuid) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_auto_router_clamps_weights_and_preserves_unset() {
+        use obleth_config::AutoRouterSettings;
+        let existing = AutoRouterSettings {
+            capacity_weight: 0.9,
+            temperature: 0.3,
+            ..Default::default()
+        };
+        let body = UpdateAutoRouterSettings {
+            cost_weight: Some(0.7),
+            temperature: Some(-5.0), // out of range, must clamp to 0.0
+            ..Default::default()
+        };
+        let merged = merge_auto_router(&existing, &body);
+        assert_eq!(merged.cost_weight, 0.7);
+        assert_eq!(
+            merged.capacity_weight, 0.9,
+            "unset fields keep their existing value"
+        );
+        assert_eq!(merged.temperature, 0.0, "negative temperature clamps to argmax");
+    }
+
+    #[test]
+    fn update_auto_router_rejects_zero_soft_cap() {
+        use obleth_config::AutoRouterSettings;
+        let existing = AutoRouterSettings::default();
+        let body = UpdateAutoRouterSettings {
+            default_soft_cap: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(merge_auto_router(&existing, &body).default_soft_cap, 8);
+    }
+
+    #[test]
+    fn update_auto_router_preserves_tier_source_on_unrecognized_string() {
+        use obleth_config::{AutoRouterSettings, TierSource};
+        let existing = AutoRouterSettings {
+            tier_source: TierSource::Declared,
+            ..Default::default()
+        };
+        let body = UpdateAutoRouterSettings {
+            tier_source: Some("bogus".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_auto_router(&existing, &body).tier_source,
+            TierSource::Declared
+        );
+
+        let body_absent = UpdateAutoRouterSettings::default();
+        assert_eq!(
+            merge_auto_router(&existing, &body_absent).tier_source,
+            TierSource::Declared
+        );
+
+        let body_valid = UpdateAutoRouterSettings {
+            tier_source: Some("derived".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_auto_router(&existing, &body_valid).tier_source,
+            TierSource::Derived
+        );
+    }
+
+    #[test]
+    fn auto_router_view_round_trips_scoring_fields() {
+        use obleth_config::{AutoRouterSettings, TierSource};
+        let s = AutoRouterSettings {
+            capacity_weight: 0.7,
+            cost_weight: 0.3,
+            tag_weight: 0.4,
+            default_soft_cap: 12,
+            temperature: 0.5,
+            difficulty_enabled: true,
+            tier_source: TierSource::Declared,
+            ..Default::default()
+        };
+        let view = AutoRouterSettingsView::from_settings(&s);
+        assert_eq!(view.capacity_weight, 0.7);
+        assert_eq!(view.cost_weight, 0.3);
+        assert_eq!(view.tag_weight, 0.4);
+        assert_eq!(view.default_soft_cap, 12);
+        assert_eq!(view.temperature, 0.5);
+        assert!(view.difficulty_enabled);
+        assert_eq!(view.tier_source, "declared");
+    }
 
     #[test]
     fn boon_view_round_trips_compression() {

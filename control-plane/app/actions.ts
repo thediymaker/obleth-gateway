@@ -1410,12 +1410,27 @@ export async function setAlertSettingsAction(
   return { ok: true };
 }
 
+const autoRouterUpdateSchema = z.object({
+  classifier_enabled: z.boolean().optional(),
+  classifier_model: z.string().optional(),
+  classifier_timeout_ms: z.number().optional(),
+  capacity_weight: z.number().min(0).max(1).optional(),
+  cost_weight: z.number().min(0).max(1).optional(),
+  tag_weight: z.number().min(0).max(1).optional(),
+  default_soft_cap: z.number().int().min(1).optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  difficulty_enabled: z.boolean().optional(),
+  tier_source: z.enum(["hybrid", "derived", "declared"]).optional(),
+});
+
 export async function setAutoRouterSettingsAction(
   body: UpdateAutoRouterSettings,
 ): Promise<ActionResult> {
   const session = await requireAdmin();
+  const parsed = autoRouterUpdateSchema.safeParse(body);
+  if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
   try {
-    await obleth.setAutoRouterSettings(body, { auditActor: session.email });
+    await obleth.setAutoRouterSettings(parsed.data, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }

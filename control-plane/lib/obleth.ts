@@ -761,12 +761,26 @@ export interface AutoRouterSettingsView {
   classifier_model: string | null;
   classifier_timeout_ms: number;
   available_tags: string[];
+  capacity_weight: number;
+  cost_weight: number;
+  tag_weight: number;
+  default_soft_cap: number;
+  temperature: number;
+  difficulty_enabled: boolean;
+  tier_source: "hybrid" | "derived" | "declared";
 }
 
 export interface UpdateAutoRouterSettings {
   classifier_enabled?: boolean;
   classifier_model?: string | null;
   classifier_timeout_ms?: number;
+  capacity_weight?: number;
+  cost_weight?: number;
+  tag_weight?: number;
+  default_soft_cap?: number;
+  temperature?: number;
+  difficulty_enabled?: boolean;
+  tier_source?: "hybrid" | "derived" | "declared";
 }
 
 export interface BoonSettingsView {
