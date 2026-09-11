@@ -396,12 +396,13 @@ impl Store {
     /// `load_active_chunks`) until the last one lands, so retrieval serves the
     /// complete old set throughout and switches atomically.
     ///
-    /// Retries once on a Postgres deadlock (`40P01`). Concurrent commits for
-    /// different documents/collections (possibly from different gateway
-    /// replicas, or — in this crate's own test suite — different tests
-    /// running in parallel) can occasionally deadlock over shared FK-checked
-    /// rows; that is an expected, transient outcome of concurrent writers
-    /// against the same tables, not a correctness bug, and the whole
+    /// Retries on a Postgres deadlock (`40P01`) up to `MAX_DEADLOCK_RETRIES`
+    /// times (4 attempts total: the first try plus 3 retries). Concurrent
+    /// commits for different documents/collections (possibly from different
+    /// gateway replicas, or — in this crate's own test suite — different
+    /// tests running in parallel) can occasionally deadlock over shared
+    /// FK-checked rows; that is an expected, transient outcome of concurrent
+    /// writers against the same tables, not a correctness bug, and the whole
     /// transaction is safe to retry verbatim (see the idempotency note
     /// above).
     pub async fn commit_document_generation(
@@ -735,22 +736,47 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    /// Migrate the test database exactly once per test binary.
+    ///
+    /// Every test calling `migrate()` meant N parallel threads each running the
+    /// full DDL script. The migration advisory lock serialized those against
+    /// each other, but the DDL inside takes ACCESS EXCLUSIVE locks that conflict
+    /// with other tests' concurrent DML, which deadlocked intermittently.
+    ///
+    /// Re-runnability is asserted HERE rather than in a test body: we migrate
+    /// twice inside this initialiser, while every other test is still awaiting
+    /// it and therefore issuing no DML at all. If the second run fails, init
+    /// panics and the whole suite fails — a louder signal than one test failing.
+    static MIGRATED: tokio::sync::OnceCell<()> = tokio::sync::OnceCell::const_new();
+
     /// Requires a live Postgres; skipped when TEST_DATABASE_URL is unset so the
     /// unit suite stays runnable without infrastructure.
     async fn test_store() -> Option<crate::Store> {
         let url = std::env::var("TEST_DATABASE_URL").ok()?;
         let store = crate::Store::connect(&url).await.ok()?;
-        store.migrate().await.ok()?;
+        MIGRATED
+            .get_or_init(|| async {
+                store.migrate().await.expect("migrate test database");
+                // Every migration runs on every boot, so it must be re-runnable.
+                store
+                    .migrate()
+                    .await
+                    .expect("migrations must be re-runnable");
+            })
+            .await;
         Some(store)
     }
 
     #[tokio::test]
     async fn migrate_is_rerunnable() {
-        let Some(store) = test_store().await else {
+        // The actual double-migration proof lives in `test_store`'s `MIGRATED`
+        // once-cell initializer above: it runs `migrate()` twice before any
+        // other test can issue DML, which is what used to deadlock when every
+        // test ran `migrate()` on its own. This is just a thin assertion that
+        // initialization (connect + migrate-twice) succeeded.
+        let Some(_store) = test_store().await else {
             return;
         };
-        // Every migration runs on every boot; running twice must not error.
-        store.migrate().await.expect("second migrate");
     }
 
     #[tokio::test]
@@ -1052,40 +1078,43 @@ mod tests {
             .expect("doc");
 
         // Claim it, then simulate the worker dying: the row stays `indexing`.
-        // `claim_specific` retries past any stale orphan this table-wide scan
-        // might otherwise grab first (left behind by an earlier crashed test
-        // run — this is the *only* test in the suite that calls
-        // `claim_pending_document`, so anything it grabs that isn't `doc` can
-        // only be such an orphan, never a live sibling test's document; see
-        // its doc comment).
-        let claimed = claim_specific(&store, doc.id, 1_800).await;
-        assert_eq!(claimed.id, doc.id);
+        //
+        // `claim_pending_document` is an UNSCOPED whole-table scan (the oldest
+        // pending/stale-indexing row, full stop) — it can never be assumed to
+        // return *this* document specifically. An earlier version of this test
+        // "handled" that by retrying and calling `mark_document_failed` on
+        // whatever else it claimed, on the theory that anything else must be a
+        // stale orphan. That theory is false: a claim landing here can just as
+        // easily be a different, currently-running test's own live `pending`
+        // document, and marking it `failed` silently corrupts that test rather
+        // than merely flaking this one. A test must never call
+        // `claim_pending_document` for cleanup, and must never call
+        // `mark_document_failed` on a document it did not itself create — the
+        // schema cascades `delete_collection` -> documents -> chunks, so this
+        // test's own rows are already cleaned up correctly below without
+        // touching anything global. If this occasionally claims a different
+        // test's document, that shows up as a flake to fix at the source
+        // (see `test_store`'s `MIGRATED` once-cell, which removed the dominant
+        // cause), not to paper over here.
+        let claimed = store.claim_pending_document(1_800).await.expect("claim");
+        assert_eq!(claimed.expect("claimed").id, doc.id);
 
-        // With a long window OUR row is NOT reclaimable — no double-processing
-        // of a document that is merely slow. Anything else this claims is,
-        // for the same reason as above, necessarily a stray orphan, not a live
-        // sibling test's document; retire it so it stops interfering with
-        // every future run of this test.
-        for _ in 0..20 {
-            match store.claim_pending_document(1_800).await.expect("claim") {
-                None => break,
-                Some(other) => {
-                    assert_ne!(
-                        other.id, doc.id,
-                        "a fresh claim must not re-steal our own document"
-                    );
-                    store
-                        .mark_document_failed(other.id, "test cleanup: stale orphan")
-                        .await
-                        .expect("retire orphan");
-                }
-            }
-        }
+        // With a long window it is NOT reclaimable — no double-processing of a
+        // document that is merely slow.
+        assert!(
+            store
+                .claim_pending_document(1_800)
+                .await
+                .expect("claim")
+                .is_none(),
+            "a fresh claim must not be stealable"
+        );
 
         // With a zero window the stranded row is reclaimed rather than lost.
-        let reclaimed = claim_specific(&store, doc.id, 0).await;
+        let reclaimed = store.claim_pending_document(0).await.expect("reclaim");
         assert_eq!(
-            reclaimed.id, doc.id,
+            reclaimed.expect("reclaimed").id,
+            doc.id,
             "a stranded indexing row must be reclaimable on timeout"
         );
 
@@ -1133,40 +1162,6 @@ mod tests {
         assert_eq!(chunks[0].text, "live");
 
         store.delete_collection(c.id).await.ok();
-    }
-
-    /// Repeatedly call `claim_pending_document`, permanently retiring
-    /// (`mark_document_failed`) anything claimed that isn't `id`, until `id`
-    /// itself is claimed. `claim_pending_document` scans the whole table with
-    /// no scoping — the globally oldest `pending`/stale-`indexing` row, not a
-    /// specific one — and orders by `created_at`, so a stale orphan left by an
-    /// earlier crashed test run sorts ahead of our freshly created document
-    /// and would otherwise be reclaimed forever (putting it back to `pending`
-    /// only re-queues it at the front again — a livelock, not a fix). Failing
-    /// it out permanently is safe here specifically because this is the only
-    /// test in the suite that calls `claim_pending_document`, so anything
-    /// claimed that isn't `id` cannot belong to a live sibling test.
-    async fn claim_specific(
-        store: &crate::Store,
-        id: uuid::Uuid,
-        stale_after_secs: i64,
-    ) -> super::KnowledgeDocument {
-        for _ in 0..100 {
-            if let Some(doc) = store
-                .claim_pending_document(stale_after_secs)
-                .await
-                .expect("claim")
-            {
-                if doc.id == id {
-                    return doc;
-                }
-                store
-                    .mark_document_failed(doc.id, "test cleanup: stale orphan")
-                    .await
-                    .expect("retire orphan");
-            }
-        }
-        panic!("could not claim document {id} after many attempts");
     }
 
     /// Mark a specific document `indexing` directly — bypassing
