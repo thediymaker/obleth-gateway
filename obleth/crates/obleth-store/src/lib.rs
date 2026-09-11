@@ -76,6 +76,7 @@ const SCHEMA_V15: &str = include_str!("../../../../schema/postgres/0015_tenant_s
 const SCHEMA_V16: &str = include_str!("../../../../schema/postgres/0016_api_keys_identity.sql");
 const SCHEMA_V17: &str = include_str!("../../../../schema/postgres/0017_model_route_bias.sql");
 const SCHEMA_V18: &str = include_str!("../../../../schema/postgres/0018_knowledge_base.sql");
+const SCHEMA_V19: &str = include_str!("../../../../schema/postgres/0019_model_auto_eligible.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -215,6 +216,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V16).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V17).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V18).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V19).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1277,6 +1279,7 @@ impl Store {
         tool_servers: &[String],
         energy_slots_per_node: i64,
         route_bias: f64,
+        auto_eligible: bool,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -1286,8 +1289,8 @@ impl Store {
                 cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                 admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                 supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
-                energy_slots_per_node, route_bias
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
+                energy_slots_per_node, route_bias, auto_eligible
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
              returning id, model_name, description, upstream_model, api_base, api_key, model_type,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
@@ -1295,7 +1298,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
                        created_at, updated_at",
         )
         .bind(Uuid::new_v4())
@@ -1325,6 +1328,7 @@ impl Store {
         )))
         .bind(energy_slots_per_node.max(0))
         .bind(route_bias)
+        .bind(auto_eligible)
         .fetch_one(&self.pool)
         .await?;
         model_from_row(&row)
@@ -1340,7 +1344,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node, route_bias,
+                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
                     created_at, updated_at
              from models order by model_name",
         )
@@ -1359,7 +1363,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node, route_bias,
+                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
                     created_at, updated_at
              from models where id = $1",
         )
@@ -1380,7 +1384,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node, route_bias,
+                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
                     created_at, updated_at
              from models where model_name = $1",
         )
@@ -1419,6 +1423,7 @@ impl Store {
         tool_servers: &[String],
         energy_slots_per_node: i64,
         route_bias: f64,
+        auto_eligible: bool,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -1433,6 +1438,7 @@ impl Store {
                 cost_per_image = $18, cost_per_audio_second = $19, cost_per_character = $20,
                 supports_vision = $21, boons = $22, tool_servers = $23,
                 energy_slots_per_node = $24, route_bias = $25,
+                auto_eligible = $26,
                 updated_at = now()
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, model_type,
@@ -1442,7 +1448,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1472,6 +1478,7 @@ impl Store {
         )))
         .bind(energy_slots_per_node.max(0))
         .bind(route_bias)
+        .bind(auto_eligible)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1504,7 +1511,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1533,7 +1540,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1563,7 +1570,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1589,7 +1596,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1608,7 +1615,7 @@ impl Store {
                     context_window, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node, route_bias
+                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible
              from models where enabled = true",
         )
         .fetch_all(&self.pool)
@@ -1700,6 +1707,10 @@ impl Store {
                     // older SQL statements or pre-migration rows degrade to the
                     // neutral 1.0 rather than a score-zeroing 0.0.
                     route_bias: row.try_get("route_bias").unwrap_or(1.0),
+                    // Tolerant read: column added in the auto-eligibility
+                    // migration; older SQL statements or pre-migration rows
+                    // degrade to eligible, never to a silent exclusion.
+                    auto_eligible: row.try_get("auto_eligible").unwrap_or(true),
                     endpoints,
                 },
             ));
@@ -1769,7 +1780,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1806,7 +1817,7 @@ impl Store {
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
                        request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                       debug_diagnostics, energy_slots_per_node, route_bias,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
                        created_at, updated_at",
         )
         .bind(id)
@@ -2826,7 +2837,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
                        created_at, updated_at",
         )
         .bind(server_name)
@@ -3409,6 +3420,10 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         // statements or pre-migration rows degrade to the neutral 1.0 rather
         // than a score-zeroing 0.0.
         route_bias: row.try_get("route_bias").unwrap_or(1.0),
+        // Tolerant read: column added in the auto-eligibility migration; older
+        // SQL statements or pre-migration rows degrade to eligible, never to a
+        // silent exclusion from the auto router.
+        auto_eligible: row.try_get("auto_eligible").unwrap_or(true),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -3796,6 +3811,7 @@ mod tests {
                 &[],
                 0,
                 1.0,
+                true,
             )
             .await
             .expect("create model");
@@ -4069,6 +4085,7 @@ mod tests {
                 &[],
                 0,
                 1.0,
+                true,
             )
             .await
             .expect("create model");
@@ -4201,6 +4218,7 @@ mod tests {
                 &[],
                 0,
                 1.0,
+                true,
             )
             .await
             .expect("create model");
@@ -4397,6 +4415,7 @@ mod tests {
                 &args.21,
                 args.22,
                 args.23,
+                true,
             )
             .await
             .expect("create model");
@@ -4464,6 +4483,7 @@ mod tests {
                 &args.21,
                 args.22,
                 args.23,
+                true,
             )
             .await
             .expect("update model");
@@ -4588,7 +4608,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23,
+                &args.19, &args.20, &args.21, args.22, args.23, true,
             )
             .await
             .expect("create model");
@@ -4666,7 +4686,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23,
+                &args.19, &args.20, &args.21, args.22, args.23, true,
             )
             .await
             .expect("model");
@@ -4745,7 +4765,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23,
+                &args.19, &args.20, &args.21, args.22, args.23, true,
             )
             .await
             .expect("create model");
@@ -4941,7 +4961,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23,
+                &args.19, &args.20, &args.21, args.22, args.23, true,
             )
             .await
             .expect("create model");
@@ -5033,6 +5053,7 @@ mod tests {
                 &[doomed.clone(), kept.clone()],
                 args.22,
                 args.23,
+                true,
             )
             .await
             .expect("create model with both grants");
@@ -5066,6 +5087,7 @@ mod tests {
                 std::slice::from_ref(&kept),
                 args.22,
                 args.23,
+                true,
             )
             .await
             .expect("create model with kept grant");
@@ -5114,7 +5136,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23,
+                &args.19, &args.20, &args.21, args.22, args.23, true,
             )
             .await
             .expect("create model");
@@ -5186,6 +5208,7 @@ mod tests {
                 &[],
                 0,
                 1.0,
+                true,
             )
             .await
             .expect("create model");
@@ -5258,6 +5281,7 @@ mod tests {
                 &[],
                 0,
                 1.0,
+                true,
             )
             .await
             .expect("create model");
@@ -5324,7 +5348,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23,
+                &args.19, &args.20, &args.21, args.22, args.23, true,
             )
             .await
             .expect("create model");
@@ -5433,6 +5457,7 @@ mod tests {
                 &[],
                 8,
                 1.0,
+                true,
             )
             .await
             .expect("create model");
@@ -5505,7 +5530,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23,
+                &args.19, &args.20, &args.21, args.22, args.23, true,
             )
             .await
             .expect("create model");
@@ -5534,6 +5559,122 @@ mod tests {
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// An auto-excluded model must stay excluded across reads, across an
+    /// unrelated update, and in the resolved view the router actually consumes.
+    /// The tolerant reads that back this column default to `true`, so a
+    /// dropped column would silently re-include the model — these assertions
+    /// are what distinguish "stored false" from "never read".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn auto_eligible_round_trips_and_survives_unrelated_update() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let model_name = format!("excluded-{}", Uuid::new_v4());
+        let args = default_test_model(&model_name);
+        let model = store
+            .create_model(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
+                &args.19, &args.20, &args.21, args.22, args.23, false,
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+
+        assert!(
+            !model.auto_eligible,
+            "create_model must persist auto_eligible"
+        );
+        assert!(
+            !store.get_model(model.id).await.unwrap().auto_eligible,
+            "get_model must return the persisted value"
+        );
+
+        // An UNRELATED update's RETURNING must not silently re-include it.
+        store
+            .update_model_cache(model.id, true, 60)
+            .await
+            .expect("update_model_cache (unrelated update)");
+        assert!(
+            !store.get_model(model.id).await.unwrap().auto_eligible,
+            "unrelated update must not clear auto_eligible"
+        );
+
+        // The router reads the resolved view, not ModelRoute, so the exclusion
+        // has to survive that mapping too.
+        let resolved = store
+            .all_resolved_models()
+            .await
+            .expect("resolved models")
+            .into_iter()
+            .find(|(name, _)| name == &model_name)
+            .expect("model in resolved view")
+            .1;
+        assert!(
+            !resolved.auto_eligible,
+            "the resolved view the router consumes must carry the exclusion"
+        );
+
+        // And the candidate list the router is actually handed must reject it.
+        let candidates = store
+            .build_candidates(obleth_config::TierSource::Hybrid)
+            .await
+            .expect("candidates");
+        let candidate = candidates
+            .iter()
+            .find(|c| c.model.model_name == model_name)
+            .expect("model in candidate list");
+        assert!(!candidate.model.auto_eligible);
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// A model created without an explicit choice participates in auto routing:
+    /// this migration must not quietly empty an existing deployment's pool.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn auto_eligible_defaults_to_participating() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let model_name = format!("included-{}", Uuid::new_v4());
+        let args = default_test_model(&model_name);
+        let model = store
+            .create_model(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
+                &args.19, &args.20, &args.21, args.22, args.23, true,
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+        assert!(model.auto_eligible);
+
+        // Pre-migration rows have no value to read at all. Clearing the column
+        // default and inserting through it is the closest reproduction of that
+        // state, and it must still resolve as eligible.
+        sqlx::query("update models set auto_eligible = default where id = $1")
+            .bind(model.id)
+            .execute(&store.pool)
+            .await
+            .expect("reset to column default");
+        assert!(
+            store.get_model(model.id).await.unwrap().auto_eligible,
+            "the column default must be eligible"
+        );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     /// Verifies a model created without an explicit bias is neutral (`1.0`),
     /// never the score-zeroing `0.0`, and that the resolved-cache view used
     /// by the router agrees.
@@ -5554,7 +5695,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23,
+                &args.19, &args.20, &args.21, args.22, args.23, true,
             )
             .await
             .expect("create model");
