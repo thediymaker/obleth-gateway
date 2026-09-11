@@ -590,12 +590,42 @@ mod tests {
 
     #[test]
     fn injection_is_skipped_when_nothing_clears_the_threshold() {
-        // pack() of an empty hit list must leave the body untouched. This
-        // mirrors `apply`'s own guard: it returns the "miss" outcome (and
-        // never calls inject) whenever `pack` comes back empty.
+        // Runs the real pipeline in production order: retrieve() -> pack()
+        // -> the guard -> inject(). The emptiness must come from an actual
+        // min_score rejection inside `retrieve`, not from an empty slab or a
+        // hand-built empty Vec — otherwise this collapses back to a pack/
+        // budget test (already covered by `pack_with_zero_budget_keeps_nothing`)
+        // and the guard is dead code by construction, which proves nothing
+        // about fail-open. With a real, non-empty candidate that genuinely
+        // fails the threshold, a bug that let it through (e.g. weakening the
+        // `min_score` filter in `score_against`) would make `packed`
+        // non-empty, flip the guard live, and let `inject` actually mutate
+        // `body` — which the byte-identical assertion below would catch.
         let mut body = json!({"messages": [{"role": "user", "content": "q"}]});
         let before = body.clone();
-        let packed = pack(Vec::new(), 1500);
+
+        let slab = crate::knowledge::CollectionSlab {
+            embedding_model: "embed-a".into(),
+            dim: 2,
+            version: 1,
+            chunks: vec![crate::knowledge::SlabChunk {
+                id: Uuid::new_v4(),
+                title: "A".into(),
+                text: "a".into(),
+                token_count: 10,
+                embedding: vec![1.0, 0.0],
+            }],
+        };
+        // The query matches the only chunk exactly (score 1.0), but the
+        // threshold demands more than a perfect match — nothing clears it.
+        let hits = slab.retrieve(&[1.0, 0.0], 5, 1.5);
+        assert!(
+            hits.is_empty(),
+            "the threshold must reject the only candidate"
+        );
+
+        let budget = available_budget(1500, 8192, 100);
+        let packed = pack(hits, budget);
         assert!(packed.is_empty());
         if !packed.is_empty() {
             inject(&mut body, &render_block(&packed), true);
@@ -605,6 +635,13 @@ mod tests {
 
     #[test]
     fn injection_is_skipped_when_the_context_window_is_full() {
+        // Same real pipeline, same reasoning: the emptiness here comes from
+        // `available_budget`'s context-window clamp acting on a genuine,
+        // non-empty hit, not from an empty input. A bug that under-clamped
+        // the budget (e.g. dropping the output-reserve subtraction) would
+        // let `pack` keep the hit, flip the guard live, and let `inject`
+        // actually mutate `body` — which the byte-identical assertion below
+        // would catch.
         let mut body = json!({"messages": [{"role": "user", "content": "q"}]});
         let before = body.clone();
         // 8000 estimated tokens against an 8192-token window leaves no room
@@ -615,7 +652,7 @@ mod tests {
         if !packed.is_empty() {
             inject(&mut body, &render_block(&packed), true);
         }
-        assert_eq!(body, before);
+        assert_eq!(body, before, "body must be byte-identical");
     }
 
     #[test]
