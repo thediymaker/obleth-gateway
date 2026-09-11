@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 mod backup;
 mod crypto;
+pub mod knowledge;
 pub use backup::BACKUP_KEY_SENTINEL;
 pub use crypto::{Cipher, CryptoError};
 
@@ -74,6 +75,7 @@ const SCHEMA_V14: &str = include_str!("../../../../schema/postgres/0014_model_en
 const SCHEMA_V15: &str = include_str!("../../../../schema/postgres/0015_tenant_synthetic.sql");
 const SCHEMA_V16: &str = include_str!("../../../../schema/postgres/0016_api_keys_identity.sql");
 const SCHEMA_V17: &str = include_str!("../../../../schema/postgres/0017_model_route_bias.sql");
+const SCHEMA_V18: &str = include_str!("../../../../schema/postgres/0018_knowledge_base.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -212,6 +214,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V15).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V16).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V17).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V18).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
