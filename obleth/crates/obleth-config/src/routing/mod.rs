@@ -1025,6 +1025,7 @@ mod tests {
             declared_levels: Vec::new(),
             boons: Vec::new(),
             tool_servers: Vec::new(),
+            knowledge_collections: Vec::new(),
             request_timeout_secs: None,
             max_retries: 0,
             retry_backoff_ms: crate::DEFAULT_RETRY_BACKOFF_MS,

@@ -529,6 +529,10 @@ pub struct ResolvedModel {
     /// loop). `#[serde(default)]` keeps older cached payloads readable.
     #[serde(default)]
     pub tool_servers: Vec<String>,
+    /// Knowledge collections this model grounds on. `#[serde(default)]` keeps
+    /// Redis payloads cached by an older build deserializable.
+    #[serde(default)]
+    pub knowledge_collections: Vec<Uuid>,
     /// Per-request upstream timeout in seconds. `None` falls back to the global
     /// default. `#[serde(default)]` keeps older cached payloads readable.
     #[serde(default)]
@@ -1108,8 +1112,10 @@ pub fn parse_tag_level(raw: &str) -> Option<(String, u8)> {
 /// `structured_output` enforces `response_format` JSON schemas with gateway-side
 /// validation and repair. `compression` reduces the input tokens a model reads
 /// (JSON/code compaction, cross-turn dedup, deterministic lossy text compaction) before dispatch.
+/// `knowledge` grounds chat requests on admin-curated institutional documents
+/// retrieved from an in-process vector index.
 /// Operators opt each model into a subset of these; nothing is granted by default.
-pub const MODEL_BOONS: &[&str] = &["vision", "structured_output", "compression"];
+pub const MODEL_BOONS: &[&str] = &["vision", "structured_output", "compression", "knowledge"];
 
 /// True when `boon` is part of the fixed [`MODEL_BOONS`] vocabulary.
 pub fn is_valid_boon(boon: &str) -> bool {
@@ -1428,6 +1434,10 @@ pub struct BoonSettings {
     /// semantically compress) what the model reads before dispatch.
     #[serde(default)]
     pub compression: CompressionBoonSettings,
+    /// The knowledge boon: ground chat requests on admin-curated institutional
+    /// documents retrieved from an in-process vector index.
+    #[serde(default)]
+    pub knowledge: KnowledgeBoonSettings,
 }
 
 /// Configuration for the vision boon (image-to-text relay).
@@ -1698,6 +1708,105 @@ impl Default for CompressionBoonSettings {
 
 impl CompressionBoonSettings {
     /// True when the boon is enabled. (All compaction is deterministic; no helper.)
+    pub fn active(&self) -> bool {
+        self.enabled
+    }
+}
+
+fn default_knowledge_top_k() -> u32 {
+    5
+}
+fn default_knowledge_min_score() -> f32 {
+    0.35
+}
+fn default_knowledge_max_context_tokens() -> u32 {
+    1500
+}
+fn default_knowledge_embed_timeout_ms() -> u64 {
+    1500
+}
+fn default_knowledge_query_cache_ttl_s() -> u64 {
+    600
+}
+fn default_knowledge_query_turns() -> u32 {
+    2
+}
+fn default_knowledge_max_upload_bytes() -> i64 {
+    10 * 1024 * 1024
+}
+fn default_knowledge_max_chunks() -> i64 {
+    100_000
+}
+fn default_knowledge_index_batch_size() -> u32 {
+    32
+}
+fn default_knowledge_index_timeout_ms() -> u64 {
+    30_000
+}
+
+/// Configuration for the knowledge boon (institutional RAG).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KnowledgeBoonSettings {
+    /// Master switch. False leaves every request untouched.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Chunks considered per request before thresholding.
+    #[serde(default = "default_knowledge_top_k")]
+    pub top_k: u32,
+    /// Cosine floor; a chunk below this is dropped even if it is the best match.
+    #[serde(default = "default_knowledge_min_score")]
+    pub min_score: f32,
+    /// Ceiling on injected tokens, before the context-window clamp.
+    #[serde(default = "default_knowledge_max_context_tokens")]
+    pub max_context_tokens: u32,
+    /// Hard bound on the request-path query-embedding call.
+    #[serde(default = "default_knowledge_embed_timeout_ms")]
+    pub embed_timeout_ms: u64,
+    /// Query-vector cache lifetime in Redis.
+    #[serde(default = "default_knowledge_query_cache_ttl_s")]
+    pub query_cache_ttl_s: u64,
+    /// How many trailing user messages form the retrieval query.
+    #[serde(default = "default_knowledge_query_turns")]
+    pub query_turns: u32,
+    /// Per-file upload cap, rejected before parsing.
+    #[serde(default = "default_knowledge_max_upload_bytes")]
+    pub max_upload_bytes: i64,
+    /// Per-collection chunk cap; indexing refuses past it.
+    #[serde(default = "default_knowledge_max_chunks")]
+    pub max_chunks_per_collection: i64,
+    /// Chunks per upstream embedding call during indexing.
+    #[serde(default = "default_knowledge_index_batch_size")]
+    pub index_batch_size: u32,
+    /// Timeout for indexing-time embedding calls (looser than the hot path).
+    #[serde(default = "default_knowledge_index_timeout_ms")]
+    pub index_timeout_ms: u64,
+    /// Write retrieved chunk *text* into spans. Costs roughly 20x the default
+    /// tracing tier, so it is opt-in and surfaced with a size warning.
+    #[serde(default)]
+    pub debug_snapshot: bool,
+}
+
+impl Default for KnowledgeBoonSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            top_k: default_knowledge_top_k(),
+            min_score: default_knowledge_min_score(),
+            max_context_tokens: default_knowledge_max_context_tokens(),
+            embed_timeout_ms: default_knowledge_embed_timeout_ms(),
+            query_cache_ttl_s: default_knowledge_query_cache_ttl_s(),
+            query_turns: default_knowledge_query_turns(),
+            max_upload_bytes: default_knowledge_max_upload_bytes(),
+            max_chunks_per_collection: default_knowledge_max_chunks(),
+            index_batch_size: default_knowledge_index_batch_size(),
+            index_timeout_ms: default_knowledge_index_timeout_ms(),
+            debug_snapshot: false,
+        }
+    }
+}
+
+impl KnowledgeBoonSettings {
+    /// True when the boon may run at all.
     pub fn active(&self) -> bool {
         self.enabled
     }
@@ -2408,5 +2517,52 @@ mod tests {
         assert_eq!(s.brain_model.as_deref(), Some("llama-3"));
         assert!(s.enabled); // default
         assert_eq!(s.bench_max_concurrency, 40); // default
+    }
+
+    #[test]
+    fn knowledge_is_a_recognized_boon() {
+        assert!(is_valid_boon("knowledge"));
+        let boons = normalize_boons(["knowledge", "knowledge", "bogus"]);
+        assert_eq!(boons, vec!["knowledge"]);
+    }
+
+    #[test]
+    fn knowledge_settings_default_to_off() {
+        // Existing installs must be unaffected until an admin opts in.
+        let s = KnowledgeBoonSettings::default();
+        assert!(!s.enabled);
+        assert!(!s.active());
+        assert!(!s.debug_snapshot, "the expensive tracing tier is opt-in");
+    }
+
+    #[test]
+    fn knowledge_settings_have_usable_defaults_once_enabled() {
+        let s = KnowledgeBoonSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(s.active());
+        assert_eq!(s.top_k, 5);
+        assert_eq!(s.max_context_tokens, 1500);
+        assert_eq!(s.query_turns, 2);
+    }
+
+    #[test]
+    fn boon_settings_without_knowledge_still_deserialize() {
+        // Settings rows written by an older build have no `knowledge` key.
+        let old = r#"{"vision":{"enabled":true}}"#;
+        let s: BoonSettings = serde_json::from_str(old).expect("deserialize");
+        assert!(!s.knowledge.enabled);
+    }
+
+    #[test]
+    fn resolved_model_without_collections_still_deserializes() {
+        // Redis payloads cached by an older build lack the new field.
+        let json = r#"{"model_name":"m","upstream_model":"u","api_base":"http://x",
+                       "api_key":null,"model_type":"chat","admission_weight":100,
+                       "max_in_flight":null,"enabled":true,"cache_enabled":false,
+                       "cache_ttl_secs":0}"#;
+        let m: ResolvedModel = serde_json::from_str(json).expect("deserialize");
+        assert!(m.knowledge_collections.is_empty());
     }
 }

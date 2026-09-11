@@ -2125,6 +2125,9 @@ async fn put_boon_settings(
                 .filter(|r| *r > 0.0 && *r <= 1.0)
                 .unwrap_or(existing.compression.neural_keep_ratio),
         },
+        // No admin-API fields for the knowledge boon yet (Task 7+); carry the
+        // persisted value through unchanged, same as `guardrails` above.
+        knowledge: existing.knowledge.clone(),
     };
 
     state.store.put_boon_settings(&settings).await?;
@@ -4692,6 +4695,9 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         declared_levels: obleth_config::normalize_tag_levels(&model.tags),
         boons: model.boons.clone(),
         tool_servers: model.tool_servers.clone(),
+        // Task 7 wires this up from the real knowledge-collection assignment
+        // store method; until then no model grounds on anything.
+        knowledge_collections: Vec::new(),
         request_timeout_secs: model.request_timeout_secs,
         max_retries: model.max_retries,
         retry_backoff_ms: model.retry_backoff_ms,
