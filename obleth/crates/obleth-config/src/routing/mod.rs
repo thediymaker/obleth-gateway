@@ -71,6 +71,17 @@ impl RouterWeights {
             difficulty_enabled: s.difficulty_enabled,
         }
     }
+
+    /// True when the pick is a softmax draw rather than the exact argmax, i.e.
+    /// when the `uniform` a caller passes in is actually read.
+    ///
+    /// Exposed so a caller can skip *producing* a draw nobody will look at
+    /// (`splitmix_uniform` is a clock read) without restating the threshold —
+    /// [`pick_index`] is the single definition of it, and a copy in a call site
+    /// would be exactly the drift this module's contract forbids.
+    pub fn samples(&self) -> bool {
+        self.temperature > f64::EPSILON
+    }
 }
 
 impl Default for RouterWeights {
@@ -566,7 +577,7 @@ fn pick_index(scored: &[ScoredRef<'_>], weights: &RouterWeights, uniform: f64) -
     if scored.is_empty() {
         return None;
     }
-    if weights.temperature <= f64::EPSILON {
+    if !weights.samples() {
         return Some(0);
     }
 
