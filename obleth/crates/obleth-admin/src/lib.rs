@@ -11,6 +11,7 @@ pub mod autotune;
 mod backup;
 pub mod energy_probe;
 mod error;
+pub mod knowledge;
 pub mod model_health;
 mod openapi;
 pub mod recipes;
