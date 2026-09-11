@@ -410,10 +410,10 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         // Advance the collection's embedder only when no document lags behind.
+        // Deliberately does NOT touch `version` — see the unconditional bump below.
         sqlx::query(
             "update knowledge_collections c
-                set indexed_embedding_model = $2, embedding_dim = $3,
-                    version = version + 1, updated_at = now()
+                set indexed_embedding_model = $2, embedding_dim = $3, updated_at = now()
               where c.id = $1
                 and not exists (
                     select 1 from knowledge_documents d
@@ -427,18 +427,16 @@ impl Store {
         .bind(embedding_dim)
         .execute(&mut *tx)
         .await?;
-        // Always bump version, even when the embedder did not advance, so the
-        // proxy still picks up this document's new chunks. Mutually exclusive
-        // with the update above by its `where` clause, so `version` increases
-        // exactly once per call either way.
+        // Bump `version` unconditionally and exactly once. This document's chunks
+        // changed, so every proxy must rebuild its slab regardless of whether the
+        // collection's embedder advanced. (An earlier two-conditional-statement
+        // form left a reachable gap where neither statement fired and version
+        // never moved — see the correction doc for the live-Postgres proof.)
         sqlx::query(
             "update knowledge_collections set version = version + 1, updated_at = now()
-              where id = $1
-                and not (indexed_embedding_model = $2 and embedding_dim = $3)",
+              where id = $1",
         )
         .bind(collection_id)
-        .bind(embedding_model)
-        .bind(embedding_dim)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -782,6 +780,70 @@ mod tests {
         let chunks = store.load_active_chunks(c.id).await.expect("load");
         assert_eq!(chunks.len(), 1, "the old generation must be gone");
         assert_eq!(chunks[0].text, "new");
+
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn flip_bumps_version_even_when_the_embedder_does_not_advance() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(&format!("bump-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("collection");
+        let a = store
+            .upsert_document(c.id, "Doc A", "a.md", "text/markdown", "body a")
+            .await
+            .expect("doc a");
+        store
+            .write_generation(
+                c.id,
+                a.id,
+                1,
+                &[super::ChunkInsert {
+                    ordinal: 0,
+                    text: "a".into(),
+                    token_count: 1,
+                    embedding: vec![1.0, 0.0],
+                }],
+            )
+            .await
+            .expect("write");
+        store
+            .flip_document_generation(c.id, a.id, 1, "embed-a", 2)
+            .await
+            .expect("flip 1");
+        let after_first = store.get_collection(c.id).await.expect("get").version;
+
+        // Second flip with identical embedder and dimension: the collection's
+        // embedder cannot advance, but version MUST still move or the proxy
+        // never rebuilds its slab.
+        store
+            .write_generation(
+                c.id,
+                a.id,
+                2,
+                &[super::ChunkInsert {
+                    ordinal: 0,
+                    text: "a2".into(),
+                    token_count: 1,
+                    embedding: vec![0.0, 1.0],
+                }],
+            )
+            .await
+            .expect("write 2");
+        store
+            .flip_document_generation(c.id, a.id, 2, "embed-a", 2)
+            .await
+            .expect("flip 2");
+        let after_second = store.get_collection(c.id).await.expect("get").version;
+
+        assert!(
+            after_second > after_first,
+            "version must bump on every flip"
+        );
 
         store.delete_collection(c.id).await.ok();
     }
