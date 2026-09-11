@@ -276,6 +276,9 @@ pub fn select_model(
             let tag_score = (overlap as f64 / desired_tags.len() as f64).min(1.0);
             weights.tag * tag_score + (1.0 - weights.tag) * base
         };
+        // Operator thumb on the scale. Clamped so a typo cannot zero out or
+        // explode a model's chances.
+        let score = score * cand.model.route_bias.clamp(0.1, 3.0);
         scored.push((score, cand));
     }
 
@@ -470,6 +473,7 @@ mod tests {
             endpoint_selection_mode: obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
             debug_diagnostics: false,
             energy_slots_per_node: 0,
+            route_bias: 1.0,
             endpoints: Vec::new(),
         }
     }
@@ -543,6 +547,28 @@ mod tests {
             0.0
         )
         .is_none());
+    }
+
+    #[test]
+    fn route_bias_can_flip_an_otherwise_equal_pick() {
+        let mut a = model("alpha");
+        let mut b = model("beta");
+        a.route_bias = 1.0;
+        b.route_bias = 2.0;
+        let candidates = vec![healthy(a), healthy(b)];
+        let chosen = select_model(
+            &candidates,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+        )
+        .unwrap();
+        // Without bias, the name tie-break would pick "alpha".
+        assert_eq!(chosen.model_name, "beta");
     }
 
     #[test]

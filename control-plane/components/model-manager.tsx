@@ -985,6 +985,16 @@ function CreateModelWizard({
                   defaultValue="0"
                   hint="How many of this model's requests one node can serve at once when fully loaded (replicas per node × concurrent sequences per replica). Node power is split across this many slots. 0 = energy accounting off for this model."
                 />
+                <Field
+                  label="Routing bias"
+                  name="route_bias"
+                  type="number"
+                  defaultValue="1.0"
+                  step={0.1}
+                  min={0.1}
+                  max={3}
+                  hint="Multiplier on this model's auto-routing score. 1.0 is neutral."
+                />
               </section>
 
               <section className={cn("space-y-3", step !== 4 && "hidden")}>
@@ -1405,6 +1415,16 @@ function ConnectionTab({
                 type="number"
                 defaultValue={String(model.energy_slots_per_node)}
                 hint="How many of this model's requests one node can serve at once when fully loaded (replicas per node × concurrent sequences per replica). Node power is split across this many slots. 0 = energy accounting off for this model."
+              />
+              <Field
+                label="Routing bias"
+                name="route_bias"
+                type="number"
+                defaultValue={String(model.route_bias)}
+                step={0.1}
+                min={0.1}
+                max={3}
+                hint="Multiplier on this model's auto-routing score. 1.0 is neutral."
               />
             </FormSection>
           </div>
@@ -2529,6 +2549,9 @@ function Field({
   type = "text",
   defaultValue,
   hint,
+  step,
+  min,
+  max,
 }: {
   label: string;
   name: string;
@@ -2537,11 +2560,24 @@ function Field({
   type?: string;
   defaultValue?: string;
   hint?: string;
+  step?: number;
+  min?: number;
+  max?: number;
 }) {
   return (
     <div className="space-y-1.5">
       <Label htmlFor={`${name}-${label}`}>{label}</Label>
-      <Input id={`${name}-${label}`} name={name} type={type} placeholder={placeholder} required={required} defaultValue={defaultValue} />
+      <Input
+        id={`${name}-${label}`}
+        name={name}
+        type={type}
+        placeholder={placeholder}
+        required={required}
+        defaultValue={defaultValue}
+        step={step}
+        min={min}
+        max={max}
+      />
       {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
     </div>
   );

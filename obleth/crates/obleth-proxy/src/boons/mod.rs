@@ -784,6 +784,7 @@ mod tests {
             endpoint_selection_mode: "failover".to_string(),
             debug_diagnostics: false,
             energy_slots_per_node: 0,
+            route_bias: 1.0,
             endpoints: vec![],
         }
     }

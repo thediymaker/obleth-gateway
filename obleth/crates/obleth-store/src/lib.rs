@@ -73,6 +73,7 @@ const SCHEMA_V13: &str = include_str!("../../../../schema/postgres/0013_compress
 const SCHEMA_V14: &str = include_str!("../../../../schema/postgres/0014_model_energy_slots.sql");
 const SCHEMA_V15: &str = include_str!("../../../../schema/postgres/0015_tenant_synthetic.sql");
 const SCHEMA_V16: &str = include_str!("../../../../schema/postgres/0016_api_keys_identity.sql");
+const SCHEMA_V17: &str = include_str!("../../../../schema/postgres/0017_model_route_bias.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -186,6 +187,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V14).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V15).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V16).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V17).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1247,6 +1249,7 @@ impl Store {
         boons: &[String],
         tool_servers: &[String],
         energy_slots_per_node: i64,
+        route_bias: f64,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -1256,8 +1259,8 @@ impl Store {
                 cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                 admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                 supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
-                energy_slots_per_node
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24)
+                energy_slots_per_node, route_bias
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25)
              returning id, model_name, description, upstream_model, api_base, api_key, model_type,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
@@ -1265,7 +1268,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node,
+                       debug_diagnostics, energy_slots_per_node, route_bias,
                        created_at, updated_at",
         )
         .bind(Uuid::new_v4())
@@ -1294,6 +1297,7 @@ impl Store {
             tool_servers,
         )))
         .bind(energy_slots_per_node.max(0))
+        .bind(route_bias)
         .fetch_one(&self.pool)
         .await?;
         model_from_row(&row)
@@ -1309,7 +1313,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node,
+                    debug_diagnostics, energy_slots_per_node, route_bias,
                     created_at, updated_at
              from models order by model_name",
         )
@@ -1328,7 +1332,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node,
+                    debug_diagnostics, energy_slots_per_node, route_bias,
                     created_at, updated_at
              from models where id = $1",
         )
@@ -1349,7 +1353,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node,
+                    debug_diagnostics, energy_slots_per_node, route_bias,
                     created_at, updated_at
              from models where model_name = $1",
         )
@@ -1387,6 +1391,7 @@ impl Store {
         boons: &[String],
         tool_servers: &[String],
         energy_slots_per_node: i64,
+        route_bias: f64,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -1400,7 +1405,7 @@ impl Store {
                 enabled = $15, tags = $16, model_type = $17,
                 cost_per_image = $18, cost_per_audio_second = $19, cost_per_character = $20,
                 supports_vision = $21, boons = $22, tool_servers = $23,
-                energy_slots_per_node = $24,
+                energy_slots_per_node = $24, route_bias = $25,
                 updated_at = now()
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, model_type,
@@ -1410,7 +1415,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node,
+                       debug_diagnostics, energy_slots_per_node, route_bias,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1439,6 +1444,7 @@ impl Store {
             tool_servers,
         )))
         .bind(energy_slots_per_node.max(0))
+        .bind(route_bias)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1471,7 +1477,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node,
+                       debug_diagnostics, energy_slots_per_node, route_bias,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1500,7 +1506,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node,
+                       debug_diagnostics, energy_slots_per_node, route_bias,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1530,7 +1536,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node,
+                       debug_diagnostics, energy_slots_per_node, route_bias,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1556,7 +1562,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node,
+                       debug_diagnostics, energy_slots_per_node, route_bias,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1575,7 +1581,7 @@ impl Store {
                     context_window, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node
+                    debug_diagnostics, energy_slots_per_node, route_bias
              from models where enabled = true",
         )
         .fetch_all(&self.pool)
@@ -1655,6 +1661,10 @@ impl Store {
                     // Tolerant read: column added in the energy-accounting migration;
                     // older SQL statements or pre-migration rows degrade to 0 (off).
                     energy_slots_per_node: row.try_get("energy_slots_per_node").unwrap_or(0),
+                    // Tolerant read: column added in the route-bias migration;
+                    // older SQL statements or pre-migration rows degrade to the
+                    // neutral 1.0 rather than a score-zeroing 0.0.
+                    route_bias: row.try_get("route_bias").unwrap_or(1.0),
                     endpoints,
                 },
             ));
@@ -1679,7 +1689,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node,
+                       debug_diagnostics, energy_slots_per_node, route_bias,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1716,7 +1726,7 @@ impl Store {
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
                        request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                       debug_diagnostics, energy_slots_per_node,
+                       debug_diagnostics, energy_slots_per_node, route_bias,
                        created_at, updated_at",
         )
         .bind(id)
@@ -2736,7 +2746,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node,
+                       debug_diagnostics, energy_slots_per_node, route_bias,
                        created_at, updated_at",
         )
         .bind(server_name)
@@ -3315,6 +3325,10 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         // Tolerant read: column added in the energy-accounting migration;
         // older SQL statements or pre-migration rows degrade to 0 (off).
         energy_slots_per_node: row.try_get("energy_slots_per_node").unwrap_or(0),
+        // Tolerant read: column added in the route-bias migration; older SQL
+        // statements or pre-migration rows degrade to the neutral 1.0 rather
+        // than a score-zeroing 0.0.
+        route_bias: row.try_get("route_bias").unwrap_or(1.0),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -3701,6 +3715,7 @@ mod tests {
                 &[],
                 &[],
                 0,
+                1.0,
             )
             .await
             .expect("create model");
@@ -3973,6 +3988,7 @@ mod tests {
                 &[],
                 &[],
                 0,
+                1.0,
             )
             .await
             .expect("create model");
@@ -4104,6 +4120,7 @@ mod tests {
                 &[],
                 &[],
                 0,
+                1.0,
             )
             .await
             .expect("create model");
@@ -4214,6 +4231,7 @@ mod tests {
         Vec<String>,
         Vec<String>,
         i64,
+        f64,
     ) {
         (
             name,
@@ -4239,6 +4257,7 @@ mod tests {
             vec![],
             vec![],
             0,
+            1.0,
         )
     }
 
@@ -4358,7 +4377,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22,
+                &args.19, &args.20, &args.21, args.22, args.23,
             )
             .await
             .expect("create model");
@@ -4436,7 +4455,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22,
+                &args.19, &args.20, &args.21, args.22, args.23,
             )
             .await
             .expect("model");
@@ -4515,7 +4534,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22,
+                &args.19, &args.20, &args.21, args.22, args.23,
             )
             .await
             .expect("create model");
@@ -4711,7 +4730,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22,
+                &args.19, &args.20, &args.21, args.22, args.23,
             )
             .await
             .expect("create model");
@@ -4802,6 +4821,7 @@ mod tests {
                 &args.20,
                 &[doomed.clone(), kept.clone()],
                 args.22,
+                args.23,
             )
             .await
             .expect("create model with both grants");
@@ -4834,6 +4854,7 @@ mod tests {
                 &args.20,
                 std::slice::from_ref(&kept),
                 args.22,
+                args.23,
             )
             .await
             .expect("create model with kept grant");
@@ -4882,7 +4903,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22,
+                &args.19, &args.20, &args.21, args.22, args.23,
             )
             .await
             .expect("create model");
@@ -4953,6 +4974,7 @@ mod tests {
                 &[],
                 &[],
                 0,
+                1.0,
             )
             .await
             .expect("create model");
@@ -5024,6 +5046,7 @@ mod tests {
                 &[],
                 &[],
                 0,
+                1.0,
             )
             .await
             .expect("create model");
@@ -5090,7 +5113,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22,
+                &args.19, &args.20, &args.21, args.22, args.23,
             )
             .await
             .expect("create model");
@@ -5198,6 +5221,7 @@ mod tests {
                 &[],
                 &[],
                 8,
+                1.0,
             )
             .await
             .expect("create model");
@@ -5245,6 +5269,102 @@ mod tests {
                 .energy_slots_per_node,
             8,
             "unrelated update must not clear energy_slots_per_node"
+        );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Verifies that `route_bias` round-trips through the store and is not
+    /// silently cleared back to the neutral default by an unrelated update's
+    /// RETURNING (same cache-poisoning trap as `energy_slots_per_node`).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn route_bias_round_trips_and_survives_unrelated_update() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let model_name = format!("biased-{}", Uuid::new_v4());
+        let mut args = default_test_model(&model_name);
+        args.23 = 1.4;
+        let model = store
+            .create_model(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
+                &args.19, &args.20, &args.21, args.22, args.23,
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+
+        assert_eq!(
+            model.route_bias, 1.4,
+            "create_model must persist route_bias"
+        );
+        assert_eq!(
+            store.get_model(model.id).await.unwrap().route_bias,
+            1.4,
+            "get_model must return the persisted value"
+        );
+
+        // An UNRELATED update's RETURNING must not reset it to the default.
+        store
+            .update_model_cache(model.id, true, 60)
+            .await
+            .expect("update_model_cache (unrelated update)");
+        assert_eq!(
+            store.get_model(model.id).await.unwrap().route_bias,
+            1.4,
+            "unrelated update must not clear route_bias"
+        );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Verifies a model created without an explicit bias is neutral (`1.0`),
+    /// never the score-zeroing `0.0`, and that the resolved-cache view used
+    /// by the router agrees.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn route_bias_defaults_to_neutral() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let model_name = format!("plain-{}", Uuid::new_v4());
+        let args = default_test_model(&model_name);
+        let model = store
+            .create_model(
+                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
+                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
+                &args.19, &args.20, &args.21, args.22, args.23,
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+
+        assert_eq!(
+            model.route_bias, 1.0,
+            "a model created without a bias must be neutral"
+        );
+
+        let resolved = store
+            .all_resolved_models()
+            .await
+            .expect("all_resolved_models")
+            .into_iter()
+            .find(|(name, _)| name == &model_name)
+            .map(|(_, m)| m)
+            .expect("resolved model present");
+        assert_eq!(
+            resolved.route_bias, 1.0,
+            "resolved-cache view must also see the neutral default, not 0.0"
         );
     }
 

@@ -413,6 +413,12 @@ pub struct ModelRoute {
     /// `0` (default) disables energy accounting for this model.
     #[serde(default)]
     pub energy_slots_per_node: i64,
+    /// Per-model multiplier on the `auto` router's final score. `1.0` is
+    /// neutral; above 1.0 prefers the model, below 1.0 de-prioritizes it.
+    /// `#[serde(default = "default_route_bias")]` keeps older payloads
+    /// deserializable as neutral rather than the score-zeroing `0.0`.
+    #[serde(default = "default_route_bias")]
+    pub route_bias: f64,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -540,6 +546,12 @@ pub struct ResolvedModel {
     /// `0` (default) disables energy accounting for this model.
     #[serde(default)]
     pub energy_slots_per_node: i64,
+    /// Per-model multiplier on the `auto` router's final score. `1.0` is
+    /// neutral; above 1.0 prefers the model, below 1.0 de-prioritizes it.
+    /// `#[serde(default = "default_route_bias")]` keeps older cached Redis
+    /// payloads deserializable as neutral rather than the score-zeroing `0.0`.
+    #[serde(default = "default_route_bias")]
+    pub route_bias: f64,
     /// Upstream endpoints for this model. When empty, the data plane falls back
     /// to the legacy single `api_base`/`api_key` pair above (older cached
     /// payloads and un-migrated rows).
@@ -1157,6 +1169,13 @@ pub const DEFAULT_RETRY_BACKOFF_MS: i64 = 200;
 
 fn default_retry_backoff_ms() -> i64 {
     DEFAULT_RETRY_BACKOFF_MS
+}
+
+/// Neutral value for a model's `auto`-router score multiplier.
+pub const DEFAULT_ROUTE_BIAS: f64 = 1.0;
+
+fn default_route_bias() -> f64 {
+    DEFAULT_ROUTE_BIAS
 }
 
 /// True when `mode` is part of the fixed [`ENDPOINT_SELECTION_MODES`] vocabulary.
