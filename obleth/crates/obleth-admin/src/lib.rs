@@ -4453,7 +4453,12 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         supports_response_schema: model.supports_response_schema,
         supports_tool_choice: model.supports_tool_choice,
         supports_vision: model.supports_vision,
-        tags: model.tags.clone(),
+        // `model.tags` is the raw suffixed storage form (round-tripped as-is
+        // through create/update so a declared `tag:level` survives an edit
+        // that doesn't touch tags). The hot-path cache needs the bare
+        // vocabulary for the router's overlap match, plus the parsed ladder.
+        tags: obleth_config::normalize_tags(&model.tags),
+        declared_levels: obleth_config::normalize_tag_levels(&model.tags),
         boons: model.boons.clone(),
         tool_servers: model.tool_servers.clone(),
         request_timeout_secs: model.request_timeout_secs,
