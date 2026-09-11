@@ -1535,6 +1535,9 @@ async fn put_auto_router_settings(
             .classifier_timeout_ms
             .filter(|ms| *ms > 0)
             .unwrap_or(existing.classifier_timeout_ms),
+        // Scoring weights aren't editable through this endpoint yet; carry the
+        // existing values forward untouched.
+        ..existing
     };
 
     state.store.put_auto_router_settings(&settings).await?;

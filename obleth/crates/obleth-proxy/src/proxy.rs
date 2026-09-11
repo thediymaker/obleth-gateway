@@ -268,16 +268,27 @@ async fn proxy_handler_inner(
             resolved.allowed_models.as_deref()
         };
 
+        // Single snapshot load for this request: reused for both tag
+        // derivation and scoring so `auto` costs exactly one settings read.
+        let router_settings = state.classifier.settings();
+
         // Derive intent tags: classifier (when enabled + resolvable) first,
         // then cheap heuristics, then neutral capacity/cost routing.
         let available_tags = union_candidate_tags(&candidates, allowed);
-        let desired_tags =
-            derive_desired_tags(&state, &json, est.input_tokens as u64, &available_tags).await;
+        let desired_tags = derive_desired_tags(
+            &state,
+            &json,
+            est.input_tokens as u64,
+            &available_tags,
+            &router_settings,
+        )
+        .await;
 
         // Boon-granted capabilities count as native in the hard filters: a
         // model carrying the structured_output boon can serve requests that
         // need it, because the boon engine emulates the capability.
         let grants = crate::router::BoonGrants::from_settings(&state.boons.settings());
+        let weights = crate::router::RouterWeights::from_settings(&router_settings);
         match crate::router::select_model(
             &candidates,
             &features,
@@ -285,6 +296,7 @@ async fn proxy_handler_inner(
             allowed,
             &desired_tags,
             grants,
+            &weights,
         ) {
             Some(chosen) => {
                 tracing::debug!(chosen = %chosen.model_name, "auto-routed request");
@@ -1964,8 +1976,8 @@ async fn derive_desired_tags(
     json: &serde_json::Value,
     est_input_tokens: u64,
     available_tags: &[String],
+    settings: &obleth_config::AutoRouterSettings,
 ) -> Vec<String> {
-    let settings = state.classifier.settings();
     if settings.classifier_active() && !available_tags.is_empty() {
         if let Some(name) = settings.classifier_model.as_deref() {
             if name != crate::router::AUTO_MODEL_NAME {

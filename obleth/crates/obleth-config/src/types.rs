@@ -1211,10 +1211,25 @@ where
     out
 }
 
-/// Runtime-editable configuration for the `auto` router's intent classifier.
-/// Persisted in `app_settings` under the `auto_router` key so it is editable
-/// from the control plane without a restart; seeded from environment on boot.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// How a model's per-topic strength level is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TierSource {
+    /// Derive from cost rank; an explicit `tag:level` suffix overrides it.
+    #[default]
+    Hybrid,
+    /// Derive from cost rank only; ignore declared suffixes.
+    Derived,
+    /// Use declared suffixes only; unsuffixed tags are level 1.
+    Declared,
+}
+
+/// Runtime-editable configuration for the `auto` router's intent classifier
+/// and scoring weights. Persisted in `app_settings` under the `auto_router`
+/// key so it is editable from the control plane without a restart; seeded
+/// from environment (classifier fields) or these defaults (scoring fields)
+/// on boot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AutoRouterSettings {
     /// When true, an `auto` request is first sent to the classifier model to
     /// derive intent tags. When false (or unavailable) the router falls back to
@@ -1230,10 +1245,44 @@ pub struct AutoRouterSettings {
     /// to heuristics so an `auto` request is never blocked on the brain.
     #[serde(default = "default_classifier_timeout_ms")]
     pub classifier_timeout_ms: u64,
+
+    /// Relative weight of spare capacity when scoring candidates.
+    #[serde(default = "default_capacity_weight")]
+    pub capacity_weight: f64,
+    /// Relative weight of cost when scoring candidates.
+    #[serde(default = "default_cost_weight")]
+    pub cost_weight: f64,
+    /// Weight of intent-tag match, layered over the capacity/cost base.
+    #[serde(default = "default_tag_weight")]
+    pub tag_weight: f64,
+    /// Assumed concurrency ceiling for models with no explicit `max_in_flight`.
+    #[serde(default = "default_soft_cap")]
+    pub default_soft_cap: u32,
+    /// 0.0 selects the highest-scoring candidate (deterministic argmax).
+    /// Above 0.0, candidates are sampled from a softmax over their scores.
+    #[serde(default)]
+    pub temperature: f64,
+    /// When false, the difficulty tier filter is skipped entirely.
+    #[serde(default)]
+    pub difficulty_enabled: bool,
+    #[serde(default)]
+    pub tier_source: TierSource,
 }
 
 fn default_classifier_timeout_ms() -> u64 {
     250
+}
+fn default_capacity_weight() -> f64 {
+    0.6
+}
+fn default_cost_weight() -> f64 {
+    0.4
+}
+fn default_tag_weight() -> f64 {
+    0.5
+}
+fn default_soft_cap() -> u32 {
+    8
 }
 
 impl Default for AutoRouterSettings {
@@ -1242,6 +1291,13 @@ impl Default for AutoRouterSettings {
             classifier_enabled: false,
             classifier_model: None,
             classifier_timeout_ms: default_classifier_timeout_ms(),
+            capacity_weight: default_capacity_weight(),
+            cost_weight: default_cost_weight(),
+            tag_weight: default_tag_weight(),
+            default_soft_cap: default_soft_cap(),
+            temperature: 0.0,
+            difficulty_enabled: false,
+            tier_source: TierSource::default(),
         }
     }
 }
@@ -1935,6 +1991,31 @@ pub struct RestoreReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_router_defaults_match_router_constants() {
+        let s = AutoRouterSettings::default();
+        assert_eq!(s.capacity_weight, 0.6);
+        assert_eq!(s.cost_weight, 0.4);
+        assert_eq!(s.tag_weight, 0.5);
+        assert_eq!(s.default_soft_cap, 8);
+        assert_eq!(s.temperature, 0.0);
+        assert!(!s.difficulty_enabled);
+        assert_eq!(s.tier_source, TierSource::Hybrid);
+    }
+
+    #[test]
+    fn auto_router_row_without_new_fields_still_parses() {
+        // A row written before this feature shipped.
+        let json = r#"{"classifier_enabled":true,"classifier_model":"brain","classifier_timeout_ms":250}"#;
+        let s: AutoRouterSettings = serde_json::from_str(json).unwrap();
+        assert!(s.classifier_enabled);
+        assert_eq!(s.classifier_model.as_deref(), Some("brain"));
+        // New fields fall back to the constants, not to zero.
+        assert_eq!(s.capacity_weight, 0.6);
+        assert_eq!(s.default_soft_cap, 8);
+        assert!(!s.difficulty_enabled);
+    }
 
     #[test]
     fn slurm_settings_defaults_have_no_node_aliases() {
