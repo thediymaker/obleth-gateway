@@ -28,6 +28,16 @@ describe("collectionStatus", () => {
     expect(collectionStatus(stale, docs(["ready"]))).toBe("needs re-index");
   });
 
+  it("reports indexing over a stale embedder when both are true", () => {
+    // The state right after kicking off a reindex: needs_reindex is still true
+    // (the collection isn't done yet) and the requeued documents are back to
+    // pending/indexing. "indexing" is the more useful status here — it says
+    // work is in progress, rather than repeating the same "needs re-index"
+    // the operator just acted on.
+    expect(collectionStatus(stale, docs(["ready", "pending"]))).toBe("indexing");
+    expect(collectionStatus(stale, docs(["indexing"]))).toBe("indexing");
+  });
+
   it("reports ready when everything is indexed and current", () => {
     expect(collectionStatus(base, docs(["ready"]))).toBe("ready");
   });
