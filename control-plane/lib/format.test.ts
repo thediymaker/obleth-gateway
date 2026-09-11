@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   clamp,
+  formatBytes,
   formatCompact,
   formatDecimal,
   formatDelta,
@@ -80,5 +81,32 @@ describe("misc formatters", () => {
   it("clamp", () => {
     expect(clamp(5, 0, 3)).toBe(3);
     expect(clamp(-1, 0, 3)).toBe(0);
+  });
+});
+
+describe("formatBytes", () => {
+  it("scales to readable units", () => {
+    expect(formatBytes(0)).toBe("0 B");
+    expect(formatBytes(1024)).toBe("1.0 KB");
+    expect(formatBytes(1024 * 1024 * 235)).toBe("235.0 MB");
+  });
+
+  it("stays in whole bytes below 1 KB", () => {
+    expect(formatBytes(500)).toBe("500 B");
+    expect(formatBytes(1023)).toBe("1023 B");
+  });
+
+  it("reaches GB and TB", () => {
+    expect(formatBytes(1024 ** 3)).toBe("1.0 GB");
+    expect(formatBytes(1024 ** 4)).toBe("1.0 TB");
+  });
+
+  it("caps at TB rather than inventing a larger unit", () => {
+    expect(formatBytes(1024 ** 5)).toBe("1024.0 TB");
+  });
+
+  it("treats non-finite or negative input as 0 B", () => {
+    expect(formatBytes(NaN)).toBe("0 B");
+    expect(formatBytes(-5)).toBe("0 B");
   });
 });

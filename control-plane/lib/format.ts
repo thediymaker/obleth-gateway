@@ -54,3 +54,19 @@ export function truncateId(id: string): string {
 export function clamp(n: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, n));
 }
+
+const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB"];
+
+/** Byte counts scaled to the largest unit that keeps the value >= 1. Whole
+ * bytes render without a decimal; everything above KB keeps one. */
+export function formatBytes(n: number): string {
+  if (!Number.isFinite(n)) return "0 B";
+  if (n < 1024) return `${Math.max(0, Math.round(n))} B`;
+  let value = n;
+  let unit = 0;
+  while (value >= 1024 && unit < BYTE_UNITS.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  return `${value.toFixed(1)} ${BYTE_UNITS[unit]}`;
+}

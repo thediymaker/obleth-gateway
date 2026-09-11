@@ -5,6 +5,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { authClient } from "@/lib/auth/client";
 import { useEffect, useMemo, useState } from "react";
 import {
+  BookOpen,
   BookText,
   Boxes,
   BarChart3,
@@ -57,6 +58,7 @@ const navGroups = [
   { label: "Configuration", items: [
     { href: "/recipes", label: "Recipes", icon: BookText },
     { href: "/mcp", label: "MCP Servers", icon: Plug },
+    { href: "/knowledge", label: "Knowledge", icon: BookOpen },
     { href: "/settings", label: "Settings", icon: Settings },
     { href: "/audit", label: "Audit", icon: ScrollText },
   ] },
