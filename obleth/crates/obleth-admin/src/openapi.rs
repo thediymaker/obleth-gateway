@@ -103,6 +103,7 @@ use obleth_config::{
         crate::set_model_weight,
         crate::set_model_cache,
         crate::set_model_reliability,
+        crate::knowledge::get_model_collections,
         crate::knowledge::set_model_collections,
         crate::list_model_endpoints,
         crate::create_model_endpoint,
