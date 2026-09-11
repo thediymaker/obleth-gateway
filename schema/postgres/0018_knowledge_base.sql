@@ -20,6 +20,23 @@ create table if not exists knowledge_collections (
     updated_at               timestamptz not null default now()
 );
 
+-- chunk_overlap_tokens must stay below chunk_tokens: an overlap at or above the
+-- target makes the chunker accumulate content instead of advancing, producing
+-- chunks that grow without bound. Added via a guarded block (rather than inline
+-- in `create table`) so this file remains re-runnable on a database that already
+-- has the table.
+do $$
+begin
+    if not exists (
+        select 1 from pg_constraint
+         where conname = 'knowledge_collections_overlap_lt_tokens'
+    ) then
+        alter table knowledge_collections
+            add constraint knowledge_collections_overlap_lt_tokens
+            check (chunk_overlap_tokens < chunk_tokens);
+    end if;
+end $$;
+
 create table if not exists knowledge_documents (
     id                       uuid primary key,
     collection_id            uuid not null references knowledge_collections(id) on delete cascade,
