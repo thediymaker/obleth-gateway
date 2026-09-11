@@ -61,6 +61,16 @@ pub struct RouteExplain {
     pub tier_floor_clamped: bool,
     pub weights: WeightsView,
     pub temperature: f64,
+    /// The uniform draw in `[0,1)` this decision was made with, echoed so the
+    /// decision can be reproduced exactly.
+    ///
+    /// Ignored (and irrelevant) at `temperature == 0`, where the pick is the
+    /// exact argmax. Above it the draw is what chose between rows, so without
+    /// it two runs of the same inputs are not comparable: a caller diffing two
+    /// decisions — the routing tuner shows saved-weights vs. edited-weights side
+    /// by side — must pin one draw across both, or sampling noise shows up as if
+    /// it were an effect of the edit.
+    pub uniform: f64,
     /// True when the softmax draw landed on a row other than the first.
     ///
     /// Rows are ordered by descending score, ties broken by name, and this

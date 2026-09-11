@@ -830,6 +830,12 @@ export interface RouteExplainView {
   tier_floor_clamped: boolean;
   weights: RouteWeightsView;
   temperature: number;
+  /**
+   * The draw this decision was made with. Ignored at `temperature === 0`.
+   * Above it, pin the same value across two simulations that differ only in
+   * their weights, or sampling noise reads as an effect of the weight change.
+   */
+  uniform: number;
   sampled: boolean;
   scored: ScoredCandidateView[];
   rejected: RejectionView[];
@@ -839,10 +845,13 @@ export interface RouteExplainView {
 /// back to the saved auto-router settings.
 export interface SimulateRouteRequest {
   prompt?: string;
-  messages?: unknown;
+  /** Must be an array of chat messages when present; anything else is a 400. */
+  messages?: unknown[];
+  max_tokens?: number;
   tenant_id?: string;
   effort?: "low" | "medium" | "high";
   needs_function_calling?: boolean;
+  needs_tool_choice?: boolean;
   needs_response_schema?: boolean;
   capacity_weight?: number;
   cost_weight?: number;
@@ -850,7 +859,13 @@ export interface SimulateRouteRequest {
   default_soft_cap?: number;
   temperature?: number;
   difficulty_enabled?: boolean;
+  /** Omit to score against the live fleet load, as the gateway itself does. */
   busyness?: Record<string, number>;
+  /**
+   * Pin the softmax draw in `[0,1)`. Omit for a fresh draw. Pin it when
+   * comparing two simulations so only the weight change moves the result.
+   */
+  uniform?: number;
 }
 
 export interface BoonSettingsView {
