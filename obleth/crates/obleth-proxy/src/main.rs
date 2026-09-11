@@ -148,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
             classifier_enabled: cfg.auto_classifier_enabled,
             classifier_model: cfg.auto_classifier_model.clone(),
             classifier_timeout_ms: cfg.auto_classifier_timeout_ms,
+            ..Default::default()
         },
         Err(e) => {
             tracing::warn!(error = %e, "failed to load auto-router settings; using defaults");

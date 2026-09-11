@@ -24,18 +24,46 @@ use obleth_config::ResolvedModel;
 /// Reserved client-facing model name that triggers auto selection.
 pub const AUTO_MODEL_NAME: &str = "auto";
 
-/// Relative weight of spare capacity vs. cost when scoring candidates.
-const CAPACITY_WEIGHT: f64 = 0.6;
-const COST_WEIGHT: f64 = 0.4;
+/// Borrowed view of the scoring knobs, so `select_model` stays pure and can be
+/// called with ad-hoc values by the simulate endpoint.
+#[derive(Debug, Clone, Copy)]
+pub struct RouterWeights {
+    pub capacity: f64,
+    pub cost: f64,
+    pub tag: f64,
+    pub soft_cap: f64,
+    // Not yet consumed by `select_model`: softmax sampling and the difficulty
+    // tier filter land in later steps of the auto-router-tuner plan, which is
+    // why these are threaded through now instead of being added alongside
+    // their own consumers.
+    #[allow(dead_code)]
+    pub temperature: f64,
+    #[allow(dead_code)]
+    pub difficulty_enabled: bool,
+}
 
-/// Weight of tag/intent match when the request has desired tags. The remaining
-/// `1 - TAG_WEIGHT` is the capacity/cost base score, so a busy or expensive
-/// model can still lose to a cheaper idle one even on a tag tie.
-const TAG_WEIGHT: f64 = 0.5;
+impl RouterWeights {
+    pub fn from_settings(s: &obleth_config::AutoRouterSettings) -> Self {
+        RouterWeights {
+            capacity: s.capacity_weight,
+            cost: s.cost_weight,
+            tag: s.tag_weight,
+            soft_cap: if s.default_soft_cap > 0 {
+                s.default_soft_cap as f64
+            } else {
+                8.0
+            },
+            temperature: s.temperature.max(0.0),
+            difficulty_enabled: s.difficulty_enabled,
+        }
+    }
+}
 
-/// Assumed per-model concurrency ceiling used to normalize "spare capacity"
-/// for models that do not declare an explicit `max_in_flight`.
-const DEFAULT_SOFT_CAP: f64 = 8.0;
+impl Default for RouterWeights {
+    fn default() -> Self {
+        RouterWeights::from_settings(&obleth_config::AutoRouterSettings::default())
+    }
+}
 
 /// A model the `auto` router may choose from, plus the liveness signal the
 /// router needs that is not part of [`ResolvedModel`].
@@ -159,6 +187,7 @@ pub fn select_model(
     allowed_models: Option<&[String]>,
     desired_tags: &[String],
     grants: BoonGrants,
+    weights: &RouterWeights,
 ) -> Option<ResolvedModel> {
     let required_context = features
         .est_input_tokens
@@ -215,7 +244,7 @@ pub fn select_model(
         let in_flight = busyness.get(&cand.model.model_name).copied().unwrap_or(0) as f64;
         let cap = match cand.model.max_in_flight {
             Some(cap) if cap > 0 => cap as f64,
-            _ => DEFAULT_SOFT_CAP,
+            _ => weights.soft_cap,
         };
         let spare = (1.0 - (in_flight / cap)).clamp(0.0, 1.0);
 
@@ -226,7 +255,7 @@ pub fn select_model(
             1.0
         };
 
-        let base = CAPACITY_WEIGHT * spare + COST_WEIGHT * cost_score;
+        let base = weights.capacity * spare + weights.cost * cost_score;
         // Layer intent-tag matching on top of the capacity/cost base. With no
         // desired tags the score is just the base (neutral routing).
         let score = if desired_tags.is_empty() {
@@ -237,7 +266,7 @@ pub fn select_model(
                 .filter(|t| cand.model.tags.iter().any(|mt| mt == *t))
                 .count();
             let tag_score = (overlap as f64 / desired_tags.len() as f64).min(1.0);
-            TAG_WEIGHT * tag_score + (1.0 - TAG_WEIGHT) * base
+            weights.tag * tag_score + (1.0 - weights.tag) * base
         };
         let better = match best {
             None => true,
@@ -420,6 +449,7 @@ mod tests {
             None,
             &[],
             BoonGrants::default(),
+            &RouterWeights::default(),
         );
         assert!(chosen.is_none());
     }
@@ -443,6 +473,7 @@ mod tests {
             None,
             &[],
             BoonGrants::default(),
+            &RouterWeights::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "large");
@@ -464,7 +495,8 @@ mod tests {
             &HashMap::new(),
             None,
             &[],
-            BoonGrants::default()
+            BoonGrants::default(),
+            &RouterWeights::default()
         )
         .is_none());
     }
@@ -487,6 +519,7 @@ mod tests {
             None,
             &[],
             BoonGrants::default(),
+            &RouterWeights::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "tools");
@@ -508,6 +541,7 @@ mod tests {
             None,
             &[],
             BoonGrants::default(),
+            &RouterWeights::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "up");
@@ -529,6 +563,7 @@ mod tests {
             None,
             &[],
             BoonGrants::default(),
+            &RouterWeights::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "cheap");
@@ -550,6 +585,7 @@ mod tests {
             None,
             &[],
             BoonGrants::default(),
+            &RouterWeights::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "b");
@@ -566,6 +602,7 @@ mod tests {
             Some(&allowed),
             &[],
             BoonGrants::default(),
+            &RouterWeights::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "b");
@@ -608,6 +645,7 @@ mod tests {
             None,
             &desired,
             BoonGrants::default(),
+            &RouterWeights::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "coder");
@@ -630,6 +668,7 @@ mod tests {
             None,
             &[],
             BoonGrants::default(),
+            &RouterWeights::default(),
         )
         .unwrap();
         assert_eq!(chosen.model_name, "cheap");
@@ -674,7 +713,16 @@ mod tests {
         let grants = BoonGrants {
             structured_active: true,
         };
-        assert!(select_model(&candidates, &features, &HashMap::new(), None, &[], grants).is_none());
+        assert!(select_model(
+            &candidates,
+            &features,
+            &HashMap::new(),
+            None,
+            &[],
+            grants,
+            &RouterWeights::default()
+        )
+        .is_none());
     }
 
     #[test]
@@ -693,14 +741,23 @@ mod tests {
             &HashMap::new(),
             None,
             &[],
-            BoonGrants::default()
+            BoonGrants::default(),
+            &RouterWeights::default()
         )
         .is_none());
         let grants = BoonGrants {
             structured_active: true,
         };
-        let chosen =
-            select_model(&candidates, &features, &HashMap::new(), None, &[], grants).unwrap();
+        let chosen = select_model(
+            &candidates,
+            &features,
+            &HashMap::new(),
+            None,
+            &[],
+            grants,
+            &RouterWeights::default(),
+        )
+        .unwrap();
         assert_eq!(chosen.model_name, "emulated");
     }
 
@@ -717,6 +774,63 @@ mod tests {
         let grants = BoonGrants {
             structured_active: true,
         };
-        assert!(select_model(&candidates, &features, &HashMap::new(), None, &[], grants).is_none());
+        assert!(select_model(
+            &candidates,
+            &features,
+            &HashMap::new(),
+            None,
+            &[],
+            grants,
+            &RouterWeights::default()
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn raising_cost_weight_flips_the_pick() {
+        // `cheap` is pricier-but-idle vs `pricey` which is cheap-but-saturated.
+        let mut idle_expensive = model("idle-expensive");
+        idle_expensive.input_cost_per_token = 0.000_100;
+        idle_expensive.max_in_flight = Some(4);
+        let mut busy_cheap = model("busy-cheap");
+        busy_cheap.input_cost_per_token = 0.000_001;
+        busy_cheap.max_in_flight = Some(4);
+        let candidates = vec![healthy(idle_expensive), healthy(busy_cheap)];
+        let mut busyness = HashMap::new();
+        busyness.insert("busy-cheap".to_string(), 4);
+
+        let capacity_first = RouterWeights {
+            capacity: 1.0,
+            cost: 0.0,
+            ..Default::default()
+        };
+        let chosen = select_model(
+            &candidates,
+            &RequestFeatures::default(),
+            &busyness,
+            None,
+            &[],
+            BoonGrants::default(),
+            &capacity_first,
+        )
+        .unwrap();
+        assert_eq!(chosen.model_name, "idle-expensive");
+
+        let cost_first = RouterWeights {
+            capacity: 0.0,
+            cost: 1.0,
+            ..Default::default()
+        };
+        let chosen = select_model(
+            &candidates,
+            &RequestFeatures::default(),
+            &busyness,
+            None,
+            &[],
+            BoonGrants::default(),
+            &cost_first,
+        )
+        .unwrap();
+        assert_eq!(chosen.model_name, "busy-cheap");
     }
 }
