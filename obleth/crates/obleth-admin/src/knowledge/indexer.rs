@@ -1,0 +1,207 @@
+//! Background indexing: pending document -> chunks -> vectors -> new generation.
+//!
+//! Work is claimed one document at a time with `for update skip locked`, so an
+//! indexer that crashes mid-document leaves the row claimable again on the next
+//! boot and never corrupts the live generation.
+//!
+//! Generations are scoped per-document (not per-collection): each document
+//! tracks its own `active_generation`, and `flip_document_generation` only ever
+//! touches that one document's chunks. See
+//! `.superpowers/sdd/2026-09-10-knowledge-base/CORRECTION-per-document-generations.md`
+//! for why a collection-scoped generation counter was wrong (it deleted every
+//! other document's chunks on each index).
+
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{anyhow, Result};
+use arc_swap::ArcSwap;
+use obleth_config::{BoonSettings, KnowledgeBoonSettings};
+use obleth_store::knowledge::{ChunkInsert, KnowledgeDocument};
+use obleth_store::Store;
+use obleth_tokenizer::HeuristicTokenizer;
+
+use super::chunk::{chunk_text, Chunk};
+use super::embed::{embed_batch, EmbedTarget};
+
+/// Group chunk texts into upstream-sized batches, preserving order.
+pub fn plan_batches(chunks: &[Chunk], batch_size: usize) -> Vec<Vec<String>> {
+    let size = batch_size.max(1);
+    chunks
+        .chunks(size)
+        .map(|g| g.iter().map(|c| c.text.clone()).collect())
+        .collect()
+}
+
+/// Refuse a document that would push the collection past its chunk cap.
+pub fn check_chunk_cap(existing: i64, incoming: usize, cap: i64) -> Result<()> {
+    if existing + incoming as i64 > cap {
+        return Err(anyhow!(
+            "collection chunk limit reached ({cap}); delete documents or raise \
+             max_chunks_per_collection"
+        ));
+    }
+    Ok(())
+}
+
+/// Chunk, embed, and store one document as its own next generation.
+pub async fn index_document(
+    store: &Store,
+    client: &reqwest::Client,
+    doc: &KnowledgeDocument,
+    settings: &KnowledgeBoonSettings,
+) -> Result<()> {
+    let collection = store.get_collection(doc.collection_id).await?;
+    let model = store
+        .get_model_by_name(&collection.embedding_model)
+        .await
+        .map_err(|_| {
+            anyhow!(
+                "embedding model `{}` is not registered",
+                collection.embedding_model
+            )
+        })?;
+    if model.model_type != "embedding" {
+        return Err(anyhow!(
+            "model `{}` is type `{}`, not `embedding`",
+            model.model_name,
+            model.model_type
+        ));
+    }
+
+    let tk = HeuristicTokenizer::new();
+    let chunks = chunk_text(
+        &doc.content,
+        &doc.content_type,
+        collection.chunk_tokens as u32,
+        collection.chunk_overlap_tokens as u32,
+        &tk,
+    );
+    if chunks.is_empty() {
+        return Err(anyhow!("document produced no chunks"));
+    }
+    let existing = store.collection_chunk_count(collection.id).await?;
+    check_chunk_cap(existing, chunks.len(), settings.max_chunks_per_collection)?;
+
+    let target = EmbedTarget {
+        api_base: model.api_base.clone(),
+        api_key: model.api_key.clone(),
+        upstream_model: model.upstream_model.clone(),
+    };
+    let timeout = Duration::from_millis(settings.index_timeout_ms.max(1_000));
+
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(chunks.len());
+    for batch in plan_batches(&chunks, settings.index_batch_size.max(1) as usize) {
+        vectors.extend(embed_batch(client, &target, &batch, timeout).await?);
+    }
+    if vectors.len() != chunks.len() {
+        return Err(anyhow!(
+            "embedder returned {} vectors for {} chunks",
+            vectors.len(),
+            chunks.len()
+        ));
+    }
+    let dim = vectors[0].len() as i32;
+
+    // Write into the next generation; retrieval keeps serving the current one
+    // until the flip below, so a failure here is invisible to the data plane.
+    let generation = doc.active_generation + 1;
+    let inserts: Vec<ChunkInsert> = chunks
+        .into_iter()
+        .zip(vectors)
+        .enumerate()
+        .map(|(i, (c, embedding))| ChunkInsert {
+            ordinal: i as i32,
+            text: c.text,
+            token_count: c.token_count as i32,
+            embedding,
+        })
+        .collect();
+    store
+        .write_generation(collection.id, doc.id, generation, &inserts)
+        .await?;
+    store
+        .flip_document_generation(
+            collection.id,
+            doc.id,
+            generation,
+            &collection.embedding_model,
+            dim,
+        )
+        .await?;
+    Ok(())
+}
+
+/// Poll for pending documents and index them one at a time.
+#[allow(dead_code)] // wired into a binary's startup in a later task
+pub fn spawn_indexer(store: Store, client: reqwest::Client, settings: Arc<ArcSwap<BoonSettings>>) {
+    tokio::spawn(async move {
+        loop {
+            let knowledge = settings.load().knowledge.clone();
+            match store.claim_pending_document().await {
+                Ok(Some(doc)) => {
+                    let id = doc.id;
+                    if let Err(e) = index_document(&store, &client, &doc, &knowledge).await {
+                        tracing::warn!(document = %id, error = %e, "knowledge indexing failed");
+                        let _ = store.mark_document_failed(id, &e.to_string()).await;
+                    }
+                    // Loop straight back: there may be more work queued.
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => tracing::warn!(error = %e, "knowledge indexer poll failed"),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::knowledge::chunk::Chunk;
+
+    fn chunks(n: usize) -> Vec<Chunk> {
+        (0..n)
+            .map(|i| Chunk {
+                text: format!("chunk {i}"),
+                token_count: 2,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn batches_respect_the_batch_size() {
+        let batches = plan_batches(&chunks(10), 4);
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].len(), 4);
+        assert_eq!(batches[2].len(), 2);
+    }
+
+    #[test]
+    fn batching_preserves_order_across_batches() {
+        // Vectors are matched back to chunks positionally, so any reordering
+        // attaches the wrong vector to the wrong text.
+        let flat: Vec<String> = plan_batches(&chunks(7), 3).into_iter().flatten().collect();
+        assert_eq!(flat[0], "chunk 0");
+        assert_eq!(flat[6], "chunk 6");
+    }
+
+    #[test]
+    fn empty_input_yields_no_batches() {
+        assert!(plan_batches(&[], 4).is_empty());
+    }
+
+    #[test]
+    fn cap_rejects_a_document_that_would_exceed_the_limit() {
+        // Refusing loudly is the point: silently truncating a document would
+        // make the model confidently answer from half a policy.
+        let err = check_chunk_cap(9_990, 20, 10_000).expect_err("must refuse");
+        assert!(err.to_string().contains("chunk limit"));
+    }
+
+    #[test]
+    fn cap_allows_a_document_that_fits() {
+        assert!(check_chunk_cap(9_000, 20, 10_000).is_ok());
+    }
+}
