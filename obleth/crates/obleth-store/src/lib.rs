@@ -4316,15 +4316,36 @@ mod tests {
         let model_name = format!("m-{}", Uuid::new_v4());
         let args = default_test_model(&model_name);
         let created_tags = vec![
-            "coding:3".to_string(),  // declared, tiered
-            "math".to_string(),      // declared, untiered -> level 1, stored bare
+            "coding:3".to_string(),    // declared, tiered
+            "math".to_string(),        // declared, untiered -> level 1, stored bare
             "astrology:2".to_string(), // invalid base -> dropped, as today
         ];
         let model = store
             .create_model(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &created_tags, &args.20, &args.21, args.22, args.23,
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &created_tags,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
             )
             .await
             .expect("create model");

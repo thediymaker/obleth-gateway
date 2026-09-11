@@ -2077,7 +2077,8 @@ mod tests {
     #[test]
     fn auto_router_row_without_new_fields_still_parses() {
         // A row written before this feature shipped.
-        let json = r#"{"classifier_enabled":true,"classifier_model":"brain","classifier_timeout_ms":250}"#;
+        let json =
+            r#"{"classifier_enabled":true,"classifier_model":"brain","classifier_timeout_ms":250}"#;
         let s: AutoRouterSettings = serde_json::from_str(json).unwrap();
         assert!(s.classifier_enabled);
         assert_eq!(s.classifier_model.as_deref(), Some("brain"));

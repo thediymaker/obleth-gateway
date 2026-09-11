@@ -1564,7 +1564,9 @@ fn merge_auto_router(
         None => existing.classifier_model.clone(),
     };
     AutoRouterSettings {
-        classifier_enabled: body.classifier_enabled.unwrap_or(existing.classifier_enabled),
+        classifier_enabled: body
+            .classifier_enabled
+            .unwrap_or(existing.classifier_enabled),
         classifier_model,
         classifier_timeout_ms: body
             .classifier_timeout_ms
@@ -1581,7 +1583,9 @@ fn merge_auto_router(
             .temperature
             .map(|t| t.clamp(0.0, 2.0))
             .unwrap_or(existing.temperature),
-        difficulty_enabled: body.difficulty_enabled.unwrap_or(existing.difficulty_enabled),
+        difficulty_enabled: body
+            .difficulty_enabled
+            .unwrap_or(existing.difficulty_enabled),
         tier_source: body
             .tier_source
             .as_deref()
@@ -4538,7 +4542,10 @@ mod tests {
             merged.capacity_weight, 0.9,
             "unset fields keep their existing value"
         );
-        assert_eq!(merged.temperature, 0.0, "negative temperature clamps to argmax");
+        assert_eq!(
+            merged.temperature, 0.0,
+            "negative temperature clamps to argmax"
+        );
     }
 
     #[test]
