@@ -90,7 +90,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { AutotuneReport, AutotuneWorkload, CacheStats, KnowledgeCollection, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelReplica, ModelRoute } from "@/lib/obleth";
+import type { AutotuneReport, AutotuneWorkload, CacheStats, KnowledgeCollection, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelKnowledgeCollections, ModelReplica, ModelRoute } from "@/lib/obleth";
 import { providerForModel } from "@/lib/model-providers";
 import { normalizeModelApiNameDraft, normalizeModelApiNameFinal } from "@/lib/model-name";
 import { EditForm } from "@/components/edit-form";
@@ -2626,16 +2626,23 @@ export function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute
 // form: that PUT is a full replace of the model's attachment set and its own
 // save action, decoupled from "Save capabilities" below.
 //
-// The Management API has no endpoint to *read* a model's current
-// attachments back (`obleth-admin` registers only
-// `PUT /api/v1/models/:id/knowledge`, no matching `GET`), so this control
-// cannot pre-select what is already attached — it starts empty on every
-// visit and the copy below says so plainly, since silently saving an empty
-// set would otherwise look identical to "nothing attached yet" and could
-// detach an existing selection by accident.
+// The current attachment set is read back through
+// `GET /api/live/models/:id/knowledge` (Task 16, wrapping
+// `obleth.getModelCollections`) and used to pre-populate `selected` below.
+// `ModelKnowledgeCollections` is imported with `import type` only — this is
+// a client component, and the value export of `@/lib/obleth` reads the
+// admin token, so it must never be value-imported here.
+//
+// If that read fails, `selected` has no reliable relationship to what is
+// actually attached: presenting an empty list in that case would look
+// identical to "nothing attached yet", and saving it would silently detach
+// whatever is really there. So a failed read leaves `attachments` as
+// `"failed"` and the save button disabled, rather than falling back to an
+// empty (and misleadingly confident-looking) selection.
 function ModelKnowledgeCollectionsField({ modelId }: { modelId: string }) {
   const [collections, setCollections] = useState<KnowledgeCollection[] | null>(null);
   const [loadError, setLoadError] = useState(false);
+  const [attachments, setAttachments] = useState<"loading" | "loaded" | "failed">("loading");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
@@ -2654,6 +2661,24 @@ function ModelKnowledgeCollectionsField({ modelId }: { modelId: string }) {
       cancelled = true;
     };
   }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    setAttachments("loading");
+    fetch(`/api/live/models/${modelId}/knowledge`)
+      .then((res) => (res.ok ? res.json() : Promise.reject(res)))
+      .then((data: ModelKnowledgeCollections) => {
+        if (cancelled) return;
+        setSelected(new Set(data.collection_ids));
+        setAttachments("loaded");
+      })
+      .catch(() => {
+        if (!cancelled) setAttachments("failed");
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [modelId]);
 
   async function handleSave() {
     setSaving(true);
@@ -2679,14 +2704,19 @@ function ModelKnowledgeCollectionsField({ modelId }: { modelId: string }) {
     <div className="space-y-2 rounded-md border border-border/70 bg-background/30 p-3">
       <p className="text-xs font-medium text-foreground">Attached collections</p>
       <p className="text-[11px] leading-relaxed text-muted-foreground">
-        Retrieval only runs against collections attached here. The Management API can&apos;t report
-        which collections are already attached, so this list starts empty every time this panel
-        opens — reselect every collection that should stay attached before saving; saving replaces
-        the full set.
+        Retrieval only runs against collections attached here. Saving replaces the full attachment
+        set with what is selected below.
       </p>
+      {attachments === "failed" && (
+        <p className="max-w-prose text-[11px] leading-snug text-destructive">
+          Could not load this model&apos;s current attachments. Saving is disabled until this
+          loads, since saving without it would replace the real attachment set with whatever
+          happens to be selected below.
+        </p>
+      )}
       {loadError ? (
         <p className="text-xs text-destructive">Failed to load collections.</p>
-      ) : collections === null ? (
+      ) : collections === null || attachments === "loading" ? (
         <p className="text-xs text-muted-foreground">Loading collections…</p>
       ) : collections.length === 0 ? (
         <p className="text-xs text-muted-foreground">No collections exist yet. Create one on the Knowledge page.</p>
@@ -2738,7 +2768,7 @@ function ModelKnowledgeCollectionsField({ modelId }: { modelId: string }) {
           size="sm"
           variant="outline"
           onClick={() => void handleSave()}
-          disabled={saving || collections === null}
+          disabled={saving || collections === null || attachments !== "loaded"}
         >
           {saving ? "Saving…" : "Save attachment"}
         </Button>

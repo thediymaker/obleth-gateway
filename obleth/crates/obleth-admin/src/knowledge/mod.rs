@@ -648,6 +648,22 @@ fn first_unknown_collection_id(
 }
 
 #[utoipa::path(
+    get, path = "/api/v1/models/{id}/knowledge", tag = "models",
+    params(("id" = Uuid, Path, description = "Model id")),
+    responses((status = 200, body = ModelCollectionsView))
+)]
+pub async fn get_model_collections(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ModelCollectionsView>> {
+    // Load the model first: a missing model must be a 404, not an empty list
+    // that looks like "attached to nothing" rather than "does not exist".
+    let _model = state.store.get_model(id).await?;
+    let collection_ids = state.store.model_collection_ids(id).await?;
+    Ok(Json(ModelCollectionsView { collection_ids }))
+}
+
+#[utoipa::path(
     put, path = "/api/v1/models/{id}/knowledge", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
     request_body = SetModelCollections,

@@ -2,7 +2,21 @@ import { NextRequest, NextResponse } from "next/server";
 import { obleth } from "@/lib/obleth";
 import { guardAdmin } from "@/lib/auth/guard";
 
-// Wraps PUT /api/v1/models/:id/knowledge.
+// Wraps GET and PUT /api/v1/models/:id/knowledge.
+
+export async function GET(
+  _req: NextRequest,
+  { params }: { params: Promise<{ id: string }> },
+) {
+  const denied = await guardAdmin();
+  if (denied) return denied;
+  try {
+    const { id } = await params;
+    return NextResponse.json(await obleth.getModelCollections(id));
+  } catch (e) {
+    return NextResponse.json({ error: String(e) }, { status: 502 });
+  }
+}
 
 export async function PUT(
   req: NextRequest,

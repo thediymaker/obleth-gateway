@@ -1961,6 +1961,8 @@ export const obleth = {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  getModelCollections: (modelId: string) =>
+    api<ModelKnowledgeCollections>(`/models/${modelId}/knowledge`),
   setModelCollections: (
     modelId: string,
     collection_ids: string[],

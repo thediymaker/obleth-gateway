@@ -208,7 +208,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/models/:id/reliability", put(set_model_reliability))
         .route(
             "/api/v1/models/:id/knowledge",
-            put(knowledge::set_model_collections),
+            get(knowledge::get_model_collections).put(knowledge::set_model_collections),
         )
         .route(
             "/api/v1/knowledge/collections",
