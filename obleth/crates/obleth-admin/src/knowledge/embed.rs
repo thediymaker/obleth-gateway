@@ -40,7 +40,7 @@ pub async fn embed_batch(
     if inputs.is_empty() {
         return Ok(Vec::new());
     }
-    let url = join_embeddings_url(&target.api_base);
+    let url = join_embeddings_url(&target.api_base)?;
     let mut req = client.post(&url).timeout(timeout).json(&serde_json::json!({
         "model": target.upstream_model,
         "input": inputs,
@@ -62,14 +62,29 @@ pub async fn embed_batch(
     Ok(vectors)
 }
 
-/// Mirrors the proxy's upstream-path handling: a base that already ends in
-/// `/embeddings` is used as-is rather than having the suffix appended twice.
-fn join_embeddings_url(api_base: &str) -> String {
-    let base = api_base.trim_end_matches('/');
+/// Build the embeddings URL for a model's configured base.
+///
+/// Rejects bases this client cannot use rather than emitting a URL that fails
+/// with an opaque parse error. A blank base is a real state in this codebase —
+/// a Slurm-provisioned model has no static upstream until a replica is
+/// promoted — and the message surfaces in the document's `error` column.
+fn join_embeddings_url(api_base: &str) -> Result<String> {
+    let base = api_base.trim().trim_end_matches('/');
+    if base.is_empty() {
+        return Err(anyhow!(
+            "model has no upstream configured (empty api_base); a Slurm-provisioned \
+             model has none until a replica is promoted"
+        ));
+    }
+    if base.contains('?') || base.contains('#') {
+        return Err(anyhow!(
+            "api_base must not contain a query string or fragment: {base}"
+        ));
+    }
     if base.ends_with("/embeddings") {
-        base.to_string()
+        Ok(base.to_string())
     } else {
-        format!("{base}/embeddings")
+        Ok(format!("{base}/embeddings"))
     }
 }
 
@@ -88,18 +103,40 @@ fn parse_embeddings(json: &Value, expected: usize) -> Result<Vec<Vec<f32>>> {
         ));
     }
     let mut out = vec![Vec::new(); expected];
+    let mut seen = vec![false; expected];
     for item in data {
-        let idx = item.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let idx = match item.get("index") {
+            Some(v) => v
+                .as_u64()
+                .ok_or_else(|| anyhow!("embedding entry has a non-integer `index`: {v}"))?
+                as usize,
+            None => return Err(anyhow!("embedding entry is missing `index`")),
+        };
         if idx >= expected {
             return Err(anyhow!("embedding response index {idx} out of range"));
         }
-        let v: Vec<f32> = item
+        if seen[idx] {
+            return Err(anyhow!("embedding response repeats index {idx}"));
+        }
+        seen[idx] = true;
+        let arr = item
             .get("embedding")
             .and_then(Value::as_array)
-            .ok_or_else(|| anyhow!("embedding entry has no `embedding` array"))?
-            .iter()
-            .filter_map(|x| x.as_f64().map(|f| f as f32))
-            .collect();
+            .ok_or_else(|| anyhow!("embedding entry has no `embedding` array"))?;
+        let mut v = Vec::with_capacity(arr.len());
+        for (i, x) in arr.iter().enumerate() {
+            // Reject rather than filter: dropping an element yields a shorter
+            // vector, and if every vector in the batch drops the same count they
+            // all stay equal-length and pass the ragged check while being
+            // uniformly wrong.
+            let f = x
+                .as_f64()
+                .ok_or_else(|| anyhow!("embedding element {i} is not a number: {x}"))?;
+            if !f.is_finite() {
+                return Err(anyhow!("embedding element {i} is not finite: {f}"));
+            }
+            v.push(f as f32);
+        }
         out[idx] = v;
     }
     let dim = out[0].len();
@@ -161,5 +198,77 @@ mod tests {
             ]
         });
         assert!(parse_embeddings(&body, 2).is_err());
+    }
+
+    #[test]
+    fn rejects_non_numeric_embedding_element() {
+        let body = serde_json::json!({
+            "data": [{"index": 0, "embedding": [1.0, null]}]
+        });
+        assert!(parse_embeddings(&body, 1).is_err());
+    }
+
+    #[test]
+    fn rejects_uniformly_truncated_vectors() {
+        // The dangerous case: both vectors drop one bad element, so both end up
+        // length 1 and would pass a ragged-dimension check while being wrong.
+        let body = serde_json::json!({
+            "data": [
+                {"index": 0, "embedding": [1.0, "bad"]},
+                {"index": 1, "embedding": [0.0, "bad"]}
+            ]
+        });
+        assert!(
+            parse_embeddings(&body, 2).is_err(),
+            "uniform truncation must not pass the ragged check"
+        );
+    }
+
+    #[test]
+    fn rejects_missing_index() {
+        let body = serde_json::json!({"data": [{"embedding": [1.0]}]});
+        assert!(parse_embeddings(&body, 1).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_index() {
+        let body = serde_json::json!({
+            "data": [
+                {"index": 0, "embedding": [1.0, 0.0]},
+                {"index": 0, "embedding": [0.0, 1.0]}
+            ]
+        });
+        assert!(parse_embeddings(&body, 2).is_err());
+    }
+
+    #[test]
+    fn rejects_blank_api_base() {
+        let err = join_embeddings_url("   ").expect_err("blank base must be rejected");
+        assert!(err.to_string().contains("no upstream configured"));
+    }
+
+    #[test]
+    fn rejects_api_base_with_query_string() {
+        assert!(join_embeddings_url("http://x/v1?foo=bar").is_err());
+    }
+
+    #[test]
+    fn joins_url_variants_without_doubling() {
+        assert_eq!(
+            join_embeddings_url("http://x/v1").unwrap(),
+            "http://x/v1/embeddings"
+        );
+        assert_eq!(
+            join_embeddings_url("http://x/v1/").unwrap(),
+            "http://x/v1/embeddings"
+        );
+        assert_eq!(
+            join_embeddings_url("http://x/v1/embeddings").unwrap(),
+            "http://x/v1/embeddings"
+        );
+        assert_eq!(
+            join_embeddings_url("http://x/v1/embeddings/").unwrap(),
+            "http://x/v1/embeddings"
+        );
     }
 }
