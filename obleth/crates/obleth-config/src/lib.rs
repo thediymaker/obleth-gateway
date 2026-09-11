@@ -6,6 +6,7 @@
 pub mod config;
 pub mod jwt;
 pub mod keys;
+pub mod routing;
 pub mod types;
 
 pub use config::{Config, SlackAlertConfig};

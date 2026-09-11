@@ -38,9 +38,9 @@ pub struct Rejection {
 pub struct RouteExplain {
     pub chosen: Option<String>,
     pub difficulty: u8,
-    pub difficulty_source: crate::router::IntentSource,
+    pub difficulty_source: super::IntentSource,
     pub tags: Vec<String>,
-    pub tag_source: crate::router::IntentSource,
+    pub tag_source: super::IntentSource,
     /// Milliseconds spent in the intent classifier. Only the proxy call site
     /// knows the real timing, so `explain_selection` always emits `0` and the
     /// data plane overwrites it before the span is recorded. A `0` here from

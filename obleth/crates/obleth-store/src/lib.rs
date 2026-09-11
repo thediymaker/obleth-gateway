@@ -1701,6 +1701,51 @@ impl Store {
         Ok(out)
     }
 
+    /// Build the `auto`-router candidate list from the registered models plus
+    /// the latest health/maintenance state. A model is a candidate when
+    /// enabled; it is marked unhealthy when its health check reports
+    /// `unhealthy` or it is inside a maintenance window. Models without a
+    /// health summary are treated as healthy.
+    ///
+    /// This lives on `Store` rather than in either caller because both the data
+    /// plane (boot warm-up and the 15s registry refresh) and the Management
+    /// API's routing simulator must produce *the same* candidate set: a
+    /// simulator that assembled candidates even slightly differently would
+    /// confidently show an operator a decision the gateway would never make.
+    pub async fn build_candidates(
+        &self,
+        tier_source: obleth_config::TierSource,
+    ) -> Result<Vec<obleth_config::routing::Candidate>> {
+        let now = Utc::now();
+        let models = self.all_resolved_models().await?;
+        let health = self.list_model_health_summaries().await?;
+        let health_by_name: HashMap<String, &obleth_config::ModelHealthSummary> =
+            health.iter().map(|h| (h.model_name.clone(), h)).collect();
+
+        let mut candidates: Vec<obleth_config::routing::Candidate> = models
+            .into_iter()
+            .map(|(name, model)| {
+                let healthy = match health_by_name.get(&name) {
+                    Some(h) => {
+                        h.status != "unhealthy"
+                            && h.maintenance_until.map(|m| m <= now).unwrap_or(true)
+                    }
+                    None => true,
+                };
+                obleth_config::routing::Candidate {
+                    model,
+                    healthy,
+                    levels: Vec::new(),
+                }
+            })
+            .collect();
+        // Derived here, off the request path, so routing only ever reads the
+        // result: deriving cost quantiles per request would be an O(n log n)
+        // sort in the hot path.
+        obleth_config::routing::derive_levels(&mut candidates, tier_source);
+        Ok(candidates)
+    }
+
     /// Toggle (and set the TTL of) the response cache for a model.
     pub async fn update_model_cache(
         &self,

@@ -11,7 +11,6 @@ mod mcp;
 mod metrics;
 mod output_monitor;
 mod proxy;
-mod route_explain;
 mod router;
 mod state;
 
@@ -307,10 +306,7 @@ async fn main() -> anyhow::Result<()> {
             }
             tracing::info!(count = models.len(), "warmed model cache");
             let tier_source = classifier.settings().tier_source;
-            install_candidates(
-                &model_registry,
-                build_candidates(&store, models, tier_source).await,
-            );
+            install_candidates(&model_registry, store.build_candidates(tier_source).await);
         }
         Err(e) => tracing::warn!(error = %e, "failed to load models for warming"),
     }
@@ -449,43 +445,6 @@ async fn metrics_handler(
     )
 }
 
-/// Build the `auto`-router candidate list from the registered models plus the
-/// latest health/maintenance state. A model is a candidate when enabled; it is
-/// marked unhealthy when its health check reports `unhealthy` or it is inside a
-/// maintenance window. Models without a health summary are treated as healthy.
-async fn build_candidates(
-    store: &Store,
-    models: Vec<(String, obleth_config::ResolvedModel)>,
-    tier_source: obleth_config::TierSource,
-) -> Result<Vec<router::Candidate>, obleth_store::StoreError> {
-    let now = chrono::Utc::now();
-    let health = store.list_model_health_summaries().await?;
-    let health_by_name: std::collections::HashMap<String, &obleth_config::ModelHealthSummary> =
-        health.iter().map(|h| (h.model_name.clone(), h)).collect();
-
-    let mut candidates: Vec<router::Candidate> = models
-        .into_iter()
-        .map(|(name, model)| {
-            let healthy = match health_by_name.get(&name) {
-                Some(h) => {
-                    h.status != "unhealthy" && h.maintenance_until.map(|m| m <= now).unwrap_or(true)
-                }
-                None => true,
-            };
-            router::Candidate {
-                model,
-                healthy,
-                levels: Vec::new(),
-            }
-        })
-        .collect();
-    // Derived here, off the request path, so routing only ever reads the
-    // result: deriving cost quantiles per request would be an O(n log n) sort
-    // in the hot path.
-    router::derive_levels(&mut candidates, tier_source);
-    Ok(candidates)
-}
-
 fn install_candidates(
     registry: &router::ModelRegistry,
     candidates: Result<Vec<router::Candidate>, obleth_store::StoreError>,
@@ -493,7 +452,7 @@ fn install_candidates(
     match candidates {
         Ok(candidates) => registry.store(candidates),
         Err(e) => {
-            tracing::warn!(error = %e, "auto-router health refresh failed; retaining previous snapshot")
+            tracing::warn!(error = %e, "auto-router candidate refresh failed; retaining previous snapshot")
         }
     }
 }
@@ -523,16 +482,8 @@ fn spawn_model_registry_refresh(
                 Ok(None) => {}
                 Err(e) => tracing::warn!(error = %e, "auto-router settings refresh failed"),
             }
-            match store.all_resolved_models().await {
-                Ok(models) => {
-                    let tier_source = classifier.settings().tier_source;
-                    install_candidates(
-                        &registry,
-                        build_candidates(&store, models, tier_source).await,
-                    )
-                }
-                Err(e) => tracing::warn!(error = %e, "auto-router model refresh failed"),
-            }
+            let tier_source = classifier.settings().tier_source;
+            install_candidates(&registry, store.build_candidates(tier_source).await);
             match store.get_boon_settings().await {
                 Ok(Some(settings)) => boons.update(settings),
                 Ok(None) => {}
