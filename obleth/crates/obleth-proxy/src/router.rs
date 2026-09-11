@@ -333,7 +333,7 @@ pub fn select_model(
         return None;
     }
 
-    // ---- stage 1b: difficulty tier floor ----
+    // ---- stage 2: difficulty tier floor ----
     // Clamp-down: the floor is the lesser of what the request asked for and the
     // best level actually available, so this stage can narrow the field but can
     // never empty it — a hard request degrades within its topic instead of
@@ -368,7 +368,7 @@ pub fn select_model(
         eligible
     };
 
-    // ---- stage 2: scoring ----
+    // ---- stage 3: scoring ----
     let costs: Vec<f64> = eligible
         .iter()
         .map(|c| c.model.input_cost_per_token + c.model.output_cost_per_token)
@@ -1541,5 +1541,108 @@ mod tests {
             chosen.model_name, "weak",
             "with tiering off, cost still wins"
         );
+    }
+
+    #[test]
+    fn hard_request_prefers_domain_specialist_over_cheap_generalist() {
+        // The headline claim the feature exists to deliver: a hard, topic-tagged
+        // request must degrade within its own domain, not escape into a cheap
+        // generalist — even one with a high general strength and the lowest
+        // cost of the three candidates.
+        let cands = vec![
+            tiered("weak", 0.000_010, &[("coding", 1)]),
+            tiered("middling", 0.000_050, &[("coding", 2)]),
+            tiered("generalist", 0.000_001, &[(GENERAL_DOMAIN, 3)]),
+        ];
+        let desired = vec!["coding".to_string()];
+        let chosen = select_model(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &desired,
+            BoonGrants::default(),
+            &tiering_on(),
+            0.0,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            chosen.model_name, "middling",
+            "a cheap generalist must not be chosen over a weaker-but-in-domain specialist"
+        );
+    }
+
+    #[test]
+    fn stale_snapshot_with_no_levels_still_returns_a_model() {
+        // Registry mid-refresh: `levels` hasn't been populated on either
+        // candidate yet. Every strength collapses to 0, so the defensive
+        // fallback in stage 2 must keep the whole eligible set rather than
+        // filtering everyone out.
+        let cands = vec![healthy(model("a")), healthy(model("b"))];
+        let desired = vec!["coding".to_string()];
+        assert!(select_model(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &desired,
+            BoonGrants::default(),
+            &tiering_on(),
+            0.0,
+            3,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn desired_domain_absent_from_every_candidate_still_returns_a_model() {
+        // The request wants `math`, but every candidate is tagged only
+        // `coding`. Every candidate's strength on the desired domain collapses
+        // to 0, the floor collapses to 0 with it, and everyone survives
+        // instead of the set going empty.
+        let cands = vec![
+            tiered("weak", 0.000_001, &[("coding", 1)]),
+            tiered("strong", 0.000_100, &[("coding", 3)]),
+        ];
+        let desired = vec!["math".to_string()];
+        assert!(select_model(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &desired,
+            BoonGrants::default(),
+            &tiering_on(),
+            0.0,
+            3,
+        )
+        .is_some());
+    }
+
+    #[test]
+    fn multi_domain_candidate_survives_on_its_strongest_matching_tag() {
+        // Strong at coding, weak at math: the filter must qualify the
+        // candidate via the max across the desired domains, not require every
+        // desired domain to individually clear the floor.
+        let cands = vec![tiered(
+            "specialist",
+            0.000_050,
+            &[("coding", 3), ("math", 1)],
+        )];
+        let desired = vec!["coding".to_string(), "math".to_string()];
+        let chosen = select_model(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &desired,
+            BoonGrants::default(),
+            &tiering_on(),
+            0.0,
+            3,
+        )
+        .unwrap();
+        assert_eq!(chosen.model_name, "specialist");
     }
 }
