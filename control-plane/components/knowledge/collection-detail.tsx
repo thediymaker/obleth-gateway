@@ -1,9 +1,11 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { AlertTriangle, Loader2, RefreshCw, Trash2 } from "lucide-react";
+import { AlertTriangle, Loader2, Pencil, RefreshCw, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { DetailStat, EmptyState } from "@/components/dashboard-primitives";
 import { DocumentUpload } from "@/components/knowledge/document-upload";
@@ -59,17 +61,113 @@ export function CollectionDetail({
   const [documents, setDocuments] = useState(initialDocuments);
   const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
   const [reindexPending, setReindexPending] = useState(false);
-  const [message, setMessage] = useState<string | null>(null);
+  const [message, setMessage] = useState<{ text: string; showReindex?: boolean } | null>(null);
   const { confirm, confirmElement } = useConfirm();
   const collectionIdRef = useRef(collection.id);
 
-  // A fresh selection resets the local document list to whatever the server
-  // component last loaded for it.
+  const [editing, setEditing] = useState(false);
+  const [editSaving, setEditSaving] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+  const [editName, setEditName] = useState(collection.name);
+  const [editDescription, setEditDescription] = useState(collection.description);
+  const [editEmbeddingModel, setEditEmbeddingModel] = useState(collection.embedding_model);
+  const [editChunkTokens, setEditChunkTokens] = useState(String(collection.chunk_tokens));
+  const [editChunkOverlapTokens, setEditChunkOverlapTokens] = useState(
+    String(collection.chunk_overlap_tokens),
+  );
+
+  // A fresh selection resets the local document list, and any in-progress
+  // edit buffer, to whatever the server component last loaded for it.
   useEffect(() => {
     collectionIdRef.current = collection.id;
     setDocuments(initialDocuments);
+    setEditing(false);
+    setEditError(null);
+    setEditName(collection.name);
+    setEditDescription(collection.description);
+    setEditEmbeddingModel(collection.embedding_model);
+    setEditChunkTokens(String(collection.chunk_tokens));
+    setEditChunkOverlapTokens(String(collection.chunk_overlap_tokens));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [collection.id]);
+
+  function openEdit() {
+    setEditError(null);
+    setEditName(collection.name);
+    setEditDescription(collection.description);
+    setEditEmbeddingModel(collection.embedding_model);
+    setEditChunkTokens(String(collection.chunk_tokens));
+    setEditChunkOverlapTokens(String(collection.chunk_overlap_tokens));
+    setEditing(true);
+  }
+
+  async function handleSaveEdit() {
+    setEditError(null);
+    const name = editName.trim();
+    const embeddingModel = editEmbeddingModel.trim();
+    const chunkTokens = Number(editChunkTokens);
+    const chunkOverlapTokens = Number(editChunkOverlapTokens);
+    if (!name) {
+      setEditError("Name is required.");
+      return;
+    }
+    if (!embeddingModel) {
+      setEditError("Embedding model is required.");
+      return;
+    }
+    if (!Number.isFinite(chunkTokens) || chunkTokens <= 0) {
+      setEditError("Chunk tokens must be a positive number.");
+      return;
+    }
+    if (!Number.isFinite(chunkOverlapTokens) || chunkOverlapTokens < 0) {
+      setEditError("Chunk overlap tokens must be zero or a positive number.");
+      return;
+    }
+    // Mirrors the server's own check constraint (obleth-admin rejects the
+    // same condition with a 400) so the operator gets this message instead
+    // of a round trip to learn it. The server remains authoritative.
+    if (chunkOverlapTokens >= chunkTokens) {
+      setEditError("Chunk overlap tokens must be less than chunk tokens.");
+      return;
+    }
+    const chunkingChanged =
+      embeddingModel !== collection.embedding_model ||
+      chunkTokens !== collection.chunk_tokens ||
+      chunkOverlapTokens !== collection.chunk_overlap_tokens;
+    setEditSaving(true);
+    try {
+      const res = await fetch(`/api/live/knowledge/collections/${collection.id}`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name,
+          description: editDescription.trim(),
+          embedding_model: embeddingModel,
+          chunk_tokens: chunkTokens,
+          chunk_overlap_tokens: chunkOverlapTokens,
+        }),
+      });
+      const body = await res.json().catch(() => null);
+      if (!res.ok) {
+        setEditError((body && body.error) || `Save failed (HTTP ${res.status}).`);
+        return;
+      }
+      setEditing(false);
+      setMessage(
+        chunkingChanged
+          ? {
+              text: "Collection saved. Existing chunks were built with the previous settings and won't change until you reindex.",
+              showReindex: true,
+            }
+          : { text: "Collection saved." },
+      );
+      onChanged();
+    } catch {
+      setEditError("Save failed. Check the network connection and try again.");
+    } finally {
+      setEditSaving(false);
+    }
+  }
 
   async function refreshDocuments() {
     try {
@@ -105,7 +203,9 @@ export function CollectionDetail({
         // distinct failure mode from a non-ok response; route it through the
         // same message banner rather than letting it surface only as an
         // unhandled rejection in the console.
-        setMessage(e instanceof Error ? e.message : "Something went wrong. Check your connection and try again.");
+        setMessage({
+          text: e instanceof Error ? e.message : "Something went wrong. Check your connection and try again.",
+        });
       })
       .finally(() =>
         setBusyIds((s) => {
@@ -128,7 +228,7 @@ export function CollectionDetail({
         setDocuments((prev) => prev.filter((d) => d.id !== doc.id));
         onChanged();
       } else {
-        setMessage(`Failed to delete "${doc.title}".`);
+        setMessage({ text: `Failed to delete "${doc.title}".` });
       }
     });
   }
@@ -141,7 +241,7 @@ export function CollectionDetail({
         setDocuments((prev) => prev.map((d) => (d.id === doc.id ? updated : d)));
         onChanged();
       } else {
-        setMessage(`Failed to queue "${doc.title}" for reindexing.`);
+        setMessage({ text: `Failed to queue "${doc.title}" for reindexing.` });
       }
     });
   }
@@ -161,11 +261,11 @@ export function CollectionDetail({
       });
       if (res.ok) {
         const result = (await res.json()) as { documents_requeued: number };
-        setMessage(`${result.documents_requeued} document(s) queued for reindexing.`);
+        setMessage({ text: `${result.documents_requeued} document(s) queued for reindexing.` });
         await refreshDocuments();
         onChanged();
       } else {
-        setMessage("Failed to start reindexing.");
+        setMessage({ text: "Failed to start reindexing." });
       }
     } finally {
       setReindexPending(false);
@@ -183,12 +283,90 @@ export function CollectionDetail({
     <div className="space-y-4">
       {confirmElement}
 
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <DetailStat label="Documents" value={formatCompact(documents.length)} />
-        <DetailStat label="Chunks" value={formatCompact(collection.chunk_count)} />
-        <DetailStat label="Estimated size" value={formatBytes(collection.estimated_bytes)} />
-        <DetailStat label="Chunk tokens" value={`${collection.chunk_tokens} / ${collection.chunk_overlap_tokens} overlap`} />
+      <div className="flex items-center justify-between gap-3">
+        <div className="grid flex-1 grid-cols-2 gap-2 sm:grid-cols-4">
+          <DetailStat label="Documents" value={formatCompact(documents.length)} />
+          <DetailStat label="Chunks" value={formatCompact(collection.chunk_count)} />
+          <DetailStat label="Estimated size" value={formatBytes(collection.estimated_bytes)} />
+          <DetailStat label="Chunk tokens" value={`${collection.chunk_tokens} / ${collection.chunk_overlap_tokens} overlap`} />
+        </div>
+        {!editing && (
+          <Button type="button" size="sm" variant="outline" onClick={openEdit} className="shrink-0 gap-1.5">
+            <Pencil className="h-3.5 w-3.5" />
+            Edit
+          </Button>
+        )}
       </div>
+
+      {editing && (
+        <div className="space-y-3 rounded-md border border-border/70 bg-background/30 p-3">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="kb-edit-name">Name</Label>
+              <Input id="kb-edit-name" value={editName} onChange={(e) => setEditName(e.target.value)} disabled={editSaving} />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="kb-edit-description">Description</Label>
+              <Input
+                id="kb-edit-description"
+                value={editDescription}
+                onChange={(e) => setEditDescription(e.target.value)}
+                disabled={editSaving}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="kb-edit-embedding-model">Embedding model</Label>
+              <Input
+                id="kb-edit-embedding-model"
+                value={editEmbeddingModel}
+                onChange={(e) => setEditEmbeddingModel(e.target.value)}
+                disabled={editSaving}
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="kb-edit-chunk-tokens">Chunk tokens</Label>
+                <Input
+                  id="kb-edit-chunk-tokens"
+                  type="number"
+                  min="1"
+                  value={editChunkTokens}
+                  onChange={(e) => setEditChunkTokens(e.target.value)}
+                  disabled={editSaving}
+                />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="kb-edit-chunk-overlap-tokens">Overlap tokens</Label>
+                <Input
+                  id="kb-edit-chunk-overlap-tokens"
+                  type="number"
+                  min="0"
+                  value={editChunkOverlapTokens}
+                  onChange={(e) => setEditChunkOverlapTokens(e.target.value)}
+                  disabled={editSaving}
+                />
+              </div>
+            </div>
+          </div>
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            Changing the embedding model or either chunk size does not alter chunks that already
+            exist — the new values only take effect the next time this collection is reindexed.
+          </p>
+          {editError && (
+            <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+              {editError}
+            </p>
+          )}
+          <div className="flex items-center gap-2">
+            <Button type="button" size="sm" onClick={() => void handleSaveEdit()} disabled={editSaving}>
+              {editSaving ? "Saving…" : "Save"}
+            </Button>
+            <Button type="button" size="sm" variant="ghost" onClick={() => setEditing(false)} disabled={editSaving}>
+              Cancel
+            </Button>
+          </div>
+        </div>
+      )}
 
       {staleEmbedder && (
         <div className="flex items-start justify-between gap-3 rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2.5 text-xs text-amber-200">
@@ -222,7 +400,17 @@ export function CollectionDetail({
         </div>
       )}
 
-      {message && <p className="text-xs text-muted-foreground">{message}</p>}
+      {message && (
+        <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+          <p>{message.text}</p>
+          {message.showReindex && !staleEmbedder && (
+            <Button size="sm" variant="outline" onClick={handleReindexCollection} disabled={reindexPending}>
+              <RefreshCw className={cn("h-3.5 w-3.5", reindexPending && "animate-spin")} />
+              {reindexPending ? "Reindexing…" : "Reindex now"}
+            </Button>
+          )}
+        </div>
+      )}
 
       <DocumentUpload
         collectionId={collection.id}

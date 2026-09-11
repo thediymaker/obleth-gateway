@@ -145,7 +145,7 @@ const MODEL_BOONS = [
     value: "knowledge",
     label: "Knowledge",
     description:
-      "Retrieve from administrator-curated collections and inject the result into the request before dispatch, at request time — the injected text is never user-supplied. Attach collections to this model below; granting this boon without attaching a collection retrieves nothing. Configure retrieval globally in Settings → Boons. Nothing is granted by default.",
+      "Retrieve from administrator-curated collections and inject the result into the request before dispatch, at request time — the injected text is never user-supplied. Attach collections to this model below; granting this boon without attaching a collection retrieves nothing. Configure retrieval globally in Settings → Knowledge. Nothing is granted by default.",
   },
 ] as const;
 

@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useTransition, type ReactNode } from "react";
+import { useRouter } from "next/navigation";
 import {
   Archive,
   BookOpen,
@@ -8,6 +9,7 @@ import {
   ChevronDown,
   Database,
   Eye,
+  RefreshCw,
   Save,
   Send,
   Server,
@@ -1357,27 +1359,80 @@ export function CompressionSettingsForm({
   );
 }
 
+// `KnowledgeSettingsView` is only ever `null` here because
+// `safe(obleth.getKnowledgeSettings(), null)` on the settings page swallowed a
+// Management-API failure -- the Rust side always returns real defaults
+// (`KnowledgeBoonSettings::default()`), never an empty/absent settings row.
+// A form that doesn't know the current values must not offer to overwrite
+// them: rendering the editable body with literal placeholder numbers here
+// would both disagree with the actual Rust defaults (drift class already hit
+// once with `MODEL_BOONS`) and let an operator unknowingly blast nine stored
+// values back to those placeholders by touching one toggle. So a failed read
+// gets a plain error state with a retry, never the form -- the same
+// precedent `ModelKnowledgeCollectionsField` (Task 16) already set for a
+// failed attachment read.
 export function KnowledgeSettingsForm({ settings }: { settings: KnowledgeSettingsView | null }) {
+  const router = useRouter();
+  const [retrying, startRetry] = useTransition();
+
+  if (!settings) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <BookOpen className="h-4 w-4" />
+            Knowledge
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            Could not load the current knowledge settings from the Management API. An editable form
+            can&apos;t be shown without knowing the current values, since saving it would overwrite
+            the stored configuration with placeholder numbers rather than what is actually set.
+          </p>
+          <Button
+            variant="outline"
+            onClick={() => startRetry(() => router.refresh())}
+            disabled={retrying}
+          >
+            <RefreshCw className={cn("h-4 w-4", retrying && "animate-spin")} />
+            {retrying ? "Retrying..." : "Retry"}
+          </Button>
+        </CardContent>
+      </Card>
+    );
+  }
+
+  return <KnowledgeSettingsFormBody settings={settings} />;
+}
+
+// Split from `KnowledgeSettingsForm` above so its `useState` initializers only
+// ever run against a real, freshly-loaded `KnowledgeSettingsView` -- this
+// component only mounts once the parent has confirmed `settings` is non-null,
+// including on a successful Retry (which re-mounts it with the freshly
+// loaded values, rather than an already-mounted instance whose `useState`
+// initializers won't re-run from new props).
+function KnowledgeSettingsFormBody({ settings }: { settings: KnowledgeSettingsView }) {
   const [pending, start] = useTransition();
   const [status, setStatus] = useState<{ ok: boolean; message: string } | null>(null);
 
-  const [enabled, setEnabled] = useState(settings?.enabled ?? false);
-  const [topK, setTopK] = useState(String(settings?.top_k ?? 5));
-  const [minScore, setMinScore] = useState(String(settings?.min_score ?? 0.5));
-  const [maxContextTokens, setMaxContextTokens] = useState(String(settings?.max_context_tokens ?? 2000));
-  const [embedTimeoutMs, setEmbedTimeoutMs] = useState(String(settings?.embed_timeout_ms ?? 2000));
-  const [queryCacheTtlS, setQueryCacheTtlS] = useState(String(settings?.query_cache_ttl_s ?? 300));
-  const [queryTurns, setQueryTurns] = useState(String(settings?.query_turns ?? 3));
-  const [maxUploadBytes, setMaxUploadBytes] = useState(String(settings?.max_upload_bytes ?? 10_000_000));
+  const [enabled, setEnabled] = useState(settings.enabled);
+  const [topK, setTopK] = useState(String(settings.top_k));
+  const [minScore, setMinScore] = useState(String(settings.min_score));
+  const [maxContextTokens, setMaxContextTokens] = useState(String(settings.max_context_tokens));
+  const [embedTimeoutMs, setEmbedTimeoutMs] = useState(String(settings.embed_timeout_ms));
+  const [queryCacheTtlS, setQueryCacheTtlS] = useState(String(settings.query_cache_ttl_s));
+  const [queryTurns, setQueryTurns] = useState(String(settings.query_turns));
+  const [maxUploadBytes, setMaxUploadBytes] = useState(String(settings.max_upload_bytes));
   const [maxChunksPerCollection, setMaxChunksPerCollection] = useState(
-    String(settings?.max_chunks_per_collection ?? 50_000),
+    String(settings.max_chunks_per_collection),
   );
-  const [indexBatchSize, setIndexBatchSize] = useState(String(settings?.index_batch_size ?? 16));
-  const [indexTimeoutMs, setIndexTimeoutMs] = useState(String(settings?.index_timeout_ms ?? 30_000));
+  const [indexBatchSize, setIndexBatchSize] = useState(String(settings.index_batch_size));
+  const [indexTimeoutMs, setIndexTimeoutMs] = useState(String(settings.index_timeout_ms));
   const [indexStaleAfterSecs, setIndexStaleAfterSecs] = useState(
-    String(settings?.index_stale_after_secs ?? 600),
+    String(settings.index_stale_after_secs),
   );
-  const [debugSnapshot, setDebugSnapshot] = useState(settings?.debug_snapshot ?? false);
+  const [debugSnapshot, setDebugSnapshot] = useState(settings.debug_snapshot);
 
   function save() {
     setStatus(null);
