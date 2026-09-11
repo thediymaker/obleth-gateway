@@ -2,17 +2,18 @@
 
 import { useEffect, useState } from "react";
 import { z } from "zod";
-import { ArrowDownToLine, FlaskConical, PanelLeft, MessageSquare, Plus, SlidersHorizontal, Trash2 } from "lucide-react";
+import { ArrowDownToLine, FlaskConical, MessageSquare, PanelLeft, Plus, Route, SlidersHorizontal, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { generationSchema } from "@/lib/charo/chat-request";
 import { useEnabledModels } from "@/components/charo/use-enabled-models";
 import { UnifiedWorkspace } from "./workspaces";
+import { RouterWorkspace } from "./router-workspace";
 import { migrateLegacySessions } from "./session-migration";
 import { cn } from "@/lib/utils";
 
 const sessionSchema = z.object({
-  id: z.string(), title: z.string(), mode: z.enum(["chat", "compare"]),
+  id: z.string(), title: z.string(), mode: z.enum(["chat", "compare", "router"]),
   models: z.array(z.string()).min(1).max(4), generation: generationSchema,
   recipients: z.array(z.number().int().min(0).max(3)).optional(),
 });
@@ -102,9 +103,15 @@ export function Playground({ scope }: { scope: string }) {
 
             {!showSessions && <Button variant="ghost" size="icon" title="New session" onClick={create} disabled={sessions.length >= 50}><Plus className="h-4 w-4" /></Button>}
             <input aria-label="Session name" maxLength={100} className="min-w-0 flex-1 bg-transparent text-sm outline-none focus:ring-1 focus:ring-ring" value={session.title} onChange={(e) => update({ title: e.target.value })} />
+            <div role="group" aria-label="Playground mode" className="flex shrink-0 items-center gap-0.5 rounded-md border border-border p-0.5">
+              <Button type="button" variant={session.mode === "router" ? "ghost" : "secondary"} size="sm" aria-pressed={session.mode !== "router"} onClick={() => update({ mode: "compare" })}><MessageSquare className="mr-1.5 h-3.5 w-3.5" />Chat</Button>
+              <Button type="button" variant={session.mode === "router" ? "secondary" : "ghost"} size="sm" aria-pressed={session.mode === "router"} onClick={() => update({ mode: "router" })}><Route className="mr-1.5 h-3.5 w-3.5" />Router</Button>
+            </div>
           </div>
           <div className="min-h-0 flex-1" key={`${session.id}:${session.mode}`}>
-            <UnifiedWorkspace storageKey={`${root}:${session.id}:compare`} session={session} update={update} models={models} loading={loading} />
+            {session.mode === "router"
+              ? <RouterWorkspace session={session} update={update} />
+              : <UnifiedWorkspace storageKey={`${root}:${session.id}:compare`} session={session} update={update} models={models} loading={loading} />}
           </div>
         </div>
       </div>
