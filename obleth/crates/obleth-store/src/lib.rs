@@ -1685,6 +1685,9 @@ impl Store {
                         .try_get::<sqlx::types::Json<Vec<String>>, _>("tool_servers")
                         .map(|j| j.0)
                         .unwrap_or_default(),
+                    // Task 7 wires this up from the real knowledge-collection
+                    // assignment table; until then no model grounds on anything.
+                    knowledge_collections: Vec::new(),
                     request_timeout_secs: row.try_get("request_timeout_secs")?,
                     max_retries: row.try_get("max_retries")?,
                     retry_backoff_ms: row.try_get("retry_backoff_ms")?,

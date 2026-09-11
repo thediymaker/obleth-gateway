@@ -779,6 +779,7 @@ mod tests {
             declared_levels: vec![],
             boons: vec![],
             tool_servers: vec![],
+            knowledge_collections: vec![],
             request_timeout_secs: None,
             max_retries: 0,
             retry_backoff_ms: 200,
