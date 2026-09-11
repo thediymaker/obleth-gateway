@@ -148,6 +148,7 @@ async fn main() -> anyhow::Result<()> {
             classifier_enabled: cfg.auto_classifier_enabled,
             classifier_model: cfg.auto_classifier_model.clone(),
             classifier_timeout_ms: cfg.auto_classifier_timeout_ms,
+            ..Default::default()
         },
         Err(e) => {
             tracing::warn!(error = %e, "failed to load auto-router settings; using defaults");
@@ -304,7 +305,8 @@ async fn main() -> anyhow::Result<()> {
                     .await;
             }
             tracing::info!(count = models.len(), "warmed model cache");
-            install_candidates(&model_registry, build_candidates(&store, models).await);
+            let tier_source = classifier.settings().tier_source;
+            install_candidates(&model_registry, store.build_candidates(tier_source).await);
         }
         Err(e) => tracing::warn!(error = %e, "failed to load models for warming"),
     }
@@ -443,33 +445,6 @@ async fn metrics_handler(
     )
 }
 
-/// Build the `auto`-router candidate list from the registered models plus the
-/// latest health/maintenance state. A model is a candidate when enabled; it is
-/// marked unhealthy when its health check reports `unhealthy` or it is inside a
-/// maintenance window. Models without a health summary are treated as healthy.
-async fn build_candidates(
-    store: &Store,
-    models: Vec<(String, obleth_config::ResolvedModel)>,
-) -> Result<Vec<router::Candidate>, obleth_store::StoreError> {
-    let now = chrono::Utc::now();
-    let health = store.list_model_health_summaries().await?;
-    let health_by_name: std::collections::HashMap<String, &obleth_config::ModelHealthSummary> =
-        health.iter().map(|h| (h.model_name.clone(), h)).collect();
-
-    Ok(models
-        .into_iter()
-        .map(|(name, model)| {
-            let healthy = match health_by_name.get(&name) {
-                Some(h) => {
-                    h.status != "unhealthy" && h.maintenance_until.map(|m| m <= now).unwrap_or(true)
-                }
-                None => true,
-            };
-            router::Candidate { model, healthy }
-        })
-        .collect())
-}
-
 fn install_candidates(
     registry: &router::ModelRegistry,
     candidates: Result<Vec<router::Candidate>, obleth_store::StoreError>,
@@ -477,7 +452,7 @@ fn install_candidates(
     match candidates {
         Ok(candidates) => registry.store(candidates),
         Err(e) => {
-            tracing::warn!(error = %e, "auto-router health refresh failed; retaining previous snapshot")
+            tracing::warn!(error = %e, "auto-router candidate refresh failed; retaining previous snapshot")
         }
     }
 }
@@ -499,15 +474,16 @@ fn spawn_model_registry_refresh(
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tick.tick().await;
-            match store.all_resolved_models().await {
-                Ok(models) => install_candidates(&registry, build_candidates(&store, models).await),
-                Err(e) => tracing::warn!(error = %e, "auto-router model refresh failed"),
-            }
+            // Refresh auto-router settings (including `tier_source`) before
+            // rebuilding candidates, so a tier-source change takes effect on
+            // this tick's `derive_levels` call rather than one tick late.
             match store.get_auto_router_settings().await {
                 Ok(Some(settings)) => classifier.update(settings),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(error = %e, "auto-router settings refresh failed"),
             }
+            let tier_source = classifier.settings().tier_source;
+            install_candidates(&registry, store.build_candidates(tier_source).await);
             match store.get_boon_settings().await {
                 Ok(Some(settings)) => boons.update(settings),
                 Ok(None) => {}

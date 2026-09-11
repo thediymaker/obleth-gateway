@@ -776,6 +776,7 @@ mod tests {
             supports_tool_choice: false,
             supports_vision: false,
             tags: vec![],
+            declared_levels: vec![],
             boons: vec![],
             tool_servers: vec![],
             request_timeout_secs: None,
@@ -784,6 +785,7 @@ mod tests {
             endpoint_selection_mode: "failover".to_string(),
             debug_diagnostics: false,
             energy_slots_per_node: 0,
+            route_bias: 1.0,
             endpoints: vec![],
         }
     }

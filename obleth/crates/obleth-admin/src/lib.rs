@@ -28,6 +28,11 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
+use obleth_config::routing::route_explain::RouteExplain;
+use obleth_config::routing::{
+    difficulty_from_header, explain_selection, heuristic_intent, BoonGrants, IntentSource,
+    RequestFeatures, RouterWeights,
+};
 use obleth_config::{
     hash_api_key, ApiKey, FairshareGroup, ManagedModelSpec, McpServer, ModelEndpoint, ModelReplica,
     ModelRoute, ResolvedKey, ResolvedMcpServer, ResolvedModel, Tenant,
@@ -40,6 +45,8 @@ use obleth_config::{
 use obleth_fairshare::{FairShare, StaticCapacity, Stats};
 use obleth_redis::RedisStore;
 use obleth_store::{AuditEntry, Store};
+use obleth_tokenizer::Tokenizer;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use utoipa::ToSchema;
@@ -260,6 +267,7 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/settings/auto-router",
             get(get_auto_router_settings).put(put_auto_router_settings),
         )
+        .route("/api/v1/router/simulate", post(simulate_route))
         .route(
             "/api/v1/settings/boons",
             get(get_boon_settings).put(put_boon_settings),
@@ -658,6 +666,10 @@ pub struct CreateModel {
     /// 0 disables energy accounting for this model.
     #[serde(default)]
     pub energy_slots_per_node: Option<i64>,
+    /// Per-model multiplier on the `auto` router's final score. `1.0` is
+    /// neutral; the router clamps to `[0.1, 3.0]` before applying it.
+    #[serde(default)]
+    pub route_bias: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -697,6 +709,10 @@ pub struct UpdateModel {
     /// 0 disables energy accounting for this model.
     #[serde(default)]
     pub energy_slots_per_node: Option<i64>,
+    /// Per-model multiplier on the `auto` router's final score. `1.0` is
+    /// neutral; the router clamps to `[0.1, 3.0]` before applying it.
+    #[serde(default)]
+    pub route_bias: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1454,7 +1470,28 @@ async fn put_alert_settings(
 
 // ---- auto router settings ----
 
-/// View of the persisted `auto` router classifier settings.
+/// Convert a persisted `TierSource` to the lowercase string used on the wire.
+fn tier_source_as_str(t: obleth_config::TierSource) -> &'static str {
+    match t {
+        obleth_config::TierSource::Hybrid => "hybrid",
+        obleth_config::TierSource::Derived => "derived",
+        obleth_config::TierSource::Declared => "declared",
+    }
+}
+
+/// Parse a wire string into a `TierSource`. Returns `None` for anything
+/// unrecognized so callers can fall back to the existing value instead of
+/// erroring the request.
+fn parse_tier_source(s: &str) -> Option<obleth_config::TierSource> {
+    match s {
+        "hybrid" => Some(obleth_config::TierSource::Hybrid),
+        "derived" => Some(obleth_config::TierSource::Derived),
+        "declared" => Some(obleth_config::TierSource::Declared),
+        _ => None,
+    }
+}
+
+/// View of the persisted `auto` router classifier and scoring settings.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct AutoRouterSettingsView {
     pub classifier_enabled: bool,
@@ -1462,6 +1499,14 @@ pub struct AutoRouterSettingsView {
     pub classifier_timeout_ms: u64,
     /// The fixed tag vocabulary, surfaced so the UI can render tag pickers.
     pub available_tags: Vec<String>,
+    pub capacity_weight: f64,
+    pub cost_weight: f64,
+    pub tag_weight: f64,
+    pub default_soft_cap: u32,
+    pub temperature: f64,
+    pub difficulty_enabled: bool,
+    /// `"hybrid" | "derived" | "declared"`.
+    pub tier_source: String,
 }
 
 impl AutoRouterSettingsView {
@@ -1474,11 +1519,18 @@ impl AutoRouterSettingsView {
                 .iter()
                 .map(|t| t.to_string())
                 .collect(),
+            capacity_weight: s.capacity_weight,
+            cost_weight: s.cost_weight,
+            tag_weight: s.tag_weight,
+            default_soft_cap: s.default_soft_cap,
+            temperature: s.temperature,
+            difficulty_enabled: s.difficulty_enabled,
+            tier_source: tier_source_as_str(s.tier_source).to_string(),
         }
     }
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
+#[derive(Debug, Deserialize, ToSchema, Default)]
 pub struct UpdateAutoRouterSettings {
     #[serde(default)]
     pub classifier_enabled: Option<bool>,
@@ -1487,6 +1539,67 @@ pub struct UpdateAutoRouterSettings {
     pub classifier_model: Option<String>,
     #[serde(default)]
     pub classifier_timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub capacity_weight: Option<f64>,
+    #[serde(default)]
+    pub cost_weight: Option<f64>,
+    #[serde(default)]
+    pub tag_weight: Option<f64>,
+    #[serde(default)]
+    pub default_soft_cap: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub difficulty_enabled: Option<bool>,
+    /// `"hybrid" | "derived" | "declared"`. Unrecognized or absent values
+    /// leave the persisted `tier_source` untouched.
+    #[serde(default)]
+    pub tier_source: Option<String>,
+}
+
+/// Merge an update over the persisted settings, clamping out-of-range values.
+/// Weights are clamped to [0,1]; temperature to [0,2]; soft cap must be >= 1.
+/// Fields absent from the update (or unrecognized, for `tier_source`) keep
+/// their existing persisted value rather than resetting to a default.
+fn merge_auto_router(
+    existing: &AutoRouterSettings,
+    body: &UpdateAutoRouterSettings,
+) -> AutoRouterSettings {
+    let unit = |v: Option<f64>, cur: f64| v.map(|x| x.clamp(0.0, 1.0)).unwrap_or(cur);
+    let classifier_model = match body.classifier_model.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.classifier_model.clone(),
+    };
+    AutoRouterSettings {
+        classifier_enabled: body
+            .classifier_enabled
+            .unwrap_or(existing.classifier_enabled),
+        classifier_model,
+        classifier_timeout_ms: body
+            .classifier_timeout_ms
+            .filter(|ms| *ms > 0)
+            .unwrap_or(existing.classifier_timeout_ms),
+        capacity_weight: unit(body.capacity_weight, existing.capacity_weight),
+        cost_weight: unit(body.cost_weight, existing.cost_weight),
+        tag_weight: unit(body.tag_weight, existing.tag_weight),
+        default_soft_cap: body
+            .default_soft_cap
+            .filter(|c| *c > 0)
+            .unwrap_or(existing.default_soft_cap),
+        temperature: body
+            .temperature
+            .map(|t| t.clamp(0.0, 2.0))
+            .unwrap_or(existing.temperature),
+        difficulty_enabled: body
+            .difficulty_enabled
+            .unwrap_or(existing.difficulty_enabled),
+        tier_source: body
+            .tier_source
+            .as_deref()
+            .and_then(parse_tier_source)
+            .unwrap_or(existing.tier_source),
+    }
 }
 
 #[utoipa::path(
@@ -1520,22 +1633,7 @@ async fn put_auto_router_settings(
         .await?
         .unwrap_or_default();
 
-    let classifier_model = match body.classifier_model.as_deref().map(str::trim) {
-        Some("") => None,
-        Some(m) => Some(m.to_string()),
-        None => existing.classifier_model.clone(),
-    };
-
-    let settings = AutoRouterSettings {
-        classifier_enabled: body
-            .classifier_enabled
-            .unwrap_or(existing.classifier_enabled),
-        classifier_model,
-        classifier_timeout_ms: body
-            .classifier_timeout_ms
-            .filter(|ms| *ms > 0)
-            .unwrap_or(existing.classifier_timeout_ms),
-    };
+    let settings = merge_auto_router(&existing, &body);
 
     state.store.put_auto_router_settings(&settings).await?;
     state
@@ -1549,10 +1647,235 @@ async fn put_auto_router_settings(
                 "classifier_enabled": settings.classifier_enabled,
                 "classifier_model": settings.classifier_model,
                 "classifier_timeout_ms": settings.classifier_timeout_ms,
+                "capacity_weight": settings.capacity_weight,
+                "cost_weight": settings.cost_weight,
+                "tag_weight": settings.tag_weight,
+                "default_soft_cap": settings.default_soft_cap,
+                "temperature": settings.temperature,
+                "difficulty_enabled": settings.difficulty_enabled,
+                "tier_source": tier_source_as_str(settings.tier_source),
             }),
         )
         .await?;
     Ok(Json(AutoRouterSettingsView::from_settings(&settings)))
+}
+
+/// One hypothetical `auto` request for the routing tuner.
+///
+/// Everything is optional: an empty body simulates a bare, untagged prompt
+/// against the saved settings. The weight fields are *overrides* — unset ones
+/// fall back to whatever is persisted, exactly as a partial settings write
+/// would.
+#[derive(Debug, Deserialize, ToSchema, Default)]
+pub struct SimulateRouteRequest {
+    /// Plain prompt. Ignored when `messages` is present.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// An OpenAI-style `messages` array, for replaying a real request shape
+    /// (multi-turn, or multimodal parts the vision heuristic keys off). Must be
+    /// a JSON array when present.
+    #[serde(default)]
+    pub messages: Option<serde_json::Value>,
+    /// Requested completion budget. Counts toward the context-window filter
+    /// exactly as a real request's `max_tokens` does; absent means the request
+    /// does not pin one.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
+    /// Apply this tenant's model allowlist.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// `low` | `medium` | `high`. Overrides the heuristic difficulty, and is
+    /// reported as a `header` source because it is the same override the
+    /// `x-obleth-effort` header performs on the data plane.
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub needs_function_calling: bool,
+    /// The request pins a specific tool (`tool_choice` naming a function, or
+    /// `function_call`), which only models with native tool-choice support can
+    /// serve — no boon emulates it.
+    #[serde(default)]
+    pub needs_tool_choice: bool,
+    #[serde(default)]
+    pub needs_response_schema: bool,
+    /// Weight overrides. Unset fields fall back to the saved settings.
+    #[serde(default)]
+    pub capacity_weight: Option<f64>,
+    #[serde(default)]
+    pub cost_weight: Option<f64>,
+    #[serde(default)]
+    pub tag_weight: Option<f64>,
+    #[serde(default)]
+    pub default_soft_cap: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub difficulty_enabled: Option<bool>,
+    /// Pretend this many requests are in flight per model. **Absent means the
+    /// live fleet load**, which is what the gateway itself scores against —
+    /// this field is a what-if override, not the default.
+    #[serde(default)]
+    pub busyness: Option<std::collections::HashMap<String, usize>>,
+    /// Pin the softmax draw in `[0,1)`. Absent means a fresh random draw, as on
+    /// the request path. Pin it when comparing two simulations that differ only
+    /// in their weights: at `temperature > 0` two independent draws make
+    /// sampling noise look like an effect of the weight change. The draw that
+    /// was used is echoed back as `uniform`.
+    #[serde(default)]
+    pub uniform: Option<f64>,
+}
+
+/// Run the whole `auto` routing pipeline against the live fleet and return the
+/// decision it *would* make, without dispatching anything.
+///
+/// Fidelity is the entire point, so this shares code with the data plane rather
+/// than reimplementing it: candidates come from [`Store::build_candidates`] (the
+/// same call the proxy's boot warm-up and 15s registry refresh make), busyness
+/// defaults to the same `fairshare.model_load()` the request path scores
+/// against, tokens are counted with the same `obleth-tokenizer` estimator that
+/// feeds the real context-window filter, overrides are merged through the same
+/// [`merge_auto_router`] that clamps a real settings write, and the verdict comes
+/// from `explain_selection`, which is the same `evaluate` the proxy serves from.
+/// A simulator that diverged on any of these would confidently show an operator
+/// a decision the gateway would never make.
+///
+/// Every request field is an *override* of a live input, never a replacement
+/// for one: omit `busyness` and the real fleet load is used, omit `uniform` and
+/// a fresh draw is taken. The draw that was used is always echoed back, so two
+/// simulations can be diffed without mistaking sampling noise for a weight
+/// effect.
+///
+/// **This path never calls the classifier brain.** A simulation must not incur
+/// model calls or upstream latency, so intent is derived from `heuristic_intent`
+/// plus the optional `effort` override only. `tag_source`/`difficulty_source`
+/// therefore report `heuristic` (or `header`), never `classifier` — the
+/// dashboard must not imply a classification that did not happen. With the
+/// classifier enabled, a real request's tags may differ from what is shown here.
+///
+/// Read-only: no audit entry is recorded, and nothing is written.
+#[utoipa::path(
+    post, path = "/api/v1/router/simulate", tag = "settings",
+    request_body = SimulateRouteRequest,
+    responses((status = 200, body = RouteExplain))
+)]
+async fn simulate_route(
+    State(state): State<AdminState>,
+    Json(body): Json<SimulateRouteRequest>,
+) -> Result<Json<RouteExplain>> {
+    // Saved settings with the request's overrides merged over them, clamped by
+    // the same merge a `PUT /settings/auto-router` would use.
+    let saved = state
+        .store
+        .get_auto_router_settings()
+        .await?
+        .unwrap_or_default();
+    let settings = merge_auto_router(
+        &saved,
+        &UpdateAutoRouterSettings {
+            capacity_weight: body.capacity_weight,
+            cost_weight: body.cost_weight,
+            tag_weight: body.tag_weight,
+            default_soft_cap: body.default_soft_cap,
+            temperature: body.temperature,
+            difficulty_enabled: body.difficulty_enabled,
+            ..Default::default()
+        },
+    );
+    let weights = RouterWeights::from_settings(&settings);
+
+    // Same candidate assembly, same tier derivation, as the data plane's
+    // registry refresh — including health and maintenance state.
+    let candidates = state.store.build_candidates(settings.tier_source).await?;
+
+    // Tenant allowlist, when the caller wants to see a specific tenant's view.
+    // An empty list is "no allowlist", matching the proxy's treatment.
+    let allowed: Option<Vec<String>> = match body.tenant_id.as_deref().map(str::trim) {
+        Some(id) if !id.is_empty() => {
+            let uuid = Uuid::parse_str(id)
+                .map_err(|_| AdminError::BadRequest("tenant_id is not a uuid".to_string()))?;
+            state
+                .store
+                .get_tenant(uuid)
+                .await?
+                .allowed_models
+                .filter(|m| !m.is_empty())
+        }
+        _ => None,
+    };
+
+    let grants =
+        BoonGrants::from_settings(&state.store.get_boon_settings().await?.unwrap_or_default());
+
+    // Rebuild an OpenAI-style body so token counting and feature detection read
+    // exactly what the data plane reads. A `messages` that is present but not an
+    // array is the caller's mistake: silently simulating a blank prompt instead
+    // would answer a question they did not ask, which is the worst thing to hand
+    // someone debugging their routing.
+    let messages = match body.messages {
+        Some(serde_json::Value::Array(m)) => serde_json::Value::Array(m),
+        Some(_) => {
+            return Err(AdminError::BadRequest(
+                "messages must be an array of chat messages".to_string(),
+            ))
+        }
+        None => serde_json::json!([{
+            "role": "user",
+            "content": body.prompt.unwrap_or_default(),
+        }]),
+    };
+    let max_tokens = body.max_tokens.unwrap_or(0);
+    let mut json = serde_json::json!({ "model": "auto", "messages": messages });
+    if max_tokens > 0 {
+        json["max_tokens"] = serde_json::json!(max_tokens);
+    }
+    let est = obleth_tokenizer::HeuristicTokenizer::new().estimate_request(&json);
+    let est_input_tokens = est.input_tokens as u64;
+    let mut features = RequestFeatures::from_request(&json, est_input_tokens, max_tokens);
+    // The three capability requirements the synthesized body cannot express on
+    // its own, OR-ed on so an explicit flag can only ever tighten the filters.
+    features.needs_function_calling |= body.needs_function_calling;
+    features.needs_tool_choice |= body.needs_tool_choice;
+    features.needs_response_schema |= body.needs_response_schema;
+
+    let mut intent = heuristic_intent(&json, est_input_tokens);
+    if let Some(difficulty) = difficulty_from_header(body.effort.as_deref()) {
+        intent.difficulty = difficulty;
+        intent.source = IntentSource::Header;
+    }
+
+    // Spare capacity is one of the three terms an operator comes here to tune,
+    // so the default must be the live fleet load the gateway itself scores
+    // against — simulating a perfectly idle fleet would make `capacity_weight`
+    // look inert. An explicit `busyness` is a what-if override.
+    let busyness = body
+        .busyness
+        .unwrap_or_else(|| state.fairshare.model_load());
+    // At the default temperature of 0 the draw is ignored and the pick is the
+    // exact argmax. Above it production samples, so an unpinned simulation draws
+    // too. A caller comparing two simulations must pin the same draw across
+    // both, or the sampling difference reads as a weight effect; the draw used
+    // is echoed back in the response either way.
+    let uniform = match body.uniform {
+        Some(u) if u.is_finite() => u.clamp(0.0, 0.999_999_999),
+        Some(_) => {
+            return Err(AdminError::BadRequest(
+                "uniform must be a finite number in [0,1)".to_string(),
+            ))
+        }
+        None => rand::thread_rng().gen_range(0.0..1.0),
+    };
+
+    Ok(Json(explain_selection(
+        &candidates,
+        &features,
+        &busyness,
+        allowed.as_deref(),
+        &intent.tags,
+        grants,
+        &weights,
+        uniform,
+        &intent,
+    )))
 }
 
 /// View of the persisted model-"boons" settings, flattened per boon
@@ -3308,6 +3631,7 @@ async fn create_model(
             &body.boons.clone().unwrap_or_default(),
             &body.tool_servers.clone().unwrap_or_default(),
             body.energy_slots_per_node.unwrap_or(0),
+            body.route_bias.unwrap_or(1.0),
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -3417,6 +3741,7 @@ async fn update_model(
                 .unwrap_or_else(|| existing.tool_servers.clone()),
             body.energy_slots_per_node
                 .unwrap_or(existing.energy_slots_per_node),
+            body.route_bias.unwrap_or(existing.route_bias),
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -4358,7 +4683,12 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         supports_response_schema: model.supports_response_schema,
         supports_tool_choice: model.supports_tool_choice,
         supports_vision: model.supports_vision,
-        tags: model.tags.clone(),
+        // `model.tags` is the raw suffixed storage form (round-tripped as-is
+        // through create/update so a declared `tag:level` survives an edit
+        // that doesn't touch tags). The hot-path cache needs the bare
+        // vocabulary for the router's overlap match, plus the parsed ladder.
+        tags: obleth_config::normalize_tags(&model.tags),
+        declared_levels: obleth_config::normalize_tag_levels(&model.tags),
         boons: model.boons.clone(),
         tool_servers: model.tool_servers.clone(),
         request_timeout_secs: model.request_timeout_secs,
@@ -4367,6 +4697,7 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         endpoint_selection_mode: model.endpoint_selection_mode.clone(),
         debug_diagnostics: model.debug_diagnostics,
         energy_slots_per_node: model.energy_slots_per_node,
+        route_bias: model.route_bias,
         endpoints,
     };
     if model.enabled {
@@ -4417,6 +4748,635 @@ async fn sync_tenant_keys(state: &AdminState, tenant_id: Uuid) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live-service plumbing for the handful of admin tests that need a real
+    /// router. Everything here self-skips when the integration datastores are
+    /// not configured, so a plain `cargo test` stays hermetic.
+    mod harness {
+        use super::*;
+        use tower::ServiceExt;
+
+        pub(super) const TEST_ADMIN_TOKEN: &str = "test-admin-token";
+
+        /// Reads `OBLETH_TEST_DATABASE_URL`, mirroring the guard in
+        /// `obleth-store`'s harness: refuses any database whose name does not
+        /// contain "test", so a misconfigured env can never point these
+        /// fixtures at a real or dev database.
+        pub(super) fn test_db_url() -> Option<String> {
+            let url = std::env::var("OBLETH_TEST_DATABASE_URL").ok()?;
+            let db = url
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .split('?')
+                .next()
+                .unwrap_or("");
+            assert!(
+                db.contains("test"),
+                "OBLETH_TEST_DATABASE_URL database name {db:?} is not a dedicated test DB \
+                 (name must contain \"test\", e.g. obleth_test). Refusing to run integration \
+                 tests against a possibly-real database."
+            );
+            Some(url)
+        }
+
+        /// A fixture model with sane defaults. Caller owns the returned row and
+        /// must delete it.
+        pub(super) async fn fixture_model(
+            store: &Store,
+            name: &str,
+            input_cost_per_token: f64,
+        ) -> ModelRoute {
+            store
+                .create_model(
+                    name,
+                    "",
+                    name,
+                    "http://upstream.invalid",
+                    None,
+                    obleth_config::DEFAULT_MODEL_TYPE,
+                    input_cost_per_token,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    128_000,
+                    100,
+                    Some(4),
+                    true,
+                    true,
+                    true,
+                    true,
+                    false,
+                    &["coding".to_string()],
+                    &[],
+                    &[],
+                    0,
+                    1.0,
+                )
+                .await
+                .expect("create fixture model")
+        }
+
+        /// The real `/api/v1` router plus the handles a test may need to set up
+        /// live state the handlers read.
+        pub(super) struct TestApp {
+            pub(super) app: Router,
+            pub(super) store: Store,
+            /// Same instance the router's `AdminState` holds, so admitting a
+            /// request here is visible to a handler as real fleet load.
+            pub(super) fairshare: FairShare,
+        }
+
+        /// The real `/api/v1` router, wired to the integration datastores.
+        /// Returns `None` (test skips) when either is unconfigured.
+        pub(super) async fn test_admin_app() -> Option<TestApp> {
+            let db_url = test_db_url()?;
+            let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
+
+            let store = Store::connect(&db_url).await.expect("connect postgres");
+            store.migrate().await.expect("migrate");
+            let redis = RedisStore::connect(&redis_url)
+                .await
+                .expect("connect redis");
+
+            let capacity = Arc::new(StaticCapacity::new(64));
+            let fairshare = FairShare::start(
+                capacity.clone(),
+                obleth_config::FairshareAlgorithm::default(),
+            );
+            let http = reqwest::Client::new();
+            let alerts = AlertDispatcher::new(http.clone(), AlertSettings::default());
+            let state = AdminState {
+                store: store.clone(),
+                redis,
+                capacity,
+                fairshare: fairshare.clone(),
+                fairshare_stats: fairshare.stats(),
+                // Never dialled: no route under test reads ClickHouse.
+                clickhouse: clickhouse::Client::default(),
+                admin_token: TEST_ADMIN_TOKEN.to_string(),
+                health: ModelHealthRuntime {
+                    scheduled_enabled: false,
+                    default_interval_secs: 60,
+                    timeout_secs: 5,
+                    retention_days: 1,
+                    http,
+                    alerts: None,
+                    telemetry: None,
+                    catalogs: Default::default(),
+                },
+                usage_retention_default_days: 30,
+                ssrf: ssrf::SsrfPolicy::from_env(),
+                alerts,
+                local_cache_tx: None,
+            };
+            Some(TestApp {
+                app: router(state),
+                store,
+                fairshare,
+            })
+        }
+
+        pub(super) async fn send(
+            app: &Router,
+            req: axum::http::Request<axum::body::Body>,
+        ) -> (StatusCode, serde_json::Value) {
+            let res = app.clone().oneshot(req).await.expect("handler ran");
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, json)
+        }
+
+        pub(super) fn simulate_request(
+            token: Option<&str>,
+            body: serde_json::Value,
+        ) -> axum::http::Request<axum::body::Body> {
+            let mut req = axum::http::Request::post("/api/v1/router/simulate")
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                req = req.header("authorization", format!("Bearer {token}"));
+            }
+            req.body(axum::body::Body::from(body.to_string()))
+                .expect("build request")
+        }
+    }
+
+    use harness::{fixture_model, send, simulate_request, test_admin_app, TEST_ADMIN_TOKEN};
+
+    /// The simulator sits behind the same bearer gate as every other write-side
+    /// route: it reads the whole model fleet and every tenant's allowlist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_requires_admin() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let (status, _) = send(
+            &t.app,
+            simulate_request(None, serde_json::json!({ "prompt": "hello" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The whole point of the endpoint: a full routing verdict with no upstream
+    /// call. The fixture model is unique per run and deleted before the
+    /// assertions so a failure cannot leave a row behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_returns_an_explanation_without_dispatching() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let name = format!("m-{}", Uuid::new_v4());
+        let model = fixture_model(&t.store, &name, 0.0).await;
+
+        let (status, body) = send(
+            &t.app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({ "prompt": "write a python function" }),
+            ),
+        )
+        .await;
+
+        let _ = t.store.delete_model(model.id).await;
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(body.get("scored").is_some());
+        assert!(body.get("rejected").is_some());
+        // The fixture is enabled, healthy and roomy, so it must survive every
+        // hard filter and appear in the ranking.
+        let scored = body["scored"].as_array().expect("scored is an array");
+        assert!(
+            scored.iter().any(|s| s["model"] == serde_json::json!(name)),
+            "the fixture model should be a scored candidate: {scored:?}"
+        );
+        // A "python function" prompt is tagged by the heuristics, never by the
+        // classifier: the simulate path must not make a model call.
+        assert_eq!(
+            body["tag_source"],
+            serde_json::json!("heuristic"),
+            "simulate must never report a classification it did not perform"
+        );
+        assert_eq!(body["difficulty_source"], serde_json::json!("heuristic"));
+        assert_eq!(
+            body["classifier_ms"],
+            serde_json::json!(0),
+            "no classifier ran, so there is no timing to report"
+        );
+        assert!(body["tags"]
+            .as_array()
+            .expect("tags is an array")
+            .contains(&serde_json::json!("coding")));
+    }
+
+    /// Weight overrides must be clamped exactly as a settings write would be,
+    /// and unset fields must fall through to the persisted values — otherwise
+    /// the tuner shows a ranking no saved configuration could produce.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_clamps_weight_overrides_like_a_settings_write() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let saved = t
+            .store
+            .get_auto_router_settings()
+            .await
+            .expect("read settings")
+            .unwrap_or_default();
+
+        let (status, body) = send(
+            &t.app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({
+                    "prompt": "hello",
+                    "cost_weight": 7.5,      // out of range, clamps to 1.0
+                    "temperature": -3.0,     // out of range, clamps to 0.0
+                    "default_soft_cap": 0,   // rejected, keeps the saved value
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["weights"]["cost"], serde_json::json!(1.0));
+        assert_eq!(body["temperature"], serde_json::json!(0.0));
+        assert_eq!(
+            body["weights"]["soft_cap"],
+            serde_json::json!(saved.default_soft_cap as f64),
+            "a rejected soft cap falls back to the persisted setting"
+        );
+        assert_eq!(
+            body["weights"]["capacity"],
+            serde_json::json!(saved.capacity_weight),
+            "an unset override keeps the persisted weight"
+        );
+    }
+
+    /// `effort` is the simulator's stand-in for `x-obleth-effort`, so it must
+    /// report the same `header` provenance the data plane records.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_reports_the_effort_override_as_a_header_source() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let (status, body) = send(
+            &t.app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({ "prompt": "hello", "effort": "high" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["difficulty"], serde_json::json!(3));
+        assert_eq!(body["difficulty_source"], serde_json::json!("header"));
+    }
+
+    /// A malformed tenant id is the caller's mistake, not a 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_rejects_a_malformed_tenant_id() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let (status, _) = send(
+            &t.app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({ "prompt": "hello", "tenant_id": "not-a-uuid" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Answering a malformed request with a simulation of a blank prompt is the
+    /// worst thing to hand someone who is debugging their routing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_rejects_non_array_messages() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let (status, _) = send(
+            &t.app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({ "messages": { "role": "user", "content": "hi" } }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Omitting `busyness` must score against the *live* fleet load, the same
+    /// input the request path passes. Simulating a perfectly idle fleet would
+    /// make `capacity_weight` look inert in the tuner: the term it scales would
+    /// be a constant 1.0 for every candidate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_defaults_busyness_to_the_live_fleet_load() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let name = format!("m-{}", Uuid::new_v4());
+        let model = fixture_model(&t.store, &name, 0.0).await;
+
+        // Occupy 2 of the fixture's 4 in-flight slots, and hold the permits for
+        // the duration of the call so the scheduler still reports them.
+        let tenant = Uuid::new_v4();
+        let mut permits = Vec::new();
+        for _ in 0..2 {
+            let admitted = t
+                .fairshare
+                .admit(obleth_fairshare::AdmitRequest {
+                    tenant,
+                    weight: 100,
+                    group: "default".to_string(),
+                    group_weight: 100,
+                    model: name.clone(),
+                    model_max_in_flight: Some(4),
+                    cost: 1,
+                })
+                .await
+                .expect("admitted");
+            permits.push(admitted);
+        }
+        let live = t.fairshare.model_load();
+        assert_eq!(
+            live.get(&name).copied(),
+            Some(2),
+            "the scheduler must be reporting the load this test set up"
+        );
+
+        // Same request twice: once letting the default apply, once passing the
+        // live map explicitly. They must agree — i.e. the default *is* the live
+        // load, not an empty map.
+        let defaulted = send(
+            &t.app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({ "prompt": "hello", "uniform": 0.0 }),
+            ),
+        )
+        .await;
+        let explicit = send(
+            &t.app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({ "prompt": "hello", "uniform": 0.0, "busyness": live }),
+            ),
+        )
+        .await;
+        // And an explicitly idle fleet, which must differ — otherwise the two
+        // assertions above would pass even if busyness were ignored entirely.
+        let idle = send(
+            &t.app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({
+                    "prompt": "hello",
+                    "uniform": 0.0,
+                    "busyness": serde_json::json!({}),
+                }),
+            ),
+        )
+        .await;
+
+        drop(permits);
+        let _ = t.store.delete_model(model.id).await;
+
+        assert_eq!(defaulted.0, StatusCode::OK, "body: {}", defaulted.1);
+        let spare_of = |body: &serde_json::Value| -> f64 {
+            body["scored"]
+                .as_array()
+                .expect("scored is an array")
+                .iter()
+                .find(|s| s["model"] == serde_json::json!(name))
+                .unwrap_or_else(|| panic!("fixture missing from the ranking: {body}"))["spare"]
+                .as_f64()
+                .expect("spare is a number")
+        };
+        assert_eq!(
+            spare_of(&defaulted.1),
+            spare_of(&explicit.1),
+            "omitting busyness must score against the live fleet load"
+        );
+        assert_eq!(
+            spare_of(&defaulted.1),
+            0.5,
+            "2 of 4 slots taken is half spare capacity"
+        );
+        assert_eq!(
+            spare_of(&idle.1),
+            1.0,
+            "an explicitly idle override must still be honoured"
+        );
+    }
+
+    /// The tuner calls this endpoint twice — saved weights vs. edited weights —
+    /// and shows the difference. With independent draws above temperature 0,
+    /// sampling noise would be attributed to the operator's edit, so the draw
+    /// must be pinnable and must be echoed back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_pins_the_draw_so_two_runs_are_comparable() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        // Two models with clearly different costs, isolated from whatever else
+        // lives in the shared test database by a tenant allowlist.
+        let cheap = format!("m-cheap-{}", Uuid::new_v4());
+        let dear = format!("m-dear-{}", Uuid::new_v4());
+        let cheap_row = fixture_model(&t.store, &cheap, 0.000_001).await;
+        let dear_row = fixture_model(&t.store, &dear, 0.001).await;
+        let tenant = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        t.store
+            .update_tenant_allowlist(tenant.id, Some(vec![cheap.clone(), dear.clone()]))
+            .await
+            .expect("set allowlist");
+
+        let simulate = |uniform: f64| {
+            let app = t.app.clone();
+            let tenant_id = tenant.id.to_string();
+            async move {
+                send(
+                    &app,
+                    simulate_request(
+                        Some(TEST_ADMIN_TOKEN),
+                        serde_json::json!({
+                            "prompt": "hello",
+                            "tenant_id": tenant_id,
+                            "temperature": 2.0,
+                            "uniform": uniform,
+                        }),
+                    ),
+                )
+                .await
+            }
+        };
+        let first = simulate(0.0).await;
+        let again = simulate(0.0).await;
+        let other = simulate(0.999).await;
+
+        let _ = t.store.delete_model(cheap_row.id).await;
+        let _ = t.store.delete_model(dear_row.id).await;
+        let _ = t.store.delete_tenant(tenant.id).await;
+
+        assert_eq!(first.0, StatusCode::OK, "body: {}", first.1);
+        assert_eq!(
+            first.1["uniform"],
+            serde_json::json!(0.0),
+            "the draw used must be echoed back"
+        );
+        assert_eq!(other.1["uniform"], serde_json::json!(0.999));
+        assert_eq!(
+            first.1["chosen"], again.1["chosen"],
+            "the same pinned draw and the same weights must give the same pick"
+        );
+        assert_eq!(
+            first.1["scored"], again.1["scored"],
+            "a pinned draw makes the whole ranking reproducible"
+        );
+        // Only two candidates survive the allowlist, and at temperature 2.0 a
+        // draw at the far end of the mass lands on the runner-up — so the
+        // pinning above is doing real work, not describing a degenerate case.
+        assert_ne!(
+            first.1["chosen"], other.1["chosen"],
+            "different pinned draws must be able to move the pick"
+        );
+    }
+
+    /// A handler can carry `#[utoipa::path]` and still be missing from the
+    /// document, and an unregistered schema leaves a dangling `$ref` rather
+    /// than a compile error. Pin both halves.
+    #[test]
+    fn openapi_doc_exposes_the_simulate_endpoint() {
+        use utoipa::OpenApi;
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize the openapi doc");
+        assert!(
+            doc["paths"]["/api/v1/router/simulate"]["post"].is_object(),
+            "the simulate route is missing from paths(...)"
+        );
+        let schemas = &doc["components"]["schemas"];
+        for name in [
+            "SimulateRouteRequest",
+            "RouteExplain",
+            "ScoredCandidate",
+            "Rejection",
+            "WeightsView",
+            "IntentSource",
+        ] {
+            assert!(
+                schemas.get(name).is_some(),
+                "{name} is not registered in components(...)"
+            );
+        }
+    }
+
+    #[test]
+    fn update_auto_router_clamps_weights_and_preserves_unset() {
+        use obleth_config::AutoRouterSettings;
+        let existing = AutoRouterSettings {
+            capacity_weight: 0.9,
+            temperature: 0.3,
+            ..Default::default()
+        };
+        let body = UpdateAutoRouterSettings {
+            cost_weight: Some(0.7),
+            temperature: Some(-5.0), // out of range, must clamp to 0.0
+            ..Default::default()
+        };
+        let merged = merge_auto_router(&existing, &body);
+        assert_eq!(merged.cost_weight, 0.7);
+        assert_eq!(
+            merged.capacity_weight, 0.9,
+            "unset fields keep their existing value"
+        );
+        assert_eq!(
+            merged.temperature, 0.0,
+            "negative temperature clamps to argmax"
+        );
+    }
+
+    #[test]
+    fn update_auto_router_rejects_zero_soft_cap() {
+        use obleth_config::AutoRouterSettings;
+        let existing = AutoRouterSettings::default();
+        let body = UpdateAutoRouterSettings {
+            default_soft_cap: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(merge_auto_router(&existing, &body).default_soft_cap, 8);
+    }
+
+    #[test]
+    fn update_auto_router_preserves_tier_source_on_unrecognized_string() {
+        use obleth_config::{AutoRouterSettings, TierSource};
+        let existing = AutoRouterSettings {
+            tier_source: TierSource::Declared,
+            ..Default::default()
+        };
+        let body = UpdateAutoRouterSettings {
+            tier_source: Some("bogus".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_auto_router(&existing, &body).tier_source,
+            TierSource::Declared
+        );
+
+        let body_absent = UpdateAutoRouterSettings::default();
+        assert_eq!(
+            merge_auto_router(&existing, &body_absent).tier_source,
+            TierSource::Declared
+        );
+
+        let body_valid = UpdateAutoRouterSettings {
+            tier_source: Some("derived".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            merge_auto_router(&existing, &body_valid).tier_source,
+            TierSource::Derived
+        );
+    }
+
+    #[test]
+    fn auto_router_view_round_trips_scoring_fields() {
+        use obleth_config::{AutoRouterSettings, TierSource};
+        let s = AutoRouterSettings {
+            capacity_weight: 0.7,
+            cost_weight: 0.3,
+            tag_weight: 0.4,
+            default_soft_cap: 12,
+            temperature: 0.5,
+            difficulty_enabled: true,
+            tier_source: TierSource::Declared,
+            ..Default::default()
+        };
+        let view = AutoRouterSettingsView::from_settings(&s);
+        assert_eq!(view.capacity_weight, 0.7);
+        assert_eq!(view.cost_weight, 0.3);
+        assert_eq!(view.tag_weight, 0.4);
+        assert_eq!(view.default_soft_cap, 12);
+        assert_eq!(view.temperature, 0.5);
+        assert!(view.difficulty_enabled);
+        assert_eq!(view.tier_source, "declared");
+    }
 
     #[test]
     fn boon_view_round_trips_compression() {

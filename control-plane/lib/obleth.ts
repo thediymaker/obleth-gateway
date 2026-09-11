@@ -116,6 +116,8 @@ export interface ModelRoute {
   cost_per_audio_second: number;
   cost_per_character: number;
   energy_slots_per_node: number;
+  /** Multiplier on this model's auto-routing score. 1.0 is neutral. */
+  route_bias: number;
   context_window: number;
   admission_weight: number;
   max_in_flight: number | null;
@@ -761,12 +763,109 @@ export interface AutoRouterSettingsView {
   classifier_model: string | null;
   classifier_timeout_ms: number;
   available_tags: string[];
+  capacity_weight: number;
+  cost_weight: number;
+  tag_weight: number;
+  default_soft_cap: number;
+  temperature: number;
+  difficulty_enabled: boolean;
+  tier_source: "hybrid" | "derived" | "declared";
 }
 
 export interface UpdateAutoRouterSettings {
   classifier_enabled?: boolean;
   classifier_model?: string | null;
   classifier_timeout_ms?: number;
+  capacity_weight?: number;
+  cost_weight?: number;
+  tag_weight?: number;
+  default_soft_cap?: number;
+  temperature?: number;
+  difficulty_enabled?: boolean;
+  tier_source?: "hybrid" | "derived" | "declared";
+}
+
+/// Where a request's routing intent came from. `classifier` never appears in a
+/// simulation — the simulate endpoint deliberately does not call the classifier
+/// brain, so it reports `heuristic` or `header`.
+export type IntentSource = "classifier" | "heuristic" | "header" | "default";
+
+export interface ScoredCandidateView {
+  model: string;
+  level: number;
+  spare: number;
+  cost_score: number;
+  tag_score: number;
+  bias: number;
+  score: number;
+  chosen: boolean;
+}
+
+export interface RejectionView {
+  reason: string;
+  models: string[];
+}
+
+export interface RouteWeightsView {
+  capacity: number;
+  cost: number;
+  tag: number;
+  soft_cap: number;
+  difficulty_enabled: boolean;
+}
+
+/// One `auto` routing decision, explained. The same shape is returned by
+/// `simulateRoute` and recorded in the `auto_route` span, so one component
+/// renders a hypothetical and a real decision alike.
+export interface RouteExplainView {
+  chosen: string | null;
+  difficulty: number;
+  difficulty_source: IntentSource;
+  tags: string[];
+  tag_source: IntentSource;
+  /** Always 0 from a simulation: no classifier ran, so there is no timing. */
+  classifier_ms: number;
+  tier_domains: string[];
+  tier_floor: number;
+  tier_floor_clamped: boolean;
+  weights: RouteWeightsView;
+  temperature: number;
+  /**
+   * The draw this decision was made with. Ignored at `temperature === 0`.
+   * Above it, pin the same value across two simulations that differ only in
+   * their weights, or sampling noise reads as an effect of the weight change.
+   */
+  uniform: number;
+  sampled: boolean;
+  scored: ScoredCandidateView[];
+  rejected: RejectionView[];
+}
+
+/// A hypothetical `auto` request. Weight fields are overrides; unset ones fall
+/// back to the saved auto-router settings.
+export interface SimulateRouteRequest {
+  prompt?: string;
+  /** Must be an array of chat messages when present; anything else is a 400. */
+  messages?: unknown[];
+  max_tokens?: number;
+  tenant_id?: string;
+  effort?: "low" | "medium" | "high";
+  needs_function_calling?: boolean;
+  needs_tool_choice?: boolean;
+  needs_response_schema?: boolean;
+  capacity_weight?: number;
+  cost_weight?: number;
+  tag_weight?: number;
+  default_soft_cap?: number;
+  temperature?: number;
+  difficulty_enabled?: boolean;
+  /** Omit to score against the live fleet load, as the gateway itself does. */
+  busyness?: Record<string, number>;
+  /**
+   * Pin the softmax draw in `[0,1)`. Omit for a fresh draw. Pin it when
+   * comparing two simulations so only the weight change moves the result.
+   */
+  uniform?: number;
 }
 
 export interface BoonSettingsView {
@@ -1642,6 +1741,14 @@ export const obleth = {
     api<AutoRouterSettingsView>("/settings/auto-router", {
       method: "PUT",
       headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  /// Run the whole `auto` pipeline against the live fleet and return the
+  /// decision it would make, without dispatching anything. Read-only: no audit
+  /// entry, no upstream call, and no classifier round trip.
+  simulateRoute: (body: SimulateRouteRequest) =>
+    api<RouteExplainView>("/router/simulate", {
+      method: "POST",
       body: JSON.stringify(body),
     }),
   getBoonSettings: reactCache(() => api<BoonSettingsView>("/settings/boons")),

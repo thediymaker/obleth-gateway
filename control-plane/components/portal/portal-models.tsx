@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { CodeBlock, CopyButton } from "@/components/portal/copy-button";
 import type { ModelRoute, Tenant } from "@/lib/obleth";
-import { formatNumber } from "@/lib/utils";
+import { formatNumber, parseTagLevel, tagsInclude } from "@/lib/utils";
 
 export function PortalModels({
   models,
@@ -33,7 +33,7 @@ export function PortalModels({
   const toolReady = models.filter(
     (model) => model.supports_function_calling && model.supports_tool_choice,
   ).length;
-  const vision = models.filter((model) => model.supports_vision || model.tags?.includes("vision")).length;
+  const vision = models.filter((model) => model.supports_vision || tagsInclude(model.tags, "vision")).length;
   const restricted = (tenant?.allowed_models?.length ?? 0) > 0;
 
   return (
@@ -185,7 +185,11 @@ function ModelBadges({
       {(model.tags?.length ?? 0) > 0 && (
         <span className="inline-flex min-w-0 items-center gap-1 text-[11px] text-muted-foreground">
           <Tag className="h-3 w-3 shrink-0" aria-hidden />
-          <span className="truncate">{model.tags.join(" / ")}</span>
+          {/* Base topic only: the `:level` suffix is the router's internal
+              ladder syntax and means nothing to a developer reading this. */}
+          <span className="truncate">
+            {model.tags.map((t) => parseTagLevel(t).base).join(" / ")}
+          </span>
         </span>
       )}
       {(model.boons?.length ?? 0) > 0 && (

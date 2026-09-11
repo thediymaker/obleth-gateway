@@ -97,7 +97,7 @@ import { EditForm } from "@/components/edit-form";
 import { ProviderImportWizard } from "@/components/provider-import-wizard";
 import { RecipeList } from "@/components/recipes/recipe-list";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
-import { cn, formatNumber, getJson } from "@/lib/utils";
+import { cn, formatNumber, getJson, parseTagLevel, TAG_LEVEL_LABELS } from "@/lib/utils";
 import { useSearchParams } from "next/navigation";
 
 // Lets any control inside a model's detail panel signal a successful save so the
@@ -508,7 +508,10 @@ export function ModelManager({
                               {(model.tags?.length ?? 0) > 0 && (
                                 <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
                                   <Tag className="h-3 w-3" aria-hidden />
-                                  {model.tags!.join(" · ")}
+                                  {model
+                                    .tags!.map(parseTagLevel)
+                                    .map((t) => (t.declared ? `${t.base} (${TAG_LEVEL_LABELS[t.level]})` : t.base))
+                                    .join(" · ")}
                                 </span>
                               )}
                               {(model.boons?.length ?? 0) > 0 && (
@@ -985,6 +988,16 @@ function CreateModelWizard({
                   defaultValue="0"
                   hint="How many of this model's requests one node can serve at once when fully loaded (replicas per node × concurrent sequences per replica). Node power is split across this many slots. 0 = energy accounting off for this model."
                 />
+                <Field
+                  label="Routing bias"
+                  name="route_bias"
+                  type="number"
+                  defaultValue="1.0"
+                  step={0.1}
+                  min={0.1}
+                  max={3}
+                  hint="Multiplier on this model's auto-routing score. 1.0 is neutral."
+                />
               </section>
 
               <section className={cn("space-y-3", step !== 4 && "hidden")}>
@@ -1405,6 +1418,16 @@ function ConnectionTab({
                 type="number"
                 defaultValue={String(model.energy_slots_per_node)}
                 hint="How many of this model's requests one node can serve at once when fully loaded (replicas per node × concurrent sequences per replica). Node power is split across this many slots. 0 = energy accounting off for this model."
+              />
+              <Field
+                label="Routing bias"
+                name="route_bias"
+                type="number"
+                defaultValue={String(model.route_bias)}
+                step={0.1}
+                min={0.1}
+                max={3}
+                hint="Multiplier on this model's auto-routing score. 1.0 is neutral."
               />
             </FormSection>
           </div>
@@ -2397,6 +2420,45 @@ function ChipCheckbox({
   );
 }
 
+// Compact 1-2-3 strength selector shown beside a checked routing-tag chip.
+// Same peer/sr-only styling idiom as ChipCheckbox, but exclusive-choice
+// (native radios) since a tag has exactly one level. The radio group's name
+// carries the tag it belongs to, so `tagsFromForm` on the server can fold
+// `tag_level_<tag>` back into the emitted `base:level` string.
+function TagLevelPicker({ tag, level, onChange }: { tag: string; level: number; onChange: (level: number) => void }) {
+  return (
+    <span
+      role="radiogroup"
+      aria-label={`${tag} strength level`}
+      className="inline-flex items-center gap-0.5 rounded-md border border-border bg-muted/40 p-0.5"
+    >
+      {([1, 2, 3] as const).map((lvl) => (
+        <label key={lvl} className="cursor-pointer">
+          <input
+            type="radio"
+            name={`tag_level_${tag}`}
+            value={lvl}
+            checked={level === lvl}
+            onChange={() => onChange(lvl)}
+            aria-label={`${tag}: ${TAG_LEVEL_LABELS[lvl]} (level ${lvl})`}
+            className="peer sr-only"
+          />
+          <span
+            className={cn(
+              "inline-block rounded px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground transition-colors",
+              "hover:bg-accent hover:text-accent-foreground",
+              "peer-checked:bg-secondary peer-checked:text-foreground",
+              "peer-focus-visible:ring-1 peer-focus-visible:ring-ring",
+            )}
+          >
+            {TAG_LEVEL_LABELS[lvl]}
+          </span>
+        </label>
+      ))}
+    </span>
+  );
+}
+
 // Native capabilities, routing tags, boons, and MCP tool grants for chat
 // routes, shared by the create wizard and the edit panel. Tool grants depend
 // on native function calling + tool choice: without them the gateway can't run
@@ -2404,10 +2466,19 @@ function ChipCheckbox({
 // search). Rather than letting that misconfiguration through, the Tools group
 // is disabled until both capabilities are on, and any existing grants are
 // cleared the moment either is turned off.
-function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute; mcpServers: McpServer[] }) {
+export function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute; mcpServers: McpServer[] }) {
   const [fnCalling, setFnCalling] = useState(model?.supports_function_calling ?? false);
   const [toolChoice, setToolChoice] = useState(model?.supports_tool_choice ?? false);
   const [granted, setGranted] = useState<Set<string>>(() => new Set(model?.tool_servers ?? []));
+  const [tagState, setTagState] = useState<Record<string, { checked: boolean; level: number }>>(() => {
+    const state: Record<string, { checked: boolean; level: number }> = {};
+    for (const tag of MODEL_TAGS) {
+      const match = model?.tags?.map(parseTagLevel).find((t) => t.base === tag);
+      const nativeVision = tag === "vision" && Boolean(model?.supports_vision);
+      state[tag] = { checked: Boolean(match) || nativeVision, level: match?.level ?? 1 };
+    }
+    return state;
+  });
   const toolsReady = fnCalling && toolChoice;
 
   useEffect(() => {
@@ -2424,15 +2495,30 @@ function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute; mcpSe
         <ChipCheckbox name="supports_response_schema" label="Response schema" defaultChecked={model?.supports_response_schema ?? false} />
         <ChipCheckbox name="supports_tool_choice" label="Tool choice" checked={toolChoice} onChange={setToolChoice} />
       </ChipGroup>
-      <ChipGroup label="Routing tags" info="Hints the auto router matches against request intent. The “vision” tag marks native image support.">
-        {MODEL_TAGS.map((tag) => (
-          <ChipCheckbox
-            key={tag}
-            name={`tag_${tag}`}
-            label={tag}
-            defaultChecked={model ? (model.tags?.includes(tag) ?? false) || (tag === "vision" && model.supports_vision) : false}
-          />
-        ))}
+      <ChipGroup
+        label="Routing tags"
+        info="Hints the auto router matches against request intent. The “vision” tag marks native image support. A higher level marks the model as stronger at that topic — the auto router prefers the cheapest model strong enough for a request’s difficulty."
+      >
+        {MODEL_TAGS.map((tag) => {
+          const state = tagState[tag];
+          return (
+            <span key={tag} className="inline-flex items-center gap-1">
+              <ChipCheckbox
+                name={`tag_${tag}`}
+                label={tag}
+                checked={state.checked}
+                onChange={(checked) => setTagState((prev) => ({ ...prev, [tag]: { ...prev[tag], checked } }))}
+              />
+              {state.checked && (
+                <TagLevelPicker
+                  tag={tag}
+                  level={state.level}
+                  onChange={(level) => setTagState((prev) => ({ ...prev, [tag]: { ...prev[tag], level } }))}
+                />
+              )}
+            </span>
+          );
+        })}
       </ChipGroup>
       <ChipGroup label="Boons" info="Gateway capabilities granted that the model lacks natively. Configure in Settings → Boons.">
         {MODEL_BOONS.map((boon) => (
@@ -2529,6 +2615,9 @@ function Field({
   type = "text",
   defaultValue,
   hint,
+  step,
+  min,
+  max,
 }: {
   label: string;
   name: string;
@@ -2537,11 +2626,24 @@ function Field({
   type?: string;
   defaultValue?: string;
   hint?: string;
+  step?: number;
+  min?: number;
+  max?: number;
 }) {
   return (
     <div className="space-y-1.5">
       <Label htmlFor={`${name}-${label}`}>{label}</Label>
-      <Input id={`${name}-${label}`} name={name} type={type} placeholder={placeholder} required={required} defaultValue={defaultValue} />
+      <Input
+        id={`${name}-${label}`}
+        name={name}
+        type={type}
+        placeholder={placeholder}
+        required={required}
+        defaultValue={defaultValue}
+        step={step}
+        min={min}
+        max={max}
+      />
       {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
     </div>
   );

@@ -130,7 +130,8 @@ impl Store {
                     max_in_flight, capacity_mode, capacity_tuned_at, supports_function_calling,
                     supports_system_messages, supports_response_schema, supports_tool_choice,
                     supports_vision, enabled, cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                    request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
+                    route_bias, request_timeout_secs, max_retries, retry_backoff_ms,
+                    endpoint_selection_mode,
                     health_checks_enabled, health_alerts_enabled, health_check_interval_secs,
                     health_failure_threshold, health_maintenance_until, health_maintenance_note,
                     created_at
@@ -377,14 +378,15 @@ impl Store {
                         admission_weight, max_in_flight, capacity_mode, capacity_tuned_at,
                         supports_function_calling, supports_system_messages,
                         supports_response_schema, supports_tool_choice, supports_vision, enabled,
-                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers, request_timeout_secs,
+                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers, route_bias,
+                        request_timeout_secs,
                         max_retries, retry_backoff_ms, endpoint_selection_mode,
                         health_checks_enabled, health_alerts_enabled, health_check_interval_secs,
                         health_failure_threshold, health_maintenance_until,
                         health_maintenance_note, created_at)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-                        $32, $33, $34, $35, $36, $37, $38, $39)
+                        $32, $33, $34, $35, $36, $37, $38, $39, $40)
                  on conflict (id) do update set
                         model_name = excluded.model_name,
                         description = excluded.description,
@@ -413,6 +415,7 @@ impl Store {
                         tags = excluded.tags,
                         boons = excluded.boons,
                         tool_servers = excluded.tool_servers,
+                        route_bias = excluded.route_bias,
                         request_timeout_secs = excluded.request_timeout_secs,
                         max_retries = excluded.max_retries,
                         retry_backoff_ms = excluded.retry_backoff_ms,
@@ -454,6 +457,7 @@ impl Store {
             .bind(sqlx::types::Json(&m.tags))
             .bind(sqlx::types::Json(&m.boons))
             .bind(sqlx::types::Json(&m.tool_servers))
+            .bind(m.route_bias)
             .bind(m.request_timeout_secs)
             .bind(m.max_retries)
             .bind(m.retry_backoff_ms)
@@ -668,6 +672,7 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
             .try_get::<sqlx::types::Json<Vec<String>>, _>("tool_servers")
             .map(|j| j.0)
             .unwrap_or_default(),
+        route_bias: row.try_get("route_bias")?,
         request_timeout_secs: row.try_get("request_timeout_secs")?,
         max_retries: row.try_get("max_retries")?,
         retry_backoff_ms: row.try_get("retry_backoff_ms")?,
@@ -745,6 +750,42 @@ mod tests {
             .expect("create key");
         let hash = obleth_config::hash_api_key(&secret);
 
+        // A model with a non-neutral routing bias and a levelled intent tag.
+        // Both are `auto`-router configuration an operator set deliberately, so
+        // both must survive a backup cycle rather than silently reverting to
+        // the neutral 1.0.
+        let model = store
+            .create_model(
+                &format!("m-{}", uuid::Uuid::new_v4()),
+                "backup test model",
+                "upstream-model",
+                "http://127.0.0.1:8081",
+                None,
+                "chat",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                8192,
+                100,
+                None,
+                false,
+                true,
+                false,
+                false,
+                false,
+                &["coding:3".to_string()],
+                &[],
+                &[],
+                0,
+                2.5,
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+        assert_eq!(model.route_bias, 2.5);
+
         // Export carries the stored hash and the tenant config.
         let data = store.export_backup_data().await.expect("export");
         let exported_key = data
@@ -759,6 +800,13 @@ mod tests {
             .find(|t| t.id == tenant.id)
             .expect("tenant in export");
         assert_eq!(exported_tenant.weight, 250);
+        let exported_model = data
+            .models
+            .iter()
+            .find(|m| m.id == model.id)
+            .expect("model in export");
+        assert_eq!(exported_model.route_bias, 2.5, "export carries route_bias");
+        assert_eq!(exported_model.tags, vec!["coding:3".to_string()]);
 
         // Drift the tenant, then restore: the backup wins and counts as an
         // update (everything in the export already exists, so zero inserts).
@@ -766,8 +814,20 @@ mod tests {
             .update_tenant_weight(tenant.id, 999)
             .await
             .expect("update weight");
+        // Drift the model's bias the same way, through the same restore.
+        sqlx::query("update models set route_bias = 1.0 where id = $1")
+            .bind(model.id)
+            .execute(&store.pool)
+            .await
+            .expect("drift route_bias");
         let report = store.restore_backup_data(&data).await.expect("restore");
         assert!(report.tenants.updated >= 1);
+        let restored_model = store.get_model(model.id).await.expect("get model");
+        assert_eq!(
+            restored_model.route_bias, 2.5,
+            "restore must not reset route_bias to the neutral default"
+        );
+        assert_eq!(restored_model.tags, vec!["coding:3".to_string()]);
         assert_eq!(report.tenants.inserted, 0);
         let restored = store.get_tenant(tenant.id).await.expect("get tenant");
         assert_eq!(restored.weight, 250);
