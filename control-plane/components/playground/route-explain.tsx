@@ -9,6 +9,13 @@ import type { RouteExplainView } from "@/lib/obleth";
 const fmt = (n: number) => n.toFixed(3);
 
 /**
+ * The synthetic domain covering every chat candidate travels as the `"*"`
+ * sentinel; spell it out rather than showing the sentinel to an operator.
+ */
+const domainList = (domains: string[]) =>
+  domains.length ? domains.map((d) => (d === "*" ? "all models" : d)).join(", ") : "all models";
+
+/**
  * Renders one `auto` routing decision: the stage strip (difficulty, tags,
  * tier), the ranked candidates with their arithmetic, the collapsed
  * rejections, and the tier-floor-clamp warning.
@@ -27,6 +34,10 @@ export function RouteExplainPanel({
 }) {
   const [expanded, setExpanded] = useState<string | null>(null);
   const decisionChanged = !!baseline && baseline.chosen !== explain.chosen;
+  // Per-model tier levels only mean anything while the tier filter is running.
+  // With tiering off the floor is 0 and every model clears it, so showing a
+  // level would be noise on a stage that did not execute.
+  const tiering = explain.weights.difficulty_enabled;
   const gridCols = baseline ? "grid-cols-[minmax(0,1fr)_5rem_5rem]" : "grid-cols-[minmax(0,1fr)_5rem]";
 
   return (
@@ -57,7 +68,7 @@ export function RouteExplainPanel({
         </span>
         {explain.tier_domains.length > 0 && (
           <span>
-            Domains <span className="font-medium text-foreground">{explain.tier_domains.join(", ")}</span>
+            Domains <span className="font-medium text-foreground">{domainList(explain.tier_domains)}</span>
           </span>
         )}
         <span>
@@ -125,6 +136,11 @@ export function RouteExplainPanel({
                     {wasLiveChoice && (
                       <Badge className="shrink-0 border-amber-500/30 text-amber-600 dark:text-amber-400">live pick</Badge>
                     )}
+                    {tiering && row.level > 0 && (
+                      <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+                        tier {row.level}
+                      </span>
+                    )}
                   </span>
                   {baseline && (
                     <span className="text-right tabular-nums text-muted-foreground">
@@ -147,6 +163,14 @@ export function RouteExplainPanel({
                   const blend = hasTags ? tag * row.tag_score + (1 - tag) * base : base;
                   return (
                     <div className="space-y-1.5 bg-secondary/10 px-3 py-3 text-xs">
+                      {tiering && (
+                        <p className="text-muted-foreground">
+                          Tier level <span className="tabular-nums text-foreground">{row.level}</span> in{" "}
+                          {domainList(explain.tier_domains)} ·
+                          floor <span className="tabular-nums text-foreground">{explain.tier_floor}</span>
+                          {row.level >= explain.tier_floor ? " — cleared the floor" : " — below the floor"}
+                        </p>
+                      )}
                       <p>
                         Spare capacity: <span className="tabular-nums">{fmt(row.spare)}</span> · Cost
                         score: <span className="tabular-nums">{fmt(row.cost_score)}</span> · Tag
