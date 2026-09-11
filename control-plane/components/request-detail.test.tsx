@@ -117,4 +117,44 @@ describe("auto_route span rendering", () => {
     await render(node({ span_name: "upstream", attributes: JSON.stringify(newShapeExplain) }));
     expect(host.textContent).not.toMatch(/not considered/i);
   });
+
+  it("falls back to raw rendering when scored is present but weights is missing", async () => {
+    const { weights: _weights, ...malformed } = newShapeExplain;
+    await render(node({ attributes: JSON.stringify(malformed) }));
+    expect(host.textContent).not.toMatch(/not considered/i);
+    expect(host.textContent).toContain("scored");
+  });
+
+  it("falls back to raw rendering when a scored entry is missing score", async () => {
+    const malformed = {
+      ...newShapeExplain,
+      scored: [{ model: "gpt-oss-120b", level: 2, spare: 0.9, cost_score: 0.7, tag_score: 0, bias: 1.0, chosen: true }],
+    };
+    await render(node({ attributes: JSON.stringify(malformed) }));
+    expect(host.textContent).not.toMatch(/not considered/i);
+  });
+
+  it("falls back to raw rendering when tags is missing", async () => {
+    const { tags: _tags, ...malformed } = newShapeExplain;
+    await render(node({ attributes: JSON.stringify(malformed) }));
+    expect(host.textContent).not.toMatch(/not considered/i);
+  });
+
+  it("falls back to raw rendering when tier_domains is missing", async () => {
+    const { tier_domains: _tierDomains, ...malformed } = newShapeExplain;
+    await render(node({ attributes: JSON.stringify(malformed) }));
+    expect(host.textContent).not.toMatch(/not considered/i);
+  });
+
+  it("falls back to raw rendering when a rejected entry is missing models", async () => {
+    const malformed = { ...newShapeExplain, rejected: [{ reason: "context window too small" }] };
+    await render(node({ attributes: JSON.stringify(malformed) }));
+    expect(host.textContent).not.toMatch(/not considered/i);
+  });
+
+  it("falls back to raw rendering when temperature or uniform is missing", async () => {
+    const { temperature: _temperature, ...malformed } = newShapeExplain;
+    await render(node({ attributes: JSON.stringify(malformed) }));
+    expect(host.textContent).not.toMatch(/not considered/i);
+  });
 });
