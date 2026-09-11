@@ -671,6 +671,11 @@ pub struct CreateModel {
     /// neutral; the router clamps to `[0.1, 3.0]` before applying it.
     #[serde(default)]
     pub route_bias: Option<f64>,
+    /// Whether the `auto` router may select this model. `false` keeps the model
+    /// addressable by name but removes it from auto's candidate pool. Omitted
+    /// means eligible.
+    #[serde(default)]
+    pub auto_eligible: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -714,6 +719,11 @@ pub struct UpdateModel {
     /// neutral; the router clamps to `[0.1, 3.0]` before applying it.
     #[serde(default)]
     pub route_bias: Option<f64>,
+    /// Whether the `auto` router may select this model. `false` keeps the model
+    /// addressable by name but removes it from auto's candidate pool. Omitted
+    /// leaves the current value unchanged.
+    #[serde(default)]
+    pub auto_eligible: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -3636,6 +3646,7 @@ async fn create_model(
             &body.tool_servers.clone().unwrap_or_default(),
             body.energy_slots_per_node.unwrap_or(0),
             body.route_bias.unwrap_or(1.0),
+            body.auto_eligible.unwrap_or(true),
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -3746,6 +3757,7 @@ async fn update_model(
             body.energy_slots_per_node
                 .unwrap_or(existing.energy_slots_per_node),
             body.route_bias.unwrap_or(existing.route_bias),
+            body.auto_eligible.unwrap_or(existing.auto_eligible),
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -4705,6 +4717,7 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         debug_diagnostics: model.debug_diagnostics,
         energy_slots_per_node: model.energy_slots_per_node,
         route_bias: model.route_bias,
+        auto_eligible: model.auto_eligible,
         endpoints,
     };
     if model.enabled {
@@ -4820,6 +4833,7 @@ mod tests {
                     &[],
                     0,
                     1.0,
+                    true,
                 )
                 .await
                 .expect("create fixture model")
