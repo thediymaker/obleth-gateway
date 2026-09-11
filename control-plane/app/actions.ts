@@ -26,6 +26,7 @@ import type {
 import { requireAdmin } from "@/lib/auth/roles";
 import { resolveRecipeById, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
 import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
+import { tagsInclude } from "@/lib/utils";
 
 export type ActionResult =
   | { ok: true; warnings?: string[] }
@@ -1615,13 +1616,6 @@ function clampTagLevel(raw: FormDataEntryValue | null): number {
   const n = Number(raw);
   if (!Number.isFinite(n)) return 1;
   return Math.min(3, Math.max(1, Math.trunc(n)));
-}
-
-// True if `tags` contains an entry whose base name (everything before an
-// optional `:level` suffix) matches `base` — so a suffixed "vision:2" still
-// satisfies a bare "vision" check.
-function tagsInclude(tags: string[], base: string): boolean {
-  return tags.some((t) => t === base || t.startsWith(`${base}:`));
 }
 
 // Collects checked boon checkboxes (named `boon_<name>`) from a model form into

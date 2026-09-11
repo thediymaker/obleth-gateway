@@ -129,4 +129,26 @@ describe("model tag strength levels round-trip through updateModelCapabilitiesAc
     const body = updateModel.mock.calls[0][1];
     expect(body.tags).toEqual(["coding:3", "math"]);
   });
+
+  it.each([
+    ["0", "coding"], // below range clamps up to 1, which serializes bare
+    ["9", "coding:3"], // above range clamps down to 3
+    ["x", "coding"], // unparseable falls back to 1, which serializes bare
+  ])("clamps a malformed submitted level (%s) into 1..3 without dropping the tag", async (rawLevel, expectedTag) => {
+    mockAdmin();
+    const updateModel = vi.fn().mockResolvedValue({});
+    vi.doMock("@/lib/obleth", () => ({
+      obleth: { listModels: vi.fn().mockResolvedValue([model()]), updateModel },
+      CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
+      OblethApiError: class OblethApiError extends Error {},
+    }));
+    const { updateModelCapabilitiesAction } = await import("./actions");
+    const fd = new FormData();
+    fd.set("id", "m-1");
+    fd.set("tag_coding", "on");
+    fd.set("tag_level_coding", rawLevel);
+    await updateModelCapabilitiesAction(null, fd);
+    const body = updateModel.mock.calls[0][1];
+    expect(body.tags).toEqual([expectedTag]);
+  });
 });

@@ -16,7 +16,7 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { CodeBlock, CopyButton } from "@/components/portal/copy-button";
 import type { ModelRoute, Tenant } from "@/lib/obleth";
-import { formatNumber } from "@/lib/utils";
+import { formatNumber, tagsInclude } from "@/lib/utils";
 
 export function PortalModels({
   models,
@@ -33,7 +33,7 @@ export function PortalModels({
   const toolReady = models.filter(
     (model) => model.supports_function_calling && model.supports_tool_choice,
   ).length;
-  const vision = models.filter((model) => model.supports_vision || model.tags?.includes("vision")).length;
+  const vision = models.filter((model) => model.supports_vision || tagsInclude(model.tags, "vision")).length;
   const restricted = (tenant?.allowed_models?.length ?? 0) > 0;
 
   return (
