@@ -262,9 +262,27 @@ fn content_hash(content: &str) -> String {
 }
 
 impl Store {
-    /// Insert a document, or return the existing row when the identical content
-    /// already lives in this collection. Re-uploading the same file is a no-op
-    /// rather than a duplicate and a wasted re-embed.
+    /// Insert a document, or update the existing row when identical content
+    /// already lives in this collection (matched on `(collection_id,
+    /// content_hash)`).
+    ///
+    /// The conflict path is a real update, not a duplicate-suppressing
+    /// no-op: it was previously `set title = title` (a no-op disguised as an
+    /// update, needed only because `ON CONFLICT DO NOTHING` can't combine
+    /// with `RETURNING` on the conflicting row), which silently discarded a
+    /// re-upload's corrected title/filename/content_type while still
+    /// reporting success. Since the match is on content, `content`/`byte_size`
+    /// never actually change here — updating them anyway costs nothing and
+    /// avoids a second special case if the hash function ever changes.
+    ///
+    /// Re-queues the document (`status = 'pending'`, `error` cleared) rather
+    /// than leaving it alone: `content_type` selects the chunker's boundary
+    /// strategy (e.g. CSV record boundaries vs. generic token windows), so a
+    /// re-upload that corrects it can change how this document *should* have
+    /// been chunked even though the bytes didn't change. This is also the
+    /// re-upload's recovery path for a document a bad `content_type` guess
+    /// previously sent to `failed` — distinct from, and unaffected by, the
+    /// existing per-document "Reindex" action.
     pub async fn upsert_document(
         &self,
         collection_id: Uuid,
@@ -280,7 +298,14 @@ impl Store {
                   content_hash, byte_size, status)
              values ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
              on conflict (collection_id, content_hash) do update
-                 set title = knowledge_documents.title
+                 set title = excluded.title,
+                     filename = excluded.filename,
+                     content_type = excluded.content_type,
+                     content = excluded.content,
+                     byte_size = excluded.byte_size,
+                     status = 'pending',
+                     error = null,
+                     indexing_started_at = null
              returning {DOC_COLS}"
         ))
         .bind(Uuid::new_v4())
@@ -574,6 +599,43 @@ impl Store {
                 and d.indexed_embedding_model = c.indexed_embedding_model",
         )
         .bind(collection_id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(row.get("n"))
+    }
+
+    /// Same scope as `collection_chunk_count`, excluding one document's own
+    /// active chunks.
+    ///
+    /// The indexer sizes a re-index against the chunk cap by adding this
+    /// count to the document's *new, incoming* chunk count. A document's
+    /// existing chunks stay active (and so stay counted by
+    /// `collection_chunk_count`) until the new generation commits — so using
+    /// the unscoped count as "existing" double-counts that document: once as
+    /// its still-active old generation, again as the incoming new one. That
+    /// refuses a same-size (or shrinking) re-index of a document that alone
+    /// makes up a large share of the cap, with advice ("delete documents or
+    /// raise the cap") that doesn't fix anything, since storage would not
+    /// actually have grown. Excluding the document being re-indexed here
+    /// makes "existing" mean "everything that will still be active after
+    /// this document's new generation replaces its old one".
+    pub async fn collection_chunk_count_excluding(
+        &self,
+        collection_id: Uuid,
+        exclude_document_id: Uuid,
+    ) -> Result<i64> {
+        let row = sqlx::query(
+            "select count(*) as n
+               from knowledge_chunks k
+               join knowledge_documents d on d.id = k.document_id
+               join knowledge_collections c on c.id = k.collection_id
+              where k.collection_id = $1
+                and k.generation = d.active_generation
+                and d.indexed_embedding_model = c.indexed_embedding_model
+                and k.document_id <> $2",
+        )
+        .bind(collection_id)
+        .bind(exclude_document_id)
         .fetch_one(self.pool())
         .await?;
         Ok(row.get("n"))
@@ -947,16 +1009,56 @@ mod tests {
             .upsert_document(
                 c.id,
                 "Policy renamed",
-                "policy.md",
+                "policy-v2.md",
                 "text/markdown",
                 "same body",
             )
             .await
             .expect("second");
         assert_eq!(a.id, b.id, "identical content must not create a second row");
+        // The conflict path must be a real update, not `set title = title`
+        // disguised as one -- a re-upload correcting the title/filename must
+        // not silently discard the correction while still reporting success.
+        assert_eq!(b.title, "Policy renamed");
+        assert_eq!(b.filename, "policy-v2.md");
 
         let docs = store.list_documents(c.id).await.expect("list");
         assert_eq!(docs.len(), 1);
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn reupload_of_identical_content_requeues_a_failed_document() {
+        // A bad `content_type` guess (or an upstream hiccup) can send a
+        // document to `failed`. Re-uploading the same bytes under a
+        // corrected filename/content type is a real recovery path distinct
+        // from the "Reindex" action, and must actually requeue the document
+        // rather than leaving it stuck `failed` while reporting success.
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(&format!("recover-{}", uuid::Uuid::new_v4()), "", "e")
+            .await
+            .expect("collection");
+        let a = store
+            .upsert_document(c.id, "Ledger", "ledger.txt", "text/plain", "a,b,c\n1,2,3")
+            .await
+            .expect("first");
+        store
+            .mark_document_failed(a.id, "unsupported file type")
+            .await
+            .expect("mark failed");
+
+        let b = store
+            .upsert_document(c.id, "Ledger", "ledger.csv", "text/csv", "a,b,c\n1,2,3")
+            .await
+            .expect("reupload");
+        assert_eq!(a.id, b.id, "identical content must update the same row");
+        assert_eq!(b.status, "pending", "must requeue rather than stay failed");
+        assert_eq!(b.error, None, "the stale failure reason must be cleared");
+        assert_eq!(b.content_type, "text/csv");
+
         store.delete_collection(c.id).await.ok();
     }
 
@@ -1077,6 +1179,104 @@ mod tests {
         let chunks = store.load_active_chunks(c.id).await.expect("load");
         assert_eq!(chunks.len(), 1, "the old generation must be gone");
         assert_eq!(chunks[0].text, "new");
+
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn chunk_count_excluding_omits_the_named_documents_own_chunks() {
+        // Regression for the double-count bug: `collection_chunk_count`
+        // includes a document's own currently-active chunks, which are still
+        // "active" mid-re-index (until the new generation commits). Sizing a
+        // re-index's cap check against that unscoped count adds the
+        // document's existing chunks to its own incoming ones, refusing a
+        // same-size re-index of a document that alone makes up a large share
+        // of the cap even though the collection's real storage wouldn't grow.
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(&format!("cap-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("collection");
+        let a = store
+            .upsert_document(c.id, "Doc A", "a.md", "text/markdown", "body a")
+            .await
+            .expect("doc a");
+        let b = store
+            .upsert_document(c.id, "Doc B", "b.md", "text/markdown", "body b")
+            .await
+            .expect("doc b");
+
+        mark_indexing(&store, a.id).await;
+        let a_chunks: Vec<super::ChunkInsert> = (0..3)
+            .map(|i| super::ChunkInsert {
+                ordinal: i,
+                text: format!("a-chunk-{i}"),
+                token_count: 2,
+                embedding: vec![1.0, 0.0],
+            })
+            .collect();
+        store
+            .commit_document_generation(c.id, a.id, 1, "embed-a", 2, &a_chunks)
+            .await
+            .expect("commit a");
+
+        mark_indexing(&store, b.id).await;
+        store
+            .commit_document_generation(
+                c.id,
+                b.id,
+                1,
+                "embed-a",
+                2,
+                &[super::ChunkInsert {
+                    ordinal: 0,
+                    text: "b-chunk-0".into(),
+                    token_count: 2,
+                    embedding: vec![0.0, 1.0],
+                }],
+            )
+            .await
+            .expect("commit b");
+
+        assert_eq!(
+            store.collection_chunk_count(c.id).await.expect("count"),
+            4,
+            "sanity: both documents' chunks are active"
+        );
+
+        // This is the count the indexer now feeds `check_chunk_cap` as
+        // "existing" when re-indexing A: A's own 3 (about to be replaced)
+        // are excluded, leaving only what will still be active regardless of
+        // how A's re-index turns out.
+        assert_eq!(
+            store
+                .collection_chunk_count_excluding(c.id, a.id)
+                .await
+                .expect("excl a"),
+            1,
+            "excluding A's own chunks must leave only B's"
+        );
+        assert_eq!(
+            store
+                .collection_chunk_count_excluding(c.id, b.id)
+                .await
+                .expect("excl b"),
+            3,
+            "excluding B's own chunk must leave only A's"
+        );
+
+        // A re-index of A into the *same* 3 chunks does not grow the
+        // collection at all (1 + 3 = 4, unchanged). The old, unscoped
+        // `collection_chunk_count` (4) would have made that look like 4 + 3 =
+        // 7 against the cap -- refusing a re-index that doesn't add a single
+        // chunk of real storage.
+        let existing_for_as_reindex = store
+            .collection_chunk_count_excluding(c.id, a.id)
+            .await
+            .expect("excl a for reindex sizing");
+        assert_eq!(existing_for_as_reindex + a_chunks.len() as i64, 4);
 
         store.delete_collection(c.id).await.ok();
     }

@@ -97,7 +97,13 @@ pub async fn index_document(
     if chunks.is_empty() {
         return Err(anyhow!("document produced no chunks"));
     }
-    let existing = store.collection_chunk_count(collection.id).await?;
+    // Excludes `doc`'s own currently-active chunks: they belong to the
+    // generation this index run is about to replace, so counting them as
+    // "existing" alongside the incoming chunks double-charges this document
+    // against the cap (see `collection_chunk_count_excluding`).
+    let existing = store
+        .collection_chunk_count_excluding(collection.id, doc.id)
+        .await?;
     check_chunk_cap(existing, chunks.len(), settings.max_chunks_per_collection)?;
 
     let target = EmbedTarget {
