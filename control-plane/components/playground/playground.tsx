@@ -12,14 +12,37 @@ import { RouterWorkspace } from "./router-workspace";
 import { migrateLegacySessions } from "./session-migration";
 import { cn } from "@/lib/utils";
 
-const sessionSchema = z.object({
+// Shared by the zod cap below and the Router textarea's `maxLength`
+// (router-workspace.tsx) so the two can't drift apart: if the input ever
+// accepts more than the schema allows, a session with a long-enough
+// `routerPrompt` fails `z.array(sessionSchema).safeParse` on the next load
+// and playground.tsx silently replaces *every* saved session with a fresh
+// one. The gateway itself only reads the first ~2,000 characters for intent
+// classification, but "paste a document you want routed" is the mode's
+// headline use case, so the cap is generous rather than tight.
+export const ROUTER_PROMPT_MAX_LENGTH = 100_000;
+
+// Exported so a test can assert a session parses/round-trips without
+// duplicating the schema, and so its cap can be checked against
+// ROUTER_PROMPT_MAX_LENGTH directly rather than by re-deriving it.
+export const sessionSchema = z.object({
   id: z.string(), title: z.string(), mode: z.enum(["chat", "compare", "router"]),
   models: z.array(z.string()).min(1).max(4), generation: generationSchema,
   recipients: z.array(z.number().int().min(0).max(3)).optional(),
-  // Router mode's prompt draft. Kept on the session (not component-local
-  // state) so it survives a Chat<->Router toggle, which remounts
-  // RouterWorkspace since the two modes render different component types.
-  routerPrompt: z.string().max(20000).optional(),
+  // Router mode's form draft — everything here is cheap to carry on the
+  // session (not component-local state) so it survives a Chat<->Router
+  // toggle, which remounts RouterWorkspace since the two modes render
+  // different component types. The weight sliders deliberately do NOT get
+  // this treatment: they re-seed from the live settings on every mount by
+  // design (see router-workspace.tsx), and preserving in-progress edits
+  // across a remount would need to change that seeding logic itself.
+  routerPrompt: z.string().max(ROUTER_PROMPT_MAX_LENGTH).optional(),
+  routerTenantId: z.string().max(200).optional(),
+  routerEffort: z.enum(["low", "medium", "high"]).optional(),
+  routerMaxTokens: z.number().int().min(1).max(131_072).optional(),
+  routerNeedsFunctionCalling: z.boolean().optional(),
+  routerNeedsToolChoice: z.boolean().optional(),
+  routerNeedsResponseSchema: z.boolean().optional(),
 });
 export type PlaygroundSession = z.infer<typeof sessionSchema>;
 const fresh = (): PlaygroundSession => ({ id: crypto.randomUUID(), title: "Untitled session", mode: "compare", models: ["charo"], generation: { systemPrompt: "" } });
