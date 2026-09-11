@@ -162,7 +162,13 @@ services:
   # absent or unreachable, so obleth must NOT depend on this service.
   compressor:
     profiles: ["compressor"]
-    image: ghcr.io/thediymaker/obleth-gateway/obleth-compressor:${OBLETH_VERSION:-latest}
+    # Tagged separately from the other first-party images: the edge build
+    # (docker.yml) skips this component because baking the ONNX model is slow,
+    # so an edge tag like :dev exists for every image EXCEPT this one. Pinning
+    # it independently lets OBLETH_VERSION track edge without breaking the pull
+    # here. Release tags (vX.Y.Z, latest) cover all five components, so set
+    # OBLETH_COMPRESSOR_VERSION to match OBLETH_VERSION for release deploys.
+    image: ghcr.io/thediymaker/obleth-gateway/obleth-compressor:${OBLETH_COMPRESSOR_VERSION:-latest}
     build:
       context: ../..
       dockerfile: deploy/docker/obleth-compressor.Dockerfile
