@@ -1032,6 +1032,88 @@ export interface Recipe {
   author: string;
 }
 
+// Mirrors `CollectionView` in obleth-admin/src/knowledge/mod.rs.
+export interface KnowledgeCollection {
+  id: string;
+  name: string;
+  description: string;
+  embedding_model: string;
+  indexed_embedding_model: string;
+  embedding_dim: number;
+  chunk_tokens: number;
+  chunk_overlap_tokens: number;
+  needs_reindex: boolean;
+  chunk_count: number;
+  estimated_bytes: number;
+}
+
+// Mirrors `DocumentView` in obleth-admin/src/knowledge/mod.rs.
+export interface KnowledgeDocument {
+  id: string;
+  collection_id: string;
+  title: string;
+  filename: string;
+  content_type: string;
+  byte_size: number;
+  status: "pending" | "indexing" | "ready" | "failed";
+  error: string | null;
+  chunk_count: number;
+}
+
+// Mirrors `SearchHit` in obleth-admin/src/knowledge/mod.rs.
+export interface KnowledgeHit {
+  chunk_id: string;
+  document_id: string;
+  score: number;
+  token_count: number;
+  text: string;
+  would_inject: boolean;
+}
+
+// Mirrors `ReindexResult` in obleth-admin/src/knowledge/mod.rs.
+export interface KnowledgeReindexResult {
+  documents_requeued: number;
+}
+
+// Mirrors `ModelCollectionsView` in obleth-admin/src/knowledge/mod.rs.
+export interface ModelKnowledgeCollections {
+  collection_ids: string[];
+}
+
+// Mirrors `KnowledgeSettingsView` in obleth-admin/src/knowledge/mod.rs.
+export interface KnowledgeSettingsView {
+  enabled: boolean;
+  top_k: number;
+  min_score: number;
+  max_context_tokens: number;
+  embed_timeout_ms: number;
+  query_cache_ttl_s: number;
+  query_turns: number;
+  max_upload_bytes: number;
+  max_chunks_per_collection: number;
+  index_batch_size: number;
+  index_timeout_ms: number;
+  index_stale_after_secs: number;
+  debug_snapshot: boolean;
+}
+
+// Mirrors `UpdateKnowledgeSettings` in obleth-admin/src/knowledge/mod.rs.
+export interface UpdateKnowledgeSettings {
+  enabled?: boolean;
+  top_k?: number;
+  min_score?: number;
+  max_context_tokens?: number;
+  embed_timeout_ms?: number;
+  query_cache_ttl_s?: number;
+  query_turns?: number;
+  max_upload_bytes?: number;
+  max_chunks_per_collection?: number;
+  index_batch_size?: number;
+  index_timeout_ms?: number;
+  index_stale_after_secs?: number;
+  debug_snapshot?: boolean;
+}
+
 /// Error thrown when the management API responds with a non-2xx status. Carries
 /// the parsed `error` message so the UI can display something actionable.
 export class OblethApiError extends Error {
@@ -1124,6 +1206,7 @@ export const CACHE_TAGS = {
   tenants: "tenants",
   keys: "keys",
   models: "models",
+  knowledgeCollections: "knowledge-collections",
 } as const;
 
 export const obleth = {
@@ -1799,6 +1882,104 @@ export const obleth = {
   restoreBackup: (body: ConfigBackup, options?: AuditOptions) =>
     api<RestoreReport>("/backup/restore", {
       method: "POST",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  listCollections: () =>
+    api<KnowledgeCollection[]>("/knowledge/collections", {
+      next: {
+        revalidate: LIST_REVALIDATE_SECS,
+        tags: [CACHE_TAGS.knowledgeCollections],
+      },
+    }),
+  createCollection: (
+    body: { name: string; description?: string; embedding_model: string },
+    options?: AuditOptions,
+  ) =>
+    api<KnowledgeCollection>("/knowledge/collections", {
+      method: "POST",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  getCollection: (id: string) =>
+    api<KnowledgeCollection>(`/knowledge/collections/${id}`),
+  updateCollection: (
+    id: string,
+    body: {
+      name?: string;
+      description?: string;
+      embedding_model?: string;
+      chunk_tokens?: number;
+      chunk_overlap_tokens?: number;
+    },
+    options?: AuditOptions,
+  ) =>
+    api<KnowledgeCollection>(`/knowledge/collections/${id}`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  deleteCollection: (id: string, options?: AuditOptions) =>
+    api<void>(`/knowledge/collections/${id}`, {
+      method: "DELETE",
+      headers: auditActorHeaders(options),
+    }),
+  listDocuments: (collectionId: string) =>
+    api<KnowledgeDocument[]>(
+      `/knowledge/collections/${collectionId}/documents`,
+    ),
+  uploadDocument: (
+    collectionId: string,
+    body: { title: string; filename: string; content_base64: string },
+    options?: AuditOptions,
+  ) =>
+    api<KnowledgeDocument>(
+      `/knowledge/collections/${collectionId}/documents`,
+      {
+        method: "POST",
+        headers: auditActorHeaders(options),
+        body: JSON.stringify(body),
+      },
+    ),
+  deleteDocument: (id: string, options?: AuditOptions) =>
+    api<void>(`/knowledge/documents/${id}`, {
+      method: "DELETE",
+      headers: auditActorHeaders(options),
+    }),
+  reindexCollection: (id: string, options?: AuditOptions) =>
+    api<KnowledgeReindexResult>(`/knowledge/collections/${id}/reindex`, {
+      method: "POST",
+      headers: auditActorHeaders(options),
+    }),
+  reindexDocument: (id: string, options?: AuditOptions) =>
+    api<KnowledgeDocument>(`/knowledge/documents/${id}/reindex`, {
+      method: "POST",
+      headers: auditActorHeaders(options),
+    }),
+  searchCollection: (id: string, body: { query: string; top_k?: number }) =>
+    api<KnowledgeHit[]>(`/knowledge/collections/${id}/search`, {
+      method: "POST",
+      body: JSON.stringify(body),
+    }),
+  setModelCollections: (
+    modelId: string,
+    collection_ids: string[],
+    options?: AuditOptions,
+  ) =>
+    api<ModelKnowledgeCollections>(`/models/${modelId}/knowledge`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ collection_ids }),
+    }),
+  getKnowledgeSettings: reactCache(() =>
+    api<KnowledgeSettingsView>("/settings/knowledge"),
+  ),
+  updateKnowledgeSettings: (
+    body: UpdateKnowledgeSettings,
+    options?: AuditOptions,
+  ) =>
+    api<KnowledgeSettingsView>("/settings/knowledge", {
+      method: "PUT",
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
