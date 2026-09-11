@@ -251,8 +251,12 @@ async fn proxy_handler_inner(
     // shape (estimated context size, required capabilities) and live load. From
     // here on, everything downstream — admission, budgets, caching, telemetry,
     // upstream dispatch — sees the concrete model as if the client named it.
-    let auto_start = crate::tracer::now_ms();
     let route = if model == crate::router::AUTO_MODEL_NAME {
+        // Span bookkeeping for the routing decision. Only the traced branch
+        // below reads it, so an untraced request does not pay for the clock
+        // read — nor does any non-auto request, which never enters this block.
+        let traced = tracer.is_some();
+        let auto_start = if traced { crate::tracer::now_ms() } else { 0 };
         let max_tokens = json.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
         let features = crate::router::RequestFeatures::from_request(
             &json,
@@ -277,7 +281,7 @@ async fn proxy_handler_inner(
         // neutral default.
         let available_tags = union_candidate_tags(&candidates, allowed);
         let effort_header = headers.get("x-obleth-effort").and_then(|v| v.to_str().ok());
-        let classifier_start = crate::tracer::now_ms();
+        let classifier_start = if traced { crate::tracer::now_ms() } else { 0 };
         let intent = derive_intent(
             &state,
             &json,
@@ -292,13 +296,28 @@ async fn proxy_handler_inner(
         // an isolated classifier timer — `derive_intent` is where that round-trip
         // happens, and it is nearly all of this span's time when the classifier
         // is active and near-zero otherwise. Not claiming more precision than that.
-        let classifier_ms = (crate::tracer::now_ms() - classifier_start) as u32;
+        // Measured only when something will read it; untraced, it was discarded.
+        let classifier_ms = if traced {
+            (crate::tracer::now_ms() - classifier_start) as u32
+        } else {
+            0
+        };
 
         // Boon-granted capabilities count as native in the hard filters: a
         // model carrying the structured_output boon can serve requests that
         // need it, because the boon engine emulates the capability.
         let grants = crate::router::BoonGrants::from_settings(&state.boons.settings());
         let weights = crate::router::RouterWeights::from_settings(&router_settings);
+        // Exactly one draw per request, whichever branch runs below. The router
+        // only reads it when it samples, so at the default temperature of 0 —
+        // where the pick is the exact argmax — the clock read is skipped
+        // entirely. `samples()` is the router's own predicate, not a copy of its
+        // threshold.
+        let uniform = if weights.samples() {
+            crate::router::splitmix_uniform()
+        } else {
+            0.0
+        };
         // Traced requests get the full explanation from a single `route()` call
         // (one `evaluate`, one `uniform` draw) so the span describes exactly the
         // sample that was served. Untraced requests call `select_model` instead,
@@ -313,7 +332,7 @@ async fn proxy_handler_inner(
                 &intent.tags,
                 grants,
                 &weights,
-                crate::router::splitmix_uniform(),
+                uniform,
                 &intent,
             );
             explain.classifier_ms = classifier_ms;
@@ -340,7 +359,7 @@ async fn proxy_handler_inner(
                 &intent.tags,
                 grants,
                 &weights,
-                crate::router::splitmix_uniform(),
+                uniform,
                 intent.difficulty,
             )
         };
