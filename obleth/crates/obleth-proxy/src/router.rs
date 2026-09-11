@@ -2,13 +2,17 @@
 //!
 //! When a client sends `model: "auto"`, the gateway chooses a concrete
 //! registered model instead of routing to a fixed upstream. Selection is a
-//! two-stage process:
+//! three-stage process:
 //!
 //! 1. **Hard filters** remove models that cannot serve the request at all:
 //!    disabled, unhealthy / in maintenance, too small a context window, or
 //!    missing a required capability (tools / tool_choice / JSON schema). A
 //!    per-tenant model allowlist, when present, is also enforced here.
-//! 2. **Scoring** ranks the survivors by spare capacity (prefer models that
+//! 2. **Difficulty tier floor**, gated behind `difficulty_enabled`, drops
+//!    candidates too weak for the request's difficulty. The floor clamps
+//!    *down* to the best level actually available, so this stage can narrow
+//!    the field but never empties it.
+//! 3. **Scoring** ranks the survivors by spare capacity (prefer models that
 //!    are not busy) and cost (prefer cheaper models), then picks the best with
 //!    a deterministic tie-break on model name.
 //!
@@ -32,12 +36,9 @@ pub struct RouterWeights {
     pub cost: f64,
     pub tag: f64,
     pub soft_cap: f64,
-    // `temperature` now feeds the softmax sampling in `select_model`.
-    // `difficulty_enabled` is not yet consumed: the difficulty tier filter
-    // lands in a later step of the auto-router-tuner plan, which is why it is
-    // threaded through now instead of being added alongside its own consumer.
+    // `temperature` feeds the softmax sampling in `select_model`.
+    // `difficulty_enabled` gates the tier filter in `select_model`.
     pub temperature: f64,
-    #[allow(dead_code)]
     pub difficulty_enabled: bool,
 }
 
@@ -86,11 +87,6 @@ pub const GENERAL_DOMAIN: &str = "*";
 impl Candidate {
     /// Highest level this candidate holds across `domains`. Being strong at one
     /// of the request's intents is what qualifies it.
-    ///
-    /// Not yet called outside tests: the tier filter that consumes this lands
-    /// in a later step of the auto-router-tuner plan, same as
-    /// `RouterWeights::difficulty_enabled` above.
-    #[allow(dead_code)]
     pub fn strength(&self, domains: &[String]) -> u8 {
         domains
             .iter()
@@ -280,6 +276,10 @@ impl BoonGrants {
 /// rather than `select_model` generating it, so the function stays pure and
 /// synchronous and can be exercised deterministically by tests and the
 /// simulate endpoint.
+///
+/// `difficulty` is the request's derived difficulty (1..=MAX_TIER_LEVEL). It
+/// only has an effect when `weights.difficulty_enabled` is set; see stage 1b
+/// below for the clamp-down floor it drives.
 #[allow(clippy::too_many_arguments)]
 pub fn select_model(
     candidates: &[Candidate],
@@ -290,6 +290,7 @@ pub fn select_model(
     grants: BoonGrants,
     weights: &RouterWeights,
     uniform: f64,
+    difficulty: u8,
 ) -> Option<ResolvedModel> {
     let required_context = features
         .est_input_tokens
@@ -331,6 +332,41 @@ pub fn select_model(
     if eligible.is_empty() {
         return None;
     }
+
+    // ---- stage 1b: difficulty tier floor ----
+    // Clamp-down: the floor is the lesser of what the request asked for and the
+    // best level actually available, so this stage can narrow the field but can
+    // never empty it — a hard request degrades within its topic instead of
+    // failing or falling through to a weak generalist.
+    let eligible: Vec<&Candidate> = if weights.difficulty_enabled {
+        let domains: Vec<String> = if desired_tags.is_empty() {
+            vec![GENERAL_DOMAIN.to_string()]
+        } else {
+            desired_tags.to_vec()
+        };
+        let available = eligible
+            .iter()
+            .map(|c| c.strength(&domains))
+            .max()
+            .unwrap_or(0);
+        let floor = difficulty
+            .clamp(1, obleth_config::MAX_TIER_LEVEL)
+            .min(available);
+        let kept: Vec<&Candidate> = eligible
+            .iter()
+            .copied()
+            .filter(|c| c.strength(&domains) >= floor)
+            .collect();
+        // Defensive: a candidate set with no levels at all (stale snapshot mid
+        // refresh) must not disappear.
+        if kept.is_empty() {
+            eligible
+        } else {
+            kept
+        }
+    } else {
+        eligible
+    };
 
     // ---- stage 2: scoring ----
     let costs: Vec<f64> = eligible
@@ -687,6 +723,7 @@ mod tests {
             BoonGrants::default(),
             &RouterWeights::default(),
             0.0,
+            1,
         );
         assert!(chosen.is_none());
     }
@@ -712,6 +749,7 @@ mod tests {
             BoonGrants::default(),
             &RouterWeights::default(),
             0.0,
+            1,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "large");
@@ -735,7 +773,8 @@ mod tests {
             &[],
             BoonGrants::default(),
             &RouterWeights::default(),
-            0.0
+            0.0,
+            1
         )
         .is_none());
     }
@@ -756,6 +795,7 @@ mod tests {
             BoonGrants::default(),
             &RouterWeights::default(),
             0.0,
+            1,
         )
         .unwrap();
         // Without bias, the name tie-break would pick "alpha".
@@ -782,6 +822,7 @@ mod tests {
             BoonGrants::default(),
             &RouterWeights::default(),
             0.0,
+            1,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "tools");
@@ -806,6 +847,7 @@ mod tests {
             BoonGrants::default(),
             &RouterWeights::default(),
             0.0,
+            1,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "up");
@@ -829,6 +871,7 @@ mod tests {
             BoonGrants::default(),
             &RouterWeights::default(),
             0.0,
+            1,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "cheap");
@@ -852,6 +895,7 @@ mod tests {
             BoonGrants::default(),
             &RouterWeights::default(),
             0.0,
+            1,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "b");
@@ -870,6 +914,7 @@ mod tests {
             BoonGrants::default(),
             &RouterWeights::default(),
             0.0,
+            1,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "b");
@@ -914,6 +959,7 @@ mod tests {
             BoonGrants::default(),
             &RouterWeights::default(),
             0.0,
+            1,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "coder");
@@ -938,6 +984,7 @@ mod tests {
             BoonGrants::default(),
             &RouterWeights::default(),
             0.0,
+            1,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "cheap");
@@ -1031,7 +1078,8 @@ mod tests {
             &[],
             grants,
             &RouterWeights::default(),
-            0.0
+            0.0,
+            1
         )
         .is_none());
     }
@@ -1054,7 +1102,8 @@ mod tests {
             &[],
             BoonGrants::default(),
             &RouterWeights::default(),
-            0.0
+            0.0,
+            1
         )
         .is_none());
         let grants = BoonGrants {
@@ -1069,6 +1118,7 @@ mod tests {
             grants,
             &RouterWeights::default(),
             0.0,
+            1,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "emulated");
@@ -1095,7 +1145,8 @@ mod tests {
             &[],
             grants,
             &RouterWeights::default(),
-            0.0
+            0.0,
+            1
         )
         .is_none());
     }
@@ -1127,6 +1178,7 @@ mod tests {
             BoonGrants::default(),
             &capacity_first,
             0.0,
+            1,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "idle-expensive");
@@ -1145,6 +1197,7 @@ mod tests {
             BoonGrants::default(),
             &cost_first,
             0.0,
+            1,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "busy-cheap");
@@ -1172,6 +1225,7 @@ mod tests {
                 BoonGrants::default(),
                 &w,
                 u,
+                1,
             )
             .unwrap();
             assert_eq!(
@@ -1203,6 +1257,7 @@ mod tests {
             BoonGrants::default(),
             &w,
             0.0,
+            1,
         )
         .unwrap();
         let high = select_model(
@@ -1214,6 +1269,7 @@ mod tests {
             BoonGrants::default(),
             &w,
             0.999,
+            1,
         )
         .unwrap();
         assert_ne!(
@@ -1238,6 +1294,7 @@ mod tests {
             BoonGrants::default(),
             &w,
             0.5,
+            1,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "only");
@@ -1322,5 +1379,167 @@ mod tests {
         derive_levels(&mut cands, obleth_config::TierSource::Declared);
         let domains = vec!["coding".to_string(), "math".to_string()];
         assert_eq!(cands[0].strength(&domains), 3);
+    }
+
+    fn tiered(name: &str, cost: f64, levels: &[(&str, u8)]) -> Candidate {
+        let mut m = model(name);
+        m.input_cost_per_token = cost;
+        m.tags = levels.iter().map(|(d, _)| d.to_string()).collect();
+        let mut c = healthy(m);
+        c.levels = levels.iter().map(|(d, l)| (d.to_string(), *l)).collect();
+        c
+    }
+
+    fn tiering_on() -> RouterWeights {
+        RouterWeights {
+            difficulty_enabled: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn hard_request_skips_the_weak_model() {
+        let cands = vec![
+            tiered("weak", 0.000_001, &[("coding", 1)]),
+            tiered("strong", 0.000_100, &[("coding", 3)]),
+        ];
+        let desired = vec!["coding".to_string()];
+        let chosen = select_model(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &desired,
+            BoonGrants::default(),
+            &tiering_on(),
+            0.0,
+            3,
+        )
+        .unwrap();
+        assert_eq!(chosen.model_name, "strong");
+    }
+
+    #[test]
+    fn easy_request_still_takes_the_cheap_model() {
+        let cands = vec![
+            tiered("weak", 0.000_001, &[("coding", 1)]),
+            tiered("strong", 0.000_100, &[("coding", 3)]),
+        ];
+        let desired = vec!["coding".to_string()];
+        let chosen = select_model(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &desired,
+            BoonGrants::default(),
+            &tiering_on(),
+            0.0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(chosen.model_name, "weak");
+    }
+
+    #[test]
+    fn floor_clamps_down_when_the_top_tier_is_absent() {
+        // The only coding:3 model is gone. A difficulty-3 request must fall to the
+        // best coding model still present, NOT to a weak generalist, and must not
+        // return None.
+        let cands = vec![
+            tiered("weak", 0.000_001, &[("coding", 1)]),
+            tiered("middling", 0.000_010, &[("coding", 2)]),
+        ];
+        let desired = vec!["coding".to_string()];
+        let chosen = select_model(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &desired,
+            BoonGrants::default(),
+            &tiering_on(),
+            0.0,
+            3,
+        )
+        .unwrap();
+        assert_eq!(chosen.model_name, "middling");
+    }
+
+    #[test]
+    fn tier_filter_never_empties_the_candidate_set() {
+        let cands = vec![tiered("only", 0.000_001, &[("coding", 1)])];
+        let desired = vec!["coding".to_string()];
+        for difficulty in 1..=3 {
+            assert!(
+                select_model(
+                    &cands,
+                    &RequestFeatures::default(),
+                    &HashMap::new(),
+                    None,
+                    &desired,
+                    BoonGrants::default(),
+                    &tiering_on(),
+                    0.0,
+                    difficulty,
+                )
+                .is_some(),
+                "difficulty {difficulty} turned a servable request into no-model"
+            );
+        }
+    }
+
+    #[test]
+    fn untagged_request_tiers_through_the_general_domain() {
+        let mut weak = tiered("weak", 0.000_001, &[]);
+        weak.levels = vec![(GENERAL_DOMAIN.to_string(), 1)];
+        let mut strong = tiered("strong", 0.000_100, &[]);
+        strong.levels = vec![(GENERAL_DOMAIN.to_string(), 3)];
+        let cands = vec![weak, strong];
+        let chosen = select_model(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &tiering_on(),
+            0.0,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            chosen.model_name, "strong",
+            "a hard question with no topic tag must still reach a strong model"
+        );
+    }
+
+    #[test]
+    fn tiering_disabled_ignores_difficulty_entirely() {
+        let cands = vec![
+            tiered("weak", 0.000_001, &[("coding", 1)]),
+            tiered("strong", 0.000_100, &[("coding", 3)]),
+        ];
+        let desired = vec!["coding".to_string()];
+        let off = RouterWeights {
+            difficulty_enabled: false,
+            ..Default::default()
+        };
+        let chosen = select_model(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &desired,
+            BoonGrants::default(),
+            &off,
+            0.0,
+            3,
+        )
+        .unwrap();
+        assert_eq!(
+            chosen.model_name, "weak",
+            "with tiering off, cost still wins"
+        );
     }
 }

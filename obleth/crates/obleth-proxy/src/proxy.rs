@@ -301,6 +301,7 @@ async fn proxy_handler_inner(
             grants,
             &weights,
             crate::router::splitmix_uniform(),
+            intent.difficulty,
         ) {
             Some(chosen) => {
                 tracing::debug!(chosen = %chosen.model_name, "auto-routed request");
