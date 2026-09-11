@@ -640,6 +640,18 @@ impl Store {
             .collect())
     }
 
+    /// Document id -> title, for labelling chunks in injected context.
+    /// Background-loop use only (the proxy slab rebuild) — never call this
+    /// from the request path.
+    pub async fn document_titles(&self, collection_id: Uuid) -> Result<HashMap<Uuid, String>> {
+        let rows =
+            sqlx::query("select id, title from knowledge_documents where collection_id = $1")
+                .bind(collection_id)
+                .fetch_all(self.pool())
+                .await?;
+        Ok(rows.iter().map(|r| (r.get("id"), r.get("title"))).collect())
+    }
+
     /// Collections a model grounds on. Used by the admin API to render the
     /// current attachment set for one model.
     pub async fn model_collection_ids(&self, model_id: Uuid) -> Result<Vec<Uuid>> {
@@ -1548,6 +1560,40 @@ mod tests {
         assert_eq!(chunks[0].text, "chunk");
 
         store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn document_titles_maps_id_to_title_scoped_to_the_collection() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let a = store
+            .create_collection(&format!("titles-a-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("a");
+        let b = store
+            .create_collection(&format!("titles-b-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("b");
+        let doc_a = store
+            .upsert_document(a.id, "Doc A", "a.md", "text/markdown", "body a")
+            .await
+            .expect("doc a");
+        store
+            .upsert_document(b.id, "Doc B", "b.md", "text/markdown", "body b")
+            .await
+            .expect("doc b");
+
+        let titles = store.document_titles(a.id).await.expect("titles");
+        assert_eq!(
+            titles.len(),
+            1,
+            "must be scoped to the requested collection"
+        );
+        assert_eq!(titles.get(&doc_a.id), Some(&"Doc A".to_string()));
+
+        store.delete_collection(a.id).await.ok();
+        store.delete_collection(b.id).await.ok();
     }
 
     #[test]

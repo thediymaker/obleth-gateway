@@ -63,4 +63,11 @@ pub struct AppState {
     /// This is the only handle on the request path that can reach Postgres
     /// (single-flight identity provisioning, once per identity).
     pub jwt: Option<Arc<crate::jwt_auth::JwtAuth>>,
+    /// In-process mirror of the knowledge-base corpus, kept fresh by a
+    /// background refresh loop. Starts empty and fills asynchronously; the
+    /// request path only ever reads the current snapshot, never Postgres.
+    /// Not yet read by any handler — the knowledge boon that consumes it via
+    /// `CollectionSlab::retrieve` lands in a later task.
+    #[allow(dead_code)]
+    pub knowledge: Arc<crate::knowledge::KnowledgeIndex>,
 }
