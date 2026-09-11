@@ -90,13 +90,14 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { AutotuneReport, AutotuneWorkload, CacheStats, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelReplica, ModelRoute } from "@/lib/obleth";
+import type { AutotuneReport, AutotuneWorkload, CacheStats, KnowledgeCollection, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelReplica, ModelRoute } from "@/lib/obleth";
 import { providerForModel } from "@/lib/model-providers";
 import { normalizeModelApiNameDraft, normalizeModelApiNameFinal } from "@/lib/model-name";
 import { EditForm } from "@/components/edit-form";
 import { ProviderImportWizard } from "@/components/provider-import-wizard";
 import { RecipeList } from "@/components/recipes/recipe-list";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
+import { distinctEmbeddingModelCount } from "@/lib/knowledge-format";
 import { cn, formatNumber, getJson, parseTagLevel, TAG_LEVEL_LABELS } from "@/lib/utils";
 import { useSearchParams } from "next/navigation";
 
@@ -139,6 +140,12 @@ const MODEL_BOONS = [
     label: "Compression",
     description:
       "Reduce the input tokens this model reads before dispatch: lossless JSON/code compaction always; cross-turn dedup and lossy text compaction when the tenant opts in (works on any model). If the model supports function calling with the gateway tool loop enabled, a retrieve_original tool is added so it can recover compacted detail. Configure globally in Settings → Boons and per tenant on the tenant's Compression tab.",
+  },
+  {
+    value: "knowledge",
+    label: "Knowledge",
+    description:
+      "Retrieve from administrator-curated collections and inject the result into the request before dispatch, at request time — the injected text is never user-supplied. Attach collections to this model below; granting this boon without attaching a collection retrieves nothing. Configure retrieval globally in Settings → Boons. Nothing is granted by default.",
   },
 ] as const;
 
@@ -2490,6 +2497,11 @@ export function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute
   const [fnCalling, setFnCalling] = useState(model?.supports_function_calling ?? false);
   const [toolChoice, setToolChoice] = useState(model?.supports_tool_choice ?? false);
   const [granted, setGranted] = useState<Set<string>>(() => new Set(model?.tool_servers ?? []));
+  // Only the `knowledge` boon needs a controlled checkbox (it gates the
+  // collection-attachment panel below); the others stay `defaultChecked`
+  // like the native-capability chips, since nothing else in this component
+  // reacts to them.
+  const [knowledgeChecked, setKnowledgeChecked] = useState(model?.boons?.includes("knowledge") ?? false);
   const [tagState, setTagState] = useState<Record<string, { checked: boolean; level: number }>>(() => {
     const state: Record<string, { checked: boolean; level: number }> = {};
     for (const tag of MODEL_TAGS) {
@@ -2541,16 +2553,36 @@ export function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute
         })}
       </ChipGroup>
       <ChipGroup label="Boons" info="Gateway capabilities granted that the model lacks natively. Configure in Settings → Boons.">
-        {MODEL_BOONS.map((boon) => (
-          <ChipCheckbox
-            key={boon.value}
-            name={`boon_${boon.value}`}
-            label={boon.label}
-            hint={boon.description}
-            defaultChecked={model?.boons?.includes(boon.value) ?? false}
-          />
-        ))}
+        {MODEL_BOONS.map((boon) =>
+          boon.value === "knowledge" ? (
+            <ChipCheckbox
+              key={boon.value}
+              name={`boon_${boon.value}`}
+              label={boon.label}
+              hint={boon.description}
+              checked={knowledgeChecked}
+              onChange={setKnowledgeChecked}
+            />
+          ) : (
+            <ChipCheckbox
+              key={boon.value}
+              name={`boon_${boon.value}`}
+              label={boon.label}
+              hint={boon.description}
+              defaultChecked={model?.boons?.includes(boon.value) ?? false}
+            />
+          ),
+        )}
       </ChipGroup>
+      {knowledgeChecked &&
+        (model ? (
+          <ModelKnowledgeCollectionsField modelId={model.id} />
+        ) : (
+          <p className="max-w-prose text-[11px] leading-snug text-amber-500/90">
+            Save this model first, then attach collections from its edit page — the knowledge boon
+            retrieves nothing until at least one collection is attached.
+          </p>
+        ))}
       <ChipGroup
         label="Tools"
         info="Registered MCP servers whose tools this model may use. The gateway runs the tool loop itself, which needs native function calling + tool choice."
@@ -2584,6 +2616,135 @@ export function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute
         )}
       </ChipGroup>
     </>
+  );
+}
+
+// Attaches administrator-curated knowledge collections to a chat model once
+// the `knowledge` boon is granted, persisted through
+// `PUT /api/live/models/:id/knowledge` (Task 13's live route wrapping
+// `obleth.setModelCollections`) rather than the surrounding capabilities
+// form: that PUT is a full replace of the model's attachment set and its own
+// save action, decoupled from "Save capabilities" below.
+//
+// The Management API has no endpoint to *read* a model's current
+// attachments back (`obleth-admin` registers only
+// `PUT /api/v1/models/:id/knowledge`, no matching `GET`), so this control
+// cannot pre-select what is already attached — it starts empty on every
+// visit and the copy below says so plainly, since silently saving an empty
+// set would otherwise look identical to "nothing attached yet" and could
+// detach an existing selection by accident.
+function ModelKnowledgeCollectionsField({ modelId }: { modelId: string }) {
+  const [collections, setCollections] = useState<KnowledgeCollection[] | null>(null);
+  const [loadError, setLoadError] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetch("/api/live/knowledge/collections")
+      .then((res) => (res.ok ? res.json() : Promise.reject(res)))
+      .then((data: KnowledgeCollection[]) => {
+        if (!cancelled) setCollections(data);
+      })
+      .catch(() => {
+        if (!cancelled) setLoadError(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  async function handleSave() {
+    setSaving(true);
+    setMessage(null);
+    try {
+      const res = await fetch(`/api/live/models/${modelId}/knowledge`, {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ collection_ids: Array.from(selected) }),
+      });
+      setMessage(res.ok ? "Attachment saved." : "Failed to save attachment.");
+    } catch {
+      setMessage("Failed to save attachment.");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const selectedCollections = (collections ?? []).filter((c) => selected.has(c.id));
+  const distinctEmbedderCount = distinctEmbeddingModelCount(selectedCollections);
+
+  return (
+    <div className="space-y-2 rounded-md border border-border/70 bg-background/30 p-3">
+      <p className="text-xs font-medium text-foreground">Attached collections</p>
+      <p className="text-[11px] leading-relaxed text-muted-foreground">
+        Retrieval only runs against collections attached here. The Management API can&apos;t report
+        which collections are already attached, so this list starts empty every time this panel
+        opens — reselect every collection that should stay attached before saving; saving replaces
+        the full set.
+      </p>
+      {loadError ? (
+        <p className="text-xs text-destructive">Failed to load collections.</p>
+      ) : collections === null ? (
+        <p className="text-xs text-muted-foreground">Loading collections…</p>
+      ) : collections.length === 0 ? (
+        <p className="text-xs text-muted-foreground">No collections exist yet. Create one on the Knowledge page.</p>
+      ) : (
+        <div className="flex flex-wrap gap-1.5">
+          {collections.map((c) => {
+            const isSelected = selected.has(c.id);
+            return (
+              <button
+                key={c.id}
+                type="button"
+                onClick={() =>
+                  setSelected((prev) => {
+                    const next = new Set(prev);
+                    if (isSelected) next.delete(c.id);
+                    else next.add(c.id);
+                    return next;
+                  })
+                }
+                title={`Embedded with ${c.indexed_embedding_model || c.embedding_model}`}
+                className={cn(
+                  "inline-flex items-center gap-1.5 rounded-md border border-border bg-transparent px-2 py-1 text-xs font-medium text-muted-foreground transition-colors",
+                  "hover:bg-accent hover:text-accent-foreground",
+                  isSelected && "bg-secondary text-foreground",
+                )}
+              >
+                <Check className={cn("h-3 w-3", !isSelected && "hidden")} strokeWidth={2.5} />
+                {c.name}
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {distinctEmbedderCount > 1 && (
+        <p className="max-w-prose text-[11px] leading-snug text-amber-500/90">
+          Selected collections use {distinctEmbedderCount} different embedding models — each
+          distinct embedder adds a network round trip per request.
+        </p>
+      )}
+      {selected.size === 0 && (
+        <p className="max-w-prose text-[11px] leading-snug text-amber-500/90">
+          No collection selected — the knowledge boon retrieves nothing until at least one is
+          attached and saved.
+        </p>
+      )}
+      <div className="flex items-center gap-2 pt-1">
+        <Button
+          type="button"
+          size="sm"
+          variant="outline"
+          onClick={() => void handleSave()}
+          disabled={saving || collections === null}
+        >
+          {saving ? "Saving…" : "Save attachment"}
+        </Button>
+        {message && <span className="text-xs text-muted-foreground">{message}</span>}
+      </div>
+    </div>
   );
 }
 

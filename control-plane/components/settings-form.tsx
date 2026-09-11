@@ -3,6 +3,7 @@
 import { useState, useTransition, type ReactNode } from "react";
 import {
   Archive,
+  BookOpen,
   Braces,
   ChevronDown,
   Database,
@@ -20,6 +21,7 @@ import {
   setAutoRouterSettingsAction,
   setBoonSettingsAction,
   setCharoSettingsAction,
+  setKnowledgeSettingsAction,
   testAlertAction,
   setSlurmSettingsAction,
   testSlurmConnectionAction,
@@ -33,12 +35,14 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { DestructiveConfirm } from "@/components/ui/destructive-confirm";
 import { cn, tagsInclude } from "@/lib/utils";
+import { formatBytes } from "@/lib/format";
 import type {
   AlertSettingsView,
   AutoRouterSettingsView,
   BoonSettingsView,
   CharoSettingsView,
   CompressorStatusView,
+  KnowledgeSettingsView,
   ModelRoute,
   NodeAlias,
   SlurmHealthView,
@@ -46,6 +50,7 @@ import type {
   UpdateAlertSettings,
   UpdateAutoRouterSettings,
   UpdateBoonSettings,
+  UpdateKnowledgeSettings,
   UpdateSlurmSettings,
   UsageRetentionView,
 } from "@/lib/obleth";
@@ -1334,6 +1339,253 @@ export function CompressionSettingsForm({
           <Button onClick={save} disabled={pending}>
             <Save className="h-4 w-4" />
             {pending ? "Saving..." : "Save compression"}
+          </Button>
+          {status && (
+            <p
+              className={
+                status.ok
+                  ? "rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
+                  : "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+              }
+            >
+              {status.message}
+            </p>
+          )}
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+export function KnowledgeSettingsForm({ settings }: { settings: KnowledgeSettingsView | null }) {
+  const [pending, start] = useTransition();
+  const [status, setStatus] = useState<{ ok: boolean; message: string } | null>(null);
+
+  const [enabled, setEnabled] = useState(settings?.enabled ?? false);
+  const [topK, setTopK] = useState(String(settings?.top_k ?? 5));
+  const [minScore, setMinScore] = useState(String(settings?.min_score ?? 0.5));
+  const [maxContextTokens, setMaxContextTokens] = useState(String(settings?.max_context_tokens ?? 2000));
+  const [embedTimeoutMs, setEmbedTimeoutMs] = useState(String(settings?.embed_timeout_ms ?? 2000));
+  const [queryCacheTtlS, setQueryCacheTtlS] = useState(String(settings?.query_cache_ttl_s ?? 300));
+  const [queryTurns, setQueryTurns] = useState(String(settings?.query_turns ?? 3));
+  const [maxUploadBytes, setMaxUploadBytes] = useState(String(settings?.max_upload_bytes ?? 10_000_000));
+  const [maxChunksPerCollection, setMaxChunksPerCollection] = useState(
+    String(settings?.max_chunks_per_collection ?? 50_000),
+  );
+  const [indexBatchSize, setIndexBatchSize] = useState(String(settings?.index_batch_size ?? 16));
+  const [indexTimeoutMs, setIndexTimeoutMs] = useState(String(settings?.index_timeout_ms ?? 30_000));
+  const [indexStaleAfterSecs, setIndexStaleAfterSecs] = useState(
+    String(settings?.index_stale_after_secs ?? 600),
+  );
+  const [debugSnapshot, setDebugSnapshot] = useState(settings?.debug_snapshot ?? false);
+
+  function save() {
+    setStatus(null);
+    // The server rejects a non-positive numeric field by silently keeping
+    // the previous value rather than erroring, so `|| <fallback>` here just
+    // avoids sending a bare `0` from an emptied input — it is not how an
+    // operator turns anything off. `enabled` is the only off switch.
+    const body: UpdateKnowledgeSettings = {
+      enabled,
+      top_k: Number(topK) || 1,
+      min_score: Number(minScore) || 0.01,
+      max_context_tokens: Number(maxContextTokens) || 1,
+      embed_timeout_ms: Number(embedTimeoutMs) || 1,
+      query_cache_ttl_s: Number(queryCacheTtlS) || 1,
+      query_turns: Number(queryTurns) || 1,
+      max_upload_bytes: Number(maxUploadBytes) || 1,
+      max_chunks_per_collection: Number(maxChunksPerCollection) || 1,
+      index_batch_size: Number(indexBatchSize) || 1,
+      index_timeout_ms: Number(indexTimeoutMs) || 1,
+      index_stale_after_secs: Number(indexStaleAfterSecs) || 1,
+      debug_snapshot: debugSnapshot,
+    };
+    start(async () => {
+      const result = await setKnowledgeSettingsAction(body);
+      setStatus(
+        result.ok
+          ? { ok: true, message: "Knowledge settings saved." }
+          : { ok: false, message: result.error },
+      );
+    });
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <BookOpen className="h-4 w-4" />
+          Knowledge
+        </CardTitle>
+        <CardDescription>
+          Retrieval-augmented generation from administrator-curated collections. Grant the knowledge
+          boon and attach collections on a model&apos;s edit page — retrieval is inert on a model with
+          the boon granted but no collection attached.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <ToggleRow
+          label="Enable knowledge retrieval"
+          hint="Master switch for the boon. When off, no request is retrieved against, regardless of per-model attachments."
+          checked={enabled}
+          onChange={() => setEnabled((value) => !value)}
+        />
+
+        <p className="text-xs text-muted-foreground">
+          Every field below must be a positive number — the server silently keeps the previous value
+          for zero or negative input rather than treating it as &quot;off&quot;.
+        </p>
+
+        <div className="grid gap-4 sm:grid-cols-2">
+          <div className="space-y-1">
+            <Label htmlFor="knowledge_top_k">Top K</Label>
+            <Input
+              id="knowledge_top_k"
+              type="number"
+              min="1"
+              value={topK}
+              onChange={(e) => setTopK(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">Chunks retrieved per query before scoring.</p>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="knowledge_min_score">Minimum score</Label>
+            <Input
+              id="knowledge_min_score"
+              type="number"
+              step="0.01"
+              min="0.01"
+              max="1"
+              value={minScore}
+              onChange={(e) => setMinScore(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">Hits scoring below this are dropped before injection.</p>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="knowledge_max_context_tokens">Max context tokens</Label>
+            <Input
+              id="knowledge_max_context_tokens"
+              type="number"
+              min="1"
+              value={maxContextTokens}
+              onChange={(e) => setMaxContextTokens(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">Token budget for injected retrieval per request.</p>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="knowledge_embed_timeout_ms">Embed timeout (ms)</Label>
+            <Input
+              id="knowledge_embed_timeout_ms"
+              type="number"
+              min="1"
+              value={embedTimeoutMs}
+              onChange={(e) => setEmbedTimeoutMs(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              Query-embedding call budget. On timeout the request proceeds ungrounded rather than
+              failing.
+            </p>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="knowledge_query_cache_ttl_s">Query cache TTL (secs)</Label>
+            <Input
+              id="knowledge_query_cache_ttl_s"
+              type="number"
+              min="1"
+              value={queryCacheTtlS}
+              onChange={(e) => setQueryCacheTtlS(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              How long a query&apos;s embedding vector is cached, keyed per embedder.
+            </p>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="knowledge_query_turns">Query turns</Label>
+            <Input
+              id="knowledge_query_turns"
+              type="number"
+              min="1"
+              value={queryTurns}
+              onChange={(e) => setQueryTurns(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">Trailing conversation turns folded into the retrieval query.</p>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="knowledge_max_upload_bytes">Max upload size</Label>
+            <Input
+              id="knowledge_max_upload_bytes"
+              type="number"
+              min="1"
+              value={maxUploadBytes}
+              onChange={(e) => setMaxUploadBytes(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              {formatBytes(Number(maxUploadBytes) || 0)} per document upload.
+            </p>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="knowledge_max_chunks_per_collection">Max chunks per collection</Label>
+            <Input
+              id="knowledge_max_chunks_per_collection"
+              type="number"
+              min="1"
+              value={maxChunksPerCollection}
+              onChange={(e) => setMaxChunksPerCollection(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">Indexing stops adding chunks once a collection reaches this cap.</p>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="knowledge_index_batch_size">Index batch size</Label>
+            <Input
+              id="knowledge_index_batch_size"
+              type="number"
+              min="1"
+              value={indexBatchSize}
+              onChange={(e) => setIndexBatchSize(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">Chunks embedded per indexer batch.</p>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="knowledge_index_timeout_ms">Index timeout (ms)</Label>
+            <Input
+              id="knowledge_index_timeout_ms"
+              type="number"
+              min="1"
+              value={indexTimeoutMs}
+              onChange={(e) => setIndexTimeoutMs(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">Per-batch embedding call budget during background indexing.</p>
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="knowledge_index_stale_after_secs">Stale after (secs)</Label>
+            <Input
+              id="knowledge_index_stale_after_secs"
+              type="number"
+              min="1"
+              value={indexStaleAfterSecs}
+              onChange={(e) => setIndexStaleAfterSecs(e.target.value)}
+            />
+            <p className="text-xs text-muted-foreground">
+              A document stuck indexing past this age is treated as failed and eligible for retry.
+            </p>
+          </div>
+        </div>
+
+        <div className="flex items-start justify-between gap-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3">
+          <div className="min-w-0">
+            <p className="text-sm font-medium">Debug snapshot</p>
+            <p className="mt-0.5 text-[11px] leading-snug text-amber-600 dark:text-amber-300">
+              Writes retrieved chunk text into trace spans, at roughly 20&times; the storage of the
+              default tracing tier. Enable only for a short debugging session, then turn it back off.
+            </p>
+          </div>
+          <ToggleSwitch checked={debugSnapshot} onChange={() => setDebugSnapshot((value) => !value)} label="Debug snapshot" />
+        </div>
+
+        <div className="flex flex-wrap items-center gap-3 border-t border-border/60 pt-4">
+          <Button onClick={save} disabled={pending}>
+            <Save className="h-4 w-4" />
+            {pending ? "Saving..." : "Save knowledge settings"}
           </Button>
           {status && (
             <p

@@ -41,6 +41,8 @@ export default async function KnowledgePage() {
         documentsByCollection={documentsByCollection}
         embeddingModels={embeddingModels}
         maxUploadBytes={settings?.max_upload_bytes ?? null}
+        minScore={settings?.min_score ?? null}
+        maxContextTokens={settings?.max_context_tokens ?? null}
       />
     </div>
   );

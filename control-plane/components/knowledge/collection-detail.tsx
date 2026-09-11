@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { DetailStat, EmptyState } from "@/components/dashboard-primitives";
 import { DocumentUpload } from "@/components/knowledge/document-upload";
+import { RetrievalPreview } from "@/components/knowledge/retrieval-preview";
 import { formatBytes, formatCompact } from "@/lib/format";
 import type { KnowledgeCollection, KnowledgeDocument } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
@@ -42,12 +43,16 @@ export function CollectionDetail({
   collection,
   initialDocuments,
   maxUploadBytes,
+  minScore,
+  maxContextTokens,
   onClose,
   onChanged,
 }: {
   collection: KnowledgeCollection;
   initialDocuments: KnowledgeDocument[];
   maxUploadBytes: number | null;
+  minScore: number | null;
+  maxContextTokens: number | null;
   onClose: () => void;
   onChanged: () => void;
 }) {
@@ -213,6 +218,13 @@ export function CollectionDetail({
           setDocuments((prev) => [doc, ...prev]);
           onChanged();
         }}
+      />
+
+      <RetrievalPreview
+        collection={collection}
+        documents={documents}
+        minScore={minScore}
+        maxContextTokens={maxContextTokens}
       />
 
       {documents.length === 0 ? (
