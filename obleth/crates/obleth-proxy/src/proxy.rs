@@ -297,6 +297,7 @@ async fn proxy_handler_inner(
             &desired_tags,
             grants,
             &weights,
+            crate::router::splitmix_uniform(),
         ) {
             Some(chosen) => {
                 tracing::debug!(chosen = %chosen.model_name, "auto-routed request");
