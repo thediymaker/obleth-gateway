@@ -46,12 +46,27 @@ pub struct RouteExplain {
     /// data plane overwrites it before the span is recorded. A `0` here from
     /// the simulate endpoint is expected, not a bug.
     pub classifier_ms: u32,
+    /// Domains the tier filter reasoned over: the request's intent tags, or the
+    /// single synthetic `*` domain when it had none. Empty only when tiering was
+    /// off and nothing needed it.
     pub tier_domains: Vec<String>,
+    /// Minimum strength a candidate needed on `tier_domains` to survive stage 2.
+    /// Always `0` when `weights.difficulty_enabled` is false — that is "tiering
+    /// was off", not "every model qualified at level 0".
     pub tier_floor: u8,
+    /// True when the request asked for a level no surviving candidate holds, so
+    /// the floor clamped down to the best available. Always `false` when
+    /// `weights.difficulty_enabled` is false.
     pub tier_floor_clamped: bool,
     pub weights: WeightsView,
     pub temperature: f64,
-    /// True when temperature sampling picked something other than the argmax.
+    /// True when the softmax draw landed on a row other than the first.
+    ///
+    /// Rows are ordered by descending score, ties broken by name, and this
+    /// field is index-based: when the leading scores tie, a draw that moves the
+    /// pick off the head of the list reports `true` even though the winner is
+    /// also an argmax. Read it as "sampling changed which row was taken", not
+    /// as "a lower-scoring model won".
     pub sampled: bool,
     pub scored: Vec<ScoredCandidate>,
     pub rejected: Vec<Rejection>,
