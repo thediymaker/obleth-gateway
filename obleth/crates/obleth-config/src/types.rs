@@ -1743,6 +1743,9 @@ fn default_knowledge_index_batch_size() -> u32 {
 fn default_knowledge_index_timeout_ms() -> u64 {
     30_000
 }
+fn default_knowledge_index_stale_after_secs() -> i64 {
+    1_800
+}
 
 /// Configuration for the knowledge boon (institutional RAG).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1780,6 +1783,12 @@ pub struct KnowledgeBoonSettings {
     /// Timeout for indexing-time embedding calls (looser than the hot path).
     #[serde(default = "default_knowledge_index_timeout_ms")]
     pub index_timeout_ms: u64,
+    /// How long a claimed document may sit in `indexing` before another worker
+    /// may reclaim it. Generous on purpose: it must exceed the worst-case
+    /// embedding time for a large document, or a slow document gets embedded
+    /// twice.
+    #[serde(default = "default_knowledge_index_stale_after_secs")]
+    pub index_stale_after_secs: i64,
     /// Write retrieved chunk *text* into spans. Costs roughly 20x the default
     /// tracing tier, so it is opt-in and surfaced with a size warning.
     #[serde(default)]
@@ -1800,6 +1809,7 @@ impl Default for KnowledgeBoonSettings {
             max_chunks_per_collection: default_knowledge_max_chunks(),
             index_batch_size: default_knowledge_index_batch_size(),
             index_timeout_ms: default_knowledge_index_timeout_ms(),
+            index_stale_after_secs: default_knowledge_index_stale_after_secs(),
             debug_snapshot: false,
         }
     }

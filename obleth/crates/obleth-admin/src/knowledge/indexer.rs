@@ -1,15 +1,23 @@
 //! Background indexing: pending document -> chunks -> vectors -> new generation.
 //!
-//! Work is claimed one document at a time with `for update skip locked`, so an
-//! indexer that crashes mid-document leaves the row claimable again on the next
-//! boot and never corrupts the live generation.
+//! Work is claimed one document at a time with `for update skip locked`, so two
+//! workers never claim the same row concurrently. A worker that dies mid-document
+//! leaves the row `indexing`; `claim_pending_document`'s staleness window (see
+//! `KnowledgeBoonSettings::index_stale_after_secs`) reclaims it after a timeout
+//! rather than on a startup reset, because a startup reset would let a booting
+//! replica steal a document another replica is still actively embedding.
 //!
 //! Generations are scoped per-document (not per-collection): each document
-//! tracks its own `active_generation`, and `flip_document_generation` only ever
-//! touches that one document's chunks. See
+//! tracks its own `active_generation`, and `commit_document_generation` only ever
+//! touches that one document's chunks, promoting the generation and marking the
+//! document `ready` in a single transaction. See
 //! `.superpowers/sdd/2026-09-10-knowledge-base/CORRECTION-per-document-generations.md`
 //! for why a collection-scoped generation counter was wrong (it deleted every
-//! other document's chunks on each index).
+//! other document's chunks on each index), and
+//! `.superpowers/sdd/2026-09-10-knowledge-base/CORRECTION-indexer-atomicity.md`
+//! for why writing chunks and promoting the generation must be one transaction
+//! rather than two separate calls (a crash between them left a document `ready`
+//! with no live chunks, and no retry path could ever reclaim it).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -52,15 +60,26 @@ pub async fn index_document(
     settings: &KnowledgeBoonSettings,
 ) -> Result<()> {
     let collection = store.get_collection(doc.collection_id).await?;
-    let model = store
-        .get_model_by_name(&collection.embedding_model)
-        .await
-        .map_err(|_| {
-            anyhow!(
+    // Distinguish "model isn't registered" (an administrator misconfiguration)
+    // from a transient store failure: collapsing both into the same message
+    // would mislabel a database hiccup as a configuration mistake, and this
+    // string is exactly what an administrator reads in the document's `error`
+    // column.
+    let model = match store.get_model_by_name(&collection.embedding_model).await {
+        Ok(m) => m,
+        Err(obleth_store::StoreError::NotFound) => {
+            return Err(anyhow!(
                 "embedding model `{}` is not registered",
                 collection.embedding_model
-            )
-        })?;
+            ))
+        }
+        Err(e) => {
+            return Err(anyhow!(
+                "could not load embedding model `{}`: {e}",
+                collection.embedding_model
+            ))
+        }
+    };
     if model.model_type != "embedding" {
         return Err(anyhow!(
             "model `{}` is type `{}`, not `embedding`",
@@ -103,8 +122,11 @@ pub async fn index_document(
     }
     let dim = vectors[0].len() as i32;
 
-    // Write into the next generation; retrieval keeps serving the current one
-    // until the flip below, so a failure here is invisible to the data plane.
+    // Commit into the next generation and promote it atomically: retrieval
+    // keeps serving the current generation until this single transaction
+    // commits, so a failure anywhere up to this point is invisible to the data
+    // plane, and a crash during the commit itself cannot land the document
+    // `ready` without live chunks (see `commit_document_generation`).
     let generation = doc.active_generation + 1;
     let inserts: Vec<ChunkInsert> = chunks
         .into_iter()
@@ -118,15 +140,13 @@ pub async fn index_document(
         })
         .collect();
     store
-        .write_generation(collection.id, doc.id, generation, &inserts)
-        .await?;
-    store
-        .flip_document_generation(
+        .commit_document_generation(
             collection.id,
             doc.id,
             generation,
             &collection.embedding_model,
             dim,
+            &inserts,
         )
         .await?;
     Ok(())
@@ -138,7 +158,10 @@ pub fn spawn_indexer(store: Store, client: reqwest::Client, settings: Arc<ArcSwa
     tokio::spawn(async move {
         loop {
             let knowledge = settings.load().knowledge.clone();
-            match store.claim_pending_document().await {
+            match store
+                .claim_pending_document(knowledge.index_stale_after_secs)
+                .await
+            {
                 Ok(Some(doc)) => {
                     let id = doc.id;
                     if let Err(e) = index_document(&store, &client, &doc, &knowledge).await {

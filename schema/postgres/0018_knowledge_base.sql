@@ -64,6 +64,11 @@ create table if not exists knowledge_documents (
 alter table knowledge_documents add column if not exists active_generation integer not null default 0;
 alter table knowledge_documents add column if not exists indexed_embedding_model text not null default '';
 
+-- Stamped when a document is claimed for indexing, so a document stranded by a
+-- crash or deploy can be reclaimed on a timeout. Status alone cannot express
+-- this: a claimed row is no longer `pending`, so nothing would ever retry it.
+alter table knowledge_documents add column if not exists indexing_started_at timestamptz;
+
 create unique index if not exists knowledge_documents_hash_uq
     on knowledge_documents (collection_id, content_hash);
 create index if not exists knowledge_documents_status_idx
