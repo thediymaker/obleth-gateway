@@ -7,6 +7,7 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { setAutoRouterSettingsAction } from "@/app/actions";
 import type { RouteExplainView, SimulateRouteRequest } from "@/lib/obleth";
+import { cn } from "@/lib/utils";
 import { RouteExplainPanel } from "./route-explain";
 import type { PlaygroundSession } from "./playground";
 
@@ -53,7 +54,9 @@ function WeightSlider({ id, label, hint, value, onChange, min, max, step, valueL
 export function RouterWorkspace({ session, update }: {
   session: PlaygroundSession; update: (patch: Partial<PlaygroundSession>) => void;
 }) {
-  const [prompt, setPrompt] = useState("");
+  // Kept on the session, not local state, so the draft survives switching
+  // to Chat mode and back — that toggle remounts this component.
+  const prompt = session.routerPrompt ?? "";
   const [tenantId, setTenantId] = useState("");
   const [effort, setEffort] = useState<"" | "low" | "medium" | "high">("");
   const [maxTokens, setMaxTokens] = useState("");
@@ -112,9 +115,14 @@ export function RouterWorkspace({ session, update }: {
       temperature,
       difficulty_enabled: difficultyEnabled,
     };
+    // Reports whether this run actually landed a fresh baseline/edited pair,
+    // so callers (Apply to gateway) can state what happened instead of
+    // assuming success — `baseline`/`dirty` read here would be stale, since
+    // the setState calls below don't retroactively update this closure.
+    let ok = true;
     try {
       const [b, e] = await Promise.all([postSimulate(shared, ac.signal), postSimulate(editedBody, ac.signal)]);
-      if (ac.signal.aborted) return;
+      if (ac.signal.aborted) return true;
       setBaseline(b);
       setEdited(e);
       if (!seeded.current) {
@@ -127,10 +135,11 @@ export function RouterWorkspace({ session, update }: {
         setDifficultyEnabled(b.weights.difficulty_enabled);
       }
     } catch (err) {
-      if ((err as Error).name !== "AbortError") setError((err as Error).message || "Unable to reach the gateway.");
+      if ((err as Error).name !== "AbortError") { setError((err as Error).message || "Unable to reach the gateway."); ok = false; }
     } finally {
       if (!ac.signal.aborted) setBusy(false);
     }
+    return ok;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     prompt, tenantId, effort, maxTokens, needsFunctionCalling, needsToolChoice, needsResponseSchema,
@@ -154,6 +163,10 @@ export function RouterWorkspace({ session, update }: {
     Math.abs(temperature - baseline.temperature) > EPSILON ||
     difficultyEnabled !== baseline.weights.difficulty_enabled
   );
+  // Three states, not two: without a baseline (nothing fetched yet, or the
+  // last fetch failed) there is nothing to claim parity with, so "matches
+  // live" would be a statement about settings the panel never read.
+  const weightStatus: "matches" | "edited" | "unavailable" = !baseline ? "unavailable" : dirty ? "edited" : "matches";
 
   async function applyToGateway() {
     setApplying(true);
@@ -167,17 +180,23 @@ export function RouterWorkspace({ session, update }: {
       difficulty_enabled: difficultyEnabled,
     });
     setApplying(false);
-    if (result.ok) {
-      setApplyStatus("Applied. The live baseline now matches these weights.");
-      await run();
-    } else {
-      setApplyStatus(result.error);
-    }
+    if (!result.ok) { setApplyStatus(result.error); return; }
+    // Say what actually happened, not what was hoped for: `run()`'s return
+    // reflects whether the post-Apply refetch itself succeeded, since the
+    // `baseline`/`dirty` in this closure are snapshots from before the
+    // refetch and can't be trusted to describe its outcome.
+    const refetched = await run();
+    setApplyStatus(
+      refetched
+        ? "Applied. The live baseline now matches these weights."
+        : "Settings were applied, but refreshing the baseline afterward failed — reload to confirm.",
+    );
   }
 
   function onPromptChange(value: string) {
-    setPrompt(value);
-    if (session.title === "Untitled session" && value.trim()) update({ title: value.trim().slice(0, 60) });
+    const patch: Partial<PlaygroundSession> = { routerPrompt: value };
+    if (session.title === "Untitled session" && value.trim()) patch.title = value.trim().slice(0, 60);
+    update(patch);
   }
 
   const current = edited ?? baseline;
@@ -232,8 +251,15 @@ export function RouterWorkspace({ session, update }: {
           <div className="flex items-center gap-2">
             <Wand2 className="h-4 w-4 text-violet-500" aria-hidden="true" />
             <span className="text-sm font-medium">Weights</span>
-            <span className={dirty ? "rounded-full bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-600 dark:text-amber-400" : "rounded-full bg-emerald-500/15 px-2 py-0.5 text-xs font-medium text-emerald-600 dark:text-emerald-400"}>
-              {dirty ? "✎ edited" : "matches live"}
+            <span
+              className={cn(
+                "rounded-full px-2 py-0.5 text-xs font-medium",
+                weightStatus === "edited" && "bg-amber-500/15 text-amber-600 dark:text-amber-400",
+                weightStatus === "matches" && "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
+                weightStatus === "unavailable" && "bg-muted text-muted-foreground",
+              )}
+            >
+              {weightStatus === "edited" ? "✎ edited" : weightStatus === "matches" ? "matches live" : "live weights unavailable"}
             </span>
             {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" aria-hidden="true" />}
           </div>

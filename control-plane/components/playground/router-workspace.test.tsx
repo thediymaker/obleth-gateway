@@ -1,4 +1,4 @@
-import { act } from "react";
+import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RouterWorkspace } from "./router-workspace";
@@ -18,7 +18,7 @@ let calls: SimulateRouteRequest[];
 function makeExplain(body: SimulateRouteRequest): RouteExplainView {
   return {
     chosen: body.prompt ? "model-a" : null,
-    difficulty: 0.4,
+    difficulty: 2,
     difficulty_source: "heuristic",
     tags: [],
     tag_source: "heuristic",
@@ -36,7 +36,9 @@ function makeExplain(body: SimulateRouteRequest): RouteExplainView {
     temperature: body.temperature ?? 0,
     uniform: body.uniform ?? 0,
     sampled: false,
-    scored: [{ model: "model-a", level: 1, spare: 0.9, cost_score: 0.8, tag_score: 0.5, bias: 0, score: 0.7, chosen: true }],
+    // bias is clamped to [0.1, 3.0] by the gateway (0 is unreachable); 1.0 is
+    // its neutral default.
+    scored: [{ model: "model-a", level: 1, spare: 0.9, cost_score: 0.8, tag_score: 0, bias: 1.0, score: 0.86, chosen: true }],
     rejected: [],
   };
 }
@@ -47,9 +49,18 @@ function setNativeValue(el: HTMLInputElement | HTMLTextAreaElement, value: strin
   el.dispatchEvent(new Event("input", { bubbles: true }));
 }
 
-const session: PlaygroundSession = {
+const initialSession: PlaygroundSession = {
   id: "s1", title: "Untitled session", mode: "router", models: ["charo"], generation: { systemPrompt: "" },
 };
+
+// The prompt now lives on the session (so it survives a Chat<->Router mode
+// toggle), so the harness needs a real, mutable session — a no-op `update`
+// would leave the prompt textarea permanently uncontrolled.
+function Harness() {
+  const [session, setSession] = useState(initialSession);
+  const update = (patch: Partial<PlaygroundSession>) => setSession((s) => ({ ...s, ...patch }));
+  return <RouterWorkspace session={session} update={update} />;
+}
 
 async function flush(ms = 350) {
   await act(async () => { await new Promise((r) => setTimeout(r, ms)); });
@@ -68,7 +79,7 @@ beforeEach(async () => {
   host = document.createElement("div");
   document.body.append(host);
   root = createRoot(host);
-  await act(async () => { root.render(<RouterWorkspace session={session} update={() => {}} />); });
+  await act(async () => { root.render(<Harness />); });
 });
 
 afterEach(async () => {
@@ -78,6 +89,15 @@ afterEach(async () => {
 });
 
 describe("RouterWorkspace", () => {
+  it('reports weights as unavailable, not "matches live", when no baseline has ever been fetched', async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: "gateway unreachable" }), { status: 502 })));
+    await flush();
+    expect(host.textContent).toContain("live weights unavailable");
+    expect(host.textContent).not.toContain("matches live");
+    const applyButton = [...host.querySelectorAll("button")].find((b) => b.textContent?.includes("Apply to gateway")) as HTMLButtonElement;
+    expect(applyButton.disabled).toBe(true); // no baseline to be dirty against, so nothing to apply
+  });
+
   it("pins the same uniform draw across the baseline and edited calls of one run", async () => {
     const prompt = host.querySelector<HTMLTextAreaElement>('[aria-label="Prompt"]')!;
     await act(async () => setNativeValue(prompt, "Summarize this contract"));
