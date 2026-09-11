@@ -53,6 +53,28 @@ const COLLECTION_COLS: &str = "id, name, description, embedding_model, \
     indexed_embedding_model, embedding_dim, chunk_tokens, chunk_overlap_tokens, \
     version";
 
+/// `fetch_one` on a caller-supplied id surfaces a missing row as
+/// `sqlx::Error::RowNotFound`, which the blanket `From<sqlx::Error>` wraps as
+/// `StoreError::Db` — mapped by the admin layer to a 500, not a 404, since
+/// only the explicit `StoreError::NotFound` variant gets the 404 treatment.
+/// Every by-id lookup/update/delete below that can legitimately be called
+/// with a nonexistent id runs its `fetch_one` through this so the API
+/// contract holds.
+fn map_missing(e: sqlx::Error) -> StoreError {
+    match e {
+        sqlx::Error::RowNotFound => StoreError::NotFound,
+        other => StoreError::Db(other),
+    }
+}
+
+/// True for Postgres SQLSTATE `40P01` (deadlock_detected) — an expected,
+/// transient outcome of concurrent writers, safe to retry.
+fn is_deadlock(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .and_then(|d| d.code())
+        .is_some_and(|code| code == "40P01")
+}
+
 impl Store {
     pub async fn create_collection(
         &self,
@@ -88,7 +110,8 @@ impl Store {
         ))
         .bind(id)
         .fetch_one(self.pool())
-        .await?;
+        .await
+        .map_err(map_missing)?;
         Ok(row_to_collection(&row))
     }
 
@@ -114,7 +137,8 @@ impl Store {
         .bind(chunk_tokens)
         .bind(chunk_overlap_tokens)
         .fetch_one(self.pool())
-        .await?;
+        .await
+        .map_err(map_missing)?;
         Ok(row_to_collection(&row))
     }
 
@@ -135,7 +159,8 @@ impl Store {
         .bind(model)
         .bind(dim)
         .fetch_one(self.pool())
-        .await?;
+        .await
+        .map_err(map_missing)?;
         Ok(row_to_collection(&row))
     }
 
@@ -335,7 +360,8 @@ impl Store {
             sqlx::query("delete from knowledge_documents where id = $1 returning collection_id")
                 .bind(id)
                 .fetch_one(self.pool())
-                .await?;
+                .await
+                .map_err(map_missing)?;
         Ok(row.get("collection_id"))
     }
 
@@ -369,7 +395,48 @@ impl Store {
     /// to the new embedder are excluded from the slab (see
     /// `load_active_chunks`) until the last one lands, so retrieval serves the
     /// complete old set throughout and switches atomically.
+    ///
+    /// Retries once on a Postgres deadlock (`40P01`). Concurrent commits for
+    /// different documents/collections (possibly from different gateway
+    /// replicas, or — in this crate's own test suite — different tests
+    /// running in parallel) can occasionally deadlock over shared FK-checked
+    /// rows; that is an expected, transient outcome of concurrent writers
+    /// against the same tables, not a correctness bug, and the whole
+    /// transaction is safe to retry verbatim (see the idempotency note
+    /// above).
     pub async fn commit_document_generation(
+        &self,
+        collection_id: Uuid,
+        document_id: Uuid,
+        generation: i32,
+        embedding_model: &str,
+        embedding_dim: i32,
+        chunks: &[ChunkInsert],
+    ) -> Result<()> {
+        const MAX_DEADLOCK_RETRIES: u32 = 3;
+        let mut attempt = 0;
+        loop {
+            match self
+                .commit_document_generation_once(
+                    collection_id,
+                    document_id,
+                    generation,
+                    embedding_model,
+                    embedding_dim,
+                    chunks,
+                )
+                .await
+            {
+                Err(StoreError::Db(ref e)) if is_deadlock(e) && attempt < MAX_DEADLOCK_RETRIES => {
+                    attempt += 1;
+                    continue;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn commit_document_generation_once(
         &self,
         collection_id: Uuid,
         document_id: Uuid,
@@ -418,12 +485,21 @@ impl Store {
             .execute(&mut *tx)
             .await?;
 
-        // Promote the generation and mark the document ready together.
+        // Promote the generation and mark the document ready together — unless
+        // a re-index request flipped it back to `pending` while this worker was
+        // embedding (`reindex_document`/`reindex_collection_documents` run
+        // concurrently with an in-flight `claim_pending_document`/commit pair,
+        // since a document is only locked for the duration of each individual
+        // query, not across the whole embed). In that case the chunks below
+        // are still valid and published, but `status` must stay `pending` so
+        // the queued re-index is not silently discarded — otherwise the API
+        // call that requested it reports success and nothing happens.
         sqlx::query(
             "update knowledge_documents
                 set active_generation = $2, indexed_embedding_model = $3,
-                    status = 'ready', error = null, chunk_count = $4,
-                    indexed_at = now()
+                    chunk_count = $4, indexed_at = now(),
+                    status = case when status = 'indexing' then 'ready' else status end,
+                    error = case when status = 'indexing' then null else error end
               where id = $1",
         )
         .bind(document_id)
@@ -593,6 +669,21 @@ impl Store {
         Ok(out)
     }
 
+    /// Which of the given ids are real collections, checked in one query
+    /// rather than one per id. Used to validate a caller-supplied attachment
+    /// list before writing it, instead of relying on the FK to reject a bad
+    /// id (which would otherwise surface as an opaque 500).
+    pub async fn existing_collection_ids(&self, ids: &[Uuid]) -> Result<Vec<Uuid>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows = sqlx::query("select id from knowledge_collections where id = any($1)")
+            .bind(ids)
+            .fetch_all(self.pool())
+            .await?;
+        Ok(rows.iter().map(|r| r.get("id")).collect())
+    }
+
     /// Replace a model's full set of knowledge-collection attachments.
     pub async fn set_model_collections(&self, model_id: Uuid, ids: &[Uuid]) -> Result<()> {
         let mut tx = self.pool().begin().await?;
@@ -636,7 +727,8 @@ impl Store {
         ))
         .bind(id)
         .fetch_one(self.pool())
-        .await?;
+        .await
+        .map_err(map_missing)?;
         Ok(row_to_document(&row))
     }
 }
@@ -780,6 +872,7 @@ mod tests {
             .await
             .expect("doc b");
 
+        mark_indexing(&store, a.id).await;
         store
             .commit_document_generation(
                 c.id,
@@ -797,6 +890,7 @@ mod tests {
             .await
             .expect("commit a");
 
+        mark_indexing(&store, b.id).await;
         store
             .commit_document_generation(
                 c.id,
@@ -838,6 +932,7 @@ mod tests {
             .await
             .expect("doc a");
 
+        mark_indexing(&store, a.id).await;
         store
             .commit_document_generation(
                 c.id,
@@ -855,6 +950,7 @@ mod tests {
             .await
             .expect("gen 1");
 
+        mark_indexing(&store, a.id).await;
         store
             .commit_document_generation(
                 c.id,
@@ -892,6 +988,7 @@ mod tests {
             .upsert_document(c.id, "Doc A", "a.md", "text/markdown", "body a")
             .await
             .expect("doc a");
+        mark_indexing(&store, a.id).await;
         store
             .commit_document_generation(
                 c.id,
@@ -913,6 +1010,7 @@ mod tests {
         // Second commit with identical embedder and dimension: the collection's
         // embedder cannot advance, but version MUST still move or the proxy
         // never rebuilds its slab.
+        mark_indexing(&store, a.id).await;
         store
             .commit_document_generation(
                 c.id,
@@ -954,25 +1052,40 @@ mod tests {
             .expect("doc");
 
         // Claim it, then simulate the worker dying: the row stays `indexing`.
-        let claimed = store.claim_pending_document(1_800).await.expect("claim");
-        assert_eq!(claimed.expect("claimed").id, doc.id);
+        // `claim_specific` retries past any stale orphan this table-wide scan
+        // might otherwise grab first (left behind by an earlier crashed test
+        // run — this is the *only* test in the suite that calls
+        // `claim_pending_document`, so anything it grabs that isn't `doc` can
+        // only be such an orphan, never a live sibling test's document; see
+        // its doc comment).
+        let claimed = claim_specific(&store, doc.id, 1_800).await;
+        assert_eq!(claimed.id, doc.id);
 
-        // With a long window it is NOT reclaimable — no double-processing of a
-        // document that is merely slow.
-        assert!(
-            store
-                .claim_pending_document(1_800)
-                .await
-                .expect("claim")
-                .is_none(),
-            "a fresh claim must not be stealable"
-        );
+        // With a long window OUR row is NOT reclaimable — no double-processing
+        // of a document that is merely slow. Anything else this claims is,
+        // for the same reason as above, necessarily a stray orphan, not a live
+        // sibling test's document; retire it so it stops interfering with
+        // every future run of this test.
+        for _ in 0..20 {
+            match store.claim_pending_document(1_800).await.expect("claim") {
+                None => break,
+                Some(other) => {
+                    assert_ne!(
+                        other.id, doc.id,
+                        "a fresh claim must not re-steal our own document"
+                    );
+                    store
+                        .mark_document_failed(other.id, "test cleanup: stale orphan")
+                        .await
+                        .expect("retire orphan");
+                }
+            }
+        }
 
         // With a zero window the stranded row is reclaimed rather than lost.
-        let reclaimed = store.claim_pending_document(0).await.expect("reclaim");
+        let reclaimed = claim_specific(&store, doc.id, 0).await;
         assert_eq!(
-            reclaimed.expect("reclaimed").id,
-            doc.id,
+            reclaimed.id, doc.id,
             "a stranded indexing row must be reclaimable on timeout"
         );
 
@@ -993,6 +1106,7 @@ mod tests {
             .await
             .expect("doc");
 
+        mark_indexing(&store, doc.id).await;
         store
             .commit_document_generation(
                 c.id,
@@ -1019,6 +1133,61 @@ mod tests {
         assert_eq!(chunks[0].text, "live");
 
         store.delete_collection(c.id).await.ok();
+    }
+
+    /// Repeatedly call `claim_pending_document`, permanently retiring
+    /// (`mark_document_failed`) anything claimed that isn't `id`, until `id`
+    /// itself is claimed. `claim_pending_document` scans the whole table with
+    /// no scoping — the globally oldest `pending`/stale-`indexing` row, not a
+    /// specific one — and orders by `created_at`, so a stale orphan left by an
+    /// earlier crashed test run sorts ahead of our freshly created document
+    /// and would otherwise be reclaimed forever (putting it back to `pending`
+    /// only re-queues it at the front again — a livelock, not a fix). Failing
+    /// it out permanently is safe here specifically because this is the only
+    /// test in the suite that calls `claim_pending_document`, so anything
+    /// claimed that isn't `id` cannot belong to a live sibling test.
+    async fn claim_specific(
+        store: &crate::Store,
+        id: uuid::Uuid,
+        stale_after_secs: i64,
+    ) -> super::KnowledgeDocument {
+        for _ in 0..100 {
+            if let Some(doc) = store
+                .claim_pending_document(stale_after_secs)
+                .await
+                .expect("claim")
+            {
+                if doc.id == id {
+                    return doc;
+                }
+                store
+                    .mark_document_failed(doc.id, "test cleanup: stale orphan")
+                    .await
+                    .expect("retire orphan");
+            }
+        }
+        panic!("could not claim document {id} after many attempts");
+    }
+
+    /// Mark a specific document `indexing` directly — bypassing
+    /// `claim_pending_document`, which scans the whole table with no scoping
+    /// and is unsafe to use here since this suite's tests run concurrently
+    /// against a shared database. Mirrors what the real indexer does before
+    /// calling `commit_document_generation`: the commit's status transition
+    /// is conditional on the document actually being `indexing` (a document
+    /// reset to `pending` by a concurrent re-index request must survive the
+    /// commit — see `commit_preserves_a_concurrent_reindex_request_but_still_publishes_chunks`),
+    /// so any test that commits straight after `upsert_document` (which always
+    /// starts a document `pending`) must simulate the claim step first.
+    async fn mark_indexing(store: &crate::Store, id: uuid::Uuid) {
+        sqlx::query(
+            "update knowledge_documents set status = 'indexing', indexing_started_at = now()
+              where id = $1",
+        )
+        .bind(id)
+        .execute(store.pool())
+        .await
+        .expect("mark indexing");
     }
 
     /// Insert a minimal `models` row directly (bypassing `create_model`'s long
@@ -1182,6 +1351,129 @@ mod tests {
         let reindexed = store.reindex_document(doc.id).await.expect("reindex");
         assert_eq!(reindexed.status, "pending");
         assert!(reindexed.error.is_none());
+
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn get_collection_on_a_missing_id_is_not_found() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let err = store
+            .get_collection(uuid::Uuid::new_v4())
+            .await
+            .expect_err("must fail");
+        assert!(
+            matches!(err, crate::StoreError::NotFound),
+            "a missing collection must map to StoreError::NotFound (so the \
+             admin layer returns 404, not 500), got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_collection_ids_excludes_unknown_ids_so_the_admin_guard_can_reject_before_writing(
+    ) {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let model_id = make_model(&store, &format!("model-guard-{}", uuid::Uuid::new_v4())).await;
+        let c1 = store
+            .create_collection(&format!("kc-guard-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("c1");
+        store
+            .set_model_collections(model_id, &[c1.id])
+            .await
+            .expect("attach c1");
+
+        let bogus = uuid::Uuid::new_v4();
+        let existing = store
+            .existing_collection_ids(&[c1.id, bogus])
+            .await
+            .expect("existence check");
+        assert_eq!(
+            existing,
+            vec![c1.id],
+            "the bogus id must not be reported as existing"
+        );
+
+        // Mirrors the admin handler: the guard (`existing_collection_ids` plus
+        // the pure `first_unknown_collection_id` check in
+        // `obleth-admin::knowledge`) rejects before ever calling
+        // `set_model_collections`, so the model's prior attachment is
+        // untouched by the rejected request.
+        assert_eq!(
+            store.model_collection_ids(model_id).await.expect("get"),
+            vec![c1.id],
+            "a rejected request must leave existing attachments unchanged"
+        );
+
+        store.delete_collection(c1.id).await.ok();
+        store.delete_model(model_id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn commit_preserves_a_concurrent_reindex_request_but_still_publishes_chunks() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(&format!("race-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("c");
+        let doc = store
+            .upsert_document(c.id, "Doc", "d.md", "text/markdown", "body")
+            .await
+            .expect("doc");
+
+        // Mark it `indexing` directly (rather than via `claim_pending_document`,
+        // which selects the oldest pending row across the *entire* table with
+        // no scoping — safe with a single caller, but this test suite runs
+        // concurrently and another test's pending document would race for that
+        // claim). This scopes "the worker is embedding it" to our own row.
+        mark_indexing(&store, doc.id).await;
+
+        // While the embed is in flight, an operator requests a re-index. This
+        // races the worker's eventual commit and must not be silently lost.
+        store
+            .reindex_document(doc.id)
+            .await
+            .expect("reindex mid-flight");
+
+        // The worker's commit lands after the race, unaware the document was
+        // flipped back to `pending`.
+        store
+            .commit_document_generation(
+                c.id,
+                doc.id,
+                doc.active_generation + 1,
+                "embed-a",
+                2,
+                &[super::ChunkInsert {
+                    ordinal: 0,
+                    text: "chunk".into(),
+                    token_count: 1,
+                    embedding: vec![1.0, 0.0],
+                }],
+            )
+            .await
+            .expect("commit");
+
+        let docs = store.list_documents(c.id).await.expect("list");
+        assert_eq!(
+            docs[0].status, "pending",
+            "a concurrent reindex request must survive the commit, not be clobbered back to ready"
+        );
+
+        let chunks = store.load_active_chunks(c.id).await.expect("load");
+        assert_eq!(
+            chunks.len(),
+            1,
+            "the freshly committed chunks must still be published/retrievable \
+             even though the document row stays pending"
+        );
+        assert_eq!(chunks[0].text, "chunk");
 
         store.delete_collection(c.id).await.ok();
     }

@@ -363,11 +363,24 @@ pub async fn upload_document(
     state.store.get_collection(id).await?;
 
     let settings = state.store.get_boon_settings().await?.unwrap_or_default();
+    let max_bytes = settings.knowledge.max_upload_bytes;
+
+    // Reject an oversized upload before decoding: base64 decodes to about
+    // 3/4 of its encoded length, so this estimate lets a hostile upload fail
+    // without ever allocating the full decoded buffer. The post-decode check
+    // in `validate_upload` below remains authoritative (it accounts for the
+    // ~33% inflation exactly); this is a cheap early-out, not a replacement.
+    let estimated_decoded_bytes = (body.content_base64.len() as i64 / 4) * 3;
+    if estimated_decoded_bytes > max_bytes {
+        return Err(AdminError::BadRequest(format!(
+            "file too large: an estimated {estimated_decoded_bytes} bytes exceeds the {max_bytes}-byte limit"
+        )));
+    }
+
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(&body.content_base64)
         .map_err(|_| AdminError::BadRequest("content_base64 is not valid base64".into()))?;
-    let text = validate_upload(&bytes, settings.knowledge.max_upload_bytes)
-        .map_err(AdminError::BadRequest)?;
+    let text = validate_upload(&bytes, max_bytes).map_err(AdminError::BadRequest)?;
 
     let doc = state
         .store
@@ -509,6 +522,17 @@ pub struct ModelCollectionsView {
     pub collection_ids: Vec<Uuid>,
 }
 
+/// The first requested id that is not in `existing`, or `None` when every
+/// requested id is real. Pure (no I/O) so the guard logic in
+/// `set_model_collections` is unit-testable without a database — the actual
+/// existence check (`Store::existing_collection_ids`) still needs one.
+fn first_unknown_collection_id(
+    requested: &[Uuid],
+    existing: &std::collections::HashSet<Uuid>,
+) -> Option<Uuid> {
+    requested.iter().find(|c| !existing.contains(c)).copied()
+}
+
 #[utoipa::path(
     put, path = "/api/v1/models/{id}/knowledge", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
@@ -521,13 +545,33 @@ pub async fn set_model_collections(
     headers: HeaderMap,
     Json(body): Json<SetModelCollections>,
 ) -> Result<Json<ModelCollectionsView>> {
+    // Load the model first: a missing model must be a 404, not a raw FK
+    // violation surfaced as a 500 from the write below.
+    let model = state.store.get_model(id).await?;
+
+    // Every supplied collection id must be real, checked in one query rather
+    // than one per id (and rather than relying on the FK to reject a bad id,
+    // which would otherwise surface as an opaque 500 too). This runs, and can
+    // fail, before `Store::set_model_collections` is ever called, so a bad id
+    // leaves the model's existing attachments untouched.
+    let existing: std::collections::HashSet<Uuid> = state
+        .store
+        .existing_collection_ids(&body.collection_ids)
+        .await?
+        .into_iter()
+        .collect();
+    if let Some(bad) = first_unknown_collection_id(&body.collection_ids, &existing) {
+        return Err(AdminError::BadRequest(format!(
+            "unknown collection id: {bad}"
+        )));
+    }
+
     state
         .store
         .set_model_collections(id, &body.collection_ids)
         .await?;
     // Refresh Redis immediately so the data plane reflects the new attachment
     // set on the model's next request, instead of waiting on the 15s refresh.
-    let model = state.store.get_model(id).await?;
     sync_model(&state, &model).await?;
     state
         .store
@@ -738,5 +782,30 @@ mod tests {
         assert_eq!(content_type_for("policy.md"), "text/markdown");
         assert_eq!(content_type_for("notes.txt"), "text/plain");
         assert_eq!(content_type_for("mystery"), "text/plain");
+    }
+
+    #[test]
+    fn first_unknown_collection_id_flags_the_missing_one() {
+        let known = Uuid::new_v4();
+        let missing = Uuid::new_v4();
+        let existing: std::collections::HashSet<Uuid> = [known].into_iter().collect();
+        assert_eq!(
+            first_unknown_collection_id(&[known, missing], &existing),
+            Some(missing)
+        );
+    }
+
+    #[test]
+    fn first_unknown_collection_id_is_none_when_every_id_is_known() {
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let existing: std::collections::HashSet<Uuid> = [a, b].into_iter().collect();
+        assert_eq!(first_unknown_collection_id(&[a, b], &existing), None);
+    }
+
+    #[test]
+    fn first_unknown_collection_id_is_none_for_an_empty_request() {
+        let existing: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
+        assert_eq!(first_unknown_collection_id(&[], &existing), None);
     }
 }
