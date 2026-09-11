@@ -260,6 +260,66 @@ async fn build_slab(
     })
 }
 
+/// Cache key (hash only, no prefix — `RedisStore` owns the namespace) for a
+/// query vector. Scoped to the embedding model because the vector depends
+/// only on the model, not the collection: re-indexing content must not
+/// cold-start the cache, and two embedders must never share an entry. A
+/// SHA-256 digest keeps user query text (which may carry sensitive content)
+/// out of the key itself.
+pub fn query_cache_key(embedding_model: &str, query: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(embedding_model.as_bytes());
+    h.update([0u8]);
+    h.update(query.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
+/// Embed the retrieval query, preferring the cache. Returns `None` on any
+/// failure — cache miss, cache error, unknown/unresolved embedding model,
+/// upstream timeout, or a malformed response — so the boon then passes the
+/// request through ungrounded rather than failing it. Only Redis and the
+/// moka model cache are touched: `resolve_model` never reads Postgres, which
+/// matters because this runs on the request path.
+///
+/// Unused until the knowledge boon (Task 11) calls it on the request path —
+/// see the module-level note on targeted `#[allow(dead_code)]` rather than a
+/// module-wide one.
+#[allow(dead_code)]
+pub async fn embed_query(
+    state: &crate::state::AppState,
+    embedding_model: &str,
+    query: &str,
+    settings: &obleth_config::KnowledgeBoonSettings,
+) -> Option<Vec<f32>> {
+    let key = query_cache_key(embedding_model, query);
+    if let Some(v) = state.redis.get_query_vector(&key).await {
+        return Some(v);
+    }
+    let route = crate::proxy::resolve_model(state, embedding_model).await?;
+    let target = obleth_admin::knowledge::embed::EmbedTarget {
+        api_base: route.api_base.clone(),
+        api_key: route.api_key.clone(),
+        upstream_model: route.upstream_model.clone(),
+    };
+    let inputs = [query.to_string()];
+    let vector = obleth_admin::knowledge::embed::embed_batch(
+        &state.http,
+        &target,
+        &inputs,
+        Duration::from_millis(settings.embed_timeout_ms),
+    )
+    .await
+    .ok()?
+    .into_iter()
+    .next()?;
+    state
+        .redis
+        .put_query_vector(&key, &vector, settings.query_cache_ttl_s)
+        .await;
+    Some(vector)
+}
+
 /// Apply one collection's rebuild outcome to the next snapshot: on success,
 /// insert the new slab; on failure, retain whatever `current` held for this
 /// collection (or omit it if `current` had nothing), so one bad collection
@@ -463,6 +523,28 @@ mod tests {
             3,
             "a failed rebuild must keep serving the last good slab for this collection"
         );
+    }
+
+    #[test]
+    fn cache_key_is_scoped_to_the_embedder_not_the_collection() {
+        // The vector depends only on the model, so re-indexing content must not
+        // cold-start the cache — and two embedders must never share an entry.
+        // `query_cache_key` itself returns only the hash portion: the
+        // `obleth:knowledge:q:` namespace prefix is owned by `RedisStore`
+        // (mirroring `compress_key`), since the proxy has no access to the
+        // private const that names it.
+        let a = query_cache_key("embed-a", "refund policy");
+        let b = query_cache_key("embed-b", "refund policy");
+        assert_ne!(a, b);
+        assert_eq!(a, query_cache_key("embed-a", "refund policy"));
+        assert_eq!(a.len(), 64, "sha256 hex digest");
+    }
+
+    #[test]
+    fn cache_key_does_not_embed_raw_query_text() {
+        // Queries can contain user content; the key is a digest, not the text.
+        let key = query_cache_key("embed-a", "my social security number is 123");
+        assert!(!key.contains("social"));
     }
 
     #[test]

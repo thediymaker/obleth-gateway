@@ -40,6 +40,10 @@ const CACHE_PREFIX: &str = "obleth:cache:";
 /// Namespace for compression-boon originals stashed for reversibility. Distinct
 /// from the response cache so the two never collide.
 const COMPRESS_PREFIX: &str = "obleth:compress:";
+/// Namespace for cached query vectors (knowledge boon). The key itself is
+/// built here from the hash the proxy supplies (see `query_vector_key`),
+/// mirroring `compress_key`.
+const KNOWLEDGE_QUERY_PREFIX: &str = "obleth:knowledge:q:";
 const INVALIDATE_CHANNEL: &str = "obleth:invalidate";
 /// Single shared key holding the provisioner's last-seen epoch seconds. Shared
 /// via Redis (not per-pod memory) so the dashboard reads a consistent value no
@@ -302,6 +306,47 @@ impl RedisStore {
         let mut conn = self.conn.clone();
         let v: Option<String> = conn.get(Self::compress_key(hash)).await?;
         Ok(v)
+    }
+
+    fn query_vector_key(hash: &str) -> String {
+        format!("{KNOWLEDGE_QUERY_PREFIX}{hash}")
+    }
+
+    /// Fetch a cached query vector by its hash. Any error, a missing key, or a
+    /// byte length that is not a multiple of 4 (a misaligned vector, which
+    /// would score plausibly but wrongly) is treated as a plain miss: the
+    /// caller re-embeds. The cache is an optimization, never a correctness
+    /// requirement.
+    pub async fn get_query_vector(&self, hash: &str) -> Option<Vec<f32>> {
+        let mut conn = self.conn.clone();
+        let bytes: Option<Vec<u8>> = conn.get(Self::query_vector_key(hash)).await.ok()?;
+        let bytes = bytes?;
+        if bytes.is_empty() || bytes.len() % 4 != 0 {
+            return None;
+        }
+        Some(
+            bytes
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect(),
+        )
+    }
+
+    /// Store a query vector under its hash, little-endian f32 encoded.
+    /// Failures are ignored — the cache is an optimization, never a
+    /// correctness requirement.
+    pub async fn put_query_vector(&self, hash: &str, vector: &[f32], ttl_secs: u64) {
+        let mut bytes = Vec::with_capacity(vector.len() * 4);
+        for f in vector {
+            bytes.extend_from_slice(&f.to_le_bytes());
+        }
+        let mut conn = self.conn.clone();
+        let redis_key = Self::query_vector_key(hash);
+        if ttl_secs > 0 {
+            let _: redis::RedisResult<()> = conn.set_ex(redis_key, bytes, ttl_secs).await;
+        } else {
+            let _: redis::RedisResult<()> = conn.set(redis_key, bytes).await;
+        }
     }
 
     /// Publish invalidation for a key hash, model name (`model:<name>`), or `*`.
@@ -681,5 +726,41 @@ mod tests {
             store.compress_get(&hash).await.unwrap().as_deref(),
             Some("the original content")
         );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn query_vector_roundtrip_and_miss() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let store = RedisStore::connect(&url).await.expect("connect");
+        let hash = format!("q-{}", Uuid::new_v4());
+
+        // Miss before write.
+        assert!(store.get_query_vector(&hash).await.is_none());
+
+        let vector = vec![0.5f32, -1.25, 3.0, 0.0];
+        store.put_query_vector(&hash, &vector, 60).await;
+        assert_eq!(store.get_query_vector(&hash).await, Some(vector));
+    }
+
+    /// A misaligned byte length must be treated as a miss, not a decode
+    /// error: a stray truncated write must never score a request against a
+    /// silently shifted vector.
+    #[tokio::test]
+    async fn query_vector_misaligned_bytes_is_a_miss() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let store = RedisStore::connect(&url).await.expect("connect");
+        let hash = format!("q-bad-{}", Uuid::new_v4());
+        let redis_key = RedisStore::query_vector_key(&hash);
+        let mut conn = store.conn.clone();
+        let _: () = conn.set(redis_key, vec![1u8, 2, 3]).await.unwrap();
+
+        assert!(store.get_query_vector(&hash).await.is_none());
     }
 }

@@ -1767,6 +1767,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
+ "sha2",
  "tokio",
  "tower 0.4.13",
  "tower-http 0.5.2",

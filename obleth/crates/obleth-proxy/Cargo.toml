@@ -47,6 +47,7 @@ obleth-admin.workspace = true
 regex.workspace = true
 jsonwebtoken.workspace = true
 base64.workspace = true
+sha2 = "0.10"
 
 [dev-dependencies]
 ring = "0.17"
