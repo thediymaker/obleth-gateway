@@ -1,11 +1,13 @@
 name: docker-edge
 
-# Every push to main builds amd64 images and moves the :main tag. This keeps
-# the Docker build path continuously exercised (release day is never the first
-# time the Dockerfiles build) and gives users a way to test unreleased fixes.
+# Every push to main or dev builds amd64 images and moves the tag named after
+# the branch (:main, :dev). This keeps the Docker build path continuously
+# exercised (release day is never the first time the Dockerfiles build) and
+# gives users a way to test unreleased fixes. Integration happens on dev, so
+# :dev is the moving edge and :main tracks what has been promoted for release.
 on:
   push:
-    branches: [main]
+    branches: [main, dev]
 
 permissions:
   packages: write
@@ -29,7 +31,7 @@ jobs:
             context: ./benchmark-backend
     runs-on: ubuntu-latest
     concurrency:
-      group: edge-${{ matrix.component }}
+      group: edge-${{ matrix.component }}-${{ github.ref_name }}
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
@@ -46,7 +48,7 @@ jobs:
           context: ${{ matrix.context }}
           file: deploy/docker/${{ matrix.component }}.Dockerfile
           push: true
-          tags: ${{ env.REGISTRY }}/${{ matrix.component }}:main
+          tags: ${{ env.REGISTRY }}/${{ matrix.component }}:${{ github.ref_name }}
           build-args: |
             GIT_SHA=${{ github.sha }}
             BUILD_TIMESTAMP=${{ steps.meta.outputs.built_at }}

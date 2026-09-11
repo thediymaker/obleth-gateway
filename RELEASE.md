@@ -48,9 +48,11 @@ before the first stable tag of a version.
 
 ## Edge builds
 
-Every push to `main` publishes amd64-only `:main` tags via
-`.github/workflows/docker.yml` — useful for testing unreleased fixes
-(`OBLETH_VERSION=main` in `deploy/docker/.env`).
+Every push to `main` or `dev` publishes amd64-only images tagged after the
+branch via `.github/workflows/docker.yml` — useful for testing unreleased
+fixes (`OBLETH_VERSION=dev` in `deploy/docker/.env`). Features are integrated
+on `dev`, so `:dev` is the moving edge; `:main` tracks what has been promoted
+toward a release.
 
 ## First-release checklist (one-time)
 
