@@ -8,13 +8,8 @@
 //! The index starts empty and fills asynchronously (see `spawn_refresh`), so a
 //! large corpus never delays boot.
 //!
-//! This task builds the index and its refresh loop only; the request-path
-//! consumer (the knowledge boon reading `AppState::knowledge` and calling
-//! `CollectionSlab::retrieve`) lands in a later task (Task 11). Until then
-//! `Hit`, `retrieve`, and several slab/chunk fields are exercised only by this
-//! module's own tests, so they carry targeted `#[allow(dead_code)]` rather
-//! than a module-wide one — a later dead item added elsewhere in this module
-//! should still be caught.
+//! The request-path consumer is the knowledge boon (`boons::knowledge`),
+//! which reads `AppState::knowledge` and calls `CollectionSlab::retrieve`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -27,15 +22,10 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct SlabChunk {
-    #[allow(dead_code)]
     pub id: Uuid,
-    #[allow(dead_code)]
     pub title: String,
-    #[allow(dead_code)]
     pub text: String,
-    #[allow(dead_code)]
     pub token_count: u32,
-    #[allow(dead_code)]
     pub embedding: Vec<f32>,
 }
 
@@ -44,20 +34,21 @@ pub struct SlabChunk {
 pub struct CollectionSlab {
     /// The embedder that built these vectors. A query must be embedded with
     /// this same model, or the scores are meaningless.
-    #[allow(dead_code)]
     pub embedding_model: String,
+    /// Not read yet on the request path (the boon does not currently validate
+    /// query/collection dimension parity before scoring); still genuinely
+    /// unused, so it keeps its own allow rather than being swept up with the
+    /// other fields Task 11 put to use.
     #[allow(dead_code)]
     pub dim: usize,
     /// The collection's `version` at the time this slab was built. Compared
     /// against the live row on each refresh so an unchanged collection is
     /// never re-read from Postgres.
     pub version: i64,
-    #[allow(dead_code)]
     pub chunks: Vec<SlabChunk>,
 }
 
 /// One retrieved chunk.
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct Hit {
     pub id: Uuid,
@@ -68,7 +59,6 @@ pub struct Hit {
 }
 
 impl CollectionSlab {
-    #[allow(dead_code)]
     pub fn retrieve(&self, query: &[f32], top_k: usize, min_score: f32) -> Vec<Hit> {
         // No intermediate `Vec<Vec<f32>>`: at the collection chunk cap
         // (100k chunks x 768 dims) cloning every embedding on each
@@ -282,10 +272,8 @@ pub fn query_cache_key(embedding_model: &str, query: &str) -> String {
 /// moka model cache are touched: `resolve_model` never reads Postgres, which
 /// matters because this runs on the request path.
 ///
-/// Unused until the knowledge boon (Task 11) calls it on the request path —
-/// see the module-level note on targeted `#[allow(dead_code)]` rather than a
-/// module-wide one.
-#[allow(dead_code)]
+/// Called from the knowledge boon (`boons::knowledge::apply`) on the request
+/// path.
 pub async fn embed_query(
     state: &crate::state::AppState,
     embedding_model: &str,

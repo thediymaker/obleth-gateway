@@ -335,18 +335,25 @@ impl RedisStore {
     /// Store a query vector under its hash, little-endian f32 encoded.
     /// Failures are ignored — the cache is an optimization, never a
     /// correctness requirement.
+    ///
+    /// Unlike `compress_put`, `ttl_secs == 0` here means "caching disabled —
+    /// skip the write entirely" rather than "store with no expiry": this
+    /// key space is a digest of arbitrary user query text, so a never-expiring
+    /// entry would be an unbounded memory path in the only hot-path store,
+    /// which also serves key resolution and budget enforcement. A
+    /// storage-boundary method should not depend on a caller in another crate
+    /// validating this for it.
     pub async fn put_query_vector(&self, hash: &str, vector: &[f32], ttl_secs: u64) {
+        if ttl_secs == 0 {
+            return;
+        }
         let mut bytes = Vec::with_capacity(vector.len() * 4);
         for f in vector {
             bytes.extend_from_slice(&f.to_le_bytes());
         }
         let mut conn = self.conn.clone();
         let redis_key = Self::query_vector_key(hash);
-        if ttl_secs > 0 {
-            let _: redis::RedisResult<()> = conn.set_ex(redis_key, bytes, ttl_secs).await;
-        } else {
-            let _: redis::RedisResult<()> = conn.set(redis_key, bytes).await;
-        }
+        let _: redis::RedisResult<()> = conn.set_ex(redis_key, bytes, ttl_secs).await;
     }
 
     /// Publish invalidation for a key hash, model name (`model:<name>`), or `*`.
