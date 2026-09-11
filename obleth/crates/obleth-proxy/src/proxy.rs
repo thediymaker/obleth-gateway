@@ -3260,7 +3260,11 @@ mod tests {
     #[test]
     fn avoids_duplicate_v1_prefix() {
         assert_eq!(
-            build_upstream_url("https://inference.example.com/v1", "/v1/chat/completions", ""),
+            build_upstream_url(
+                "https://inference.example.com/v1",
+                "/v1/chat/completions",
+                ""
+            ),
             "https://inference.example.com/v1/chat/completions"
         );
     }

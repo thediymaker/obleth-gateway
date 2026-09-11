@@ -131,7 +131,12 @@ pub fn derive_levels(candidates: &mut [Candidate], source: obleth_config::TierSo
             cost(&candidates[a])
                 .partial_cmp(&cost(&candidates[b]))
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| candidates[a].model.model_name.cmp(&candidates[b].model.model_name))
+                .then_with(|| {
+                    candidates[a]
+                        .model
+                        .model_name
+                        .cmp(&candidates[b].model.model_name)
+                })
         });
 
         let n = members.len();
@@ -1041,7 +1046,10 @@ mod tests {
                 u,
             )
             .unwrap();
-            assert_eq!(chosen.model_name, "cheap", "uniform {u} changed a temperature-0 pick");
+            assert_eq!(
+                chosen.model_name, "cheap",
+                "uniform {u} changed a temperature-0 pick"
+            );
         }
     }
 
@@ -1137,7 +1145,11 @@ mod tests {
         let mut cands = vec![healthy(cheap), healthy(dear)];
         derive_levels(&mut cands, obleth_config::TierSource::Derived);
         assert_eq!(level_of(&cands[0], "math"), 1);
-        assert_eq!(level_of(&cands[1], "math"), 2, "two models rank 1..2, not 1 and 3");
+        assert_eq!(
+            level_of(&cands[1], "math"),
+            2,
+            "two models rank 1..2, not 1 and 3"
+        );
     }
 
     #[test]

@@ -525,7 +525,10 @@ fn spawn_model_registry_refresh(
             match store.all_resolved_models().await {
                 Ok(models) => {
                     let tier_source = classifier.settings().tier_source;
-                    install_candidates(&registry, build_candidates(&store, models, tier_source).await)
+                    install_candidates(
+                        &registry,
+                        build_candidates(&store, models, tier_source).await,
+                    )
                 }
                 Err(e) => tracing::warn!(error = %e, "auto-router model refresh failed"),
             }
