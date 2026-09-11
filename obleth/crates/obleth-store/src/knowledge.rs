@@ -5,6 +5,8 @@
 //! here and searched in the proxy's in-memory slab — which means the extension
 //! would buy nothing while costing every self-hoster a deployment requirement.
 
+use std::collections::HashMap;
+
 use sqlx::Row;
 use uuid::Uuid;
 
@@ -560,6 +562,83 @@ impl Store {
             })
             .collect())
     }
+
+    /// Collections a model grounds on. Used by the admin API to render the
+    /// current attachment set for one model.
+    pub async fn model_collection_ids(&self, model_id: Uuid) -> Result<Vec<Uuid>> {
+        let rows = sqlx::query(
+            "select collection_id from model_knowledge_collections where model_id = $1",
+        )
+        .bind(model_id)
+        .fetch_all(self.pool())
+        .await?;
+        Ok(rows.iter().map(|r| r.get("collection_id")).collect())
+    }
+
+    /// Every model's collection attachments in one query, grouped by model.
+    ///
+    /// Used by `Store::all_resolved_models` (the proxy boot warm path, and the
+    /// 15s registry refresh) so cost stays flat regardless of model count —
+    /// one query over the whole join table rather than one per model.
+    pub async fn all_model_collection_ids(&self) -> Result<HashMap<Uuid, Vec<Uuid>>> {
+        let rows = sqlx::query("select model_id, collection_id from model_knowledge_collections")
+            .fetch_all(self.pool())
+            .await?;
+        let mut out: HashMap<Uuid, Vec<Uuid>> = HashMap::new();
+        for row in &rows {
+            out.entry(row.get("model_id"))
+                .or_default()
+                .push(row.get("collection_id"));
+        }
+        Ok(out)
+    }
+
+    /// Replace a model's full set of knowledge-collection attachments.
+    pub async fn set_model_collections(&self, model_id: Uuid, ids: &[Uuid]) -> Result<()> {
+        let mut tx = self.pool().begin().await?;
+        sqlx::query("delete from model_knowledge_collections where model_id = $1")
+            .bind(model_id)
+            .execute(&mut *tx)
+            .await?;
+        for id in ids {
+            sqlx::query(
+                "insert into model_knowledge_collections (model_id, collection_id)
+                 values ($1, $2) on conflict do nothing",
+            )
+            .bind(model_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Reset every document in a collection back to `pending`, clearing any
+    /// prior error, so a manual re-index requeues the whole collection for the
+    /// background indexer. Returns the number of documents requeued.
+    pub async fn reindex_collection_documents(&self, collection_id: Uuid) -> Result<u64> {
+        let result = sqlx::query(
+            "update knowledge_documents set status = 'pending', error = null
+              where collection_id = $1",
+        )
+        .bind(collection_id)
+        .execute(self.pool())
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Reset a single document back to `pending`, clearing any prior error.
+    pub async fn reindex_document(&self, id: Uuid) -> Result<KnowledgeDocument> {
+        let row = sqlx::query(&format!(
+            "update knowledge_documents set status = 'pending', error = null
+              where id = $1 returning {DOC_COLS}"
+        ))
+        .bind(id)
+        .fetch_one(self.pool())
+        .await?;
+        Ok(row_to_document(&row))
+    }
 }
 
 #[cfg(test)]
@@ -938,6 +1017,171 @@ mod tests {
         let chunks = store.load_active_chunks(c.id).await.expect("load");
         assert_eq!(chunks.len(), 1, "a ready document must have live chunks");
         assert_eq!(chunks[0].text, "live");
+
+        store.delete_collection(c.id).await.ok();
+    }
+
+    /// Insert a minimal `models` row directly (bypassing `create_model`'s long
+    /// argument list, which is irrelevant to these attachment tests).
+    async fn make_model(store: &crate::Store, name: &str) -> uuid::Uuid {
+        let id = uuid::Uuid::new_v4();
+        sqlx::query(
+            "insert into models (id, model_name, upstream_model, api_base)
+             values ($1, $2, 'upstream', 'http://localhost')",
+        )
+        .bind(id)
+        .bind(name)
+        .execute(store.pool())
+        .await
+        .expect("insert model");
+        id
+    }
+
+    #[tokio::test]
+    async fn model_collections_roundtrip_and_replace() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let model_id = make_model(&store, &format!("model-{}", uuid::Uuid::new_v4())).await;
+        let c1 = store
+            .create_collection(&format!("kc-a-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("c1");
+        let c2 = store
+            .create_collection(&format!("kc-b-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("c2");
+
+        store
+            .set_model_collections(model_id, &[c1.id, c2.id])
+            .await
+            .expect("set");
+        let mut ids = store.model_collection_ids(model_id).await.expect("get");
+        ids.sort();
+        let mut expected = vec![c1.id, c2.id];
+        expected.sort();
+        assert_eq!(ids, expected);
+
+        // Replacing must clear the old set, not append to it.
+        store
+            .set_model_collections(model_id, &[c1.id])
+            .await
+            .expect("replace");
+        assert_eq!(
+            store.model_collection_ids(model_id).await.expect("get2"),
+            vec![c1.id]
+        );
+
+        store.delete_collection(c1.id).await.ok();
+        store.delete_collection(c2.id).await.ok();
+        store.delete_model(model_id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn all_model_collection_ids_groups_by_model_in_one_query() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let m1 = make_model(&store, &format!("model-a-{}", uuid::Uuid::new_v4())).await;
+        let m2 = make_model(&store, &format!("model-b-{}", uuid::Uuid::new_v4())).await;
+        let c = store
+            .create_collection(&format!("kc-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("c");
+
+        store
+            .set_model_collections(m1, &[c.id])
+            .await
+            .expect("set m1");
+        // m2 deliberately gets nothing attached.
+
+        let all = store.all_model_collection_ids().await.expect("bulk");
+        assert_eq!(all.get(&m1), Some(&vec![c.id]));
+        assert!(
+            !all.contains_key(&m2),
+            "a model with no attachments must be absent from the map, not an empty vec"
+        );
+
+        store.delete_collection(c.id).await.ok();
+        store.delete_model(m1).await.ok();
+        store.delete_model(m2).await.ok();
+    }
+
+    #[tokio::test]
+    async fn reindex_collection_documents_requeues_only_that_collection() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let a = store
+            .create_collection(&format!("reidx-a-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("a");
+        let b = store
+            .create_collection(&format!("reidx-b-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("b");
+        let doc_a = store
+            .upsert_document(a.id, "Doc A", "a.md", "text/markdown", "body a")
+            .await
+            .expect("doc a");
+        let doc_b = store
+            .upsert_document(b.id, "Doc B", "b.md", "text/markdown", "body b")
+            .await
+            .expect("doc b");
+        store
+            .mark_document_failed(doc_a.id, "boom")
+            .await
+            .expect("fail a");
+        store
+            .mark_document_failed(doc_b.id, "boom")
+            .await
+            .expect("fail b");
+
+        let n = store
+            .reindex_collection_documents(a.id)
+            .await
+            .expect("reindex a");
+        assert_eq!(n, 1);
+
+        let docs_a = store.list_documents(a.id).await.expect("list a");
+        assert_eq!(docs_a[0].status, "pending");
+        assert!(docs_a[0].error.is_none());
+
+        let docs_b = store.list_documents(b.id).await.expect("list b");
+        assert_eq!(
+            docs_b[0].status, "failed",
+            "a different collection's document must be untouched"
+        );
+
+        store.delete_collection(a.id).await.ok();
+        store.delete_collection(b.id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn reindex_document_resets_status_and_clears_error() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(
+                &format!("reidx-doc-{}", uuid::Uuid::new_v4()),
+                "",
+                "embed-a",
+            )
+            .await
+            .expect("c");
+        let doc = store
+            .upsert_document(c.id, "Doc", "d.md", "text/markdown", "body")
+            .await
+            .expect("doc");
+        store
+            .mark_document_failed(doc.id, "boom")
+            .await
+            .expect("fail");
+
+        let reindexed = store.reindex_document(doc.id).await.expect("reindex");
+        assert_eq!(reindexed.status, "pending");
+        assert!(reindexed.error.is_none());
 
         store.delete_collection(c.id).await.ok();
     }
