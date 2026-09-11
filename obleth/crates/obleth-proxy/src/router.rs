@@ -72,6 +72,95 @@ pub struct Candidate {
     /// `false` when the model is reported down or is inside a maintenance
     /// window. Unhealthy candidates are filtered out before scoring.
     pub healthy: bool,
+    /// Effective per-topic strength, one entry per domain (a model tag, or the
+    /// synthetic [`GENERAL_DOMAIN`]). Computed by [`derive_levels`] at
+    /// registry-refresh time; empty until the registry has run at least once.
+    pub levels: Vec<(String, u8)>,
+}
+
+/// Synthetic domain covering every chat candidate, used when a request has no
+/// intent tags. Deliberately NOT "general" — that is a real, operator-assignable
+/// tag in `MODEL_TAGS`, and colliding with it would filter on the wrong thing.
+pub const GENERAL_DOMAIN: &str = "*";
+
+impl Candidate {
+    /// Highest level this candidate holds across `domains`. Being strong at one
+    /// of the request's intents is what qualifies it.
+    ///
+    /// Not yet called outside tests: the tier filter that consumes this lands
+    /// in a later step of the auto-router-tuner plan, same as
+    /// `RouterWeights::difficulty_enabled` above.
+    #[allow(dead_code)]
+    pub fn strength(&self, domains: &[String]) -> u8 {
+        domains
+            .iter()
+            .filter_map(|d| self.levels.iter().find(|(ld, _)| ld == d).map(|(_, l)| *l))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Compute each candidate's effective per-topic strength. Runs at registry
+/// refresh (every 15s), never on the request path: deriving cost quantiles
+/// per request would be an O(n log n) sort in the hot path.
+pub fn derive_levels(candidates: &mut [Candidate], source: obleth_config::TierSource) {
+    use obleth_config::{TierSource, MAX_TIER_LEVEL};
+
+    let mut domains: Vec<String> = vec![GENERAL_DOMAIN.to_string()];
+    for c in candidates.iter() {
+        for t in &c.model.tags {
+            if !domains.contains(t) {
+                domains.push(t.clone());
+            }
+        }
+    }
+
+    let cost = |c: &Candidate| c.model.input_cost_per_token + c.model.output_cost_per_token;
+    let mut assigned: Vec<Vec<(String, u8)>> = vec![Vec::new(); candidates.len()];
+
+    for domain in &domains {
+        // Indices of candidates in this domain, cheapest first. Ties break by
+        // name so the ladder is stable across refreshes.
+        let mut members: Vec<usize> = (0..candidates.len())
+            .filter(|&i| domain == GENERAL_DOMAIN || candidates[i].model.tags.contains(domain))
+            .collect();
+        if members.is_empty() {
+            continue;
+        }
+        members.sort_by(|&a, &b| {
+            cost(&candidates[a])
+                .partial_cmp(&cost(&candidates[b]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| candidates[a].model.model_name.cmp(&candidates[b].model.model_name))
+        });
+
+        let n = members.len();
+        for (rank, &i) in members.iter().enumerate() {
+            let derived = if n >= MAX_TIER_LEVEL as usize {
+                // Split into three bands by cost rank.
+                (((rank * MAX_TIER_LEVEL as usize) / n) + 1).min(MAX_TIER_LEVEL as usize) as u8
+            } else {
+                // Fewer than three members: rank order, not three bands.
+                (rank + 1) as u8
+            };
+            let declared = candidates[i]
+                .model
+                .declared_levels
+                .iter()
+                .find(|(d, _)| d == domain)
+                .map(|(_, l)| *l);
+            let level = match source {
+                TierSource::Derived => derived,
+                TierSource::Declared => declared.unwrap_or(1),
+                TierSource::Hybrid => declared.unwrap_or(derived),
+            };
+            assigned[i].push((domain.clone(), level));
+        }
+    }
+
+    for (i, levels) in assigned.into_iter().enumerate() {
+        candidates[i].levels = levels;
+    }
 }
 
 /// Lock-free, hot-swappable list of auto-routing candidates. Reads clone an
@@ -483,7 +572,16 @@ mod tests {
         Candidate {
             model: m,
             healthy: true,
+            levels: Vec::new(),
         }
+    }
+
+    fn level_of(c: &Candidate, domain: &str) -> u8 {
+        c.levels
+            .iter()
+            .find(|(d, _)| d == domain)
+            .map(|(_, l)| *l)
+            .unwrap_or(0)
     }
 
     #[test]
@@ -602,6 +700,7 @@ mod tests {
         let mut down = Candidate {
             model: model("down"),
             healthy: false,
+            levels: Vec::new(),
         };
         down.model.input_cost_per_token = 0.0; // would otherwise be cheapest
         let up = healthy(model("up"));
@@ -1006,5 +1105,82 @@ mod tests {
         )
         .unwrap();
         assert_eq!(chosen.model_name, "only");
+    }
+
+    #[test]
+    fn cost_rank_splits_three_models_into_three_bands() {
+        let mut cheap = model("cheap");
+        cheap.input_cost_per_token = 0.000_001;
+        let mut mid = model("mid");
+        mid.input_cost_per_token = 0.000_010;
+        let mut dear = model("dear");
+        dear.input_cost_per_token = 0.000_100;
+        for m in [&mut cheap, &mut mid, &mut dear] {
+            m.tags = vec!["coding".to_string()];
+        }
+        let mut cands = vec![healthy(cheap), healthy(mid), healthy(dear)];
+        derive_levels(&mut cands, obleth_config::TierSource::Derived);
+        assert_eq!(level_of(&cands[0], "coding"), 1);
+        assert_eq!(level_of(&cands[1], "coding"), 2);
+        assert_eq!(level_of(&cands[2], "coding"), 3);
+    }
+
+    #[test]
+    fn two_models_get_rank_order_not_three_bands() {
+        let mut cheap = model("cheap");
+        cheap.input_cost_per_token = 0.000_001;
+        let mut dear = model("dear");
+        dear.input_cost_per_token = 0.000_100;
+        for m in [&mut cheap, &mut dear] {
+            m.tags = vec!["math".to_string()];
+        }
+        let mut cands = vec![healthy(cheap), healthy(dear)];
+        derive_levels(&mut cands, obleth_config::TierSource::Derived);
+        assert_eq!(level_of(&cands[0], "math"), 1);
+        assert_eq!(level_of(&cands[1], "math"), 2, "two models rank 1..2, not 1 and 3");
+    }
+
+    #[test]
+    fn declared_level_overrides_derived_for_that_pair_only() {
+        let mut small = model("small");
+        small.input_cost_per_token = 0.000_001;
+        small.tags = vec!["coding".to_string(), "math".to_string()];
+        small.declared_levels = vec![("coding".to_string(), 3)];
+        let mut big = model("big");
+        big.input_cost_per_token = 0.000_100;
+        big.tags = vec!["coding".to_string(), "math".to_string()];
+        let mut cands = vec![healthy(small), healthy(big)];
+        derive_levels(&mut cands, obleth_config::TierSource::Hybrid);
+        assert_eq!(level_of(&cands[0], "coding"), 3, "declared wins");
+        assert_eq!(level_of(&cands[0], "math"), 1, "other tags stay derived");
+    }
+
+    #[test]
+    fn every_candidate_has_a_level_in_the_general_domain() {
+        let mut untagged = model("untagged");
+        untagged.tags = Vec::new();
+        let mut cands = vec![healthy(untagged)];
+        derive_levels(&mut cands, obleth_config::TierSource::Hybrid);
+        assert!(
+            level_of(&cands[0], GENERAL_DOMAIN) >= 1,
+            "the synthetic domain must cover every candidate so the filter cannot empty the set"
+        );
+    }
+
+    #[test]
+    fn general_domain_sentinel_does_not_collide_with_the_real_general_tag() {
+        assert_ne!(GENERAL_DOMAIN, "general");
+        assert!(!obleth_config::is_valid_tag(GENERAL_DOMAIN));
+    }
+
+    #[test]
+    fn strength_is_the_max_across_desired_domains() {
+        let mut m = model("specialist");
+        m.tags = vec!["coding".to_string(), "math".to_string()];
+        m.declared_levels = vec![("coding".to_string(), 3), ("math".to_string(), 1)];
+        let mut cands = vec![healthy(m)];
+        derive_levels(&mut cands, obleth_config::TierSource::Declared);
+        let domains = vec!["coding".to_string(), "math".to_string()];
+        assert_eq!(cands[0].strength(&domains), 3);
     }
 }

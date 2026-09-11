@@ -2188,6 +2188,13 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_declared_levels_keep_the_first_occurrence() {
+        // normalize_tag_levels dedups by first occurrence: ["coding:3","coding:1"] -> 3.
+        let got = normalize_tag_levels(["coding:3", "coding:1"]);
+        assert_eq!(got, vec![("coding".to_string(), 3)]);
+    }
+
+    #[test]
     fn normalize_boons_accepts_new_vocabulary() {
         // The retired `tools` boon is dropped along with any other unknown value;
         // `compression` is part of the vocabulary and is kept.
