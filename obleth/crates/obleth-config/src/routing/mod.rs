@@ -113,11 +113,20 @@ impl Candidate {
 /// Compute each candidate's effective per-topic strength. Runs at registry
 /// refresh (every 15s), never on the request path: deriving cost quantiles
 /// per request would be an O(n log n) sort in the hot path.
+///
+/// Only chat candidates take part. `auto` is a chat-completions convenience and
+/// [`evaluate`]'s `model_type` hard filter drops every other modality anyway, so
+/// letting embedding, image or audio rows occupy cost ranks here would only
+/// distort the ladder the chat models are ranked on — on a fleet with cheap
+/// embedding models, every real chat model would be pushed into the top bands.
+/// Non-chat candidates keep an empty level list.
 pub fn derive_levels(candidates: &mut [Candidate], source: crate::TierSource) {
     use crate::{TierSource, MAX_TIER_LEVEL};
 
+    let eligible = |c: &Candidate| c.model.model_type == crate::DEFAULT_MODEL_TYPE;
+
     let mut domains: Vec<String> = vec![GENERAL_DOMAIN.to_string()];
-    for c in candidates.iter() {
+    for c in candidates.iter().filter(|c| eligible(c)) {
         for t in &c.model.tags {
             if !domains.contains(t) {
                 domains.push(t.clone());
@@ -132,6 +141,7 @@ pub fn derive_levels(candidates: &mut [Candidate], source: crate::TierSource) {
         // Indices of candidates in this domain, cheapest first. Ties break by
         // name so the ladder is stable across refreshes.
         let mut members: Vec<usize> = (0..candidates.len())
+            .filter(|&i| eligible(&candidates[i]))
             .filter(|&i| domain == GENERAL_DOMAIN || candidates[i].model.tags.contains(domain))
             .collect();
         if members.is_empty() {
@@ -1681,6 +1691,57 @@ mod tests {
             level_of(&cands[0], GENERAL_DOMAIN) >= 1,
             "the synthetic domain must cover every candidate so the filter cannot empty the set"
         );
+    }
+
+    #[test]
+    fn non_chat_models_do_not_occupy_a_band() {
+        // A realistic mixed fleet: three chat models and three embedding models
+        // that are an order of magnitude cheaper. Ranking all six together would
+        // put the embeddings in the cheap ranks and push every chat model into
+        // band 2 or 3, collapsing the ladder.
+        let mut cands = Vec::new();
+        for (name, cost) in [
+            ("chat-cheap", 0.000_001),
+            ("chat-mid", 0.000_010),
+            ("chat-dear", 0.000_100),
+        ] {
+            let mut m = model(name);
+            m.input_cost_per_token = cost;
+            m.tags = vec!["coding".to_string()];
+            cands.push(healthy(m));
+        }
+        for (name, cost) in [
+            ("embed-a", 0.000_000_001),
+            ("embed-b", 0.000_000_002),
+            ("embed-c", 0.000_000_003),
+        ] {
+            let mut m = model(name);
+            m.model_type = "embedding".to_string();
+            m.input_cost_per_token = cost;
+            m.tags = vec!["coding".to_string()];
+            cands.push(healthy(m));
+        }
+
+        derive_levels(&mut cands, crate::TierSource::Derived);
+
+        for domain in [GENERAL_DOMAIN, "coding"] {
+            assert_eq!(
+                (
+                    level_of(&cands[0], domain),
+                    level_of(&cands[1], domain),
+                    level_of(&cands[2], domain)
+                ),
+                (1, 2, 3),
+                "chat models must be ranked 1..3 among themselves in {domain}"
+            );
+        }
+        for c in &cands[3..] {
+            assert!(
+                c.levels.is_empty(),
+                "{} is not a chat model and must hold no level",
+                c.model.model_name
+            );
+        }
     }
 
     #[test]
