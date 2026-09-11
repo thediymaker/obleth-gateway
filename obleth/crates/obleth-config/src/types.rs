@@ -1981,6 +1981,10 @@ pub struct ModelBackup {
     pub boons: Vec<String>,
     #[serde(default)]
     pub tool_servers: Vec<String>,
+    /// Operator thumb on the scale for `auto` routing. Defaulted rather than
+    /// required so backups taken before the column existed still restore.
+    #[serde(default = "default_route_bias")]
+    pub route_bias: f64,
     #[serde(default)]
     pub request_timeout_secs: Option<i64>,
     #[serde(default)]
