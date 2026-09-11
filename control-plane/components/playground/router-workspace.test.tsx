@@ -3,7 +3,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RouterWorkspace } from "./router-workspace";
 import { setAutoRouterSettingsAction } from "@/app/actions";
-import type { PlaygroundSession } from "./playground";
+import { ROUTER_PROMPT_MAX_LENGTH, type PlaygroundSession } from "./playground";
 import type { RouteExplainView, SimulateRouteRequest } from "@/lib/obleth";
 
 vi.mock("@/app/actions", () => ({ setAutoRouterSettingsAction: vi.fn() }));
@@ -89,6 +89,16 @@ afterEach(async () => {
 });
 
 describe("RouterWorkspace", () => {
+  it("caps the prompt textarea at exactly the schema's routerPrompt limit", () => {
+    const textarea = host.querySelector<HTMLTextAreaElement>('[aria-label="Prompt"]')!;
+    // Pinned together, not just coincidentally equal: if router-workspace.tsx
+    // and playground.tsx's schema ever import different constants for this,
+    // this test still passes as long as *this* file's imported constant
+    // matches the DOM — but session-schema.test.ts pins the schema side, so
+    // between the two, a drift in either file is caught.
+    expect(textarea.maxLength).toBe(ROUTER_PROMPT_MAX_LENGTH);
+  });
+
   it('reports weights as unavailable, not "matches live", when no baseline has ever been fetched', async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: "gateway unreachable" }), { status: 502 })));
     await flush();

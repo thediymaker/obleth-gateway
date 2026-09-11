@@ -9,7 +9,7 @@ import { setAutoRouterSettingsAction } from "@/app/actions";
 import type { RouteExplainView, SimulateRouteRequest } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import { RouteExplainPanel } from "./route-explain";
-import type { PlaygroundSession } from "./playground";
+import { ROUTER_PROMPT_MAX_LENGTH, type PlaygroundSession } from "./playground";
 
 const DEBOUNCE_MS = 300;
 const EPSILON = 1e-6;
@@ -54,15 +54,16 @@ function WeightSlider({ id, label, hint, value, onChange, min, max, step, valueL
 export function RouterWorkspace({ session, update }: {
   session: PlaygroundSession; update: (patch: Partial<PlaygroundSession>) => void;
 }) {
-  // Kept on the session, not local state, so the draft survives switching
-  // to Chat mode and back — that toggle remounts this component.
+  // Kept on the session, not local state, so the form survives switching to
+  // Chat mode and back — that toggle remounts this component. (Weights are
+  // the deliberate exception; see the schema comment in playground.tsx.)
   const prompt = session.routerPrompt ?? "";
-  const [tenantId, setTenantId] = useState("");
-  const [effort, setEffort] = useState<"" | "low" | "medium" | "high">("");
-  const [maxTokens, setMaxTokens] = useState("");
-  const [needsFunctionCalling, setNeedsFunctionCalling] = useState(false);
-  const [needsToolChoice, setNeedsToolChoice] = useState(false);
-  const [needsResponseSchema, setNeedsResponseSchema] = useState(false);
+  const tenantId = session.routerTenantId ?? "";
+  const effort: "" | "low" | "medium" | "high" = session.routerEffort ?? "";
+  const maxTokens = session.routerMaxTokens;
+  const needsFunctionCalling = session.routerNeedsFunctionCalling ?? false;
+  const needsToolChoice = session.routerNeedsToolChoice ?? false;
+  const needsResponseSchema = session.routerNeedsResponseSchema ?? false;
 
   const [capacityWeight, setCapacityWeight] = useState(0.6);
   const [costWeight, setCostWeight] = useState(0.4);
@@ -102,7 +103,7 @@ export function RouterWorkspace({ session, update }: {
     if (prompt.trim()) shared.prompt = prompt;
     if (tenantId.trim()) shared.tenant_id = tenantId.trim();
     if (effort) shared.effort = effort;
-    if (maxTokens.trim() && Number.isFinite(Number(maxTokens))) shared.max_tokens = Number(maxTokens);
+    if (maxTokens !== undefined) shared.max_tokens = maxTokens;
     if (needsFunctionCalling) shared.needs_function_calling = true;
     if (needsToolChoice) shared.needs_tool_choice = true;
     if (needsResponseSchema) shared.needs_response_schema = true;
@@ -209,6 +210,7 @@ export function RouterWorkspace({ session, update }: {
           <textarea
             aria-label="Prompt"
             rows={3}
+            maxLength={ROUTER_PROMPT_MAX_LENGTH}
             value={prompt}
             onChange={(e) => onPromptChange(e.target.value)}
             placeholder="Paste or write the request you want to see routed…"
@@ -218,7 +220,7 @@ export function RouterWorkspace({ session, update }: {
         <div className="grid gap-3 sm:grid-cols-4">
           <label className="text-xs font-medium">
             Tenant ID
-            <Input aria-label="Tenant ID" className="mt-1" placeholder="Optional" value={tenantId} onChange={(e) => setTenantId(e.target.value)} />
+            <Input aria-label="Tenant ID" className="mt-1" maxLength={200} placeholder="Optional" value={tenantId} onChange={(e) => update({ routerTenantId: e.target.value })} />
           </label>
           <label className="text-xs font-medium">
             Effort
@@ -226,7 +228,7 @@ export function RouterWorkspace({ session, update }: {
               aria-label="Effort"
               className="mt-1 flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
               value={effort}
-              onChange={(e) => setEffort(e.target.value as typeof effort)}
+              onChange={(e) => update({ routerEffort: e.target.value ? (e.target.value as "low" | "medium" | "high") : undefined })}
             >
               <option value="">Default</option>
               <option value="low">Low</option>
@@ -236,12 +238,15 @@ export function RouterWorkspace({ session, update }: {
           </label>
           <label className="text-xs font-medium">
             Max output tokens
-            <Input aria-label="Max output tokens" className="mt-1" type="number" min={1} placeholder="Unset" value={maxTokens} onChange={(e) => setMaxTokens(e.target.value)} />
+            <Input aria-label="Max output tokens" className="mt-1" type="number" min={1} max={131072} placeholder="Unset" value={maxTokens ?? ""} onChange={(e) => {
+              const n = e.target.valueAsNumber;
+              if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 131072)) update({ routerMaxTokens: e.target.value ? n : undefined });
+            }} />
           </label>
           <div className="flex flex-col justify-end gap-1 text-xs">
-            <label className="flex items-center gap-2"><input type="checkbox" checked={needsFunctionCalling} onChange={(e) => setNeedsFunctionCalling(e.target.checked)} className="h-3.5 w-3.5" />Function calling</label>
-            <label className="flex items-center gap-2"><input type="checkbox" checked={needsToolChoice} onChange={(e) => setNeedsToolChoice(e.target.checked)} className="h-3.5 w-3.5" />Forced tool choice</label>
-            <label className="flex items-center gap-2"><input type="checkbox" checked={needsResponseSchema} onChange={(e) => setNeedsResponseSchema(e.target.checked)} className="h-3.5 w-3.5" />Response schema</label>
+            <label className="flex items-center gap-2"><input type="checkbox" checked={needsFunctionCalling} onChange={(e) => update({ routerNeedsFunctionCalling: e.target.checked })} className="h-3.5 w-3.5" />Function calling</label>
+            <label className="flex items-center gap-2"><input type="checkbox" checked={needsToolChoice} onChange={(e) => update({ routerNeedsToolChoice: e.target.checked })} className="h-3.5 w-3.5" />Forced tool choice</label>
+            <label className="flex items-center gap-2"><input type="checkbox" checked={needsResponseSchema} onChange={(e) => update({ routerNeedsResponseSchema: e.target.checked })} className="h-3.5 w-3.5" />Response schema</label>
           </div>
         </div>
       </div>
