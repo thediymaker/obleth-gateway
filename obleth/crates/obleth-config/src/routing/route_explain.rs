@@ -6,10 +6,11 @@
 //! simulator unchanged.
 
 use serde::Serialize;
+use utoipa::ToSchema;
 
 /// One candidate that survived every hard filter, with the score components
 /// that produced its rank. Emitted in the router's own descending-score order.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ScoredCandidate {
     pub model: String,
     /// Strength on the request's tier domains (see [`RouteExplain::tier_domains`]).
@@ -28,13 +29,13 @@ pub struct ScoredCandidate {
 /// Candidates dropped by one hard filter, collapsed under that filter's name.
 /// Collapsing keeps the payload small enough to ride the span without a
 /// per-model row for the boring majority.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct Rejection {
     pub reason: &'static str,
     pub models: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct RouteExplain {
     pub chosen: Option<String>,
     pub difficulty: u8,
@@ -72,7 +73,7 @@ pub struct RouteExplain {
     pub rejected: Vec<Rejection>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct WeightsView {
     pub capacity: f64,
     pub cost: f64,

@@ -28,6 +28,11 @@ use axum::middleware::Next;
 use axum::response::Response;
 use axum::routing::{get, patch, post, put};
 use axum::{Json, Router};
+use obleth_config::routing::route_explain::RouteExplain;
+use obleth_config::routing::{
+    difficulty_from_header, explain_selection, heuristic_intent, BoonGrants, IntentSource,
+    RequestFeatures, RouterWeights,
+};
 use obleth_config::{
     hash_api_key, ApiKey, FairshareGroup, ManagedModelSpec, McpServer, ModelEndpoint, ModelReplica,
     ModelRoute, ResolvedKey, ResolvedMcpServer, ResolvedModel, Tenant,
@@ -40,6 +45,8 @@ use obleth_config::{
 use obleth_fairshare::{FairShare, StaticCapacity, Stats};
 use obleth_redis::RedisStore;
 use obleth_store::{AuditEntry, Store};
+use obleth_tokenizer::Tokenizer;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 use utoipa::ToSchema;
@@ -260,6 +267,7 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/settings/auto-router",
             get(get_auto_router_settings).put(put_auto_router_settings),
         )
+        .route("/api/v1/router/simulate", post(simulate_route))
         .route(
             "/api/v1/settings/boons",
             get(get_boon_settings).put(put_boon_settings),
@@ -1650,6 +1658,169 @@ async fn put_auto_router_settings(
         )
         .await?;
     Ok(Json(AutoRouterSettingsView::from_settings(&settings)))
+}
+
+/// One hypothetical `auto` request for the routing tuner.
+///
+/// Everything is optional: an empty body simulates a bare, untagged prompt
+/// against the saved settings. The weight fields are *overrides* — unset ones
+/// fall back to whatever is persisted, exactly as a partial settings write
+/// would.
+#[derive(Debug, Deserialize, ToSchema, Default)]
+pub struct SimulateRouteRequest {
+    /// Plain prompt. Ignored when `messages` is present.
+    #[serde(default)]
+    pub prompt: Option<String>,
+    /// An OpenAI-style `messages` array, for replaying a real request shape
+    /// (multi-turn, or multimodal parts the vision heuristic keys off).
+    #[serde(default)]
+    pub messages: Option<serde_json::Value>,
+    /// Apply this tenant's model allowlist.
+    #[serde(default)]
+    pub tenant_id: Option<String>,
+    /// `low` | `medium` | `high`. Overrides the heuristic difficulty, and is
+    /// reported as a `header` source because it is the same override the
+    /// `x-obleth-effort` header performs on the data plane.
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub needs_function_calling: bool,
+    #[serde(default)]
+    pub needs_response_schema: bool,
+    /// Weight overrides. Unset fields fall back to the saved settings.
+    #[serde(default)]
+    pub capacity_weight: Option<f64>,
+    #[serde(default)]
+    pub cost_weight: Option<f64>,
+    #[serde(default)]
+    pub tag_weight: Option<f64>,
+    #[serde(default)]
+    pub default_soft_cap: Option<u32>,
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub difficulty_enabled: Option<bool>,
+    /// Pretend this many requests are in flight per model.
+    #[serde(default)]
+    pub busyness: Option<std::collections::HashMap<String, usize>>,
+}
+
+/// Run the whole `auto` routing pipeline against the live fleet and return the
+/// decision it *would* make, without dispatching anything.
+///
+/// Fidelity is the entire point, so this shares code with the data plane rather
+/// than reimplementing it: candidates come from [`Store::build_candidates`] (the
+/// same call the proxy's boot warm-up and 15s registry refresh make), tokens are
+/// counted with the same `obleth-tokenizer` estimator that feeds the real
+/// context-window filter, overrides are merged through the same
+/// [`merge_auto_router`] that clamps a real settings write, and the verdict comes
+/// from `explain_selection`, which is the same `evaluate` the proxy serves from.
+/// A simulator that diverged on any of these would confidently show an operator
+/// a decision the gateway would never make.
+///
+/// **This path never calls the classifier brain.** A simulation must not incur
+/// model calls or upstream latency, so intent is derived from `heuristic_intent`
+/// plus the optional `effort` override only. `tag_source`/`difficulty_source`
+/// therefore report `heuristic` (or `header`), never `classifier` — the
+/// dashboard must not imply a classification that did not happen. With the
+/// classifier enabled, a real request's tags may differ from what is shown here.
+///
+/// Read-only: no audit entry is recorded, and nothing is written.
+#[utoipa::path(
+    post, path = "/api/v1/router/simulate", tag = "settings",
+    request_body = SimulateRouteRequest,
+    responses((status = 200, body = RouteExplain))
+)]
+async fn simulate_route(
+    State(state): State<AdminState>,
+    Json(body): Json<SimulateRouteRequest>,
+) -> Result<Json<RouteExplain>> {
+    // Saved settings with the request's overrides merged over them, clamped by
+    // the same merge a `PUT /settings/auto-router` would use.
+    let saved = state
+        .store
+        .get_auto_router_settings()
+        .await?
+        .unwrap_or_default();
+    let settings = merge_auto_router(
+        &saved,
+        &UpdateAutoRouterSettings {
+            capacity_weight: body.capacity_weight,
+            cost_weight: body.cost_weight,
+            tag_weight: body.tag_weight,
+            default_soft_cap: body.default_soft_cap,
+            temperature: body.temperature,
+            difficulty_enabled: body.difficulty_enabled,
+            ..Default::default()
+        },
+    );
+    let weights = RouterWeights::from_settings(&settings);
+
+    // Same candidate assembly, same tier derivation, as the data plane's
+    // registry refresh — including health and maintenance state.
+    let candidates = state.store.build_candidates(settings.tier_source).await?;
+
+    // Tenant allowlist, when the caller wants to see a specific tenant's view.
+    // An empty list is "no allowlist", matching the proxy's treatment.
+    let allowed: Option<Vec<String>> = match body.tenant_id.as_deref().map(str::trim) {
+        Some(id) if !id.is_empty() => {
+            let uuid = Uuid::parse_str(id)
+                .map_err(|_| AdminError::BadRequest("tenant_id is not a uuid".to_string()))?;
+            state
+                .store
+                .get_tenant(uuid)
+                .await?
+                .allowed_models
+                .filter(|m| !m.is_empty())
+        }
+        _ => None,
+    };
+
+    let grants =
+        BoonGrants::from_settings(&state.store.get_boon_settings().await?.unwrap_or_default());
+
+    // Rebuild an OpenAI-style body so token counting and feature detection read
+    // exactly what the data plane reads.
+    let messages = match body.messages {
+        Some(serde_json::Value::Array(m)) => serde_json::Value::Array(m),
+        _ => serde_json::json!([{
+            "role": "user",
+            "content": body.prompt.unwrap_or_default(),
+        }]),
+    };
+    let json = serde_json::json!({ "model": "auto", "messages": messages });
+    let est = obleth_tokenizer::HeuristicTokenizer::new().estimate_request(&json);
+    let est_input_tokens = est.input_tokens as u64;
+    // No completion budget is simulated: `max_tokens` is 0, i.e. a request that
+    // does not pin one. Required context is therefore the prompt estimate alone.
+    let mut features = RequestFeatures::from_request(&json, est_input_tokens, 0);
+    features.needs_function_calling |= body.needs_function_calling;
+    features.needs_response_schema |= body.needs_response_schema;
+
+    let mut intent = heuristic_intent(&json, est_input_tokens);
+    if let Some(difficulty) = difficulty_from_header(body.effort.as_deref()) {
+        intent.difficulty = difficulty;
+        intent.source = IntentSource::Header;
+    }
+
+    let busyness = body.busyness.unwrap_or_default();
+    // At the default temperature of 0 the draw is ignored and the pick is the
+    // exact argmax. Above it, production samples, so a real draw is what "what
+    // would the gateway do" actually means — `sampled` flags when it moved the
+    // pick off the head of the list.
+    let uniform = rand::thread_rng().gen_range(0.0..1.0);
+
+    Ok(Json(explain_selection(
+        &candidates,
+        &features,
+        &busyness,
+        allowed.as_deref(),
+        &intent.tags,
+        grants,
+        &weights,
+        uniform,
+        &intent,
+    )))
 }
 
 /// View of the persisted model-"boons" settings, flattened per boon
@@ -4522,6 +4693,318 @@ async fn sync_tenant_keys(state: &AdminState, tenant_id: Uuid) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Live-service plumbing for the handful of admin tests that need a real
+    /// router. Everything here self-skips when the integration datastores are
+    /// not configured, so a plain `cargo test` stays hermetic.
+    mod harness {
+        use super::*;
+        use tower::ServiceExt;
+
+        pub(super) const TEST_ADMIN_TOKEN: &str = "test-admin-token";
+
+        /// Reads `OBLETH_TEST_DATABASE_URL`, mirroring the guard in
+        /// `obleth-store`'s harness: refuses any database whose name does not
+        /// contain "test", so a misconfigured env can never point these
+        /// fixtures at a real or dev database.
+        pub(super) fn test_db_url() -> Option<String> {
+            let url = std::env::var("OBLETH_TEST_DATABASE_URL").ok()?;
+            let db = url
+                .rsplit('/')
+                .next()
+                .unwrap_or("")
+                .split('?')
+                .next()
+                .unwrap_or("");
+            assert!(
+                db.contains("test"),
+                "OBLETH_TEST_DATABASE_URL database name {db:?} is not a dedicated test DB \
+                 (name must contain \"test\", e.g. obleth_test). Refusing to run integration \
+                 tests against a possibly-real database."
+            );
+            Some(url)
+        }
+
+        /// The real `/api/v1` router, wired to the integration datastores.
+        /// Returns `None` (test skips) when either is unconfigured.
+        pub(super) async fn test_admin_app() -> Option<(Router, Store)> {
+            let db_url = test_db_url()?;
+            let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
+
+            let store = Store::connect(&db_url).await.expect("connect postgres");
+            store.migrate().await.expect("migrate");
+            let redis = RedisStore::connect(&redis_url)
+                .await
+                .expect("connect redis");
+
+            let capacity = Arc::new(StaticCapacity::new(64));
+            let fairshare = FairShare::start(
+                capacity.clone(),
+                obleth_config::FairshareAlgorithm::default(),
+            );
+            let http = reqwest::Client::new();
+            let alerts = AlertDispatcher::new(http.clone(), AlertSettings::default());
+            let state = AdminState {
+                store: store.clone(),
+                redis,
+                capacity,
+                fairshare: fairshare.clone(),
+                fairshare_stats: fairshare.stats(),
+                // Never dialled: no route under test reads ClickHouse.
+                clickhouse: clickhouse::Client::default(),
+                admin_token: TEST_ADMIN_TOKEN.to_string(),
+                health: ModelHealthRuntime {
+                    scheduled_enabled: false,
+                    default_interval_secs: 60,
+                    timeout_secs: 5,
+                    retention_days: 1,
+                    http,
+                    alerts: None,
+                    telemetry: None,
+                    catalogs: Default::default(),
+                },
+                usage_retention_default_days: 30,
+                ssrf: ssrf::SsrfPolicy::from_env(),
+                alerts,
+                local_cache_tx: None,
+            };
+            Some((router(state), store))
+        }
+
+        pub(super) async fn send(
+            app: &Router,
+            req: axum::http::Request<axum::body::Body>,
+        ) -> (StatusCode, serde_json::Value) {
+            let res = app.clone().oneshot(req).await.expect("handler ran");
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+                .await
+                .expect("read body");
+            let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+            (status, json)
+        }
+
+        pub(super) fn simulate_request(
+            token: Option<&str>,
+            body: serde_json::Value,
+        ) -> axum::http::Request<axum::body::Body> {
+            let mut req = axum::http::Request::post("/api/v1/router/simulate")
+                .header("content-type", "application/json");
+            if let Some(token) = token {
+                req = req.header("authorization", format!("Bearer {token}"));
+            }
+            req.body(axum::body::Body::from(body.to_string()))
+                .expect("build request")
+        }
+    }
+
+    use harness::{send, simulate_request, test_admin_app, TEST_ADMIN_TOKEN};
+
+    /// The simulator sits behind the same bearer gate as every other write-side
+    /// route: it reads the whole model fleet and every tenant's allowlist.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_requires_admin() {
+        let Some((app, _store)) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let (status, _) = send(
+            &app,
+            simulate_request(None, serde_json::json!({ "prompt": "hello" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// The whole point of the endpoint: a full routing verdict with no upstream
+    /// call. The fixture model is unique per run and deleted before the
+    /// assertions so a failure cannot leave a row behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_returns_an_explanation_without_dispatching() {
+        let Some((app, store)) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let name = format!("m-{}", Uuid::new_v4());
+        let model = store
+            .create_model(
+                &name,
+                "",
+                &name,
+                "http://upstream.invalid",
+                None,
+                obleth_config::DEFAULT_MODEL_TYPE,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                128_000,
+                100,
+                None,
+                true,
+                true,
+                true,
+                true,
+                false,
+                &["coding".to_string()],
+                &[],
+                &[],
+                0,
+                1.0,
+            )
+            .await
+            .expect("create fixture model");
+
+        let (status, body) = send(
+            &app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({ "prompt": "write a python function" }),
+            ),
+        )
+        .await;
+
+        let _ = store.delete_model(model.id).await;
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(body.get("scored").is_some());
+        assert!(body.get("rejected").is_some());
+        // The fixture is enabled, healthy and roomy, so it must survive every
+        // hard filter and appear in the ranking.
+        let scored = body["scored"].as_array().expect("scored is an array");
+        assert!(
+            scored.iter().any(|s| s["model"] == serde_json::json!(name)),
+            "the fixture model should be a scored candidate: {scored:?}"
+        );
+        // A "python function" prompt is tagged by the heuristics, never by the
+        // classifier: the simulate path must not make a model call.
+        assert_eq!(
+            body["tag_source"],
+            serde_json::json!("heuristic"),
+            "simulate must never report a classification it did not perform"
+        );
+        assert_eq!(body["difficulty_source"], serde_json::json!("heuristic"));
+        assert_eq!(
+            body["classifier_ms"],
+            serde_json::json!(0),
+            "no classifier ran, so there is no timing to report"
+        );
+        assert!(body["tags"]
+            .as_array()
+            .expect("tags is an array")
+            .contains(&serde_json::json!("coding")));
+    }
+
+    /// Weight overrides must be clamped exactly as a settings write would be,
+    /// and unset fields must fall through to the persisted values — otherwise
+    /// the tuner shows a ranking no saved configuration could produce.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_clamps_weight_overrides_like_a_settings_write() {
+        let Some((app, store)) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let saved = store
+            .get_auto_router_settings()
+            .await
+            .expect("read settings")
+            .unwrap_or_default();
+
+        let (status, body) = send(
+            &app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({
+                    "prompt": "hello",
+                    "cost_weight": 7.5,      // out of range, clamps to 1.0
+                    "temperature": -3.0,     // out of range, clamps to 0.0
+                    "default_soft_cap": 0,   // rejected, keeps the saved value
+                }),
+            ),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["weights"]["cost"], serde_json::json!(1.0));
+        assert_eq!(body["temperature"], serde_json::json!(0.0));
+        assert_eq!(
+            body["weights"]["soft_cap"],
+            serde_json::json!(saved.default_soft_cap as f64),
+            "a rejected soft cap falls back to the persisted setting"
+        );
+        assert_eq!(
+            body["weights"]["capacity"],
+            serde_json::json!(saved.capacity_weight),
+            "an unset override keeps the persisted weight"
+        );
+    }
+
+    /// `effort` is the simulator's stand-in for `x-obleth-effort`, so it must
+    /// report the same `header` provenance the data plane records.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_reports_the_effort_override_as_a_header_source() {
+        let Some((app, _store)) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let (status, body) = send(
+            &app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({ "prompt": "hello", "effort": "high" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["difficulty"], serde_json::json!(3));
+        assert_eq!(body["difficulty_source"], serde_json::json!("header"));
+    }
+
+    /// A malformed tenant id is the caller's mistake, not a 500.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_rejects_a_malformed_tenant_id() {
+        let Some((app, _store)) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let (status, _) = send(
+            &app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({ "prompt": "hello", "tenant_id": "not-a-uuid" }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// A handler can carry `#[utoipa::path]` and still be missing from the
+    /// document, and an unregistered schema leaves a dangling `$ref` rather
+    /// than a compile error. Pin both halves.
+    #[test]
+    fn openapi_doc_exposes_the_simulate_endpoint() {
+        use utoipa::OpenApi;
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize the openapi doc");
+        assert!(
+            doc["paths"]["/api/v1/router/simulate"]["post"].is_object(),
+            "the simulate route is missing from paths(...)"
+        );
+        let schemas = &doc["components"]["schemas"];
+        for name in [
+            "SimulateRouteRequest",
+            "RouteExplain",
+            "ScoredCandidate",
+            "Rejection",
+            "WeightsView",
+            "IntentSource",
+        ] {
+            assert!(
+                schemas.get(name).is_some(),
+                "{name} is not registered in components(...)"
+            );
+        }
+    }
 
     #[test]
     fn update_auto_router_clamps_weights_and_preserves_unset() {
