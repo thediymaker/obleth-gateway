@@ -30,3 +30,9 @@ obleth-store.workspace = true
 obleth-redis.workspace = true
 obleth-fairshare.workspace = true
 obleth-provisioner.workspace = true
+obleth-tokenizer.workspace = true
+
+[dev-dependencies]
+# `util` brings `ServiceExt::oneshot`, which drives the router in-process so the
+# endpoint tests exercise the real middleware stack without binding a port.
+tower = { workspace = true, features = ["util"] }

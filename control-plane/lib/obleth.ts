@@ -785,6 +785,74 @@ export interface UpdateAutoRouterSettings {
   tier_source?: "hybrid" | "derived" | "declared";
 }
 
+/// Where a request's routing intent came from. `classifier` never appears in a
+/// simulation — the simulate endpoint deliberately does not call the classifier
+/// brain, so it reports `heuristic` or `header`.
+export type IntentSource = "classifier" | "heuristic" | "header" | "default";
+
+export interface ScoredCandidateView {
+  model: string;
+  level: number;
+  spare: number;
+  cost_score: number;
+  tag_score: number;
+  bias: number;
+  score: number;
+  chosen: boolean;
+}
+
+export interface RejectionView {
+  reason: string;
+  models: string[];
+}
+
+export interface RouteWeightsView {
+  capacity: number;
+  cost: number;
+  tag: number;
+  soft_cap: number;
+  difficulty_enabled: boolean;
+}
+
+/// One `auto` routing decision, explained. The same shape is returned by
+/// `simulateRoute` and recorded in the `auto_route` span, so one component
+/// renders a hypothetical and a real decision alike.
+export interface RouteExplainView {
+  chosen: string | null;
+  difficulty: number;
+  difficulty_source: IntentSource;
+  tags: string[];
+  tag_source: IntentSource;
+  /** Always 0 from a simulation: no classifier ran, so there is no timing. */
+  classifier_ms: number;
+  tier_domains: string[];
+  tier_floor: number;
+  tier_floor_clamped: boolean;
+  weights: RouteWeightsView;
+  temperature: number;
+  sampled: boolean;
+  scored: ScoredCandidateView[];
+  rejected: RejectionView[];
+}
+
+/// A hypothetical `auto` request. Weight fields are overrides; unset ones fall
+/// back to the saved auto-router settings.
+export interface SimulateRouteRequest {
+  prompt?: string;
+  messages?: unknown;
+  tenant_id?: string;
+  effort?: "low" | "medium" | "high";
+  needs_function_calling?: boolean;
+  needs_response_schema?: boolean;
+  capacity_weight?: number;
+  cost_weight?: number;
+  tag_weight?: number;
+  default_soft_cap?: number;
+  temperature?: number;
+  difficulty_enabled?: boolean;
+  busyness?: Record<string, number>;
+}
+
 export interface BoonSettingsView {
   vision_enabled: boolean;
   vision_fallback_model: string | null;
@@ -1658,6 +1726,14 @@ export const obleth = {
     api<AutoRouterSettingsView>("/settings/auto-router", {
       method: "PUT",
       headers: auditActorHeaders(options),
+      body: JSON.stringify(body),
+    }),
+  /// Run the whole `auto` pipeline against the live fleet and return the
+  /// decision it would make, without dispatching anything. Read-only: no audit
+  /// entry, no upstream call, and no classifier round trip.
+  simulateRoute: (body: SimulateRouteRequest) =>
+    api<RouteExplainView>("/router/simulate", {
+      method: "POST",
       body: JSON.stringify(body),
     }),
   getBoonSettings: reactCache(() => api<BoonSettingsView>("/settings/boons")),

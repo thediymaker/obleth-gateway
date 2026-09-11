@@ -694,9 +694,6 @@ pub fn route(
 /// `classifier_ms` is always `0` here. Only the data-plane call site times the
 /// classifier, so the proxy overwrites the field before recording the span;
 /// a `0` from the simulate endpoint is correct, not a missing measurement.
-// Not yet called outside tests: the admin simulate endpoint is the consumer,
-// and it lands after this.
-#[allow(dead_code)]
 #[allow(clippy::too_many_arguments)]
 pub fn explain_selection(
     candidates: &[Candidate],
@@ -779,7 +776,7 @@ fn narrate(
 
 /// Where a request's routing intent came from. Surfaced in traces and the
 /// tuner so an operator can tell a real classification from a fallback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum IntentSource {
     Classifier,
