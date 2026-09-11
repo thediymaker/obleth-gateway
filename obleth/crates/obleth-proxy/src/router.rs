@@ -16,8 +16,11 @@
 //!    are not busy) and cost (prefer cheaper models), then picks the best with
 //!    a deterministic tie-break on model name.
 //!
-//! The scoring function [`select_model`] is pure and synchronous so it can be
-//! unit-tested without any of the data-plane wiring.
+//! All three stages live in one private function, [`evaluate`]. [`select_model`]
+//! takes its verdict and [`explain_selection`] narrates it, so the routing
+//! explanation shown in traces and the tuner cannot describe a decision the
+//! router would not actually make. Both are pure and synchronous, so they can
+//! be unit-tested without any of the data-plane wiring.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -263,26 +266,56 @@ impl BoonGrants {
     }
 }
 
-/// Pick the best concrete model for an `auto` request, or `None` when no
-/// registered model can serve it.
+/// Every hard-filter reason string, in the order the filters are applied. A
+/// candidate is attributed to the *first* filter it fails, so this order is
+/// part of the explanation's contract, not just presentation.
+const REJECTION_REASONS: [&str; 9] = [
+    "disabled",
+    "unhealthy",
+    "model_type",
+    "context_window",
+    "function_calling",
+    "tool_choice",
+    "response_schema",
+    "tenant_allowlist",
+    "below_tier_floor",
+];
+
+/// One scored survivor, holding a borrow of its candidate so [`select_model`]
+/// can clone the winning [`ResolvedModel`] without re-running anything.
+struct ScoredRef<'a> {
+    cand: &'a Candidate,
+    level: u8,
+    spare: f64,
+    cost_score: f64,
+    tag_score: f64,
+    bias: f64,
+    score: f64,
+}
+
+/// Everything one routing decision produced: the ordered survivors, the index
+/// of the pick, why each loser was dropped, and the tier-filter state.
+struct Evaluation<'a> {
+    /// Survivors in the router's own order: descending score, ties by name.
+    ordered: Vec<ScoredRef<'a>>,
+    /// Index into `ordered`. `None` only when no candidate cleared stage 1.
+    chosen: Option<usize>,
+    rejected: Vec<crate::route_explain::Rejection>,
+    tier_domains: Vec<String>,
+    tier_floor: u8,
+    tier_floor_clamped: bool,
+}
+
+/// The one implementation of `auto` selection.
 ///
-/// `desired_tags` are the intent tags derived for this request (by the
-/// classifier or heuristics). When non-empty, candidates whose tags overlap
-/// the desired set are preferred; when empty, selection is pure capacity/cost.
-///
-/// `uniform` is a draw in `[0,1)` used for softmax sampling when
-/// `weights.temperature` is above zero; it is ignored (and the pick is exact
-/// argmax) at the default temperature of `0.0`. Callers pass the draw in
-/// rather than `select_model` generating it, so the function stays pure and
-/// synchronous and can be exercised deterministically by tests and the
-/// simulate endpoint.
-///
-/// `difficulty` is the request's derived difficulty (1..=MAX_TIER_LEVEL). It
-/// only has an effect when `weights.difficulty_enabled` is set; see stage 1b
-/// below for the clamp-down floor it drives.
+/// [`select_model`] and [`explain_selection`] are both thin wrappers over this
+/// function and share every filter, weight and tie-break by construction, so
+/// the explanation cannot describe a decision the router would not make. Do not
+/// reimplement any stage in a caller: a tuned threshold that lives here changes
+/// both, and a tuned threshold that lives in a caller is a drift bug.
 #[allow(clippy::too_many_arguments)]
-pub fn select_model(
-    candidates: &[Candidate],
+fn evaluate<'a>(
+    candidates: &'a [Candidate],
     features: &RequestFeatures,
     busyness: &HashMap<String, usize>,
     allowed_models: Option<&[String]>,
@@ -291,7 +324,7 @@ pub fn select_model(
     weights: &RouterWeights,
     uniform: f64,
     difficulty: u8,
-) -> Option<ResolvedModel> {
+) -> Evaluation<'a> {
     let required_context = features
         .est_input_tokens
         .saturating_add(features.max_tokens);
@@ -303,34 +336,90 @@ pub fn select_model(
         grants.structured_active && c.model.boons.iter().any(|b| b == "structured_output")
     };
 
+    // Which domains the tier filter reasons over. Computed even when tiering is
+    // off, because the explanation reports each survivor's level either way.
+    let tier_domains: Vec<String> = if desired_tags.is_empty() {
+        vec![GENERAL_DOMAIN.to_string()]
+    } else {
+        desired_tags.to_vec()
+    };
+
+    // Rejections collapse by reason rather than one row per model, so the
+    // payload stays small enough to ride a trace span.
+    let mut buckets: Vec<Vec<String>> = vec![Vec::new(); REJECTION_REASONS.len()];
+    let mut reject = |reason: &str, name: &str| {
+        let slot = REJECTION_REASONS
+            .iter()
+            .position(|r| *r == reason)
+            .expect("rejection reason must be declared in REJECTION_REASONS");
+        buckets[slot].push(name.to_string());
+    };
+    let finish = |buckets: Vec<Vec<String>>| -> Vec<crate::route_explain::Rejection> {
+        REJECTION_REASONS
+            .iter()
+            .zip(buckets)
+            .filter(|(_, models)| !models.is_empty())
+            .map(|(reason, models)| crate::route_explain::Rejection { reason, models })
+            .collect()
+    };
+
     // ---- stage 1: hard filters ----
-    let eligible: Vec<&Candidate> = candidates
-        .iter()
-        .filter(|c| c.model.enabled && c.healthy)
+    // First failing filter wins; the order below is the filter order.
+    let hard_reject = |c: &Candidate| -> Option<&'static str> {
+        if !c.model.enabled {
+            return Some("disabled");
+        }
+        if !c.healthy {
+            return Some("unhealthy");
+        }
         // `auto` is a chat-completions convenience; only chat models are
         // eligible. Non-chat modalities (embedding, image, audio) are addressed
         // by name on their dedicated endpoints.
-        .filter(|c| c.model.model_type == obleth_config::DEFAULT_MODEL_TYPE)
-        .filter(|c| {
-            // A non-positive context window means "unknown" (misconfigured or
-            // legacy row); don't exclude on a signal we don't trust.
-            c.model.context_window <= 0 || c.model.context_window as u64 >= required_context
-        })
-        .filter(|c| !features.needs_function_calling || c.model.supports_function_calling)
-        .filter(|c| !features.needs_tool_choice || c.model.supports_tool_choice)
-        .filter(|c| {
-            !features.needs_response_schema
-                || c.model.supports_response_schema
-                || schema_via_boon(c)
-        })
-        .filter(|c| match allowed_models {
-            Some(allowed) => allowed.iter().any(|m| m == &c.model.model_name),
-            None => true,
-        })
-        .collect();
+        if c.model.model_type != obleth_config::DEFAULT_MODEL_TYPE {
+            return Some("model_type");
+        }
+        // A non-positive context window means "unknown" (misconfigured or
+        // legacy row); don't exclude on a signal we don't trust.
+        if c.model.context_window > 0 && (c.model.context_window as u64) < required_context {
+            return Some("context_window");
+        }
+        if features.needs_function_calling && !c.model.supports_function_calling {
+            return Some("function_calling");
+        }
+        if features.needs_tool_choice && !c.model.supports_tool_choice {
+            return Some("tool_choice");
+        }
+        if features.needs_response_schema
+            && !c.model.supports_response_schema
+            && !schema_via_boon(c)
+        {
+            return Some("response_schema");
+        }
+        if let Some(allowed) = allowed_models {
+            if !allowed.iter().any(|m| m == &c.model.model_name) {
+                return Some("tenant_allowlist");
+            }
+        }
+        None
+    };
+
+    let mut eligible: Vec<&Candidate> = Vec::with_capacity(candidates.len());
+    for c in candidates {
+        match hard_reject(c) {
+            Some(reason) => reject(reason, &c.model.model_name),
+            None => eligible.push(c),
+        }
+    }
 
     if eligible.is_empty() {
-        return None;
+        return Evaluation {
+            ordered: Vec::new(),
+            chosen: None,
+            rejected: finish(buckets),
+            tier_domains,
+            tier_floor: 0,
+            tier_floor_clamped: false,
+        };
     }
 
     // ---- stage 2: difficulty tier floor ----
@@ -338,30 +427,31 @@ pub fn select_model(
     // best level actually available, so this stage can narrow the field but can
     // never empty it — a hard request degrades within its topic instead of
     // failing or falling through to a weak generalist.
+    let mut tier_floor = 0u8;
+    let mut tier_floor_clamped = false;
     let eligible: Vec<&Candidate> = if weights.difficulty_enabled {
-        let domains: Vec<String> = if desired_tags.is_empty() {
-            vec![GENERAL_DOMAIN.to_string()]
-        } else {
-            desired_tags.to_vec()
-        };
         let available = eligible
             .iter()
-            .map(|c| c.strength(&domains))
+            .map(|c| c.strength(&tier_domains))
             .max()
             .unwrap_or(0);
-        let floor = difficulty
-            .clamp(1, obleth_config::MAX_TIER_LEVEL)
-            .min(available);
-        let kept: Vec<&Candidate> = eligible
+        let requested = difficulty.clamp(1, obleth_config::MAX_TIER_LEVEL);
+        tier_floor = requested.min(available);
+        // True exactly when the request asked for more than any survivor holds,
+        // i.e. the clamp actually moved the floor.
+        tier_floor_clamped = requested > available;
+        let (kept, dropped): (Vec<&Candidate>, Vec<&Candidate>) = eligible
             .iter()
             .copied()
-            .filter(|c| c.strength(&domains) >= floor)
-            .collect();
+            .partition(|c| c.strength(&tier_domains) >= tier_floor);
         // Defensive: a candidate set with no levels at all (stale snapshot mid
         // refresh) must not disappear.
         if kept.is_empty() {
             eligible
         } else {
+            for c in dropped {
+                reject("below_tier_floor", &c.model.model_name);
+            }
             kept
         }
     } else {
@@ -377,7 +467,7 @@ pub fn select_model(
     let max_cost = costs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let cost_span = max_cost - min_cost;
 
-    let mut scored: Vec<(f64, &Candidate)> = Vec::with_capacity(eligible.len());
+    let mut scored: Vec<ScoredRef<'a>> = Vec::with_capacity(eligible.len());
     for (cand, cost) in eligible.iter().zip(costs.iter()) {
         let in_flight = busyness.get(&cand.model.model_name).copied().unwrap_or(0) as f64;
         let cap = match cand.model.max_in_flight {
@@ -396,53 +486,214 @@ pub fn select_model(
         let base = weights.capacity * spare + weights.cost * cost_score;
         // Layer intent-tag matching on top of the capacity/cost base. With no
         // desired tags the score is just the base (neutral routing).
-        let score = if desired_tags.is_empty() {
-            base
+        let (tag_score, score) = if desired_tags.is_empty() {
+            (0.0, base)
         } else {
             let overlap = desired_tags
                 .iter()
                 .filter(|t| cand.model.tags.iter().any(|mt| mt == *t))
                 .count();
             let tag_score = (overlap as f64 / desired_tags.len() as f64).min(1.0);
-            weights.tag * tag_score + (1.0 - weights.tag) * base
+            (
+                tag_score,
+                weights.tag * tag_score + (1.0 - weights.tag) * base,
+            )
         };
         // Operator thumb on the scale. Clamped so a typo cannot zero out or
         // explode a model's chances.
-        let score = score * cand.model.route_bias.clamp(0.1, 3.0);
-        scored.push((score, cand));
+        let bias = cand.model.route_bias.clamp(0.1, 3.0);
+        scored.push(ScoredRef {
+            cand,
+            level: cand.strength(&tier_domains),
+            spare,
+            cost_score,
+            tag_score,
+            bias,
+            score: score * bias,
+        });
     }
 
     // Deterministic order first: descending score, ties broken by name ascending.
     // This ordering is also what makes sampling reproducible given a fixed draw.
     scored.sort_by(|a, b| {
-        b.0.partial_cmp(&a.0)
+        b.score
+            .partial_cmp(&a.score)
             .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| a.1.model.model_name.cmp(&b.1.model.model_name))
+            .then_with(|| a.cand.model.model_name.cmp(&b.cand.model.model_name))
     });
 
+    let chosen = pick_index(&scored, weights, uniform);
+
+    Evaluation {
+        ordered: scored,
+        chosen,
+        rejected: finish(buckets),
+        tier_domains,
+        tier_floor,
+        tier_floor_clamped,
+    }
+}
+
+/// Index of the winner in an already-ordered candidate list: the argmax at
+/// temperature 0, otherwise a softmax draw against `uniform`.
+fn pick_index(scored: &[ScoredRef<'_>], weights: &RouterWeights, uniform: f64) -> Option<usize> {
+    if scored.is_empty() {
+        return None;
+    }
     if weights.temperature <= f64::EPSILON {
-        return scored.first().map(|(_, c)| c.model.clone());
+        return Some(0);
     }
 
     // Softmax over scores, shifted by the max for numerical stability.
-    let max = scored[0].0;
+    let max = scored[0].score;
     let exps: Vec<f64> = scored
         .iter()
-        .map(|(s, _)| ((s - max) / weights.temperature).exp())
+        .map(|s| ((s.score - max) / weights.temperature).exp())
         .collect();
     let total: f64 = exps.iter().sum();
     if !total.is_finite() || total <= 0.0 {
-        return scored.first().map(|(_, c)| c.model.clone());
+        return Some(0);
     }
     let target = uniform.clamp(0.0, 1.0) * total;
     let mut acc = 0.0;
-    for (exp, (_, cand)) in exps.iter().zip(scored.iter()) {
+    for (i, exp) in exps.iter().enumerate() {
         acc += exp;
         if acc >= target {
-            return Some(cand.model.clone());
+            return Some(i);
         }
     }
-    scored.last().map(|(_, c)| c.model.clone())
+    Some(scored.len() - 1)
+}
+
+/// Pick the best concrete model for an `auto` request, or `None` when no
+/// registered model can serve it.
+///
+/// `desired_tags` are the intent tags derived for this request (by the
+/// classifier or heuristics). When non-empty, candidates whose tags overlap
+/// the desired set are preferred; when empty, selection is pure capacity/cost.
+///
+/// `uniform` is a draw in `[0,1)` used for softmax sampling when
+/// `weights.temperature` is above zero; it is ignored (and the pick is exact
+/// argmax) at the default temperature of `0.0`. Callers pass the draw in
+/// rather than `select_model` generating it, so the function stays pure and
+/// synchronous and can be exercised deterministically by tests and the
+/// simulate endpoint.
+///
+/// `difficulty` is the request's derived difficulty (1..=MAX_TIER_LEVEL). It
+/// only has an effect when `weights.difficulty_enabled` is set; see stage 2 of
+/// [`evaluate`] for the clamp-down floor it drives.
+///
+/// All of the logic lives in [`evaluate`], which [`explain_selection`] also
+/// calls — that shared core is what makes the two answers identical by
+/// construction rather than by review.
+#[allow(clippy::too_many_arguments)]
+pub fn select_model(
+    candidates: &[Candidate],
+    features: &RequestFeatures,
+    busyness: &HashMap<String, usize>,
+    allowed_models: Option<&[String]>,
+    desired_tags: &[String],
+    grants: BoonGrants,
+    weights: &RouterWeights,
+    uniform: f64,
+    difficulty: u8,
+) -> Option<ResolvedModel> {
+    let ev = evaluate(
+        candidates,
+        features,
+        busyness,
+        allowed_models,
+        desired_tags,
+        grants,
+        weights,
+        uniform,
+        difficulty,
+    );
+    ev.chosen.map(|i| ev.ordered[i].cand.model.clone())
+}
+
+/// Explain the same decision [`select_model`] would make for these inputs.
+///
+/// Both functions delegate to [`evaluate`], so the verdict here is the verdict
+/// there — the explanation records the losers instead of discarding them, and
+/// adds nothing that could disagree.
+///
+/// `intent` supplies the difficulty *and* its provenance: `intent.source` is
+/// reported as both `difficulty_source` and `tag_source`, because a request's
+/// tags and difficulty are always derived together by the same step.
+///
+/// `classifier_ms` is always `0` here. Only the data-plane call site times the
+/// classifier, so the proxy overwrites the field before recording the span;
+/// a `0` from the simulate endpoint is correct, not a missing measurement.
+// Not yet called outside tests: the `auto_route` span writer and the admin
+// simulate endpoint are the two consumers, and both land after this.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn explain_selection(
+    candidates: &[Candidate],
+    features: &RequestFeatures,
+    busyness: &HashMap<String, usize>,
+    allowed_models: Option<&[String]>,
+    desired_tags: &[String],
+    grants: BoonGrants,
+    weights: &RouterWeights,
+    uniform: f64,
+    intent: &Intent,
+) -> crate::route_explain::RouteExplain {
+    let ev = evaluate(
+        candidates,
+        features,
+        busyness,
+        allowed_models,
+        desired_tags,
+        grants,
+        weights,
+        uniform,
+        intent.difficulty,
+    );
+
+    crate::route_explain::RouteExplain {
+        chosen: ev
+            .chosen
+            .map(|i| ev.ordered[i].cand.model.model_name.clone()),
+        difficulty: intent.difficulty,
+        difficulty_source: intent.source,
+        // The tags that actually drove scoring, which the simulate endpoint may
+        // override independently of the intent that produced them.
+        tags: desired_tags.to_vec(),
+        tag_source: intent.source,
+        classifier_ms: 0,
+        tier_domains: ev.tier_domains,
+        tier_floor: ev.tier_floor,
+        tier_floor_clamped: ev.tier_floor_clamped,
+        weights: crate::route_explain::WeightsView {
+            capacity: weights.capacity,
+            cost: weights.cost,
+            tag: weights.tag,
+            soft_cap: weights.soft_cap,
+            difficulty_enabled: weights.difficulty_enabled,
+        },
+        temperature: weights.temperature,
+        // The list is in descending-score order, so anything but index 0 can
+        // only have been reached by a softmax draw.
+        sampled: ev.chosen.is_some_and(|i| i != 0),
+        scored: ev
+            .ordered
+            .iter()
+            .enumerate()
+            .map(|(i, s)| crate::route_explain::ScoredCandidate {
+                model: s.cand.model.model_name.clone(),
+                level: s.level,
+                spare: s.spare,
+                cost_score: s.cost_score,
+                tag_score: s.tag_score,
+                bias: s.bias,
+                score: s.score,
+                chosen: ev.chosen == Some(i),
+            })
+            .collect(),
+        rejected: ev.rejected,
+    }
 }
 
 /// One uniform draw in `[0,1)`. Dependency-free splitmix64 seeded from the
@@ -1632,5 +1883,288 @@ mod tests {
         )
         .unwrap();
         assert_eq!(chosen.model_name, "specialist");
+    }
+
+    fn intent_at(difficulty: u8) -> Intent {
+        Intent {
+            difficulty,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn explain_collapses_rejections_by_reason() {
+        let mut small = model("small");
+        small.context_window = 4_000;
+        let mut tiny = model("tiny");
+        tiny.context_window = 2_000;
+        let ok = model("ok");
+        let cands = vec![healthy(small), healthy(tiny), healthy(ok)];
+        let features = RequestFeatures {
+            est_input_tokens: 100_000,
+            max_tokens: 2_000,
+            ..Default::default()
+        };
+        let ex = explain_selection(
+            &cands,
+            &features,
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            &Intent::default(),
+        );
+        assert_eq!(ex.chosen.as_deref(), Some("ok"));
+        assert_eq!(ex.scored.len(), 1);
+        let ctx = ex
+            .rejected
+            .iter()
+            .find(|r| r.reason == "context_window")
+            .unwrap();
+        assert_eq!(
+            ctx.models.len(),
+            2,
+            "both too-small models collapse under one reason"
+        );
+    }
+
+    #[test]
+    fn explain_agrees_with_select_model() {
+        let mut cheap = model("cheap");
+        cheap.input_cost_per_token = 0.000_001;
+        let mut pricey = model("pricey");
+        pricey.input_cost_per_token = 0.000_100;
+        let cands = vec![healthy(pricey), healthy(cheap)];
+        let w = RouterWeights::default();
+        let picked = select_model(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &w,
+            0.0,
+            1,
+        );
+        let ex = explain_selection(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &w,
+            0.0,
+            &Intent::default(),
+        );
+        assert_eq!(
+            ex.chosen,
+            picked.map(|m| m.model_name),
+            "the explanation must never disagree with the real selection"
+        );
+    }
+
+    #[test]
+    fn explain_marks_the_chosen_row_and_orders_by_score() {
+        let mut cheap = model("cheap");
+        cheap.input_cost_per_token = 0.000_001;
+        let mut pricey = model("pricey");
+        pricey.input_cost_per_token = 0.000_100;
+        let cands = vec![healthy(pricey), healthy(cheap)];
+        let ex = explain_selection(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            &Intent::default(),
+        );
+        assert_eq!(ex.scored[0].model, "cheap");
+        assert!(ex.scored[0].chosen);
+        assert!(!ex.scored[1].chosen);
+        assert!(
+            ex.scored[0].score >= ex.scored[1].score,
+            "rows must arrive in the router's own descending-score order"
+        );
+        assert!(!ex.sampled, "temperature 0 is never a sampled pick");
+    }
+
+    #[test]
+    fn explain_flags_the_clamp_only_when_it_fires() {
+        let cands = vec![
+            tiered("weak", 0.000_001, &[("coding", 1)]),
+            tiered("middling", 0.000_010, &[("coding", 2)]),
+        ];
+        let desired = vec!["coding".to_string()];
+        let reachable = explain_selection(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &desired,
+            BoonGrants::default(),
+            &tiering_on(),
+            0.0,
+            &intent_at(2),
+        );
+        assert!(!reachable.tier_floor_clamped);
+        assert_eq!(reachable.tier_floor, 2);
+        assert_eq!(reachable.tier_domains, desired);
+        let below = reachable
+            .rejected
+            .iter()
+            .find(|r| r.reason == "below_tier_floor")
+            .expect("the weak model is dropped by the tier filter");
+        assert_eq!(below.models, vec!["weak".to_string()]);
+
+        // Nothing holds coding:3, so the floor clamps down to 2.
+        let clamped = explain_selection(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &desired,
+            BoonGrants::default(),
+            &tiering_on(),
+            0.0,
+            &intent_at(3),
+        );
+        assert!(
+            clamped.tier_floor_clamped,
+            "asking for a level nothing holds must report the clamp"
+        );
+        assert_eq!(clamped.tier_floor, 2);
+        assert_eq!(clamped.chosen.as_deref(), Some("middling"));
+    }
+
+    #[test]
+    fn explain_reports_a_sampled_pick() {
+        let mut cheap = model("cheap");
+        cheap.input_cost_per_token = 0.000_001;
+        let mut pricey = model("pricey");
+        pricey.input_cost_per_token = 0.000_100;
+        let cands = vec![healthy(pricey), healthy(cheap)];
+        let w = RouterWeights {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        let explain_with = |uniform: f64| {
+            explain_selection(
+                &cands,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                None,
+                &[],
+                BoonGrants::default(),
+                &w,
+                uniform,
+                &Intent::default(),
+            )
+        };
+        let argmax = explain_with(0.0);
+        assert_eq!(argmax.chosen.as_deref(), Some("cheap"));
+        assert!(
+            !argmax.sampled,
+            "landing on the argmax is not a sampled pick"
+        );
+        let drawn = explain_with(0.999);
+        assert_eq!(drawn.chosen.as_deref(), Some("pricey"));
+        assert!(drawn.sampled);
+        assert!(drawn.scored[1].chosen, "the marked row follows the draw");
+    }
+
+    #[test]
+    fn explain_reports_no_model_without_inventing_one() {
+        let mut small = model("small");
+        small.context_window = 4_000;
+        let cands = vec![healthy(small)];
+        let features = RequestFeatures {
+            est_input_tokens: 100_000,
+            max_tokens: 2_000,
+            ..Default::default()
+        };
+        let ex = explain_selection(
+            &cands,
+            &features,
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            &Intent::default(),
+        );
+        assert!(ex.chosen.is_none());
+        assert!(ex.scored.is_empty());
+        assert_eq!(ex.rejected.len(), 1);
+        assert_eq!(ex.rejected[0].reason, "context_window");
+    }
+
+    #[test]
+    fn explain_attributes_each_model_to_its_first_failing_filter() {
+        // Disabled *and* unhealthy *and* too small: only the first filter in
+        // the chain may claim it, or the collapsed counts double-count.
+        let mut broken = model("broken");
+        broken.enabled = false;
+        broken.context_window = 10;
+        let cands = vec![
+            Candidate {
+                model: broken,
+                healthy: false,
+                levels: Vec::new(),
+            },
+            healthy(model("ok")),
+        ];
+        let features = RequestFeatures {
+            est_input_tokens: 50_000,
+            ..Default::default()
+        };
+        let ex = explain_selection(
+            &cands,
+            &features,
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            &Intent::default(),
+        );
+        assert_eq!(ex.rejected.len(), 1);
+        assert_eq!(ex.rejected[0].reason, "disabled");
+        assert_eq!(ex.rejected[0].models, vec!["broken".to_string()]);
+    }
+
+    #[test]
+    fn explain_carries_intent_provenance_and_leaves_timing_to_the_caller() {
+        let cands = vec![healthy(model("only"))];
+        let intent = Intent {
+            tags: vec!["coding".to_string()],
+            difficulty: 2,
+            source: IntentSource::Classifier,
+        };
+        let ex = explain_selection(
+            &cands,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &intent.tags,
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            &intent,
+        );
+        assert_eq!(ex.difficulty, 2);
+        assert_eq!(ex.difficulty_source, IntentSource::Classifier);
+        assert_eq!(ex.tag_source, IntentSource::Classifier);
+        assert_eq!(ex.tags, vec!["coding".to_string()]);
+        assert_eq!(ex.classifier_ms, 0, "only the proxy knows the real timing");
+        assert!(serde_json::to_string(&ex).is_ok());
     }
 }

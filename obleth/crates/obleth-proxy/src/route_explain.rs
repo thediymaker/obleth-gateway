@@ -1,0 +1,67 @@
+//! Serializable account of one `auto` routing decision.
+//!
+//! The same shape is returned by the admin simulate endpoint and written into
+//! the `auto_route` span, so the dashboard renders a hypothetical and a real
+//! decision with one component, and a real decision can be replayed through the
+//! simulator unchanged.
+
+use serde::Serialize;
+
+/// One candidate that survived every hard filter, with the score components
+/// that produced its rank. Emitted in the router's own descending-score order.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScoredCandidate {
+    pub model: String,
+    /// Strength on the request's tier domains (see [`RouteExplain::tier_domains`]).
+    pub level: u8,
+    pub spare: f64,
+    pub cost_score: f64,
+    /// Fraction of the request's intent tags this model carries. Always `0.0`
+    /// when the request had no tags, matching the router's neutral path where
+    /// the tag term is skipped entirely rather than scored as a miss.
+    pub tag_score: f64,
+    pub bias: f64,
+    pub score: f64,
+    pub chosen: bool,
+}
+
+/// Candidates dropped by one hard filter, collapsed under that filter's name.
+/// Collapsing keeps the payload small enough to ride the span without a
+/// per-model row for the boring majority.
+#[derive(Debug, Clone, Serialize)]
+pub struct Rejection {
+    pub reason: &'static str,
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RouteExplain {
+    pub chosen: Option<String>,
+    pub difficulty: u8,
+    pub difficulty_source: crate::router::IntentSource,
+    pub tags: Vec<String>,
+    pub tag_source: crate::router::IntentSource,
+    /// Milliseconds spent in the intent classifier. Only the proxy call site
+    /// knows the real timing, so `explain_selection` always emits `0` and the
+    /// data plane overwrites it before the span is recorded. A `0` here from
+    /// the simulate endpoint is expected, not a bug.
+    pub classifier_ms: u32,
+    pub tier_domains: Vec<String>,
+    pub tier_floor: u8,
+    pub tier_floor_clamped: bool,
+    pub weights: WeightsView,
+    pub temperature: f64,
+    /// True when temperature sampling picked something other than the argmax.
+    pub sampled: bool,
+    pub scored: Vec<ScoredCandidate>,
+    pub rejected: Vec<Rejection>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct WeightsView {
+    pub capacity: f64,
+    pub cost: f64,
+    pub tag: f64,
+    pub soft_cap: f64,
+    pub difficulty_enabled: bool,
+}
