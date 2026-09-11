@@ -25,6 +25,7 @@ pub struct Metrics {
     upstream_attempts: IntCounterVec,
     jwt_verify: IntCounterVec,
     jwks_refresh: IntCounterVec,
+    knowledge_retrievals: IntCounterVec,
 }
 
 impl Metrics {
@@ -124,6 +125,14 @@ impl Metrics {
             &["issuer_index", "result"],
         )
         .unwrap();
+        let knowledge_retrievals = IntCounterVec::new(
+            Opts::new(
+                "obleth_knowledge_retrievals_total",
+                "Knowledge retrievals by outcome",
+            ),
+            &["outcome"],
+        )
+        .unwrap();
 
         registry.register(Box::new(requests.clone())).unwrap();
         registry.register(Box::new(tokens_in.clone())).unwrap();
@@ -146,6 +155,9 @@ impl Metrics {
             .unwrap();
         registry.register(Box::new(jwt_verify.clone())).unwrap();
         registry.register(Box::new(jwks_refresh.clone())).unwrap();
+        registry
+            .register(Box::new(knowledge_retrievals.clone()))
+            .unwrap();
 
         Metrics {
             registry,
@@ -164,6 +176,7 @@ impl Metrics {
             upstream_attempts,
             jwt_verify,
             jwks_refresh,
+            knowledge_retrievals,
         }
     }
 
@@ -218,6 +231,16 @@ impl Metrics {
     pub fn record_jwks_refresh(&self, issuer_idx: usize, result: &str) {
         self.jwks_refresh
             .with_label_values(&[&issuer_idx.to_string(), result])
+            .inc();
+    }
+
+    /// Record one knowledge-boon retrieval attempt. `outcome` is one of the
+    /// fixed set `hit`/`miss`/`no_query`/`error` — nothing request-derived
+    /// (collection id, model, tenant, query text) may ever become a label
+    /// here; per-tenant/per-collection breakdowns live in ClickHouse.
+    pub fn record_knowledge_retrieval(&self, outcome: &str) {
+        self.knowledge_retrievals
+            .with_label_values(&[outcome])
             .inc();
     }
 

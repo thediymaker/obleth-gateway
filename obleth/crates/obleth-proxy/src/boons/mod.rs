@@ -33,6 +33,7 @@ pub(crate) mod compressor;
 pub(crate) mod drain;
 pub(crate) mod embedded_json;
 pub(crate) mod guardrails;
+pub(crate) mod knowledge;
 pub mod mcp_tools;
 pub mod respond;
 pub(crate) mod structural_json;
@@ -48,6 +49,7 @@ use arc_swap::ArcSwap;
 use obleth_config::{
     BoonSettings, ResolvedKey, ResolvedModel, StructuredOutputBoonSettings, UsageRecord,
 };
+use obleth_tokenizer::Tokenizer;
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -305,6 +307,18 @@ impl BoonEngine {
             return outcome;
         }
 
+        // ---- knowledge boon, phase 1: capture the query ----
+        // The query is read BEFORE any compression pass, because the trailing user
+        // turn is itself an eligible compression target and a `[ref:HASH]` marker
+        // makes a meaningless retrieval query. Injection happens in phase 2, after
+        // compression, so the retrieved text reaches the model verbatim.
+        let knowledge_eligible = knowledge::eligible(route, &settings.knowledge, key, is_chat);
+        let knowledge_query = if knowledge_eligible {
+            knowledge::extract_query(json, settings.knowledge.query_turns)
+        } else {
+            None
+        };
+
         // ---- compression boon ----
         // All compression passes report under ONE `boon:compression` span: the
         // lossless structural/code pass here, then the reversible dedup + lossy
@@ -475,6 +489,56 @@ impl BoonEngine {
                     }),
                 );
             }
+        }
+
+        // ---- knowledge boon, phase 2: retrieve and inject ----
+        // Runs after every compression pass so `available_budget` measures the
+        // true post-compression prompt size, and so the injected block itself
+        // is never handed to a compression pass on this same request.
+        if knowledge_eligible {
+            let outcome_label = match knowledge_query.as_deref() {
+                None => "no_query",
+                Some(query) => {
+                    let start = crate::tracer::now_ms();
+                    let estimated = state.tokenizer.estimate_request(json).input_tokens;
+                    let retrieval =
+                        knowledge::apply(state, &settings.knowledge, route, estimated, query, json)
+                            .await;
+                    if retrieval.outcome == "hit" {
+                        outcome.rewritten = true;
+                        outcome.applied.push("knowledge");
+                    }
+                    if let Some(t) = tracer.as_deref_mut() {
+                        // Chunk ids and scores always; text only when explicitly
+                        // enabled, because it costs ~20x as much span storage.
+                        let chunks: Vec<Value> = retrieval
+                            .hits
+                            .iter()
+                            .map(|h| {
+                                let mut v =
+                                    serde_json::json!({"id": h.id.to_string(), "score": h.score});
+                                if settings.knowledge.debug_snapshot {
+                                    v["text"] = serde_json::json!(h.text);
+                                }
+                                v
+                            })
+                            .collect();
+                        t.record_elapsed(
+                            "boon:knowledge",
+                            "proxy_request",
+                            start,
+                            "ok",
+                            serde_json::json!({
+                                "chunks": chunks,
+                                "count": retrieval.hits.len(),
+                                "outcome": retrieval.outcome,
+                            }),
+                        );
+                    }
+                    retrieval.outcome
+                }
+            };
+            state.metrics.record_knowledge_retrieval(outcome_label);
         }
 
         // ---- structured-output boon ----
