@@ -50,7 +50,11 @@ export function BenchResultCard({ data }: { data: unknown }) {
         {r.grade && (
           <div className="flex shrink-0 flex-col items-end gap-0.5">
             <Badge className={GRADE_TONE[r.grade] ?? ""}>{r.grade} · {r.score ?? 0}/100</Badge>
-            {kneeFloor && <span className="text-[10px] text-muted-foreground">provisional — ramp capped</span>}
+            {kneeFloor && (
+              <span className="text-[10px] text-muted-foreground">
+                {r.capped ? "provisional — ramp capped" : "no degradation seen"}
+              </span>
+            )}
           </div>
         )}
       </div>

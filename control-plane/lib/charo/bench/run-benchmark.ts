@@ -1,7 +1,7 @@
 import type { CharoTool, ToolCtx, ToolProgress } from "@/lib/charo/tools/types";
 import type { BenchResult } from "./types";
 import { runRamp } from "./ramp";
-import { detectKnee, kneeConfirmed } from "./knee";
+import { detectKnee } from "./knee";
 import { scoreBench, gradeFromScore } from "./score";
 import { configFingerprint } from "./fingerprint";
 import { obleth } from "@/lib/obleth";
@@ -68,8 +68,8 @@ export const runBenchmarkTool: CharoTool<BenchArgs, BenchResult> = {
       onStep: (s) => emit({ kind: "bench_step", step: s }),
     });
 
-    const kneeConcurrency = detectKnee(steps);
-    const { score, findings } = scoreBench(steps, kneeConcurrency);
+    const knee = detectKnee(steps);
+    const { score, findings } = scoreBench(steps, knee);
     if (capped) findings.push(`Run stopped early: ${capped}.`);
 
     return {
@@ -77,7 +77,10 @@ export const runBenchmarkTool: CharoTool<BenchArgs, BenchResult> = {
       modelName: model.model_name,
       configFingerprint: configFingerprint(model, endpoints),
       startedAt: new Date().toISOString(),
-      steps, kneeConcurrency, kneeConfirmed: kneeConfirmed(steps, kneeConcurrency),
+      steps,
+      kneeConcurrency: knee.concurrency,
+      kneeConfirmed: knee.confirmed,
+      kneeReason: knee.reason,
       score, grade: gradeFromScore(score), findings,
       ...(capped ? { capped } : {}),
     };
