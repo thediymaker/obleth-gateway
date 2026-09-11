@@ -2,10 +2,11 @@
 
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { SpanEntry, UsageLogEntry } from "@/lib/obleth";
+import type { RouteExplainView, SpanEntry, UsageLogEntry } from "@/lib/obleth";
 import { formatDurationMs } from "@/lib/format";
 import { cn, formatCurrency } from "@/lib/utils";
 import { formatWh } from "@/components/request-logs";
+import { RouteExplainPanel } from "@/components/playground/route-explain";
 
 interface Props {
   row: UsageLogEntry;
@@ -110,9 +111,97 @@ function parseAttrs(raw: string): [string, string][] {
   }
 }
 
-interface SpanNode {
+export interface SpanNode {
   span: SpanEntry;
   children: SpanNode[];
+}
+
+/**
+ * Validates the subset of `RouteExplainView` that `RouteExplainPanel`
+ * (control-plane/components/playground/route-explain.tsx) dereferences with
+ * an array/string method call, `.toFixed()`, or an object destructure — the
+ * accesses that throw during render on a missing or mistyped field, rather
+ * than degrade. Full enumerated read list from that file, for reference:
+ *
+ *   - Read as plain JSX text or through `??`/a ternary, so `undefined`
+ *     renders harmlessly instead of throwing — NOT validated here:
+ *     `chosen`, `difficulty`, `difficulty_source`, `tag_source`,
+ *     `tier_floor`, `classifier_ms`, `sampled`, and each row's `model` /
+ *     `chosen`.
+ *   - Called with `.length`, `.join`, `.toFixed`, `.map`, or destructured as
+ *     an object — throws if missing/mistyped, so validated below:
+ *     `tags` (.length/.join), `tier_domains` (.length/.join), `temperature`
+ *     (.toFixed), `uniform` (.toFixed), `scored` (.map; each row's `score`,
+ *     and — only once a row is expanded — `spare`/`cost_score`/`tag_score`/
+ *     `bias`, all via `.toFixed`), `weights` (destructured for `capacity`/
+ *     `cost`/`tag`, read when any row is expanded), `rejected` (.length/
+ *     .map; each entry's `models` via `.join`).
+ *
+ * The expand-only fields (`weights`, and each row's `spare`/`cost_score`/
+ * `tag_score`/`bias`) are included even though they're behind a click,
+ * because a payload that renders fine collapsed and then throws the moment
+ * an operator expands a row is not an acceptable degradation either.
+ */
+function isValidRouteExplain(obj: Record<string, unknown>): boolean {
+  if (!Array.isArray(obj.tags)) return false;
+  if (!Array.isArray(obj.tier_domains)) return false;
+  if (typeof obj.temperature !== "number") return false;
+  if (typeof obj.uniform !== "number") return false;
+  if (!Array.isArray(obj.scored)) return false;
+  if (!Array.isArray(obj.rejected)) return false;
+
+  const weights = obj.weights;
+  if (
+    typeof weights !== "object" ||
+    weights === null ||
+    typeof (weights as Record<string, unknown>).capacity !== "number" ||
+    typeof (weights as Record<string, unknown>).cost !== "number" ||
+    typeof (weights as Record<string, unknown>).tag !== "number"
+  ) {
+    return false;
+  }
+
+  const rowsOk = obj.scored.every((row) => {
+    if (typeof row !== "object" || row === null) return false;
+    const r = row as Record<string, unknown>;
+    return (
+      typeof r.score === "number" &&
+      typeof r.spare === "number" &&
+      typeof r.cost_score === "number" &&
+      typeof r.tag_score === "number" &&
+      typeof r.bias === "number"
+    );
+  });
+  if (!rowsOk) return false;
+
+  return obj.rejected.every((entry) => {
+    if (typeof entry !== "object" || entry === null) return false;
+    return Array.isArray((entry as Record<string, unknown>).models);
+  });
+}
+
+/**
+ * Parses an `auto_route` span's attributes as the enriched `RouteExplainView`
+ * payload (Task 12), keying detection off `Array.isArray(scored)` — never a
+ * truthiness check on `candidates`, since the pre-upgrade payload carries
+ * `candidates` as a *number*, not an array — and then validating the rest of
+ * the shape `RouteExplainPanel` depends on (see `isValidRouteExplain`).
+ * Returns null for anything that doesn't fully match: unparseable JSON, the
+ * pre-upgrade `{ chosen, candidates, tags }` span, the gateway's
+ * serialization-failure fallback `{ chosen, error }`, and a `scored`-shaped
+ * payload that is missing or mistyping one of the other fields the panel
+ * reads — all of which fall back to raw rendering instead of crashing.
+ */
+export function parseRouteExplain(raw: string): RouteExplainView | null {
+  try {
+    const obj = JSON.parse(raw) as Record<string, unknown>;
+    if (obj && typeof obj === "object" && isValidRouteExplain(obj)) {
+      return obj as unknown as RouteExplainView;
+    }
+  } catch {
+    // Unparseable attributes: fall back to raw rendering below.
+  }
+  return null;
 }
 
 interface CanvasNode {
@@ -447,9 +536,10 @@ function parseAttrsRaw(raw: string): Record<string, unknown> {
   }
 }
 
-function SpanExpandDetail({ node, onClose }: { node: SpanNode; onClose: () => void }) {
+export function SpanExpandDetail({ node, onClose }: { node: SpanNode; onClose: () => void }) {
   const { span, children } = node;
   const allAttrs = parseAttrs(span.attributes);
+  const routeExplain = span.span_name === "auto_route" ? parseRouteExplain(span.attributes) : null;
 
   const iterChildren = children
     .filter((c) => c.span.span_name.startsWith("boon:tool_loop:iter:"))
@@ -481,17 +571,23 @@ function SpanExpandDetail({ node, onClose }: { node: SpanNode; onClose: () => vo
         </button>
       </div>
 
-      {allAttrs.length > 0 && (
-        <dl className="mb-3 grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3 lg:grid-cols-4">
-          {allAttrs.map(([k, v]) => (
-            <div key={k} className="flex min-w-0 flex-col gap-0.5">
-              <dt className="text-[10px] text-muted-foreground">{k}</dt>
-              <dd className="truncate font-mono text-[11px] text-foreground/75" title={v}>
-                {v}
-              </dd>
-            </div>
-          ))}
-        </dl>
+      {routeExplain ? (
+        <div className="mb-3">
+          <RouteExplainPanel explain={routeExplain} />
+        </div>
+      ) : (
+        allAttrs.length > 0 && (
+          <dl className="mb-3 grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3 lg:grid-cols-4">
+            {allAttrs.map(([k, v]) => (
+              <div key={k} className="flex min-w-0 flex-col gap-0.5">
+                <dt className="text-[10px] text-muted-foreground">{k}</dt>
+                <dd className="truncate font-mono text-[11px] text-foreground/75" title={v}>
+                  {v}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        )
       )}
 
       {iterChildren.length > 0 && (

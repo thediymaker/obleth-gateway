@@ -251,8 +251,12 @@ async fn proxy_handler_inner(
     // shape (estimated context size, required capabilities) and live load. From
     // here on, everything downstream — admission, budgets, caching, telemetry,
     // upstream dispatch — sees the concrete model as if the client named it.
-    let auto_start = crate::tracer::now_ms();
     let route = if model == crate::router::AUTO_MODEL_NAME {
+        // Span bookkeeping for the routing decision. Only the traced branch
+        // below reads it, so an untraced request does not pay for the clock
+        // read — nor does any non-auto request, which never enters this block.
+        let traced = tracer.is_some();
+        let auto_start = if traced { crate::tracer::now_ms() } else { 0 };
         let max_tokens = json.get("max_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
         let features = crate::router::RequestFeatures::from_request(
             &json,
@@ -268,41 +272,101 @@ async fn proxy_handler_inner(
             resolved.allowed_models.as_deref()
         };
 
-        // Derive intent tags: classifier (when enabled + resolvable) first,
-        // then cheap heuristics, then neutral capacity/cost routing.
+        // Single snapshot load for this request: reused for both tag
+        // derivation and scoring so `auto` costs exactly one settings read.
+        let router_settings = state.classifier.settings();
+
+        // Derive intent (tags + difficulty): explicit header first, then the
+        // classifier (when enabled + resolvable), then cheap heuristics, then a
+        // neutral default.
         let available_tags = union_candidate_tags(&candidates, allowed);
-        let desired_tags =
-            derive_desired_tags(&state, &json, est.input_tokens as u64, &available_tags).await;
+        let effort_header = headers.get("x-obleth-effort").and_then(|v| v.to_str().ok());
+        let classifier_start = if traced { crate::tracer::now_ms() } else { 0 };
+        let intent = derive_intent(
+            &state,
+            &json,
+            est.input_tokens as u64,
+            &available_tags,
+            &router_settings,
+            effort_header,
+        )
+        .await;
+        // Wall-clock around the whole of intent derivation (header parse,
+        // classifier round-trip when active, heuristic fallback otherwise), not
+        // an isolated classifier timer — `derive_intent` is where that round-trip
+        // happens, and it is nearly all of this span's time when the classifier
+        // is active and near-zero otherwise. Not claiming more precision than that.
+        // Measured only when something will read it; untraced, it was discarded.
+        let classifier_ms = if traced {
+            (crate::tracer::now_ms() - classifier_start) as u32
+        } else {
+            0
+        };
 
         // Boon-granted capabilities count as native in the hard filters: a
         // model carrying the structured_output boon can serve requests that
         // need it, because the boon engine emulates the capability.
         let grants = crate::router::BoonGrants::from_settings(&state.boons.settings());
-        match crate::router::select_model(
-            &candidates,
-            &features,
-            &busyness,
-            allowed,
-            &desired_tags,
-            grants,
-        ) {
+        let weights = crate::router::RouterWeights::from_settings(&router_settings);
+        // Exactly one draw per request, whichever branch runs below. The router
+        // only reads it when it samples, so at the default temperature of 0 —
+        // where the pick is the exact argmax — the clock read is skipped
+        // entirely. `samples()` is the router's own predicate, not a copy of its
+        // threshold.
+        let uniform = if weights.samples() {
+            crate::router::splitmix_uniform()
+        } else {
+            0.0
+        };
+        // Traced requests get the full explanation from a single `route()` call
+        // (one `evaluate`, one `uniform` draw) so the span describes exactly the
+        // sample that was served. Untraced requests call `select_model` instead,
+        // which asks for `Narration::Off` and builds no rejection/score data —
+        // that is the whole cost story for this feature: zero by default.
+        let picked = if let Some(ref mut t) = tracer {
+            let (picked, mut explain) = crate::router::route(
+                &candidates,
+                &features,
+                &busyness,
+                allowed,
+                &intent.tags,
+                grants,
+                &weights,
+                uniform,
+                &intent,
+            );
+            explain.classifier_ms = classifier_ms;
+            t.record(
+                "auto_route",
+                "proxy_request",
+                auto_start,
+                (crate::tracer::now_ms() - auto_start) as u32,
+                "ok",
+                serde_json::to_value(&explain).unwrap_or_else(|_| {
+                    serde_json::json!({
+                        "chosen": explain.chosen,
+                        "error": "explanation failed to serialize",
+                    })
+                }),
+            );
+            picked
+        } else {
+            crate::router::select_model(
+                &candidates,
+                &features,
+                &busyness,
+                allowed,
+                &intent.tags,
+                grants,
+                &weights,
+                uniform,
+                intent.difficulty,
+            )
+        };
+        match picked {
             Some(chosen) => {
                 tracing::debug!(chosen = %chosen.model_name, "auto-routed request");
                 model = chosen.model_name.clone();
-                if let Some(ref mut t) = tracer {
-                    t.record(
-                        "auto_route",
-                        "proxy_request",
-                        auto_start,
-                        (crate::tracer::now_ms() - auto_start) as u32,
-                        "ok",
-                        serde_json::json!({
-                            "chosen": chosen.model_name,
-                            "candidates": candidates.len(),
-                            "tags": desired_tags,
-                        }),
-                    );
-                }
                 Some(Arc::new(chosen))
             }
             None => {
@@ -1956,36 +2020,51 @@ fn union_candidate_tags(
     out
 }
 
-/// Intent tags for an `auto` request. Tries the classifier brain first (when
-/// enabled, configured, resolvable, and not itself `auto`), then falls back to
-/// cheap heuristics. Either may return empty, which routes on capacity/cost.
-async fn derive_desired_tags(
+/// Routing intent for an `auto` request. Precedence: explicit header, then the
+/// classifier brain (when enabled, configured, resolvable, and not itself
+/// `auto`), then cheap heuristics, then a neutral default. Every fallback
+/// lowers difficulty rather than raising it, so a slow or broken brain makes
+/// routing cheaper and never silently more expensive.
+async fn derive_intent(
     state: &AppState,
     json: &serde_json::Value,
     est_input_tokens: u64,
     available_tags: &[String],
-) -> Vec<String> {
-    let settings = state.classifier.settings();
+    settings: &obleth_config::AutoRouterSettings,
+    effort_header: Option<&str>,
+) -> crate::router::Intent {
+    let forced = crate::router::difficulty_from_header(effort_header);
+
     if settings.classifier_active() && !available_tags.is_empty() {
         if let Some(name) = settings.classifier_model.as_deref() {
             if name != crate::router::AUTO_MODEL_NAME {
                 if let Some(brain) = resolve_model(state, name).await {
                     let prompt = classifier_prompt(json);
                     if !prompt.trim().is_empty() {
-                        let tags = state
+                        let mut intent = state
                             .classifier
                             .classify(&state.http, &brain, &prompt, available_tags)
                             .await;
-                        if !tags.is_empty() {
-                            return tags;
+                        if !intent.tags.is_empty() {
+                            if let Some(d) = forced {
+                                intent.difficulty = d;
+                                intent.source = crate::router::IntentSource::Header;
+                            }
+                            return intent;
                         }
                     }
                 }
             }
         }
     }
+
     // Heuristic fallback (also used when the classifier is off or returns empty).
-    crate::router::heuristic_tags(json, est_input_tokens)
+    let mut intent = crate::router::heuristic_intent(json, est_input_tokens);
+    if let Some(d) = forced {
+        intent.difficulty = d;
+        intent.source = crate::router::IntentSource::Header;
+    }
+    intent
 }
 
 /// Build a compact prompt for the classifier: the system message (if any) plus
@@ -3167,9 +3246,11 @@ mod tests {
         is_models_endpoint, is_retryable_status, prepare_upstream_body, request_type_for_path,
         resolve_conversation, session_hash_order, tenant_active_now, weighted_order, RequestMeta,
     };
+    use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::http::HeaderMap;
     use chrono::{DateTime, TimeZone, Utc};
-    use obleth_config::{ResolvedEndpoint, ResolvedKey, WeeklyWindow};
+    use obleth_config::{ResolvedEndpoint, ResolvedKey, ResolvedModel, WeeklyWindow};
+    use std::collections::HashMap;
     use std::time::Duration;
     use uuid::Uuid;
 
@@ -3247,7 +3328,11 @@ mod tests {
     #[test]
     fn avoids_duplicate_v1_prefix() {
         assert_eq!(
-            build_upstream_url("https://inference.example.com/v1", "/v1/chat/completions", ""),
+            build_upstream_url(
+                "https://inference.example.com/v1",
+                "/v1/chat/completions",
+                ""
+            ),
             "https://inference.example.com/v1/chat/completions"
         );
     }
@@ -3496,6 +3581,7 @@ mod tests {
             supports_tool_choice: true,
             supports_vision: false,
             tags: Vec::new(),
+            declared_levels: Vec::new(),
             boons: Vec::new(),
             tool_servers: Vec::new(),
             request_timeout_secs: None,
@@ -3504,6 +3590,7 @@ mod tests {
             endpoint_selection_mode: obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
             debug_diagnostics: false,
             energy_slots_per_node: 0,
+            route_bias: 1.0,
             endpoints,
         }
     }
@@ -3910,5 +3997,81 @@ mod tests {
             device_id: "dev-1".into(),
         };
         assert_eq!(meta.device_id, "dev-1");
+    }
+
+    fn minimal_model(name: &str) -> ResolvedModel {
+        ResolvedModel {
+            model_name: name.to_string(),
+            upstream_model: name.to_string(),
+            api_base: "http://upstream".to_string(),
+            api_key: None,
+            model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
+            admission_weight: 100,
+            max_in_flight: None,
+            enabled: true,
+            cache_enabled: false,
+            cache_ttl_secs: 0,
+            input_cost_per_token: 0.0,
+            output_cost_per_token: 0.0,
+            cost_per_image: 0.0,
+            cost_per_audio_second: 0.0,
+            cost_per_character: 0.0,
+            context_window: 128_000,
+            supports_function_calling: true,
+            supports_system_messages: true,
+            supports_response_schema: true,
+            supports_tool_choice: true,
+            supports_vision: false,
+            tags: Vec::new(),
+            declared_levels: Vec::new(),
+            boons: Vec::new(),
+            tool_servers: Vec::new(),
+            request_timeout_secs: None,
+            max_retries: 0,
+            retry_backoff_ms: obleth_config::DEFAULT_RETRY_BACKOFF_MS,
+            endpoint_selection_mode: obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
+            debug_diagnostics: false,
+            energy_slots_per_node: 0,
+            route_bias: 1.0,
+            endpoints: Vec::new(),
+        }
+    }
+
+    // Regression guard for the `auto_route` span payload: this is the exact
+    // shape `route()` hands the tracer in `proxy_handler_inner`, and the
+    // dashboard renderer (Task 14) keys off `chosen`/`scored`/`rejected` by
+    // name. A silent field rename here must fail this test rather than show up
+    // as a blank panel later.
+    #[test]
+    fn auto_route_explanation_serializes_with_dashboard_keys() {
+        let candidates = vec![Candidate {
+            model: minimal_model("solo"),
+            healthy: true,
+            levels: Vec::new(),
+        }];
+        let (picked, mut explain) = crate::router::route(
+            &candidates,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            &Intent::default(),
+        );
+        assert_eq!(picked.map(|m| m.model_name), Some("solo".to_string()));
+        // Mirrors the overwrite the data plane performs before recording the
+        // span (see the `auto` branch of `proxy_handler_inner`).
+        explain.classifier_ms = 7;
+
+        let value = serde_json::to_value(&explain).expect("route explanation must serialize");
+        let obj = value
+            .as_object()
+            .expect("explanation must serialize to a JSON object");
+        assert!(obj.contains_key("chosen"), "missing `chosen`: {obj:?}");
+        assert!(obj.contains_key("scored"), "missing `scored`: {obj:?}");
+        assert!(obj.contains_key("rejected"), "missing `rejected`: {obj:?}");
+        assert_eq!(value["classifier_ms"], serde_json::json!(7));
     }
 }

@@ -26,6 +26,7 @@ import type {
 import { requireAdmin } from "@/lib/auth/roles";
 import { resolveRecipeById, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
 import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
+import { tagsInclude } from "@/lib/utils";
 
 export type ActionResult =
   | { ok: true; warnings?: string[] }
@@ -143,6 +144,7 @@ const modelFieldsSchema = {
   cost_per_audio_second: nonNegNumber(0),
   cost_per_character: nonNegNumber(0),
   energy_slots_per_node: z.preprocess(blankToUndef, z.coerce.number().int().nonnegative().default(0)),
+  route_bias: z.preprocess(blankToUndef, z.coerce.number().min(0.1).max(3).default(1)),
   context_window: positiveIntWithDefault(8192),
   admission_weight: positiveIntWithDefault(100),
   supports_function_calling: checkbox,
@@ -686,6 +688,7 @@ export async function createModelAction(
     cost_per_audio_second: formData.get("cost_per_audio_second"),
     cost_per_character: formData.get("cost_per_character"),
     energy_slots_per_node: formData.get("energy_slots_per_node"),
+    route_bias: formData.get("route_bias"),
     context_window: formData.get("context_window"),
     admission_weight: formData.get("admission_weight"),
     supports_function_calling: formData.get("supports_function_calling"),
@@ -718,7 +721,7 @@ export async function createModelAction(
       api_base: isSlurm ? "" : parsed.data.api_base,
       api_key: isSlurm ? null : strOrNull(formData.get("api_key")),
       max_in_flight: numOrNull(formData.get("max_in_flight")),
-      supports_vision: tags.includes("vision"),
+      supports_vision: tagsInclude(tags, "vision"),
       tags,
       boons: boonsFromForm(formData),
       tool_servers: toolServersFromForm(formData),
@@ -944,6 +947,7 @@ function toModelUpdateBody(model: ModelRoute) {
     cost_per_audio_second: model.cost_per_audio_second,
     cost_per_character: model.cost_per_character,
     energy_slots_per_node: model.energy_slots_per_node,
+    route_bias: model.route_bias,
     context_window: model.context_window,
     admission_weight: model.admission_weight,
     max_in_flight: model.max_in_flight,
@@ -994,6 +998,7 @@ export async function updateModelConnectionAction(
       cost_per_character: numOr(formData.get("cost_per_character"), current.cost_per_character),
       cost_per_audio_second: numOr(formData.get("cost_per_audio_second"), current.cost_per_audio_second),
       energy_slots_per_node: numOr(formData.get("energy_slots_per_node"), current.energy_slots_per_node),
+      route_bias: numOr(formData.get("route_bias"), current.route_bias),
       ...(newKey ? { api_key: newKey } : {}),
     }, { auditActor: session.email });
   } catch (e) {
@@ -1031,7 +1036,7 @@ export async function updateModelCapabilitiesAction(
       supports_system_messages: formData.get("supports_system_messages") === "on",
       supports_response_schema: formData.get("supports_response_schema") === "on",
       supports_tool_choice: formData.get("supports_tool_choice") === "on",
-      supports_vision: tags.includes("vision"),
+      supports_vision: tagsInclude(tags, "vision"),
       tags,
       boons: boonsFromForm(formData),
       tool_servers: toolServersFromForm(formData),
@@ -1410,12 +1415,27 @@ export async function setAlertSettingsAction(
   return { ok: true };
 }
 
+const autoRouterUpdateSchema = z.object({
+  classifier_enabled: z.boolean().optional(),
+  classifier_model: z.string().optional(),
+  classifier_timeout_ms: z.number().optional(),
+  capacity_weight: z.number().min(0).max(1).optional(),
+  cost_weight: z.number().min(0).max(1).optional(),
+  tag_weight: z.number().min(0).max(1).optional(),
+  default_soft_cap: z.number().int().min(1).optional(),
+  temperature: z.number().min(0).max(2).optional(),
+  difficulty_enabled: z.boolean().optional(),
+  tier_source: z.enum(["hybrid", "derived", "declared"]).optional(),
+});
+
 export async function setAutoRouterSettingsAction(
   body: UpdateAutoRouterSettings,
 ): Promise<ActionResult> {
   const session = await requireAdmin();
+  const parsed = autoRouterUpdateSchema.safeParse(body);
+  if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
   try {
-    await obleth.setAutoRouterSettings(body, { auditActor: session.email });
+    await obleth.setAutoRouterSettings(parsed.data, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
@@ -1575,16 +1595,27 @@ function numOr(v: FormDataEntryValue | null, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
-// Collects checked tag checkboxes (named `tag_<name>`) from a model form into
-// an array of tag names, e.g. { tag_coding: "on" } -> ["coding"].
+// Collects checked tag checkboxes (named `tag_<name>`) from a model form,
+// folding in each tag's paired strength level (`tag_level_<name>`, 1-3) into
+// a `base:level` string, e.g. { tag_coding: "on", tag_level_coding: "3" } ->
+// ["coding:3"]. Level 1 serializes as the bare tag name so an untouched
+// model's stored tags round-trip byte-identical; this mirrors the gateway's
+// `parse_tag_level` convention on the Rust side.
 function tagsFromForm(formData: FormData): string[] {
   const tags: string[] = [];
   for (const [key, value] of formData.entries()) {
-    if (key.startsWith("tag_") && value === "on") {
-      tags.push(key.slice("tag_".length));
-    }
+    if (!key.startsWith("tag_") || key.startsWith("tag_level_") || value !== "on") continue;
+    const base = key.slice("tag_".length);
+    const level = clampTagLevel(formData.get(`tag_level_${base}`));
+    tags.push(level > 1 ? `${base}:${level}` : base);
   }
   return tags;
+}
+
+function clampTagLevel(raw: FormDataEntryValue | null): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 1;
+  return Math.min(3, Math.max(1, Math.trunc(n)));
 }
 
 // Collects checked boon checkboxes (named `boon_<name>`) from a model form into

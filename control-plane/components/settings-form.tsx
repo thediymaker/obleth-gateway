@@ -32,7 +32,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { DestructiveConfirm } from "@/components/ui/destructive-confirm";
-import { cn } from "@/lib/utils";
+import { cn, tagsInclude } from "@/lib/utils";
 import type {
   AlertSettingsView,
   AutoRouterSettingsView,
@@ -361,6 +361,50 @@ export function AlertSettingsForm({ settings }: { settings: AlertSettingsView | 
   );
 }
 
+function ScoringSlider({
+  id,
+  label,
+  hint,
+  value,
+  onChange,
+  min,
+  max,
+  step,
+  valueLabel,
+}: {
+  id: string;
+  label: string;
+  hint: string;
+  value: number;
+  onChange: (value: number) => void;
+  min: number;
+  max: number;
+  step: number;
+  valueLabel?: string;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor={id}>{label}</Label>
+        <span className="text-xs font-medium tabular-nums text-foreground">
+          {valueLabel ?? value.toFixed(2)}
+        </span>
+      </div>
+      <input
+        id={id}
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+        className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-muted accent-foreground"
+      />
+      <p className="text-xs text-muted-foreground">{hint}</p>
+    </div>
+  );
+}
+
 export function AutoRouterSettingsForm({
   settings,
   models,
@@ -373,6 +417,17 @@ export function AutoRouterSettingsForm({
   const [enabled, setEnabled] = useState(settings?.classifier_enabled ?? false);
   const [model, setModel] = useState(settings?.classifier_model ?? "");
   const [timeout, setTimeoutMs] = useState(String(settings?.classifier_timeout_ms ?? 250));
+  const [capacityWeight, setCapacityWeight] = useState(settings?.capacity_weight ?? 0.6);
+  const [costWeight, setCostWeight] = useState(settings?.cost_weight ?? 0.4);
+  const [tagWeight, setTagWeight] = useState(settings?.tag_weight ?? 0.5);
+  const [softCap, setSoftCap] = useState(String(settings?.default_soft_cap ?? 8));
+  const [temperature, setTemperature] = useState(settings?.temperature ?? 0);
+  const [difficultyEnabled, setDifficultyEnabled] = useState(
+    settings?.difficulty_enabled ?? false,
+  );
+  const [tierSource, setTierSource] = useState<"hybrid" | "derived" | "declared">(
+    settings?.tier_source ?? "hybrid",
+  );
 
   function save() {
     setStatus(null);
@@ -380,6 +435,13 @@ export function AutoRouterSettingsForm({
       classifier_enabled: enabled,
       classifier_model: model.trim() ? model.trim() : "",
       classifier_timeout_ms: Number(timeout) || 250,
+      capacity_weight: capacityWeight,
+      cost_weight: costWeight,
+      tag_weight: tagWeight,
+      default_soft_cap: Number(softCap) || 8,
+      temperature,
+      difficulty_enabled: difficultyEnabled,
+      tier_source: tierSource,
     };
     start(async () => {
       const result = await setAutoRouterSettingsAction(body);
@@ -440,6 +502,109 @@ export function AutoRouterSettingsForm({
             />
           </div>
         </div>
+
+        <div className="space-y-4 border-t border-border/60 pt-4">
+          <div>
+            <div className="text-sm font-medium">Scoring</div>
+            <p className="mt-0.5 text-xs text-muted-foreground">
+              Weights used to rank candidates for an <code>auto</code> request. Changes apply
+              within 15 seconds, no restart required.
+            </p>
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <ScoringSlider
+              id="capacity_weight"
+              label="Capacity"
+              hint="How much idle capacity matters when choosing between models."
+              value={capacityWeight}
+              onChange={setCapacityWeight}
+              min={0}
+              max={1}
+              step={0.05}
+            />
+            <ScoringSlider
+              id="cost_weight"
+              label="Cost"
+              hint="How much price matters when choosing between models."
+              value={costWeight}
+              onChange={setCostWeight}
+              min={0}
+              max={1}
+              step={0.05}
+            />
+            <ScoringSlider
+              id="tag_weight"
+              label="Tag"
+              hint="How much a topic match matters, relative to capacity and cost."
+              value={tagWeight}
+              onChange={setTagWeight}
+              min={0}
+              max={1}
+              step={0.05}
+            />
+          </div>
+
+          <div className="grid gap-4 sm:grid-cols-2">
+            <ScoringSlider
+              id="temperature"
+              label="Temperature"
+              hint="0 always picks the top-scoring model. Higher values spread traffic across close scorers."
+              value={temperature}
+              onChange={setTemperature}
+              min={0}
+              max={2}
+              step={0.1}
+              valueLabel={temperature === 0 ? "Deterministic" : temperature.toFixed(1)}
+            />
+            <div className="space-y-1">
+              <Label htmlFor="default_soft_cap">Default soft cap</Label>
+              <Input
+                id="default_soft_cap"
+                type="number"
+                min={1}
+                value={softCap}
+                onChange={(e) => setSoftCap(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                Assumed concurrency ceiling for models with no explicit max in-flight limit.
+              </p>
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={difficultyEnabled}
+                onChange={(e) => setDifficultyEnabled(e.target.checked)}
+                className="h-4 w-4"
+              />
+              Difficulty tiering
+            </label>
+            <p className="text-xs text-muted-foreground">
+              Route harder requests to stronger models. Strength is ranked by price within each
+              topic unless a model declares its own level.
+            </p>
+          </div>
+
+          <div className="max-w-xs space-y-1">
+            <Label htmlFor="tier_source">Tier source</Label>
+            <select
+              id="tier_source"
+              value={tierSource}
+              onChange={(e) =>
+                setTierSource(e.target.value as "hybrid" | "derived" | "declared")
+              }
+              className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
+            >
+              <option value="hybrid">Hybrid</option>
+              <option value="derived">Derived from cost</option>
+              <option value="declared">Declared only</option>
+            </select>
+          </div>
+        </div>
+
         <Button onClick={save} disabled={pending}>
           {pending ? "Saving..." : "Save auto routing"}
         </Button>
@@ -644,7 +809,7 @@ export function BoonsSettingsForm({
   const [expanded, setExpanded] = useState<BoonSectionKey | null>(null);
 
   const visionModels = models.filter(
-    (m) => m.model_name !== "auto" && (m.supports_vision || (m.tags?.includes("vision") ?? false)),
+    (m) => m.model_name !== "auto" && (m.supports_vision || tagsInclude(m.tags, "vision")),
   );
   const chatModels = models.filter(
     (m) => m.model_name !== "auto" && (m.model_type ?? "chat") === "chat",
