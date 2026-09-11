@@ -302,6 +302,14 @@ pub struct DocumentView {
     pub status: String,
     pub error: Option<String>,
     pub chunk_count: i32,
+    /// True while a reindex was requested (a re-upload of identical content,
+    /// or an explicit reindex) but this document was already `indexing`, so
+    /// the request could not be applied immediately without letting a second
+    /// worker claim a document the first is still embedding. Only ever true
+    /// alongside `status: "indexing"` — the requesting call still succeeds
+    /// and this document's own in-flight run picks the request up once it
+    /// finishes, rather than nothing visibly happening.
+    pub reindex_requested: bool,
 }
 
 impl DocumentView {
@@ -316,6 +324,7 @@ impl DocumentView {
             status: d.status.clone(),
             error: d.error.clone(),
             chunk_count: d.chunk_count,
+            reindex_requested: d.reindex_requested,
         }
     }
 }
@@ -392,8 +401,12 @@ pub async fn upload_document(
             &text,
         )
         .await?;
-    // The document lands as `pending`; the background indexer picks it up
-    // within a few seconds.
+    // Usually lands as `pending`; the background indexer picks it up within a
+    // few seconds. The one exception is a re-upload of a document that is
+    // already `indexing` (identical content, corrected metadata): `status`
+    // stays `indexing` and `reindex_requested` is set instead, so this
+    // document's own in-flight run requeues it once that run finishes,
+    // rather than a second worker claiming it right now.
     let view = DocumentView::from_document(&doc);
     state
         .store
@@ -464,6 +477,14 @@ pub async fn reindex_collection(
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ReindexResult {
+    /// Every document in the collection is guaranteed a fresh index pass
+    /// after this call, and this count includes all of them -- but not all
+    /// of them start immediately. A document that was `pending`, `ready`, or
+    /// `failed` is reset to `pending` right now. A document that was already
+    /// `indexing` stays `indexing` (see `DocumentView::reindex_requested`)
+    /// and only starts its fresh pass once its current run finishes, so
+    /// "requeued" here means "will be re-indexed", not "is in the pending
+    /// queue as of this response".
     pub documents_requeued: u64,
 }
 

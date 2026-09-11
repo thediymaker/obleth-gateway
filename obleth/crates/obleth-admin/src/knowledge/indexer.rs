@@ -1,10 +1,18 @@
 //! Background indexing: pending document -> chunks -> vectors -> new generation.
 //!
-//! Work is claimed one document at a time with `for update skip locked`, so two
-//! workers never claim the same row concurrently. A worker that dies mid-document
-//! leaves the row `indexing`; `claim_pending_document`'s staleness window (see
-//! `KnowledgeBoonSettings::index_stale_after_secs`) reclaims it after a timeout
-//! rather than on a startup reset, because a startup reset would let a booting
+//! Work is claimed one document at a time with `for update skip locked`, so no
+//! two claims ever return the same row in the same instant. That is not the
+//! same as "two workers can never hold a document at once": a worker that
+//! dies mid-document leaves the row `indexing`, and `claim_pending_document`'s
+//! staleness window (see `KnowledgeBoonSettings::index_stale_after_secs`)
+//! deliberately lets a second worker reclaim it after a timeout, even if the
+//! first worker turns out to still be alive and embedding it -- that overlap
+//! is how stranded work is recovered at all, not a bug. What makes it safe is
+//! `knowledge_chunks_document_generation_ordinal_uq` (`0020`): only one of the
+//! two workers' commits can actually persist chunks for the document's
+//! generation, and the loser fails with `23505` rather than retrying (see
+//! `knowledge::commit_document_generation`). Recovery is timeout-based rather
+//! than a reset at startup because a startup reset would let a booting
 //! replica steal a document another replica is still actively embedding.
 //!
 //! Generations are scoped per-document (not per-collection): each document

@@ -1058,6 +1058,11 @@ export interface KnowledgeDocument {
   status: "pending" | "indexing" | "ready" | "failed";
   error: string | null;
   chunk_count: number;
+  // True only alongside status "indexing": a reindex was requested while
+  // this document was already indexing, and this document's own in-flight
+  // run will requeue it once that run finishes, rather than a second worker
+  // claiming it immediately.
+  reindex_requested: boolean;
 }
 
 // Mirrors `SearchHit` in obleth-admin/src/knowledge/mod.rs.
