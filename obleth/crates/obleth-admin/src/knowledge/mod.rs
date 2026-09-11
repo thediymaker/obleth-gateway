@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use base64::Engine;
 use obleth_config::{BoonSettings, KnowledgeBoonSettings};
-use obleth_store::knowledge::{KnowledgeCollection, KnowledgeDocument};
+use obleth_store::knowledge::{score_against, KnowledgeCollection, KnowledgeDocument};
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
@@ -492,22 +492,131 @@ pub async fn reindex_document(
     Ok(Json(view))
 }
 
-// ---- search (Task 8 implements retrieval) --------------------------------
+// ---- search ---------------------------------------------------------------
 
-/// STUB. Registered now so the router carries the route and the dashboard has
-/// a stable endpoint to call; real semantic retrieval (query embedding + top-k
-/// cosine search over the proxy slab) lands in Task 8. Always returns an
-/// empty array until then.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SearchQuery {
+    pub query: String,
+    #[serde(default)]
+    pub top_k: Option<u32>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SearchHit {
+    pub chunk_id: Uuid,
+    pub document_id: Uuid,
+    pub score: f32,
+    pub token_count: i32,
+    pub text: String,
+    /// Whether this hit would actually be injected under the collection's
+    /// current `min_score` threshold and `max_context_tokens` budget --
+    /// the whole reason this preview exists is to let an administrator tune
+    /// those two knobs by eye.
+    pub would_inject: bool,
+}
+
+/// Administrator-facing retrieval preview: embeds `query` with the model the
+/// collection's active generation was actually built with, cosine-scores
+/// every retrievable chunk, and reports which hits would actually be injected
+/// under the current knowledge-boon settings -- mirroring the boon's own
+/// packing rather than just thresholding on score. Reads Postgres directly,
+/// which is fine here: this is the Management API, not the request path.
 #[utoipa::path(
     post, path = "/api/v1/knowledge/collections/{id}/search", tag = "knowledge",
     params(("id" = Uuid, Path, description = "Collection id")),
-    responses((status = 200, body = [serde_json::Value]))
+    request_body = SearchQuery,
+    responses((status = 200, body = [SearchHit]), (status = 400), (status = 404))
 )]
 pub async fn search_collection(
-    State(_state): State<AdminState>,
-    Path(_id): Path<Uuid>,
-) -> Result<Json<Vec<serde_json::Value>>> {
-    Ok(Json(Vec::new()))
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    Json(body): Json<SearchQuery>,
+) -> Result<Json<Vec<SearchHit>>> {
+    let query = body.query.trim();
+    if query.is_empty() {
+        return Err(AdminError::BadRequest("query is required".into()));
+    }
+
+    let collection = state.store.get_collection(id).await?;
+    // `indexed_embedding_model` -- the embedder the *active* generation was
+    // actually built with -- not `embedding_model`, the operator's currently
+    // desired embedder. Those two differ exactly when an administrator has
+    // changed the embedder but a re-index has not finished yet
+    // (`collection.needs_reindex()`); embedding the query with the wrong
+    // model produces a plausible-looking but meaningless similarity score
+    // rather than an error, which is the worst failure mode available here.
+    if collection.indexed_embedding_model.is_empty() {
+        return Err(AdminError::BadRequest(
+            "collection has not been indexed yet; upload a document and wait for indexing to \
+             finish"
+                .into(),
+        ));
+    }
+
+    let settings = state
+        .store
+        .get_boon_settings()
+        .await?
+        .unwrap_or_default()
+        .knowledge;
+
+    let model = state
+        .store
+        .get_model_by_name(&collection.indexed_embedding_model)
+        .await?;
+    let target = embed::EmbedTarget {
+        api_base: model.api_base.clone(),
+        api_key: model.api_key.clone(),
+        upstream_model: model.upstream_model.clone(),
+    };
+    // `embed_timeout_ms` -- the hard bound documented for request-path query
+    // embedding -- not `index_timeout_ms`, which is the (looser) background
+    // indexing timeout. This preview issues the same kind of call the
+    // proxy's retrieval path will make later, not an indexing call.
+    let query_owned = query.to_string();
+    let query_vec = embed::embed_batch(
+        &state.health.http,
+        &target,
+        std::slice::from_ref(&query_owned),
+        std::time::Duration::from_millis(settings.embed_timeout_ms),
+    )
+    .await
+    .map_err(|e| AdminError::Internal(e.to_string()))?
+    .into_iter()
+    .next()
+    .unwrap_or_default();
+
+    let chunks = state.store.load_active_chunks(id).await?;
+    let vectors: Vec<Vec<f32>> = chunks.iter().map(|c| c.embedding.clone()).collect();
+    let top_k = body.top_k.unwrap_or(settings.top_k) as usize;
+    let scored = score_against(&query_vec, &vectors, top_k, settings.min_score);
+
+    // Mirror the boon's packing so `would_inject` tells the truth about what
+    // would actually be injected, not merely what scored well: walk hits in
+    // descending score order (guaranteed by `score_against`), subtracting
+    // `token_count` from a budget seeded at `max_context_tokens`, and mark a
+    // hit `would_inject: true` only while it still fits. A hit that scores
+    // well but blows the budget must show `false`.
+    let mut budget = settings.max_context_tokens as i64;
+    let hits = scored
+        .into_iter()
+        .map(|s| {
+            let c = &chunks[s.index];
+            let fits = budget >= c.token_count as i64;
+            if fits {
+                budget -= c.token_count as i64;
+            }
+            SearchHit {
+                chunk_id: c.id,
+                document_id: c.document_id,
+                score: s.score,
+                token_count: c.token_count,
+                text: c.text.clone(),
+                would_inject: fits,
+            }
+        })
+        .collect();
+    Ok(Json(hits))
 }
 
 // ---- model attachment -----------------------------------------------------
