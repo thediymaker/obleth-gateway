@@ -27,7 +27,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::{header::AUTHORIZATION, HeaderMap, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
-use axum::routing::{get, patch, post, put};
+use axum::routing::{delete, get, patch, post, put};
 use axum::{Json, Router};
 use obleth_config::routing::route_explain::RouteExplain;
 use obleth_config::routing::{
@@ -207,6 +207,40 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/models/:id/cache", put(set_model_cache))
         .route("/api/v1/models/:id/reliability", put(set_model_reliability))
         .route(
+            "/api/v1/models/:id/knowledge",
+            put(knowledge::set_model_collections),
+        )
+        .route(
+            "/api/v1/knowledge/collections",
+            post(knowledge::create_collection).get(knowledge::list_collections),
+        )
+        .route(
+            "/api/v1/knowledge/collections/:id",
+            get(knowledge::get_collection)
+                .put(knowledge::update_collection)
+                .delete(knowledge::delete_collection),
+        )
+        .route(
+            "/api/v1/knowledge/collections/:id/documents",
+            get(knowledge::list_documents).post(knowledge::upload_document),
+        )
+        .route(
+            "/api/v1/knowledge/collections/:id/reindex",
+            post(knowledge::reindex_collection),
+        )
+        .route(
+            "/api/v1/knowledge/collections/:id/search",
+            post(knowledge::search_collection),
+        )
+        .route(
+            "/api/v1/knowledge/documents/:id",
+            delete(knowledge::delete_document),
+        )
+        .route(
+            "/api/v1/knowledge/documents/:id/reindex",
+            post(knowledge::reindex_document),
+        )
+        .route(
             "/api/v1/recipes",
             get(recipes::list_recipes).post(recipes::create_recipe),
         )
@@ -272,6 +306,10 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/api/v1/settings/boons",
             get(get_boon_settings).put(put_boon_settings),
+        )
+        .route(
+            "/api/v1/settings/knowledge",
+            get(knowledge::get_knowledge_settings).put(knowledge::put_knowledge_settings),
         )
         .route(
             "/api/v1/settings/energy",
@@ -4677,6 +4715,11 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         .resolved_endpoints_for(model.id)
         .await
         .unwrap_or_default();
+    let knowledge_collections = state
+        .store
+        .model_collection_ids(model.id)
+        .await
+        .unwrap_or_default();
     let resolved = ResolvedModel {
         model_name: model.model_name.clone(),
         upstream_model: model.upstream_model.clone(),
@@ -4707,9 +4750,7 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         declared_levels: obleth_config::normalize_tag_levels(&model.tags),
         boons: model.boons.clone(),
         tool_servers: model.tool_servers.clone(),
-        // Task 7 wires this up from the real knowledge-collection assignment
-        // store method; until then no model grounds on anything.
-        knowledge_collections: Vec::new(),
+        knowledge_collections,
         request_timeout_secs: model.request_timeout_secs,
         max_retries: model.max_retries,
         retry_backoff_ms: model.retry_backoff_ms,

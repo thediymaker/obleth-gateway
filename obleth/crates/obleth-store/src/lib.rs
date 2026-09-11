@@ -1644,6 +1644,11 @@ impl Store {
                 .or_default()
                 .push(resolved_endpoint_from_row(row)?);
         }
+        // One bulk query over every model's knowledge-collection attachments,
+        // rather than one query per model — this runs on every proxy boot and
+        // on the 15s registry refresh, so per-model queries would scale with
+        // fleet size. See `knowledge::all_model_collection_ids`.
+        let mut collections_by_model = self.all_model_collection_ids().await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in &rows {
             let name: String = row.try_get("model_name")?;
@@ -1692,9 +1697,9 @@ impl Store {
                         .try_get::<sqlx::types::Json<Vec<String>>, _>("tool_servers")
                         .map(|j| j.0)
                         .unwrap_or_default(),
-                    // Task 7 wires this up from the real knowledge-collection
-                    // assignment table; until then no model grounds on anything.
-                    knowledge_collections: Vec::new(),
+                    knowledge_collections: collections_by_model
+                        .remove(&model_id)
+                        .unwrap_or_default(),
                     request_timeout_secs: row.try_get("request_timeout_secs")?,
                     max_retries: row.try_get("max_retries")?,
                     retry_backoff_ms: row.try_get("retry_backoff_ms")?,
