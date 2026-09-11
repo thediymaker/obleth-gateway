@@ -97,7 +97,7 @@ import { EditForm } from "@/components/edit-form";
 import { ProviderImportWizard } from "@/components/provider-import-wizard";
 import { RecipeList } from "@/components/recipes/recipe-list";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
-import { cn, formatNumber, getJson } from "@/lib/utils";
+import { cn, formatNumber, getJson, parseTagLevel, TAG_LEVEL_LABELS } from "@/lib/utils";
 import { useSearchParams } from "next/navigation";
 
 // Lets any control inside a model's detail panel signal a successful save so the
@@ -117,20 +117,6 @@ const MODEL_TAGS = [
   "fast",
   "creative",
 ] as const;
-
-// Splits a stored tag entry into its base name and strength level, mirroring
-// the gateway's `parse_tag_level`: base is everything before the first ':',
-// the level is the digit after it, and a missing or out-of-range level clamps
-// into 1..=3 rather than dropping the tag.
-function parseTagLevel(raw: string): { base: string; level: number } {
-  const idx = raw.indexOf(":");
-  if (idx === -1) return { base: raw, level: 1 };
-  const base = raw.slice(0, idx);
-  const level = Number(raw.slice(idx + 1));
-  return { base, level: Number.isFinite(level) ? Math.min(3, Math.max(1, Math.trunc(level))) : 1 };
-}
-
-const TAG_LEVEL_LABELS: Record<number, string> = { 1: "Basic", 2: "Strong", 3: "Best" };
 
 // Fixed boon vocabulary; mirrors obleth-config `MODEL_BOONS`. A boon grants a
 // capability the model lacks natively. Each boon is configured globally in
@@ -522,7 +508,10 @@ export function ModelManager({
                               {(model.tags?.length ?? 0) > 0 && (
                                 <span className="inline-flex items-center gap-1 text-[11px] text-muted-foreground">
                                   <Tag className="h-3 w-3" aria-hidden />
-                                  {model.tags!.join(" · ")}
+                                  {model
+                                    .tags!.map(parseTagLevel)
+                                    .map((t) => (t.declared ? `${t.base} (${TAG_LEVEL_LABELS[t.level]})` : t.base))
+                                    .join(" · ")}
                                 </span>
                               )}
                               {(model.boons?.length ?? 0) > 0 && (

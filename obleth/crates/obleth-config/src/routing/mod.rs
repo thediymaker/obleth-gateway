@@ -1331,7 +1331,7 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_tags_detect_code_and_vision() {
+    fn heuristic_intent_detects_code_and_vision() {
         let body = serde_json::json!({
             "messages": [
                 {"role": "user", "content": [
@@ -1346,7 +1346,7 @@ mod tests {
     }
 
     #[test]
-    fn heuristic_tags_long_context() {
+    fn heuristic_intent_tags_long_context() {
         let body = serde_json::json!({ "messages": [{"role": "user", "content": "hello"}] });
         let tags = heuristic_intent(&body, 40_000).tags;
         assert!(tags.contains(&"long-context".to_string()));
