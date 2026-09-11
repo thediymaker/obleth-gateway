@@ -19,12 +19,10 @@
 //! rather than two separate calls (a crash between them left a document `ready`
 //! with no live chunks, and no retry path could ever reclaim it).
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
-use arc_swap::ArcSwap;
-use obleth_config::{BoonSettings, KnowledgeBoonSettings};
+use obleth_config::KnowledgeBoonSettings;
 use obleth_store::knowledge::{ChunkInsert, KnowledgeDocument};
 use obleth_store::Store;
 use obleth_tokenizer::HeuristicTokenizer;
@@ -153,11 +151,23 @@ pub async fn index_document(
 }
 
 /// Poll for pending documents and index them one at a time.
-#[allow(dead_code)] // wired into a binary's startup in a later task
-pub fn spawn_indexer(store: Store, client: reqwest::Client, settings: Arc<ArcSwap<BoonSettings>>) {
+///
+/// Settings are read from the store on each iteration rather than accepted as
+/// a shared `Arc<ArcSwap<BoonSettings>>`: the proxy's `BoonEngine` already owns
+/// its settings inside its own `ArcSwap`, and there is no way for a caller to
+/// share that specific instance without introducing a second, independently
+/// refreshed settings source that could drift from the one the boon actually
+/// reads. Reading Postgres here is fine — this loop already polls every 5s and
+/// is explicitly allowed to read Postgres (unlike the request hot path).
+pub fn spawn_indexer(store: Store, client: reqwest::Client) {
     tokio::spawn(async move {
         loop {
-            let knowledge = settings.load().knowledge.clone();
+            let knowledge = store
+                .get_boon_settings()
+                .await
+                .unwrap_or_default()
+                .unwrap_or_default()
+                .knowledge;
             match store
                 .claim_pending_document(knowledge.index_stale_after_secs)
                 .await

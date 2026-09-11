@@ -7,6 +7,7 @@
 mod completion;
 mod energy;
 mod jwt_auth;
+mod knowledge;
 mod mcp;
 mod metrics;
 mod output_monitor;
@@ -181,6 +182,12 @@ async fn main() -> anyhow::Result<()> {
     };
     let energy = energy::EnergyEngine::new(initial_energy_settings);
 
+    // In-process knowledge-base index: the request path may not read Postgres,
+    // so the corpus is mirrored into memory and swapped wholesale, mirroring
+    // the model registry/classifier/boons pattern above. Starts empty and
+    // fills on the first refresh tick, so a large corpus never delays boot.
+    let knowledge = Arc::new(knowledge::KnowledgeIndex::new());
+
     // Alert settings are persisted in Postgres (app_settings, key='alerts') and
     // hot-reloadable at runtime. On boot, prefer the saved settings; otherwise
     // seed from the legacy env-configured Slack webhook so existing deployments
@@ -292,6 +299,7 @@ async fn main() -> anyhow::Result<()> {
         compressor: crate::boons::compressor::CompressorClient::from_env(),
         energy: energy.clone(),
         jwt,
+        knowledge: knowledge.clone(),
     };
 
     match store.all_resolved_models().await {
@@ -322,6 +330,25 @@ async fn main() -> anyhow::Result<()> {
     );
 
     energy::spawn_energy_poller(energy.clone(), http.clone(), alerts.clone());
+
+    // Keep the in-process knowledge index fresh: unchanged collections reuse
+    // their existing `Arc` (see `refresh_once`), so this is cheap once the
+    // corpus is stable. A Postgres error here leaves the last good index
+    // serving rather than clearing it — see `KnowledgeIndex::refresh_once`.
+    knowledge::KnowledgeIndex::spawn_refresh(
+        knowledge.clone(),
+        store.clone(),
+        Duration::from_secs(15),
+    );
+
+    // The background document indexer (chunk -> embed -> commit generation)
+    // has no other caller anywhere in the workspace: without this, an
+    // uploaded document sits at `status = 'pending'` forever. Every replica
+    // may run one — `for update skip locked` claiming, per-document
+    // generations, and the staleness reclaim together make concurrent
+    // indexers across replicas safe, so no singleton/leader election is
+    // needed here.
+    obleth_admin::knowledge::indexer::spawn_indexer(store.clone(), http.clone());
 
     match store.all_resolved_mcp_servers().await {
         Ok(servers) => {
