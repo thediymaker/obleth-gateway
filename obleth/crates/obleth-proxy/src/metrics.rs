@@ -235,8 +235,9 @@ impl Metrics {
     }
 
     /// Record one knowledge-boon retrieval attempt. `outcome` is one of the
-    /// fixed set `hit`/`miss`/`no_query`/`error` — nothing request-derived
-    /// (collection id, model, tenant, query text) may ever become a label
+    /// fixed set `hit`/`miss`/`no_query`/`error`/`no_window` — nothing
+    /// request-derived (collection id, model, tenant, query text) may ever
+    /// become a label
     /// here; per-tenant/per-collection breakdowns live in ClickHouse.
     pub fn record_knowledge_retrieval(&self, outcome: &str) {
         self.knowledge_retrievals

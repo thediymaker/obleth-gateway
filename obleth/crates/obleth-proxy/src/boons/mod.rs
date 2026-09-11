@@ -491,56 +491,6 @@ impl BoonEngine {
             }
         }
 
-        // ---- knowledge boon, phase 2: retrieve and inject ----
-        // Runs after every compression pass so `available_budget` measures the
-        // true post-compression prompt size, and so the injected block itself
-        // is never handed to a compression pass on this same request.
-        if knowledge_eligible {
-            let outcome_label = match knowledge_query.as_deref() {
-                None => "no_query",
-                Some(query) => {
-                    let start = crate::tracer::now_ms();
-                    let estimated = state.tokenizer.estimate_request(json).input_tokens;
-                    let retrieval =
-                        knowledge::apply(state, &settings.knowledge, route, estimated, query, json)
-                            .await;
-                    if retrieval.outcome == "hit" {
-                        outcome.rewritten = true;
-                        outcome.applied.push("knowledge");
-                    }
-                    if let Some(t) = tracer.as_deref_mut() {
-                        // Chunk ids and scores always; text only when explicitly
-                        // enabled, because it costs ~20x as much span storage.
-                        let chunks: Vec<Value> = retrieval
-                            .hits
-                            .iter()
-                            .map(|h| {
-                                let mut v =
-                                    serde_json::json!({"id": h.id.to_string(), "score": h.score});
-                                if settings.knowledge.debug_snapshot {
-                                    v["text"] = serde_json::json!(h.text);
-                                }
-                                v
-                            })
-                            .collect();
-                        t.record_elapsed(
-                            "boon:knowledge",
-                            "proxy_request",
-                            start,
-                            "ok",
-                            serde_json::json!({
-                                "chunks": chunks,
-                                "count": retrieval.hits.len(),
-                                "outcome": retrieval.outcome,
-                            }),
-                        );
-                    }
-                    retrieval.outcome
-                }
-            };
-            state.metrics.record_knowledge_retrieval(outcome_label);
-        }
-
         // ---- structured-output boon ----
         if route.boons.iter().any(|b| b == "structured_output")
             && !route.supports_response_schema
@@ -566,26 +516,17 @@ impl BoonEngine {
             }
         }
 
-        // The tool loop captures the fully enriched request body so follow-up
-        // turns re-dispatch with identical sampling parameters; its own
-        // dispatches are always non-streaming.
-        let tool_loop_plan = tool_loop_servers.map(|servers| {
-            let mut request = json.clone();
-            if let Some(obj) = request.as_object_mut() {
-                obj.insert("stream".into(), Value::Bool(false));
-                obj.remove("stream_options");
-            }
-            tool_loop::ToolLoopPlan {
-                tool_servers: servers,
-                request,
-                settings: settings.tool_loop.clone(),
-                passthrough_unmapped: client_sent_tools,
-            }
-        });
-
         // ---- guardrails boon (input scanning) ----
         // Guardrails are enabled per-tenant by the presence of a policy; there
         // is no global master switch. Internal probe keys are always exempt.
+        //
+        // Runs BEFORE the knowledge boon's phase 2 on purpose: guardrails scans
+        // every message including system content, so injecting the knowledge
+        // block first would let retrieved institutional text (an email address
+        // in a policy doc, the literal phrase "prompt injection" in an AI-use
+        // policy) trip a tenant's own PII/injection scanner and block a request
+        // the boon must never fail. `tracer` is reborrowed here (not moved) so
+        // it is still available for the knowledge span below.
         if !key.internal {
             if let Some(policy) = &key.guardrails_policy {
                 let guard_outcome = guardrails::apply_input(
@@ -595,7 +536,7 @@ impl BoonEngine {
                     key,
                     session_id,
                     json,
-                    tracer,
+                    tracer.as_deref_mut(),
                 )
                 .await;
                 if let Some(reason) = guard_outcome.blocked {
@@ -631,6 +572,82 @@ impl BoonEngine {
                 }
             }
         }
+
+        // ---- knowledge boon, phase 2: retrieve and inject ----
+        // Runs after every compression pass so `available_budget` measures the
+        // true post-compression prompt size, and so the injected block itself
+        // is never handed to a compression pass on this same request. Also
+        // runs after guardrails (see the comment above that block): a blocked
+        // request already returned above, so knowledge only ever touches a
+        // request that is going upstream, and its own injected text is never
+        // subjected to the tenant's input scanners.
+        if knowledge_eligible {
+            let outcome_label = match knowledge_query.as_deref() {
+                None => "no_query",
+                Some(_) if route.context_window <= 0 => "no_window",
+                Some(query) => {
+                    let start = crate::tracer::now_ms();
+                    let estimated = state.tokenizer.estimate_request(json).input_tokens;
+                    let retrieval =
+                        knowledge::apply(state, &settings.knowledge, route, estimated, query, json)
+                            .await;
+                    if retrieval.outcome == "hit" {
+                        outcome.rewritten = true;
+                        outcome.applied.push("knowledge");
+                    }
+                    // Last use of `tracer` in this function (nothing after phase
+                    // 2 needs it), so it is moved rather than reborrowed.
+                    if let Some(t) = tracer {
+                        // Chunk ids and scores always; text only when explicitly
+                        // enabled, because it costs ~20x as much span storage.
+                        let chunks: Vec<Value> = retrieval
+                            .hits
+                            .iter()
+                            .map(|h| {
+                                let mut v =
+                                    serde_json::json!({"id": h.id.to_string(), "score": h.score});
+                                if settings.knowledge.debug_snapshot {
+                                    v["text"] = serde_json::json!(h.text);
+                                }
+                                v
+                            })
+                            .collect();
+                        t.record_elapsed(
+                            "boon:knowledge",
+                            "proxy_request",
+                            start,
+                            "ok",
+                            serde_json::json!({
+                                "chunks": chunks,
+                                "count": retrieval.hits.len(),
+                                "outcome": retrieval.outcome,
+                            }),
+                        );
+                    }
+                    retrieval.outcome
+                }
+            };
+            state.metrics.record_knowledge_retrieval(outcome_label);
+        }
+
+        // The tool loop captures the fully enriched request body so follow-up
+        // turns re-dispatch with identical sampling parameters; its own
+        // dispatches are always non-streaming. Captured after the knowledge
+        // boon's phase 2 so a follow-up tool turn re-dispatches WITH the
+        // injected knowledge block, not without it.
+        let tool_loop_plan = tool_loop_servers.map(|servers| {
+            let mut request = json.clone();
+            if let Some(obj) = request.as_object_mut() {
+                obj.insert("stream".into(), Value::Bool(false));
+                obj.remove("stream_options");
+            }
+            tool_loop::ToolLoopPlan {
+                tool_servers: servers,
+                request,
+                settings: settings.tool_loop.clone(),
+                passthrough_unmapped: client_sent_tools,
+            }
+        });
 
         if structured_plan.is_some() || tool_loop_plan.is_some() {
             let existing_guardrails = outcome
@@ -1073,6 +1090,62 @@ mod tests {
         assert_eq!(
             build_chat_url("http://host:8080/v1"),
             "http://host:8080/v1/chat/completions"
+        );
+    }
+
+    /// The knowledge boon's two-phase split is an ordering property of
+    /// `enrich_request` itself — no test over the pure functions in
+    /// `boons::knowledge` can express "phase 1 runs before compression" or
+    /// "phase 2 runs after guardrails", and there is no `AppState` test
+    /// harness in this crate to exercise `enrich_request` end to end (only
+    /// `main.rs` builds one, and it would drag in Redis, fairshare, and
+    /// telemetry). So this asserts the invariant directly against this
+    /// file's own source, blunt as that is: it fails loudly if someone
+    /// reorders these blocks, which is the actual failure that must be
+    /// caught. See Task 11 fix round 1, item 5, and item 1 for why phase 2
+    /// must land after guardrails specifically (an injected chunk must never
+    /// be scanned and blocked by the tenant's own input scanners).
+    #[test]
+    fn knowledge_boon_phases_stay_in_source_order() {
+        let src = include_str!("mod.rs");
+        let phase1 = src
+            .find("knowledge boon, phase 1")
+            .expect("phase 1 marker comment");
+        let compression_apply = src
+            .find("compression::apply(")
+            .expect("lossless compression::apply call");
+        let apply_lossy = src
+            .find("compression::apply_lossy(")
+            .expect("apply_lossy call");
+        let guardrails_apply = src
+            .find("guardrails::apply_input(")
+            .expect("guardrails::apply_input call");
+        let phase2 = src
+            .find("knowledge boon, phase 2")
+            .expect("phase 2 marker comment");
+        let tool_loop_plan = src
+            .find("let tool_loop_plan = tool_loop_servers.map(")
+            .expect("tool_loop_plan binding");
+
+        assert!(
+            phase1 < compression_apply,
+            "the query must be captured before any compression pass touches the request"
+        );
+        assert!(
+            apply_lossy < phase2,
+            "phase 2 must run after every compression pass, or the injected \
+             block itself becomes an eligible compression target"
+        );
+        assert!(
+            guardrails_apply < phase2,
+            "phase 2 must run after guardrails' input scan, or a retrieved \
+             chunk can trip a tenant's own PII/injection scanner and block \
+             a request the boon must never fail"
+        );
+        assert!(
+            phase2 < tool_loop_plan,
+            "the tool loop's captured request must include the injected \
+             knowledge block, or every follow-up tool turn goes ungrounded"
         );
     }
 }
