@@ -14,6 +14,7 @@ export interface BenchResult {
   steps: StepOutcome[];
   kneeConcurrency: number | null;
   kneeConfirmed: boolean;      // true only if a higher step degraded above the knee (else knee is a floor, "≥")
+  kneeReason?: string | null;  // what ended the ramp; null when it finished without degrading
   score: number;               // 0–100
   grade: "A" | "B" | "C" | "D" | "F";
   findings: string[];
