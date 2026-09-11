@@ -658,6 +658,10 @@ pub struct CreateModel {
     /// 0 disables energy accounting for this model.
     #[serde(default)]
     pub energy_slots_per_node: Option<i64>,
+    /// Per-model multiplier on the `auto` router's final score. `1.0` is
+    /// neutral; the router clamps to `[0.1, 3.0]` before applying it.
+    #[serde(default)]
+    pub route_bias: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -697,6 +701,10 @@ pub struct UpdateModel {
     /// 0 disables energy accounting for this model.
     #[serde(default)]
     pub energy_slots_per_node: Option<i64>,
+    /// Per-model multiplier on the `auto` router's final score. `1.0` is
+    /// neutral; the router clamps to `[0.1, 3.0]` before applying it.
+    #[serde(default)]
+    pub route_bias: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -3393,6 +3401,7 @@ async fn create_model(
             &body.boons.clone().unwrap_or_default(),
             &body.tool_servers.clone().unwrap_or_default(),
             body.energy_slots_per_node.unwrap_or(0),
+            body.route_bias.unwrap_or(1.0),
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -3502,6 +3511,7 @@ async fn update_model(
                 .unwrap_or_else(|| existing.tool_servers.clone()),
             body.energy_slots_per_node
                 .unwrap_or(existing.energy_slots_per_node),
+            body.route_bias.unwrap_or(existing.route_bias),
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -4452,6 +4462,7 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         endpoint_selection_mode: model.endpoint_selection_mode.clone(),
         debug_diagnostics: model.debug_diagnostics,
         energy_slots_per_node: model.energy_slots_per_node,
+        route_bias: model.route_bias,
         endpoints,
     };
     if model.enabled {

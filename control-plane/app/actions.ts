@@ -143,6 +143,7 @@ const modelFieldsSchema = {
   cost_per_audio_second: nonNegNumber(0),
   cost_per_character: nonNegNumber(0),
   energy_slots_per_node: z.preprocess(blankToUndef, z.coerce.number().int().nonnegative().default(0)),
+  route_bias: z.preprocess(blankToUndef, z.coerce.number().min(0.1).max(3).default(1)),
   context_window: positiveIntWithDefault(8192),
   admission_weight: positiveIntWithDefault(100),
   supports_function_calling: checkbox,
@@ -686,6 +687,7 @@ export async function createModelAction(
     cost_per_audio_second: formData.get("cost_per_audio_second"),
     cost_per_character: formData.get("cost_per_character"),
     energy_slots_per_node: formData.get("energy_slots_per_node"),
+    route_bias: formData.get("route_bias"),
     context_window: formData.get("context_window"),
     admission_weight: formData.get("admission_weight"),
     supports_function_calling: formData.get("supports_function_calling"),
@@ -944,6 +946,7 @@ function toModelUpdateBody(model: ModelRoute) {
     cost_per_audio_second: model.cost_per_audio_second,
     cost_per_character: model.cost_per_character,
     energy_slots_per_node: model.energy_slots_per_node,
+    route_bias: model.route_bias,
     context_window: model.context_window,
     admission_weight: model.admission_weight,
     max_in_flight: model.max_in_flight,
@@ -994,6 +997,7 @@ export async function updateModelConnectionAction(
       cost_per_character: numOr(formData.get("cost_per_character"), current.cost_per_character),
       cost_per_audio_second: numOr(formData.get("cost_per_audio_second"), current.cost_per_audio_second),
       energy_slots_per_node: numOr(formData.get("energy_slots_per_node"), current.energy_slots_per_node),
+      route_bias: numOr(formData.get("route_bias"), current.route_bias),
       ...(newKey ? { api_key: newKey } : {}),
     }, { auditActor: session.email });
   } catch (e) {

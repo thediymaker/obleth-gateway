@@ -116,6 +116,8 @@ export interface ModelRoute {
   cost_per_audio_second: number;
   cost_per_character: number;
   energy_slots_per_node: number;
+  /** Multiplier on this model's auto-routing score. 1.0 is neutral. */
+  route_bias: number;
   context_window: number;
   admission_weight: number;
   max_in_flight: number | null;
