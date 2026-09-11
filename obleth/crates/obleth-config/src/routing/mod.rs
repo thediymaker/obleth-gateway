@@ -676,7 +676,7 @@ pub fn route(
         Narration::On,
     );
     let picked = ev.chosen.map(|i| ev.ordered[i].cand.model.clone());
-    (picked, narrate(ev, desired_tags, weights, intent))
+    (picked, narrate(ev, desired_tags, weights, intent, uniform))
 }
 
 /// Explain the decision [`select_model`] would make for these inputs, without
@@ -718,7 +718,7 @@ pub fn explain_selection(
         intent.difficulty,
         Narration::On,
     );
-    narrate(ev, desired_tags, weights, intent)
+    narrate(ev, desired_tags, weights, intent, uniform)
 }
 
 /// Render a finished [`Evaluation`] as the wire shape. Pure presentation: it
@@ -729,6 +729,7 @@ fn narrate(
     desired_tags: &[String],
     weights: &RouterWeights,
     intent: &Intent,
+    uniform: f64,
 ) -> route_explain::RouteExplain {
     route_explain::RouteExplain {
         chosen: ev
@@ -752,6 +753,9 @@ fn narrate(
             difficulty_enabled: weights.difficulty_enabled,
         },
         temperature: weights.temperature,
+        // Echoed verbatim, including at temperature 0 where it was ignored, so
+        // a caller can always replay this exact decision.
+        uniform,
         // Index-based: the draw moved the pick off the head of the list. See
         // the field's own docs for why that is not quite "beat the argmax".
         sampled: ev.chosen.is_some_and(|i| i != 0),
@@ -2343,6 +2347,45 @@ mod tests {
         assert_eq!(drawn.chosen.as_deref(), Some("pricey"));
         assert!(drawn.sampled);
         assert!(drawn.scored[1].chosen, "the marked row follows the draw");
+    }
+
+    /// The explanation echoes the draw it was made with, so a consumer diffing
+    /// two decisions can tell a weight effect from sampling noise — and can
+    /// replay either one exactly.
+    #[test]
+    fn explain_echoes_the_draw_it_used() {
+        let cands = varied_candidates();
+        let w = RouterWeights {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        for u in [0.0, 0.25, 0.75, 0.999] {
+            let ex = explain_selection(
+                &cands,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                None,
+                &[],
+                BoonGrants::default(),
+                &w,
+                u,
+                &Intent::default(),
+            );
+            assert_eq!(ex.uniform, u, "the reported draw must be the one used");
+            // Replaying the echoed draw reproduces the same pick.
+            let replay = explain_selection(
+                &cands,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                None,
+                &[],
+                BoonGrants::default(),
+                &w,
+                ex.uniform,
+                &Intent::default(),
+            );
+            assert_eq!(replay.chosen, ex.chosen);
+        }
     }
 
     #[test]

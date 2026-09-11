@@ -1672,9 +1672,15 @@ pub struct SimulateRouteRequest {
     #[serde(default)]
     pub prompt: Option<String>,
     /// An OpenAI-style `messages` array, for replaying a real request shape
-    /// (multi-turn, or multimodal parts the vision heuristic keys off).
+    /// (multi-turn, or multimodal parts the vision heuristic keys off). Must be
+    /// a JSON array when present.
     #[serde(default)]
     pub messages: Option<serde_json::Value>,
+    /// Requested completion budget. Counts toward the context-window filter
+    /// exactly as a real request's `max_tokens` does; absent means the request
+    /// does not pin one.
+    #[serde(default)]
+    pub max_tokens: Option<u64>,
     /// Apply this tenant's model allowlist.
     #[serde(default)]
     pub tenant_id: Option<String>,
@@ -1685,6 +1691,11 @@ pub struct SimulateRouteRequest {
     pub effort: Option<String>,
     #[serde(default)]
     pub needs_function_calling: bool,
+    /// The request pins a specific tool (`tool_choice` naming a function, or
+    /// `function_call`), which only models with native tool-choice support can
+    /// serve — no boon emulates it.
+    #[serde(default)]
+    pub needs_tool_choice: bool,
     #[serde(default)]
     pub needs_response_schema: bool,
     /// Weight overrides. Unset fields fall back to the saved settings.
@@ -1700,9 +1711,18 @@ pub struct SimulateRouteRequest {
     pub temperature: Option<f64>,
     #[serde(default)]
     pub difficulty_enabled: Option<bool>,
-    /// Pretend this many requests are in flight per model.
+    /// Pretend this many requests are in flight per model. **Absent means the
+    /// live fleet load**, which is what the gateway itself scores against —
+    /// this field is a what-if override, not the default.
     #[serde(default)]
     pub busyness: Option<std::collections::HashMap<String, usize>>,
+    /// Pin the softmax draw in `[0,1)`. Absent means a fresh random draw, as on
+    /// the request path. Pin it when comparing two simulations that differ only
+    /// in their weights: at `temperature > 0` two independent draws make
+    /// sampling noise look like an effect of the weight change. The draw that
+    /// was used is echoed back as `uniform`.
+    #[serde(default)]
+    pub uniform: Option<f64>,
 }
 
 /// Run the whole `auto` routing pipeline against the live fleet and return the
@@ -1710,13 +1730,20 @@ pub struct SimulateRouteRequest {
 ///
 /// Fidelity is the entire point, so this shares code with the data plane rather
 /// than reimplementing it: candidates come from [`Store::build_candidates`] (the
-/// same call the proxy's boot warm-up and 15s registry refresh make), tokens are
-/// counted with the same `obleth-tokenizer` estimator that feeds the real
-/// context-window filter, overrides are merged through the same
+/// same call the proxy's boot warm-up and 15s registry refresh make), busyness
+/// defaults to the same `fairshare.model_load()` the request path scores
+/// against, tokens are counted with the same `obleth-tokenizer` estimator that
+/// feeds the real context-window filter, overrides are merged through the same
 /// [`merge_auto_router`] that clamps a real settings write, and the verdict comes
 /// from `explain_selection`, which is the same `evaluate` the proxy serves from.
 /// A simulator that diverged on any of these would confidently show an operator
 /// a decision the gateway would never make.
+///
+/// Every request field is an *override* of a live input, never a replacement
+/// for one: omit `busyness` and the real fleet load is used, omit `uniform` and
+/// a fresh draw is taken. The draw that was used is always echoed back, so two
+/// simulations can be diffed without mistaking sampling noise for a weight
+/// effect.
 ///
 /// **This path never calls the classifier brain.** A simulation must not incur
 /// model calls or upstream latency, so intent is derived from `heuristic_intent`
@@ -1780,21 +1807,34 @@ async fn simulate_route(
         BoonGrants::from_settings(&state.store.get_boon_settings().await?.unwrap_or_default());
 
     // Rebuild an OpenAI-style body so token counting and feature detection read
-    // exactly what the data plane reads.
+    // exactly what the data plane reads. A `messages` that is present but not an
+    // array is the caller's mistake: silently simulating a blank prompt instead
+    // would answer a question they did not ask, which is the worst thing to hand
+    // someone debugging their routing.
     let messages = match body.messages {
         Some(serde_json::Value::Array(m)) => serde_json::Value::Array(m),
-        _ => serde_json::json!([{
+        Some(_) => {
+            return Err(AdminError::BadRequest(
+                "messages must be an array of chat messages".to_string(),
+            ))
+        }
+        None => serde_json::json!([{
             "role": "user",
             "content": body.prompt.unwrap_or_default(),
         }]),
     };
-    let json = serde_json::json!({ "model": "auto", "messages": messages });
+    let max_tokens = body.max_tokens.unwrap_or(0);
+    let mut json = serde_json::json!({ "model": "auto", "messages": messages });
+    if max_tokens > 0 {
+        json["max_tokens"] = serde_json::json!(max_tokens);
+    }
     let est = obleth_tokenizer::HeuristicTokenizer::new().estimate_request(&json);
     let est_input_tokens = est.input_tokens as u64;
-    // No completion budget is simulated: `max_tokens` is 0, i.e. a request that
-    // does not pin one. Required context is therefore the prompt estimate alone.
-    let mut features = RequestFeatures::from_request(&json, est_input_tokens, 0);
+    let mut features = RequestFeatures::from_request(&json, est_input_tokens, max_tokens);
+    // The three capability requirements the synthesized body cannot express on
+    // its own, OR-ed on so an explicit flag can only ever tighten the filters.
     features.needs_function_calling |= body.needs_function_calling;
+    features.needs_tool_choice |= body.needs_tool_choice;
     features.needs_response_schema |= body.needs_response_schema;
 
     let mut intent = heuristic_intent(&json, est_input_tokens);
@@ -1803,12 +1843,27 @@ async fn simulate_route(
         intent.source = IntentSource::Header;
     }
 
-    let busyness = body.busyness.unwrap_or_default();
+    // Spare capacity is one of the three terms an operator comes here to tune,
+    // so the default must be the live fleet load the gateway itself scores
+    // against — simulating a perfectly idle fleet would make `capacity_weight`
+    // look inert. An explicit `busyness` is a what-if override.
+    let busyness = body
+        .busyness
+        .unwrap_or_else(|| state.fairshare.model_load());
     // At the default temperature of 0 the draw is ignored and the pick is the
-    // exact argmax. Above it, production samples, so a real draw is what "what
-    // would the gateway do" actually means — `sampled` flags when it moved the
-    // pick off the head of the list.
-    let uniform = rand::thread_rng().gen_range(0.0..1.0);
+    // exact argmax. Above it production samples, so an unpinned simulation draws
+    // too. A caller comparing two simulations must pin the same draw across
+    // both, or the sampling difference reads as a weight effect; the draw used
+    // is echoed back in the response either way.
+    let uniform = match body.uniform {
+        Some(u) if u.is_finite() => u.clamp(0.0, 0.999_999_999),
+        Some(_) => {
+            return Err(AdminError::BadRequest(
+                "uniform must be a finite number in [0,1)".to_string(),
+            ))
+        }
+        None => rand::thread_rng().gen_range(0.0..1.0),
+    };
 
     Ok(Json(explain_selection(
         &candidates,
@@ -4725,9 +4780,57 @@ mod tests {
             Some(url)
         }
 
+        /// A fixture model with sane defaults. Caller owns the returned row and
+        /// must delete it.
+        pub(super) async fn fixture_model(
+            store: &Store,
+            name: &str,
+            input_cost_per_token: f64,
+        ) -> ModelRoute {
+            store
+                .create_model(
+                    name,
+                    "",
+                    name,
+                    "http://upstream.invalid",
+                    None,
+                    obleth_config::DEFAULT_MODEL_TYPE,
+                    input_cost_per_token,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    128_000,
+                    100,
+                    Some(4),
+                    true,
+                    true,
+                    true,
+                    true,
+                    false,
+                    &["coding".to_string()],
+                    &[],
+                    &[],
+                    0,
+                    1.0,
+                )
+                .await
+                .expect("create fixture model")
+        }
+
+        /// The real `/api/v1` router plus the handles a test may need to set up
+        /// live state the handlers read.
+        pub(super) struct TestApp {
+            pub(super) app: Router,
+            pub(super) store: Store,
+            /// Same instance the router's `AdminState` holds, so admitting a
+            /// request here is visible to a handler as real fleet load.
+            pub(super) fairshare: FairShare,
+        }
+
         /// The real `/api/v1` router, wired to the integration datastores.
         /// Returns `None` (test skips) when either is unconfigured.
-        pub(super) async fn test_admin_app() -> Option<(Router, Store)> {
+        pub(super) async fn test_admin_app() -> Option<TestApp> {
             let db_url = test_db_url()?;
             let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
 
@@ -4768,7 +4871,11 @@ mod tests {
                 alerts,
                 local_cache_tx: None,
             };
-            Some((router(state), store))
+            Some(TestApp {
+                app: router(state),
+                store,
+                fairshare,
+            })
         }
 
         pub(super) async fn send(
@@ -4798,18 +4905,18 @@ mod tests {
         }
     }
 
-    use harness::{send, simulate_request, test_admin_app, TEST_ADMIN_TOKEN};
+    use harness::{fixture_model, send, simulate_request, test_admin_app, TEST_ADMIN_TOKEN};
 
     /// The simulator sits behind the same bearer gate as every other write-side
     /// route: it reads the whole model fleet and every tenant's allowlist.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn simulate_requires_admin() {
-        let Some((app, _store)) = test_admin_app().await else {
+        let Some(t) = test_admin_app().await else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
             return;
         };
         let (status, _) = send(
-            &app,
+            &t.app,
             simulate_request(None, serde_json::json!({ "prompt": "hello" })),
         )
         .await;
@@ -4821,43 +4928,15 @@ mod tests {
     /// assertions so a failure cannot leave a row behind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn simulate_returns_an_explanation_without_dispatching() {
-        let Some((app, store)) = test_admin_app().await else {
+        let Some(t) = test_admin_app().await else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
             return;
         };
         let name = format!("m-{}", Uuid::new_v4());
-        let model = store
-            .create_model(
-                &name,
-                "",
-                &name,
-                "http://upstream.invalid",
-                None,
-                obleth_config::DEFAULT_MODEL_TYPE,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                0.0,
-                128_000,
-                100,
-                None,
-                true,
-                true,
-                true,
-                true,
-                false,
-                &["coding".to_string()],
-                &[],
-                &[],
-                0,
-                1.0,
-            )
-            .await
-            .expect("create fixture model");
+        let model = fixture_model(&t.store, &name, 0.0).await;
 
         let (status, body) = send(
-            &app,
+            &t.app,
             simulate_request(
                 Some(TEST_ADMIN_TOKEN),
                 serde_json::json!({ "prompt": "write a python function" }),
@@ -4865,7 +4944,7 @@ mod tests {
         )
         .await;
 
-        let _ = store.delete_model(model.id).await;
+        let _ = t.store.delete_model(model.id).await;
 
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert!(body.get("scored").is_some());
@@ -4901,18 +4980,19 @@ mod tests {
     /// the tuner shows a ranking no saved configuration could produce.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn simulate_clamps_weight_overrides_like_a_settings_write() {
-        let Some((app, store)) = test_admin_app().await else {
+        let Some(t) = test_admin_app().await else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
             return;
         };
-        let saved = store
+        let saved = t
+            .store
             .get_auto_router_settings()
             .await
             .expect("read settings")
             .unwrap_or_default();
 
         let (status, body) = send(
-            &app,
+            &t.app,
             simulate_request(
                 Some(TEST_ADMIN_TOKEN),
                 serde_json::json!({
@@ -4944,12 +5024,12 @@ mod tests {
     /// report the same `header` provenance the data plane records.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn simulate_reports_the_effort_override_as_a_header_source() {
-        let Some((app, _store)) = test_admin_app().await else {
+        let Some(t) = test_admin_app().await else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
             return;
         };
         let (status, body) = send(
-            &app,
+            &t.app,
             simulate_request(
                 Some(TEST_ADMIN_TOKEN),
                 serde_json::json!({ "prompt": "hello", "effort": "high" }),
@@ -4964,12 +5044,12 @@ mod tests {
     /// A malformed tenant id is the caller's mistake, not a 500.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn simulate_rejects_a_malformed_tenant_id() {
-        let Some((app, _store)) = test_admin_app().await else {
+        let Some(t) = test_admin_app().await else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
             return;
         };
         let (status, _) = send(
-            &app,
+            &t.app,
             simulate_request(
                 Some(TEST_ADMIN_TOKEN),
                 serde_json::json!({ "prompt": "hello", "tenant_id": "not-a-uuid" }),
@@ -4977,6 +5057,207 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Answering a malformed request with a simulation of a blank prompt is the
+    /// worst thing to hand someone who is debugging their routing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_rejects_non_array_messages() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let (status, _) = send(
+            &t.app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({ "messages": { "role": "user", "content": "hi" } }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// Omitting `busyness` must score against the *live* fleet load, the same
+    /// input the request path passes. Simulating a perfectly idle fleet would
+    /// make `capacity_weight` look inert in the tuner: the term it scales would
+    /// be a constant 1.0 for every candidate.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_defaults_busyness_to_the_live_fleet_load() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let name = format!("m-{}", Uuid::new_v4());
+        let model = fixture_model(&t.store, &name, 0.0).await;
+
+        // Occupy 2 of the fixture's 4 in-flight slots, and hold the permits for
+        // the duration of the call so the scheduler still reports them.
+        let tenant = Uuid::new_v4();
+        let mut permits = Vec::new();
+        for _ in 0..2 {
+            let admitted = t
+                .fairshare
+                .admit(obleth_fairshare::AdmitRequest {
+                    tenant,
+                    weight: 100,
+                    group: "default".to_string(),
+                    group_weight: 100,
+                    model: name.clone(),
+                    model_max_in_flight: Some(4),
+                    cost: 1,
+                })
+                .await
+                .expect("admitted");
+            permits.push(admitted);
+        }
+        let live = t.fairshare.model_load();
+        assert_eq!(
+            live.get(&name).copied(),
+            Some(2),
+            "the scheduler must be reporting the load this test set up"
+        );
+
+        // Same request twice: once letting the default apply, once passing the
+        // live map explicitly. They must agree — i.e. the default *is* the live
+        // load, not an empty map.
+        let defaulted = send(
+            &t.app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({ "prompt": "hello", "uniform": 0.0 }),
+            ),
+        )
+        .await;
+        let explicit = send(
+            &t.app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({ "prompt": "hello", "uniform": 0.0, "busyness": live }),
+            ),
+        )
+        .await;
+        // And an explicitly idle fleet, which must differ — otherwise the two
+        // assertions above would pass even if busyness were ignored entirely.
+        let idle = send(
+            &t.app,
+            simulate_request(
+                Some(TEST_ADMIN_TOKEN),
+                serde_json::json!({
+                    "prompt": "hello",
+                    "uniform": 0.0,
+                    "busyness": serde_json::json!({}),
+                }),
+            ),
+        )
+        .await;
+
+        drop(permits);
+        let _ = t.store.delete_model(model.id).await;
+
+        assert_eq!(defaulted.0, StatusCode::OK, "body: {}", defaulted.1);
+        let spare_of = |body: &serde_json::Value| -> f64 {
+            body["scored"]
+                .as_array()
+                .expect("scored is an array")
+                .iter()
+                .find(|s| s["model"] == serde_json::json!(name))
+                .unwrap_or_else(|| panic!("fixture missing from the ranking: {body}"))["spare"]
+                .as_f64()
+                .expect("spare is a number")
+        };
+        assert_eq!(
+            spare_of(&defaulted.1),
+            spare_of(&explicit.1),
+            "omitting busyness must score against the live fleet load"
+        );
+        assert_eq!(
+            spare_of(&defaulted.1),
+            0.5,
+            "2 of 4 slots taken is half spare capacity"
+        );
+        assert_eq!(
+            spare_of(&idle.1),
+            1.0,
+            "an explicitly idle override must still be honoured"
+        );
+    }
+
+    /// The tuner calls this endpoint twice — saved weights vs. edited weights —
+    /// and shows the difference. With independent draws above temperature 0,
+    /// sampling noise would be attributed to the operator's edit, so the draw
+    /// must be pinnable and must be echoed back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn simulate_pins_the_draw_so_two_runs_are_comparable() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        // Two models with clearly different costs, isolated from whatever else
+        // lives in the shared test database by a tenant allowlist.
+        let cheap = format!("m-cheap-{}", Uuid::new_v4());
+        let dear = format!("m-dear-{}", Uuid::new_v4());
+        let cheap_row = fixture_model(&t.store, &cheap, 0.000_001).await;
+        let dear_row = fixture_model(&t.store, &dear, 0.001).await;
+        let tenant = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        t.store
+            .update_tenant_allowlist(tenant.id, Some(vec![cheap.clone(), dear.clone()]))
+            .await
+            .expect("set allowlist");
+
+        let simulate = |uniform: f64| {
+            let app = t.app.clone();
+            let tenant_id = tenant.id.to_string();
+            async move {
+                send(
+                    &app,
+                    simulate_request(
+                        Some(TEST_ADMIN_TOKEN),
+                        serde_json::json!({
+                            "prompt": "hello",
+                            "tenant_id": tenant_id,
+                            "temperature": 2.0,
+                            "uniform": uniform,
+                        }),
+                    ),
+                )
+                .await
+            }
+        };
+        let first = simulate(0.0).await;
+        let again = simulate(0.0).await;
+        let other = simulate(0.999).await;
+
+        let _ = t.store.delete_model(cheap_row.id).await;
+        let _ = t.store.delete_model(dear_row.id).await;
+        let _ = t.store.delete_tenant(tenant.id).await;
+
+        assert_eq!(first.0, StatusCode::OK, "body: {}", first.1);
+        assert_eq!(
+            first.1["uniform"],
+            serde_json::json!(0.0),
+            "the draw used must be echoed back"
+        );
+        assert_eq!(other.1["uniform"], serde_json::json!(0.999));
+        assert_eq!(
+            first.1["chosen"], again.1["chosen"],
+            "the same pinned draw and the same weights must give the same pick"
+        );
+        assert_eq!(
+            first.1["scored"], again.1["scored"],
+            "a pinned draw makes the whole ranking reproducible"
+        );
+        // Only two candidates survive the allowlist, and at temperature 2.0 a
+        // draw at the far end of the mass lands on the runner-up — so the
+        // pinning above is doing real work, not describing a degenerate case.
+        assert_ne!(
+            first.1["chosen"], other.1["chosen"],
+            "different pinned draws must be able to move the pick"
+        );
     }
 
     /// A handler can carry `#[utoipa::path]` and still be missing from the
