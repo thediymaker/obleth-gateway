@@ -32,11 +32,10 @@ pub struct RouterWeights {
     pub cost: f64,
     pub tag: f64,
     pub soft_cap: f64,
-    // Not yet consumed by `select_model`: softmax sampling and the difficulty
-    // tier filter land in later steps of the auto-router-tuner plan, which is
-    // why these are threaded through now instead of being added alongside
-    // their own consumers.
-    #[allow(dead_code)]
+    // `temperature` now feeds the softmax sampling in `select_model`.
+    // `difficulty_enabled` is not yet consumed: the difficulty tier filter
+    // lands in a later step of the auto-router-tuner plan, which is why it is
+    // threaded through now instead of being added alongside its own consumer.
     pub temperature: f64,
     #[allow(dead_code)]
     pub difficulty_enabled: bool,
@@ -180,6 +179,14 @@ impl BoonGrants {
 /// `desired_tags` are the intent tags derived for this request (by the
 /// classifier or heuristics). When non-empty, candidates whose tags overlap
 /// the desired set are preferred; when empty, selection is pure capacity/cost.
+///
+/// `uniform` is a draw in `[0,1)` used for softmax sampling when
+/// `weights.temperature` is above zero; it is ignored (and the pick is exact
+/// argmax) at the default temperature of `0.0`. Callers pass the draw in
+/// rather than `select_model` generating it, so the function stays pure and
+/// synchronous and can be exercised deterministically by tests and the
+/// simulate endpoint.
+#[allow(clippy::too_many_arguments)]
 pub fn select_model(
     candidates: &[Candidate],
     features: &RequestFeatures,
@@ -188,6 +195,7 @@ pub fn select_model(
     desired_tags: &[String],
     grants: BoonGrants,
     weights: &RouterWeights,
+    uniform: f64,
 ) -> Option<ResolvedModel> {
     let required_context = features
         .est_input_tokens
@@ -239,7 +247,7 @@ pub fn select_model(
     let max_cost = costs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let cost_span = max_cost - min_cost;
 
-    let mut best: Option<(&Candidate, f64)> = None;
+    let mut scored: Vec<(f64, &Candidate)> = Vec::with_capacity(eligible.len());
     for (cand, cost) in eligible.iter().zip(costs.iter()) {
         let in_flight = busyness.get(&cand.model.model_name).copied().unwrap_or(0) as f64;
         let cap = match cand.model.max_in_flight {
@@ -268,21 +276,54 @@ pub fn select_model(
             let tag_score = (overlap as f64 / desired_tags.len() as f64).min(1.0);
             weights.tag * tag_score + (1.0 - weights.tag) * base
         };
-        let better = match best {
-            None => true,
-            Some((cur, cur_score)) => {
-                // Higher score wins; break ties deterministically by name.
-                score > cur_score + f64::EPSILON
-                    || ((score - cur_score).abs() <= f64::EPSILON
-                        && cand.model.model_name < cur.model.model_name)
-            }
-        };
-        if better {
-            best = Some((cand, score));
-        }
+        scored.push((score, cand));
     }
 
-    best.map(|(cand, _)| cand.model.clone())
+    // Deterministic order first: descending score, ties broken by name ascending.
+    // This ordering is also what makes sampling reproducible given a fixed draw.
+    scored.sort_by(|a, b| {
+        b.0.partial_cmp(&a.0)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.1.model.model_name.cmp(&b.1.model.model_name))
+    });
+
+    if weights.temperature <= f64::EPSILON {
+        return scored.first().map(|(_, c)| c.model.clone());
+    }
+
+    // Softmax over scores, shifted by the max for numerical stability.
+    let max = scored[0].0;
+    let exps: Vec<f64> = scored
+        .iter()
+        .map(|(s, _)| ((s - max) / weights.temperature).exp())
+        .collect();
+    let total: f64 = exps.iter().sum();
+    if !total.is_finite() || total <= 0.0 {
+        return scored.first().map(|(_, c)| c.model.clone());
+    }
+    let target = uniform.clamp(0.0, 1.0) * total;
+    let mut acc = 0.0;
+    for (exp, (_, cand)) in exps.iter().zip(scored.iter()) {
+        acc += exp;
+        if acc >= target {
+            return Some(cand.model.clone());
+        }
+    }
+    scored.last().map(|(_, c)| c.model.clone())
+}
+
+/// One uniform draw in `[0,1)`. Dependency-free splitmix64 seeded from the
+/// clock, matching `weighted_order` in proxy.rs — obleth-proxy deliberately
+/// carries no `rand` dependency.
+pub fn splitmix_uniform() -> f64 {
+    let mut z = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9e37_79b9_7f4a_7c15)
+        .wrapping_add(0x9e37_79b9_7f4a_7c15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    ((z ^ (z >> 31)) as f64 / u64::MAX as f64).clamp(0.0, 0.999_999_999)
 }
 
 /// Cheap, dependency-free intent tags derived from the request body. Used as a
@@ -450,6 +491,7 @@ mod tests {
             &[],
             BoonGrants::default(),
             &RouterWeights::default(),
+            0.0,
         );
         assert!(chosen.is_none());
     }
@@ -474,6 +516,7 @@ mod tests {
             &[],
             BoonGrants::default(),
             &RouterWeights::default(),
+            0.0,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "large");
@@ -496,7 +539,8 @@ mod tests {
             None,
             &[],
             BoonGrants::default(),
-            &RouterWeights::default()
+            &RouterWeights::default(),
+            0.0
         )
         .is_none());
     }
@@ -520,6 +564,7 @@ mod tests {
             &[],
             BoonGrants::default(),
             &RouterWeights::default(),
+            0.0,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "tools");
@@ -542,6 +587,7 @@ mod tests {
             &[],
             BoonGrants::default(),
             &RouterWeights::default(),
+            0.0,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "up");
@@ -564,6 +610,7 @@ mod tests {
             &[],
             BoonGrants::default(),
             &RouterWeights::default(),
+            0.0,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "cheap");
@@ -586,6 +633,7 @@ mod tests {
             &[],
             BoonGrants::default(),
             &RouterWeights::default(),
+            0.0,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "b");
@@ -603,6 +651,7 @@ mod tests {
             &[],
             BoonGrants::default(),
             &RouterWeights::default(),
+            0.0,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "b");
@@ -646,6 +695,7 @@ mod tests {
             &desired,
             BoonGrants::default(),
             &RouterWeights::default(),
+            0.0,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "coder");
@@ -669,6 +719,7 @@ mod tests {
             &[],
             BoonGrants::default(),
             &RouterWeights::default(),
+            0.0,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "cheap");
@@ -720,7 +771,8 @@ mod tests {
             None,
             &[],
             grants,
-            &RouterWeights::default()
+            &RouterWeights::default(),
+            0.0
         )
         .is_none());
     }
@@ -742,7 +794,8 @@ mod tests {
             None,
             &[],
             BoonGrants::default(),
-            &RouterWeights::default()
+            &RouterWeights::default(),
+            0.0
         )
         .is_none());
         let grants = BoonGrants {
@@ -756,6 +809,7 @@ mod tests {
             &[],
             grants,
             &RouterWeights::default(),
+            0.0,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "emulated");
@@ -781,7 +835,8 @@ mod tests {
             None,
             &[],
             grants,
-            &RouterWeights::default()
+            &RouterWeights::default(),
+            0.0
         )
         .is_none());
     }
@@ -812,6 +867,7 @@ mod tests {
             &[],
             BoonGrants::default(),
             &capacity_first,
+            0.0,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "idle-expensive");
@@ -829,8 +885,99 @@ mod tests {
             &[],
             BoonGrants::default(),
             &cost_first,
+            0.0,
         )
         .unwrap();
         assert_eq!(chosen.model_name, "busy-cheap");
+    }
+
+    #[test]
+    fn temperature_zero_is_exact_argmax() {
+        let mut cheap = model("cheap");
+        cheap.input_cost_per_token = 0.000_001;
+        let mut pricey = model("pricey");
+        pricey.input_cost_per_token = 0.000_100;
+        let candidates = vec![healthy(pricey), healthy(cheap)];
+        let w = RouterWeights {
+            temperature: 0.0,
+            ..Default::default()
+        };
+        // Every uniform draw must produce the same answer when temperature is 0.
+        for u in [0.0, 0.25, 0.5, 0.75, 0.999] {
+            let chosen = select_model(
+                &candidates,
+                &RequestFeatures::default(),
+                &HashMap::new(),
+                None,
+                &[],
+                BoonGrants::default(),
+                &w,
+                u,
+            )
+            .unwrap();
+            assert_eq!(chosen.model_name, "cheap", "uniform {u} changed a temperature-0 pick");
+        }
+    }
+
+    #[test]
+    fn temperature_makes_the_outcome_depend_on_the_draw() {
+        let mut cheap = model("cheap");
+        cheap.input_cost_per_token = 0.000_001;
+        let mut pricey = model("pricey");
+        pricey.input_cost_per_token = 0.000_100;
+        let candidates = vec![healthy(pricey), healthy(cheap)];
+        let w = RouterWeights {
+            temperature: 1.0,
+            ..Default::default()
+        };
+        // Candidates are ordered by descending score; a draw past the leader's
+        // probability mass must land on the runner-up.
+        let low = select_model(
+            &candidates,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &w,
+            0.0,
+        )
+        .unwrap();
+        let high = select_model(
+            &candidates,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &w,
+            0.999,
+        )
+        .unwrap();
+        assert_ne!(
+            low.model_name, high.model_name,
+            "temperature 1.0 must make the outcome depend on the draw"
+        );
+    }
+
+    #[test]
+    fn temperature_still_returns_some_for_a_single_candidate() {
+        let candidates = vec![healthy(model("only"))];
+        let w = RouterWeights {
+            temperature: 1.5,
+            ..Default::default()
+        };
+        let chosen = select_model(
+            &candidates,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &w,
+            0.5,
+        )
+        .unwrap();
+        assert_eq!(chosen.model_name, "only");
     }
 }
