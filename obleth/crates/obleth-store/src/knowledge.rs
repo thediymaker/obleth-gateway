@@ -391,10 +391,19 @@ impl Store {
     ///
     /// Recovery is timeout-based rather than a reset at startup: with more than
     /// one gateway replica, a booting replica would otherwise yank a document
-    /// another replica is actively embedding. Double-claiming a genuinely slow
-    /// document is wasteful but not corrupting — both workers derive the same
-    /// generation from `doc.active_generation + 1`, and
-    /// `commit_document_generation` replaces that generation's rows wholesale.
+    /// another replica is actively embedding.
+    ///
+    /// The staleness path deliberately lets two workers hold the same document
+    /// at once — that overlap is how stranded work gets recovered at all, not
+    /// a bug to be closed. Both workers derive the same generation from
+    /// `doc.active_generation + 1`, but only one of them can actually persist
+    /// chunks for it: `knowledge_chunks_document_generation_ordinal_uq` (see
+    /// `0020_knowledge_chunk_unique.sql`) rejects the second writer's insert
+    /// with SQLSTATE `23505`, and `commit_document_generation` lets that
+    /// failure propagate rather than retrying it — a retry would just collide
+    /// with the same rows the other worker already committed. The loser's
+    /// document is picked up again by a later claim, not by retrying this
+    /// commit.
     pub async fn claim_pending_document(
         &self,
         stale_after_secs: i64,
@@ -476,9 +485,16 @@ impl Store {
     /// `generation <> $2` would drop every other document's chunks too — that
     /// was the Task 2 round-1 defect. `<>` rather than `<` is intentional and
     /// safe here: it also garbage-collects a higher generation orphaned by a
-    /// crashed indexer, and two indexers can never hold the same document
-    /// concurrently because `claim_pending_document` flips it to `indexing`
-    /// under `for update skip locked` first.
+    /// crashed indexer.
+    ///
+    /// Two indexers CAN hold the same document concurrently — the staleness
+    /// reclaim in `claim_pending_document` deliberately claims a document a
+    /// second time when the first worker's claim looks abandoned. What makes
+    /// that safe is not mutual exclusion here; it is
+    /// `knowledge_chunks_document_generation_ordinal_uq` (`0020`), which lets
+    /// only one of the two commits actually persist chunks for a given
+    /// `(document_id, generation)` — the loser's insert fails with `23505`
+    /// and is not retried (see `is_unique_violation`).
     ///
     /// The collection-level `indexed_embedding_model` advances only once EVERY
     /// document in the collection has been built with the collection's desired

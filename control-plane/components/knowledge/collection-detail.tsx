@@ -461,7 +461,12 @@ export function CollectionDetail({
                   </div>
                   <div className="text-sm text-muted-foreground md:text-left">{formatBytes(doc.byte_size)}</div>
                   <div className="text-sm text-muted-foreground md:text-left">{formatCompact(doc.chunk_count)}</div>
-                  <div>{statusBadge(doc)}</div>
+                  <div>
+                    {statusBadge(doc)}
+                    {doc.status === "indexing" && doc.reindex_requested && (
+                      <p className="mt-1 text-[10px] text-muted-foreground">Reindex queued</p>
+                    )}
+                  </div>
                   <div className="flex items-center justify-end gap-1">
                     <button
                       type="button"
