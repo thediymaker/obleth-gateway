@@ -156,29 +156,34 @@ pub fn render_block(hits: &[Hit]) -> String {
 
 /// Place the block. Many models honor only the first system message, so an
 /// existing one is extended rather than joined by a second — that holds
-/// whether its content is a plain string or an OpenAI-style array of parts;
-/// treating an array as "no content" and falling through to insert a *second*
-/// system message would silently demote the tenant's own system prompt to
-/// second place (several chat templates reject two system messages outright).
+/// whether its content is a plain string or an OpenAI-style array of parts,
+/// and regardless of *where* in the message list that system message sits.
+/// `[user, system, user]` is unusual but legal (some clients emit it), and
+/// only checking `messages[0]` would miss it and fall through to inserting a
+/// second system message ahead of it; treating an array as "no content"
+/// would do the same. Either way the tenant's own system prompt gets
+/// silently demoted to second place, and several chat templates reject two
+/// system messages outright.
 pub fn inject(json: &mut Value, block: &str, supports_system: bool) -> bool {
     let Some(messages) = json.get_mut("messages").and_then(Value::as_array_mut) else {
         return false;
     };
     if supports_system {
-        if let Some(first) = messages.first_mut() {
-            if first.get("role").and_then(Value::as_str) == Some("system") {
-                match first.get_mut("content") {
-                    Some(Value::String(existing)) => {
-                        existing.push_str("\n\n");
-                        existing.push_str(block);
-                        return true;
-                    }
-                    Some(Value::Array(parts)) => {
-                        parts.push(json!({"type": "text", "text": block}));
-                        return true;
-                    }
-                    _ => {}
+        if let Some(existing) = messages
+            .iter_mut()
+            .find(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+        {
+            match existing.get_mut("content") {
+                Some(Value::String(existing)) => {
+                    existing.push_str("\n\n");
+                    existing.push_str(block);
+                    return true;
                 }
+                Some(Value::Array(parts)) => {
+                    parts.push(json!({"type": "text", "text": block}));
+                    return true;
+                }
+                _ => {}
             }
         }
         messages.insert(0, json!({"role": "system", "content": block}));
@@ -324,6 +329,44 @@ mod tests {
             text: text.into(),
             token_count: tokens,
             score,
+        }
+    }
+
+    // `ResolvedKey` (29 fields) and `ResolvedModel` (36 fields) derive
+    // neither `Default` nor anything an abbreviated struct literal could
+    // lean on. Rather than duplicate two more field-by-field constructors,
+    // this reuses `boons::tests::test_route` / `test_key_with_policy`
+    // (made `pub(super)` for exactly this) and layers the fields each
+    // eligibility test actually cares about on top.
+    //
+    // `context_window` and `supports_system_messages` are set explicitly
+    // here rather than left at `test_route()`'s defaults (`0` / `false`):
+    // since Task 11's fix round, a non-positive `context_window` makes
+    // `apply` short-circuit to the `"no_window"` outcome before retrieval
+    // ever runs. These `eligible()` tests do not call `apply`, so that
+    // short-circuit is not itself in play here — but leaving the fields at
+    // their zero-value defaults would make the intent invisible in the test
+    // body, so they are pinned to values appropriate to an otherwise
+    // eligible route.
+    fn route(boons: &[&str], collections: usize) -> ResolvedModel {
+        let mut r = crate::boons::tests::test_route();
+        r.boons = boons.iter().map(|s| s.to_string()).collect();
+        r.knowledge_collections = (0..collections).map(|_| Uuid::new_v4()).collect();
+        r.context_window = 8192;
+        r.supports_system_messages = true;
+        r
+    }
+
+    fn key(internal: bool) -> ResolvedKey {
+        let mut k = crate::boons::tests::test_key_with_policy(None);
+        k.internal = internal;
+        k
+    }
+
+    fn on() -> KnowledgeBoonSettings {
+        KnowledgeBoonSettings {
+            enabled: true,
+            ..Default::default()
         }
     }
 
@@ -482,5 +525,150 @@ mod tests {
         assert_eq!(available_budget(1500, 8192, 1000), 1500);
         // Room for 2192 after the reserve, so the configured ceiling applies.
         assert!(available_budget(4000, 8192, 5000) < 4000);
+    }
+
+    // ---- eligibility gate ----
+
+    #[test]
+    fn ineligible_without_the_boon_grant() {
+        assert!(!eligible(&route(&[], 1), &on(), &key(false), true));
+    }
+
+    #[test]
+    fn ineligible_without_attached_collections() {
+        assert!(!eligible(
+            &route(&["knowledge"], 0),
+            &on(),
+            &key(false),
+            true
+        ));
+    }
+
+    #[test]
+    fn ineligible_when_globally_disabled() {
+        let off = KnowledgeBoonSettings::default();
+        assert!(!eligible(
+            &route(&["knowledge"], 1),
+            &off,
+            &key(false),
+            true
+        ));
+    }
+
+    #[test]
+    fn ineligible_for_internal_probe_keys() {
+        assert!(!eligible(
+            &route(&["knowledge"], 1),
+            &on(),
+            &key(true),
+            true
+        ));
+    }
+
+    #[test]
+    fn ineligible_for_non_chat_requests() {
+        assert!(!eligible(
+            &route(&["knowledge"], 1),
+            &on(),
+            &key(false),
+            false
+        ));
+    }
+
+    #[test]
+    fn eligible_when_everything_lines_up() {
+        assert!(eligible(
+            &route(&["knowledge"], 1),
+            &on(),
+            &key(false),
+            true
+        ));
+    }
+
+    // ---- fail-open: retrieval and injection must leave the body untouched
+    // when nothing clears the bar ----
+
+    #[test]
+    fn injection_is_skipped_when_nothing_clears_the_threshold() {
+        // pack() of an empty hit list must leave the body untouched. This
+        // mirrors `apply`'s own guard: it returns the "miss" outcome (and
+        // never calls inject) whenever `pack` comes back empty.
+        let mut body = json!({"messages": [{"role": "user", "content": "q"}]});
+        let before = body.clone();
+        let packed = pack(Vec::new(), 1500);
+        assert!(packed.is_empty());
+        if !packed.is_empty() {
+            inject(&mut body, &render_block(&packed), true);
+        }
+        assert_eq!(body, before, "body must be byte-identical");
+    }
+
+    #[test]
+    fn injection_is_skipped_when_the_context_window_is_full() {
+        let mut body = json!({"messages": [{"role": "user", "content": "q"}]});
+        let before = body.clone();
+        // 8000 estimated tokens against an 8192-token window leaves no room
+        // once the output reserve is charged — available_budget clamps to 0.
+        let budget = available_budget(1500, 8192, 8000);
+        let packed = pack(vec![hit("A", "a", 100, 0.9)], budget);
+        assert!(packed.is_empty(), "no room left in the context window");
+        if !packed.is_empty() {
+            inject(&mut body, &render_block(&packed), true);
+        }
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn inject_leaves_a_body_without_messages_untouched() {
+        let mut body = json!({"prompt": "legacy completion"});
+        let before = body.clone();
+        assert!(!inject(&mut body, "BLOCK", true));
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn retrieval_across_embedding_spaces_yields_nothing() {
+        // A slab built with a 768-dim embedder must not match a 2-dim query:
+        // `score_against` skips any chunk vector whose length differs from
+        // the query's, so retrieval yields nothing rather than garbage
+        // scores across incompatible embedding spaces.
+        let slab = crate::knowledge::CollectionSlab {
+            embedding_model: "embed-a".into(),
+            dim: 768,
+            version: 1,
+            chunks: vec![crate::knowledge::SlabChunk {
+                id: Uuid::new_v4(),
+                title: "Doc".into(),
+                text: "chunk".into(),
+                token_count: 10,
+                embedding: vec![1.0; 768],
+            }],
+        };
+        assert!(slab.retrieve(&[1.0, 0.0], 5, -1.0).is_empty());
+    }
+
+    // ---- fold-in fix: a system message that is not messages[0] ----
+
+    #[test]
+    fn inject_finds_a_system_message_that_is_not_first() {
+        // [user, system, user] is unusual but legal, and some clients emit
+        // it. Only checking messages[0] would miss this system message and
+        // fall through to inserting a SECOND one ahead of it, demoting the
+        // tenant's own system prompt and risking a 400 from chat templates
+        // that reject two system messages.
+        let mut body = json!({"messages": [
+            {"role": "user", "content": "first"},
+            {"role": "system", "content": "be helpful"},
+            {"role": "user", "content": "second"}
+        ]});
+        assert!(inject(&mut body, "BLOCK", true));
+        let messages = body["messages"].as_array().expect("arr");
+        assert_eq!(messages.len(), 3, "still exactly one system message");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "system");
+        let sys = messages[1]["content"].as_str().expect("system content");
+        assert!(sys.starts_with("be helpful"));
+        assert!(sys.contains("BLOCK"));
+        assert_eq!(messages[2]["role"], "user");
     }
 }

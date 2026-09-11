@@ -833,7 +833,7 @@ pub(crate) fn now_ms() -> i64 {
 mod tests {
     use super::*;
 
-    fn test_route() -> obleth_config::ResolvedModel {
+    pub(super) fn test_route() -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
             model_name: "test".to_string(),
             upstream_model: "test".to_string(),
@@ -873,7 +873,7 @@ mod tests {
         }
     }
 
-    fn test_key_with_policy(
+    pub(super) fn test_key_with_policy(
         policy: Option<obleth_config::CompressionPolicy>,
     ) -> obleth_config::ResolvedKey {
         let mut k = obleth_config::ResolvedKey {
@@ -1107,7 +1107,16 @@ mod tests {
     /// be scanned and blocked by the tenant's own input scanners).
     #[test]
     fn knowledge_boon_phases_stay_in_source_order() {
-        let src = include_str!("mod.rs");
+        let full_src = include_str!("mod.rs");
+        // Search only the code above this test module. Otherwise this
+        // test's own source contains the same anchor literals in the same
+        // asserted order, so it would pass vacuously even if the boon's
+        // wiring in `enrich_request` were deleted entirely — a reorder is
+        // still caught, but a deletion is not, unless the test module
+        // itself is excluded from the haystack.
+        let src = &full_src[..full_src
+            .find("\nmod tests {")
+            .expect("this file's own test module marker")];
         let phase1 = src
             .find("knowledge boon, phase 1")
             .expect("phase 1 marker comment");
