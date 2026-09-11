@@ -16,6 +16,10 @@ const sessionSchema = z.object({
   id: z.string(), title: z.string(), mode: z.enum(["chat", "compare", "router"]),
   models: z.array(z.string()).min(1).max(4), generation: generationSchema,
   recipients: z.array(z.number().int().min(0).max(3)).optional(),
+  // Router mode's prompt draft. Kept on the session (not component-local
+  // state) so it survives a Chat<->Router toggle, which remounts
+  // RouterWorkspace since the two modes render different component types.
+  routerPrompt: z.string().max(20000).optional(),
 });
 export type PlaygroundSession = z.infer<typeof sessionSchema>;
 const fresh = (): PlaygroundSession => ({ id: crypto.randomUUID(), title: "Untitled session", mode: "compare", models: ["charo"], generation: { systemPrompt: "" } });
@@ -75,13 +79,14 @@ export function Playground({ scope }: { scope: string }) {
         <div><h1 className="flex items-center gap-2 text-lg font-semibold"><FlaskConical className="h-5 w-5 text-violet-500" />Playground</h1><p className="mt-1 text-xs text-muted-foreground">Explore models, compare answers, and test your gateway.</p></div>
         <div className="flex items-center gap-2">
           <Button variant="ghost" size="icon" title="Toggle sessions" aria-expanded={showSessions} onClick={() => setShowSessions(!showSessions)}><PanelLeft className="h-4 w-4" /></Button>
-          <Button variant="outline" size="sm" onClick={() => setShowSettings(!showSettings)} aria-expanded={showSettings}><SlidersHorizontal className="mr-2 h-4 w-4" />Parameters</Button>
+          {/* Chat/compare generation parameters don't apply to Router mode, which has its own weight sliders. */}
+          {session.mode !== "router" && <Button variant="outline" size="sm" onClick={() => setShowSettings(!showSettings)} aria-expanded={showSettings}><SlidersHorizontal className="mr-2 h-4 w-4" />Parameters</Button>}
           <Button variant="ghost" size="icon" title="Export saved session" onClick={exportSession}><ArrowDownToLine className="h-4 w-4" /></Button>
         </div>
       </header>
       {storageError && <p role="alert" className="px-5 py-2 text-xs text-amber-600">{storageError}</p>}
       {error && <div role="alert" className="flex items-center gap-3 px-5 py-2 text-sm text-destructive">{error}<Button variant="outline" size="sm" onClick={reload}>Retry loading models</Button></div>}
-      {showSettings && <div className="grid gap-3 border-b border-border bg-secondary/20 p-4 sm:grid-cols-[1fr_9rem_10rem]">
+      {showSettings && session.mode !== "router" && <div className="grid gap-3 border-b border-border bg-secondary/20 p-4 sm:grid-cols-[1fr_9rem_10rem]">
         <label className="text-xs font-medium">System prompt<textarea aria-label="System prompt" value={session.generation.systemPrompt} maxLength={32000} onChange={(e) => update({ generation: { ...session.generation, systemPrompt: e.target.value } })} className="mt-1 w-full resize-y rounded-md border border-border bg-background p-2 text-sm" rows={2} placeholder="Instructions for direct chat and comparison" /></label>
         <label className="text-xs font-medium">Temperature<Input aria-label="Temperature" className="mt-1" type="number" min={0} max={2} step={0.1} placeholder="Model default" value={session.generation.temperature ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (n >= 0 && n <= 2)) update({ generation: { ...session.generation, temperature: e.target.value ? n : undefined } }); }} /></label>
         <label className="text-xs font-medium">Max output tokens<Input aria-label="Max output tokens" className="mt-1" type="number" min={1} max={131072} placeholder="Model default" value={session.generation.maxTokens ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 131072)) update({ generation: { ...session.generation, maxTokens: e.target.value ? n : undefined } }); }} /></label>

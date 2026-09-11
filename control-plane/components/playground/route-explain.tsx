@@ -46,7 +46,7 @@ export function RouteExplainPanel({
 
       <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
         <span>
-          Difficulty <span className="font-medium text-foreground">{explain.difficulty.toFixed(2)}</span> ({explain.difficulty_source})
+          Difficulty <span className="font-medium text-foreground">{explain.difficulty}</span> ({explain.difficulty_source})
         </span>
         <span>
           Tags{" "}
@@ -63,9 +63,10 @@ export function RouteExplainPanel({
         <span>
           Temperature <span className="font-medium text-foreground">{explain.temperature.toFixed(2)}</span>
         </span>
-        {explain.sampled && (
+        {explain.temperature > 0 && (
           <span>
-            Sampling draw <span className="font-medium text-foreground">{explain.uniform.toFixed(3)}</span>
+            Draw <span className="font-medium text-foreground">{explain.uniform.toFixed(3)}</span>
+            {explain.sampled ? " (sampled)" : " (top scorer still won)"}
           </span>
         )}
         {explain.classifier_ms > 0 && <span>Classifier {explain.classifier_ms}ms</span>}
@@ -132,29 +133,51 @@ export function RouteExplainPanel({
                   )}
                   <span className="text-right tabular-nums">{fmt(row.score)}</span>
                 </button>
-                {isExpanded && (
-                  <div className="space-y-1.5 bg-secondary/10 px-3 py-3 text-xs">
-                    <p>
-                      Spare capacity: <span className="tabular-nums">{fmt(row.spare)}</span> · Cost
-                      score: <span className="tabular-nums">{fmt(row.cost_score)}</span> · Tag
-                      score: <span className="tabular-nums">{fmt(row.tag_score)}</span> · Bias:{" "}
-                      <span className="tabular-nums">{fmt(row.bias)}</span>
-                    </p>
-                    <p className="font-mono text-muted-foreground">
-                      score = {explain.weights.capacity} × {fmt(row.spare)} + {explain.weights.cost} ×{" "}
-                      {fmt(row.cost_score)} + {explain.weights.tag} × {fmt(row.tag_score)} + {fmt(row.bias)}
-                    </p>
-                    <p className="font-mono">
-                      = {fmt(explain.weights.capacity * row.spare)} + {fmt(explain.weights.cost * row.cost_score)}{" "}
-                      + {fmt(explain.weights.tag * row.tag_score)} + {fmt(row.bias)} = <strong>{fmt(row.score)}</strong>
-                    </p>
-                    {wasLiveChoice && (
-                      <p className="text-amber-600 dark:text-amber-400">
-                        This model was chosen by the live weights.
+                {isExpanded && (() => {
+                  // Mirrors the gateway's scoring exactly (obleth-config's
+                  // routing/mod.rs): capacity/cost form a base, tags (when
+                  // requested) blend into it, and `bias` is a multiplier on
+                  // top of that blend — not a fourth addend. `row.score` is
+                  // always the value the API actually returned; `base` and
+                  // `blend` here are recomputed from the same fields purely
+                  // to narrate how it was reached.
+                  const { capacity, cost, tag } = explain.weights;
+                  const hasTags = explain.tags.length > 0;
+                  const base = capacity * row.spare + cost * row.cost_score;
+                  const blend = hasTags ? tag * row.tag_score + (1 - tag) * base : base;
+                  return (
+                    <div className="space-y-1.5 bg-secondary/10 px-3 py-3 text-xs">
+                      <p>
+                        Spare capacity: <span className="tabular-nums">{fmt(row.spare)}</span> · Cost
+                        score: <span className="tabular-nums">{fmt(row.cost_score)}</span> · Tag
+                        score: <span className="tabular-nums">{fmt(row.tag_score)}</span> · Bias:{" "}
+                        <span className="tabular-nums">{fmt(row.bias)}</span>
                       </p>
-                    )}
-                  </div>
-                )}
+                      <p className="font-mono text-muted-foreground">
+                        base = {fmt(capacity)} × {fmt(row.spare)} (spare) + {fmt(cost)} × {fmt(row.cost_score)} (cost)
+                        {" "}= <strong className="text-foreground">{fmt(base)}</strong>
+                      </p>
+                      {hasTags ? (
+                        <p className="font-mono text-muted-foreground">
+                          blend = {fmt(tag)} × {fmt(row.tag_score)} (tag) + {fmt(1 - tag)} × {fmt(base)} (base) ={" "}
+                          <strong className="text-foreground">{fmt(blend)}</strong>
+                        </p>
+                      ) : (
+                        <p className="font-mono text-muted-foreground">
+                          No requested tags, so blend = base = <strong className="text-foreground">{fmt(base)}</strong>
+                        </p>
+                      )}
+                      <p className="font-mono">
+                        score = {fmt(blend)} (blend) × {fmt(row.bias)} (bias) = <strong>{fmt(row.score)}</strong>
+                      </p>
+                      {wasLiveChoice && (
+                        <p className="text-amber-600 dark:text-amber-400">
+                          This model was chosen by the live weights.
+                        </p>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
             );
           })}
