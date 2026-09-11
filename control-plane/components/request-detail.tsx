@@ -2,10 +2,11 @@
 
 import { useEffect, useRef, useState, type CSSProperties } from "react";
 import { useQuery } from "@tanstack/react-query";
-import type { SpanEntry, UsageLogEntry } from "@/lib/obleth";
+import type { RouteExplainView, SpanEntry, UsageLogEntry } from "@/lib/obleth";
 import { formatDurationMs } from "@/lib/format";
 import { cn, formatCurrency } from "@/lib/utils";
 import { formatWh } from "@/components/request-logs";
+import { RouteExplainPanel } from "@/components/playground/route-explain";
 
 interface Props {
   row: UsageLogEntry;
@@ -110,9 +111,30 @@ function parseAttrs(raw: string): [string, string][] {
   }
 }
 
-interface SpanNode {
+export interface SpanNode {
   span: SpanEntry;
   children: SpanNode[];
+}
+
+/**
+ * Parses an `auto_route` span's attributes as the enriched `RouteExplainView`
+ * payload (Task 12), keying detection off `Array.isArray(scored)` rather than
+ * a truthiness check on `candidates` — the pre-upgrade payload carries
+ * `candidates` as a *number*, not the array this shape defines. Returns null
+ * for anything that isn't the new shape: unparseable JSON, the pre-upgrade
+ * `{ chosen, candidates, tags }` span, and the gateway's serialization-
+ * failure fallback `{ chosen, error }` all fall back to raw rendering.
+ */
+export function parseRouteExplain(raw: string): RouteExplainView | null {
+  try {
+    const obj = JSON.parse(raw) as Record<string, unknown>;
+    if (obj && typeof obj === "object" && Array.isArray(obj.scored)) {
+      return obj as unknown as RouteExplainView;
+    }
+  } catch {
+    // Unparseable attributes: fall back to raw rendering below.
+  }
+  return null;
 }
 
 interface CanvasNode {
@@ -447,9 +469,10 @@ function parseAttrsRaw(raw: string): Record<string, unknown> {
   }
 }
 
-function SpanExpandDetail({ node, onClose }: { node: SpanNode; onClose: () => void }) {
+export function SpanExpandDetail({ node, onClose }: { node: SpanNode; onClose: () => void }) {
   const { span, children } = node;
   const allAttrs = parseAttrs(span.attributes);
+  const routeExplain = span.span_name === "auto_route" ? parseRouteExplain(span.attributes) : null;
 
   const iterChildren = children
     .filter((c) => c.span.span_name.startsWith("boon:tool_loop:iter:"))
@@ -481,17 +504,23 @@ function SpanExpandDetail({ node, onClose }: { node: SpanNode; onClose: () => vo
         </button>
       </div>
 
-      {allAttrs.length > 0 && (
-        <dl className="mb-3 grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3 lg:grid-cols-4">
-          {allAttrs.map(([k, v]) => (
-            <div key={k} className="flex min-w-0 flex-col gap-0.5">
-              <dt className="text-[10px] text-muted-foreground">{k}</dt>
-              <dd className="truncate font-mono text-[11px] text-foreground/75" title={v}>
-                {v}
-              </dd>
-            </div>
-          ))}
-        </dl>
+      {routeExplain ? (
+        <div className="mb-3">
+          <RouteExplainPanel explain={routeExplain} />
+        </div>
+      ) : (
+        allAttrs.length > 0 && (
+          <dl className="mb-3 grid grid-cols-2 gap-x-6 gap-y-1 sm:grid-cols-3 lg:grid-cols-4">
+            {allAttrs.map(([k, v]) => (
+              <div key={k} className="flex min-w-0 flex-col gap-0.5">
+                <dt className="text-[10px] text-muted-foreground">{k}</dt>
+                <dd className="truncate font-mono text-[11px] text-foreground/75" title={v}>
+                  {v}
+                </dd>
+              </div>
+            ))}
+          </dl>
+        )
       )}
 
       {iterChildren.length > 0 && (
