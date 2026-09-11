@@ -720,7 +720,7 @@ export async function createModelAction(
       api_base: isSlurm ? "" : parsed.data.api_base,
       api_key: isSlurm ? null : strOrNull(formData.get("api_key")),
       max_in_flight: numOrNull(formData.get("max_in_flight")),
-      supports_vision: tags.includes("vision"),
+      supports_vision: tagsInclude(tags, "vision"),
       tags,
       boons: boonsFromForm(formData),
       tool_servers: toolServersFromForm(formData),
@@ -1035,7 +1035,7 @@ export async function updateModelCapabilitiesAction(
       supports_system_messages: formData.get("supports_system_messages") === "on",
       supports_response_schema: formData.get("supports_response_schema") === "on",
       supports_tool_choice: formData.get("supports_tool_choice") === "on",
-      supports_vision: tags.includes("vision"),
+      supports_vision: tagsInclude(tags, "vision"),
       tags,
       boons: boonsFromForm(formData),
       tool_servers: toolServersFromForm(formData),
@@ -1594,16 +1594,34 @@ function numOr(v: FormDataEntryValue | null, fallback: number): number {
   return Number.isFinite(n) ? n : fallback;
 }
 
-// Collects checked tag checkboxes (named `tag_<name>`) from a model form into
-// an array of tag names, e.g. { tag_coding: "on" } -> ["coding"].
+// Collects checked tag checkboxes (named `tag_<name>`) from a model form,
+// folding in each tag's paired strength level (`tag_level_<name>`, 1-3) into
+// a `base:level` string, e.g. { tag_coding: "on", tag_level_coding: "3" } ->
+// ["coding:3"]. Level 1 serializes as the bare tag name so an untouched
+// model's stored tags round-trip byte-identical; this mirrors the gateway's
+// `parse_tag_level` convention on the Rust side.
 function tagsFromForm(formData: FormData): string[] {
   const tags: string[] = [];
   for (const [key, value] of formData.entries()) {
-    if (key.startsWith("tag_") && value === "on") {
-      tags.push(key.slice("tag_".length));
-    }
+    if (!key.startsWith("tag_") || key.startsWith("tag_level_") || value !== "on") continue;
+    const base = key.slice("tag_".length);
+    const level = clampTagLevel(formData.get(`tag_level_${base}`));
+    tags.push(level > 1 ? `${base}:${level}` : base);
   }
   return tags;
+}
+
+function clampTagLevel(raw: FormDataEntryValue | null): number {
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return 1;
+  return Math.min(3, Math.max(1, Math.trunc(n)));
+}
+
+// True if `tags` contains an entry whose base name (everything before an
+// optional `:level` suffix) matches `base` — so a suffixed "vision:2" still
+// satisfies a bare "vision" check.
+function tagsInclude(tags: string[], base: string): boolean {
+  return tags.some((t) => t === base || t.startsWith(`${base}:`));
 }
 
 // Collects checked boon checkboxes (named `boon_<name>`) from a model form into
