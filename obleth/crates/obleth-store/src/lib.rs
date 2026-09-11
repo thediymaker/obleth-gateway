@@ -77,6 +77,10 @@ const SCHEMA_V16: &str = include_str!("../../../../schema/postgres/0016_api_keys
 const SCHEMA_V17: &str = include_str!("../../../../schema/postgres/0017_model_route_bias.sql");
 const SCHEMA_V18: &str = include_str!("../../../../schema/postgres/0018_knowledge_base.sql");
 const SCHEMA_V19: &str = include_str!("../../../../schema/postgres/0019_model_auto_eligible.sql");
+const SCHEMA_V20: &str =
+    include_str!("../../../../schema/postgres/0020_knowledge_chunk_unique.sql");
+const SCHEMA_V21: &str =
+    include_str!("../../../../schema/postgres/0021_knowledge_reindex_requested.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -217,6 +221,8 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V17).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V18).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V19).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V20).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V21).execute(&mut *conn).await?;
             Ok(())
         }
         .await;

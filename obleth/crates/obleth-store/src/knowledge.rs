@@ -75,6 +75,23 @@ fn is_deadlock(e: &sqlx::Error) -> bool {
         .is_some_and(|code| code == "40P01")
 }
 
+/// True for Postgres SQLSTATE `23505` (unique_violation) — specifically the
+/// `knowledge_chunks_document_generation_ordinal_uq` index added to make a
+/// same-document/same-generation double commit impossible at the storage
+/// layer (see `0020_knowledge_chunk_unique.sql`). Deliberately NOT added to
+/// `commit_document_generation`'s deadlock retry: unlike a deadlock, which
+/// resolves once one of the two transactions proceeds, a losing worker here
+/// is racing against chunk rows another worker already committed for this
+/// exact `(document_id, generation)` — retrying the identical insert would
+/// hit the same conflict again forever. Failing this attempt outright and
+/// letting the indexer's existing `mark_document_failed` + reclaim-on-timeout
+/// path pick the document back up is the correct recovery, not a retry loop.
+fn is_unique_violation(e: &sqlx::Error) -> bool {
+    e.as_database_error()
+        .and_then(|d| d.code())
+        .is_some_and(|code| code == "23505")
+}
+
 impl Store {
     pub async fn create_collection(
         &self,
@@ -211,6 +228,15 @@ pub struct KnowledgeDocument {
     pub active_generation: i32,
     pub indexed_embedding_model: String,
     pub indexing_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set when a reindex is requested (upsert of identical content,
+    /// `reindex_document`, or `reindex_collection_documents`) while this
+    /// document is already `indexing`. Never makes the row claimable by
+    /// itself -- `status` stays `indexing` so `claim_pending_document` can't
+    /// double-claim it -- it only tells `commit_document_generation` to
+    /// requeue (`pending`) instead of promote (`ready`) once the in-flight
+    /// run finishes. Consumed (cleared) in that same commit, and cleared on
+    /// `mark_document_failed` -- see the invariant note there.
+    pub reindex_requested: bool,
 }
 
 /// One chunk awaiting insert. `embedding` is already normalized by the indexer.
@@ -234,7 +260,7 @@ pub struct KnowledgeChunk {
 
 const DOC_COLS: &str = "id, collection_id, title, filename, content_type, content, \
     byte_size, status, error, chunk_count, active_generation, indexed_embedding_model, \
-    indexing_started_at";
+    indexing_started_at, reindex_requested";
 
 fn row_to_document(row: &sqlx::postgres::PgRow) -> KnowledgeDocument {
     KnowledgeDocument {
@@ -251,6 +277,7 @@ fn row_to_document(row: &sqlx::postgres::PgRow) -> KnowledgeDocument {
         active_generation: row.get("active_generation"),
         indexed_embedding_model: row.get("indexed_embedding_model"),
         indexing_started_at: row.get("indexing_started_at"),
+        reindex_requested: row.get("reindex_requested"),
     }
 }
 
@@ -283,6 +310,17 @@ impl Store {
     /// re-upload's recovery path for a document a bad `content_type` guess
     /// previously sent to `failed` — distinct from, and unaffected by, the
     /// existing per-document "Reindex" action.
+    ///
+    /// If the document is currently `indexing`, `status` is left alone
+    /// instead — flipping it to `pending` here would let
+    /// `claim_pending_document` hand the same document to a second worker
+    /// while the first is still embedding it, and nothing enforced that two
+    /// workers can't both derive and commit the same next generation (see
+    /// `0020_knowledge_chunk_unique.sql`, added after exactly that race).
+    /// `reindex_requested` records the request instead; the in-flight
+    /// worker's own `commit_document_generation` consults it once that run
+    /// finishes and requeues the document then, rather than concurrently
+    /// with it.
     pub async fn upsert_document(
         &self,
         collection_id: Uuid,
@@ -303,9 +341,22 @@ impl Store {
                      content_type = excluded.content_type,
                      content = excluded.content,
                      byte_size = excluded.byte_size,
-                     status = 'pending',
-                     error = null,
-                     indexing_started_at = null
+                     status = case
+                                 when knowledge_documents.status = 'indexing'
+                                 then knowledge_documents.status
+                                 else 'pending'
+                              end,
+                     error = case
+                                when knowledge_documents.status = 'indexing'
+                                then knowledge_documents.error
+                                else null
+                             end,
+                     indexing_started_at = case
+                                when knowledge_documents.status = 'indexing'
+                                then knowledge_documents.indexing_started_at
+                                else null
+                             end,
+                     reindex_requested = (knowledge_documents.status = 'indexing')
              returning {DOC_COLS}"
         ))
         .bind(Uuid::new_v4())
@@ -371,12 +422,28 @@ impl Store {
         Ok(row.as_ref().map(row_to_document))
     }
 
+    /// Also clears `reindex_requested`: a queued reindex is only ever
+    /// consumed by `commit_document_generation` reaching the `indexing ->
+    /// pending`/`indexing -> ready` decision, which a failed run never
+    /// reaches. Leaving the flag set on a `failed` row would strand it —
+    /// `failed` is neither `indexing` (so the flag can never be consulted
+    /// again by that CASE) nor claimable on its own (`claim_pending_document`
+    /// only matches `pending`, or stale `indexing`) — so it would sit inert
+    /// until whatever the operator does next (reindex, or a matching
+    /// re-upload) overwrites it anyway. Clearing it here up front means a
+    /// `failed` document always reads as "no reindex is queued", which is
+    /// simpler to reason about than relying on every future caller to
+    /// re-derive that the stale value happened to be harmless.
     pub async fn mark_document_failed(&self, id: Uuid, error: &str) -> Result<()> {
-        sqlx::query("update knowledge_documents set status = 'failed', error = $2 where id = $1")
-            .bind(id)
-            .bind(error)
-            .execute(self.pool())
-            .await?;
+        sqlx::query(
+            "update knowledge_documents
+                set status = 'failed', error = $2, reindex_requested = false
+              where id = $1",
+        )
+        .bind(id)
+        .bind(error)
+        .execute(self.pool())
+        .await?;
         Ok(())
     }
 
@@ -500,7 +567,16 @@ impl Store {
             .bind(encode_vector(&c.embedding))
             .bind(c.embedding.len() as i32)
             .execute(&mut *tx)
-            .await?;
+            .await
+            .map_err(|e| {
+                if is_unique_violation(&e) {
+                    StoreError::Conflict(
+                        "another commit already wrote chunks for this document's generation".into(),
+                    )
+                } else {
+                    StoreError::Db(e)
+                }
+            })?;
         }
 
         // Drop this document's other generations. Scoped to `document_id`:
@@ -511,21 +587,47 @@ impl Store {
             .execute(&mut *tx)
             .await?;
 
-        // Promote the generation and mark the document ready together — unless
-        // a re-index request flipped it back to `pending` while this worker was
-        // embedding (`reindex_document`/`reindex_collection_documents` run
-        // concurrently with an in-flight `claim_pending_document`/commit pair,
-        // since a document is only locked for the duration of each individual
-        // query, not across the whole embed). In that case the chunks below
-        // are still valid and published, but `status` must stay `pending` so
-        // the queued re-index is not silently discarded — otherwise the API
-        // call that requested it reports success and nothing happens.
+        // Promote the generation and mark the document ready — unless a
+        // reindex was requested while this worker was embedding
+        // (`upsert_document`/`reindex_document`/`reindex_collection_documents`
+        // run concurrently with an in-flight `claim_pending_document`/commit
+        // pair, since a document is only locked for the duration of each
+        // individual query, not across the whole embed). Those call sites no
+        // longer touch `status` directly when it is `indexing` — they set
+        // `reindex_requested` instead, specifically so this document can
+        // never become claimable a second time while this transaction is
+        // still in flight (see `0020_knowledge_chunk_unique.sql` for what
+        // that race used to allow). The chunks below are always valid and
+        // published either way; only the post-commit state differs:
+        //
+        // - `reindex_requested` false: promote to `ready` as before.
+        // - `reindex_requested` true: requeue to `pending` instead of
+        //   promoting, so the request is not silently discarded, and the
+        //   document becomes claimable again only now that this commit has
+        //   finished — never concurrently with it. The flag is cleared in
+        //   this same statement (`reindex_requested = false` whenever
+        //   `status = 'indexing'`), so this requeue fires exactly once per
+        //   request rather than looping forever on a stale flag.
+        // - Anything else (defensive: status already isn't `indexing` at
+        //   commit time): leave `status`/`reindex_requested` untouched.
         sqlx::query(
             "update knowledge_documents
                 set active_generation = $2, indexed_embedding_model = $3,
                     chunk_count = $4, indexed_at = now(),
-                    status = case when status = 'indexing' then 'ready' else status end,
-                    error = case when status = 'indexing' then null else error end
+                    status = case
+                                when status = 'indexing' and reindex_requested then 'pending'
+                                when status = 'indexing' then 'ready'
+                                else status
+                             end,
+                    error = case when status = 'indexing' then null else error end,
+                    indexing_started_at = case
+                                when status = 'indexing' and reindex_requested then null
+                                else indexing_started_at
+                             end,
+                    reindex_requested = case
+                                when status = 'indexing' then false
+                                else reindex_requested
+                             end
               where id = $1",
         )
         .bind(document_id)
@@ -583,42 +685,31 @@ impl Store {
         Ok(())
     }
 
-    /// Chunks retrievable right now: each document's own active generation,
-    /// gated to documents whose embedder matches the collection's — a document
-    /// mid-reindex to a new embedder is excluded until the whole collection has
-    /// caught up (see `commit_document_generation`), so the count never includes
-    /// a mixed embedding space.
-    pub async fn collection_chunk_count(&self, collection_id: Uuid) -> Result<i64> {
-        let row = sqlx::query(
-            "select count(*) as n
-               from knowledge_chunks k
-               join knowledge_documents d on d.id = k.document_id
-               join knowledge_collections c on c.id = k.collection_id
-              where k.collection_id = $1
-                and k.generation = d.active_generation
-                and d.indexed_embedding_model = c.indexed_embedding_model",
-        )
-        .bind(collection_id)
-        .fetch_one(self.pool())
-        .await?;
-        Ok(row.get("n"))
-    }
-
-    /// Same scope as `collection_chunk_count`, excluding one document's own
-    /// active chunks.
+    /// Chunks retrievable right now, excluding one document's own active
+    /// chunks: each *other* document's own active generation, gated to
+    /// documents whose embedder matches the collection's — a document
+    /// mid-reindex to a new embedder is excluded until the whole collection
+    /// has caught up (see `commit_document_generation`), so the count never
+    /// includes a mixed embedding space. Pass a document id that cannot
+    /// belong to this collection (e.g. a fresh `Uuid::new_v4()`) to get the
+    /// unscoped total.
     ///
     /// The indexer sizes a re-index against the chunk cap by adding this
     /// count to the document's *new, incoming* chunk count. A document's
-    /// existing chunks stay active (and so stay counted by
-    /// `collection_chunk_count`) until the new generation commits — so using
-    /// the unscoped count as "existing" double-counts that document: once as
-    /// its still-active old generation, again as the incoming new one. That
-    /// refuses a same-size (or shrinking) re-index of a document that alone
-    /// makes up a large share of the cap, with advice ("delete documents or
-    /// raise the cap") that doesn't fix anything, since storage would not
-    /// actually have grown. Excluding the document being re-indexed here
-    /// makes "existing" mean "everything that will still be active after
-    /// this document's new generation replaces its old one".
+    /// existing chunks stay active until the new generation commits — so an
+    /// unscoped count as "existing" would double-count that document: once
+    /// as its still-active old generation, again as the incoming new one.
+    /// That refuses a same-size (or shrinking) re-index of a document that
+    /// alone makes up a large share of the cap, with advice ("delete
+    /// documents or raise the cap") that doesn't fix anything, since storage
+    /// would not actually have grown. Excluding the document being
+    /// re-indexed here makes "existing" mean "everything that will still be
+    /// active after this document's new generation replaces its old one".
+    ///
+    /// (There used to be a separate unscoped `collection_chunk_count`; it was
+    /// removed once its only production caller switched to this method,
+    /// rather than leave a same-shaped, test-only twin of the query around
+    /// for a future caller to pick the wrong one by name.)
     pub async fn collection_chunk_count_excluding(
         &self,
         collection_id: Uuid,
@@ -783,9 +874,21 @@ impl Store {
     /// Reset every document in a collection back to `pending`, clearing any
     /// prior error, so a manual re-index requeues the whole collection for the
     /// background indexer. Returns the number of documents requeued.
+    /// Reset every document in a collection back to `pending` for a fresh
+    /// index. A document that is currently `indexing` is left alone (see
+    /// `upsert_document` for why) and instead has `reindex_requested` set, so
+    /// its own in-flight `commit_document_generation` requeues it once that
+    /// run finishes rather than a second worker claiming it concurrently.
     pub async fn reindex_collection_documents(&self, collection_id: Uuid) -> Result<u64> {
         let result = sqlx::query(
-            "update knowledge_documents set status = 'pending', error = null
+            "update knowledge_documents
+                set status = case when status = 'indexing' then status else 'pending' end,
+                    error = case when status = 'indexing' then error else null end,
+                    indexing_started_at = case
+                                              when status = 'indexing' then indexing_started_at
+                                              else null
+                                           end,
+                    reindex_requested = (status = 'indexing')
               where collection_id = $1",
         )
         .bind(collection_id)
@@ -795,10 +898,20 @@ impl Store {
     }
 
     /// Reset a single document back to `pending`, clearing any prior error.
+    /// Leaves `status` alone if it is currently `indexing` and sets
+    /// `reindex_requested` instead — see `upsert_document` for why.
     pub async fn reindex_document(&self, id: Uuid) -> Result<KnowledgeDocument> {
         let row = sqlx::query(&format!(
-            "update knowledge_documents set status = 'pending', error = null
-              where id = $1 returning {DOC_COLS}"
+            "update knowledge_documents
+                set status = case when status = 'indexing' then status else 'pending' end,
+                    error = case when status = 'indexing' then error else null end,
+                    indexing_started_at = case
+                                              when status = 'indexing' then indexing_started_at
+                                              else null
+                                           end,
+                    reindex_requested = (status = 'indexing')
+              where id = $1
+              returning {DOC_COLS}"
         ))
         .bind(id)
         .fetch_one(self.pool())
@@ -1063,6 +1176,72 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn duplicate_document_generation_ordinal_is_rejected_by_the_unique_index() {
+        // Direct proof that `knowledge_chunks_document_generation_ordinal_uq`
+        // (migration 0020) holds: two chunk rows for the same
+        // `(document_id, generation, ordinal)` can never both persist.
+        // Exercised with two raw inserts rather than two racing
+        // `commit_document_generation` calls, since the real race is a
+        // timing-dependent scheduling accident this test would rather not
+        // depend on to be deterministic -- the index is what makes the
+        // outcome deterministic regardless of timing, so asserting on the
+        // index directly is the more honest test.
+        //
+        // Failing mutation: dropping the `create unique index ... on
+        // knowledge_chunks (document_id, generation, ordinal)` statement (or
+        // skipping migration 0020) makes the second insert below succeed
+        // instead of erroring, and this test fails.
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(&format!("dup-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("collection");
+        let a = store
+            .upsert_document(c.id, "Doc A", "a.md", "text/markdown", "body a")
+            .await
+            .expect("doc a");
+
+        sqlx::query(
+            "insert into knowledge_chunks
+                 (id, document_id, collection_id, generation, ordinal, text,
+                  token_count, embedding, embedding_dim)
+             values ($1, $2, $3, 1, 0, 'first', 1, $4, 2)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(a.id)
+        .bind(c.id)
+        .bind(super::encode_vector(&[1.0, 0.0]))
+        .execute(store.pool())
+        .await
+        .expect("first insert must succeed");
+
+        let second = sqlx::query(
+            "insert into knowledge_chunks
+                 (id, document_id, collection_id, generation, ordinal, text,
+                  token_count, embedding, embedding_dim)
+             values ($1, $2, $3, 1, 0, 'second', 1, $4, 2)",
+        )
+        .bind(uuid::Uuid::new_v4())
+        .bind(a.id)
+        .bind(c.id)
+        .bind(super::encode_vector(&[0.0, 1.0]))
+        .execute(store.pool())
+        .await;
+
+        let err = second.expect_err(
+            "a second row at the same (document, generation, ordinal) must be rejected",
+        );
+        assert!(
+            super::is_unique_violation(&err),
+            "must fail specifically as a unique violation (23505), not some other error: {err}"
+        );
+
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
     async fn indexing_a_second_document_preserves_the_first() {
         let Some(store) = test_store().await else {
             return;
@@ -1241,9 +1420,13 @@ mod tests {
             .expect("commit b");
 
         assert_eq!(
-            store.collection_chunk_count(c.id).await.expect("count"),
+            store
+                .collection_chunk_count_excluding(c.id, uuid::Uuid::new_v4())
+                .await
+                .expect("count excluding an unrelated id"),
             4,
-            "sanity: both documents' chunks are active"
+            "sanity: excluding a document that isn't in this collection must be a no-op, \
+             leaving both documents' chunks active"
         );
 
         // This is the count the indexer now feeds `check_chunk_cap` as
@@ -1619,6 +1802,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn collection_reindex_leaves_an_indexing_document_indexing_and_queues_the_flag() {
+        // The bulk path shares the same conditional CASE as the single-
+        // document `reindex_document`. Failing mutation: reverting
+        // `reindex_collection_documents`'s conditional CASE back to an
+        // unconditional `status = 'pending'` -- the in-flight document
+        // would then read back `status == "pending"` here.
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(
+                &format!("bulk-queue-{}", uuid::Uuid::new_v4()),
+                "",
+                "embed-a",
+            )
+            .await
+            .expect("collection");
+        let doc = store
+            .upsert_document(c.id, "Doc", "d.md", "text/markdown", "body")
+            .await
+            .expect("doc");
+        mark_indexing(&store, doc.id).await;
+
+        let n = store
+            .reindex_collection_documents(c.id)
+            .await
+            .expect("bulk reindex");
+        assert_eq!(
+            n, 1,
+            "the row is affected even though status doesn't change"
+        );
+
+        let docs = store.list_documents(c.id).await.expect("list");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(
+            docs[0].status, "indexing",
+            "a document a worker is still embedding must not become claimable a second time"
+        );
+        assert!(
+            docs[0].reindex_requested,
+            "the request must be recorded instead of dropped"
+        );
+
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
     async fn reindex_document_resets_status_and_clears_error() {
         let Some(store) = test_store().await else {
             return;
@@ -1728,13 +1958,18 @@ mod tests {
 
         // While the embed is in flight, an operator requests a re-index. This
         // races the worker's eventual commit and must not be silently lost.
+        // Since the document is `indexing`, this leaves `status` alone
+        // (still `indexing`) and sets `reindex_requested` instead -- flipping
+        // straight to `pending` here would let a second worker claim this
+        // same document while the first is still embedding it.
         store
             .reindex_document(doc.id)
             .await
             .expect("reindex mid-flight");
 
-        // The worker's commit lands after the race, unaware the document was
-        // flipped back to `pending`.
+        // The worker's commit lands after the race, unaware of the request;
+        // it consults `reindex_requested` and requeues to `pending` instead
+        // of promoting to `ready`, consuming the flag in the same statement.
         store
             .commit_document_generation(
                 c.id,
@@ -1766,6 +2001,226 @@ mod tests {
              even though the document row stays pending"
         );
         assert_eq!(chunks[0].text, "chunk");
+
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn reindex_of_an_indexing_document_leaves_it_indexing_and_queues_the_flag() {
+        // Failing mutation: reverting `reindex_document`'s conditional CASE
+        // back to an unconditional `status = 'pending'` -- the document
+        // would then read back `status == "pending"` here, which is exactly
+        // what let a second `claim_pending_document` reclaim a document a
+        // first worker still holds.
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(
+                &format!("queue-reindex-{}", uuid::Uuid::new_v4()),
+                "",
+                "embed-a",
+            )
+            .await
+            .expect("collection");
+        let doc = store
+            .upsert_document(c.id, "Doc", "d.md", "text/markdown", "body")
+            .await
+            .expect("doc");
+        mark_indexing(&store, doc.id).await;
+
+        let updated = store
+            .reindex_document(doc.id)
+            .await
+            .expect("reindex mid-flight");
+        assert_eq!(
+            updated.status, "indexing",
+            "a document a worker is still embedding must not become claimable a second time"
+        );
+        assert!(
+            updated.reindex_requested,
+            "the request must be recorded instead of dropped"
+        );
+
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn reupload_of_an_indexing_documents_content_leaves_it_indexing_and_queues_the_flag() {
+        // Failing mutation: reverting `upsert_document`'s ON CONFLICT clause
+        // to the unconditional `status = 'pending'` it had before this round
+        // -- the document would then read back `status == "pending"` here,
+        // reopening the same double-claim race for the re-upload path.
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(
+                &format!("queue-reupload-{}", uuid::Uuid::new_v4()),
+                "",
+                "embed-a",
+            )
+            .await
+            .expect("collection");
+        let doc = store
+            .upsert_document(c.id, "Doc", "d.md", "text/markdown", "body")
+            .await
+            .expect("doc");
+        mark_indexing(&store, doc.id).await;
+
+        let updated = store
+            .upsert_document(c.id, "Doc renamed", "d2.md", "text/markdown", "body")
+            .await
+            .expect("reupload mid-flight");
+        assert_eq!(
+            updated.id, doc.id,
+            "identical content must update the same row"
+        );
+        assert_eq!(
+            updated.status, "indexing",
+            "a document a worker is still embedding must not become claimable a second time"
+        );
+        assert!(
+            updated.reindex_requested,
+            "the request must be recorded instead of dropped"
+        );
+        // The cosmetic correction still lands immediately; only the reindex
+        // itself is deferred to the in-flight run's own commit.
+        assert_eq!(updated.title, "Doc renamed");
+        assert_eq!(updated.filename, "d2.md");
+
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn a_queued_reindex_is_honoured_exactly_once_and_then_settles_at_ready() {
+        // Failing mutation: removing `reindex_requested = false` from
+        // `commit_document_generation_once`'s promotion CASE (i.e. not
+        // clearing the flag once it is acted on). Without that, the flag
+        // set by round 1 below would still be `true` going into round 2, so
+        // the second commit would *also* requeue to `pending` instead of
+        // settling at `ready` -- an infinite reindex loop, one full
+        // embedding run per cycle, forever.
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(&format!("no-loop-{}", uuid::Uuid::new_v4()), "", "embed-a")
+            .await
+            .expect("collection");
+        let doc = store
+            .upsert_document(c.id, "Doc", "d.md", "text/markdown", "body")
+            .await
+            .expect("doc");
+
+        // Round 1: claim, a reindex is requested mid-flight, then the
+        // worker commits. Must requeue to `pending` (the request honoured),
+        // with the flag consumed rather than left set.
+        mark_indexing(&store, doc.id).await;
+        store
+            .reindex_document(doc.id)
+            .await
+            .expect("reindex mid-flight");
+        store
+            .commit_document_generation(
+                c.id,
+                doc.id,
+                1,
+                "embed-a",
+                2,
+                &[super::ChunkInsert {
+                    ordinal: 0,
+                    text: "v1".into(),
+                    token_count: 1,
+                    embedding: vec![1.0, 0.0],
+                }],
+            )
+            .await
+            .expect("commit 1");
+
+        let docs = store.list_documents(c.id).await.expect("list");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(
+            docs[0].status, "pending",
+            "the queued reindex must requeue the document"
+        );
+        assert!(
+            !docs[0].reindex_requested,
+            "the flag must be consumed by the commit that honours it"
+        );
+
+        // Round 2: claimed again (simulating the indexer picking the
+        // requeued document back up), with no new reindex requested this
+        // time. This commit must settle at `ready`, not requeue again.
+        mark_indexing(&store, doc.id).await;
+        store
+            .commit_document_generation(
+                c.id,
+                doc.id,
+                2,
+                "embed-a",
+                2,
+                &[super::ChunkInsert {
+                    ordinal: 0,
+                    text: "v2".into(),
+                    token_count: 1,
+                    embedding: vec![1.0, 0.0],
+                }],
+            )
+            .await
+            .expect("commit 2");
+
+        let docs = store.list_documents(c.id).await.expect("list");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(
+            docs[0].status, "ready",
+            "with no new request queued, the second run must settle at ready rather than loop"
+        );
+        assert!(!docs[0].reindex_requested);
+
+        store.delete_collection(c.id).await.ok();
+    }
+
+    #[tokio::test]
+    async fn mark_document_failed_clears_a_queued_reindex_flag() {
+        // Failing mutation: dropping `reindex_requested = false` from
+        // `mark_document_failed`'s UPDATE. Without it, a flag set while a
+        // run was in flight survives into `failed`, where nothing will ever
+        // consult it again -- stranded until some unrelated write happens to
+        // overwrite it.
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let c = store
+            .create_collection(
+                &format!("fail-clears-flag-{}", uuid::Uuid::new_v4()),
+                "",
+                "embed-a",
+            )
+            .await
+            .expect("collection");
+        let doc = store
+            .upsert_document(c.id, "Doc", "d.md", "text/markdown", "body")
+            .await
+            .expect("doc");
+        mark_indexing(&store, doc.id).await;
+        store
+            .reindex_document(doc.id)
+            .await
+            .expect("reindex mid-flight");
+
+        store
+            .mark_document_failed(doc.id, "boom")
+            .await
+            .expect("mark failed");
+
+        let docs = store.list_documents(c.id).await.expect("list");
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].status, "failed");
+        assert!(
+            !docs[0].reindex_requested,
+            "a failed run must not strand a queued reindex flag"
+        );
 
         store.delete_collection(c.id).await.ok();
     }
