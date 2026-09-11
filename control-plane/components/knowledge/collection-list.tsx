@@ -68,6 +68,7 @@ export function CollectionList({
   const [description, setDescription] = useState("");
   const [embeddingModel, setEmbeddingModel] = useState("");
   const [rowBusy, setRowBusy] = useState<Set<string>>(new Set());
+  const [message, setMessage] = useState<string | null>(null);
 
   function refresh() {
     router.refresh();
@@ -75,13 +76,21 @@ export function CollectionList({
 
   function withRowBusy(id: string, run: () => Promise<void>) {
     setRowBusy((s) => new Set(s).add(id));
-    run().finally(() =>
-      setRowBusy((s) => {
-        const next = new Set(s);
-        next.delete(id);
-        return next;
-      }),
-    );
+    run()
+      .catch((e) => {
+        // A thrown/rejected run() (e.g. a network-level fetch failure) is a
+        // distinct failure mode from a non-ok response; route it through the
+        // same message banner rather than letting it surface only as an
+        // unhandled rejection in the console.
+        setMessage(e instanceof Error ? e.message : "Something went wrong. Check your connection and try again.");
+      })
+      .finally(() =>
+        setRowBusy((s) => {
+          const next = new Set(s);
+          next.delete(id);
+          return next;
+        }),
+      );
   }
 
   function openCreate() {
@@ -125,12 +134,19 @@ export function CollectionList({
       description: `Delete "${collection.name}"? This permanently deletes ${docCount} document${docCount === 1 ? "" : "s"} and all of their indexed chunks. This cannot be undone.`,
     });
     if (!ok) return;
+    setMessage(null);
     withRowBusy(collection.id, async () => {
       const res = await fetch(`/api/live/knowledge/collections/${collection.id}`, { method: "DELETE" });
       if (res.ok) {
         if (selectedId === collection.id) setSelectedId(null);
         refresh();
+        return;
       }
+      const body = await res.json().catch(() => null);
+      setMessage(
+        (body && typeof body.error === "string" && body.error) ||
+          `Failed to delete "${collection.name}" (HTTP ${res.status}).`,
+      );
     });
   }
 
@@ -141,11 +157,20 @@ export function CollectionList({
       confirmLabel: "Reindex",
     });
     if (!ok) return;
+    setMessage(null);
     withRowBusy(collection.id, async () => {
       const res = await fetch(`/api/live/knowledge/collections/${collection.id}/reindex`, {
         method: "POST",
       });
-      if (res.ok) refresh();
+      if (res.ok) {
+        refresh();
+        return;
+      }
+      const body = await res.json().catch(() => null);
+      setMessage(
+        (body && typeof body.error === "string" && body.error) ||
+          `Failed to reindex "${collection.name}" (HTTP ${res.status}).`,
+      );
     });
   }
 
@@ -189,6 +214,12 @@ export function CollectionList({
           New collection
         </Button>
       </div>
+
+      {message && (
+        <p className="mb-3 rounded-md border border-destructive/35 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+          {message}
+        </p>
+      )}
 
       <div className="overflow-hidden rounded-lg border border-border/70 bg-card/45">
         <div className="hidden grid-cols-[minmax(0,1fr)_10rem_6rem_6rem_8rem_2.75rem] border-b border-border/70 bg-background/35 px-4 py-2.5 text-xs font-medium text-muted-foreground md:grid">

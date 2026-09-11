@@ -76,6 +76,11 @@ export function CollectionDetail({
       const res = await fetch(`/api/live/knowledge/collections/${collection.id}/documents`);
       if (!res.ok) return;
       const fresh = (await res.json()) as KnowledgeDocument[];
+      // This fetch can resolve after the dialog/component has unmounted. That's
+      // deliberately left unguarded: under React 18+, calling setDocuments on an
+      // unmounted component is a harmless no-op (no warning, no leak), and the
+      // polling interval that could keep this fetch firing is already cleared on
+      // unmount below — so there's nothing here for a mounted-ref to protect.
       if (collectionIdRef.current === collection.id) setDocuments(fresh);
     } catch {
       // Transient fetch failure; the next poll tick or manual action retries.
@@ -94,13 +99,21 @@ export function CollectionDetail({
 
   function withBusy(id: string, run: () => Promise<void>) {
     setBusyIds((s) => new Set(s).add(id));
-    run().finally(() =>
-      setBusyIds((s) => {
-        const next = new Set(s);
-        next.delete(id);
-        return next;
-      }),
-    );
+    run()
+      .catch((e) => {
+        // A thrown/rejected run() (e.g. a network-level fetch failure) is a
+        // distinct failure mode from a non-ok response; route it through the
+        // same message banner rather than letting it surface only as an
+        // unhandled rejection in the console.
+        setMessage(e instanceof Error ? e.message : "Something went wrong. Check your connection and try again.");
+      })
+      .finally(() =>
+        setBusyIds((s) => {
+          const next = new Set(s);
+          next.delete(id);
+          return next;
+        }),
+      );
   }
 
   async function handleDeleteDocument(doc: KnowledgeDocument) {
