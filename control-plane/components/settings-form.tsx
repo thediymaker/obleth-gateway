@@ -32,7 +32,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { DestructiveConfirm } from "@/components/ui/destructive-confirm";
-import { cn } from "@/lib/utils";
+import { cn, tagsInclude } from "@/lib/utils";
 import type {
   AlertSettingsView,
   AutoRouterSettingsView,
@@ -809,7 +809,7 @@ export function BoonsSettingsForm({
   const [expanded, setExpanded] = useState<BoonSectionKey | null>(null);
 
   const visionModels = models.filter(
-    (m) => m.model_name !== "auto" && (m.supports_vision || (m.tags?.includes("vision") ?? false)),
+    (m) => m.model_name !== "auto" && (m.supports_vision || tagsInclude(m.tags, "vision")),
   );
   const chatModels = models.filter(
     (m) => m.model_name !== "auto" && (m.model_type ?? "chat") === "chat",

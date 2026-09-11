@@ -95,6 +95,16 @@ describe("routing tag strength levels", () => {
     expect(host.querySelector<HTMLInputElement>('[name="tag_vision"]')!.checked).toBe(true);
   });
 
+  it.each([
+    ["coding:0", 1], // below range clamps up
+    ["coding:9", 3], // above range clamps down
+    ["coding:x", 1], // unparseable falls back to 1
+  ] as const)("clamps a malformed stored level (%s) into 1..3 without dropping the tag", async (raw, expectedLevel) => {
+    await renderFields(model({ tags: [raw] }));
+    expect(host.querySelector<HTMLInputElement>('[name="tag_coding"]')!.checked).toBe(true);
+    expect(host.querySelector<HTMLInputElement>(`[name="tag_level_coding"][value="${expectedLevel}"]`)!.checked).toBe(true);
+  });
+
   it("round-trips an untouched form back to the field values the model was loaded with", async () => {
     await renderFields(model({ tags: ["coding:3", "math"] }));
     const data = new FormData(host.querySelector("form")!);
