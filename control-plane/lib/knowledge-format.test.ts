@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { collectionStatus } from "./knowledge-format";
+import { collectionStatus, distinctEmbeddingModelCount, injectionSkipReason } from "./knowledge-format";
 import type { KnowledgeCollection, KnowledgeDocument } from "@/lib/obleth";
 
 const base = { needs_reindex: false } as unknown as KnowledgeCollection;
@@ -38,5 +38,45 @@ describe("collectionStatus", () => {
 
   it("reports needs re-index for an empty collection with a stale embedder", () => {
     expect(collectionStatus(stale, [])).toBe("needs re-index");
+  });
+});
+
+describe("injectionSkipReason", () => {
+  it("attributes a hit below the active minimum score to the threshold", () => {
+    expect(injectionSkipReason({ score: 0.4 }, 0.5)).toBe("below threshold");
+  });
+
+  it("attributes a hit at or above the threshold to the token budget", () => {
+    expect(injectionSkipReason({ score: 0.5 }, 0.5)).toBe("cut by token budget");
+    expect(injectionSkipReason({ score: 0.9 }, 0.5)).toBe("cut by token budget");
+  });
+
+  it("falls back to the token budget when the active threshold is unknown", () => {
+    expect(injectionSkipReason({ score: 0.1 }, null)).toBe("cut by token budget");
+  });
+});
+
+describe("distinctEmbeddingModelCount", () => {
+  it("is zero for no collections", () => {
+    expect(distinctEmbeddingModelCount([])).toBe(0);
+  });
+
+  it("counts one for collections sharing an embedder", () => {
+    expect(
+      distinctEmbeddingModelCount([
+        { indexed_embedding_model: "bge-small-en" },
+        { indexed_embedding_model: "bge-small-en" },
+      ]),
+    ).toBe(1);
+  });
+
+  it("counts each distinct embedder", () => {
+    expect(
+      distinctEmbeddingModelCount([
+        { indexed_embedding_model: "bge-small-en" },
+        { indexed_embedding_model: "e5-large" },
+        { indexed_embedding_model: "bge-small-en" },
+      ]),
+    ).toBe(2);
   });
 });

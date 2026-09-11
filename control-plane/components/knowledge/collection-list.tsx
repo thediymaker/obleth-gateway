@@ -47,11 +47,15 @@ export function CollectionList({
   documentsByCollection,
   embeddingModels,
   maxUploadBytes,
+  minScore,
+  maxContextTokens,
 }: {
   collections: KnowledgeCollection[];
   documentsByCollection: Record<string, KnowledgeDocument[]>;
   embeddingModels: string[];
   maxUploadBytes: number | null;
+  minScore: number | null;
+  maxContextTokens: number | null;
 }) {
   const router = useRouter();
   const [pending, startTransition] = useTransition();
@@ -298,6 +302,8 @@ export function CollectionList({
                   collection={selected}
                   initialDocuments={documentsByCollection[selected.id] ?? []}
                   maxUploadBytes={maxUploadBytes}
+                  minScore={minScore}
+                  maxContextTokens={maxContextTokens}
                   onClose={() => setSelectedId(null)}
                   onChanged={refresh}
                 />

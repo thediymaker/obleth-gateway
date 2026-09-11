@@ -1,13 +1,14 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { Bell, Route, Database, Info, Server, Bot, Archive, Zap } from "lucide-react";
+import { Bell, Route, Database, Info, Server, Bot, Archive, BookOpen, Zap } from "lucide-react";
 import {
   AlertSettingsForm,
   AutoRouterSettingsForm,
   BoonsSettingsForm,
   CharoSettingsForm,
   CompressionSettingsForm,
+  KnowledgeSettingsForm,
   SlurmSettingsForm,
   UsageRetentionForm,
 } from "@/components/settings-form";
@@ -21,6 +22,7 @@ import type {
   CharoSettingsView,
   CompressorStatusView,
   EnergySettingsView,
+  KnowledgeSettingsView,
   ModelRoute,
   SlurmSettingsView,
   UsageRetentionView,
@@ -33,6 +35,7 @@ export function SettingsTabs({
   charo,
   compressor,
   energy,
+  knowledge,
   models,
   retention,
   slurm,
@@ -44,6 +47,7 @@ export function SettingsTabs({
   charo: CharoSettingsView | null;
   compressor: CompressorStatusView | null;
   energy: EnergySettingsView | null;
+  knowledge: KnowledgeSettingsView | null;
   models: ModelRoute[];
   retention: UsageRetentionView | null;
   slurm: SlurmSettingsView | null;
@@ -63,6 +67,10 @@ export function SettingsTabs({
         <TabsTrigger value="compression">
           <Archive className="h-3.5 w-3.5" />
           Compression
+        </TabsTrigger>
+        <TabsTrigger value="knowledge">
+          <BookOpen className="h-3.5 w-3.5" />
+          Knowledge
         </TabsTrigger>
         <TabsTrigger value="energy">
           <Zap className="h-3.5 w-3.5" />
@@ -99,6 +107,10 @@ export function SettingsTabs({
 
       <TabsContent value="compression">
         <CompressionSettingsForm settings={boons} compressor={compressor} />
+      </TabsContent>
+
+      <TabsContent value="knowledge">
+        <KnowledgeSettingsForm settings={knowledge} />
       </TabsContent>
 
       <TabsContent value="energy">

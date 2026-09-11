@@ -6,7 +6,7 @@ import { safe } from "@/lib/safe";
 export const dynamic = "force-dynamic";
 
 export default async function SettingsPage() {
-  const [settings, autoRouter, boons, compressor, charo, energy, models, retention, slurm] =
+  const [settings, autoRouter, boons, compressor, charo, energy, knowledge, models, retention, slurm] =
     await Promise.all([
       safe(obleth.getAlertSettings(), null),
       safe(obleth.getAutoRouterSettings(), null),
@@ -14,6 +14,7 @@ export default async function SettingsPage() {
       safe(obleth.getCompressorStatus(), null),
       safe(obleth.getCharoSettings(), null),
       safe(obleth.getEnergySettings(), null),
+      safe(obleth.getKnowledgeSettings(), null),
       safe(obleth.listModels(), []),
       safe(obleth.getUsageRetention(), null),
       safe(obleth.getSlurmSettings(), null),
@@ -35,6 +36,7 @@ export default async function SettingsPage() {
         charo={charo}
         compressor={compressor}
         energy={energy}
+        knowledge={knowledge}
         models={models}
         retention={retention}
         slurm={slurm}

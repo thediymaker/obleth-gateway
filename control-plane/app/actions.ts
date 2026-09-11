@@ -20,6 +20,7 @@ import type {
   UpdateAutoRouterSettings,
   UpdateBoonSettings,
   UpdateEnergySettings,
+  UpdateKnowledgeSettings,
   UpdateSlurmSettings,
   SlurmHealthView,
 } from "@/lib/obleth";
@@ -1453,6 +1454,19 @@ export async function setBoonSettingsAction(
   const session = await requireAdmin();
   try {
     await obleth.setBoonSettings(body, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/settings");
+  return { ok: true };
+}
+
+export async function setKnowledgeSettingsAction(
+  body: UpdateKnowledgeSettings,
+): Promise<ActionResult> {
+  const session = await requireAdmin();
+  try {
+    await obleth.updateKnowledgeSettings(body, { auditActor: session.email });
   } catch (e) {
     return actionError(e);
   }
