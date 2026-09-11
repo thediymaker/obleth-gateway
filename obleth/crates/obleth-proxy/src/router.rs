@@ -423,13 +423,57 @@ pub fn splitmix_uniform() -> f64 {
     ((z ^ (z >> 31)) as f64 / u64::MAX as f64).clamp(0.0, 0.999_999_999)
 }
 
-/// Cheap, dependency-free intent tags derived from the request body. Used as a
-/// fallback when the classifier is disabled, unconfigured, or unavailable so
-/// `auto` routing still gets a useful tag signal without an extra model call.
+/// Where a request's routing intent came from. Surfaced in traces and the
+/// tuner so an operator can tell a real classification from a fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum IntentSource {
+    Classifier,
+    Heuristic,
+    Header,
+    Default,
+}
+
+/// A request's derived routing intent: which topics it touches and how hard it
+/// looks. Difficulty is always in 1..=MAX_TIER_LEVEL.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Intent {
+    pub tags: Vec<String>,
+    pub difficulty: u8,
+    pub source: IntentSource,
+}
+
+impl Default for Intent {
+    fn default() -> Self {
+        Intent {
+            tags: Vec::new(),
+            difficulty: 1,
+            source: IntentSource::Default,
+        }
+    }
+}
+
+/// Map an `x-obleth-effort` header value to a difficulty level. Anything other
+/// than `low`/`medium`/`high` (case-insensitive) falls through to the next
+/// source in the precedence chain.
+pub fn difficulty_from_header(raw: Option<&str>) -> Option<u8> {
+    match raw?.trim().to_ascii_lowercase().as_str() {
+        "low" => Some(1),
+        "medium" => Some(2),
+        "high" => Some(3),
+        _ => None,
+    }
+}
+
+/// Cheap, dependency-free intent derived from the request body: which topics
+/// it touches, and how hard it looks. Used as a fallback when the classifier
+/// is disabled, unconfigured, or unavailable so `auto` routing still gets a
+/// useful signal without an extra model call.
 ///
-/// Only emits tags from the fixed vocabulary. Returns an empty list when no
-/// signal is detected, in which case [`select_model`] routes on capacity/cost.
-pub fn heuristic_tags(json: &serde_json::Value, est_input_tokens: u64) -> Vec<String> {
+/// Only emits tags from the fixed vocabulary. Difficulty starts at 1 (a quiet
+/// prompt always routes cheap) and only ever rises from signals found during
+/// the same scan used for tags — no second pass over the message content.
+pub fn heuristic_intent(json: &serde_json::Value, est_input_tokens: u64) -> Intent {
     let mut text = String::new();
     let mut has_image = false;
     if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
@@ -528,7 +572,50 @@ pub fn heuristic_tags(json: &serde_json::Value, est_input_tokens: u64) -> Vec<St
         push("long-context");
     }
 
-    tags
+    // Difficulty from the same scan. Each signal is a cheap proxy for effort;
+    // absence of signal means 1, so a quiet prompt always routes cheap.
+    let mut difficulty: u8 = 1;
+    let mut bump = |to: u8| {
+        if to > difficulty {
+            difficulty = to;
+        }
+    };
+    if lower.contains("stack backtrace")
+        || lower.contains("traceback (most recent call last)")
+        || lower.contains("panicked at")
+        || lower.contains("segmentation fault")
+    {
+        bump(3);
+    }
+    if [
+        "why does",
+        "race condition",
+        "deadlock",
+        "optimize",
+        "refactor",
+        "prove",
+        "derive",
+        "explain why",
+        "trade-off",
+        "root cause",
+    ]
+    .iter()
+    .any(|k| lower.contains(k))
+    {
+        bump(2);
+    }
+    if est_input_tokens > 32_000 {
+        bump(2);
+    }
+    if text.len() > 8_000 {
+        bump(2);
+    }
+
+    Intent {
+        tags,
+        difficulty,
+        source: IntentSource::Heuristic,
+    }
 }
 
 #[cfg(test)]
@@ -866,7 +953,7 @@ mod tests {
                 ]}
             ]
         });
-        let tags = heuristic_tags(&body, 10);
+        let tags = heuristic_intent(&body, 10).tags;
         assert!(tags.contains(&"coding".to_string()));
         assert!(tags.contains(&"vision".to_string()));
     }
@@ -874,8 +961,49 @@ mod tests {
     #[test]
     fn heuristic_tags_long_context() {
         let body = serde_json::json!({ "messages": [{"role": "user", "content": "hello"}] });
-        let tags = heuristic_tags(&body, 40_000);
+        let tags = heuristic_intent(&body, 40_000).tags;
         assert!(tags.contains(&"long-context".to_string()));
+    }
+
+    #[test]
+    fn header_maps_effort_words_to_levels() {
+        assert_eq!(difficulty_from_header(Some("low")), Some(1));
+        assert_eq!(difficulty_from_header(Some("medium")), Some(2));
+        assert_eq!(difficulty_from_header(Some("HIGH")), Some(3));
+        assert_eq!(difficulty_from_header(Some("banana")), None);
+        assert_eq!(difficulty_from_header(None), None);
+    }
+
+    #[test]
+    fn heuristic_difficulty_defaults_to_one() {
+        let body = serde_json::json!({ "messages": [{"role":"user","content":"hi"}] });
+        assert_eq!(heuristic_intent(&body, 10).difficulty, 1);
+    }
+
+    #[test]
+    fn heuristic_difficulty_rises_on_a_stack_trace() {
+        let body = serde_json::json!({ "messages": [{"role":"user","content":
+            "thread 'main' panicked at src/x.rs:12\n  stack backtrace:\n   0: foo\n   1: bar"}] });
+        assert!(heuristic_intent(&body, 10).difficulty >= 2);
+    }
+
+    #[test]
+    fn heuristic_difficulty_rises_on_long_context() {
+        let body = serde_json::json!({ "messages": [{"role":"user","content":"summarize"}] });
+        assert!(heuristic_intent(&body, 60_000).difficulty >= 2);
+    }
+
+    #[test]
+    fn heuristic_intent_still_yields_the_same_tags_as_before() {
+        let body = serde_json::json!({
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"Fix this python function please ```def f(): pass```"},
+                {"type":"image_url","image_url":{"url":"http://example.invalid/y.png"}}
+            ]}]
+        });
+        let intent = heuristic_intent(&body, 10);
+        assert!(intent.tags.contains(&"coding".to_string()));
+        assert!(intent.tags.contains(&"vision".to_string()));
     }
 
     #[test]

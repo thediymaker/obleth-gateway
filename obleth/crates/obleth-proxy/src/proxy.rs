@@ -272,15 +272,18 @@ async fn proxy_handler_inner(
         // derivation and scoring so `auto` costs exactly one settings read.
         let router_settings = state.classifier.settings();
 
-        // Derive intent tags: classifier (when enabled + resolvable) first,
-        // then cheap heuristics, then neutral capacity/cost routing.
+        // Derive intent (tags + difficulty): explicit header first, then the
+        // classifier (when enabled + resolvable), then cheap heuristics, then a
+        // neutral default.
         let available_tags = union_candidate_tags(&candidates, allowed);
-        let desired_tags = derive_desired_tags(
+        let effort_header = headers.get("x-obleth-effort").and_then(|v| v.to_str().ok());
+        let intent = derive_intent(
             &state,
             &json,
             est.input_tokens as u64,
             &available_tags,
             &router_settings,
+            effort_header,
         )
         .await;
 
@@ -294,7 +297,7 @@ async fn proxy_handler_inner(
             &features,
             &busyness,
             allowed,
-            &desired_tags,
+            &intent.tags,
             grants,
             &weights,
             crate::router::splitmix_uniform(),
@@ -312,7 +315,9 @@ async fn proxy_handler_inner(
                         serde_json::json!({
                             "chosen": chosen.model_name,
                             "candidates": candidates.len(),
-                            "tags": desired_tags,
+                            "tags": intent.tags,
+                            "difficulty": intent.difficulty,
+                            "intent_source": intent.source,
                         }),
                     );
                 }
@@ -1969,36 +1974,51 @@ fn union_candidate_tags(
     out
 }
 
-/// Intent tags for an `auto` request. Tries the classifier brain first (when
-/// enabled, configured, resolvable, and not itself `auto`), then falls back to
-/// cheap heuristics. Either may return empty, which routes on capacity/cost.
-async fn derive_desired_tags(
+/// Routing intent for an `auto` request. Precedence: explicit header, then the
+/// classifier brain (when enabled, configured, resolvable, and not itself
+/// `auto`), then cheap heuristics, then a neutral default. Every fallback
+/// lowers difficulty rather than raising it, so a slow or broken brain makes
+/// routing cheaper and never silently more expensive.
+async fn derive_intent(
     state: &AppState,
     json: &serde_json::Value,
     est_input_tokens: u64,
     available_tags: &[String],
     settings: &obleth_config::AutoRouterSettings,
-) -> Vec<String> {
+    effort_header: Option<&str>,
+) -> crate::router::Intent {
+    let forced = crate::router::difficulty_from_header(effort_header);
+
     if settings.classifier_active() && !available_tags.is_empty() {
         if let Some(name) = settings.classifier_model.as_deref() {
             if name != crate::router::AUTO_MODEL_NAME {
                 if let Some(brain) = resolve_model(state, name).await {
                     let prompt = classifier_prompt(json);
                     if !prompt.trim().is_empty() {
-                        let tags = state
+                        let mut intent = state
                             .classifier
                             .classify(&state.http, &brain, &prompt, available_tags)
                             .await;
-                        if !tags.is_empty() {
-                            return tags;
+                        if !intent.tags.is_empty() {
+                            if let Some(d) = forced {
+                                intent.difficulty = d;
+                                intent.source = crate::router::IntentSource::Header;
+                            }
+                            return intent;
                         }
                     }
                 }
             }
         }
     }
+
     // Heuristic fallback (also used when the classifier is off or returns empty).
-    crate::router::heuristic_tags(json, est_input_tokens)
+    let mut intent = crate::router::heuristic_intent(json, est_input_tokens);
+    if let Some(d) = forced {
+        intent.difficulty = d;
+        intent.source = crate::router::IntentSource::Header;
+    }
+    intent
 }
 
 /// Build a compact prompt for the classifier: the system message (if any) plus
