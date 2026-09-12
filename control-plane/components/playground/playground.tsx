@@ -114,8 +114,8 @@ export function Playground({ scope }: { scope: string }) {
         <div><h1 className="flex items-center gap-2 text-lg font-semibold"><FlaskConical className="h-5 w-5 text-violet-500" />Playground</h1><p className="mt-1 text-xs text-muted-foreground">Explore models, compare answers, and test your gateway.</p></div>
         <div className="flex items-center gap-2">
           <Button variant="ghost" size="icon" title="Toggle sessions" aria-expanded={showSessions} onClick={() => setShowSessions(!showSessions)}><PanelLeft className="h-4 w-4" /></Button>
-          {/* Chat/compare generation parameters don't apply to Router mode (its own weight sliders) or Image mode (its own generation parameters). */}
-          {(session.mode === "chat" || session.mode === "compare") && <Button variant="outline" size="sm" onClick={() => setShowSettings(!showSettings)} aria-expanded={showSettings}><SlidersHorizontal className="mr-2 h-4 w-4" />Parameters</Button>}
+          {/* Chat/compare and Image each have generation parameters worth hiding until asked for; Router has its own weight sliders in the workspace instead. */}
+          {session.mode !== "router" && <Button variant="outline" size="sm" onClick={() => setShowSettings(!showSettings)} aria-expanded={showSettings}><SlidersHorizontal className="mr-2 h-4 w-4" />Parameters</Button>}
           <Button variant="ghost" size="icon" title="Export saved session" onClick={exportSession}><ArrowDownToLine className="h-4 w-4" /></Button>
         </div>
       </header>
@@ -125,6 +125,12 @@ export function Playground({ scope }: { scope: string }) {
         <label className="text-xs font-medium">System prompt<textarea aria-label="System prompt" value={session.generation.systemPrompt} maxLength={32000} onChange={(e) => update({ generation: { ...session.generation, systemPrompt: e.target.value } })} className="mt-1 w-full resize-y rounded-md border border-border bg-background p-2 text-sm" rows={2} placeholder="Instructions for direct chat and comparison" /></label>
         <label className="text-xs font-medium">Temperature<Input aria-label="Temperature" className="mt-1" type="number" min={0} max={2} step={0.1} placeholder="Model default" value={session.generation.temperature ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (n >= 0 && n <= 2)) update({ generation: { ...session.generation, temperature: e.target.value ? n : undefined } }); }} /></label>
         <label className="text-xs font-medium">Max output tokens<Input aria-label="Max output tokens" className="mt-1" type="number" min={1} max={131072} placeholder="Model default" value={session.generation.maxTokens ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 131072)) update({ generation: { ...session.generation, maxTokens: e.target.value ? n : undefined } }); }} /></label>
+      </div>}
+      {showSettings && session.mode === "image" && <div className="grid gap-3 border-b border-border bg-secondary/20 p-4 sm:grid-cols-[1fr_9rem_10rem]">
+        <label className="text-xs font-medium">Negative prompt<textarea aria-label="Negative prompt" id="image-negative-prompt" value={session.imageNegativePrompt ?? ""} maxLength={4000} onChange={(e) => update({ imageNegativePrompt: e.target.value })} className="mt-1 w-full resize-y rounded-md border border-border bg-background p-2 text-sm" rows={2} placeholder="blurry, watermark" /></label>
+        <label className="text-xs font-medium">Steps<Input aria-label="Steps" id="image-steps" className="mt-1" type="number" min={1} max={150} placeholder="Backend default" value={session.imageSteps ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 150)) update({ imageSteps: e.target.value ? n : undefined }); }} /></label>
+        <label className="text-xs font-medium">Seed<Input aria-label="Seed" id="image-seed" className="mt-1" type="number" min={0} max={4_294_967_295} placeholder="Random" value={session.imageSeed ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 0 && n <= 4_294_967_295)) update({ imageSeed: e.target.value ? n : undefined }); }} /></label>
+        <p className="text-[11px] text-muted-foreground sm:col-span-3">Negative prompt, steps, and seed are not part of the OpenAI images API. They are passed through to the backend, which may ignore them.</p>
       </div>}
       <div className="flex min-h-0 flex-1 flex-col md:flex-row">
         {showSessions && <aside className="flex shrink-0 flex-col gap-3 border-b border-border bg-secondary/10 p-3 md:w-52 md:border-b-0 md:border-r">
