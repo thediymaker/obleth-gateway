@@ -453,7 +453,7 @@ async fn proxy_handler_inner(
             &req_meta.session_id,
             boons_opt_out,
             boons_force_lossy,
-            req_meta.request_type == "chat",
+            is_chat_path(&path),
             &mut json,
             tracer.as_mut(),
         )
@@ -2995,12 +2995,27 @@ fn request_type_for_path(path: &str) -> &'static str {
 /// The request class recorded in the ledger: synthetic tenants' traffic is
 /// tagged `benchmark` (replacing the path-derived class, mirroring how health
 /// probes record `health_probe`), everything else classifies by path.
+///
+/// This is an ACCOUNTING label. It must never gate behavior — see
+/// [`is_chat_path`].
 fn effective_request_type(resolved: &ResolvedKey, path: &str) -> &'static str {
     if resolved.synthetic {
         obleth_config::BENCHMARK_REQUEST_TYPE
     } else {
         request_type_for_path(path)
     }
+}
+
+/// Whether chat-only boons (knowledge, compression, tools, structured output,
+/// the MCP tool loop) apply to this request.
+///
+/// Derived from the path, never from the ledger's `request_type`: that label is
+/// overwritten with `benchmark` for every synthetic tenant, so reading it here
+/// disabled every chat-only boon for precisely the two callers that exist to
+/// exercise them — the Charo console/playground and the benchmark suite, both of
+/// which call the data plane as the reserved (synthetic) control-plane tenant.
+fn is_chat_path(path: &str) -> bool {
+    request_type_for_path(path) == "chat"
 }
 
 /// Provenance of a resolved conversation id.
@@ -3243,7 +3258,8 @@ fn now_ms() -> i64 {
 mod tests {
     use super::{
         backoff_for, build_targets, build_upstream_url, effective_request_type, has_path_traversal,
-        is_models_endpoint, is_retryable_status, prepare_upstream_body, request_type_for_path,
+        is_chat_path, is_models_endpoint, is_retryable_status, prepare_upstream_body,
+        request_type_for_path,
         resolve_conversation, session_hash_order, tenant_active_now, weighted_order, RequestMeta,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
@@ -3322,6 +3338,51 @@ mod tests {
         assert_eq!(
             effective_request_type(&resolved, "/v1/chat/completions"),
             obleth_config::BENCHMARK_REQUEST_TYPE
+        );
+    }
+
+    #[test]
+    fn a_synthetic_tenants_chat_request_still_counts_as_chat_for_boons() {
+        // The ledger label and the boon gate must not be the same value. A
+        // synthetic tenant's chat completion is stamped `benchmark` for
+        // accounting, but it is still a chat request: every chat-only boon
+        // (knowledge, compression, tools, structured output, the MCP tool loop)
+        // has to fire for it, or the console and the benchmark suite measure a
+        // gateway with those boons silently switched off.
+        let mut resolved = key_with_schedule("UTC", None, None, None);
+        resolved.synthetic = true;
+        assert_eq!(
+            effective_request_type(&resolved, "/v1/chat/completions"),
+            obleth_config::BENCHMARK_REQUEST_TYPE,
+            "accounting still tags it benchmark"
+        );
+        assert!(
+            is_chat_path("/v1/chat/completions"),
+            "but the boon gate reads the path, not that label"
+        );
+        assert!(!is_chat_path("/v1/embeddings"));
+        assert!(!is_chat_path("/v1/images/generations"));
+    }
+
+    #[test]
+    fn boons_are_gated_on_the_path_not_the_ledger_label() {
+        // Both helpers above are individually correct; the defect was purely in
+        // the wiring — `enrich_request` was handed `req_meta.request_type ==
+        // "chat"`, which is never true for a synthetic tenant. No test over the
+        // pure functions can catch that, so this pins the call site itself
+        // (same approach as `knowledge_boon_phases_stay_in_source_order`).
+        let src = include_str!("proxy.rs");
+        let call = src
+            .find(".enrich_request(")
+            .expect("the enrich_request call site");
+        let args = &src[call..(call + 600).min(src.len())];
+        assert!(
+            args.contains("is_chat_path(&path)"),
+            "the chat flag passed to the boon engine must be path-derived"
+        );
+        assert!(
+            !args.contains("request_type == \"chat\""),
+            "the ledger's request_type is an accounting label and must not gate boons"
         );
     }
 
