@@ -2176,6 +2176,9 @@ async fn put_boon_settings(
         // No admin-API fields for the knowledge boon yet (Task 7+); carry the
         // persisted value through unchanged, same as `guardrails` above.
         knowledge: existing.knowledge.clone(),
+        // No admin-API fields for the image_generation boon yet; carry the
+        // persisted value through unchanged.
+        image_generation: existing.image_generation.clone(),
     };
 
     state.store.put_boon_settings(&settings).await?;
