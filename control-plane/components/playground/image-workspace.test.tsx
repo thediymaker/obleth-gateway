@@ -216,6 +216,85 @@ describe("ImageWorkspace", () => {
     expect(detail[STORAGE_KEY]).toMatchObject([{ model: "sdxl", prompt: "a cat" }]);
   });
 
+  it("generates on Enter from the composer", async () => {
+    act(() => {
+      root.render(
+        <ImageWorkspace
+          session={session({ imageModel: "sdxl", imagePrompt: "a cat" })}
+          update={() => {}}
+          models={models}
+          loading={false}
+          storageKey={STORAGE_KEY}
+        />,
+      );
+    });
+    await act(async () => {
+      host.querySelector<HTMLTextAreaElement>("#image-prompt")!.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true }),
+      );
+    });
+    expect(bodies).toEqual([{ model: "sdxl", prompt: "a cat", size: "512x512", n: 1 }]);
+  });
+
+  // A row records the request that produced it, so Retry reproduces that
+  // request. Reading the live toolbar instead would silently re-run an old
+  // prompt against new settings and label the result with the old ones.
+  it("retries a row with the parameters it was generated with", async () => {
+    const render = (imageSize: string) =>
+      act(() => {
+        root.render(
+          <ImageWorkspace
+            session={session({ imageModel: "sdxl", imagePrompt: "a cat", imageSize })}
+            update={() => {}}
+            models={models}
+            loading={false}
+            storageKey={STORAGE_KEY}
+          />,
+        );
+      });
+    render("512x512");
+    await act(async () => {
+      host.querySelector<HTMLButtonElement>("#image-generate")!.click();
+    });
+    render("1024x1024");
+    await act(async () => {
+      host.querySelector<HTMLButtonElement>("[title='Generate this prompt again']")!.click();
+    });
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toMatchObject({ size: "512x512" });
+  });
+
+  it("collapses a long backend error behind a disclosure", async () => {
+    const long = `litellm.InternalServerError: ${"synStatus 31 ".repeat(20)}`;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => ({
+        ok: false,
+        status: 500,
+        json: async () => ({ error: long }),
+      }) as unknown as Response),
+    );
+    act(() => {
+      root.render(
+        <ImageWorkspace
+          session={session({ imageModel: "sdxl", imagePrompt: "a cat" })}
+          update={() => {}}
+          models={models}
+          loading={false}
+          storageKey={STORAGE_KEY}
+        />,
+      );
+    });
+    await act(async () => {
+      host.querySelector<HTMLButtonElement>("#image-generate")!.click();
+    });
+    const alert = host.querySelector("[role='alert']")!;
+    // The lead is truncated, but the untruncated text is still reachable.
+    expect(alert.querySelector("p")!.textContent).toMatch(/…$/);
+    expect(alert.querySelector("summary")!.textContent).toBe("Show details");
+    expect(alert.querySelector("pre")!.textContent).toBe(long);
+  });
+
   it("blocks generation with no prompt", () => {
     act(() => {
       root.render(
