@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 //! The **image-generation** boon: lets a chat model produce images.
 //!
 //! A model granted this boon has a `generate_image` function tool merged into
@@ -13,6 +11,11 @@
 //! turn one picture into megabytes of prompt tokens on every subsequent turn.
 //! The image travels out of band in a `Vec<GeneratedImage>` accumulator and is
 //! appended to the final assistant message as markdown.
+
+// Scaffolding: these items are exercised by tests but have no production caller
+// until the tool loop is wired up. Remove once the tool loop calls `inject` and
+// other execution functions from this module (Task 6).
+#![allow(dead_code)]
 
 use obleth_config::{ImageGenerationBoonSettings, IMAGE_GENERATION_MAX_PER_REQUEST};
 use serde_json::{json, Value};
