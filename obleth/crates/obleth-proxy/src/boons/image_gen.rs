@@ -17,8 +17,14 @@
 // other execution functions from this module (Task 6).
 #![allow(dead_code)]
 
-use obleth_config::{ImageGenerationBoonSettings, IMAGE_GENERATION_MAX_PER_REQUEST};
+use std::time::Duration;
+
+use obleth_config::{
+    ImageGenerationBoonSettings, ResolvedKey, ResolvedModel, IMAGE_GENERATION_MAX_PER_REQUEST,
+};
 use serde_json::{json, Value};
+
+use crate::state::AppState;
 
 /// Name of the gateway-executed tool this boon injects.
 pub(super) const GENERATE_IMAGE_TOOL: &str = "generate_image";
@@ -229,6 +235,233 @@ pub(super) fn build_images_url(api_base: &str) -> String {
     format!("{base}/images/generations")
 }
 
+/// Total attached image bytes allowed on one completion. Independent of
+/// `proxy::BOON_BUFFER_MAX`, which caps the *upstream* buffer before this
+/// transform runs — images are added afterwards, so both limits apply.
+pub(super) const IMAGE_ATTACH_MAX_BYTES: usize = 3 * 1024 * 1024;
+
+/// Markdown alt text for a generated image. The prompt is model-written, so a
+/// stray `]` or newline in it would break the image link — strip both before
+/// shortening.
+fn alt_text(prompt: &str) -> String {
+    let flattened: String = prompt
+        .chars()
+        .map(|c| match c {
+            '[' | ']' | '\n' | '\r' => ' ',
+            other => other,
+        })
+        .collect();
+    excerpt(flattened.split_whitespace().collect::<Vec<_>>().join(" ").as_str())
+}
+
+/// The markdown block appended to the final assistant message, or `None` when
+/// no image was generated. Over-budget images are dropped individually with a
+/// visible note; the batch is never discarded wholesale.
+pub(super) fn attachment(images: &[GeneratedImage]) -> Option<String> {
+    if images.is_empty() {
+        return None;
+    }
+    let mut used = 0usize;
+    let mut dropped = 0usize;
+    let mut lines: Vec<String> = Vec::new();
+    for image in images {
+        if used.saturating_add(image.url.len()) > IMAGE_ATTACH_MAX_BYTES {
+            dropped += 1;
+            continue;
+        }
+        used += image.url.len();
+        lines.push(format!("![{}]({})", alt_text(&image.prompt), image.url));
+    }
+    if dropped > 0 {
+        let plural = if dropped == 1 { "image was" } else { "images were" };
+        lines.push(format!(
+            "_{dropped} generated {plural} too large to include in this reply._"
+        ));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    Some(format!("\n\n{}", lines.join("\n\n")))
+}
+
+/// Append the generated images to `/choices/0/message/content`. Returns true
+/// when the completion was modified. A completion without that pointer (an
+/// error body, a malformed reply) is left byte-identical.
+pub(super) fn attach_to_completion(images: &[GeneratedImage], body: &mut Value) -> bool {
+    let Some(markdown) = attachment(images) else {
+        return false;
+    };
+    let Some(message) = body
+        .pointer_mut("/choices/0/message")
+        .and_then(|m| m.as_object_mut())
+    else {
+        return false;
+    };
+    let existing = message
+        .get("content")
+        .and_then(|c| c.as_str())
+        .unwrap_or_default()
+        .to_string();
+    message.insert(
+        "content".into(),
+        Value::String(format!("{existing}{markdown}")),
+    );
+    true
+}
+
+/// One generation attempt, for the trace span. Recorded by the caller, which
+/// owns the tracer (`execute` does not).
+pub(super) struct ImageGenEvent {
+    pub images: u32,
+    pub size: String,
+    pub model: String,
+    pub upstream_ms: u32,
+    pub ok: bool,
+}
+
+/// Everything the gateway-executed `generate_image` tool needs, threaded
+/// through the tool loop for the life of one request.
+pub(super) struct ImageCtx<'a> {
+    /// Settings snapshot taken at request time, so a hot-reload mid-request
+    /// cannot change behaviour.
+    pub cfg: &'a ImageGenerationBoonSettings,
+    pub key: &'a ResolvedKey,
+    pub session_id: &'a str,
+    /// Images produced so far — the out-of-band channel that keeps image bytes
+    /// out of the model's context.
+    pub images: Vec<GeneratedImage>,
+    pub events: Vec<ImageGenEvent>,
+}
+
+/// Execute one `generate_image` call: clamp the arguments, POST to the
+/// configured image model, push any images into the accumulator, bill them, and
+/// return the short text receipt the model will read.
+///
+/// Fail-open throughout: every failure returns a receipt describing the failure
+/// and leaves the accumulator untouched, so the model answers in prose.
+pub(super) async fn execute(state: &AppState, ctx: &mut ImageCtx<'_>, args: &Value) -> String {
+    let Some(prompt) = prompt_arg(args) else {
+        return failure_receipt("no prompt was supplied");
+    };
+    let Some(model_name) = ctx.cfg.image_model.as_deref().map(str::trim) else {
+        return failure_receipt("no image model is configured");
+    };
+    let Some(image_model) = crate::proxy::resolve_model(state, model_name).await else {
+        tracing::warn!(
+            model = %model_name,
+            "image-generation boon target is not registered; no image produced"
+        );
+        return failure_receipt("the image model is not available");
+    };
+    if !image_model.enabled {
+        tracing::warn!(
+            model = %model_name,
+            "image-generation boon target is disabled; no image produced"
+        );
+        return failure_receipt("the image model is not available");
+    }
+
+    let n = clamp_n(ctx.cfg, args);
+    let size = clamp_size(ctx.cfg, args);
+    // Deliberately the boon's own timeout, not the tool loop's `tool_timeout_ms`
+    // (default 30s): image generation routinely takes longer than an MCP call.
+    let timeout = Duration::from_millis(ctx.cfg.timeout_ms.max(1));
+    let body = json!({
+        "model": image_model.upstream_model,
+        "prompt": prompt,
+        "n": n,
+        "size": size,
+        "response_format": "b64_json",
+    });
+
+    let started = crate::tracer::now_ms();
+    let outcome = generate(state, &image_model, body, timeout).await;
+    let upstream_ms = (crate::tracer::now_ms() - started) as u32;
+
+    match outcome {
+        Ok(response) => {
+            let urls = image_urls(&response);
+            if urls.is_empty() {
+                tracing::warn!(
+                    model = %model_name,
+                    "image-generation boon response carried no image data"
+                );
+                ctx.events.push(ImageGenEvent {
+                    images: 0,
+                    size,
+                    model: image_model.model_name.clone(),
+                    upstream_ms,
+                    ok: false,
+                });
+                return failure_receipt("the image model returned no image");
+            }
+            let count = urls.len();
+            for url in urls {
+                ctx.images.push(GeneratedImage {
+                    url,
+                    size: size.clone(),
+                    prompt: prompt.clone(),
+                });
+            }
+            super::bill_image_generation(
+                state,
+                &image_model,
+                ctx.key,
+                ctx.session_id,
+                count as u32,
+            );
+            ctx.events.push(ImageGenEvent {
+                images: count as u32,
+                size: size.clone(),
+                model: image_model.model_name.clone(),
+                upstream_ms,
+                ok: true,
+            });
+            receipt(count, &size, &prompt)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                model = %model_name,
+                "image-generation boon call failed; answering without an image"
+            );
+            ctx.events.push(ImageGenEvent {
+                images: 0,
+                size,
+                model: image_model.model_name.clone(),
+                upstream_ms,
+                ok: false,
+            });
+            failure_receipt(&e.to_string())
+        }
+    }
+}
+
+/// POST one generation request to the image model, bounded by `timeout`.
+async fn generate(
+    state: &AppState,
+    model: &ResolvedModel,
+    body: Value,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let fut = async {
+        let url = build_images_url(&model.api_base);
+        let mut req = state.http.post(url).json(&body);
+        if let Some(api_key) = &model.api_key {
+            req = req.bearer_auth(api_key);
+        }
+        let resp = req.send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("upstream returned {}", resp.status());
+        }
+        Ok(resp.json::<Value>().await?)
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(result) => result,
+        Err(_) => anyhow::bail!("image generation timed out after {timeout:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +626,90 @@ mod tests {
             build_images_url("http://host:8080/v1"),
             "http://host:8080/v1/images/generations"
         );
+    }
+
+    fn img(url: &str) -> GeneratedImage {
+        GeneratedImage {
+            url: url.to_string(),
+            size: "512x512".to_string(),
+            prompt: "a cat".to_string(),
+        }
+    }
+
+    #[test]
+    fn attachment_is_none_when_nothing_was_generated() {
+        assert!(attachment(&[]).is_none());
+    }
+
+    #[test]
+    fn attachment_renders_one_markdown_image_per_line() {
+        let md = attachment(&[img("data:image/png;base64,AAAA"), img("http://i/x.png")])
+            .expect("two images produce an attachment");
+        assert!(md.contains("![a cat](data:image/png;base64,AAAA)"));
+        assert!(md.contains("![a cat](http://i/x.png)"));
+        assert_eq!(md.matches("![").count(), 2);
+    }
+
+    #[test]
+    fn alt_text_cannot_break_the_markdown_link() {
+        let mut image = img("http://i/x.png");
+        image.prompt = "a [cat]\nwearing a hat".to_string();
+        let md = attachment(std::slice::from_ref(&image)).unwrap();
+        assert_eq!(md.trim(), "![a cat wearing a hat](http://i/x.png)");
+        assert_eq!(md.matches('[').count(), 1);
+        assert_eq!(md.matches(']').count(), 1);
+    }
+
+    #[test]
+    fn attachment_drops_the_overflow_not_the_whole_batch() {
+        let big = "x".repeat(IMAGE_ATTACH_MAX_BYTES);
+        let md = attachment(&[img("data:image/png;base64,AAAA"), img(&big)])
+            .expect("the first image still fits");
+        assert!(md.contains("AAAA"));
+        assert!(!md.contains(&big));
+        assert!(
+            md.to_lowercase().contains("too large"),
+            "the dropped image must be acknowledged, got: {md}"
+        );
+    }
+
+    #[test]
+    fn attach_to_completion_leaves_content_alone_when_empty() {
+        let mut body = serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": "here you go" } }]
+        });
+        let before = body.clone();
+        assert!(!attach_to_completion(&[], &mut body));
+        assert_eq!(body, before);
+    }
+
+    #[test]
+    fn attach_to_completion_appends_after_the_prose() {
+        let mut body = serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": "here you go" } }]
+        });
+        assert!(attach_to_completion(&[img("http://i/x.png")], &mut body));
+        let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(content.starts_with("here you go"));
+        assert!(content.contains("![a cat](http://i/x.png)"));
+    }
+
+    #[test]
+    fn attach_to_completion_handles_a_null_content_message() {
+        // A model that answered with only a tool call leaves `content: null`.
+        let mut body = serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": null } }]
+        });
+        assert!(attach_to_completion(&[img("http://i/x.png")], &mut body));
+        let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(content.contains("![a cat](http://i/x.png)"));
+    }
+
+    #[test]
+    fn attach_to_completion_is_a_noop_on_a_malformed_completion() {
+        let mut body = serde_json::json!({ "error": "upstream exploded" });
+        let before = body.clone();
+        assert!(!attach_to_completion(&[img("http://i/x.png")], &mut body));
+        assert_eq!(body, before);
     }
 }

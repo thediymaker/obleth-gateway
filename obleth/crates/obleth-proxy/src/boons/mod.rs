@@ -821,6 +821,56 @@ pub(crate) fn bill_helper_call(
     });
 }
 
+/// Record a boon-generated image against the tenant's ledger. Image models are
+/// priced per image, not per token, so this is a sibling of
+/// [`bill_helper_call`] rather than a call into it: cost comes from
+/// `cost_per_image` and both token counts are zero. Synthetic tenants are
+/// relabelled `benchmark` and internal probe keys are unbilled, exactly as
+/// there.
+pub(crate) fn bill_image_generation(
+    state: &AppState,
+    image_model: &ResolvedModel,
+    key: &ResolvedKey,
+    session_id: &str,
+    images: u32,
+) {
+    let request_type = helper_request_type(key, "image_generation_boon");
+    let cost_usd = images as f64 * image_model.cost_per_image;
+
+    state.metrics.record_request("boon", 200, 0, 0);
+    if key.internal {
+        return;
+    }
+    state.telemetry.record(UsageRecord {
+        request_id: Uuid::new_v4(),
+        tenant_id: key.tenant_id,
+        key_id: key.key_id,
+        model: image_model.model_name.clone(),
+        admission: "boon".to_string(),
+        weight: key.weight,
+        input_tokens: 0,
+        output_tokens: 0,
+        estimated_tokens: 0,
+        queue_wait_ms: 0,
+        ttft_ms: 0,
+        total_ms: 0,
+        status_code: 200,
+        cache_status: "off".to_string(),
+        cost_usd,
+        // Same reasoning as `bill_helper_call`: no duration is recorded here,
+        // so slot-share energy is zero by construction and the main request's
+        // wall time covers this hardware time.
+        energy_wh: 0.0,
+        energy_cost_usd: 0.0,
+        co2_g: 0.0,
+        ts_ms: now_ms(),
+        session_id: session_id.to_string(),
+        session_id_source: "none".to_string(),
+        request_type: request_type.to_string(),
+        device_id: String::new(),
+    });
+}
+
 pub(crate) fn build_chat_url(api_base: &str) -> String {
     let base = api_base.trim_end_matches('/');
     format!("{base}/chat/completions")
