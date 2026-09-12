@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useTransition } from "react";
+import { useEffect, useState, useTransition } from "react";
 import { useRouter } from "next/navigation";
 import { AlertTriangle, BookOpen, ChevronRight, Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { Badge } from "@/components/ui/badge";
@@ -16,7 +16,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { EmptyState } from "@/components/dashboard-primitives";
 import { CollectionDetail } from "@/components/knowledge/collection-detail";
 import { collectionStatus } from "@/lib/knowledge-format";
 import { formatBytes, formatCompact } from "@/lib/format";
@@ -24,6 +23,13 @@ import type { KnowledgeCollection, KnowledgeDocument } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 
 type Status = ReturnType<typeof collectionStatus>;
+
+/** Refresh cadence while a collection is still indexing — matches the
+ * document-level poll in `CollectionDetail` so the two views agree. */
+const ACTIVE_REFRESH_MS = 5_000;
+/** Background cadence when nothing is in flight; slower because each refresh
+ * re-reads every collection's document list on the server. */
+const IDLE_REFRESH_MS = 30_000;
 
 const STATUS_STYLE: Record<Status, string> = {
   ready: "border-emerald-500/35 bg-emerald-500/10 text-emerald-300",
@@ -73,6 +79,29 @@ export function CollectionList({
   function refresh() {
     router.refresh();
   }
+
+  const anyIndexing = collections.some(
+    (c) => collectionStatus(c, documentsByCollection[c.id] ?? []) === "indexing",
+  );
+
+  // Indexing happens in the background on the gateway, so chunk counts and
+  // statuses go stale the moment a document is uploaded or requeued. Re-run
+  // the server component on a timer instead of making the operator reload.
+  // Ticks are skipped while the tab is hidden — nobody is reading them and
+  // each one re-reads every collection's documents — and a refresh fires as
+  // soon as the tab comes back so what's on screen is never stale on return.
+  useEffect(() => {
+    const period = anyIndexing ? ACTIVE_REFRESH_MS : IDLE_REFRESH_MS;
+    const tick = () => {
+      if (!document.hidden) router.refresh();
+    };
+    const timer = window.setInterval(tick, period);
+    document.addEventListener("visibilitychange", tick);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener("visibilitychange", tick);
+    };
+  }, [anyIndexing, router]);
 
   function withRowBusy(id: string, run: () => Promise<void>) {
     setRowBusy((s) => new Set(s).add(id));
@@ -222,7 +251,12 @@ export function CollectionList({
       )}
 
       <div className="overflow-hidden rounded-lg border border-border/70 bg-card/45">
-        <div className="hidden grid-cols-[minmax(0,1fr)_10rem_6rem_6rem_8rem_2.75rem] border-b border-border/70 bg-background/35 px-4 py-2.5 text-xs font-medium text-muted-foreground md:grid">
+        {/* Header and rows must share one column template *and* one gap, or the
+            headings drift out of line with the values under them. The trailing
+            column is a fixed 5.75rem (three 1.75rem buttons + two gap-1) rather
+            than `auto` so rows with a reindex button line up with rows without
+            one. */}
+        <div className="hidden grid-cols-[minmax(0,1fr)_10rem_6rem_6rem_8rem_5.75rem] gap-3 border-b border-border/70 bg-background/35 px-4 py-2.5 text-xs font-medium text-muted-foreground md:grid">
           <div>Collection</div>
           <div>Embedding model</div>
           <div>Documents</div>
@@ -238,7 +272,7 @@ export function CollectionList({
             return (
               <div
                 key={collection.id}
-                className="group relative grid gap-3 px-4 py-4 md:grid-cols-[minmax(0,1fr)_10rem_6rem_6rem_8rem_auto] md:items-center"
+                className="group relative grid gap-3 px-4 py-4 md:grid-cols-[minmax(0,1fr)_10rem_6rem_6rem_8rem_5.75rem] md:items-center"
               >
                 <button
                   type="button"
@@ -328,7 +362,7 @@ export function CollectionList({
                   </div>
                 </div>
               </DialogHeader>
-              <div className="min-h-0 overflow-y-auto px-5 py-4 sm:px-6">
+              <div className="scroll-slim min-h-0 overflow-y-auto overscroll-contain px-5 py-4 sm:px-6">
                 <CollectionDetail
                   collection={selected}
                   initialDocuments={documentsByCollection[selected.id] ?? []}

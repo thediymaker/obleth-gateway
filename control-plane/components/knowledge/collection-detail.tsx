@@ -415,10 +415,8 @@ export function CollectionDetail({
       <DocumentUpload
         collectionId={collection.id}
         maxUploadBytes={maxUploadBytes}
-        onUploaded={(doc) => {
-          setDocuments((prev) => [doc, ...prev]);
-          onChanged();
-        }}
+        onUploaded={(doc) => setDocuments((prev) => [doc, ...prev])}
+        onSettled={onChanged}
       />
 
       <RetrievalPreview
@@ -435,7 +433,11 @@ export function CollectionDetail({
         </EmptyState>
       ) : (
         <div className="overflow-hidden rounded-lg border border-border/70 bg-card/45">
-          <div className="hidden grid-cols-[minmax(0,1fr)_7rem_6rem_6rem_2.5rem] border-b border-border/70 bg-background/35 px-4 py-2.5 text-xs font-medium text-muted-foreground md:grid">
+          {/* Header and rows must share one column template *and* one gap, or
+              the headings drift out of line with the values under them. The
+              trailing column is a fixed 3.75rem (two 1.75rem buttons + gap-1)
+              rather than `auto` so every row's controls align. */}
+          <div className="hidden grid-cols-[minmax(0,1fr)_7rem_6rem_6rem_3.75rem] gap-2 border-b border-border/70 bg-background/35 px-4 py-2.5 text-xs font-medium text-muted-foreground md:grid">
             <div>Document</div>
             <div>Size</div>
             <div>Chunks</div>
@@ -448,7 +450,7 @@ export function CollectionDetail({
               return (
                 <div
                   key={doc.id}
-                  className="grid gap-2 px-4 py-3 md:grid-cols-[minmax(0,1fr)_7rem_6rem_6rem_auto] md:items-center"
+                  className="grid gap-2 px-4 py-3 md:grid-cols-[minmax(0,1fr)_7rem_6rem_6rem_3.75rem] md:items-center"
                 >
                   <div className="min-w-0">
                     <p className="truncate text-sm font-medium" title={doc.title}>
