@@ -8,6 +8,10 @@
 //! - **structured_output** ([`structured`]): enforces `response_format` JSON
 //!   schemas. The schema is rendered into the prompt; the reply is validated at
 //!   the gateway and repaired via a configurable fixer model when it fails.
+//! - **image_generation** ([`image_gen`]): injects a gateway-executed
+//!   `generate_image` tool so a chat model can produce images through a
+//!   registered image model. The tool returns a text receipt; the image itself
+//!   is attached to the final assistant message out of band.
 //!
 //! Vision rewrites only the request. Structured output additionally rewrites the
 //! **response**: when it arms a [`ResponsePlan`], the proxy forces a
@@ -33,6 +37,7 @@ pub(crate) mod compressor;
 pub(crate) mod drain;
 pub(crate) mod embedded_json;
 pub(crate) mod guardrails;
+pub(crate) mod image_gen;
 pub(crate) mod knowledge;
 pub mod mcp_tools;
 pub mod respond;
