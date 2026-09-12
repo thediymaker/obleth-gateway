@@ -317,30 +317,46 @@ export function RequestLogs({ tenants, models, initialRequestId = "" }: { tenant
             <option value="success">Success</option>
             <option value="error">Error</option>
           </Select>
+          {/* Neutral when on, like Live Tail above and every other selected
+              control in the dashboard. Hue is reserved for status (a badge
+              saying something is failed or stale), not for "this filter is
+              applied" — the filled dot carries that. */}
           <button
             type="button"
             onClick={() => patchFilters({ tracedOnly: !filters.tracedOnly })}
+            aria-pressed={filters.tracedOnly}
             className={cn(
               "inline-flex h-8 items-center justify-center gap-1.5 rounded-md border px-2.5 text-[11px] transition-colors",
               filters.tracedOnly
-                ? "border-emerald-700/60 bg-emerald-950/40 text-emerald-400"
+                ? "border-border bg-secondary text-foreground"
                 : "border-border bg-muted/30 text-muted-foreground hover:text-foreground",
             )}
           >
-            <span className="h-1.5 w-1.5 rounded-full border border-current" />
+            <span
+              className={cn(
+                "h-1.5 w-1.5 rounded-full border border-current",
+                filters.tracedOnly && "bg-current",
+              )}
+            />
             Traced only
           </button>
           <button
             type="button"
             onClick={() => patchFilters({ includeInternal: !filters.includeInternal })}
+            aria-pressed={filters.includeInternal}
             className={cn(
               "inline-flex h-8 items-center justify-center gap-1.5 rounded-md border px-2.5 text-[11px] transition-colors",
               filters.includeInternal
-                ? "border-amber-700/60 bg-amber-950/40 text-amber-400"
+                ? "border-border bg-secondary text-foreground"
                 : "border-border bg-muted/30 text-muted-foreground hover:text-foreground",
             )}
           >
-            <span className="h-1.5 w-1.5 rounded-full border border-current" />
+            <span
+              className={cn(
+                "h-1.5 w-1.5 rounded-full border border-current",
+                filters.includeInternal && "bg-current",
+              )}
+            />
             Show health/internal traffic
           </button>
           {filtersActive && (
