@@ -43,6 +43,26 @@ function setNativeValue(el: HTMLInputElement | HTMLSelectElement, value: string,
   el.dispatchEvent(new Event(eventType, { bubbles: true }));
 }
 
+/** The dropdown trigger; its text is the selected option's label. */
+function selectTrigger(id: string) {
+  return host.querySelector<HTMLButtonElement>(`button#${id}`)!;
+}
+
+// The dropdown opens on pointerdown and Radix ignores a plain Event there (it
+// reads `button`/`ctrlKey`), so send a MouseEvent. Options render in a portal
+// on document.body, outside `host`.
+async function chooseOption(id: string, label: string) {
+  await act(async () => {
+    selectTrigger(id).dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
+  });
+  const option = [...document.querySelectorAll<HTMLElement>("[role='menuitem']")].find(
+    (el) => el.textContent === label,
+  )!;
+  await act(async () => {
+    option.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+}
+
 async function render(view: AutoRouterSettingsView | null) {
   // useState initializers only run on mount, so a settings-prop change on an
   // already-mounted form (as the real page never does) wouldn't reset the
@@ -87,7 +107,7 @@ it("reflects incoming settings in the scoring controls and their readouts", () =
   expect(range("tag_weight").value).toBe("0.3");
   expect(range("temperature").value).toBe("0.4");
   expect(host.querySelector<HTMLInputElement>("#default_soft_cap")!.value).toBe("12");
-  expect(host.querySelector<HTMLSelectElement>("#tier_source")!.value).toBe("derived");
+  expect(selectTrigger("tier_source").textContent).toBe("Derived from cost");
   expect(host.querySelector<HTMLInputElement>('input[type="checkbox"]')).not.toBeNull();
 
   // Numeric readouts beside each slider.
@@ -115,9 +135,7 @@ it("submits changed scoring values, the soft cap, tiering toggle, and tier sourc
     const toggle = host.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')[1]!;
     toggle.click();
   });
-  await act(async () => {
-    setNativeValue(host.querySelector<HTMLSelectElement>("#tier_source")!, "declared", "change");
-  });
+  await chooseOption("tier_source", "Declared only");
 
   await save();
 
@@ -139,5 +157,5 @@ it("falls back to the backend defaults when no settings are saved yet", async ()
   expect(range("tag_weight").value).toBe("0.5");
   expect(range("temperature").value).toBe("0");
   expect(host.querySelector<HTMLInputElement>("#default_soft_cap")!.value).toBe("8");
-  expect(host.querySelector<HTMLSelectElement>("#tier_source")!.value).toBe("hybrid");
+  expect(selectTrigger("tier_source").textContent).toBe("Hybrid");
 });

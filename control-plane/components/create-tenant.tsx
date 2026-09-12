@@ -6,6 +6,7 @@ import { createTenantAction } from "@/app/actions";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { WeeklyWindow } from "@/lib/obleth";
@@ -279,18 +280,12 @@ export function CreateTenant({
               />
               <div className="space-y-1.5">
                 <Label htmlFor="tenant-budget-period">Reset period</Label>
-                <select
+                <Select
                   id="tenant-budget-period"
                   name="budget_period"
                   defaultValue="lifetime"
-                  className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
-                >
-                  {BUDGET_PERIODS.map((period) => (
-                    <option key={period} value={period}>
-                      {period}
-                    </option>
-                  ))}
-                </select>
+                  options={BUDGET_PERIODS.map((period) => ({ value: period, label: period }))}
+                />
               </div>
             </div>
           </PanelCard>
@@ -390,17 +385,13 @@ function WindowRow({
 }) {
   return (
     <div className="flex flex-wrap items-center gap-2 rounded-md border border-border/60 bg-background/30 p-2">
-      <select
-        value={window.day}
-        onChange={(e) => onPatch({ day: Number(e.target.value) })}
-        className="h-9 rounded-md border border-input bg-background px-2 text-sm"
-      >
-        {DAY_LABELS.map((label, day) => (
-          <option key={day} value={day}>
-            {label}
-          </option>
-        ))}
-      </select>
+      <Select
+        aria-label="Day of week"
+        value={String(window.day)}
+        onValueChange={(value) => onPatch({ day: Number(value) })}
+        className="w-32"
+        options={DAY_LABELS.map((label, day) => ({ value: String(day), label }))}
+      />
       <Input
         type="time"
         className="w-32"

@@ -44,7 +44,6 @@ import { DestructiveConfirm } from "@/components/ui/destructive-confirm";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
-import { FormSelect } from "@/components/ui/form-select";
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import type { ApiKey, KeyUsageSummary, Tenant } from "@/lib/obleth";
 import { describeIdentityKey } from "@/lib/key-kind";
@@ -52,6 +51,12 @@ import { cn, formatCurrency, formatNumber } from "@/lib/utils";
 import { useRouter } from "next/navigation";
 
 const PAGE_SIZE_OPTIONS = [50, 100, 250, 500] as const;
+
+const BUDGET_PERIOD_OPTIONS = [
+  { value: "lifetime", label: "Lifetime" },
+  { value: "monthly", label: "Monthly" },
+  { value: "term", label: "Term" },
+];
 
 type StatusFilter = "all" | "active" | "disabled";
 type BudgetFilter = "all" | "budgeted" | "unlimited";
@@ -370,52 +375,44 @@ export function KeyManager({
                 </div>
                 <Select
                   value={tenantFilter}
-                  onChange={(e) => onFilterChange(setTenantFilter)(e.target.value)}
+                  onValueChange={(value) => onFilterChange(setTenantFilter)(value)}
                   aria-label="Filter API keys by tenant"
                   className="h-9 text-xs"
-                >
-                  <option value="all">All tenants</option>
-                  {tenants.map((t) => (
-                    <option key={t.id} value={t.id}>
-                      {t.name}
-                    </option>
-                  ))}
-                </Select>
+                  searchPlaceholder="Filter tenants"
+                  options={[{ value: "all", label: "All tenants" }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+                />
                 <Select
                   value={statusFilter}
-                  onChange={(e) => onFilterChange(setStatusFilter)(e.target.value as StatusFilter)}
+                  onValueChange={(value) => onFilterChange(setStatusFilter)(value as StatusFilter)}
                   aria-label="Filter API keys by status"
                   className="h-9 text-xs"
-                >
-                  <option value="all">All status</option>
-                  <option value="active">Active</option>
-                  <option value="disabled">Disabled</option>
-                </Select>
+                  options={[
+                    { value: "all", label: "All status" },
+                    { value: "active", label: "Active" },
+                    { value: "disabled", label: "Disabled" },
+                  ]}
+                />
                 <Select
                   value={budgetFilter}
-                  onChange={(e) => onFilterChange(setBudgetFilter)(e.target.value as BudgetFilter)}
+                  onValueChange={(value) => onFilterChange(setBudgetFilter)(value as BudgetFilter)}
                   aria-label="Filter API keys by budget"
                   className="h-9 text-xs"
-                >
-                  <option value="all">All budgets</option>
-                  <option value="budgeted">Budgeted</option>
-                  <option value="unlimited">Unlimited</option>
-                </Select>
+                  options={[
+                    { value: "all", label: "All budgets" },
+                    { value: "budgeted", label: "Budgeted" },
+                    { value: "unlimited", label: "Unlimited" },
+                  ]}
+                />
                 <Select
                   value={String(pageSize)}
-                  onChange={(e) => {
-                    setPageSize(Number(e.target.value));
+                  onValueChange={(value) => {
+                    setPageSize(Number(value));
                     setPage(0);
                   }}
                   aria-label="Rows per page"
                   className="h-9 text-xs"
-                >
-                  {PAGE_SIZE_OPTIONS.map((size) => (
-                    <option key={size} value={size}>
-                      {size} rows
-                    </option>
-                  ))}
-                </Select>
+                  options={PAGE_SIZE_OPTIONS.map((size) => ({ value: String(size), label: `${size} rows` }))}
+                />
               </div>
             </div>
 
@@ -623,7 +620,16 @@ function CreateKeyDialog({
           <div className="min-h-0 space-y-5 overflow-y-auto pr-1">
             <div className="grid gap-4 md:grid-cols-2">
               <Field label="Tenant" htmlFor="new-key-tenant">
-                <FormSelect id="new-key-tenant" name="tenant_id" required disabled={pending || tenants.length === 0} defaultValue={tenants[0]?.id} options={tenants.map((t) => ({ value: t.id, label: t.name }))} />
+                <Select
+                  id="new-key-tenant"
+                  name="tenant_id"
+                  required
+                  disabled={pending || tenants.length === 0}
+                  defaultValue={tenants[0]?.id}
+                  placeholder="Choose a tenant"
+                  searchPlaceholder="Filter tenants"
+                  options={tenants.map((t) => ({ value: t.id, label: t.name }))}
+                />
               </Field>
               <Field label="Key name" htmlFor="new-key-name">
                 <Input id="new-key-name" name="name" placeholder="prod-chat" required />
@@ -798,11 +804,12 @@ function KeyDetailPanel({
             <Input id={`key-name-${key.id}`} name="name" defaultValue={key.name} required />
           </Field>
           <Field label="Budget period" htmlFor={`key-budget-period-${key.id}`}>
-            <Select id={`key-budget-period-${key.id}`} name="budget_period" defaultValue={key.budget_period ?? "lifetime"}>
-              <option value="lifetime">Lifetime</option>
-              <option value="monthly">Monthly</option>
-              <option value="term">Term</option>
-            </Select>
+            <Select
+              id={`key-budget-period-${key.id}`}
+              name="budget_period"
+              defaultValue={key.budget_period ?? "lifetime"}
+              options={BUDGET_PERIOD_OPTIONS}
+            />
           </Field>
           <Field label="Description" htmlFor={`key-description-${key.id}`} className="md:col-span-2">
             <textarea
@@ -936,7 +943,7 @@ function BudgetFields() {
           <Input id="new-key-budget-cost" name="budget_cost_usd" type="number" min={0} step="0.01" placeholder="Unlimited" />
         </Field>
         <Field label="Period" htmlFor="new-key-budget-period">
-          <FormSelect id="new-key-budget-period" name="budget_period" defaultValue="lifetime" options={[{ value: "lifetime", label: "Lifetime" }, { value: "monthly", label: "Monthly" }, { value: "term", label: "Term" }]} />
+          <Select id="new-key-budget-period" name="budget_period" defaultValue="lifetime" options={BUDGET_PERIOD_OPTIONS} />
         </Field>
       </div>
     </div>

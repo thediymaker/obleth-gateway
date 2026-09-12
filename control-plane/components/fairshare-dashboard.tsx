@@ -1075,31 +1075,27 @@ function TenantOperations({ view }: { view?: FairshareLiveView }) {
           </div>
           <Select
             value={groupFilter}
-            onChange={(e) => setGroupFilter(e.target.value)}
+            onValueChange={setGroupFilter}
             aria-label="Filter tenants by group"
             className="h-8 w-40 text-xs"
-          >
-            <option value="all">All groups</option>
-            {groups.map((g) => (
-              <option key={g} value={g}>
-                {g}
-              </option>
-            ))}
-          </Select>
+            searchPlaceholder="Filter groups"
+            options={[{ value: "all", label: "All groups" }, ...groups.map((g) => ({ value: g, label: g }))]}
+          />
           <Select
             value={sort}
-            onChange={(e) => setSort(e.target.value as TenantSort)}
+            onValueChange={(value) => setSort(value as TenantSort)}
             aria-label="Sort tenants"
             className="h-8 w-44 text-xs"
-          >
-            <option value="pressure">Active pressure</option>
-            <option value="queued">Queued</option>
-            <option value="deficit">Slot deficit</option>
-            <option value="score">Scheduler debt</option>
-            <option value="served">Served work</option>
-            <option value="weight">Weight</option>
-            <option value="share">Weight share</option>
-          </Select>
+            options={[
+              { value: "pressure", label: "Active pressure" },
+              { value: "queued", label: "Queued" },
+              { value: "deficit", label: "Slot deficit" },
+              { value: "score", label: "Scheduler debt" },
+              { value: "served", label: "Served work" },
+              { value: "weight", label: "Weight" },
+              { value: "share", label: "Weight share" },
+            ]}
+          />
         </div>
       </CardHeader>
       <CardContent className="p-0">

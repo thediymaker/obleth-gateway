@@ -345,31 +345,24 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
 
         <Select
           value={tenantId}
-          onChange={(e) => selectTenant(e.target.value)}
+          onValueChange={selectTenant}
           aria-label="Filter by team"
           className="h-9 w-44 text-sm"
-        >
-          <option value="">All teams</option>
-          {tenants.map((t) => (
-            <option key={t.id} value={t.id}>
-              {t.name}
-            </option>
-          ))}
-        </Select>
+          searchPlaceholder="Filter teams"
+          options={[{ value: "", label: "All teams" }, ...tenants.map((t) => ({ value: t.id, label: t.name }))]}
+        />
         {tenantId && (
           <Select
             value={keyId}
-            onChange={(e) => setKeyId(e.target.value)}
+            onValueChange={setKeyId}
             aria-label="Filter by key"
             className="h-9 w-44 text-sm"
-          >
-            <option value="">All keys</option>
-            {tenantKeys.map((k) => (
-              <option key={k.id} value={k.id}>
-                {k.name || k.key_prefix}
-              </option>
-            ))}
-          </Select>
+            searchPlaceholder="Filter keys"
+            options={[
+              { value: "", label: "All keys" },
+              ...tenantKeys.map((k) => ({ value: k.id, label: k.name || k.key_prefix })),
+            ]}
+          />
         )}
 
         {query.isFetching && (
@@ -409,16 +402,17 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
             </p>
             <Select
               value={exportGroup}
-              onChange={(e) => setExportGroup(e.target.value as UsageDailyGroupBy)}
+              onValueChange={(value) => setExportGroup(value as UsageDailyGroupBy)}
               aria-label="Export row grouping"
               className="h-8 w-44 text-xs"
-            >
-              <option value="key_model">Per key + model</option>
-              <option value="day">Per day</option>
-              <option value="tenant">Per team</option>
-              <option value="key">Per key</option>
-              <option value="model">Per model</option>
-            </Select>
+              options={[
+                { value: "key_model", label: "Per key + model" },
+                { value: "day", label: "Per day" },
+                { value: "tenant", label: "Per team" },
+                { value: "key", label: "Per key" },
+                { value: "model", label: "Per model" },
+              ]}
+            />
             <div className="grid grid-cols-2 gap-x-6 gap-y-2 sm:grid-cols-3">
               {EXPORT_COLUMNS.map((c) => (
                 <label key={c.key} className="flex items-center gap-2 text-sm">
@@ -733,15 +727,16 @@ export function ReportsDashboard({ tenants, keys }: { tenants: Tenant[]; keys: A
           <CardTitle>Breakdown</CardTitle>
           <Select
             value={tableGroup}
-            onChange={(e) => setTableGroup(e.target.value as BreakdownGroup)}
+            onValueChange={(value) => setTableGroup(value as BreakdownGroup)}
             aria-label="Group breakdown by"
             className="h-8 w-32 text-xs"
-          >
-            <option value="day">By day</option>
-            <option value="tenant">By team</option>
-            <option value="key">By key</option>
-            <option value="model">By model</option>
-          </Select>
+            options={[
+              { value: "day", label: "By day" },
+              { value: "tenant", label: "By team" },
+              { value: "key", label: "By key" },
+              { value: "model", label: "By model" },
+            ]}
+          />
         </CardHeader>
         <CardContent className="overflow-x-auto">
           <table className="w-full text-sm">

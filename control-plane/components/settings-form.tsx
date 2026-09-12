@@ -35,6 +35,7 @@ import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
 import { DestructiveConfirm } from "@/components/ui/destructive-confirm";
 import { cn, tagsInclude } from "@/lib/utils";
 import { formatBytes } from "@/lib/format";
@@ -483,21 +484,18 @@ export function AutoRouterSettingsForm({
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-1">
             <Label htmlFor="classifier_model">Classifier model</Label>
-            <select
+            <Select
               id="classifier_model"
               value={model}
-              onChange={(e) => setModel(e.target.value)}
-              className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
-            >
-              <option value="">None</option>
-              {models
-                .filter((m) => m.model_name !== "auto")
-                .map((m) => (
-                  <option key={m.id} value={m.model_name}>
-                    {m.model_name}
-                  </option>
-                ))}
-            </select>
+              onValueChange={setModel}
+              searchPlaceholder="Filter models"
+              options={[
+                { value: "", label: "None" },
+                ...models
+                  .filter((m) => m.model_name !== "auto")
+                  .map((m) => ({ value: m.model_name, label: m.model_name })),
+              ]}
+            />
           </div>
           <div className="space-y-1">
             <Label htmlFor="classifier_timeout_ms">Timeout (ms)</Label>
@@ -597,18 +595,16 @@ export function AutoRouterSettingsForm({
 
           <div className="max-w-xs space-y-1">
             <Label htmlFor="tier_source">Tier source</Label>
-            <select
+            <Select
               id="tier_source"
               value={tierSource}
-              onChange={(e) =>
-                setTierSource(e.target.value as "hybrid" | "derived" | "declared")
-              }
-              className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
-            >
-              <option value="hybrid">Hybrid</option>
-              <option value="derived">Derived from cost</option>
-              <option value="declared">Declared only</option>
-            </select>
+              onValueChange={(value) => setTierSource(value as "hybrid" | "derived" | "declared")}
+              options={[
+                { value: "hybrid", label: "Hybrid" },
+                { value: "derived", label: "Derived from cost" },
+                { value: "declared", label: "Declared only" },
+              ]}
+            />
           </div>
         </div>
 
@@ -899,19 +895,16 @@ export function BoonsSettingsForm({
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                 <div className="space-y-1">
                   <Label htmlFor="vision_fallback_model">Describer model</Label>
-                  <select
+                  <Select
                     id="vision_fallback_model"
                     value={model}
-                    onChange={(e) => setModel(e.target.value)}
-                    className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
-                  >
-                    <option value="">None</option>
-                    {visionModels.map((m) => (
-                      <option key={m.id} value={m.model_name}>
-                        {m.model_name}
-                      </option>
-                    ))}
-                  </select>
+                    onValueChange={setModel}
+                    searchPlaceholder="Filter models"
+                    options={[
+                      { value: "", label: "None" },
+                      ...visionModels.map((m) => ({ value: m.model_name, label: m.model_name })),
+                    ]}
+                  />
                 </div>
                 <div className="space-y-1">
                   <Label htmlFor="vision_max_images">Max images per request</Label>
@@ -982,19 +975,16 @@ export function BoonsSettingsForm({
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                 <div className="space-y-1">
                   <Label htmlFor="structured_output_fixer_model">Fixer model</Label>
-                  <select
+                  <Select
                     id="structured_output_fixer_model"
                     value={fixerModel}
-                    onChange={(e) => setFixerModel(e.target.value)}
-                    className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
-                  >
-                    <option value="">Same model (re-prompt)</option>
-                    {chatModels.map((m) => (
-                      <option key={m.id} value={m.model_name}>
-                        {m.model_name}
-                      </option>
-                    ))}
-                  </select>
+                    onValueChange={setFixerModel}
+                    searchPlaceholder="Filter models"
+                    options={[
+                      { value: "", label: "Same model (re-prompt)" },
+                      ...chatModels.map((m) => ({ value: m.model_name, label: m.model_name })),
+                    ]}
+                  />
                 </div>
                 <div className="space-y-1">
                   <Label htmlFor="structured_output_max_repair_attempts">
@@ -1716,16 +1706,16 @@ export function CharoSettingsForm({
 
         <div className="space-y-1.5">
           <label className="text-sm font-medium">Brain model</label>
-          <select
+          <Select
+            aria-label="Brain model"
             value={brain}
-            onChange={(e) => setBrain(e.target.value)}
-            className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm"
-          >
-            <option value="">None (legacy tester mode)</option>
-            {brainCandidates.map((m) => (
-              <option key={m.id} value={m.model_name}>{m.model_name}</option>
-            ))}
-          </select>
+            onValueChange={setBrain}
+            searchPlaceholder="Filter models"
+            options={[
+              { value: "", label: "None (legacy tester mode)" },
+              ...brainCandidates.map((m) => ({ value: m.model_name, label: m.model_name })),
+            ]}
+          />
           <p className="text-xs text-muted-foreground">
             Only function-calling models can be a brain. {brainCandidates.length === 0 && "No enabled model supports function calling yet."}
           </p>
@@ -2178,18 +2168,15 @@ export function UsageRetentionForm({ retention }: { retention: UsageRetentionVie
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-1">
             <Label htmlFor="retention_days">Retention window</Label>
-            <select
+            <Select
               id="retention_days"
-              value={selected}
-              onChange={(e) => setSelected(Number(e.target.value))}
-              className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
-            >
-              {options.map((d) => (
-                <option key={d} value={d}>
-                  {d} days{d === currentDays ? " (current)" : ""}
-                </option>
-              ))}
-            </select>
+              value={String(selected)}
+              onValueChange={(value) => setSelected(Number(value))}
+              options={options.map((d) => ({
+                value: String(d),
+                label: `${d} days${d === currentDays ? " (current)" : ""}`,
+              }))}
+            />
           </div>
         </div>
 

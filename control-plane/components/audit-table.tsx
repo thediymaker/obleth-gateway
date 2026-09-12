@@ -118,16 +118,11 @@ export function AuditTable({ entries, tenants = [] }: { entries: AuditEntry[]; t
             </div>
             <Select
               value={String(pageSize)}
-              onChange={(e) => selectPageSize(e.target.value)}
+              onValueChange={selectPageSize}
               aria-label="Rows per page"
               className="h-8 w-full text-xs"
-            >
-              {PAGE_SIZES.map((n) => (
-                <option key={n} value={n}>
-                  {n} / page
-                </option>
-              ))}
-            </Select>
+              options={PAGE_SIZES.map((n) => ({ value: String(n), label: `${n} / page` }))}
+            />
             {filtersActive && (
               <Button type="button" variant="secondary" size="sm" onClick={resetFilters} className="h-8">
                 <FilterX className="h-3.5 w-3.5" />
@@ -139,43 +134,34 @@ export function AuditTable({ entries, tenants = [] }: { entries: AuditEntry[]; t
           <div className="grid gap-2 sm:grid-cols-3">
             <Select
               value={filters.actor}
-              onChange={(e) => patchFilters({ actor: e.target.value })}
+              onValueChange={(value) => patchFilters({ actor: value })}
               aria-label="Filter audit events by actor"
               className="h-8 w-full text-xs"
-            >
-              <option value="">All actors</option>
-              {actors.map((actor) => (
-                <option key={actor} value={actor}>
-                  {actor}
-                </option>
-              ))}
-            </Select>
+              searchPlaceholder="Filter actors"
+              options={[{ value: "", label: "All actors" }, ...actors.map((actor) => ({ value: actor, label: actor }))]}
+            />
             <Select
               value={filters.action}
-              onChange={(e) => patchFilters({ action: e.target.value })}
+              onValueChange={(value) => patchFilters({ action: value })}
               aria-label="Filter audit events by action"
               className="h-8 w-full text-xs"
-            >
-              <option value="">All actions</option>
-              {actions.map((action) => (
-                <option key={action} value={action}>
-                  {labelize(action)}
-                </option>
-              ))}
-            </Select>
+              searchPlaceholder="Filter actions"
+              options={[
+                { value: "", label: "All actions" },
+                ...actions.map((action) => ({ value: action, label: labelize(action) })),
+              ]}
+            />
             <Select
               value={filters.entityType}
-              onChange={(e) => patchFilters({ entityType: e.target.value })}
+              onValueChange={(value) => patchFilters({ entityType: value })}
               aria-label="Filter audit events by entity type"
               className="h-8 w-full text-xs"
-            >
-              <option value="">All targets</option>
-              {entityTypes.map((entityType) => (
-                <option key={entityType} value={entityType}>
-                  {labelize(entityType)}
-                </option>
-              ))}
-            </Select>
+              searchPlaceholder="Filter targets"
+              options={[
+                { value: "", label: "All targets" },
+                ...entityTypes.map((entityType) => ({ value: entityType, label: labelize(entityType) })),
+              ]}
+            />
           </div>
 
           <AuditPager

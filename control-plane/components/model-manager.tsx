@@ -1746,16 +1746,12 @@ export function AutotunePanel({ model }: { model: ModelRoute }) {
                 info="How much slower than a single idle request you'll accept at peak load. The ramp stops once p99 crosses this multiple of the baseline — tighter tolerance means fewer slots but snappier responses."
               >
                 <Select
+                  aria-label="Latency tolerance"
                   value={headroom}
-                  onChange={(e) => setHeadroom(e.target.value)}
+                  onValueChange={setHeadroom}
                   className="h-9 w-full text-xs"
-                >
-                  {AUTOTUNE_HEADROOM_OPTIONS.map((o) => (
-                    <option key={o.value} value={o.value}>
-                      {o.label}
-                    </option>
-                  ))}
-                </Select>
+                  options={AUTOTUNE_HEADROOM_OPTIONS}
+                />
               </AutotuneField>
 
               <AutotuneField
@@ -1763,13 +1759,16 @@ export function AutotunePanel({ model }: { model: ModelRoute }) {
                 info="The shape of the probe requests. Pick whichever matches real traffic — coding sends large prompts and longer replies, which costs more capacity than short chat turns, so it tunes to a lower slot count."
               >
                 <Select
+                  aria-label="Workload"
                   value={workload}
-                  onChange={(e) => setWorkload(e.target.value as AutotuneWorkload)}
+                  onValueChange={(value) => setWorkload(value as AutotuneWorkload)}
                   className="h-9 w-full text-xs"
-                >
-                  <option value="chat">Chat — short prompt, short reply</option>
-                  <option value="coding">Coding — large context, longer reply</option>
-                </Select>
+                  contentClassName="w-72"
+                  options={[
+                    { value: "chat", label: "Chat — short prompt, short reply" },
+                    { value: "coding", label: "Coding — large context, longer reply" },
+                  ]}
+                />
               </AutotuneField>
             </div>
           </TooltipProvider>
@@ -2164,17 +2163,17 @@ function ReliabilityPanel({
             </div>
             <div className="space-y-1.5">
               <Label htmlFor={`selection-${model.id}`}>Endpoint selection</Label>
-              <select
+              <Select
                 id={`selection-${model.id}`}
                 name="endpoint_selection_mode"
                 value={selectionMode}
-                onChange={(e) => setSelectionMode(e.target.value)}
-                className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-              >
-                <option value="failover">failover (priority order)</option>
-                <option value="load_balance">load_balance (weighted)</option>
-                <option value="session_hash">session_hash (sticky by session)</option>
-              </select>
+                onValueChange={setSelectionMode}
+                options={[
+                  { value: "failover", label: "failover (priority order)" },
+                  { value: "load_balance", label: "load_balance (weighted)" },
+                  { value: "session_hash", label: "session_hash (sticky by session)" },
+                ]}
+              />
             </div>
             <ChipCheckbox
               name="debug_diagnostics"
@@ -2895,19 +2894,13 @@ function SelectField({
   return (
     <div className="space-y-1.5">
       <Label htmlFor={`${name}-${label}`}>{label}</Label>
-      <select
+      <Select
         id={`${name}-${label}`}
         name={name}
         value={value}
-        onChange={(e) => onChange?.(e.target.value)}
-        className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-      >
-        {options.map((opt) => (
-          <option key={opt.value} value={opt.value}>
-            {opt.label}
-          </option>
-        ))}
-      </select>
+        onValueChange={(next) => onChange?.(next)}
+        options={options}
+      />
       {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
     </div>
   );
