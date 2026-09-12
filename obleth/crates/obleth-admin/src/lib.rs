@@ -4819,6 +4819,21 @@ mod tests {
 
         pub(super) const TEST_ADMIN_TOKEN: &str = "test-admin-token";
 
+        /// Serialises the DB-backed tests in this crate, mirroring
+        /// `obleth-store`'s `serial()`. These tests share one Postgres
+        /// database, and some of what a handler reads is *global*, not scoped
+        /// to a test's own fixtures: `build_candidates` derives cost-rank tier
+        /// levels across every model in the database, so a sibling test
+        /// creating or deleting a fixture model mid-test shifts the ladder and
+        /// changes another test's `level` values between two calls (exactly
+        /// how `simulate_pins_the_draw_so_two_runs_are_comparable` flaked in
+        /// CI). Held via `TestApp` so every DB-backed test carries it for its
+        /// full duration and a new test cannot forget to take it.
+        static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+        fn serial() -> &'static tokio::sync::Mutex<()> {
+            SERIAL.get_or_init(tokio::sync::Mutex::default)
+        }
+
         /// Reads `OBLETH_TEST_DATABASE_URL`, mirroring the guard in
         /// `obleth-store`'s harness: refuses any database whose name does not
         /// contain "test", so a misconfigured env can never point these
@@ -4888,6 +4903,9 @@ mod tests {
             /// Same instance the router's `AdminState` holds, so admitting a
             /// request here is visible to a handler as real fleet load.
             pub(super) fairshare: FairShare,
+            /// Keeps this test's exclusive claim on the shared test database
+            /// alive for the test's full duration (see `serial()`).
+            _serial: tokio::sync::MutexGuard<'static, ()>,
         }
 
         /// The real `/api/v1` router, wired to the integration datastores.
@@ -4896,6 +4914,9 @@ mod tests {
             let db_url = test_db_url()?;
             let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
 
+            // Taken before the first database touch (`migrate()` runs DDL) and
+            // held until the test drops its `TestApp`.
+            let guard = serial().lock().await;
             let store = Store::connect(&db_url).await.expect("connect postgres");
             store.migrate().await.expect("migrate");
             let redis = RedisStore::connect(&redis_url)
@@ -4937,6 +4958,7 @@ mod tests {
                 app: router(state),
                 store,
                 fairshare,
+                _serial: guard,
             })
         }
 
