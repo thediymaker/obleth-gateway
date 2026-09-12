@@ -152,6 +152,19 @@ fn effective_code_compaction(
     }
 }
 
+/// The image-generation boon is eligible when the model was granted it, the
+/// boon is globally active (enabled with an image model configured), and the
+/// model can actually call functions. Unlike the compression boon there is no
+/// tenant opt-out: an operator granting the boon is the opt-in.
+fn image_gen_eligible(
+    route: &obleth_config::ResolvedModel,
+    settings: &obleth_config::BoonSettings,
+) -> bool {
+    route.boons.iter().any(|b| b == "image_generation")
+        && settings.image_generation.active()
+        && route.supports_function_calling
+}
+
 /// Per-request boon control header (comma-separated tokens), also echoed on
 /// responses listing the boons that were applied. Recognized request tokens:
 /// - `off`   — disable ALL boon processing for this request (wins over others).
@@ -397,6 +410,65 @@ impl BoonEngine {
                      Enable function calling on this model to use the tool loop."
                 );
             }
+        }
+
+        // ---- image-generation boon ----
+        // Injects a gateway-executed `generate_image` tool and arms the tool
+        // loop by inserting its own synthetic-server entry. Deliberately
+        // independent of `settings.tool_loop.active()`: granting a model the
+        // ability to draw must not silently depend on the unrelated MCP tool
+        // loop's global switch. `run()` executes whenever `plan.tool_loop` is
+        // `Some`, so the entry alone is enough.
+        let mut image_gen_cfg: Option<obleth_config::ImageGenerationBoonSettings> = None;
+        if image_gen_eligible(route, &settings) {
+            // `generate_image` may already be owned by the client's own tools
+            // or by a granted MCP server (`tool_loop_servers`, just injected
+            // above). Both the tool injection and the map insert below must be
+            // skipped together in that case — deciding them from one shared
+            // check keeps "who owns this name" consistent between the request
+            // body and the tool loop's dispatch map. See `image_gen::collides`.
+            if image_gen::collides(json, tool_loop_servers.as_ref()) {
+                tracing::warn!(
+                    tool = %image_gen::GENERATE_IMAGE_TOOL,
+                    model = %route.model_name,
+                    "generate_image collides with a client-supplied tool or a granted MCP \
+                     tool; existing tool wins, image-generation boon inactive for this request"
+                );
+            } else {
+                // Nudge only a plain chat client that got no other nudge: an
+                // agentic client steers its own tool use, and the tool-loop nudge
+                // already told the model it has tools. Read before the insert
+                // below, which would otherwise make the map non-empty.
+                let nudge = !client_sent_tools && tool_loop_servers.is_none();
+                image_gen::inject(
+                    &settings.image_generation,
+                    nudge,
+                    route.supports_system_messages,
+                    json,
+                );
+                tool_loop_servers
+                    .get_or_insert_with(std::collections::HashMap::new)
+                    .insert(
+                        image_gen::GENERATE_IMAGE_TOOL.to_string(),
+                        image_gen::IMAGE_SYNTHETIC_SERVER.to_string(),
+                    );
+                image_gen_cfg = Some(settings.image_generation.clone());
+                outcome.rewritten = true;
+                outcome.applied.push("image_generation");
+            }
+        } else if route.boons.iter().any(|b| b == "image_generation")
+            && settings.image_generation.active()
+        {
+            // Granted and configured, but the model cannot call functions.
+            // Same failure shape as the tool loop's: the model silently gets no
+            // tool and tells the user it cannot draw, with nothing in the logs
+            // to explain why.
+            tracing::warn!(
+                model = %route.model_name,
+                "model is granted the image_generation boon but is not flagged \
+                 supports_function_calling; no generate_image tool will be injected. \
+                 Enable function calling on this model to use the boon."
+            );
         }
 
         // Reversible compression passes (dedup + lossy text), per-piece. Run
@@ -651,6 +723,7 @@ impl BoonEngine {
                 request,
                 settings: settings.tool_loop.clone(),
                 passthrough_unmapped: client_sent_tools,
+                image_gen: image_gen_cfg.clone(),
             }
         });
 
@@ -1210,6 +1283,81 @@ mod tests {
             phase2 < tool_loop_plan,
             "the tool loop's captured request must include the injected \
              knowledge block, or every follow-up tool turn goes ungrounded"
+        );
+    }
+
+    #[test]
+    fn image_gen_eligible_requires_grant_active_and_function_calling() {
+        use obleth_config::{BoonSettings, ImageGenerationBoonSettings};
+
+        let mut settings = BoonSettings {
+            image_generation: ImageGenerationBoonSettings {
+                enabled: true,
+                image_model: Some("sdxl".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut route = test_route();
+        route.boons = vec!["image_generation".to_string()];
+        route.supports_function_calling = true;
+
+        assert!(image_gen_eligible(&route, &settings));
+
+        // Not granted -> ineligible.
+        route.boons.clear();
+        assert!(!image_gen_eligible(&route, &settings));
+        route.boons = vec!["image_generation".to_string()];
+
+        // No native function calling -> ineligible (the tool can never be called).
+        route.supports_function_calling = false;
+        assert!(!image_gen_eligible(&route, &settings));
+        route.supports_function_calling = true;
+
+        // Global switch off -> ineligible.
+        settings.image_generation.enabled = false;
+        assert!(!image_gen_eligible(&route, &settings));
+        settings.image_generation.enabled = true;
+
+        // No image model configured -> ineligible.
+        settings.image_generation.image_model = None;
+        assert!(!image_gen_eligible(&route, &settings));
+    }
+
+    /// The gate must sit inside the `is_chat` region and after the tool-loop
+    /// injection block, so a client-supplied `tools` array is already visible
+    /// and the boon's synthetic entry lands in the same `tool_loop_servers`
+    /// map the plan is built from. Asserted against this file's own source for
+    /// the same reason `knowledge_boon_phases_stay_in_source_order` is: there
+    /// is no `AppState` harness in this crate to drive `enrich_request`.
+    #[test]
+    fn image_gen_gate_runs_after_tool_loop_injection() {
+        let full_src = include_str!("mod.rs");
+        let src = &full_src[..full_src
+            .find("\nmod tests {")
+            .expect("this file's own test module marker")];
+        let is_chat_guard = src.find("if !is_chat {").expect("the is_chat early return");
+        let tool_loop_inject = src
+            .find("tool_loop_servers = tool_loop::inject(")
+            .expect("tool-loop injection call");
+        // The full banner, not the bare phrase: `image_gen_eligible`'s own doc
+        // comment sits far above the gate and would otherwise match first.
+        let image_gate = src
+            .find("---- image-generation boon ----")
+            .expect("image-generation gate marker comment");
+        let tool_loop_plan = src
+            .find("let tool_loop_plan = tool_loop_servers.map(")
+            .expect("tool_loop_plan binding");
+
+        assert!(is_chat_guard < image_gate, "the boon is chat-only");
+        assert!(
+            tool_loop_inject < image_gate,
+            "the gate must see the tool-loop injection's result so a model with both \
+             MCP tools and this boon gets one merged tools array"
+        );
+        assert!(
+            image_gate < tool_loop_plan,
+            "the synthetic server entry must be in the map before the plan is built"
         );
     }
 }

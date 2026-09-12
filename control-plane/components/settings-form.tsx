@@ -9,6 +9,7 @@ import {
   ChevronDown,
   Database,
   Eye,
+  Image as ImageIcon,
   RefreshCw,
   Save,
   Send,
@@ -627,7 +628,7 @@ export function AutoRouterSettingsForm({
   );
 }
 
-type BoonSectionKey = "vision" | "structured" | "tool_loop";
+type BoonSectionKey = "vision" | "structured" | "tool_loop" | "image_generation";
 
 function ToggleSwitch({
   checked,
@@ -809,6 +810,20 @@ export function BoonsSettingsForm({
     String(settings?.tool_loop_tool_timeout_ms ?? 30000),
   );
   const [toolLoopNudge, setToolLoopNudge] = useState(settings?.tool_loop_nudge ?? "");
+  const [imageEnabled, setImageEnabled] = useState(settings?.image_generation_enabled ?? false);
+  const [imageModel, setImageModel] = useState(settings?.image_generation_model ?? "");
+  const [imageSizes, setImageSizes] = useState(
+    (settings?.image_generation_allowed_sizes ?? ["512x512", "1024x1024"]).join(", "),
+  );
+  const [imageMaxCount, setImageMaxCount] = useState(
+    String(settings?.image_generation_max_images_per_request ?? 2),
+  );
+  const [imageTimeout, setImageTimeout] = useState(
+    String(settings?.image_generation_timeout_ms ?? 120000),
+  );
+  const [imageToolDescription, setImageToolDescription] = useState(
+    settings?.image_generation_tool_description ?? "",
+  );
   const [expanded, setExpanded] = useState<BoonSectionKey | null>(null);
 
   const visionModels = models.filter(
@@ -816,6 +831,9 @@ export function BoonsSettingsForm({
   );
   const chatModels = models.filter(
     (m) => m.model_name !== "auto" && (m.model_type ?? "chat") === "chat",
+  );
+  const imageModels = models.filter(
+    (m) => m.model_name !== "auto" && m.model_type === "image",
   );
 
   function toggleSection(section: BoonSectionKey) {
@@ -838,6 +856,15 @@ export function BoonsSettingsForm({
       tool_loop_max_turns: Math.min(Number(toolLoopMaxTurns) || 4, 8),
       tool_loop_tool_timeout_ms: Number(toolLoopTimeout) || 30000,
       tool_loop_nudge: toolLoopNudge,
+      image_generation_enabled: imageEnabled,
+      image_generation_model: imageModel.trim() ? imageModel.trim() : "",
+      image_generation_tool_description: imageToolDescription.trim(),
+      image_generation_allowed_sizes: imageSizes
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean),
+      image_generation_max_images_per_request: Math.min(Number(imageMaxCount) || 2, 4),
+      image_generation_timeout_ms: Number(imageTimeout) || 120000,
     };
     start(async () => {
       const result = await setBoonSettingsAction(body);
@@ -1088,6 +1115,108 @@ export function BoonsSettingsForm({
               left untouched. Blank resets to the built-in default.
             </p>
           </div>
+            </div>
+          </BoonPanel>
+
+          <BoonPanel
+            title="Image generation"
+            description="Injects a generate_image tool so a chat model can produce images through a registered image model."
+            icon={ImageIcon}
+            enabled={imageEnabled}
+            expanded={expanded === "image_generation"}
+            onToggle={() => toggleSection("image_generation")}
+            summary={
+              <>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {imageModel || "no image model"}
+                </Badge>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  max {imageMaxCount || "2"} per call
+                </Badge>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {imageTimeout || "120000"} ms
+                </Badge>
+              </>
+            }
+          >
+            <div className="space-y-4">
+              <ToggleRow
+                label="Enable image generation boon"
+                hint="Opted-in models gain a generate_image tool. The model must also have the Function calling capability, or no tool is injected."
+                checked={imageEnabled}
+                onChange={() => setImageEnabled((value) => !value)}
+              />
+              <p className="text-sm text-muted-foreground">
+                The model decides when to call the tool. The gateway runs the generation against
+                the image model below, bills it per image, and attaches the result to the reply.
+                Requests that also ask for a <code>response_format</code> schema keep the schema
+                and drop the image.
+              </p>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <div className="space-y-1">
+                  <Label htmlFor="image_generation_model">Image model</Label>
+                  <Select
+                    id="image_generation_model"
+                    value={imageModel}
+                    onValueChange={setImageModel}
+                    searchPlaceholder="Filter models"
+                    options={[
+                      { value: "", label: "None" },
+                      ...imageModels.map((m) => ({ value: m.model_name, label: m.model_name })),
+                    ]}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="image_generation_max_images_per_request">
+                    Max images per call (1-4)
+                  </Label>
+                  <Input
+                    id="image_generation_max_images_per_request"
+                    type="number"
+                    min={1}
+                    max={4}
+                    value={imageMaxCount}
+                    onChange={(e) => setImageMaxCount(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="image_generation_timeout_ms">Generation timeout (ms)</Label>
+                  <Input
+                    id="image_generation_timeout_ms"
+                    type="number"
+                    value={imageTimeout}
+                    onChange={(e) => setImageTimeout(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="image_generation_allowed_sizes">Allowed sizes</Label>
+                <Input
+                  id="image_generation_allowed_sizes"
+                  value={imageSizes}
+                  onChange={(e) => setImageSizes(e.target.value)}
+                  placeholder="512x512, 1024x1024"
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  Comma separated. Offered to the model in the tool schema and enforced at
+                  execution; a size outside the list falls back to the first entry.
+                </p>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="image_generation_tool_description">Tool description</Label>
+                <textarea
+                  id="image_generation_tool_description"
+                  value={imageToolDescription}
+                  onChange={(e) => setImageToolDescription(e.target.value)}
+                  rows={3}
+                  className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  placeholder="Generate an image from a text description..."
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  What the model reads when deciding to call the tool. Clear it to restore the
+                  default.
+                </p>
+              </div>
             </div>
           </BoonPanel>
 

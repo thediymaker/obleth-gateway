@@ -147,6 +147,12 @@ const MODEL_BOONS = [
     description:
       "Retrieve from administrator-curated collections and inject the result into the request before dispatch, at request time — the injected text is never user-supplied. Attach collections to this model below; granting this boon without attaching a collection retrieves nothing. Configure retrieval globally in Settings → Knowledge. Nothing is granted by default.",
   },
+  {
+    value: "image_generation",
+    label: "Image generation",
+    description:
+      "Add a generate_image tool this model can call to produce pictures through the image model configured in Settings → Boons. The gateway runs the generation and attaches the result to the reply; the image is billed per image against the caller's tenant. Requires the Function calling capability — without it no tool is injected and the model will say it cannot draw.",
+  },
 ] as const;
 
 // Model modality vocabulary; mirrors obleth-config `MODEL_TYPES`. The type

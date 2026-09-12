@@ -1335,6 +1335,7 @@ async fn proxy_handler_inner(
                         tool_servers: loop_plan.tool_servers.clone(),
                         settings: loop_plan.settings.clone(),
                         passthrough_unmapped: loop_plan.passthrough_unmapped,
+                        image_gen: loop_plan.image_gen.clone(),
                         dispatch_timeout: req_timeout,
                         client_include_usage: plan.include_usage,
                         upstream_start,
@@ -3259,8 +3260,8 @@ mod tests {
     use super::{
         backoff_for, build_targets, build_upstream_url, effective_request_type, has_path_traversal,
         is_chat_path, is_models_endpoint, is_retryable_status, prepare_upstream_body,
-        request_type_for_path,
-        resolve_conversation, session_hash_order, tenant_active_now, weighted_order, RequestMeta,
+        request_type_for_path, resolve_conversation, session_hash_order, tenant_active_now,
+        weighted_order, RequestMeta,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::http::HeaderMap;

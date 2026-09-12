@@ -49,6 +49,19 @@ pub(super) const RETRIEVE_ORIGINAL_TOOL: &str = "retrieve_original";
 /// short-circuits the call by name before any server lookup.
 pub(super) const COMPRESSION_SYNTHETIC_SERVER: &str = "__compression__";
 
+/// Warning reported when a request armed both this boon and the
+/// structured-output boon: the image is generated and billed, but attaching
+/// markdown to a schema-validated completion would corrupt it, so the schema
+/// wins and the suppression is surfaced on `BOONS_WARNING_HEADER`.
+pub(super) const IMAGE_SUPPRESSED_WARNING: &str = "image_suppressed_by_response_format";
+
+/// Warning reported when billed images could not be attached to the final
+/// completion because it lacked `/choices/0/message` (an error body, a
+/// malformed reply). The generation still happened and was billed; this is
+/// the last point in the request where that fact would otherwise vanish with
+/// no signal to the client or the logs.
+pub(super) const IMAGE_ATTACH_FAILED_WARNING: &str = "image_attach_failed";
+
 /// The OpenAI function-tool definition for `retrieve_original`.
 pub(super) fn retrieve_original_tool_def() -> Value {
     json!({
@@ -102,6 +115,10 @@ pub struct ToolLoopPlan {
     /// gateway does not own (i.e. a client tool) is returned to the client
     /// untouched instead of being executed or error-recovered.
     pub passthrough_unmapped: bool,
+    /// Image-generation boon settings snapshot, present when the boon armed
+    /// the loop. `None` leaves `generate_image` unhandled, which is correct:
+    /// the tool is only ever injected alongside this field.
+    pub image_gen: Option<obleth_config::ImageGenerationBoonSettings>,
 }
 
 /// Inject the granted servers' tools into a chat request. Returns the
@@ -211,6 +228,48 @@ async fn cached_tools(state: &AppState, server_name: &str) -> Option<Arc<Vec<Mcp
     }
 }
 
+/// Attach generated images to the final completion and reconcile the warning.
+///
+/// `structured_armed` is `plan.structured.is_some()`. When a schema is armed the
+/// images are deliberately *not* attached — appending markdown to a
+/// schema-validated JSON completion produces output that is neither valid JSON
+/// nor a rendered image, in either order — and the suppression is reported
+/// instead. The generation is still billed, because it happened.
+///
+/// `existing` is whatever warning the structured transform already produced; a
+/// real validation failure is never overwritten by the suppression note.
+fn finish_images(
+    images: &[super::image_gen::GeneratedImage],
+    structured_armed: bool,
+    body: &mut Value,
+    existing: Option<&'static str>,
+) -> Option<&'static str> {
+    if images.is_empty() {
+        return existing;
+    }
+    if structured_armed {
+        tracing::warn!(
+            images = images.len(),
+            "image-generation boon produced images on a request that also asked for a \
+             response_format schema; the images are suppressed so the validated JSON \
+             stays intact"
+        );
+        return existing.or(Some(IMAGE_SUPPRESSED_WARNING));
+    }
+    if !super::image_gen::attach_to_completion(images, body) {
+        // The images were already billed the moment upstream generation
+        // succeeded; a malformed completion (no `/choices/0/message`) must
+        // not let that billing vanish with zero signal to the client or the
+        // logs. A pre-existing, more specific warning still wins.
+        tracing::warn!(
+            images = images.len(),
+            "billed images could not be attached: malformed completion"
+        );
+        return existing.or(Some(IMAGE_ATTACH_FAILED_WARNING));
+    }
+    existing
+}
+
 /// Drive the tool loop over a buffered completion: execute the model's tool
 /// calls against their MCP servers, append the results, re-dispatch, and
 /// repeat until the model answers (or the turn limit is hit). Mutates `body`
@@ -246,6 +305,16 @@ pub async fn run(
     // see a single initialization instead of one per tool call.
     let mut sessions: HashMap<String, mcp_tools::Session> = HashMap::new();
     let tool_loop_start = crate::tracer::now_ms();
+    let mut image_ctx = loop_plan
+        .image_gen
+        .as_ref()
+        .map(|cfg| super::image_gen::ImageCtx {
+            cfg,
+            key,
+            session_id,
+            images: Vec::new(),
+            events: Vec::new(),
+        });
 
     let mut completed_turns: u32 = 0;
     // Deduplicated list of every tool name called across all turns, for the
@@ -272,7 +341,16 @@ pub async fn run(
                     serde_json::json!({ "turns": completed_turns, "tools": all_tools_seen }),
                 );
             }
-            return TransformResult { warning: None };
+            let warning = finish_images(
+                image_ctx
+                    .as_ref()
+                    .map(|c| c.images.as_slice())
+                    .unwrap_or(&[]),
+                plan.structured.is_some(),
+                body,
+                None,
+            );
+            return TransformResult { warning };
         }
         if calls.is_empty() {
             // Final answer. Apply the structured-output transform when armed.
@@ -290,6 +368,15 @@ pub async fn run(
                 }
                 None => None,
             };
+            let warning = finish_images(
+                image_ctx
+                    .as_ref()
+                    .map(|c| c.images.as_slice())
+                    .unwrap_or(&[]),
+                plan.structured.is_some(),
+                body,
+                warning,
+            );
             if let Some(t) = tracer {
                 t.record_elapsed(
                     "boon:tool_loop",
@@ -321,6 +408,7 @@ pub async fn run(
                 state,
                 &loop_plan.tool_servers,
                 &mut sessions,
+                image_ctx.as_mut(),
                 call,
                 tool_timeout,
             )
@@ -339,6 +427,24 @@ pub async fn run(
                     "content": result_text,
                 }),
             );
+        }
+        if let Some(ctx) = image_ctx.as_mut() {
+            for event in ctx.events.drain(..) {
+                if let Some(t) = tracer.as_deref_mut() {
+                    t.record(
+                        "boon:image_generation",
+                        "boon:tool_loop",
+                        tool_exec_start,
+                        event.upstream_ms,
+                        if event.ok { "ok" } else { "error" },
+                        serde_json::json!({
+                            "images": event.images,
+                            "size": event.size,
+                            "model": event.model,
+                        }),
+                    );
+                }
+            }
         }
         let tool_exec_ms = (crate::tracer::now_ms() - tool_exec_start) as u32;
 
@@ -410,9 +516,16 @@ pub async fn run(
                         serde_json::json!({ "turns": completed_turns, "tools": all_tools_seen }),
                     );
                 }
-                return TransformResult {
-                    warning: Some("tool_loop_dispatch_failed"),
-                };
+                let warning = finish_images(
+                    image_ctx
+                        .as_ref()
+                        .map(|c| c.images.as_slice())
+                        .unwrap_or(&[]),
+                    plan.structured.is_some(),
+                    body,
+                    Some("tool_loop_dispatch_failed"),
+                );
+                return TransformResult { warning };
             }
         }
     }
@@ -471,9 +584,16 @@ pub async fn run(
             serde_json::json!({ "turns": max_turns, "tools": all_tools_seen }),
         );
     }
-    TransformResult {
-        warning: Some("tool_loop_turn_limit"),
-    }
+    let warning = finish_images(
+        image_ctx
+            .as_ref()
+            .map(|c| c.images.as_slice())
+            .unwrap_or(&[]),
+        plan.structured.is_some(),
+        body,
+        Some("tool_loop_turn_limit"),
+    );
+    TransformResult { warning }
 }
 
 /// One tool call extracted from a completion.
@@ -523,6 +643,7 @@ pub(super) async fn execute_call(
     state: &AppState,
     tool_servers: &HashMap<String, String>,
     sessions: &mut HashMap<String, mcp_tools::Session>,
+    image: Option<&mut super::image_gen::ImageCtx<'_>>,
     call: &PendingCall,
     timeout: Duration,
 ) -> String {
@@ -540,6 +661,16 @@ pub(super) async fn execute_call(
             None => None,
         };
         return format_retrieve_result(reference, content);
+    }
+
+    // Gateway-executed image generation: a POST to the configured image model,
+    // never an MCP server. The returned receipt is what the model reads; the
+    // image itself lands in `ctx.images`.
+    if call.name == super::image_gen::GENERATE_IMAGE_TOOL {
+        let Some(ctx) = image else {
+            return super::image_gen::failure_receipt("image generation is not configured");
+        };
+        return super::image_gen::execute(state, ctx, &call.arguments).await;
     }
 
     let Some(server_name) = tool_servers.get(&call.name) else {
@@ -673,6 +804,129 @@ mod tests {
         assert_eq!(
             format_retrieve_result(Some("abc123"), Some("the original".to_string())),
             "the original"
+        );
+    }
+
+    use crate::boons::image_gen::GeneratedImage;
+
+    fn one_image() -> Vec<GeneratedImage> {
+        vec![GeneratedImage {
+            url: "http://i/x.png".to_string(),
+            size: "512x512".to_string(),
+            prompt: "a cat".to_string(),
+        }]
+    }
+
+    #[test]
+    fn final_answer_gets_the_images_when_no_schema_is_armed() {
+        let mut body = json!({
+            "choices": [{ "message": { "role": "assistant", "content": "here you go" } }]
+        });
+        let warning = finish_images(&one_image(), false, &mut body, None);
+        assert_eq!(warning, None);
+        let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(content.contains("![a cat](http://i/x.png)"));
+    }
+
+    #[test]
+    fn an_armed_schema_suppresses_attachment_and_warns() {
+        // Appending markdown to schema-validated JSON would produce output that
+        // is neither valid JSON nor a rendered image. The schema wins; the
+        // suppression is reported.
+        let mut body = json!({
+            "choices": [{ "message": { "role": "assistant", "content": "{\"ok\":true}" } }]
+        });
+        let warning = finish_images(&one_image(), true, &mut body, None);
+        assert_eq!(warning, Some(IMAGE_SUPPRESSED_WARNING));
+        assert_eq!(
+            body["choices"][0]["message"]["content"], "{\"ok\":true}",
+            "the validated JSON must be left byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_structured_validation_warning_is_not_overwritten() {
+        let mut body = json!({
+            "choices": [{ "message": { "role": "assistant", "content": "not json" } }]
+        });
+        let warning = finish_images(&one_image(), true, &mut body, Some("structured_invalid"));
+        assert_eq!(
+            warning,
+            Some("structured_invalid"),
+            "a real validation failure is more important than the suppression note"
+        );
+    }
+
+    #[test]
+    fn no_images_means_the_completion_is_untouched() {
+        let mut body = json!({
+            "choices": [{ "message": { "role": "assistant", "content": "plain answer" } }]
+        });
+        let before = body.clone();
+        assert_eq!(finish_images(&[], false, &mut body, None), None);
+        assert_eq!(
+            body, before,
+            "a request that never called the tool is byte-identical"
+        );
+        // ...and an existing warning survives.
+        assert_eq!(
+            finish_images(&[], false, &mut body, Some("tool_loop_turn_limit")),
+            Some("tool_loop_turn_limit")
+        );
+    }
+
+    #[test]
+    fn a_dispatch_failure_still_attaches_already_billed_images() {
+        // An image generated in a prior turn was already billed the moment the
+        // upstream call succeeded; if the *next* turn's model dispatch then
+        // fails, the image must still reach the client instead of being
+        // silently dropped while the tenant is charged for it.
+        let mut body = json!({
+            "choices": [{ "message": { "role": "assistant", "content": "here you go" } }]
+        });
+        let warning = finish_images(
+            &one_image(),
+            false,
+            &mut body,
+            Some("tool_loop_dispatch_failed"),
+        );
+        assert_eq!(
+            warning,
+            Some("tool_loop_dispatch_failed"),
+            "the dispatch-failure warning must survive unchanged"
+        );
+        let content = body["choices"][0]["message"]["content"].as_str().unwrap();
+        assert!(content.contains("![a cat](http://i/x.png)"));
+    }
+
+    #[test]
+    fn a_malformed_completion_warns_instead_of_silently_dropping_billed_images() {
+        // No `/choices/0/message` pointer: `attach_to_completion` is a no-op,
+        // but the images were already billed the moment generation succeeded.
+        // That must never vanish with zero signal.
+        let mut body = json!({ "error": "upstream exploded" });
+        let before = body.clone();
+        let warning = finish_images(&one_image(), false, &mut body, None);
+        assert_eq!(warning, Some(IMAGE_ATTACH_FAILED_WARNING));
+        assert_eq!(
+            body, before,
+            "a completion attach failed must leave the body untouched, not corrupt it further"
+        );
+    }
+
+    #[test]
+    fn a_malformed_completion_does_not_overwrite_a_more_specific_warning() {
+        let mut body = json!({ "error": "upstream exploded" });
+        let warning = finish_images(
+            &one_image(),
+            false,
+            &mut body,
+            Some("tool_loop_dispatch_failed"),
+        );
+        assert_eq!(
+            warning,
+            Some("tool_loop_dispatch_failed"),
+            "a pre-existing, more specific warning must win over the attach-failed note"
         );
     }
 }

@@ -1954,6 +1954,12 @@ pub struct BoonSettingsView {
     pub compression_compact_logs: bool,
     pub compression_allow_lossy: bool,
     pub compression_neural_keep_ratio: f32,
+    pub image_generation_enabled: bool,
+    pub image_generation_model: Option<String>,
+    pub image_generation_tool_description: String,
+    pub image_generation_allowed_sizes: Vec<String>,
+    pub image_generation_max_images_per_request: u32,
+    pub image_generation_timeout_ms: u64,
 }
 
 impl BoonSettingsView {
@@ -1982,6 +1988,12 @@ impl BoonSettingsView {
             compression_compact_logs: s.compression.compact_logs,
             compression_allow_lossy: s.compression.allow_lossy,
             compression_neural_keep_ratio: s.compression.neural_keep_ratio,
+            image_generation_enabled: s.image_generation.enabled,
+            image_generation_model: s.image_generation.image_model.clone(),
+            image_generation_tool_description: s.image_generation.tool_description.clone(),
+            image_generation_allowed_sizes: s.image_generation.allowed_sizes.clone(),
+            image_generation_max_images_per_request: s.image_generation.max_images_per_request,
+            image_generation_timeout_ms: s.image_generation.timeout_ms,
         }
     }
 }
@@ -2052,6 +2064,28 @@ pub struct UpdateBoonSettings {
     /// `(0.0, 1.0]`; values outside that range (or omitted) leave it unchanged.
     #[serde(default)]
     pub compression_neural_keep_ratio: Option<f32>,
+    /// Enable or disable the image-generation boon globally. Omit to leave unchanged.
+    #[serde(default)]
+    pub image_generation_enabled: Option<bool>,
+    /// `model_name` of the registered `image`-type model that serves
+    /// generations. Empty string clears it (which deactivates the boon).
+    #[serde(default)]
+    pub image_generation_model: Option<String>,
+    /// Tool description the model reads. Empty string resets it to the built-in
+    /// default; omit the field to leave it unchanged.
+    #[serde(default)]
+    pub image_generation_tool_description: Option<String>,
+    /// Sizes offered in the tool schema. An empty or all-blank list resets it to
+    /// the built-in default.
+    #[serde(default)]
+    pub image_generation_allowed_sizes: Option<Vec<String>>,
+    /// Images per tool call, clamped to `IMAGE_GENERATION_MAX_PER_REQUEST`.
+    /// A value of `0` is a no-op and leaves the existing setting unchanged.
+    #[serde(default)]
+    pub image_generation_max_images_per_request: Option<u32>,
+    /// Generation timeout (ms). Omit/zero leaves unchanged.
+    #[serde(default)]
+    pub image_generation_timeout_ms: Option<u64>,
 }
 
 #[utoipa::path(
@@ -2061,6 +2095,29 @@ pub struct UpdateBoonSettings {
 async fn get_boon_settings(State(state): State<AdminState>) -> Result<Json<BoonSettingsView>> {
     let settings = state.store.get_boon_settings().await?.unwrap_or_default();
     Ok(Json(BoonSettingsView::from_settings(&settings)))
+}
+
+/// Trim, drop blanks, de-duplicate order-stably, and fall back to the built-in
+/// list when nothing usable remains — an empty `enum` in the tool schema would
+/// make the `size` argument unsatisfiable.
+fn normalize_image_sizes(sizes: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for size in sizes {
+        let s = size.trim().to_string();
+        if !s.is_empty() && !out.contains(&s) {
+            out.push(s);
+        }
+    }
+    if out.is_empty() {
+        obleth_config::ImageGenerationBoonSettings::default().allowed_sizes
+    } else {
+        out
+    }
+}
+
+/// Images per call, bounded by the hard ceiling.
+fn clamp_image_count(n: u32) -> u32 {
+    n.clamp(1, obleth_config::IMAGE_GENERATION_MAX_PER_REQUEST)
 }
 
 #[utoipa::path(
@@ -2090,6 +2147,54 @@ async fn put_boon_settings(
         Some("") => None,
         Some(m) => Some(m.to_string()),
         None => existing.structured_output.fixer_model.clone(),
+    };
+
+    let image_model = match body.image_generation_model.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.image_generation.image_model.clone(),
+    };
+    // Reject a misconfiguration here rather than leaving it to surface as a
+    // warn line at request time: the boon fails open, so a bad model name is
+    // otherwise invisible until someone notices no images are ever produced.
+    //
+    // Only validate when the caller actually supplied the field: `image_model`
+    // above falls back to the *existing* persisted value when it is omitted,
+    // and re-validating that carried-forward value here would mean a PUT that
+    // only touches an unrelated setting (e.g. toggling vision) starts failing
+    // the moment the configured image model is deleted or renamed elsewhere.
+    if body.image_generation_model.is_some() {
+        if let Some(name) = image_model.as_deref() {
+            match state.store.get_model_by_name(name).await {
+                Ok(model) if model.model_type == "image" => {}
+                Ok(model) => {
+                    return Err(AdminError::BadRequest(format!(
+                        "image_generation_model `{name}` has model_type `{}`; it must be `image`",
+                        model.model_type
+                    )))
+                }
+                // A genuinely missing model is the caller's mistake.
+                Err(obleth_store::StoreError::NotFound) => {
+                    return Err(AdminError::BadRequest(format!(
+                        "image_generation_model `{name}` is not a registered model"
+                    )))
+                }
+                // Any other store error (a transient DB failure, say) is not a
+                // bad model name and must not be reported as one — that would
+                // invite an operator to "fix" a perfectly good setting.
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    let image_tool_description = match body
+        .image_generation_tool_description
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("") => obleth_config::DEFAULT_IMAGE_TOOL_DESCRIPTION.to_string(),
+        Some(d) => d.to_string(),
+        None => existing.image_generation.tool_description.clone(),
     };
 
     let settings = BoonSettings {
@@ -2176,9 +2281,26 @@ async fn put_boon_settings(
         // No admin-API fields for the knowledge boon yet (Task 7+); carry the
         // persisted value through unchanged, same as `guardrails` above.
         knowledge: existing.knowledge.clone(),
-        // No admin-API fields for the image_generation boon yet; carry the
-        // persisted value through unchanged.
-        image_generation: existing.image_generation.clone(),
+        image_generation: obleth_config::ImageGenerationBoonSettings {
+            enabled: body
+                .image_generation_enabled
+                .unwrap_or(existing.image_generation.enabled),
+            image_model,
+            tool_description: image_tool_description,
+            allowed_sizes: match body.image_generation_allowed_sizes {
+                Some(sizes) => normalize_image_sizes(sizes),
+                None => existing.image_generation.allowed_sizes.clone(),
+            },
+            max_images_per_request: body
+                .image_generation_max_images_per_request
+                .filter(|n| *n > 0)
+                .map(clamp_image_count)
+                .unwrap_or(existing.image_generation.max_images_per_request),
+            timeout_ms: body
+                .image_generation_timeout_ms
+                .filter(|ms| *ms > 0)
+                .unwrap_or(existing.image_generation.timeout_ms),
+        },
     };
 
     state.store.put_boon_settings(&settings).await?;
@@ -2202,6 +2324,11 @@ async fn put_boon_settings(
                 "tool_loop_max_turns": settings.tool_loop.max_turns,
                 "tool_loop_tool_timeout_ms": settings.tool_loop.tool_timeout_ms,
                 "tool_loop_nudge_len": settings.tool_loop.nudge.len(),
+                "image_generation_enabled": settings.image_generation.enabled,
+                "image_generation_model": settings.image_generation.image_model,
+                "image_generation_allowed_sizes": settings.image_generation.allowed_sizes,
+                "image_generation_max_images_per_request": settings.image_generation.max_images_per_request,
+                "image_generation_timeout_ms": settings.image_generation.timeout_ms,
             }),
         )
         .await?;
@@ -5347,6 +5474,62 @@ mod tests {
         );
     }
 
+    /// A PUT that never mentions `image_generation_model` must not be rejected
+    /// because the *previously configured* image model was since deleted or
+    /// renamed elsewhere. Before the fix, `image_model` fell back to that
+    /// stale existing value and got re-validated anyway, so an operator could
+    /// not save an unrelated toggle (here, `vision_enabled`) until they
+    /// noticed and cleared a field they never touched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn put_boon_settings_does_not_revalidate_an_unsupplied_image_model() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let original = t
+            .store
+            .get_boon_settings()
+            .await
+            .expect("read boon settings");
+        let restore = original.clone().unwrap_or_default();
+
+        // Seed a stale reference standing in for "the configured image model
+        // was deleted after the fact": a name that is not registered at all.
+        let mut seeded = restore.clone();
+        seeded.image_generation.enabled = true;
+        seeded.image_generation.image_model = Some("ghost-model-does-not-exist".to_string());
+        t.store
+            .put_boon_settings(&seeded)
+            .await
+            .expect("seed a stale image_generation_model");
+
+        let req = axum::http::Request::put("/api/v1/settings/boons")
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::from(
+                serde_json::json!({ "vision_enabled": true }).to_string(),
+            ))
+            .expect("build request");
+        let (status, body) = send(&t.app, req).await;
+
+        // Leave the shared test database as this test found it, regardless of
+        // the assertions below.
+        let _ = t.store.put_boon_settings(&restore).await;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a PUT that never touched image_generation_model must not be rejected \
+             over a stale carried-forward value; body: {body}"
+        );
+        assert_eq!(
+            body["image_generation_model"],
+            serde_json::json!("ghost-model-does-not-exist"),
+            "the unsupplied field must be carried forward unchanged, not cleared"
+        );
+        assert_eq!(body["vision_enabled"], serde_json::json!(true));
+    }
+
     /// A handler can carry `#[utoipa::path]` and still be missing from the
     /// document, and an unregistered schema leaves a dangling `$ref` rather
     /// than a compile error. Pin both halves.
@@ -5519,6 +5702,54 @@ mod tests {
         };
         let view = BoonSettingsView::from_settings(&s);
         assert!(view.compression_code_compaction);
+    }
+
+    #[test]
+    fn boon_view_exposes_image_generation_settings() {
+        let s = BoonSettings {
+            image_generation: obleth_config::ImageGenerationBoonSettings {
+                enabled: true,
+                image_model: Some("sdxl".to_string()),
+                allowed_sizes: vec!["768x768".to_string()],
+                max_images_per_request: 3,
+                timeout_ms: 90_000,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let view = BoonSettingsView::from_settings(&s);
+        assert!(view.image_generation_enabled);
+        assert_eq!(view.image_generation_model.as_deref(), Some("sdxl"));
+        assert_eq!(
+            view.image_generation_allowed_sizes,
+            vec!["768x768".to_string()]
+        );
+        assert_eq!(view.image_generation_max_images_per_request, 3);
+        assert_eq!(view.image_generation_timeout_ms, 90_000);
+        assert!(!view.image_generation_tool_description.is_empty());
+    }
+
+    #[test]
+    fn image_generation_sizes_are_normalised() {
+        // Blank and duplicate entries are dropped; an all-blank list falls back
+        // to the default rather than leaving the tool schema with an empty enum.
+        assert_eq!(
+            normalize_image_sizes(vec![" 512x512 ".into(), "".into(), "512x512".into()]),
+            vec!["512x512".to_string()]
+        );
+        assert_eq!(
+            normalize_image_sizes(vec!["   ".into()]),
+            obleth_config::ImageGenerationBoonSettings::default().allowed_sizes
+        );
+    }
+
+    #[test]
+    fn image_generation_count_is_clamped_to_the_ceiling() {
+        assert_eq!(
+            clamp_image_count(99),
+            obleth_config::IMAGE_GENERATION_MAX_PER_REQUEST
+        );
+        assert_eq!(clamp_image_count(1), 1);
     }
 
     #[test]

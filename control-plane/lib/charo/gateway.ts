@@ -7,7 +7,8 @@
 // as it would for any real client — this is a faithful functional test.
 //
 // The system key secret is fetched once (cached) from the admin API and never
-// leaves the server. Only route handlers under `app/api/charo/*` import this.
+// leaves the server. Only server-side route handlers import this — today
+// `app/api/charo/*` and `app/api/live/playground/images`.
 
 import { obleth } from "@/lib/obleth";
 

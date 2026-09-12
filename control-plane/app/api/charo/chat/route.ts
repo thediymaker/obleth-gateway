@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { guardAdmin } from "@/lib/auth/guard";
 import { chatRequestSchema } from "@/lib/charo/chat-request";
 import { gatewayChat, gatewayImages, type ChatMessage } from "@/lib/charo/gateway";
+import { apiErrorMessage } from "@/lib/charo/errors";
 import { imageUrls, promptFromMessages } from "@/lib/charo/images";
 import { assembleTrace, type TraceSummary } from "@/lib/charo/trace";
 import { CHARO_PERSONA } from "@/lib/charo/persona";
@@ -37,18 +38,6 @@ function messageContent(body: unknown): string {
   if (!Array.isArray(choices) || choices.length === 0) return "";
   const message = (choices[0] as { message?: { content?: unknown } }).message;
   return typeof message?.content === "string" ? message.content : "";
-}
-
-/** Pull a human-readable message out of an upstream error body. Covers the
- * OpenAI `{"error": …}` shape and the FastAPI-style `{"detail": …}` many
- * inference servers return. */
-function apiErrorMessage(parsed: unknown, fallback: string): string {
-  const j = parsed as
-    | { error?: { message?: string } | string; detail?: unknown }
-    | null;
-  const fromError = typeof j?.error === "object" ? j?.error?.message : j?.error;
-  const fromDetail = typeof j?.detail === "string" ? j.detail : undefined;
-  return fromError ?? fromDetail ?? fallback;
 }
 
 /**
