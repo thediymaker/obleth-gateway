@@ -1128,8 +1128,16 @@ pub fn parse_tag_level(raw: &str) -> Option<(String, u8)> {
 /// (JSON/code compaction, cross-turn dedup, deterministic lossy text compaction) before dispatch.
 /// `knowledge` grounds chat requests on admin-curated institutional documents
 /// retrieved from an in-process vector index.
+/// `image_generation` injects a gateway-executed `generate_image` tool so a chat
+/// model can produce images through a registered image model.
 /// Operators opt each model into a subset of these; nothing is granted by default.
-pub const MODEL_BOONS: &[&str] = &["vision", "structured_output", "compression", "knowledge"];
+pub const MODEL_BOONS: &[&str] = &[
+    "vision",
+    "structured_output",
+    "compression",
+    "knowledge",
+    "image_generation",
+];
 
 /// True when `boon` is part of the fixed [`MODEL_BOONS`] vocabulary.
 pub fn is_valid_boon(boon: &str) -> bool {
@@ -1459,6 +1467,11 @@ pub struct BoonSettings {
     /// documents retrieved from an in-process vector index.
     #[serde(default)]
     pub knowledge: KnowledgeBoonSettings,
+    /// The image-generation boon: inject a gateway-executed `generate_image`
+    /// tool so a chat model can produce images through a registered image
+    /// model.
+    #[serde(default)]
+    pub image_generation: ImageGenerationBoonSettings,
 }
 
 /// Configuration for the vision boon (image-to-text relay).
@@ -1503,6 +1516,90 @@ impl VisionBoonSettings {
         self.enabled
             && self
                 .fallback_model
+                .as_ref()
+                .is_some_and(|m| !m.trim().is_empty())
+    }
+}
+
+/// Default description the model reads when deciding whether to call
+/// `generate_image`. Deliberately explicit about not describing the result: the
+/// tool returns a text receipt, and a model that tries to narrate the image
+/// invents details it never saw.
+pub const DEFAULT_IMAGE_TOOL_DESCRIPTION: &str =
+    "Generate an image from a text description. Call this when the user asks for a picture, \
+     drawing, diagram, logo, or any other visual that has to be created rather than described. \
+     Write the prompt yourself: state the subject, style, and composition in detail. The \
+     generated image is attached to your reply automatically — refer to it, but do not describe \
+     its contents.";
+
+/// Hard ceiling on `max_images_per_request`, regardless of what an operator
+/// configures (cost, latency, and response-size guard).
+pub const IMAGE_GENERATION_MAX_PER_REQUEST: u32 = 4;
+
+fn default_image_tool_description() -> String {
+    DEFAULT_IMAGE_TOOL_DESCRIPTION.to_string()
+}
+
+fn default_image_allowed_sizes() -> Vec<String> {
+    vec!["512x512".to_string(), "1024x1024".to_string()]
+}
+
+fn default_image_max_per_request() -> u32 {
+    2
+}
+
+fn default_image_timeout_ms() -> u64 {
+    120_000
+}
+
+/// Configuration for the image-generation boon (gateway-executed
+/// `generate_image` tool backed by a registered `image`-type model).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ImageGenerationBoonSettings {
+    /// Master switch. When false, no tool is injected and requests pass through
+    /// unchanged.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `model_name` of the registered `image`-type model that serves
+    /// generations. `None` disables the boon regardless of `enabled`.
+    #[serde(default)]
+    pub image_model: Option<String>,
+    /// Tool description the model reads when deciding to call the tool.
+    #[serde(default = "default_image_tool_description")]
+    pub tool_description: String,
+    /// Sizes offered in the tool schema and accepted at execution. A requested
+    /// size outside this list is clamped to the first entry.
+    #[serde(default = "default_image_allowed_sizes")]
+    pub allowed_sizes: Vec<String>,
+    /// Maximum images per tool call, clamped to
+    /// [`IMAGE_GENERATION_MAX_PER_REQUEST`].
+    #[serde(default = "default_image_max_per_request")]
+    pub max_images_per_request: u32,
+    /// Hard timeout for one generation call, in milliseconds. On timeout the
+    /// model is told the generation failed and answers in prose.
+    #[serde(default = "default_image_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl Default for ImageGenerationBoonSettings {
+    fn default() -> Self {
+        ImageGenerationBoonSettings {
+            enabled: false,
+            image_model: None,
+            tool_description: default_image_tool_description(),
+            allowed_sizes: default_image_allowed_sizes(),
+            max_images_per_request: default_image_max_per_request(),
+            timeout_ms: default_image_timeout_ms(),
+        }
+    }
+}
+
+impl ImageGenerationBoonSettings {
+    /// True when the boon is enabled and points at an image model.
+    pub fn active(&self) -> bool {
+        self.enabled
+            && self
+                .image_model
                 .as_ref()
                 .is_some_and(|m| !m.trim().is_empty())
     }
@@ -2599,5 +2696,63 @@ mod tests {
                        "cache_ttl_secs":0}"#;
         let m: ResolvedModel = serde_json::from_str(json).expect("deserialize");
         assert!(m.knowledge_collections.is_empty());
+    }
+
+    #[test]
+    fn image_generation_boon_is_in_the_vocabulary() {
+        assert!(is_valid_boon("image_generation"));
+        assert_eq!(
+            normalize_boons(["Image_Generation", "image_generation", "bogus"]),
+            vec!["image_generation".to_string()]
+        );
+    }
+
+    #[test]
+    fn image_generation_defaults_are_off_and_bounded() {
+        let s = ImageGenerationBoonSettings::default();
+        assert!(!s.enabled);
+        assert!(s.image_model.is_none());
+        assert_eq!(s.allowed_sizes, vec!["512x512".to_string(), "1024x1024".to_string()]);
+        assert_eq!(s.max_images_per_request, 2);
+        assert_eq!(s.timeout_ms, 120_000);
+        assert!(!s.tool_description.trim().is_empty());
+        assert!(!s.active());
+    }
+
+    #[test]
+    fn image_generation_active_requires_enabled_and_a_model() {
+        let s = ImageGenerationBoonSettings {
+            enabled: true,
+            ..Default::default()
+        };
+        assert!(!s.active(), "enabled with no model is inactive");
+        let s = ImageGenerationBoonSettings {
+            enabled: true,
+            image_model: Some("   ".to_string()),
+            ..Default::default()
+        };
+        assert!(!s.active(), "a blank model name is inactive");
+        let s = ImageGenerationBoonSettings {
+            enabled: true,
+            image_model: Some("sdxl".to_string()),
+            ..Default::default()
+        };
+        assert!(s.active());
+        let s = ImageGenerationBoonSettings {
+            image_model: Some("sdxl".to_string()),
+            ..Default::default()
+        };
+        assert!(!s.active());
+    }
+
+    #[test]
+    fn boon_settings_row_from_an_older_build_still_parses() {
+        // A `boons` row written before this field existed has no
+        // `image_generation` key at all; it must deserialize to the default.
+        let older = serde_json::json!({ "vision": { "enabled": true } });
+        let parsed: BoonSettings = serde_json::from_value(older).expect("older row parses");
+        assert!(parsed.vision.enabled);
+        assert!(!parsed.image_generation.enabled);
+        assert_eq!(parsed.image_generation.max_images_per_request, 2);
     }
 }
