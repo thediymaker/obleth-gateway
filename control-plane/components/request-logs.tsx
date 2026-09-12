@@ -264,7 +264,10 @@ export function RequestLogs({ tenants, models, initialRequestId = "" }: { tenant
           </Button>
         </div>
 
-        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-[minmax(0,11rem)_minmax(0,11rem)_minmax(0,9rem)_minmax(0,9rem)_auto_1fr]">
+        {/* One column per control, both toggles content-sized (`auto`). The
+            trailing `1fr` is slack for Reset to sit against the right edge —
+            putting a toggle there stretched it into a full-width bar. */}
+        <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-[minmax(0,11rem)_minmax(0,11rem)_minmax(0,9rem)_minmax(0,9rem)_auto_auto_1fr]">
           <Select
             value={filters.tenantId}
             onChange={(e) => patchFilters({ tenantId: e.target.value })}
