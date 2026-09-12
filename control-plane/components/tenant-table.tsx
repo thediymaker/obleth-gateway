@@ -50,14 +50,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import {
-  DropdownMenu,
-  DropdownMenuContent,
-  DropdownMenuItem,
-  DropdownMenuTrigger,
-} from "@/components/ui/dropdown-menu";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { GuardrailsPolicy, Tenant, WeeklyWindow } from "@/lib/obleth";
@@ -752,17 +747,13 @@ function ScheduleEditor({ tenant }: { tenant: Tenant }) {
                 key={idx}
                 className="flex flex-wrap items-center gap-2 rounded-md border border-border/60 bg-background/30 p-2"
               >
-                <select
-                  value={w.day}
-                  onChange={(e) => patchWindow(idx, { day: Number(e.target.value) })}
-                  className="h-9 rounded-md border border-input bg-background px-2 text-sm"
-                >
-                  {DAY_LABELS.map((label, d) => (
-                    <option key={d} value={d}>
-                      {label}
-                    </option>
-                  ))}
-                </select>
+                <Select
+                  aria-label="Day of week"
+                  value={String(w.day)}
+                  onValueChange={(value) => patchWindow(idx, { day: Number(value) })}
+                  className="w-32"
+                  options={DAY_LABELS.map((label, d) => ({ value: String(d), label }))}
+                />
                 <Input
                   type="time"
                   className="w-32"
@@ -891,18 +882,12 @@ function BudgetEditor({ tenant }: { tenant: Tenant }) {
           </div>
           <div className="space-y-1.5">
             <Label htmlFor={`budget-period-${tenant.id}`}>Reset period</Label>
-            <select
+            <Select
               id={`budget-period-${tenant.id}`}
               value={period}
-              onChange={(e) => setPeriod(e.target.value)}
-              className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
-            >
-              {BUDGET_PERIODS.map((p) => (
-                <option key={p} value={p}>
-                  {p}
-                </option>
-              ))}
-            </select>
+              onValueChange={setPeriod}
+              options={BUDGET_PERIODS.map((p) => ({ value: p, label: p }))}
+            />
           </div>
         </div>
         <p className="text-xs text-muted-foreground">
@@ -1189,56 +1174,6 @@ function ScannerToggle({
   );
 }
 
-/** Themed combobox for picking a guard model — replaces the native <select> popup. */
-function GuardModelSelect({
-  id,
-  value,
-  models,
-  invalid,
-  onChange,
-}: {
-  id: string;
-  value: string;
-  models: string[];
-  invalid: boolean;
-  onChange: (value: string) => void;
-}) {
-  const options = ["", ...models];
-  const display = value || "— none —";
-  return (
-    <DropdownMenu>
-      <DropdownMenuTrigger
-        id={id}
-        className={cn(
-          "flex h-9 w-full items-center justify-between gap-2 rounded-md border bg-background px-3 text-sm transition-colors focus:outline-none focus:ring-1 focus:ring-ring data-[state=open]:ring-1 data-[state=open]:ring-ring",
-          invalid ? "border-destructive" : "border-input",
-        )}
-      >
-        <span className={cn("truncate", !value && "text-muted-foreground")}>{display}</span>
-        <ChevronDown className="h-4 w-4 shrink-0 text-muted-foreground" />
-      </DropdownMenuTrigger>
-      <DropdownMenuContent
-        align="start"
-        className="max-h-72 w-[var(--radix-dropdown-menu-trigger-width)] overflow-y-auto"
-      >
-        {options.map((m) => {
-          const selected = m === value;
-          return (
-            <DropdownMenuItem
-              key={m || "__none__"}
-              onSelect={() => onChange(m)}
-              className="cursor-pointer justify-between gap-2"
-            >
-              <span className={cn("truncate", !m && "text-muted-foreground")}>{m || "— none —"}</span>
-              {selected && <Check className="h-3.5 w-3.5 shrink-0 text-primary" strokeWidth={2.5} />}
-            </DropdownMenuItem>
-          );
-        })}
-      </DropdownMenuContent>
-    </DropdownMenu>
-  );
-}
-
 function GuardrailsEditor({ tenant, models }: { tenant: Tenant; models: string[] }) {
   const flashSaved = useContext(SaveFlashContext);
   const [pending, start] = useTransition();
@@ -1495,12 +1430,16 @@ function GuardrailsEditor({ tenant, models }: { tenant: Tenant; models: string[]
                             Guard model {missingGuardModel && <span className="normal-case text-destructive">— required</span>}
                           </Label>
                           {models.length > 0 ? (
-                            <GuardModelSelect
+                            <Select
                               id={`guardrails-model-${tenant.id}`}
                               value={guardModel}
-                              models={models}
                               invalid={missingGuardModel}
-                              onChange={(v) => { setGuardModel(v); dirty(); }}
+                              onValueChange={(v) => { setGuardModel(v); dirty(); }}
+                              searchPlaceholder="Filter models"
+                              options={[
+                                { value: "", label: "— none —" },
+                                ...models.map((m) => ({ value: m, label: m })),
+                              ]}
                             />
                           ) : (
                             <Input

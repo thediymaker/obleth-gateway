@@ -216,31 +216,21 @@ export function RequestLogs({ tenants, models, initialRequestId = "" }: { tenant
           </div>
           <Select
             value={String(filters.windowMs)}
-            onChange={(e) => patchFilters({ windowMs: Number(e.target.value) })}
+            onValueChange={(value) => patchFilters({ windowMs: Number(value) })}
             aria-label="Time window"
             className="h-8 w-full text-xs"
-          >
-            {WINDOWS.map((w) => (
-              <option key={w.ms} value={w.ms}>
-                {w.label}
-              </option>
-            ))}
-          </Select>
+            options={WINDOWS.map((w) => ({ value: String(w.ms), label: w.label }))}
+          />
           <Select
             value={String(pageSize)}
-            onChange={(e) => {
-              setPageSize(Number(e.target.value));
+            onValueChange={(value) => {
+              setPageSize(Number(value));
               resetPaging();
             }}
             aria-label="Rows per page"
             className="h-8 w-full text-xs"
-          >
-            {PAGE_SIZES.map((n) => (
-              <option key={n} value={n}>
-                {n} / page
-              </option>
-            ))}
-          </Select>
+            options={PAGE_SIZES.map((n) => ({ value: String(n), label: `${n} / page` }))}
+          />
           <Button
             type="button"
             variant={liveTail ? "default" : "secondary"}
@@ -270,53 +260,41 @@ export function RequestLogs({ tenants, models, initialRequestId = "" }: { tenant
         <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-[minmax(0,11rem)_minmax(0,11rem)_minmax(0,9rem)_minmax(0,9rem)_auto_auto_1fr]">
           <Select
             value={filters.tenantId}
-            onChange={(e) => patchFilters({ tenantId: e.target.value })}
+            onValueChange={(value) => patchFilters({ tenantId: value })}
             aria-label="Filter by team"
             className="h-8 w-full text-xs"
-          >
-            <option value="">All teams</option>
-            {tenants.map((t) => (
-              <option key={t.id} value={t.id}>
-                {t.name}
-              </option>
-            ))}
-          </Select>
+            searchPlaceholder="Filter teams"
+            options={[
+              { value: "", label: "All teams" },
+              ...tenants.map((t) => ({ value: t.id, label: t.name })),
+            ]}
+          />
           <Select
             value={filters.model}
-            onChange={(e) => patchFilters({ model: e.target.value })}
+            onValueChange={(value) => patchFilters({ model: value })}
             aria-label="Filter by model"
             className="h-8 w-full text-xs"
-          >
-            <option value="">All models</option>
-            {models.map((m) => (
-              <option key={m} value={m}>
-                {m}
-              </option>
-            ))}
-          </Select>
+            searchPlaceholder="Filter models"
+            options={[{ value: "", label: "All models" }, ...models.map((m) => ({ value: m, label: m }))]}
+          />
           <Select
             value={filters.requestType}
-            onChange={(e) => patchFilters({ requestType: e.target.value })}
+            onValueChange={(value) => patchFilters({ requestType: value })}
             aria-label="Filter by type"
             className="h-8 w-full text-xs"
-          >
-            <option value="">All types</option>
-            {REQUEST_TYPES.map((t) => (
-              <option key={t} value={t}>
-                {t}
-              </option>
-            ))}
-          </Select>
+            options={[{ value: "", label: "All types" }, ...REQUEST_TYPES.map((t) => ({ value: t, label: t }))]}
+          />
           <Select
             value={filters.status}
-            onChange={(e) => patchFilters({ status: e.target.value })}
+            onValueChange={(value) => patchFilters({ status: value })}
             aria-label="Filter by status"
             className="h-8 w-full text-xs"
-          >
-            <option value="">All status</option>
-            <option value="success">Success</option>
-            <option value="error">Error</option>
-          </Select>
+            options={[
+              { value: "", label: "All status" },
+              { value: "success", label: "Success" },
+              { value: "error", label: "Error" },
+            ]}
+          />
           {/* Neutral when on, like Live Tail above and every other selected
               control in the dashboard. Hue is reserved for status (a badge
               saying something is failed or stale), not for "this filter is

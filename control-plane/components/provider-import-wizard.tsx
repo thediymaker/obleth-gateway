@@ -246,15 +246,11 @@ export function ProviderImportWizard({
                 <div className="space-y-1.5">
                   <Label>Default type</Label>
                   <Select
+                    aria-label="Default type"
                     value={defaults.model_type}
-                    onChange={(e) => setDefaults((d) => ({ ...d, model_type: e.target.value }))}
-                  >
-                    {MODEL_TYPE_OPTIONS.map((o) => (
-                      <option key={o.value} value={o.value}>
-                        {o.label}
-                      </option>
-                    ))}
-                  </Select>
+                    onValueChange={(value) => setDefaults((d) => ({ ...d, model_type: value }))}
+                    options={MODEL_TYPE_OPTIONS}
+                  />
                 </div>
                 <NumberField
                   label="Context window"
@@ -332,16 +328,13 @@ export function ProviderImportWizard({
                     </div>
                     {!isExisting && (
                       <Select
+                        aria-label={`Type for ${d.modelName}`}
                         value={r?.overrides.model_type ?? defaults.model_type}
-                        onChange={(e) => setRowOverride(d.id, { model_type: e.target.value })}
-                        className="h-7 w-44 text-xs"
-                      >
-                        {MODEL_TYPE_OPTIONS.map((o) => (
-                          <option key={o.value} value={o.value}>
-                            {o.label}
-                          </option>
-                        ))}
-                      </Select>
+                        onValueChange={(value) => setRowOverride(d.id, { model_type: value })}
+                        className="h-7 w-44 shrink-0 text-xs"
+                        contentClassName="w-56"
+                        options={MODEL_TYPE_OPTIONS}
+                      />
                     )}
                     {isExisting && <Badge className="bg-background text-[10px]">Already imported</Badge>}
                   </div>

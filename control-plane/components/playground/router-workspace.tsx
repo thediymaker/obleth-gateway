@@ -5,6 +5,7 @@ import { Loader2, Wand2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { Select } from "@/components/ui/select";
 import { setAutoRouterSettingsAction } from "@/app/actions";
 import type { RouteExplainView, SimulateRouteRequest } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
@@ -224,17 +225,18 @@ export function RouterWorkspace({ session, update }: {
           </label>
           <label className="text-xs font-medium">
             Effort
-            <select
+            <Select
               aria-label="Effort"
-              className="mt-1 flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
-              value={effort}
-              onChange={(e) => update({ routerEffort: e.target.value ? (e.target.value as "low" | "medium" | "high") : undefined })}
-            >
-              <option value="">Default</option>
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
-            </select>
+              className="mt-1 font-normal"
+              value={effort ?? ""}
+              onValueChange={(value) => update({ routerEffort: value ? (value as "low" | "medium" | "high") : undefined })}
+              options={[
+                { value: "", label: "Default" },
+                { value: "low", label: "Low" },
+                { value: "medium", label: "Medium" },
+                { value: "high", label: "High" },
+              ]}
+            />
           </label>
           <label className="text-xs font-medium">
             Max output tokens
