@@ -93,6 +93,39 @@
   }
 }
 
+/* Scroll areas inside panels and dialogs. The platform scrollbar paints a wide
+   light slab that reads as a seam against the dark chrome and butts into the
+   container's rounded corner. This keeps native scrolling and only restyles the
+   bar: transparent track, and a thumb whose 3px transparent border plus
+   padding-box clip is what makes a 10px-wide bar draw as a 4px pill inset from
+   the edge. Firefox has no ::-webkit pseudo-elements, so it gets the standard
+   scrollbar-width/scrollbar-color pair for the same result. */
+.scroll-slim {
+  scrollbar-width: thin;
+  scrollbar-color: hsl(240 5% 100% / 0.14) transparent;
+}
+
+.scroll-slim::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+.scroll-slim::-webkit-scrollbar-track,
+.scroll-slim::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+.scroll-slim::-webkit-scrollbar-thumb {
+  border: 3px solid transparent;
+  border-radius: 9999px;
+  background-color: hsl(240 5% 100% / 0.14);
+  background-clip: padding-box;
+}
+
+.scroll-slim::-webkit-scrollbar-thumb:hover {
+  background-color: hsl(240 5% 100% / 0.26);
+}
+
 /* Request trace flow - node canvas */
 .trace-grid {
   min-width: 0;
