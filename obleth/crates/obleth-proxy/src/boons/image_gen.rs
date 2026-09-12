@@ -12,11 +12,7 @@
 //! The image travels out of band in a `Vec<GeneratedImage>` accumulator and is
 //! appended to the final assistant message as markdown.
 
-// Scaffolding: these items are exercised by tests but have no production caller
-// until the tool loop is wired up. Remove once the tool loop calls `inject` and
-// other execution functions from this module (Task 6).
-#![allow(dead_code)]
-
+use std::collections::HashMap;
 use std::time::Duration;
 
 use obleth_config::{
@@ -114,9 +110,39 @@ fn nudge_text() -> &'static str {
      automatically."
 }
 
+/// Whether `generate_image` is already owned by something else: a tool the
+/// client itself defined, or a tool the MCP tool loop already mapped from a
+/// granted server (`tool_loop_servers`, built by `tool_loop::inject` just
+/// before this boon's gate runs). Mirrors `tool_loop::inject`'s own
+/// client-collision check.
+///
+/// The caller must decide the injection and the `tool_loop_servers` map
+/// insert together from this single answer: checking client tools and MCP
+/// tools separately (one gate in `inject`, another in the map insert) would
+/// let the two records of "who owns this name" disagree — which is exactly
+/// how a client's own tool call ends up hijacked by the gateway's image
+/// executor and billed to the tenant.
+pub(super) fn collides(
+    json_body: &Value,
+    tool_loop_servers: Option<&HashMap<String, String>>,
+) -> bool {
+    let client_has_it = json_body
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .is_some_and(|arr| {
+            arr.iter().any(|t| {
+                t.pointer("/function/name").and_then(|n| n.as_str()) == Some(GENERATE_IMAGE_TOOL)
+            })
+        });
+    client_has_it || tool_loop_servers.is_some_and(|m| m.contains_key(GENERATE_IMAGE_TOOL))
+}
+
 /// Merge the tool definition into the request, and optionally add the system
 /// nudge. Client-supplied tools are preserved: a client that brought its own
 /// tools keeps them and gains this one.
+///
+/// Callers must check [`collides`] first: this function does not itself guard
+/// against a name collision.
 pub(super) fn inject(
     cfg: &ImageGenerationBoonSettings,
     nudge: bool,
@@ -133,11 +159,7 @@ pub(super) fn inject(
         }
     }
     if nudge {
-        super::structured::inject_prompt_section(
-            json_body,
-            nudge_text(),
-            supports_system_messages,
-        );
+        super::structured::inject_prompt_section(json_body, nudge_text(), supports_system_messages);
     }
 }
 
@@ -153,7 +175,11 @@ pub(super) fn clamp_n(cfg: &ImageGenerationBoonSettings, args: &Value) -> u32 {
 /// the first allowed size.
 pub(super) fn clamp_size(cfg: &ImageGenerationBoonSettings, args: &Value) -> String {
     let sizes = allowed_sizes(cfg);
-    let requested = args.get("size").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let requested = args
+        .get("size")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
     if sizes.iter().any(|s| s == requested) {
         requested.to_string()
     } else {
@@ -173,7 +199,8 @@ pub(super) fn prompt_arg(args: &Value) -> Option<String> {
 
 /// Pull displayable image URLs out of an `/images/generations` response body.
 /// Accepts both wire shapes: `b64_json` becomes a data URL; a backend that
-/// returns `url` passes through. Mirrors `control-plane/lib/charo/images.ts`.
+/// returns `url` passes through (after [`sanitize_passthrough_url`]). Mirrors
+/// `control-plane/lib/charo/images.ts`.
 pub(super) fn image_urls(body: &Value) -> Vec<String> {
     let Some(data) = body.get("data").and_then(|d| d.as_array()) else {
         return Vec::new();
@@ -187,12 +214,38 @@ pub(super) fn image_urls(body: &Value) -> Vec<String> {
             }
         }
         if let Some(url) = item.get("url").and_then(|v| v.as_str()) {
-            if !url.is_empty() {
-                out.push(url.to_string());
+            if let Some(safe) = sanitize_passthrough_url(url) {
+                out.push(safe);
             }
         }
     }
     out
+}
+
+/// Validate a backend-supplied passthrough `url` before it is embedded,
+/// unsanitized, into markdown (`attachment`). Unlike the model-authored
+/// prompt used for alt text, this string is backend-controlled: an operator
+/// registers the backend, but the URL text itself is whatever that backend's
+/// response happened to contain.
+///
+/// Only `http:`, `https:`, and `data:image/` are accepted, and a URL carrying
+/// `(`, `)`, or whitespace is rejected outright rather than repaired — either
+/// could break out of the markdown link (`![alt](url)`) or, for parens,
+/// prematurely close it. A rejected URL is dropped exactly like an
+/// unparseable response already is: silently, never as an error.
+fn sanitize_passthrough_url(url: &str) -> Option<String> {
+    let scheme_ok =
+        url.starts_with("http://") || url.starts_with("https://") || url.starts_with("data:image/");
+    if !scheme_ok {
+        return None;
+    }
+    if url
+        .chars()
+        .any(|c| c == '(' || c == ')' || c.is_whitespace())
+    {
+        return None;
+    }
+    Some(url.to_string())
 }
 
 /// Shorten a prompt for echoing back in a receipt.
@@ -251,7 +304,13 @@ fn alt_text(prompt: &str) -> String {
             other => other,
         })
         .collect();
-    excerpt(flattened.split_whitespace().collect::<Vec<_>>().join(" ").as_str())
+    excerpt(
+        flattened
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .as_str(),
+    )
 }
 
 /// The markdown block appended to the final assistant message, or `None` when
@@ -273,7 +332,11 @@ pub(super) fn attachment(images: &[GeneratedImage]) -> Option<String> {
         lines.push(format!("![{}]({})", alt_text(&image.prompt), image.url));
     }
     if dropped > 0 {
-        let plural = if dropped == 1 { "image was" } else { "images were" };
+        let plural = if dropped == 1 {
+            "image was"
+        } else {
+            "images were"
+        };
         lines.push(format!(
             "_{dropped} generated {plural} too large to include in this reply._"
         ));
@@ -432,9 +495,43 @@ pub(super) async fn execute(state: &AppState, ctx: &mut ImageCtx<'_>, args: &Val
                 upstream_ms,
                 ok: false,
             });
-            failure_receipt(&e.to_string())
+            failure_receipt(&sanitize_generation_error(&e))
         }
     }
+}
+
+/// Reduce an upstream generation failure to a short, sanitized reason safe to
+/// hand back to the model — and, via the receipt, to the client — in a
+/// `role: "tool"` message.
+///
+/// A `reqwest` transport error's `Display` includes the request URL, which
+/// here is the image backend's `api_base`: an operator-internal address that
+/// must never surface in client-visible text. The full error (URL included)
+/// is still logged by the caller's `tracing::warn!` above, where only
+/// operators can see it.
+fn sanitize_generation_error(e: &anyhow::Error) -> String {
+    if let Some(re) = e.downcast_ref::<reqwest::Error>() {
+        if re.is_timeout() {
+            return "timed out".to_string();
+        }
+        if let Some(status) = re.status() {
+            return format!("upstream returned {status}");
+        }
+        if re.is_connect() {
+            return "unreachable".to_string();
+        }
+        return "request failed".to_string();
+    }
+    // Not a `reqwest::Error`: one of the two ad-hoc `anyhow::bail!` messages
+    // raised directly in `generate()`, both already address-free.
+    let msg = e.to_string();
+    if msg.starts_with("upstream returned ") {
+        return msg;
+    }
+    if msg.contains("timed out") {
+        return "timed out".to_string();
+    }
+    "request failed".to_string()
 }
 
 /// POST one generation request to the image model, bounded by `timeout`.
@@ -552,7 +649,10 @@ mod tests {
     fn max_images_is_capped_by_the_hard_ceiling() {
         let mut c = cfg();
         c.max_images_per_request = 99;
-        assert_eq!(max_images(&c), obleth_config::IMAGE_GENERATION_MAX_PER_REQUEST);
+        assert_eq!(
+            max_images(&c),
+            obleth_config::IMAGE_GENERATION_MAX_PER_REQUEST
+        );
         c.max_images_per_request = 0;
         assert_eq!(max_images(&c), 1);
     }
@@ -598,7 +698,10 @@ mod tests {
         assert!(r.contains('2'));
         assert!(r.contains("1024x1024"));
         assert!(r.contains("a cat wearing a hat"));
-        assert!(!r.contains("base64"), "the receipt must not carry image data");
+        assert!(
+            !r.contains("base64"),
+            "the receipt must not carry image data"
+        );
         assert!(r.to_lowercase().contains("attached"));
     }
 
@@ -606,7 +709,11 @@ mod tests {
     fn receipt_truncates_a_long_prompt() {
         let long = "a ".repeat(500);
         let r = receipt(1, "512x512", &long);
-        assert!(r.len() < 500, "receipt must stay short, got {} chars", r.len());
+        assert!(
+            r.len() < 500,
+            "receipt must stay short, got {} chars",
+            r.len()
+        );
     }
 
     #[test]
@@ -711,5 +818,167 @@ mod tests {
         let before = body.clone();
         assert!(!attach_to_completion(&[img("http://i/x.png")], &mut body));
         assert_eq!(body, before);
+    }
+
+    // ---- I2: generate_image name-collision guard ----
+
+    #[test]
+    fn collides_when_the_client_brought_its_own_generate_image_tool() {
+        let json = serde_json::json!({
+            "tools": [{ "type": "function", "function": { "name": GENERATE_IMAGE_TOOL } }],
+        });
+        assert!(collides(&json, None));
+    }
+
+    #[test]
+    fn collides_when_a_granted_mcp_server_already_owns_the_name() {
+        let json = serde_json::json!({});
+        let mut servers = HashMap::new();
+        servers.insert(
+            GENERATE_IMAGE_TOOL.to_string(),
+            "some_mcp_server".to_string(),
+        );
+        assert!(collides(&json, Some(&servers)));
+    }
+
+    #[test]
+    fn no_collision_when_the_name_is_free() {
+        let json = serde_json::json!({
+            "tools": [{ "type": "function", "function": { "name": "client_tool" } }],
+        });
+        let servers: HashMap<String, String> = HashMap::new();
+        assert!(!collides(&json, Some(&servers)));
+        assert!(!collides(&json, None));
+    }
+
+    /// Mirrors the calling contract in `boons::mod`: check `collides` first,
+    /// and only call `inject` when it says the name is free.
+    #[test]
+    fn a_client_tool_named_generate_image_suppresses_injection() {
+        let mut json = serde_json::json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "draw a cat" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": GENERATE_IMAGE_TOOL, "parameters": { "type": "object" } },
+            }],
+        });
+        let tool_loop_servers: Option<HashMap<String, String>> = None;
+        if !collides(&json, tool_loop_servers.as_ref()) {
+            inject(&cfg(), false, true, &mut json);
+        }
+        let tools = json["tools"].as_array().unwrap();
+        assert_eq!(
+            tools.len(),
+            1,
+            "only the client's own generate_image definition may remain"
+        );
+        assert_eq!(tools[0]["function"]["name"], GENERATE_IMAGE_TOOL);
+        assert!(
+            tools[0]["function"]["parameters"]["properties"].is_null(),
+            "the boon's tool definition must not have been merged in"
+        );
+    }
+
+    #[test]
+    fn a_noncolliding_client_tool_still_gets_the_boon_merged_in() {
+        let mut json = serde_json::json!({
+            "model": "m",
+            "messages": [{ "role": "user", "content": "draw a cat" }],
+            "tools": [{ "type": "function", "function": { "name": "client_tool" } }],
+        });
+        let tool_loop_servers: Option<HashMap<String, String>> = None;
+        assert!(!collides(&json, tool_loop_servers.as_ref()));
+        inject(&cfg(), false, true, &mut json);
+        let tools = json["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["function"]["name"], "client_tool");
+        assert_eq!(tools[1]["function"]["name"], GENERATE_IMAGE_TOOL);
+    }
+
+    // ---- M1: sanitized failure reasons ----
+
+    #[test]
+    fn sanitize_generation_error_passes_through_a_bare_status_message() {
+        let e = anyhow::anyhow!("upstream returned 503 Service Unavailable");
+        assert_eq!(
+            sanitize_generation_error(&e),
+            "upstream returned 503 Service Unavailable"
+        );
+    }
+
+    #[test]
+    fn sanitize_generation_error_maps_the_bail_timeout_message() {
+        let e = anyhow::anyhow!("image generation timed out after 30s");
+        assert_eq!(sanitize_generation_error(&e), "timed out");
+    }
+
+    #[tokio::test]
+    async fn sanitize_generation_error_strips_a_reqwest_transport_url() {
+        // A connection to a closed loopback port fails immediately with a
+        // `reqwest::Error` whose `Display` embeds the URL we attempted.
+        let client = reqwest::Client::new();
+        let reqwest_err = client
+            .get("http://127.0.0.1:1/images/generations")
+            .send()
+            .await
+            .expect_err("port 1 on loopback must not accept connections");
+        // Sanity: the raw error is exactly the leak this function must close.
+        assert!(reqwest_err.to_string().contains("127.0.0.1"));
+
+        let wrapped: anyhow::Error = reqwest_err.into();
+        let reason = sanitize_generation_error(&wrapped);
+        assert!(
+            !reason.contains("127.0.0.1"),
+            "reason leaked the host: {reason}"
+        );
+        assert!(
+            !reason.contains("://"),
+            "reason leaked a URL scheme: {reason}"
+        );
+
+        let receipt = failure_receipt(&reason);
+        assert!(
+            !receipt.contains("127.0.0.1"),
+            "receipt leaked the host: {receipt}"
+        );
+    }
+
+    // ---- M3: passthrough URL sanitization ----
+
+    #[test]
+    fn image_urls_drops_a_url_containing_a_closing_paren() {
+        let body = serde_json::json!({
+            "data": [{ "url": "http://img/x)evil.png" }]
+        });
+        assert!(image_urls(&body).is_empty());
+    }
+
+    #[test]
+    fn image_urls_drops_a_non_image_scheme() {
+        let body = serde_json::json!({
+            "data": [
+                { "url": "javascript:alert(1)" },
+                { "url": "ftp://img/x.png" },
+            ]
+        });
+        assert!(image_urls(&body).is_empty());
+    }
+
+    #[test]
+    fn image_urls_keeps_well_formed_http_and_data_urls() {
+        let body = serde_json::json!({
+            "data": [
+                { "url": "http://img/x.png" },
+                { "url": "https://img/y.png" },
+            ]
+        });
+        assert_eq!(
+            image_urls(&body),
+            vec![
+                "http://img/x.png".to_string(),
+                "https://img/y.png".to_string()
+            ]
+        );
     }
 }

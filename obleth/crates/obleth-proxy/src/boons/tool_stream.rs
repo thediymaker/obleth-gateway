@@ -63,6 +63,9 @@ pub struct StreamLoop {
     /// True when the client brought its own tools: a call against a name the
     /// gateway does not own is handed back to the client untouched.
     pub passthrough_unmapped: bool,
+    /// Image-generation boon settings snapshot, present when the boon armed the
+    /// loop.
+    pub image_gen: Option<obleth_config::ImageGenerationBoonSettings>,
     pub dispatch_timeout: Duration,
     /// Whether the client asked for `stream_options.include_usage`.
     pub client_include_usage: bool,
@@ -95,6 +98,7 @@ pub fn run(
             tool_servers,
             settings,
             passthrough_unmapped,
+            image_gen,
             dispatch_timeout,
             client_include_usage,
             upstream_start,
@@ -107,6 +111,13 @@ pub fn run(
         let mut request = base_request;
         let mut sessions: HashMap<String, mcp_tools::Session> = HashMap::new();
         let mut current: Option<reqwest::Response> = Some(first);
+        let mut image_ctx = image_gen.as_ref().map(|cfg| super::image_gen::ImageCtx {
+            cfg,
+            key: &key,
+            session_id: &session_id,
+            images: Vec::new(),
+            events: Vec::new(),
+        });
 
         'turns: for _turn in 0..max_turns {
             // Obtain this turn's streaming response: reuse the proxy's first
@@ -132,6 +143,13 @@ pub fn run(
                                 created,
                                 &format!("\n\n[search continuation failed: {e}]\n\n"),
                             )));
+                            if let Some(ctx) = image_ctx.as_ref() {
+                                if let Some(chunk) =
+                                    image_chunk("chatcmpl-toolstream", &upstream_model, created, &ctx.images)
+                                {
+                                    yield Ok(Bytes::from(chunk));
+                                }
+                            }
                             yield Ok(Bytes::from(finish_chunk(
                                 "chatcmpl-toolstream",
                                 &upstream_model,
@@ -240,6 +258,11 @@ pub fn run(
             // upstream's was dropped above because it carried no content), then
             // the optional usage chunk and `[DONE]`.
             if calls.is_empty() {
+                if let Some(ctx) = image_ctx.as_ref() {
+                    if let Some(chunk) = image_chunk(&id, &model_name, created, &ctx.images) {
+                        yield Ok(Bytes::from(chunk));
+                    }
+                }
                 yield Ok(Bytes::from(finish_chunk(
                     &id,
                     &model_name,
@@ -270,6 +293,11 @@ pub fn run(
                         "choices": [{ "index": 0, "delta": d, "finish_reason": null }],
                     });
                     yield Ok(Bytes::from(format!("data: {chunk}\n\n")));
+                }
+                if let Some(ctx) = image_ctx.as_ref() {
+                    if let Some(chunk) = image_chunk(&id, &model_name, created, &ctx.images) {
+                        yield Ok(Bytes::from(chunk));
+                    }
                 }
                 let fin = json!({
                     "id": id,
@@ -318,6 +346,7 @@ pub fn run(
                     &state,
                     &tool_servers,
                     &mut sessions,
+                    image_ctx.as_mut(),
                     &pending,
                     tool_timeout,
                 )
@@ -365,6 +394,13 @@ pub fn run(
                     created,
                     "\n\n[reached the tool-call turn limit and could not produce a final answer]\n\n",
                 )));
+                if let Some(ctx) = image_ctx.as_ref() {
+                    if let Some(chunk) =
+                        image_chunk("chatcmpl-toolstream", &upstream_model, created, &ctx.images)
+                    {
+                        yield Ok(Bytes::from(chunk));
+                    }
+                }
                 yield Ok(Bytes::from(finish_chunk(
                     "chatcmpl-toolstream",
                     &upstream_model,
@@ -441,6 +477,11 @@ pub fn run(
         // The finalization turn is the client-facing final answer, so it is
         // settled as the main request via `finalize_stats` below — not billed
         // as a separate helper call (that would double-charge this turn).
+        if let Some(ctx) = image_ctx.as_ref() {
+            if let Some(chunk) = image_chunk(&id, &model_name, created, &ctx.images) {
+                yield Ok(Bytes::from(chunk));
+            }
+        }
         yield Ok(Bytes::from(finish_chunk(&id, &model_name, created, finish_reason)));
         if client_include_usage {
             if let Some((it, ot)) = usage {
@@ -592,6 +633,20 @@ fn content_chunk(id: &str, model: &str, created: i64, text: &str) -> String {
         "choices": [{ "index": 0, "delta": { "content": text }, "finish_reason": null }],
     });
     format!("data: {chunk}\n\n")
+}
+
+/// A content chunk carrying the markdown for every image generated this
+/// request, or `None` when none were. Emitted just before the terminal finish
+/// chunk so the image lands after the model's prose, matching the buffered
+/// loop's ordering.
+fn image_chunk(
+    id: &str,
+    model: &str,
+    created: i64,
+    images: &[super::image_gen::GeneratedImage],
+) -> Option<String> {
+    let markdown = super::image_gen::attachment(images)?;
+    Some(content_chunk(id, model, created, &markdown))
 }
 
 /// A `chat.completion.chunk` carrying a single reasoning delta. Used for the
@@ -798,5 +853,29 @@ mod tests {
         let json_part = c.trim_start_matches("data: ").trim_end();
         let v: Value = serde_json::from_str(json_part).unwrap();
         assert_eq!(v["choices"][0]["delta"]["content"], "hello");
+    }
+
+    #[test]
+    fn image_chunk_carries_the_markdown_on_the_content_channel() {
+        let images = vec![crate::boons::image_gen::GeneratedImage {
+            url: "http://i/x.png".to_string(),
+            size: "512x512".to_string(),
+            prompt: "a cat".to_string(),
+        }];
+        let sse = image_chunk("id1", "m", 1, &images).expect("one image produces a chunk");
+        assert!(sse.starts_with("data: "));
+        assert!(sse.ends_with("\n\n"));
+        let v: Value = serde_json::from_str(sse.trim_start_matches("data: ").trim_end()).unwrap();
+        let content = v["choices"][0]["delta"]["content"].as_str().unwrap();
+        assert!(content.contains("![a cat](http://i/x.png)"));
+        // The image is the answer, not thinking: it must not ride the
+        // reasoning channel the tool markers use.
+        assert!(v["choices"][0]["delta"].get("reasoning_content").is_none());
+        assert!(v["choices"][0]["finish_reason"].is_null());
+    }
+
+    #[test]
+    fn image_chunk_is_none_without_images() {
+        assert!(image_chunk("id1", "m", 1, &[]).is_none());
     }
 }

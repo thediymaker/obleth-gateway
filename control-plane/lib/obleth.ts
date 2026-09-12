@@ -897,6 +897,12 @@ export interface BoonSettingsView {
   compression_compact_logs: boolean;
   compression_allow_lossy: boolean;
   compression_neural_keep_ratio: number;
+  image_generation_enabled: boolean;
+  image_generation_model: string | null;
+  image_generation_tool_description: string;
+  image_generation_allowed_sizes: string[];
+  image_generation_max_images_per_request: number;
+  image_generation_timeout_ms: number;
 }
 
 export interface UpdateBoonSettings {
@@ -923,6 +929,12 @@ export interface UpdateBoonSettings {
   compression_compact_logs?: boolean;
   compression_allow_lossy?: boolean;
   compression_neural_keep_ratio?: number;
+  image_generation_enabled?: boolean;
+  image_generation_model?: string | null;
+  image_generation_tool_description?: string;
+  image_generation_allowed_sizes?: string[];
+  image_generation_max_images_per_request?: number;
+  image_generation_timeout_ms?: number;
 }
 
 // Live status of the optional neural compression sidecar (a health probe of

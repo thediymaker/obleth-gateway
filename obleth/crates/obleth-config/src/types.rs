@@ -2712,7 +2712,10 @@ mod tests {
         let s = ImageGenerationBoonSettings::default();
         assert!(!s.enabled);
         assert!(s.image_model.is_none());
-        assert_eq!(s.allowed_sizes, vec!["512x512".to_string(), "1024x1024".to_string()]);
+        assert_eq!(
+            s.allowed_sizes,
+            vec!["512x512".to_string(), "1024x1024".to_string()]
+        );
         assert_eq!(s.max_images_per_request, 2);
         assert_eq!(s.timeout_ms, 120_000);
         assert!(!s.tool_description.trim().is_empty());
