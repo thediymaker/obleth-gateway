@@ -113,7 +113,7 @@ export function ImageWorkspace({
   useEffect(() => {
     const el = timeline.current;
     if (el && el.scrollHeight - el.scrollTop - el.clientHeight < 160) {
-      el.scrollTop = el.scrollHeight;
+      el.scrollTo({ top: el.scrollHeight });
     }
   });
 

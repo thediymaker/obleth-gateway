@@ -3,9 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Loader2, Wand2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { Select } from "@/components/ui/select";
 import { setAutoRouterSettingsAction } from "@/app/actions";
 import type { RouteExplainView, SimulateRouteRequest } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
@@ -218,39 +216,6 @@ export function RouterWorkspace({ session, update }: {
             className="mt-1 w-full resize-y rounded-md border border-border bg-background p-2 text-sm outline-none focus:ring-1 focus:ring-ring"
           />
         </label>
-        <div className="grid gap-3 sm:grid-cols-4">
-          <label className="text-xs font-medium">
-            Tenant ID
-            <Input aria-label="Tenant ID" className="mt-1" maxLength={200} placeholder="Optional" value={tenantId} onChange={(e) => update({ routerTenantId: e.target.value })} />
-          </label>
-          <label className="text-xs font-medium">
-            Effort
-            <Select
-              aria-label="Effort"
-              className="mt-1 font-normal"
-              value={effort ?? ""}
-              onValueChange={(value) => update({ routerEffort: value ? (value as "low" | "medium" | "high") : undefined })}
-              options={[
-                { value: "", label: "Default" },
-                { value: "low", label: "Low" },
-                { value: "medium", label: "Medium" },
-                { value: "high", label: "High" },
-              ]}
-            />
-          </label>
-          <label className="text-xs font-medium">
-            Max output tokens
-            <Input aria-label="Max output tokens" className="mt-1" type="number" min={1} max={131072} placeholder="Unset" value={maxTokens ?? ""} onChange={(e) => {
-              const n = e.target.valueAsNumber;
-              if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 131072)) update({ routerMaxTokens: e.target.value ? n : undefined });
-            }} />
-          </label>
-          <div className="flex flex-col justify-end gap-1 text-xs">
-            <label className="flex items-center gap-2"><input type="checkbox" checked={needsFunctionCalling} onChange={(e) => update({ routerNeedsFunctionCalling: e.target.checked })} className="h-3.5 w-3.5" />Function calling</label>
-            <label className="flex items-center gap-2"><input type="checkbox" checked={needsToolChoice} onChange={(e) => update({ routerNeedsToolChoice: e.target.checked })} className="h-3.5 w-3.5" />Forced tool choice</label>
-            <label className="flex items-center gap-2"><input type="checkbox" checked={needsResponseSchema} onChange={(e) => update({ routerNeedsResponseSchema: e.target.checked })} className="h-3.5 w-3.5" />Response schema</label>
-          </div>
-        </div>
       </div>
 
       <div className="space-y-3 border-b border-border bg-secondary/10 p-4">
