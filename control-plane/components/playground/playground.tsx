@@ -2,9 +2,10 @@
 
 import { useEffect, useState } from "react";
 import { z } from "zod";
-import { ArrowDownToLine, FlaskConical, Image as ImageIcon, MessageSquare, PanelLeft, Plus, Route, SlidersHorizontal, Trash2 } from "lucide-react";
+import { ArrowDownToLine, History, Image as ImageIcon, MessageSquare, Plus, Route, SlidersHorizontal, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Select } from "@/components/ui/select";
 import { generationSchema } from "@/lib/charo/chat-request";
 import { useEnabledModels } from "@/components/charo/use-enabled-models";
 import { UnifiedWorkspace } from "./workspaces";
@@ -110,28 +111,8 @@ export function Playground({ scope }: { scope: string }) {
   if (!session) return <p className="p-6 text-sm text-muted-foreground">Loading Playground…</p>;
   return (
     <div className="flex h-full min-h-[36rem] flex-col">
-      <header className="flex flex-wrap items-center justify-between gap-3 border-b border-border px-5 py-4">
-        <div><h1 className="flex items-center gap-2 text-lg font-semibold"><FlaskConical className="h-5 w-5 text-violet-500" />Playground</h1><p className="mt-1 text-xs text-muted-foreground">Explore models, compare answers, and test your gateway.</p></div>
-        <div className="flex items-center gap-2">
-          <Button variant="ghost" size="icon" title="Toggle sessions" aria-expanded={showSessions} onClick={() => setShowSessions(!showSessions)}><PanelLeft className="h-4 w-4" /></Button>
-          {/* Chat/compare and Image each have generation parameters worth hiding until asked for; Router has its own weight sliders in the workspace instead. */}
-          {session.mode !== "router" && <Button variant="outline" size="sm" onClick={() => setShowSettings(!showSettings)} aria-expanded={showSettings}><SlidersHorizontal className="mr-2 h-4 w-4" />Parameters</Button>}
-          <Button variant="ghost" size="icon" title="Export saved session" onClick={exportSession}><ArrowDownToLine className="h-4 w-4" /></Button>
-        </div>
-      </header>
-      {storageError && <p role="alert" className="px-5 py-2 text-xs text-amber-600">{storageError}</p>}
-      {error && <div role="alert" className="flex items-center gap-3 px-5 py-2 text-sm text-destructive">{error}<Button variant="outline" size="sm" onClick={reload}>Retry loading models</Button></div>}
-      {showSettings && (session.mode === "chat" || session.mode === "compare") && <div className="grid gap-3 border-b border-border bg-secondary/20 p-4 sm:grid-cols-[1fr_9rem_10rem]">
-        <label className="text-xs font-medium">System prompt<textarea aria-label="System prompt" value={session.generation.systemPrompt} maxLength={32000} onChange={(e) => update({ generation: { ...session.generation, systemPrompt: e.target.value } })} className="mt-1 w-full resize-y rounded-md border border-border bg-background p-2 text-sm" rows={2} placeholder="Instructions for direct chat and comparison" /></label>
-        <label className="text-xs font-medium">Temperature<Input aria-label="Temperature" className="mt-1" type="number" min={0} max={2} step={0.1} placeholder="Model default" value={session.generation.temperature ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (n >= 0 && n <= 2)) update({ generation: { ...session.generation, temperature: e.target.value ? n : undefined } }); }} /></label>
-        <label className="text-xs font-medium">Max output tokens<Input aria-label="Max output tokens" className="mt-1" type="number" min={1} max={131072} placeholder="Model default" value={session.generation.maxTokens ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 131072)) update({ generation: { ...session.generation, maxTokens: e.target.value ? n : undefined } }); }} /></label>
-      </div>}
-      {showSettings && session.mode === "image" && <div className="grid gap-3 border-b border-border bg-secondary/20 p-4 sm:grid-cols-[1fr_9rem_10rem]">
-        <label className="text-xs font-medium">Negative prompt<textarea aria-label="Negative prompt" id="image-negative-prompt" value={session.imageNegativePrompt ?? ""} maxLength={4000} onChange={(e) => update({ imageNegativePrompt: e.target.value })} className="mt-1 w-full resize-y rounded-md border border-border bg-background p-2 text-sm" rows={2} placeholder="blurry, watermark" /></label>
-        <label className="text-xs font-medium">Steps<Input aria-label="Steps" id="image-steps" className="mt-1" type="number" min={1} max={150} placeholder="Backend default" value={session.imageSteps ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 150)) update({ imageSteps: e.target.value ? n : undefined }); }} /></label>
-        <label className="text-xs font-medium">Seed<Input aria-label="Seed" id="image-seed" className="mt-1" type="number" min={0} max={4_294_967_295} placeholder="Random" value={session.imageSeed ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 0 && n <= 4_294_967_295)) update({ imageSeed: e.target.value ? n : undefined }); }} /></label>
-        <p className="text-[11px] text-muted-foreground sm:col-span-3">Negative prompt, steps, and seed are not part of the OpenAI images API. They are passed through to the backend, which may ignore them.</p>
-      </div>}
+      {storageError && <p role="alert" className="px-4 py-2 text-xs text-amber-600">{storageError}</p>}
+      {error && <div role="alert" className="flex items-center gap-3 px-4 py-2 text-sm text-destructive">{error}<Button variant="outline" size="sm" onClick={reload}>Retry loading models</Button></div>}
       <div className="flex min-h-0 flex-1 flex-col md:flex-row">
         {showSessions && <aside className="flex shrink-0 flex-col gap-3 border-b border-border bg-secondary/10 p-3 md:w-52 md:border-b-0 md:border-r">
           <Button variant="outline" size="sm" onClick={create} disabled={sessions.length >= 50}><Plus className="mr-2 h-4 w-4" />New session</Button>
@@ -145,8 +126,9 @@ export function Playground({ scope }: { scope: string }) {
           <p className="hidden text-[11px] text-muted-foreground md:block">Sessions are saved in this browser for your account.</p>
         </aside>}
         <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-          <div className="flex flex-wrap items-center gap-3 border-b border-border px-4 py-2">
-
+          {/* One control row for the whole page. There used to be a second header above this one carrying a duplicate "Playground" title and a second panel toggle; the app shell already names the page and already owns the navigation toggle. */}
+          <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-2">
+            <Button variant="ghost" size="icon" title="Toggle session list" aria-label="Toggle session list" aria-expanded={showSessions} onClick={() => setShowSessions(!showSessions)}><History className="h-4 w-4" /></Button>
             {!showSessions && <Button variant="ghost" size="icon" title="New session" onClick={create} disabled={sessions.length >= 50}><Plus className="h-4 w-4" /></Button>}
             <input aria-label="Session name" maxLength={100} className="min-w-0 flex-1 bg-transparent text-sm outline-none focus:ring-1 focus:ring-ring" value={session.title} onChange={(e) => update({ title: e.target.value })} />
             <div role="group" aria-label="Playground mode" className="flex shrink-0 items-center gap-0.5 rounded-md border border-border p-0.5">
@@ -154,7 +136,31 @@ export function Playground({ scope }: { scope: string }) {
               <Button type="button" variant={session.mode === "router" ? "secondary" : "ghost"} size="sm" aria-pressed={session.mode === "router"} onClick={() => update({ mode: "router" })}><Route className="mr-1.5 h-3.5 w-3.5" />Router</Button>
               <Button type="button" variant={session.mode === "image" ? "secondary" : "ghost"} size="sm" aria-pressed={session.mode === "image"} onClick={() => update({ mode: "image" })}><ImageIcon className="mr-1.5 h-3.5 w-3.5" />Image</Button>
             </div>
+            {/* Every mode has request parameters worth hiding until asked for, and every mode puts them in the same place. */}
+            <Button variant="outline" size="sm" onClick={() => setShowSettings(!showSettings)} aria-expanded={showSettings}><SlidersHorizontal className="mr-2 h-4 w-4" />Parameters</Button>
+            <Button variant="ghost" size="icon" title="Export saved session" onClick={exportSession}><ArrowDownToLine className="h-4 w-4" /></Button>
           </div>
+          {showSettings && (session.mode === "chat" || session.mode === "compare") && <div className="grid gap-3 border-b border-border bg-secondary/20 p-4 sm:grid-cols-[1fr_9rem_10rem]">
+            <label className="text-xs font-medium">System prompt<textarea aria-label="System prompt" value={session.generation.systemPrompt} maxLength={32000} onChange={(e) => update({ generation: { ...session.generation, systemPrompt: e.target.value } })} className="mt-1 w-full resize-y rounded-md border border-border bg-background p-2 text-sm" rows={2} placeholder="Instructions for direct chat and comparison" /></label>
+            <label className="text-xs font-medium">Temperature<Input aria-label="Temperature" className="mt-1" type="number" min={0} max={2} step={0.1} placeholder="Model default" value={session.generation.temperature ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (n >= 0 && n <= 2)) update({ generation: { ...session.generation, temperature: e.target.value ? n : undefined } }); }} /></label>
+            <label className="text-xs font-medium">Max output tokens<Input aria-label="Max output tokens" className="mt-1" type="number" min={1} max={131072} placeholder="Model default" value={session.generation.maxTokens ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 131072)) update({ generation: { ...session.generation, maxTokens: e.target.value ? n : undefined } }); }} /></label>
+          </div>}
+          {showSettings && session.mode === "router" && <div className="grid gap-3 border-b border-border bg-secondary/20 p-4 sm:grid-cols-4">
+            <label className="text-xs font-medium">Tenant ID<Input aria-label="Tenant ID" className="mt-1" maxLength={200} placeholder="Optional" value={session.routerTenantId ?? ""} onChange={(e) => update({ routerTenantId: e.target.value })} /></label>
+            <label className="text-xs font-medium">Effort<Select aria-label="Effort" className="mt-1 font-normal" value={session.routerEffort ?? ""} onValueChange={(value) => update({ routerEffort: value ? (value as "low" | "medium" | "high") : undefined })} options={[{ value: "", label: "Default" }, { value: "low", label: "Low" }, { value: "medium", label: "Medium" }, { value: "high", label: "High" }]} /></label>
+            <label className="text-xs font-medium">Max output tokens<Input aria-label="Max output tokens" className="mt-1" type="number" min={1} max={131072} placeholder="Unset" value={session.routerMaxTokens ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 131072)) update({ routerMaxTokens: e.target.value ? n : undefined }); }} /></label>
+            <div className="flex flex-col justify-end gap-1 text-xs">
+              <label className="flex items-center gap-2"><input type="checkbox" checked={session.routerNeedsFunctionCalling ?? false} onChange={(e) => update({ routerNeedsFunctionCalling: e.target.checked })} className="h-3.5 w-3.5" />Function calling</label>
+              <label className="flex items-center gap-2"><input type="checkbox" checked={session.routerNeedsToolChoice ?? false} onChange={(e) => update({ routerNeedsToolChoice: e.target.checked })} className="h-3.5 w-3.5" />Forced tool choice</label>
+              <label className="flex items-center gap-2"><input type="checkbox" checked={session.routerNeedsResponseSchema ?? false} onChange={(e) => update({ routerNeedsResponseSchema: e.target.checked })} className="h-3.5 w-3.5" />Response schema</label>
+            </div>
+          </div>}
+          {showSettings && session.mode === "image" && <div className="grid gap-3 border-b border-border bg-secondary/20 p-4 sm:grid-cols-[1fr_9rem_10rem]">
+            <label className="text-xs font-medium">Negative prompt<textarea aria-label="Negative prompt" id="image-negative-prompt" value={session.imageNegativePrompt ?? ""} maxLength={4000} onChange={(e) => update({ imageNegativePrompt: e.target.value })} className="mt-1 w-full resize-y rounded-md border border-border bg-background p-2 text-sm" rows={2} placeholder="blurry, watermark" /></label>
+            <label className="text-xs font-medium">Steps<Input aria-label="Steps" id="image-steps" className="mt-1" type="number" min={1} max={150} placeholder="Backend default" value={session.imageSteps ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 150)) update({ imageSteps: e.target.value ? n : undefined }); }} /></label>
+            <label className="text-xs font-medium">Seed<Input aria-label="Seed" id="image-seed" className="mt-1" type="number" min={0} max={4_294_967_295} placeholder="Random" value={session.imageSeed ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 0 && n <= 4_294_967_295)) update({ imageSeed: e.target.value ? n : undefined }); }} /></label>
+            <p className="text-[11px] text-muted-foreground sm:col-span-3">Negative prompt, steps, and seed are not part of the OpenAI images API. They are passed through to the backend, which may ignore them.</p>
+          </div>}
           <div className="min-h-0 flex-1" key={`${session.id}:${session.mode}`}>
             {session.mode === "router"
               ? <RouterWorkspace session={session} update={update} />
