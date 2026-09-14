@@ -154,6 +154,12 @@ const MODEL_BOONS = [
     description:
       "Add a generate_image tool this model can call to produce pictures through the image model configured in Settings → Boons. The gateway runs the generation and attaches the result to the reply; the image is billed per image against the caller's tenant. Requires the Function calling capability — without it no tool is injected and the model will say it cannot draw.",
   },
+  {
+    value: "speculation",
+    label: "Speculation",
+    description:
+      "Answer with the configured fast drafter model whenever this model itself verifies the draft (one cheap prompt_logprobs prefill scores every draft token); drafts that fail verification fall through to this model unchanged. Same quality, several times faster on verified requests. Configure the drafter, verifier, gates, and per-category rules in Settings → Boons.",
+  },
 ] as const;
 
 // Model modality vocabulary; mirrors obleth-config `MODEL_TYPES`. The type

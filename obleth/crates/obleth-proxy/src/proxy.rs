@@ -485,6 +485,7 @@ async fn proxy_handler_inner(
         )
     });
     let response_plan = boon_outcome.response_plan;
+    let speculation_plan = boon_outcome.speculation;
 
     // Live streaming tool loop: when the *only* response transform is the
     // gateway tool loop and the client asked to stream, keep the upstream call
@@ -905,6 +906,136 @@ async fn proxy_handler_inner(
         .as_ref()
         .map(|r| r.endpoint_selection_mode.as_str())
         .unwrap_or(obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE);
+
+    // ---- speculation boon (draft-verify cascade, pre-dispatch) ----
+    // Runs after admission and budget reserve — the request is fully admitted
+    // either way — but before the target dispatch. A committed cascade returns
+    // the response here (verified draft, or draft + mid-stream continuation);
+    // an abstain falls through so the normal dispatch below runs untouched.
+    if let (Some(spec_plan), Some(spec_route)) = (speculation_plan, route.clone()) {
+        if multipart_fields.is_none() {
+            let spec_stats = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::boons::speculation::SpecStats::default(),
+            ));
+            let spec_req = crate::boons::speculation::SpecRequest {
+                state: &state,
+                route: spec_route,
+                key: &resolved,
+                session_id: &req_meta.session_id,
+                dispatch_timeout: req_timeout,
+                started: request_start,
+            };
+            match crate::boons::speculation::run(spec_req, spec_plan, spec_stats.clone()).await {
+                crate::boons::speculation::Outcome::Abstain(_) => {}
+                crate::boons::speculation::Outcome::ShippedJson {
+                    body,
+                    input_tokens,
+                    output_tokens,
+                } => {
+                    drop(permit);
+                    let accounting = StreamAccounting {
+                        state: state.clone(),
+                        request_id,
+                        resolved: resolved.clone(),
+                        meta: req_meta.clone(),
+                        model: model.clone(),
+                        admission,
+                        est,
+                        queue_wait_ms,
+                        request_start,
+                        cache_status: cache_status_label.to_string(),
+                        capacity,
+                        term_period: term_period.clone(),
+                        key_term_period: key_term_period.clone(),
+                        in_cost_rate,
+                        out_cost_rate,
+                        modality_cost,
+                        energy_slots,
+                    };
+                    let total_ms = request_start.elapsed().as_millis() as u32;
+                    accounting
+                        .settle((input_tokens, output_tokens), total_ms, total_ms, 200, None)
+                        .await;
+                    if let Some(t) = tracer.take() {
+                        t.finish("ok");
+                    }
+                    let mut builder = Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("x-obleth-request-id", request_id.to_string())
+                        .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
+                    if !boons_applied.is_empty() {
+                        builder =
+                            builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
+                    }
+                    return builder
+                        .body(Body::from(body.to_string()))
+                        .unwrap_or_else(|_| {
+                            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+                        });
+                }
+                crate::boons::speculation::Outcome::Stream(driver) => {
+                    let accounting = StreamAccounting {
+                        state: state.clone(),
+                        request_id,
+                        resolved: resolved.clone(),
+                        meta: req_meta.clone(),
+                        model: model.clone(),
+                        admission,
+                        est,
+                        queue_wait_ms,
+                        request_start,
+                        cache_status: cache_status_label.to_string(),
+                        capacity,
+                        term_period: term_period.clone(),
+                        key_term_period: key_term_period.clone(),
+                        in_cost_rate,
+                        out_cost_rate,
+                        modality_cost,
+                        energy_slots,
+                    };
+                    let completion = accounting.cancellation_guard();
+                    let body_stream = async_stream::stream! {
+                        futures_util::pin_mut!(driver);
+                        while let Some(item) = driver.next().await {
+                            yield item;
+                        }
+                        drop(permit);
+                        let (ttft_ms, input_tokens, output_tokens) = {
+                            let s = spec_stats.lock().unwrap_or_else(|e| e.into_inner());
+                            let toks = if s.final_set {
+                                (s.input_tokens, s.output_tokens)
+                            } else {
+                                (est.input_tokens, est.estimated_output_tokens)
+                            };
+                            (s.ttft_ms, toks.0, toks.1)
+                        };
+                        let total_ms = request_start.elapsed().as_millis() as u32;
+                        let _ = completion.complete(accounting.settle(
+                            (input_tokens, output_tokens), ttft_ms, total_ms, 200, None,
+                        )).await;
+                    };
+                    if let Some(t) = tracer.take() {
+                        t.finish("ok");
+                    }
+                    let mut builder = Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .header("x-obleth-request-id", request_id.to_string())
+                        .header(NO_BUFFER_HEADER.0, NO_BUFFER_HEADER.1);
+                    if !boons_applied.is_empty() {
+                        builder =
+                            builder.header(crate::boons::BOONS_HEADER, boons_applied.join(","));
+                    }
+                    return builder
+                        .body(Body::from_stream(body_stream))
+                        .unwrap_or_else(|_| {
+                            error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed")
+                        });
+                }
+            }
+        }
+    }
 
     // Build the ordered list of upstream targets. When a model defines explicit
     // endpoints we route across the healthy/enabled ones (priority order for
