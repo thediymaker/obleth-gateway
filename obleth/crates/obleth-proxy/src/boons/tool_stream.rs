@@ -704,7 +704,12 @@ fn forward_delta(v: &Value) -> Value {
 /// delta — the chunk a normal OpenAI stream sends right before the usage chunk
 /// and `[DONE]`. `finish_reason` defaults to `"stop"` when the upstream did not
 /// report one.
-pub(crate) fn finish_chunk(id: &str, model: &str, created: i64, finish_reason: Option<Value>) -> String {
+pub(crate) fn finish_chunk(
+    id: &str,
+    model: &str,
+    created: i64,
+    finish_reason: Option<Value>,
+) -> String {
     let chunk = json!({
         "id": id,
         "object": "chat.completion.chunk",
