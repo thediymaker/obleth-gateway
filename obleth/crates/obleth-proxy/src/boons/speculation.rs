@@ -227,8 +227,7 @@ pub(crate) fn resolve_gate(s: &SpeculationBoonSettings, tags: &[String]) -> Opti
             });
         }
     }
-    s.unlisted_categories_speculate
-        .then(|| Gate::global(s))
+    s.unlisted_categories_speculate.then(|| Gate::global(s))
 }
 
 pub(crate) fn zone(g: &Gate, agree: f64, mean_lp: f64) -> Zone {
@@ -290,7 +289,11 @@ pub(crate) fn parse_score(
     }
     Ok(Score {
         agree: agree as f64 / draft_ids.len().max(1) as f64,
-        mean_lp: if lp_n > 0 { lp_sum / lp_n as f64 } else { -99.0 },
+        mean_lp: if lp_n > 0 {
+            lp_sum / lp_n as f64
+        } else {
+            -99.0
+        },
         n_draft: draft_ids.len(),
     })
 }
@@ -524,10 +527,7 @@ impl DraftReader {
             return;
         };
         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
-            let it = u
-                .get("prompt_tokens")
-                .and_then(|x| x.as_u64())
-                .unwrap_or(0) as u32;
+            let it = u.get("prompt_tokens").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
             let ot = u
                 .get("completion_tokens")
                 .and_then(|x| x.as_u64())
@@ -693,7 +693,10 @@ pub async fn run(
         }
     }
     let Some(gate) = resolve_gate(s, &tags) else {
-        tracing::info!(?tags, "speculation category excluded; target model answers directly");
+        tracing::info!(
+            ?tags,
+            "speculation category excluded; target model answers directly"
+        );
         return Outcome::Abstain("category excluded");
     };
 
@@ -708,20 +711,34 @@ pub async fn run(
     if plan.client_stream {
         return match tokio::time::timeout(
             budget,
-            precommit_stream(&req, &plan, gate, &drafter, &mut verifier, client_max_tokens),
+            precommit_stream(
+                &req,
+                &plan,
+                gate,
+                &drafter,
+                &mut verifier,
+                client_max_tokens,
+            ),
         )
         .await
         {
-            Ok(Ok(committed)) => {
-                Outcome::Stream(drive_stream(req, plan, gate, drafter, verifier, committed, stats))
-            }
+            Ok(Ok(committed)) => Outcome::Stream(drive_stream(
+                req, plan, gate, drafter, verifier, committed, stats,
+            )),
             Ok(Err(reason)) => abstain(&req, &verifier, reason),
             Err(_) => abstain(&req, &verifier, "pre-release budget exhausted"),
         };
     }
     match tokio::time::timeout(
         budget,
-        run_nonstream(&req, &plan, gate, &drafter, &mut verifier, client_max_tokens),
+        run_nonstream(
+            &req,
+            &plan,
+            gate,
+            &drafter,
+            &mut verifier,
+            client_max_tokens,
+        ),
     )
     .await
     {
@@ -1290,9 +1307,21 @@ mod tests {
         let g = Gate::global(&settings());
         assert_eq!(zone(&g, 0.9, -0.2), Zone::Pass);
         assert_eq!(zone(&g, 0.5, -1.0), Zone::Pass, "gate floors are inclusive");
-        assert_eq!(zone(&g, 0.44, -0.2), Zone::Abort, "agreement below the abort floor");
-        assert_eq!(zone(&g, 0.9, -1.7), Zone::Abort, "logprob below the abort floor");
-        assert_eq!(zone(&g, 0.47, -1.2), Zone::Defer, "between the floors defers");
+        assert_eq!(
+            zone(&g, 0.44, -0.2),
+            Zone::Abort,
+            "agreement below the abort floor"
+        );
+        assert_eq!(
+            zone(&g, 0.9, -1.7),
+            Zone::Abort,
+            "logprob below the abort floor"
+        );
+        assert_eq!(
+            zone(&g, 0.47, -1.2),
+            Zone::Defer,
+            "between the floors defers"
+        );
     }
 
     #[test]
