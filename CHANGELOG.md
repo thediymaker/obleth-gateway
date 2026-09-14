@@ -4,11 +4,35 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
-## Unreleased
+## v1.1.0
+
+Institutional knowledge retrieval, an auto-router you can tune and inspect, and chat models that produce images.
+
+- **Ground chat answers on your own documents.** A new Knowledge page holds collections of uploaded text, Markdown, and CSV files, chunked and embedded through a registered embedding model and served from an in-process vector index. Grant a model the `knowledge` boon, attach the collections it may read, and matching passages are retrieved and placed ahead of the conversation on every request. Chunk size and overlap are set per collection; the number of chunks considered, the similarity floor, and the ceiling on injected tokens are in Settings. Indexing runs in the background and survives a restart mid-document, uploads take several files at once, and a collection whose embedding model has changed is marked as needing re-index rather than quietly serving vectors from the old embedder. A retrieval preview shows what a query would pull back and at what score. The boon is off by default and fails open: an embedding timeout or an upstream failure leaves the request untouched rather than failing it.
+
+- **Chat models can generate images.** A model granted the `image_generation` boon gains a `generate_image` tool that the gateway executes against a registered image model, so an ordinary chat client gets a picture back with no client changes. The generation is billed per image against the tenant and the result is attached to the final reply on both the buffered and streaming paths. Operators choose the image model, the offered sizes, the per-call cap, and the timeout in Settings → Model boons, then grant the boon per model. It fails open throughout: an unregistered or disabled image model, an upstream failure, or a timeout leaves the caller with a normal completion. A request carrying a `response_format` schema keeps the schema and reports the suppressed image instead of corrupting the JSON, and a client that already defines a `generate_image` tool keeps its own.
 
 - **Auto-routing is now tunable and inspectable.** Scoring weights, a routing temperature, and a per-model routing bias are editable from Settings and take effect without a restart. A new Router mode in the Playground shows why a prompt routes where it does and previews the effect of a change before you apply it. Optional difficulty tiering routes harder requests to stronger models, ranking strength by price within each topic unless a model declares its own level.
 
 - **Models can be excluded from auto-routing.** An "Eligible for auto" switch on each model keeps it out of the auto router's candidate pool while leaving it callable by name — for a model you want available on request but never chosen on your behalf. Every model is eligible by default, so existing routing is unchanged. Excluded models appear in the Playground's routing explanation under `auto_excluded`.
+
+- **The model registry moves as a file.** Export every model to an `obleth-models` manifest and import it back, on the same instance or another one. The file is keyed by model name rather than id and every field but the name is optional, so a short file can retag one model without disturbing anything else. Upstream keys are reported as a presence flag and never written out, which makes a manifest safe to keep in a repository and lets it move between instances with different encryption keys; an import that sets a key still accepts one in plain text. The dashboard shows which models an import would create, update, and leave unchanged before anything is written. This replaces the earlier dashboard-only model template importer.
+
+- **An Image workspace in the Playground.** Test image models directly with a prompt, negative prompt, size, count, steps, and seed, and a gallery reporting the model, size, latency, and cost for each result. Parameters that backends interpret differently are labelled as such. Results are held for the session and can be downloaded or exported. Chat, Router, and Image modes now share one control row and the same Parameters panel.
+
+- **Themed dropdowns throughout the dashboard.** Native select controls are replaced with one styled component, so menus match the rest of the interface in both light and dark mode.
+
+- **Boons now run for Playground and benchmark traffic.** The Playground and the benchmark suite call the data plane as the reserved control-plane tenant, which is synthetic; the boon engine read its chat/non-chat decision from an accounting label that is rewritten for synthetic tenants, so knowledge, compression, tools, structured output, and the MCP tool loop never ran for either. A model with a knowledge collection attached answered ungrounded in the Playground, and benchmark runs measured a gateway with those boons switched off.
+
+- **The compression sidecar is tagged independently.** Edge image builds skip the compressor because baking its model is slow, so sharing one tag broke the pull whenever the stack pointed at an edge tag. It now reads `OBLETH_COMPRESSOR_VERSION`, defaulting to `latest`. Set both to the same `vX.Y.Z` to pin a release.
+
+- **Edge images follow `dev`.** Features are integrated on `dev` and promoted to `main` at release, so `:dev` is now the moving edge tag and `:main` tracks release-ready work. Anyone testing unreleased fixes with `OBLETH_VERSION=main` should move to `dev`.
+
+- **Configuration backups carry the routing bias.** A model's `route_bias` was lost through export and restore.
+
+- **The capacity benchmark finds the knee correctly.** The capacity chart compared each step against an idle baseline instead of the step before it, and drew two series on one scale; both are fixed, along with the chart's dark-mode colors.
+
+- **The request log's filter toggles read as controls.** Both toggles used the status palette when active, so the internal-traffic switch looked like a warning about the traffic rather than a switch that reveals it.
 
 ## v1.0.0
 
