@@ -13,6 +13,7 @@ pub mod energy_probe;
 mod error;
 pub mod knowledge;
 pub mod model_health;
+mod models_io;
 mod openapi;
 pub mod recipes;
 pub mod slurm_resources;
@@ -180,6 +181,10 @@ pub fn router(state: AdminState) -> Router {
             "/api/v1/models/validate",
             post(model_health::validate_model),
         )
+        // Static segments must stay above `/api/v1/models/:id` so they are not
+        // swallowed by the uuid param route, same as `health` and `validate`.
+        .route("/api/v1/models/export", get(models_io::export_models))
+        .route("/api/v1/models/import", post(models_io::import_models))
         .route(
             "/api/v1/models/:id",
             get(get_model).put(update_model).delete(delete_model),

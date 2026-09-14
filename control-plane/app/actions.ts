@@ -14,6 +14,8 @@ import type {
   CompressionPolicy,
   EnergyTestResult,
   GuardrailsPolicy,
+  ModelImportReport,
+  ModelManifest,
   ModelRoute,
   RestoreReport,
   UpdateAlertSettings,
@@ -1067,183 +1069,6 @@ export async function checkAllModelHealthAction() {
   revalidatePath("/models");
 }
 
-export type ImportModelsResult =
-  | {
-      ok: true;
-      created: number;
-      updated: number;
-      failed: number;
-      errors: string[];
-    }
-  | { ok: false; error: string };
-
-export interface ImportPlanItem {
-  model_name: string;
-  action: "create" | "update";
-  upstream_model: string;
-  api_base: string;
-  enabled: boolean;
-}
-
-export type ImportPlanResult =
-  | { ok: true; plan: ImportPlanItem[] }
-  | { ok: false; error: string };
-
-// Dry-run preview: parses the uploaded obleth models template and reports which
-// routes would be created vs. updated (matched by `model_name`) without writing
-// anything. The UI shows this plan and only then calls `importModelsAction`.
-export async function planModelImportAction(
-  text: string,
-): Promise<ImportPlanResult> {
-  await requireAdmin();
-  const read = readModelInputs(text);
-  if (read.error) return { ok: false, error: read.error };
-
-  let existing: ModelRoute[];
-  try {
-    existing = await obleth.listModels();
-  } catch (e) {
-    return {
-      ok: false,
-      error: e instanceof Error ? e.message : "Failed to load existing models.",
-    };
-  }
-  const names = new Set(existing.map((m) => m.model_name));
-
-  const plan: ImportPlanItem[] = read.inputs.map((input) => ({
-    model_name: input.model_name,
-    action: names.has(input.model_name) ? "update" : "create",
-    upstream_model: input.upstream_model,
-    api_base: input.api_base,
-    enabled: input.enabled ?? true,
-  }));
-  return { ok: true, plan };
-}
-
-// Imports model routes from an uploaded obleth models template (YAML or JSON
-// with a top-level `models:` list). Existing routes are matched by `model_name`
-// and updated in place; unknown names are created. Per-model failures are
-// collected so a single bad entry doesn't abort the whole import.
-export async function importModelsAction(
-  text: string,
-): Promise<ImportModelsResult> {
-  const session = await requireAdmin();
-  const read = readModelInputs(text);
-  if (read.error) return { ok: false, error: read.error };
-  const inputs = read.inputs;
-
-  let existing: ModelRoute[];
-  try {
-    existing = await obleth.listModels();
-  } catch (e) {
-    return {
-      ok: false,
-      error: e instanceof Error ? e.message : "Failed to load existing models.",
-    };
-  }
-  const byName = new Map(existing.map((m) => [m.model_name, m]));
-
-  let created = 0;
-  let updated = 0;
-  const errors: string[] = [];
-
-  // One model per request is the admin API's shape, but the requests are
-  // independent — run them in bounded-concurrency chunks so large imports
-  // don't pay one round trip per model sequentially.
-  const importOne = async (
-    input: ModelImportInput,
-  ): Promise<"created" | "updated"> => {
-    const found = byName.get(input.model_name);
-    if (found) {
-      await obleth.updateModel(found.id, {
-        description: input.description ?? found.description,
-        upstream_model: input.upstream_model,
-        api_base: input.api_base,
-        api_key: input.api_key ?? undefined,
-        model_type: input.model_type ?? found.model_type,
-        input_cost_per_token:
-          input.input_cost_per_token ?? found.input_cost_per_token,
-        output_cost_per_token:
-          input.output_cost_per_token ?? found.output_cost_per_token,
-        cost_per_image: input.cost_per_image ?? found.cost_per_image,
-        cost_per_audio_second:
-          input.cost_per_audio_second ?? found.cost_per_audio_second,
-        cost_per_character:
-          input.cost_per_character ?? found.cost_per_character,
-        context_window: input.context_window ?? found.context_window,
-        admission_weight: input.admission_weight ?? found.admission_weight,
-        max_in_flight:
-          input.max_in_flight !== undefined
-            ? input.max_in_flight
-            : found.max_in_flight,
-        supports_function_calling:
-          input.supports_function_calling ?? found.supports_function_calling,
-        supports_system_messages:
-          input.supports_system_messages ?? found.supports_system_messages,
-        supports_response_schema:
-          input.supports_response_schema ?? found.supports_response_schema,
-        supports_tool_choice:
-          input.supports_tool_choice ?? found.supports_tool_choice,
-        supports_vision: input.supports_vision ?? found.supports_vision,
-        enabled: input.enabled ?? found.enabled,
-        tags: input.tags ?? found.tags,
-        boons: input.boons ?? found.boons,
-      }, { auditActor: session.email });
-      return "updated";
-    }
-    await obleth.createModel({
-      model_name: input.model_name,
-      description: input.description ?? "",
-      upstream_model: input.upstream_model,
-      api_base: input.api_base,
-      api_key: input.api_key ?? undefined,
-      model_type: input.model_type ?? "chat",
-      input_cost_per_token: input.input_cost_per_token ?? 0,
-      output_cost_per_token: input.output_cost_per_token ?? 0,
-      cost_per_image: input.cost_per_image ?? 0,
-      cost_per_audio_second: input.cost_per_audio_second ?? 0,
-      cost_per_character: input.cost_per_character ?? 0,
-      context_window: input.context_window ?? 8192,
-      admission_weight: input.admission_weight ?? 100,
-      max_in_flight: input.max_in_flight ?? null,
-      supports_function_calling: input.supports_function_calling ?? false,
-      supports_system_messages: input.supports_system_messages ?? true,
-      supports_response_schema: input.supports_response_schema ?? false,
-      supports_tool_choice: input.supports_tool_choice ?? false,
-      supports_vision: input.supports_vision ?? false,
-      enabled: input.enabled ?? true,
-      tags: input.tags ?? [],
-      boons: input.boons ?? [],
-    }, { auditActor: session.email });
-    return "created";
-  };
-
-  const chunkSize = 10;
-  for (let i = 0; i < inputs.length; i += chunkSize) {
-    const chunk = inputs.slice(i, i + chunkSize);
-    const results = await Promise.allSettled(chunk.map(importOne));
-    results.forEach((result, idx) => {
-      if (result.status === "fulfilled") {
-        if (result.value === "created") created += 1;
-        else updated += 1;
-      } else {
-        const e = result.reason;
-        const detail =
-          e instanceof OblethApiError
-            ? e.message
-            : e instanceof Error
-              ? e.message
-              : "unknown error";
-        errors.push(`${chunk[idx].model_name}: ${detail}`);
-      }
-    });
-  }
-
-  updateTag(CACHE_TAGS.models);
-  revalidatePath("/models");
-  revalidatePath("/fairshare");
-  return { ok: true, created, updated, failed: errors.length, errors };
-}
 
 export type UpstreamModelsResult =
   | { ok: true; base: string; models: UpstreamModel[] }
@@ -1347,6 +1172,107 @@ export async function restoreBackupAction(
     revalidatePath("/mcp");
     revalidatePath("/fairshare");
     revalidatePath("/settings");
+    return { ok: true, report };
+  } catch (e) {
+    const err = actionError(e);
+    return err.ok ? { ok: false, error: "Unexpected error" } : err;
+  }
+}
+
+export type ApplyManifestResult =
+  | { ok: true; report: ModelImportReport }
+  | { ok: false; error: string };
+
+// Parses an uploaded model file into a manifest the gateway will accept.
+//
+// Two shapes are allowed. A current manifest carries `format: "obleth-models"`.
+// A bare `models:` list — the shape the older models template used — is
+// accepted too and wrapped, so template files written before the manifest
+// existed keep working. YAML and JSON both parse; YAML is a JSON superset, so
+// one parser covers the JSON case when a strict JSON parse fails.
+function readModelManifest(
+  text: string,
+): { manifest: ModelManifest } | { error: string } {
+  if (!text.trim()) return { error: "No file content provided." };
+
+  let parsed: unknown;
+  const trimmed = text.trim();
+  try {
+    parsed =
+      trimmed.startsWith("{") || trimmed.startsWith("[")
+        ? JSON.parse(trimmed)
+        : parseYaml(trimmed);
+  } catch {
+    try {
+      parsed = parseYaml(trimmed);
+    } catch {
+      return { error: "Could not parse the file as JSON or YAML." };
+    }
+  }
+
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { error: "Expected a document with a top-level `models` list." };
+  }
+  const doc = parsed as Record<string, unknown>;
+
+  const isManifest = doc.format === "obleth-models";
+  if (doc.format != null && !isManifest) {
+    return {
+      error: `Not an obleth model file (format ${JSON.stringify(doc.format)}).`,
+    };
+  }
+  if (!Array.isArray(doc.models)) {
+    return { error: "Expected a document with a top-level `models` list." };
+  }
+  if (doc.models.length === 0) {
+    return { error: "The file lists no models." };
+  }
+  const bad = doc.models.findIndex(
+    (m) =>
+      !m ||
+      typeof m !== "object" ||
+      typeof (m as Record<string, unknown>).model_name !== "string" ||
+      !(m as Record<string, unknown>).model_name,
+  );
+  if (bad >= 0) {
+    return { error: `Model at position ${bad + 1} has no model_name.` };
+  }
+
+  return {
+    manifest: {
+      format: "obleth-models",
+      // Only a real manifest's version is meaningful; a bare `models:` list
+      // may carry an unrelated `version` from the older template shape.
+      version: isManifest && typeof doc.version === "number" ? doc.version : 1,
+      models: doc.models as ModelManifest["models"],
+    },
+  };
+}
+
+// Applies an uploaded model manifest. Call with dryRun to validate and preview
+// the per-model diff without writing; call again with dryRun false to commit.
+// The gateway validates the whole file before touching anything, so a rejected
+// manifest leaves the registry exactly as it was.
+export async function applyModelManifestAction(
+  text: string,
+  dryRun: boolean,
+): Promise<ApplyManifestResult> {
+  const session = await requireAdmin();
+
+  const read = readModelManifest(text);
+  if ("error" in read) return { ok: false, error: read.error };
+
+  try {
+    const report = await obleth.importModels(read.manifest, {
+      dryRun,
+      auditActor: session.email,
+    });
+    // A dry run writes nothing, so there is nothing to revalidate.
+    if (!dryRun) {
+      updateTag(CACHE_TAGS.models);
+      revalidatePath("/models");
+      revalidatePath("/");
+    }
     return { ok: true, report };
   } catch (e) {
     const err = actionError(e);
@@ -1682,157 +1608,6 @@ function datetimeOrNull(v: FormDataEntryValue | null): string | null {
   if (!s) return null;
   const date = new Date(s);
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
-}
-
-// ----------------------------------------------------------------------------
-// Model import helpers
-// ----------------------------------------------------------------------------
-
-// Normalized shape for an imported model. Only the routing essentials are
-// required; everything else is optional so partial sources (e.g. LiteLLM
-// configs without admission weights) fall back to sane defaults on create or
-// to the existing value on update.
-interface ModelImportInput {
-  model_name: string;
-  upstream_model: string;
-  api_base: string;
-  description?: string;
-  api_key?: string;
-  model_type?: string;
-  input_cost_per_token?: number;
-  output_cost_per_token?: number;
-  cost_per_image?: number;
-  cost_per_audio_second?: number;
-  cost_per_character?: number;
-  context_window?: number;
-  admission_weight?: number;
-  max_in_flight?: number | null;
-  supports_function_calling?: boolean;
-  supports_system_messages?: boolean;
-  supports_response_schema?: boolean;
-  supports_tool_choice?: boolean;
-  supports_vision?: boolean;
-  enabled?: boolean;
-  tags?: string[];
-  boons?: string[];
-}
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
-
-// Parses and normalizes an uploaded obleth models template into import inputs.
-// Returns a human-readable `error` instead of throwing so callers can surface
-// it directly. The template is YAML or JSON with a top-level `models:` list.
-function readModelInputs(text: string): {
-  inputs: ModelImportInput[];
-  error?: string;
-} {
-  if (!text || !text.trim()) {
-    return { inputs: [], error: "No file content provided." };
-  }
-
-  let parsed: unknown;
-  try {
-    parsed = parseModelDocument(text);
-  } catch {
-    return {
-      inputs: [],
-      error:
-        "Could not parse file. Expected an obleth models YAML/JSON template.",
-    };
-  }
-
-  const inputs = extractModelEntries(parsed)
-    .map(toImportInput)
-    .filter((m): m is ModelImportInput => m != null);
-
-  if (inputs.length === 0) {
-    return {
-      inputs: [],
-      error:
-        "No valid models found. Use the obleth template: a top-level `models:` list where each entry has model_name, upstream_model and api_base.",
-    };
-  }
-  return { inputs };
-}
-
-function parseModelDocument(text: string): unknown {
-  const trimmed = text.trim();
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
-    try {
-      return JSON.parse(trimmed);
-    } catch {
-      // Fall through to YAML — YAML is a JSON superset and may still parse.
-    }
-  }
-  return parseYaml(trimmed);
-}
-
-// Reaches the array of raw model entries in the obleth template: a top-level
-// `models:` list (YAML template or JSON export), or a bare array.
-function extractModelEntries(parsed: unknown): unknown[] {
-  if (Array.isArray(parsed)) return parsed;
-  if (isRecord(parsed) && Array.isArray(parsed.models)) return parsed.models;
-  return [];
-}
-
-function toImportInput(entry: unknown): ModelImportInput | null {
-  if (!isRecord(entry)) return null;
-  const modelName = coerceStr(entry.model_name);
-  const upstream = coerceStr(entry.upstream_model);
-  const apiBase = coerceStr(entry.api_base);
-  if (!modelName || !upstream || !apiBase) return null;
-
-  return {
-    model_name: modelName,
-    upstream_model: upstream,
-    api_base: apiBase,
-    description: coerceStr(entry.description) || undefined,
-    api_key: coerceStr(entry.api_key) || undefined,
-    model_type: coerceStr(entry.model_type) || undefined,
-    input_cost_per_token: coerceNum(entry.input_cost_per_token),
-    output_cost_per_token: coerceNum(entry.output_cost_per_token),
-    cost_per_image: coerceNum(entry.cost_per_image),
-    cost_per_audio_second: coerceNum(entry.cost_per_audio_second),
-    cost_per_character: coerceNum(entry.cost_per_character),
-    context_window: coerceNum(entry.context_window),
-    admission_weight: coerceNum(entry.admission_weight),
-    max_in_flight:
-      entry.max_in_flight == null
-        ? undefined
-        : (coerceNum(entry.max_in_flight) ?? null),
-    supports_function_calling: coerceBool(entry.supports_function_calling),
-    supports_system_messages: coerceBool(entry.supports_system_messages),
-    supports_response_schema: coerceBool(entry.supports_response_schema),
-    supports_tool_choice: coerceBool(entry.supports_tool_choice),
-    supports_vision: coerceBool(entry.supports_vision),
-    enabled: coerceBool(entry.enabled),
-    tags: Array.isArray(entry.tags)
-      ? entry.tags.map(coerceStr).filter(Boolean)
-      : undefined,
-    boons: Array.isArray(entry.boons)
-      ? entry.boons.map(coerceStr).filter(Boolean)
-      : undefined,
-  };
-}
-
-function coerceStr(v: unknown): string {
-  if (v == null) return "";
-  return String(v).trim();
-}
-
-function coerceNum(v: unknown): number | undefined {
-  if (v == null || v === "") return undefined;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : undefined;
-}
-
-function coerceBool(v: unknown): boolean | undefined {
-  if (typeof v === "boolean") return v;
-  if (v === "true") return true;
-  if (v === "false") return false;
-  return undefined;
 }
 
 export async function clearLostReplicasAction(modelId: string): Promise<ActionResult> {

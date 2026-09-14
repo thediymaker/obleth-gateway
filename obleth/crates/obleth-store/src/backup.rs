@@ -131,7 +131,7 @@ impl Store {
                     supports_system_messages, supports_response_schema, supports_tool_choice,
                     supports_vision, enabled, cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     route_bias, auto_eligible, request_timeout_secs, max_retries, retry_backoff_ms,
-                    endpoint_selection_mode,
+                    endpoint_selection_mode, debug_diagnostics, energy_slots_per_node,
                     health_checks_enabled, health_alerts_enabled, health_check_interval_secs,
                     health_failure_threshold, health_maintenance_until, health_maintenance_note,
                     created_at
@@ -384,10 +384,11 @@ impl Store {
                         max_retries, retry_backoff_ms, endpoint_selection_mode,
                         health_checks_enabled, health_alerts_enabled, health_check_interval_secs,
                         health_failure_threshold, health_maintenance_until,
-                        health_maintenance_note, created_at)
+                        health_maintenance_note, created_at,
+                        debug_diagnostics, energy_slots_per_node)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-                        $32, $33, $34, $35, $36, $37, $38, $39, $40, $41)
+                        $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43)
                  on conflict (id) do update set
                         model_name = excluded.model_name,
                         description = excluded.description,
@@ -428,6 +429,8 @@ impl Store {
                         health_failure_threshold = excluded.health_failure_threshold,
                         health_maintenance_until = excluded.health_maintenance_until,
                         health_maintenance_note = excluded.health_maintenance_note,
+                        debug_diagnostics = excluded.debug_diagnostics,
+                        energy_slots_per_node = excluded.energy_slots_per_node,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -472,6 +475,8 @@ impl Store {
             .bind(m.health_maintenance_until)
             .bind(&m.health_maintenance_note)
             .bind(m.created_at)
+            .bind(m.debug_diagnostics)
+            .bind(m.energy_slots_per_node)
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -681,6 +686,8 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
         max_retries: row.try_get("max_retries")?,
         retry_backoff_ms: row.try_get("retry_backoff_ms")?,
         endpoint_selection_mode: row.try_get("endpoint_selection_mode")?,
+        debug_diagnostics: row.try_get("debug_diagnostics")?,
+        energy_slots_per_node: row.try_get("energy_slots_per_node")?,
         health_checks_enabled: row.try_get("health_checks_enabled")?,
         health_alerts_enabled: row.try_get("health_alerts_enabled")?,
         health_check_interval_secs: row.try_get("health_check_interval_secs")?,
