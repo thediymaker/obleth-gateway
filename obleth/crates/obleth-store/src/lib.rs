@@ -20,8 +20,10 @@ use uuid::Uuid;
 mod backup;
 mod crypto;
 pub mod knowledge;
+mod models_io;
 pub use backup::BACKUP_KEY_SENTINEL;
 pub use crypto::{Cipher, CryptoError};
+pub use models_io::{ModelImportOutcome, ModelImportWrite};
 
 /// Process-wide cipher for upstream secret columns, initialized once from the
 /// environment. Kept global so the row-mapping helpers can transparently

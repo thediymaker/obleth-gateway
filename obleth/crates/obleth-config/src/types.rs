@@ -2234,6 +2234,15 @@ pub struct ModelBackup {
     pub retry_backoff_ms: i64,
     #[serde(default = "default_endpoint_selection_mode")]
     pub endpoint_selection_mode: String,
+    /// Opt-in upstream diagnostics. `#[serde(default)]` keeps backups written
+    /// before this field was carried here readable; they restore to the same
+    /// column default such a backup already implied.
+    #[serde(default)]
+    pub debug_diagnostics: bool,
+    /// Declared saturation for energy accounting. Same compatibility note as
+    /// `debug_diagnostics`.
+    #[serde(default)]
+    pub energy_slots_per_node: i64,
     pub health_checks_enabled: bool,
     pub health_alerts_enabled: bool,
     pub health_check_interval_secs: i64,

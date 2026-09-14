@@ -1017,6 +1017,45 @@ export interface ConfigBackup {
   data: ConfigBackupData;
 }
 
+/// The `obleth-models` manifest: model configuration as a portable, editable
+/// file. Distinct from ConfigBackup, which is a whole-instance snapshot keyed
+/// by uuid. Every field but model_name is optional — absent means "leave
+/// unchanged" — so this is deliberately loosely typed on the way in.
+export interface ModelManifest {
+  format: string;
+  version: number;
+  exported_at?: string;
+  gateway_version?: string;
+  models: ManifestModel[];
+}
+
+export interface ManifestModel {
+  model_name: string;
+  tags?: string[];
+  boons?: string[];
+  enabled?: boolean;
+  /** Export-only presence flag; the key itself is never exported. */
+  has_api_key?: boolean;
+  endpoints?: unknown[];
+  [key: string]: unknown;
+}
+
+export interface ModelImportEntry {
+  model_name: string;
+  /** "created" | "updated" | "unchanged" */
+  action: string;
+  changed_fields: string[];
+  warnings: string[];
+}
+
+export interface ModelImportReport {
+  dry_run: boolean;
+  created: number;
+  updated: number;
+  unchanged: number;
+  models: ModelImportEntry[];
+}
+
 export interface RestoreCounts {
   inserted: number;
   updated: number;
@@ -1902,6 +1941,22 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
+  exportModels: (options?: AuditOptions) =>
+    api<ModelManifest>("/models/export", {
+      headers: auditActorHeaders(options),
+    }),
+  importModels: (
+    body: ModelManifest,
+    opts: { dryRun: boolean } & AuditOptions,
+  ) =>
+    api<ModelImportReport>(
+      `/models/import?dry_run=${opts.dryRun ? "true" : "false"}`,
+      {
+        method: "POST",
+        headers: auditActorHeaders(opts),
+        body: JSON.stringify(body),
+      },
+    ),
   listCollections: () =>
     api<KnowledgeCollection[]>("/knowledge/collections", {
       next: {

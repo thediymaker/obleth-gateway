@@ -4,13 +4,14 @@
 import { useMemo, useState, useTransition } from "react";
 import { Search } from "lucide-react";
 import {
-  importModelsAction,
+  applyModelManifestAction,
   listUpstreamModelsAction,
-  planModelImportAction,
-  type ImportModelsResult,
-  type ImportPlanItem,
 } from "@/app/actions";
-import { ImportPreview, ImportResultBanner } from "@/components/model-manager";
+import {
+  ManifestPreview,
+  ManifestResultBanner,
+} from "@/components/model-import-review";
+import type { ModelImportReport } from "@/lib/obleth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
@@ -70,8 +71,8 @@ export function ProviderImportWizard({
   const [showExisting, setShowExisting] = useState(false);
 
   // Review
-  const [plan, setPlan] = useState<ImportPlanItem[] | null>(null);
-  const [result, setResult] = useState<ImportModelsResult | null>(null);
+  const [plan, setPlan] = useState<ModelImportReport | null>(null);
+  const [result, setResult] = useState<ModelImportReport | null>(null);
 
   const newRows = discovered.filter((d) => d.status === "new");
   const existingCount = discovered.length - newRows.length;
@@ -157,12 +158,12 @@ export function ProviderImportWizard({
     }
     const payload = buildImportPayload(Object.values(rows), base, apiKey || undefined, defaults);
     start(async () => {
-      const res = await planModelImportAction(JSON.stringify(payload));
+      const res = await applyModelManifestAction(JSON.stringify(payload), true);
       if (!res.ok) {
         setError(res.error);
         return;
       }
-      setPlan(res.plan);
+      setPlan(res.report);
       setStep("review");
     });
   }
@@ -170,9 +171,13 @@ export function ProviderImportWizard({
   function confirmImport() {
     const payload = buildImportPayload(Object.values(rows), base, apiKey || undefined, defaults);
     start(async () => {
-      const res = await importModelsAction(JSON.stringify(payload));
-      setResult(res);
+      const res = await applyModelManifestAction(JSON.stringify(payload), false);
       setPlan(null);
+      if (res.ok) {
+        setResult(res.report);
+      } else {
+        setError(res.error);
+      }
     });
   }
 
@@ -197,7 +202,7 @@ export function ProviderImportWizard({
           </p>
         )}
 
-        {result && <ImportResultBanner result={result} onDismiss={onClose} />}
+        {result && <ManifestResultBanner report={result} onDismiss={onClose} />}
 
         {!result && step === "connect" && (
           <section className="grid gap-4 md:max-w-xl">
@@ -363,7 +368,7 @@ export function ProviderImportWizard({
 
         {!result && step === "review" && plan && (
           <section className="space-y-3">
-            <ImportPreview plan={plan} pending={pending} onConfirm={confirmImport} onCancel={() => setStep("select")} />
+            <ManifestPreview report={plan} pending={pending} onConfirm={confirmImport} onCancel={() => setStep("select")} />
           </section>
         )}
       </CardContent>

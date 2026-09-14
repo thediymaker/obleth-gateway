@@ -6,6 +6,7 @@
 pub mod config;
 pub mod jwt;
 pub mod keys;
+pub mod manifest;
 pub mod routing;
 pub mod types;
 
@@ -16,5 +17,12 @@ pub use jwt::{
 };
 pub use keys::{
     cache_key, content_hash, generate_api_key, hash_api_key, pepper_is_set, GeneratedKey,
+};
+pub use manifest::{
+    endpoint_to_manifest_entry, model_to_manifest_entry, resolve_endpoint, resolve_model,
+    EndpointConfig, ManifestEndpoint, ManifestError, ManifestModel, ModelConfig, ModelImportEntry,
+    ModelImportReport, ModelManifest, ResolvedManifestEndpoint, ResolvedManifestModel,
+    IMPORT_ACTION_CREATED, IMPORT_ACTION_UNCHANGED, IMPORT_ACTION_UPDATED, MODEL_MANIFEST_FORMAT,
+    MODEL_MANIFEST_VERSION,
 };
 pub use types::*;

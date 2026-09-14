@@ -32,8 +32,9 @@ use crate::{
 use obleth_config::{
     ApiKey, ApiKeyBackup, AppSettingBackup, BackupData, BackupEncryption, CompressionPolicy,
     ConfigBackup, FairshareGroup, FairshareGroupBackup, GuardrailsPolicy, ManagedModelSpec,
-    McpServer, McpServerBackup, ModelBackup, ModelEndpoint, ModelEndpointBackup, ModelHealthCheck,
-    ModelHealthDetail, ModelHealthSummary, ModelReplica, ModelRoute, RestoreCounts, RestoreReport,
+    ManifestEndpoint, ManifestModel, McpServer, McpServerBackup, ModelBackup, ModelEndpoint,
+    ModelEndpointBackup, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelImportEntry,
+    ModelImportReport, ModelManifest, ModelReplica, ModelRoute, RestoreCounts, RestoreReport,
     Tenant, TenantBackup, WeeklyWindow,
 };
 
@@ -180,6 +181,9 @@ use obleth_config::{
         // backup
         crate::backup::export_backup,
         crate::backup::restore_backup,
+        // model manifest
+        crate::models_io::export_models,
+        crate::models_io::import_models,
     ),
     components(schemas(
         Tenant,
@@ -320,6 +324,11 @@ use obleth_config::{
         AppSettingBackup,
         RestoreReport,
         RestoreCounts,
+        ModelManifest,
+        ManifestModel,
+        ManifestEndpoint,
+        ModelImportReport,
+        ModelImportEntry,
         crate::VersionInfo,
         crate::recipes::RecipeView,
         crate::recipes::UpsertRecipeBody,

@@ -39,8 +39,7 @@ import {
   createModelEndpointAction,
   deleteModelAction,
   deleteModelEndpointAction,
-  importModelsAction,
-  planModelImportAction,
+  applyModelManifestAction,
   setModelCacheAction,
   setModelCapacityAction,
   setModelCapacityModeAction,
@@ -51,10 +50,12 @@ import {
   updateModelConnectionAction,
   updateModelCapabilitiesAction,
   updateModelEndpointAction,
-  type ImportModelsResult,
-  type ImportPlanItem,
   type ModelActionState,
 } from "@/app/actions";
+import {
+  ManifestPreview,
+  ManifestResultBanner,
+} from "@/components/model-import-review";
 import { ChartShell, axisTick, chartGrid, compactAxis, tip, timeCursor } from "@/components/chart-tooltip";
 import { ModelMetricsDetail } from "@/components/model-metrics-detail";
 import { ManagedModelConfig } from "@/components/managed-model-config";
@@ -90,7 +91,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { AutotuneReport, AutotuneWorkload, CacheStats, KnowledgeCollection, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelKnowledgeCollections, ModelReplica, ModelRoute } from "@/lib/obleth";
+import type { AutotuneReport, AutotuneWorkload, CacheStats, KnowledgeCollection, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelImportReport, ModelKnowledgeCollections, ModelReplica, ModelRoute } from "@/lib/obleth";
 import { providerForModel } from "@/lib/model-providers";
 import { normalizeModelApiNameDraft, normalizeModelApiNameFinal } from "@/lib/model-name";
 import { EditForm } from "@/components/edit-form";
@@ -243,8 +244,8 @@ export function ModelManager({
   const [createError, setCreateError] = useState<string | null>(null);
   const [createWarnings, setCreateWarnings] = useState<string[] | null>(null);
   const importInputRef = useRef<HTMLInputElement>(null);
-  const [importResult, setImportResult] = useState<ImportModelsResult | null>(null);
-  const [importPlan, setImportPlan] = useState<ImportPlanItem[] | null>(null);
+  const [importResult, setImportResult] = useState<ModelImportReport | null>(null);
+  const [importPreview, setImportPreview] = useState<ModelImportReport | null>(null);
   const [importText, setImportText] = useState<string>("");
   const [importError, setImportError] = useState<string | null>(null);
   const healthByModel = useMemo(() => new Map(health.map((row) => [row.model_id, row])), [health]);
@@ -261,21 +262,14 @@ export function ModelManager({
     start(() => deleteModelAction(model.id));
   }
 
+  // Exported by the gateway rather than assembled from the models already on
+  // this page: the server has every field (endpoints, energy slots, routing
+  // bias, reliability) and replaces upstream keys with a presence flag, so the
+  // file round-trips through import without losing or leaking anything.
   function exportModels() {
-    const payload = {
-      version: 1 as const,
-      exported_at: new Date().toISOString(),
-      models: models.map(toExportShape),
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = `obleth-models-${new Date().toISOString().slice(0, 10)}.json`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    URL.revokeObjectURL(url);
+    setImportError(null);
+    setImportResult(null);
+    window.location.href = "/api/live/models/export";
   }
 
   function onImportFile(event: ChangeEvent<HTMLInputElement>) {
@@ -283,18 +277,20 @@ export function ModelManager({
     event.target.value = "";
     if (!file) return;
     setImportResult(null);
-    setImportPlan(null);
+    setImportPreview(null);
     setImportError(null);
     const reader = new FileReader();
     reader.onload = () => {
       const text = String(reader.result ?? "");
       start(async () => {
-        const plan = await planModelImportAction(text);
-        if (plan.ok) {
+        // Dry run first: validates the whole file gateway-side and reports the
+        // per-model diff without writing.
+        const preview = await applyModelManifestAction(text, true);
+        if (preview.ok) {
           setImportText(text);
-          setImportPlan(plan.plan);
+          setImportPreview(preview.report);
         } else {
-          setImportError(plan.error);
+          setImportError(preview.error);
         }
       });
     };
@@ -305,15 +301,19 @@ export function ModelManager({
   function confirmImport() {
     if (!importText) return;
     start(async () => {
-      const result = await importModelsAction(importText);
-      setImportResult(result);
-      setImportPlan(null);
+      const result = await applyModelManifestAction(importText, false);
+      setImportPreview(null);
       setImportText("");
+      if (result.ok) {
+        setImportResult(result.report);
+      } else {
+        setImportError(result.error);
+      }
     });
   }
 
   function cancelImport() {
-    setImportPlan(null);
+    setImportPreview(null);
     setImportText("");
     setImportError(null);
   }
@@ -456,14 +456,14 @@ export function ModelManager({
               </div>
             </div>
           )}
-          {importPlan && (
+          {importPreview && (
             <div className="px-6 pt-4">
-              <ImportPreview plan={importPlan} pending={pending} onConfirm={confirmImport} onCancel={cancelImport} />
+              <ManifestPreview report={importPreview} pending={pending} onConfirm={confirmImport} onCancel={cancelImport} />
             </div>
           )}
           {importResult && (
             <div className="px-6 pt-4">
-              <ImportResultBanner result={importResult} onDismiss={() => setImportResult(null)} />
+              <ManifestResultBanner report={importResult} onDismiss={() => setImportResult(null)} />
             </div>
           )}
           <div className="text-sm">
@@ -2998,152 +2998,6 @@ function fallbackHealth(model: ModelRoute): ModelHealthSummary {
 function isBenchmarkRoute(model: ModelRoute) {
   const values = [model.model_name, model.upstream_model, model.api_base].join(" ").toLowerCase();
   return values.includes("benchmark-endpoint") || values.includes("mock-model") || values.includes("mock-backend");
-}
-
-// Editable, secret-free projection of a model route used for the JSON backup.
-// `id`, timestamps and `api_key` are intentionally dropped: ids/timestamps are
-// server-assigned and upstream secrets must never land in a downloaded file.
-function toExportShape(model: ModelRoute) {
-  return {
-    model_name: model.model_name,
-    description: model.description,
-    upstream_model: model.upstream_model,
-    api_base: model.api_base,
-    model_type: model.model_type,
-    input_cost_per_token: model.input_cost_per_token,
-    output_cost_per_token: model.output_cost_per_token,
-    cost_per_image: model.cost_per_image,
-    cost_per_audio_second: model.cost_per_audio_second,
-    cost_per_character: model.cost_per_character,
-    context_window: model.context_window,
-    admission_weight: model.admission_weight,
-    max_in_flight: model.max_in_flight,
-    supports_function_calling: model.supports_function_calling,
-    supports_system_messages: model.supports_system_messages,
-    supports_response_schema: model.supports_response_schema,
-    supports_tool_choice: model.supports_tool_choice,
-    supports_vision: model.supports_vision,
-    enabled: model.enabled,
-    cache_enabled: model.cache_enabled,
-    cache_ttl_secs: model.cache_ttl_secs,
-    tags: model.tags,
-    boons: model.boons,
-  };
-}
-
-export function ImportPreview({
-  plan,
-  pending,
-  onConfirm,
-  onCancel,
-}: {
-  plan: ImportPlanItem[];
-  pending: boolean;
-  onConfirm: () => void;
-  onCancel: () => void;
-}) {
-  const createCount = plan.filter((item) => item.action === "create").length;
-  const updateCount = plan.length - createCount;
-  return (
-    <div className="rounded-md border border-border bg-card/40">
-      <div className="flex flex-col gap-3 border-b border-border/60 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <p className="text-sm font-medium">Review import</p>
-          <p className="text-xs text-muted-foreground">
-            {plan.length} models in file / {createCount} new / {updateCount} to update
-          </p>
-        </div>
-        <div className="flex items-center gap-2">
-          <Button type="button" size="sm" variant="ghost" disabled={pending} onClick={onCancel}>
-            Cancel
-          </Button>
-          <Button type="button" size="sm" disabled={pending} onClick={onConfirm}>
-            {pending ? "Importing..." : `Confirm import (${plan.length})`}
-          </Button>
-        </div>
-      </div>
-      <div className="max-h-72 overflow-auto">
-        <table className="w-full text-xs">
-          <thead>
-            <tr className="border-b border-border text-left text-muted-foreground">
-              <th className="px-4 py-2 font-medium">Model</th>
-              <th className="px-3 py-2 font-medium">Action</th>
-              <th className="hidden px-3 py-2 font-medium md:table-cell">Upstream</th>
-              <th className="px-3 py-2 font-medium">State</th>
-            </tr>
-          </thead>
-          <tbody>
-            {plan.map((item) => (
-              <tr key={item.model_name} className="border-b border-border/50">
-                <td className="px-4 py-2 font-medium">{item.model_name}</td>
-                <td className="px-3 py-2">
-                  <Badge
-                    className={cn(
-                      "text-[10px]",
-                      item.action === "create"
-                        ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-300"
-                        : "border-sky-500/35 bg-sky-500/10 text-sky-300",
-                    )}
-                  >
-                    {item.action === "create" ? "new" : "update"}
-                  </Badge>
-                </td>
-                <td className="hidden px-3 py-2 font-mono text-[11px] text-muted-foreground md:table-cell">{item.upstream_model}</td>
-                <td className="px-3 py-2 text-muted-foreground">{item.enabled ? "enabled" : "disabled"}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </div>
-  );
-}
-
-export function ImportResultBanner({
-  result,
-  onDismiss,
-}: {
-  result: ImportModelsResult;
-  onDismiss: () => void;
-}) {
-  if (!result.ok) {
-    return (
-      <div className="flex items-start justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
-        <span>Import failed: {result.error}</span>
-        <button type="button" onClick={onDismiss} className="shrink-0 text-xs underline opacity-80 hover:opacity-100">
-          Dismiss
-        </button>
-      </div>
-    );
-  }
-  const ok = result.failed === 0;
-  return (
-    <div
-      className={cn(
-        "rounded-md border px-3 py-2 text-sm",
-        ok
-          ? "border-emerald-500/35 bg-emerald-500/10 text-emerald-300"
-          : "border-amber-500/35 bg-amber-500/10 text-amber-200",
-      )}
-    >
-      <div className="flex items-start justify-between gap-3">
-        <span>
-          Imported {result.created} new, updated {result.updated}
-          {result.failed > 0 ? `, ${result.failed} failed` : ""}.
-        </span>
-        <button type="button" onClick={onDismiss} className="shrink-0 text-xs underline opacity-80 hover:opacity-100">
-          Dismiss
-        </button>
-      </div>
-      {result.errors.length > 0 && (
-        <ul className="mt-2 list-disc space-y-0.5 pl-5 text-xs">
-          {result.errors.map((error, index) => (
-            <li key={index}>{error}</li>
-          ))}
-        </ul>
-      )}
-    </div>
-  );
 }
 
 function formatModelCost(model: ModelRoute) {

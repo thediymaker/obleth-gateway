@@ -96,11 +96,11 @@ function stripUndefined<T extends object>(obj: T): Partial<T> {
 }
 
 // Merges batch defaults with per-row overrides for each included row, producing
-// entries shaped exactly like the obleth models template (field names that
-// `toImportInput` in app/actions.ts already coerces). Serializes to JSON and
-// flows through the existing planModelImportAction / importModelsAction path.
-// Note: importModelsAction updates routes whose model_name already exists, so
-// the additive (create-only) guarantee is enforced by the caller — the wizard
+// a bare `{ models: [...] }` document — the shape `applyModelManifestAction`
+// accepts alongside a full manifest. Serialized to JSON, it flows through the
+// same dry-run-then-apply path as an uploaded file.
+// Note: the import updates routes whose model_name already exists, so the
+// additive (create-only) guarantee is enforced by the caller — the wizard
 // excludes already-existing models from selection. This builder does not itself
 // prevent updates.
 export function buildImportPayload(
