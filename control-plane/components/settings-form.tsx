@@ -36,6 +36,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
@@ -185,12 +186,7 @@ export function AlertSettingsForm({ settings }: { settings: AlertSettingsView | 
           </div>
           {slackSet && (
             <label className="flex items-center gap-2 text-sm text-muted-foreground">
-              <input
-                type="checkbox"
-                checked={clearSlack}
-                onChange={(e) => setClearSlack(e.target.checked)}
-                className="h-4 w-4 rounded border-border"
-              />
+              <Checkbox checked={clearSlack} onChange={setClearSlack} />
               Remove the configured Slack webhook
             </label>
           )}
@@ -204,12 +200,7 @@ export function AlertSettingsForm({ settings }: { settings: AlertSettingsView | 
         </CardHeader>
         <CardContent className="space-y-4">
           <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={emailEnabled}
-              onChange={(e) => setEmailEnabled(e.target.checked)}
-              className="h-4 w-4 rounded border-border"
-            />
+            <Checkbox checked={emailEnabled} onChange={setEmailEnabled} />
             Enable email alerts
           </label>
           {emailEnabled && (
@@ -256,11 +247,10 @@ export function AlertSettingsForm({ settings }: { settings: AlertSettingsView | 
                 />
                 {passwordSet && (
                   <label className="flex items-center gap-2 pt-1 text-xs text-muted-foreground">
-                    <input
-                      type="checkbox"
+                    <Checkbox
                       checked={clearPassword}
-                      onChange={(e) => setClearPassword(e.target.checked)}
-                      className="h-3.5 w-3.5 rounded border-border"
+                      onChange={setClearPassword}
+                      className="h-3.5 w-3.5"
                     />
                     Remove the stored password
                   </label>
@@ -287,12 +277,7 @@ export function AlertSettingsForm({ settings }: { settings: AlertSettingsView | 
               </div>
               <div className="md:col-span-2">
                 <label className="flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={starttls}
-                    onChange={(e) => setStarttls(e.target.checked)}
-                    className="h-4 w-4 rounded border-border"
-                  />
+                  <Checkbox checked={starttls} onChange={setStarttls} />
                   Use STARTTLS (recommended; uncheck only for plaintext relays)
                 </label>
               </div>
@@ -417,6 +402,89 @@ function ScoringSlider({
   );
 }
 
+// Auto-router policy profiles: one click sets every scoring weight and tiering
+// choice below. "Custom" is what the form reports once any advanced value no
+// longer matches a preset.
+type RouterProfileValues = {
+  capacity_weight: number;
+  cost_weight: number;
+  tag_weight: number;
+  temperature: number;
+  soft_cap: number;
+  difficulty: boolean;
+  tier_source: "hybrid" | "derived" | "declared";
+};
+
+const ROUTER_PROFILES: (SettingsProfile & { values: RouterProfileValues })[] = [
+  {
+    key: "balanced",
+    label: "Balanced",
+    recommended: true,
+    card: "Weigh spare capacity and price about evenly; topic match breaks ties.",
+    blurb:
+      "The server defaults: spare capacity matters most, price second, topic match as a strong tiebreaker. Deterministic — the top scorer always wins.",
+    values: {
+      capacity_weight: 0.6,
+      cost_weight: 0.4,
+      tag_weight: 0.5,
+      temperature: 0,
+      soft_cap: 8,
+      difficulty: false,
+      tier_source: "hybrid",
+    },
+  },
+  {
+    key: "best_answer",
+    label: "Best answer",
+    card: "Follow the topic match and send harder requests to stronger models. Price barely counts.",
+    blurb:
+      "Topic match dominates scoring and difficulty tiering is on, so harder requests land on stronger models regardless of price. Use when answer quality is worth paying for.",
+    values: {
+      capacity_weight: 0.4,
+      cost_weight: 0.05,
+      tag_weight: 0.9,
+      temperature: 0,
+      soft_cap: 8,
+      difficulty: true,
+      tier_source: "hybrid",
+    },
+  },
+  {
+    key: "cost_saver",
+    label: "Cost saver",
+    card: "Prefer the cheapest capable model; capacity steers around busy ones.",
+    blurb:
+      "Price dominates scoring, spare capacity still steers around overloaded models, and topic match only breaks ties. Use when the fleet is billing-sensitive.",
+    values: {
+      capacity_weight: 0.5,
+      cost_weight: 0.9,
+      tag_weight: 0.4,
+      temperature: 0,
+      soft_cap: 8,
+      difficulty: false,
+      tier_source: "hybrid",
+    },
+  },
+];
+
+function routerProfileFromSettings(s: AutoRouterSettingsView | null): string {
+  for (const p of ROUTER_PROFILES) {
+    const v = p.values;
+    if (
+      (s?.capacity_weight ?? 0.6) === v.capacity_weight &&
+      (s?.cost_weight ?? 0.4) === v.cost_weight &&
+      (s?.tag_weight ?? 0.5) === v.tag_weight &&
+      (s?.temperature ?? 0) === v.temperature &&
+      (s?.default_soft_cap ?? 8) === v.soft_cap &&
+      (s?.difficulty_enabled ?? false) === v.difficulty &&
+      (s?.tier_source ?? "hybrid") === v.tier_source
+    ) {
+      return p.key;
+    }
+  }
+  return "custom";
+}
+
 export function AutoRouterSettingsForm({
   settings,
   models,
@@ -440,6 +508,34 @@ export function AutoRouterSettingsForm({
   const [tierSource, setTierSource] = useState<"hybrid" | "derived" | "declared">(
     settings?.tier_source ?? "hybrid",
   );
+  const [profile, setProfile] = useState<string>(() => routerProfileFromSettings(settings));
+  const [advanced, setAdvanced] = useState(false);
+
+  function applyProfile(key: string) {
+    setProfile(key);
+    const preset = ROUTER_PROFILES.find((p) => p.key === key);
+    if (!preset) {
+      // "Custom" keeps the current values and just opens the advanced editor.
+      setAdvanced(true);
+      return;
+    }
+    const v = preset.values;
+    setCapacityWeight(v.capacity_weight);
+    setCostWeight(v.cost_weight);
+    setTagWeight(v.tag_weight);
+    setTemperature(v.temperature);
+    setSoftCap(String(v.soft_cap));
+    setDifficultyEnabled(v.difficulty);
+    setTierSource(v.tier_source);
+  }
+
+  // Any hand edit to a scoring value means the presets no longer describe it.
+  function custom<T>(set: (value: T) => void): (value: T) => void {
+    return (value) => {
+      setProfile("custom");
+      set(value);
+    };
+  }
 
   function save() {
     setStatus(null);
@@ -476,15 +572,12 @@ export function AutoRouterSettingsForm({
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => setEnabled(e.target.checked)}
-            className="h-4 w-4"
-          />
-          Enable intent classifier
-        </label>
+        <ToggleRow
+          label="Use an intent classifier"
+          hint="A tiny model tags each auto request by topic so routing can match models to what the request is actually about. Off = heuristics, then capacity and cost."
+          checked={enabled}
+          onChange={() => setEnabled((value) => !value)}
+        />
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-1">
             <Label htmlFor="classifier_model">Classifier model</Label>
@@ -500,6 +593,9 @@ export function AutoRouterSettingsForm({
                   .map((m) => ({ value: m.model_name, label: m.model_name })),
               ]}
             />
+            <p className="text-[11px] text-muted-foreground">
+              A tiny non-thinking model; anything slower delays every auto request.
+            </p>
           </div>
           <div className="space-y-1">
             <Label htmlFor="classifier_timeout_ms">Timeout (ms)</Label>
@@ -509,17 +605,30 @@ export function AutoRouterSettingsForm({
               value={timeout}
               onChange={(e) => setTimeoutMs(e.target.value)}
             />
+            <p className="text-[11px] text-muted-foreground">
+              On timeout the request routes without tags rather than failing.
+            </p>
           </div>
         </div>
 
-        <div className="space-y-4 border-t border-border/60 pt-4">
-          <div>
-            <div className="text-sm font-medium">Scoring</div>
-            <p className="mt-0.5 text-xs text-muted-foreground">
-              Weights used to rank candidates for an <code>auto</code> request. Changes apply
-              within 15 seconds, no restart required.
-            </p>
-          </div>
+        <ProfilePicker
+          label="Routing profile"
+          profiles={ROUTER_PROFILES}
+          active={profile}
+          onSelect={applyProfile}
+          customCard="Hand-tuned scoring weights or tiering — edit them under Advanced."
+          customBlurb="The values under Advanced no longer match a preset. Picking a profile above overwrites them."
+        />
+
+        <AdvancedDisclosure
+          label="Advanced — scoring weights, spread, difficulty tiering"
+          open={advanced}
+          onToggle={() => setAdvanced((value) => !value)}
+        >
+          <p className="text-xs text-muted-foreground">
+            Weights used to rank candidates for an <code>auto</code> request. Changes apply within
+            15 seconds, no restart required.
+          </p>
 
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <ScoringSlider
@@ -527,7 +636,7 @@ export function AutoRouterSettingsForm({
               label="Capacity"
               hint="How much idle capacity matters when choosing between models."
               value={capacityWeight}
-              onChange={setCapacityWeight}
+              onChange={custom(setCapacityWeight)}
               min={0}
               max={1}
               step={0.05}
@@ -537,7 +646,7 @@ export function AutoRouterSettingsForm({
               label="Cost"
               hint="How much price matters when choosing between models."
               value={costWeight}
-              onChange={setCostWeight}
+              onChange={custom(setCostWeight)}
               min={0}
               max={1}
               step={0.05}
@@ -547,7 +656,7 @@ export function AutoRouterSettingsForm({
               label="Tag"
               hint="How much a topic match matters, relative to capacity and cost."
               value={tagWeight}
-              onChange={setTagWeight}
+              onChange={custom(setTagWeight)}
               min={0}
               max={1}
               step={0.05}
@@ -560,7 +669,7 @@ export function AutoRouterSettingsForm({
               label="Temperature"
               hint="0 always picks the top-scoring model. Higher values spread traffic across close scorers."
               value={temperature}
-              onChange={setTemperature}
+              onChange={custom(setTemperature)}
               min={0}
               max={2}
               step={0.1}
@@ -573,7 +682,7 @@ export function AutoRouterSettingsForm({
                 type="number"
                 min={1}
                 value={softCap}
-                onChange={(e) => setSoftCap(e.target.value)}
+                onChange={(e) => custom(setSoftCap)(e.target.value)}
               />
               <p className="text-xs text-muted-foreground">
                 Assumed concurrency ceiling for models with no explicit max in-flight limit.
@@ -581,28 +690,24 @@ export function AutoRouterSettingsForm({
             </div>
           </div>
 
-          <div className="space-y-1.5">
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={difficultyEnabled}
-                onChange={(e) => setDifficultyEnabled(e.target.checked)}
-                className="h-4 w-4"
-              />
-              Difficulty tiering
-            </label>
-            <p className="text-xs text-muted-foreground">
-              Route harder requests to stronger models. Strength is ranked by price within each
-              topic unless a model declares its own level.
-            </p>
-          </div>
+          <ToggleRow
+            label="Difficulty tiering"
+            hint="Route harder requests to stronger models. Strength is ranked by price within each topic unless a model declares its own level."
+            checked={difficultyEnabled}
+            onChange={() => {
+              setProfile("custom");
+              setDifficultyEnabled((value) => !value);
+            }}
+          />
 
           <div className="max-w-xs space-y-1">
             <Label htmlFor="tier_source">Tier source</Label>
             <Select
               id="tier_source"
               value={tierSource}
-              onValueChange={(value) => setTierSource(value as "hybrid" | "derived" | "declared")}
+              onValueChange={(value) =>
+                custom(setTierSource)(value as "hybrid" | "derived" | "declared")
+              }
               options={[
                 { value: "hybrid", label: "Hybrid" },
                 { value: "derived", label: "Derived from cost" },
@@ -610,7 +715,7 @@ export function AutoRouterSettingsForm({
               ]}
             />
           </div>
-        </div>
+        </AdvancedDisclosure>
 
         <Button onClick={save} disabled={pending}>
           {pending ? "Saving..." : "Save auto routing"}
@@ -781,6 +886,132 @@ function ToggleRow({
   );
 }
 
+// ---------------------------------------------------------------------------
+// Shared settings scaffolding: a named-preset chooser plus a collapsed
+// "Advanced" disclosure. Each preset sets every policy value in its section at
+// once; any hand edit under Advanced flips the selection to "custom".
+
+type SettingsProfile = {
+  key: string;
+  label: string;
+  card: string;
+  blurb: string;
+  recommended?: boolean;
+};
+
+function ProfileCard({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        "rounded-lg border p-3 text-left transition-colors",
+        active
+          ? "border-primary/50 bg-primary/10 ring-1 ring-primary/20"
+          : "border-border/70 bg-background/40 hover:border-border hover:bg-muted/20",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function ProfilePicker({
+  label = "Policy profile",
+  profiles,
+  active,
+  onSelect,
+  customCard,
+  customBlurb,
+}: {
+  label?: string;
+  profiles: SettingsProfile[];
+  active: string;
+  onSelect: (key: string) => void;
+  customCard: string;
+  customBlurb: string;
+}) {
+  const activePreset = profiles.find((p) => p.key === active);
+  return (
+    <div className="space-y-2">
+      <Label>{label}</Label>
+      <div
+        className={cn(
+          "grid gap-2",
+          profiles.length >= 3 ? "sm:grid-cols-2 lg:grid-cols-4" : "sm:grid-cols-3",
+        )}
+      >
+        {profiles.map((p) => (
+          <ProfileCard key={p.key} active={active === p.key} onClick={() => onSelect(p.key)}>
+            <span className="flex items-center gap-2 text-sm font-medium">
+              {p.label}
+              {p.recommended && (
+                <Badge className="border-primary/40 bg-primary/10 text-[10px] text-primary">
+                  recommended
+                </Badge>
+              )}
+            </span>
+            <span className="mt-1 block text-[11px] leading-snug text-muted-foreground">
+              {p.card}
+            </span>
+          </ProfileCard>
+        ))}
+        <ProfileCard active={!activePreset} onClick={() => onSelect("custom")}>
+          <span className="block text-sm font-medium">Custom</span>
+          <span className="mt-1 block text-[11px] leading-snug text-muted-foreground">
+            {customCard}
+          </span>
+        </ProfileCard>
+      </div>
+      <p className="text-[11px] leading-snug text-muted-foreground">
+        {activePreset ? activePreset.blurb : customBlurb}
+      </p>
+    </div>
+  );
+}
+
+function AdvancedDisclosure({
+  label,
+  open,
+  onToggle,
+  children,
+}: {
+  label: string;
+  open: boolean;
+  onToggle: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <ChevronDown
+          className={cn("h-3.5 w-3.5 transition-transform duration-200", open && "rotate-180")}
+        />
+        {label}
+      </button>
+      {open && (
+        <div className="mt-3 space-y-4 rounded-lg border border-border/60 bg-background/25 p-4">
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // Speculation policy profiles: one click sets every threshold, cadence value,
 // and category gate below. "Custom" is not a preset — it is what the panel
 // reports once any advanced value no longer matches a preset.
@@ -801,16 +1032,14 @@ type SpecProfileValues = {
   gates: SpeculationCategoryGate[];
 };
 
-const SPEC_PROFILES: {
+const SPEC_PROFILES: (SettingsProfile & {
   key: Exclude<SpecProfileKey, "custom">;
-  label: string;
-  card: string;
-  blurb: string;
   values: SpecProfileValues;
-}[] = [
+})[] = [
   {
     key: "calibrated",
     label: "Calibrated",
+    recommended: true,
     card: "Per-category gates from the judged-prompt calibration. Best coverage at high precision.",
     blurb:
       "Drafts are attempted only in the categories where verification measured reliably precise (coding, math, summaries, prose), each with its own tuned floor; categories that never verify well go straight to the target before any draft cost. Requires a classify model.",
@@ -1576,75 +1805,18 @@ export function BoonsSettingsForm({
                   </p>
                 </div>
               </div>
-              <div className="space-y-2">
-                <Label>Policy profile</Label>
-                <div className="grid gap-2 sm:grid-cols-3">
-                  {SPEC_PROFILES.map((p) => (
-                    <button
-                      key={p.key}
-                      type="button"
-                      onClick={() => applySpecProfile(p.key)}
-                      aria-pressed={specProfile === p.key}
-                      className={cn(
-                        "rounded-lg border p-3 text-left transition-colors",
-                        specProfile === p.key
-                          ? "border-primary/50 bg-primary/10 ring-1 ring-primary/20"
-                          : "border-border/70 bg-background/40 hover:border-border hover:bg-muted/20",
-                      )}
-                    >
-                      <span className="flex items-center gap-2 text-sm font-medium">
-                        {p.label}
-                        {p.key === "calibrated" && (
-                          <Badge className="border-primary/40 bg-primary/10 text-[10px] text-primary">
-                            recommended
-                          </Badge>
-                        )}
-                      </span>
-                      <span className="mt-1 block text-[11px] leading-snug text-muted-foreground">
-                        {p.card}
-                      </span>
-                    </button>
-                  ))}
-                  <button
-                    type="button"
-                    onClick={() => applySpecProfile("custom")}
-                    aria-pressed={specProfile === "custom"}
-                    className={cn(
-                      "rounded-lg border p-3 text-left transition-colors",
-                      specProfile === "custom"
-                        ? "border-primary/50 bg-primary/10 ring-1 ring-primary/20"
-                        : "border-border/70 bg-background/40 hover:border-border hover:bg-muted/20",
-                    )}
-                  >
-                    <span className="block text-sm font-medium">Custom</span>
-                    <span className="mt-1 block text-[11px] leading-snug text-muted-foreground">
-                      Hand-tuned floors, cadence, or category gates — edit them under Advanced.
-                    </span>
-                  </button>
-                </div>
-                <p className="text-[11px] leading-snug text-muted-foreground">
-                  {specProfile === "custom"
-                    ? "The values under Advanced no longer match a preset. Picking a profile above overwrites them."
-                    : SPEC_PROFILES.find((p) => p.key === specProfile)?.blurb}
-                </p>
-              </div>
-              <div>
-                <button
-                  type="button"
-                  onClick={() => setSpecAdvanced((value) => !value)}
-                  aria-expanded={specAdvanced}
-                  className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
-                >
-                  <ChevronDown
-                    className={cn(
-                      "h-3.5 w-3.5 transition-transform duration-200",
-                      specAdvanced && "rotate-180",
-                    )}
-                  />
-                  Advanced — decision floors, verify cadence, category gates
-                </button>
-                {specAdvanced && (
-                  <div className="mt-3 space-y-4 rounded-lg border border-border/60 bg-background/25 p-4">
+              <ProfilePicker
+                profiles={SPEC_PROFILES}
+                active={specProfile}
+                onSelect={(key) => applySpecProfile(key as SpecProfileKey)}
+                customCard="Hand-tuned floors, cadence, or category gates — edit them under Advanced."
+                customBlurb="The values under Advanced no longer match a preset. Picking a profile above overwrites them."
+              />
+              <AdvancedDisclosure
+                label="Advanced — decision floors, verify cadence, category gates"
+                open={specAdvanced}
+                onToggle={() => setSpecAdvanced((value) => !value)}
+              >
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <div className="space-y-1">
                   <Label htmlFor="speculation_agree_min">Ship floor: agreement (0-1)</Label>
@@ -1817,11 +1989,10 @@ export function BoonsSettingsForm({
                     <div className="space-y-1">
                       <Label className="text-[11px]">Speculate</Label>
                       <div className="flex h-9 items-center">
-                        <input
-                          type="checkbox"
+                        <Checkbox
                           checked={gate.speculate ?? true}
-                          onChange={(e) => updateSpecGate(i, { speculate: e.target.checked })}
-                          className="h-4 w-4"
+                          onChange={(checked) => updateSpecGate(i, { speculate: checked })}
+                          aria-label={`Speculate for ${gate.tag || "this category"}`}
                         />
                       </div>
                     </div>
@@ -1879,9 +2050,7 @@ export function BoonsSettingsForm({
                   }}
                 />
               </div>
-                  </div>
-                )}
-              </div>
+              </AdvancedDisclosure>
             </div>
           </BoonPanel>
 
@@ -2190,6 +2359,60 @@ export function KnowledgeSettingsForm({ settings }: { settings: KnowledgeSetting
   return <KnowledgeSettingsFormBody settings={settings} />;
 }
 
+// Knowledge retrieval profiles: one click sets the four values that decide
+// what gets injected (chunk count, score floor, token budget, query turns).
+// Ingestion and operational limits are not part of a profile — they live
+// under Advanced and never flip the selection to "custom".
+type KnowledgeProfileValues = {
+  top_k: number;
+  min_score: number;
+  max_context_tokens: number;
+  query_turns: number;
+};
+
+const KNOWLEDGE_PROFILES: (SettingsProfile & { values: KnowledgeProfileValues })[] = [
+  {
+    key: "standard",
+    label: "Standard",
+    recommended: true,
+    card: "A handful of solid hits within a modest token budget.",
+    blurb:
+      "The server defaults: 5 chunks per query, matches scoring under 0.35 dropped, at most 1,500 injected tokens, query built from the last 2 turns. A good fit for most collections.",
+    values: { top_k: 5, min_score: 0.35, max_context_tokens: 1500, query_turns: 2 },
+  },
+  {
+    key: "precise",
+    label: "Precise",
+    card: "Fewer, higher-confidence hits — clean answers over recall.",
+    blurb:
+      "3 chunks, only strong matches (score ≥ 0.5), an 800-token budget, query from the last turn only. Prefer when wrong context is worse than no context.",
+    values: { top_k: 3, min_score: 0.5, max_context_tokens: 800, query_turns: 1 },
+  },
+  {
+    key: "broad",
+    label: "Broad",
+    card: "Cast a wide net — more chunks, looser floor, bigger budget.",
+    blurb:
+      "10 chunks with a 0.25 score floor, up to 4,000 injected tokens, query from the last 4 turns. Prefer for exploratory questions over large collections.",
+    values: { top_k: 10, min_score: 0.25, max_context_tokens: 4000, query_turns: 4 },
+  },
+];
+
+function knowledgeProfileFromSettings(s: KnowledgeSettingsView): string {
+  for (const p of KNOWLEDGE_PROFILES) {
+    const v = p.values;
+    if (
+      s.top_k === v.top_k &&
+      s.min_score === v.min_score &&
+      s.max_context_tokens === v.max_context_tokens &&
+      s.query_turns === v.query_turns
+    ) {
+      return p.key;
+    }
+  }
+  return "custom";
+}
+
 // Split from `KnowledgeSettingsForm` above so its `useState` initializers only
 // ever run against a real, freshly-loaded `KnowledgeSettingsView` -- this
 // component only mounts once the parent has confirmed `settings` is non-null,
@@ -2217,6 +2440,32 @@ function KnowledgeSettingsFormBody({ settings }: { settings: KnowledgeSettingsVi
     String(settings.index_stale_after_secs),
   );
   const [debugSnapshot, setDebugSnapshot] = useState(settings.debug_snapshot);
+  const [profile, setProfile] = useState<string>(() => knowledgeProfileFromSettings(settings));
+  const [advanced, setAdvanced] = useState(false);
+
+  function applyProfile(key: string) {
+    setProfile(key);
+    const preset = KNOWLEDGE_PROFILES.find((p) => p.key === key);
+    if (!preset) {
+      // "Custom" keeps the current values and just opens the advanced editor.
+      setAdvanced(true);
+      return;
+    }
+    const v = preset.values;
+    setTopK(String(v.top_k));
+    setMinScore(String(v.min_score));
+    setMaxContextTokens(String(v.max_context_tokens));
+    setQueryTurns(String(v.query_turns));
+  }
+
+  // Any hand edit to a retrieval-policy value means the presets no longer
+  // describe it; ingestion/operational fields deliberately don't do this.
+  function custom(set: (value: string) => void): (value: string) => void {
+    return (value) => {
+      setProfile("custom");
+      set(value);
+    };
+  }
 
   function save() {
     setStatus(null);
@@ -2270,145 +2519,170 @@ function KnowledgeSettingsFormBody({ settings }: { settings: KnowledgeSettingsVi
           onChange={() => setEnabled((value) => !value)}
         />
 
-        <p className="text-xs text-muted-foreground">
-          Every field below must be a positive number — the server silently keeps the previous value
-          for zero or negative input rather than treating it as &quot;off&quot;.
-        </p>
+        <ProfilePicker
+          label="Retrieval profile"
+          profiles={KNOWLEDGE_PROFILES}
+          active={profile}
+          onSelect={applyProfile}
+          customCard="Hand-tuned retrieval values — edit them under Advanced."
+          customBlurb="The retrieval values under Advanced no longer match a preset. Picking a profile above overwrites them."
+        />
 
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_top_k">Top K</Label>
-            <Input
-              id="knowledge_top_k"
-              type="number"
-              min="1"
-              value={topK}
-              onChange={(e) => setTopK(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Chunks retrieved per query before scoring.</p>
+        <AdvancedDisclosure
+          label="Advanced — retrieval values, ingestion & operational limits"
+          open={advanced}
+          onToggle={() => setAdvanced((value) => !value)}
+        >
+          <p className="text-xs text-muted-foreground">
+            Every field must be a positive number — the server silently keeps the previous value
+            for zero or negative input rather than treating it as &quot;off&quot;.
+          </p>
+
+          <div className="text-sm font-medium">Retrieval</div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_top_k">Top K</Label>
+              <Input
+                id="knowledge_top_k"
+                type="number"
+                min="1"
+                value={topK}
+                onChange={(e) => custom(setTopK)(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Chunks retrieved per query before scoring.</p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_min_score">Minimum score</Label>
+              <Input
+                id="knowledge_min_score"
+                type="number"
+                step="0.01"
+                min="0.01"
+                max="1"
+                value={minScore}
+                onChange={(e) => custom(setMinScore)(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Hits scoring below this are dropped before injection.</p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_max_context_tokens">Max context tokens</Label>
+              <Input
+                id="knowledge_max_context_tokens"
+                type="number"
+                min="1"
+                value={maxContextTokens}
+                onChange={(e) => custom(setMaxContextTokens)(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Token budget for injected retrieval per request.</p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_query_turns">Query turns</Label>
+              <Input
+                id="knowledge_query_turns"
+                type="number"
+                min="1"
+                value={queryTurns}
+                onChange={(e) => custom(setQueryTurns)(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Trailing conversation turns folded into the retrieval query.</p>
+            </div>
           </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_min_score">Minimum score</Label>
-            <Input
-              id="knowledge_min_score"
-              type="number"
-              step="0.01"
-              min="0.01"
-              max="1"
-              value={minScore}
-              onChange={(e) => setMinScore(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Hits scoring below this are dropped before injection.</p>
+
+          <div className="border-t border-border/60 pt-3 text-sm font-medium">
+            Ingestion &amp; operations
           </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_max_context_tokens">Max context tokens</Label>
-            <Input
-              id="knowledge_max_context_tokens"
-              type="number"
-              min="1"
-              value={maxContextTokens}
-              onChange={(e) => setMaxContextTokens(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Token budget for injected retrieval per request.</p>
+          <p className="-mt-2 text-xs text-muted-foreground">
+            Plumbing limits, not retrieval policy — changing these never leaves the profile above.
+          </p>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_embed_timeout_ms">Embed timeout (ms)</Label>
+              <Input
+                id="knowledge_embed_timeout_ms"
+                type="number"
+                min="1"
+                value={embedTimeoutMs}
+                onChange={(e) => setEmbedTimeoutMs(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                Query-embedding call budget. On timeout the request proceeds ungrounded rather than
+                failing.
+              </p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_query_cache_ttl_s">Query cache TTL (secs)</Label>
+              <Input
+                id="knowledge_query_cache_ttl_s"
+                type="number"
+                min="1"
+                value={queryCacheTtlS}
+                onChange={(e) => setQueryCacheTtlS(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                How long a query&apos;s embedding vector is cached, keyed per embedder.
+              </p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_max_upload_bytes">Max upload size</Label>
+              <Input
+                id="knowledge_max_upload_bytes"
+                type="number"
+                min="1"
+                value={maxUploadBytes}
+                onChange={(e) => setMaxUploadBytes(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                {formatBytes(Number(maxUploadBytes) || 0)} per document upload.
+              </p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_max_chunks_per_collection">Max chunks per collection</Label>
+              <Input
+                id="knowledge_max_chunks_per_collection"
+                type="number"
+                min="1"
+                value={maxChunksPerCollection}
+                onChange={(e) => setMaxChunksPerCollection(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Indexing stops adding chunks once a collection reaches this cap.</p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_index_batch_size">Index batch size</Label>
+              <Input
+                id="knowledge_index_batch_size"
+                type="number"
+                min="1"
+                value={indexBatchSize}
+                onChange={(e) => setIndexBatchSize(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Chunks embedded per indexer batch.</p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_index_timeout_ms">Index timeout (ms)</Label>
+              <Input
+                id="knowledge_index_timeout_ms"
+                type="number"
+                min="1"
+                value={indexTimeoutMs}
+                onChange={(e) => setIndexTimeoutMs(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Per-batch embedding call budget during background indexing.</p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_index_stale_after_secs">Stale after (secs)</Label>
+              <Input
+                id="knowledge_index_stale_after_secs"
+                type="number"
+                min="1"
+                value={indexStaleAfterSecs}
+                onChange={(e) => setIndexStaleAfterSecs(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                A document stuck indexing past this age is treated as failed and eligible for retry.
+              </p>
+            </div>
           </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_embed_timeout_ms">Embed timeout (ms)</Label>
-            <Input
-              id="knowledge_embed_timeout_ms"
-              type="number"
-              min="1"
-              value={embedTimeoutMs}
-              onChange={(e) => setEmbedTimeoutMs(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              Query-embedding call budget. On timeout the request proceeds ungrounded rather than
-              failing.
-            </p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_query_cache_ttl_s">Query cache TTL (secs)</Label>
-            <Input
-              id="knowledge_query_cache_ttl_s"
-              type="number"
-              min="1"
-              value={queryCacheTtlS}
-              onChange={(e) => setQueryCacheTtlS(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              How long a query&apos;s embedding vector is cached, keyed per embedder.
-            </p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_query_turns">Query turns</Label>
-            <Input
-              id="knowledge_query_turns"
-              type="number"
-              min="1"
-              value={queryTurns}
-              onChange={(e) => setQueryTurns(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Trailing conversation turns folded into the retrieval query.</p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_max_upload_bytes">Max upload size</Label>
-            <Input
-              id="knowledge_max_upload_bytes"
-              type="number"
-              min="1"
-              value={maxUploadBytes}
-              onChange={(e) => setMaxUploadBytes(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              {formatBytes(Number(maxUploadBytes) || 0)} per document upload.
-            </p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_max_chunks_per_collection">Max chunks per collection</Label>
-            <Input
-              id="knowledge_max_chunks_per_collection"
-              type="number"
-              min="1"
-              value={maxChunksPerCollection}
-              onChange={(e) => setMaxChunksPerCollection(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Indexing stops adding chunks once a collection reaches this cap.</p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_index_batch_size">Index batch size</Label>
-            <Input
-              id="knowledge_index_batch_size"
-              type="number"
-              min="1"
-              value={indexBatchSize}
-              onChange={(e) => setIndexBatchSize(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Chunks embedded per indexer batch.</p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_index_timeout_ms">Index timeout (ms)</Label>
-            <Input
-              id="knowledge_index_timeout_ms"
-              type="number"
-              min="1"
-              value={indexTimeoutMs}
-              onChange={(e) => setIndexTimeoutMs(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Per-batch embedding call budget during background indexing.</p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_index_stale_after_secs">Stale after (secs)</Label>
-            <Input
-              id="knowledge_index_stale_after_secs"
-              type="number"
-              min="1"
-              value={indexStaleAfterSecs}
-              onChange={(e) => setIndexStaleAfterSecs(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              A document stuck indexing past this age is treated as failed and eligible for retry.
-            </p>
-          </div>
-        </div>
+        </AdvancedDisclosure>
 
         <div className="flex items-start justify-between gap-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3">
           <div className="min-w-0">
@@ -2484,61 +2758,86 @@ export function CharoSettingsForm({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Charo assistant</CardTitle>
+        <CardTitle>Playground assistant</CardTitle>
         <CardDescription>
-          Charo is the guided assistant in Playground. Give it a brain model to let it run
-          tools (like the capacity benchmark) and answer with live results. Without a brain
-          model it stays a plain model-tester: the persona rides the model under test and no
-          tools are offered. Every token is billed to the reserved internal tenant.
+          The dashboard&apos;s built-in assistant, available in Playground. Give it an agent
+          model to let it run tools (like the capacity benchmark) and answer with live results.
+          Without one it acts as a plain model tester: no tools, and its persona rides the model
+          under test. Every token is billed to the reserved internal tenant.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-5">
-        <label className="flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4" />
-          Enable Playground in the dashboard
-        </label>
+        <ToggleRow
+          label="Enable Playground in the dashboard"
+          hint="Off hides the Playground page and the assistant launcher entirely."
+          checked={enabled}
+          onChange={() => setEnabled((value) => !value)}
+        />
 
         <div className="space-y-1.5">
-          <label className="text-sm font-medium">Brain model</label>
+          <label className="text-sm font-medium">Agent model</label>
           <Select
-            aria-label="Brain model"
+            aria-label="Agent model"
             value={brain}
             onValueChange={setBrain}
             searchPlaceholder="Filter models"
             options={[
-              { value: "", label: "None (legacy tester mode)" },
+              { value: "", label: "None (plain model tester)" },
               ...brainCandidates.map((m) => ({ value: m.model_name, label: m.model_name })),
             ]}
           />
           <p className="text-xs text-muted-foreground">
-            Only function-calling models can be a brain. {brainCandidates.length === 0 && "No enabled model supports function calling yet."}
+            Runs the assistant&apos;s tool loop, so only function-calling models qualify.{" "}
+            {brainCandidates.length === 0 && "No enabled model supports function calling yet."}
           </p>
         </div>
 
         <div className="space-y-2">
           <div className="text-sm font-medium">Tools</div>
           <label className="flex items-center gap-2 text-sm">
-            <input type="checkbox" checked={runBench} onChange={(e) => setRunBench(e.target.checked)} className="h-4 w-4" />
+            <Checkbox checked={runBench} onChange={setRunBench} />
             Capacity benchmark (<code>run_benchmark</code>)
           </label>
         </div>
 
-        <div className="grid grid-cols-3 gap-3">
-          <label className="space-y-1 text-sm">
-            <span className="text-muted-foreground">Max concurrency</span>
-            <input type="number" min={1} value={maxConc} onChange={(e) => setMaxConc(Number(e.target.value))}
-              className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm" />
-          </label>
-          <label className="space-y-1 text-sm">
-            <span className="text-muted-foreground">Max duration (s)</span>
-            <input type="number" min={1} value={maxDur} onChange={(e) => setMaxDur(Number(e.target.value))}
-              className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm" />
-          </label>
-          <label className="space-y-1 text-sm">
-            <span className="text-muted-foreground">Max requests</span>
-            <input type="number" min={1} value={maxReq} onChange={(e) => setMaxReq(Number(e.target.value))}
-              className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm" />
-          </label>
+        <div className="space-y-1.5">
+          <div className="text-sm font-medium">Benchmark limits</div>
+          <p className="text-xs text-muted-foreground">
+            Ceilings for benchmarks the assistant starts, so a casual ask can&apos;t swamp the
+            fleet.
+          </p>
+          <div className="grid grid-cols-3 gap-3">
+            <div className="space-y-1">
+              <Label htmlFor="assistant_bench_max_concurrency">Max concurrency</Label>
+              <Input
+                id="assistant_bench_max_concurrency"
+                type="number"
+                min={1}
+                value={maxConc}
+                onChange={(e) => setMaxConc(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="assistant_bench_max_duration_s">Max duration (s)</Label>
+              <Input
+                id="assistant_bench_max_duration_s"
+                type="number"
+                min={1}
+                value={maxDur}
+                onChange={(e) => setMaxDur(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="assistant_bench_max_requests">Max requests</Label>
+              <Input
+                id="assistant_bench_max_requests"
+                type="number"
+                min={1}
+                value={maxReq}
+                onChange={(e) => setMaxReq(Number(e.target.value))}
+              />
+            </div>
+          </div>
         </div>
 
         <Button onClick={save} disabled={pending}>{pending ? "Saving..." : "Save assistant"}</Button>
@@ -2631,12 +2930,7 @@ export function SlurmSettingsForm({ settings }: { settings: SlurmSettingsView | 
       </CardHeader>
       <CardContent className="space-y-4">
         <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => setEnabled(e.target.checked)}
-            className="h-4 w-4 rounded border-border"
-          />
+          <Checkbox checked={enabled} onChange={setEnabled} />
           Enable Slurm provisioning
         </label>
         {!enabled && settings?.enabled && (

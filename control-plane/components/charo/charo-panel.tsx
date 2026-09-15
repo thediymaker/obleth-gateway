@@ -86,7 +86,7 @@ const PANEL_CSS = `
 // first token, so a pending response never reads as dead air.
 function TypingDots() {
   return (
-    <span className="flex h-5 items-center gap-1" role="status" aria-label="Charo is thinking">
+    <span className="flex h-5 items-center gap-1" role="status" aria-label="The assistant is thinking">
       {[0, 160, 320].map((d) => (
         <span
           key={d}
@@ -439,7 +439,7 @@ export function CharoPanel({
               }
             }}
             rows={expanded ? 3 : 2}
-            placeholder={activeTarget ? `Message ${activeTarget}…` : "Message Charo…"}
+            placeholder={activeTarget ? `Message ${activeTarget}…` : "Message the assistant…"}
             className="min-h-11 flex-1 resize-none border-0 bg-transparent px-2 py-1.5 text-sm leading-5 placeholder:text-muted-foreground/80 focus-visible:outline-none disabled:opacity-50"
           />
           <div className="flex shrink-0 items-center gap-1">
