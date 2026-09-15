@@ -123,6 +123,15 @@ export interface ModelRoute {
    * candidate pool while leaving it addressable by name.
    */
   auto_eligible: boolean;
+  /** This model's own speculation drafter. Empty = the fleet default. */
+  draft_model: string;
+  /**
+   * Direct URL of a deployment of this model that scores its drafts
+   * (prompt_logprobs). Empty = the model cannot speculate.
+   */
+  verify_api_base: string;
+  /** Name that scoring backend serves, if not this model's upstream_model. */
+  verify_upstream_model: string;
   context_window: number;
   admission_weight: number;
   max_in_flight: number | null;
@@ -903,6 +912,33 @@ export interface BoonSettingsView {
   image_generation_allowed_sizes: string[];
   image_generation_max_images_per_request: number;
   image_generation_timeout_ms: number;
+  speculation_enabled: boolean;
+  speculation_draft_model: string | null;
+  speculation_verify_model: string | null;
+  speculation_classify_model: string | null;
+  speculation_agree_min: number;
+  speculation_lp_min: number;
+  speculation_abort_agree: number;
+  speculation_abort_lp: number;
+  speculation_first_chunk_tokens: number;
+  speculation_chunk_tokens: number;
+  speculation_decide_by_tokens: number;
+  speculation_max_draft_tokens: number;
+  speculation_pace_ms: number;
+  speculation_timeout_ms: number;
+  speculation_draft_chat_template_kwargs: Record<string, unknown> | null;
+  speculation_category_gates: SpeculationCategoryGate[];
+  speculation_unlisted_categories_speculate: boolean;
+  speculation_verify_url_template: string;
+}
+
+// One per-category gate of the speculation boon. Missing thresholds fall back
+// to the global floors server-side; `speculate: false` excludes the category.
+export interface SpeculationCategoryGate {
+  tag: string;
+  speculate?: boolean;
+  agree_min?: number;
+  lp_min?: number;
 }
 
 export interface UpdateBoonSettings {
@@ -935,6 +971,26 @@ export interface UpdateBoonSettings {
   image_generation_allowed_sizes?: string[];
   image_generation_max_images_per_request?: number;
   image_generation_timeout_ms?: number;
+  speculation_enabled?: boolean;
+  speculation_draft_model?: string | null;
+  speculation_verify_model?: string | null;
+  speculation_classify_model?: string | null;
+  speculation_agree_min?: number;
+  speculation_lp_min?: number;
+  speculation_abort_agree?: number;
+  speculation_abort_lp?: number;
+  speculation_first_chunk_tokens?: number;
+  speculation_chunk_tokens?: number;
+  speculation_decide_by_tokens?: number;
+  speculation_max_draft_tokens?: number;
+  speculation_pace_ms?: number;
+  speculation_timeout_ms?: number;
+  /** An empty object clears the kwargs; omit to leave unchanged. */
+  speculation_draft_chat_template_kwargs?: Record<string, unknown>;
+  /** Replaces the whole gate list; an empty list clears it. */
+  speculation_category_gates?: SpeculationCategoryGate[];
+  speculation_unlisted_categories_speculate?: boolean;
+  speculation_verify_url_template?: string;
 }
 
 // Live status of the optional neural compression sidecar (a health probe of

@@ -426,6 +426,20 @@ pub struct ModelRoute {
     /// reads as an exclusion.
     #[serde(default = "default_auto_eligible")]
     pub auto_eligible: bool,
+    /// Which small model writes this model's speculation drafts. Empty falls
+    /// back to the fleet default in the boon settings.
+    #[serde(default)]
+    pub draft_model: String,
+    /// Direct (non-gateway) URL of a deployment of THIS model whose backend
+    /// supports `prompt_logprobs`; it scores every draft token. Empty means
+    /// this model cannot speculate.
+    #[serde(default)]
+    pub verify_api_base: String,
+    /// The model name that scoring backend serves, when it differs from this
+    /// model's own `upstream_model` (a canary serving its own name). Empty =
+    /// same as `upstream_model`.
+    #[serde(default)]
+    pub verify_upstream_model: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -575,6 +589,20 @@ pub struct ResolvedModel {
     /// before this field existed must not read as an exclusion.
     #[serde(default = "default_auto_eligible")]
     pub auto_eligible: bool,
+    /// Which small model writes this model's speculation drafts. Empty falls
+    /// back to the fleet default in the boon settings.
+    #[serde(default)]
+    pub draft_model: String,
+    /// Direct (non-gateway) URL of a deployment of THIS model whose backend
+    /// supports `prompt_logprobs`; it scores every draft token. Empty means
+    /// this model cannot speculate.
+    #[serde(default)]
+    pub verify_api_base: String,
+    /// The model name that scoring backend serves, when it differs from this
+    /// model's own `upstream_model` (a canary serving its own name). Empty =
+    /// same as `upstream_model`.
+    #[serde(default)]
+    pub verify_upstream_model: String,
     /// Upstream endpoints for this model. When empty, the data plane falls back
     /// to the legacy single `api_base`/`api_key` pair above (older cached
     /// payloads and un-migrated rows).
@@ -1130,6 +1158,9 @@ pub fn parse_tag_level(raw: &str) -> Option<(String, u8)> {
 /// retrieved from an in-process vector index.
 /// `image_generation` injects a gateway-executed `generate_image` tool so a chat
 /// model can produce images through a registered image model.
+/// `speculation` answers with a fast drafter model when the target model itself
+/// verifies the draft (one cheap prefill scores every draft token via
+/// prompt_logprobs); unverified drafts escalate to the target model.
 /// Operators opt each model into a subset of these; nothing is granted by default.
 pub const MODEL_BOONS: &[&str] = &[
     "vision",
@@ -1137,6 +1168,7 @@ pub const MODEL_BOONS: &[&str] = &[
     "compression",
     "knowledge",
     "image_generation",
+    "speculation",
 ];
 
 /// True when `boon` is part of the fixed [`MODEL_BOONS`] vocabulary.
@@ -1472,6 +1504,10 @@ pub struct BoonSettings {
     /// model.
     #[serde(default)]
     pub image_generation: ImageGenerationBoonSettings,
+    /// The speculation boon: answer with a fast drafter model when the target
+    /// model verifies the draft; escalate to the target otherwise.
+    #[serde(default)]
+    pub speculation: SpeculationBoonSettings,
 }
 
 /// Configuration for the vision boon (image-to-text relay).
@@ -1602,6 +1638,210 @@ impl ImageGenerationBoonSettings {
                 .image_model
                 .as_ref()
                 .is_some_and(|m| !m.trim().is_empty())
+    }
+}
+
+fn default_spec_agree_min() -> f64 {
+    0.5
+}
+
+fn default_spec_lp_min() -> f64 {
+    -1.0
+}
+
+fn default_spec_abort_agree() -> f64 {
+    0.45
+}
+
+fn default_spec_abort_lp() -> f64 {
+    -1.6
+}
+
+fn default_spec_first_chunk_tokens() -> u32 {
+    80
+}
+
+fn default_spec_chunk_tokens() -> u32 {
+    250
+}
+
+fn default_spec_decide_by_tokens() -> u32 {
+    450
+}
+
+fn default_spec_max_draft_tokens() -> u32 {
+    2048
+}
+
+fn default_spec_pace_ms() -> u64 {
+    9
+}
+
+fn default_spec_timeout_ms() -> u64 {
+    45_000
+}
+
+/// Configuration for the speculation boon (draft-verify cascade).
+///
+/// The drafter writes a candidate answer; the verifier — a deployment of the
+/// TARGET model family whose backend supports `prompt_logprobs` — scores every
+/// draft token in one prefill (~50x cheaper than decoding them). The gate is a
+/// pair of floors over that scoring: `agree_min` on the fraction of draft
+/// tokens the verifier would itself have picked (rank 1), `lp_min` on the mean
+/// log-probability. Streaming uses a three-zone gate: at or above the gate a
+/// chunk is released to the client; below the `abort_*` floors the draft is
+/// abandoned and the target model answers; in between the decision is deferred
+/// while the draft grows (a draft's stylistic opening scores lowest).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpeculationBoonSettings {
+    /// Master switch. When false, requests pass through unchanged.
+    #[serde(default)]
+    pub enabled: bool,
+    /// `model_name` of the registered chat model that drafts answers. Must be
+    /// several times faster than the target for the boon to pay off. `None`
+    /// disables the boon regardless of `enabled`.
+    #[serde(default)]
+    pub draft_model: Option<String>,
+    /// `model_name` of the registered model that scores drafts via
+    /// `prompt_logprobs`. Must be the target model's family (it defines
+    /// "verified") on a backend that supports prompt logprobs, registered with
+    /// a DIRECT service `api_base` — scoring also calls the backend's
+    /// `/tokenize` endpoint, which gateway-routed bases may not forward.
+    /// `None` disables the boon regardless of `enabled`.
+    #[serde(default)]
+    pub verify_model: Option<String>,
+    /// Ship floor: minimum fraction of draft tokens the verifier ranks #1.
+    #[serde(default = "default_spec_agree_min")]
+    pub agree_min: f64,
+    /// Ship floor: minimum mean log-probability over draft tokens.
+    #[serde(default = "default_spec_lp_min")]
+    pub lp_min: f64,
+    /// Abort floor (streaming): below this agreement, stop drafting and
+    /// escalate immediately instead of deferring.
+    #[serde(default = "default_spec_abort_agree")]
+    pub abort_agree: f64,
+    /// Abort floor (streaming): below this mean log-probability, stop drafting
+    /// and escalate immediately instead of deferring.
+    #[serde(default = "default_spec_abort_lp")]
+    pub abort_lp: f64,
+    /// Draft tokens accumulated before the FIRST verification. Small, so a
+    /// passing draft starts streaming early and a failing one aborts cheaply.
+    #[serde(default = "default_spec_first_chunk_tokens")]
+    pub first_chunk_tokens: u32,
+    /// Draft tokens between subsequent verifications.
+    #[serde(default = "default_spec_chunk_tokens")]
+    pub chunk_tokens: u32,
+    /// Defer patience: if nothing has been released by this many draft tokens
+    /// and the cumulative stats still sit below the gate, escalate — such
+    /// drafts almost never recover, and every deferred token is added latency
+    /// before the target model starts over.
+    #[serde(default = "default_spec_decide_by_tokens")]
+    pub decide_by_tokens: u32,
+    /// Cap on the drafter's `max_tokens` (a reasoning drafter can burn an
+    /// unbounded budget producing nothing shippable).
+    #[serde(default = "default_spec_max_draft_tokens")]
+    pub max_draft_tokens: u32,
+    /// Milliseconds between released draft deltas, so verified spans play back
+    /// as a continuous stream instead of bursts. 0 releases each span at once.
+    #[serde(default = "default_spec_pace_ms")]
+    pub pace_ms: u64,
+    /// `chat_template_kwargs` sent with DRAFT calls only (e.g.
+    /// `{"reasoning": false}` on drafters whose template can skip thinking —
+    /// measured both faster and more reliable than letting the drafter reason).
+    /// Never forwarded to the verifier or the target.
+    #[serde(default)]
+    pub draft_chat_template_kwargs: Option<serde_json::Value>,
+    /// Wall-clock budget in milliseconds for the pre-release phase (drafting +
+    /// verification before anything is sent to the client). On timeout the
+    /// request falls through to the target model unchanged.
+    #[serde(default = "default_spec_timeout_ms")]
+    pub timeout_ms: u64,
+    /// `model_name` of a registered tiny model that classifies each request
+    /// into one of the `category_gates` tags before drafting (the same
+    /// mechanism as the auto-router's brain, with this boon's own vocabulary).
+    /// `None` disables classification: the default gate applies to everything.
+    #[serde(default)]
+    pub classify_model: Option<String>,
+    /// Per-category gate overrides. Calibration shows the gate's precision is
+    /// strongly category-dependent — and that some categories should never
+    /// ship a draft at all (`speculate: false` abstains before the draft is
+    /// even requested, costing nothing).
+    #[serde(default)]
+    pub category_gates: Vec<SpeculationCategoryGate>,
+    /// What happens when the request's category has no `category_gates` entry
+    /// (including when classification is off or failed): `true` applies the
+    /// default `agree_min`/`lp_min` gate, `false` abstains (the target model
+    /// answers directly).
+    #[serde(default = "default_spec_unlisted_speculate")]
+    pub unlisted_categories_speculate: bool,
+    /// Fleet rule for locating a model's scoring endpoint when the model does
+    /// not set its own `verify_api_base`: a URL with `{upstream}` and/or
+    /// `{model}` placeholders (e.g.
+    /// `http://{upstream}.serving.svc.cluster.local:8000/v1`). Only set this
+    /// once the fleet's backends can survive `prompt_logprobs` scoring —
+    /// pointing it at unpatched pods kills them. Empty = models without their
+    /// own endpoint cannot speculate.
+    #[serde(default)]
+    pub verify_url_template: String,
+}
+
+fn default_spec_unlisted_speculate() -> bool {
+    true
+}
+
+fn default_spec_gate_speculate() -> bool {
+    true
+}
+
+/// One per-category gate for the speculation boon. Thresholds default to the
+/// global floors; `speculate: false` excludes the category entirely.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpeculationCategoryGate {
+    /// The classifier tag this gate applies to.
+    pub tag: String,
+    /// False = never draft for this category.
+    #[serde(default = "default_spec_gate_speculate")]
+    pub speculate: bool,
+    /// Ship floor override for this category.
+    #[serde(default = "default_spec_agree_min")]
+    pub agree_min: f64,
+    /// Ship floor override for this category.
+    #[serde(default = "default_spec_lp_min")]
+    pub lp_min: f64,
+}
+
+impl Default for SpeculationBoonSettings {
+    fn default() -> Self {
+        SpeculationBoonSettings {
+            enabled: false,
+            draft_model: None,
+            verify_model: None,
+            agree_min: default_spec_agree_min(),
+            lp_min: default_spec_lp_min(),
+            abort_agree: default_spec_abort_agree(),
+            abort_lp: default_spec_abort_lp(),
+            first_chunk_tokens: default_spec_first_chunk_tokens(),
+            chunk_tokens: default_spec_chunk_tokens(),
+            decide_by_tokens: default_spec_decide_by_tokens(),
+            max_draft_tokens: default_spec_max_draft_tokens(),
+            pace_ms: default_spec_pace_ms(),
+            draft_chat_template_kwargs: None,
+            timeout_ms: default_spec_timeout_ms(),
+            classify_model: None,
+            category_gates: Vec::new(),
+            unlisted_categories_speculate: default_spec_unlisted_speculate(),
+            verify_url_template: String::new(),
+        }
+    }
+}
+
+impl SpeculationBoonSettings {
+    /// True when the boon is switched on. Everything else is per target: the
+    /// drafter comes from the model's own `draft_model` (this `draft_model`
+    /// here is only the fleet default) and verification uses the model's
+    /// `verify_api_base`.
+    pub fn active(&self) -> bool {
+        self.enabled
     }
 }
 
@@ -2226,6 +2466,20 @@ pub struct ModelBackup {
     /// taken before the column existed restore without excluding anything.
     #[serde(default = "default_auto_eligible")]
     pub auto_eligible: bool,
+    /// Which small model writes this model's speculation drafts. Empty falls
+    /// back to the fleet default in the boon settings.
+    #[serde(default)]
+    pub draft_model: String,
+    /// Direct (non-gateway) URL of a deployment of THIS model whose backend
+    /// supports `prompt_logprobs`; it scores every draft token. Empty means
+    /// this model cannot speculate.
+    #[serde(default)]
+    pub verify_api_base: String,
+    /// The model name that scoring backend serves, when it differs from this
+    /// model's own `upstream_model` (a canary serving its own name). Empty =
+    /// same as `upstream_model`.
+    #[serde(default)]
+    pub verify_upstream_model: String,
     #[serde(default)]
     pub request_timeout_secs: Option<i64>,
     #[serde(default)]
@@ -2398,6 +2652,21 @@ mod tests {
         assert_eq!(settings.structured_output.max_repair_attempts, 1);
         assert_eq!(settings.structured_output.timeout_ms, 30_000);
         assert_eq!(settings.guardrails.timeout_ms, 5_000);
+        assert!(!settings.speculation.enabled);
+        assert!(!settings.speculation.active());
+        assert_eq!(settings.speculation.agree_min, 0.5);
+        assert_eq!(settings.speculation.first_chunk_tokens, 80);
+    }
+
+    #[test]
+    fn speculation_settings_active_is_just_the_switch() {
+        let mut s = SpeculationBoonSettings::default();
+        assert!(!s.active(), "disabled by default");
+        s.enabled = true;
+        assert!(
+            s.active(),
+            "drafter and verifier both resolve per target model; no global requirement"
+        );
     }
 
     #[test]
@@ -2452,15 +2721,19 @@ mod tests {
     #[test]
     fn normalize_boons_accepts_new_vocabulary() {
         // The retired `tools` boon is dropped along with any other unknown value;
-        // `compression` is part of the vocabulary and is kept.
+        // `compression` and `speculation` are part of the vocabulary and kept.
         let boons = normalize_boons([
             " structured_output ",
             "vision",
             "compression",
             "bogus",
             "tools",
+            "Speculation",
         ]);
-        assert_eq!(boons, vec!["structured_output", "vision", "compression"]);
+        assert_eq!(
+            boons,
+            vec!["structured_output", "vision", "compression", "speculation"]
+        );
     }
 
     #[test]

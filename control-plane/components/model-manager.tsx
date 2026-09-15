@@ -154,6 +154,12 @@ const MODEL_BOONS = [
     description:
       "Add a generate_image tool this model can call to produce pictures through the image model configured in Settings → Boons. The gateway runs the generation and attaches the result to the reply; the image is billed per image against the caller's tenant. Requires the Function calling capability — without it no tool is injected and the model will say it cannot draw.",
   },
+  {
+    value: "speculation",
+    label: "Speculation",
+    description:
+      "Answer with the configured fast drafter model whenever this model itself verifies the draft (one cheap prompt_logprobs prefill scores every draft token); drafts that fail verification fall through to this model unchanged. Same quality, several times faster on verified requests. Configure the drafter, verifier, gates, and per-category rules in Settings → Boons.",
+  },
 ] as const;
 
 // Model modality vocabulary; mirrors obleth-config `MODEL_TYPES`. The type
@@ -364,6 +370,7 @@ export function ModelManager({
           slurmEnabled={slurmEnabled}
           mcpServers={mcpServers}
           recipeCards={recipeCards}
+          modelNames={models.map((m) => m.model_name)}
           onCancel={closeCreateWizard}
           onSubmit={submitModel}
         />
@@ -609,6 +616,7 @@ export function ModelManager({
                               model={model}
                               summary={summary}
                               mcpServers={mcpServers}
+                              modelNames={models.map((m) => m.model_name)}
                               isManaged={managed[model.id] ?? false}
                               pending={pending}
                               onCacheToggle={() => {
@@ -705,6 +713,7 @@ function CreateModelWizard({
   slurmEnabled,
   mcpServers,
   recipeCards,
+  modelNames,
   onCancel,
   onSubmit,
 }: {
@@ -713,6 +722,7 @@ function CreateModelWizard({
   slurmEnabled: boolean;
   mcpServers: McpServer[];
   recipeCards: RecipeCard[];
+  modelNames: string[];
   onCancel: () => void;
   onSubmit: (formData: FormData) => void;
 }) {
@@ -1025,7 +1035,11 @@ function CreateModelWizard({
 
               <section className={cn("space-y-3", step !== 4 && "hidden")}>
                 {createType === "chat" ? (
-                  <ChatCapabilityFields mcpServers={mcpServers} />
+                  <ChatCapabilityFields
+                    mcpServers={mcpServers}
+                    modelNames={modelNames}
+                    selfName={modelName}
+                  />
                 ) : (
                   <div className="rounded-md border border-border/70 bg-background/35 p-4">
                     <p className="text-sm font-medium">No chat-only capability flags for this route type.</p>
@@ -1100,6 +1114,7 @@ function ModelDetailPanel({
   mcpServers = [],
   isManaged = false,
   pending,
+  modelNames = [],
   onCacheToggle,
 }: {
   model: ModelRoute;
@@ -1107,6 +1122,7 @@ function ModelDetailPanel({
   mcpServers?: McpServer[];
   isManaged?: boolean;
   pending: boolean;
+  modelNames?: string[];
   onCacheToggle: () => void;
 }) {
   // The panel only mounts for the expanded card, so per-model detail loads
@@ -1240,7 +1256,12 @@ function ModelDetailPanel({
       </TabsContent>
 
       <TabsContent value="capabilities">
-        <CapabilitiesTab model={model} editType={editType} mcpServers={mcpServers} />
+        <CapabilitiesTab
+          model={model}
+          editType={editType}
+          mcpServers={mcpServers}
+          modelNames={modelNames}
+        />
       </TabsContent>
 
       <TabsContent value="capacity">
@@ -1485,10 +1506,12 @@ function CapabilitiesTab({
   model,
   editType,
   mcpServers = [],
+  modelNames = [],
 }: {
   model: ModelRoute;
   editType: string;
   mcpServers?: McpServer[];
+  modelNames?: string[];
 }) {
   const flashSaved = useContext(SaveFlashContext);
   const [state, formAction, pending] = useActionState(
@@ -1522,7 +1545,12 @@ function CapabilitiesTab({
           <div className="grid gap-4 p-4">
             <Field label="Context window" name="context_window" type="number" defaultValue={String(model.context_window)} />
             {editType === "chat" && (
-              <ChatCapabilityFields model={model} mcpServers={mcpServers} />
+              <ChatCapabilityFields
+                model={model}
+                mcpServers={mcpServers}
+                modelNames={modelNames}
+                selfName={model.model_name}
+              />
             )}
           </div>
           {state?.ok === false && (
@@ -2498,7 +2526,17 @@ function TagLevelPicker({ tag, level, onChange }: { tag: string; level: number; 
 // search). Rather than letting that misconfiguration through, the Tools group
 // is disabled until both capabilities are on, and any existing grants are
 // cleared the moment either is turned off.
-export function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute; mcpServers: McpServer[] }) {
+export function ChatCapabilityFields({
+  model,
+  mcpServers,
+  modelNames = [],
+  selfName = "",
+}: {
+  model?: ModelRoute;
+  mcpServers: McpServer[];
+  modelNames?: string[];
+  selfName?: string;
+}) {
   const [fnCalling, setFnCalling] = useState(model?.supports_function_calling ?? false);
   const [toolChoice, setToolChoice] = useState(model?.supports_tool_choice ?? false);
   const [granted, setGranted] = useState<Set<string>>(() => new Set(model?.tool_servers ?? []));
@@ -2507,6 +2545,13 @@ export function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute
   // like the native-capability chips, since nothing else in this component
   // reacts to them.
   const [knowledgeChecked, setKnowledgeChecked] = useState(model?.boons?.includes("knowledge") ?? false);
+  // Speculation is the other boon with follow-up fields: the model's own
+  // drafter and its scoring endpoint live right here, on the model.
+  const [speculationChecked, setSpeculationChecked] = useState(
+    model?.boons?.includes("speculation") ?? false,
+  );
+  const [draftModel, setDraftModel] = useState(model?.draft_model ?? "");
+  const [specWiringOpen, setSpecWiringOpen] = useState(false);
   const [tagState, setTagState] = useState<Record<string, { checked: boolean; level: number }>>(() => {
     const state: Record<string, { checked: boolean; level: number }> = {};
     for (const tag of MODEL_TAGS) {
@@ -2568,6 +2613,15 @@ export function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute
               checked={knowledgeChecked}
               onChange={setKnowledgeChecked}
             />
+          ) : boon.value === "speculation" ? (
+            <ChipCheckbox
+              key={boon.value}
+              name={`boon_${boon.value}`}
+              label={boon.label}
+              hint={boon.description}
+              checked={speculationChecked}
+              onChange={setSpeculationChecked}
+            />
           ) : (
             <ChipCheckbox
               key={boon.value}
@@ -2579,6 +2633,73 @@ export function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute
           ),
         )}
       </ChipGroup>
+      {speculationChecked && (
+        <div className="space-y-3 rounded-md border border-border/60 bg-muted/20 p-3">
+          <div>
+            <p className="text-xs font-medium">Speculation &mdash; this model&apos;s own cascade</p>
+            <p className="mt-0.5 max-w-prose text-[11px] leading-snug text-muted-foreground">
+              A fast drafter writes the answer and a scoring deployment of{" "}
+              <span className="font-medium text-foreground">this model</span> verifies every token
+              before anything reaches the client. Unverified drafts fall through to the model
+              itself.
+            </p>
+          </div>
+          <div className="max-w-sm space-y-1">
+            <p className="text-[11px] font-medium text-muted-foreground">Drafter</p>
+            <input type="hidden" name="draft_model" value={draftModel} />
+            <Select
+              aria-label="Drafter"
+              value={draftModel}
+              onValueChange={setDraftModel}
+              searchPlaceholder="Filter models"
+              options={[
+                { value: "", label: "Fleet default (Settings → Boons)" },
+                ...modelNames
+                  .filter((n) => n !== selfName)
+                  .map((n) => ({ value: n, label: n })),
+              ]}
+            />
+            <p className="text-[11px] leading-snug text-muted-foreground">
+              A small model 5-10x faster than this one. Verification is automatic: this
+              model&apos;s own backend scores every draft.
+            </p>
+          </div>
+          <div>
+            <button
+              type="button"
+              onClick={() => setSpecWiringOpen((value) => !value)}
+              aria-expanded={specWiringOpen}
+              className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <ChevronDown
+                className={cn(
+                  "h-3 w-3 transition-transform duration-200",
+                  specWiringOpen && "rotate-180",
+                )}
+              />
+              Advanced wiring — scoring endpoint override
+            </button>
+            {/* The fields must stay in the form even when collapsed so a save
+                never silently clears a configured override. */}
+            <div className={cn("mt-2 grid gap-3 sm:grid-cols-2", !specWiringOpen && "hidden")}>
+              <Field
+                label="Scoring endpoint URL"
+                name="verify_api_base"
+                defaultValue={model?.verify_api_base ?? ""}
+                placeholder="fleet rule (Settings → Boons)"
+                hint="Override only when this model's drafts must be scored somewhere other than the fleet rule's address — a direct URL whose backend supports prompt_logprobs."
+              />
+              <Field
+                label="Scoring endpoint serves (optional)"
+                name="verify_upstream_model"
+                defaultValue={model?.verify_upstream_model ?? ""}
+                placeholder="same as upstream model"
+                hint="Only if the scoring backend serves a different name than this model's upstream."
+              />
+            </div>
+          </div>
+        </div>
+      )}
       {knowledgeChecked &&
         (model ? (
           <ModelKnowledgeCollectionsField modelId={model.id} />

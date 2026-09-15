@@ -10,6 +10,8 @@ import {
   Database,
   Eye,
   Image as ImageIcon,
+  Plus,
+  Rabbit,
   RefreshCw,
   Save,
   Send,
@@ -34,6 +36,7 @@ import {
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { Checkbox } from "@/components/ui/checkbox";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
@@ -51,6 +54,7 @@ import type {
   NodeAlias,
   SlurmHealthView,
   SlurmSettingsView,
+  SpeculationCategoryGate,
   UpdateAlertSettings,
   UpdateAutoRouterSettings,
   UpdateBoonSettings,
@@ -182,12 +186,7 @@ export function AlertSettingsForm({ settings }: { settings: AlertSettingsView | 
           </div>
           {slackSet && (
             <label className="flex items-center gap-2 text-sm text-muted-foreground">
-              <input
-                type="checkbox"
-                checked={clearSlack}
-                onChange={(e) => setClearSlack(e.target.checked)}
-                className="h-4 w-4 rounded border-border"
-              />
+              <Checkbox checked={clearSlack} onChange={setClearSlack} />
               Remove the configured Slack webhook
             </label>
           )}
@@ -201,12 +200,7 @@ export function AlertSettingsForm({ settings }: { settings: AlertSettingsView | 
         </CardHeader>
         <CardContent className="space-y-4">
           <label className="flex items-center gap-2 text-sm">
-            <input
-              type="checkbox"
-              checked={emailEnabled}
-              onChange={(e) => setEmailEnabled(e.target.checked)}
-              className="h-4 w-4 rounded border-border"
-            />
+            <Checkbox checked={emailEnabled} onChange={setEmailEnabled} />
             Enable email alerts
           </label>
           {emailEnabled && (
@@ -253,11 +247,10 @@ export function AlertSettingsForm({ settings }: { settings: AlertSettingsView | 
                 />
                 {passwordSet && (
                   <label className="flex items-center gap-2 pt-1 text-xs text-muted-foreground">
-                    <input
-                      type="checkbox"
+                    <Checkbox
                       checked={clearPassword}
-                      onChange={(e) => setClearPassword(e.target.checked)}
-                      className="h-3.5 w-3.5 rounded border-border"
+                      onChange={setClearPassword}
+                      className="h-3.5 w-3.5"
                     />
                     Remove the stored password
                   </label>
@@ -284,12 +277,7 @@ export function AlertSettingsForm({ settings }: { settings: AlertSettingsView | 
               </div>
               <div className="md:col-span-2">
                 <label className="flex items-center gap-2 text-sm">
-                  <input
-                    type="checkbox"
-                    checked={starttls}
-                    onChange={(e) => setStarttls(e.target.checked)}
-                    className="h-4 w-4 rounded border-border"
-                  />
+                  <Checkbox checked={starttls} onChange={setStarttls} />
                   Use STARTTLS (recommended; uncheck only for plaintext relays)
                 </label>
               </div>
@@ -414,6 +402,89 @@ function ScoringSlider({
   );
 }
 
+// Auto-router policy profiles: one click sets every scoring weight and tiering
+// choice below. "Custom" is what the form reports once any advanced value no
+// longer matches a preset.
+type RouterProfileValues = {
+  capacity_weight: number;
+  cost_weight: number;
+  tag_weight: number;
+  temperature: number;
+  soft_cap: number;
+  difficulty: boolean;
+  tier_source: "hybrid" | "derived" | "declared";
+};
+
+const ROUTER_PROFILES: (SettingsProfile & { values: RouterProfileValues })[] = [
+  {
+    key: "balanced",
+    label: "Balanced",
+    recommended: true,
+    card: "Weigh spare capacity and price about evenly; topic match breaks ties.",
+    blurb:
+      "The server defaults: spare capacity matters most, price second, topic match as a strong tiebreaker. Deterministic — the top scorer always wins.",
+    values: {
+      capacity_weight: 0.6,
+      cost_weight: 0.4,
+      tag_weight: 0.5,
+      temperature: 0,
+      soft_cap: 8,
+      difficulty: false,
+      tier_source: "hybrid",
+    },
+  },
+  {
+    key: "best_answer",
+    label: "Best answer",
+    card: "Follow the topic match and send harder requests to stronger models. Price barely counts.",
+    blurb:
+      "Topic match dominates scoring and difficulty tiering is on, so harder requests land on stronger models regardless of price. Use when answer quality is worth paying for.",
+    values: {
+      capacity_weight: 0.4,
+      cost_weight: 0.05,
+      tag_weight: 0.9,
+      temperature: 0,
+      soft_cap: 8,
+      difficulty: true,
+      tier_source: "hybrid",
+    },
+  },
+  {
+    key: "cost_saver",
+    label: "Cost saver",
+    card: "Prefer the cheapest capable model; capacity steers around busy ones.",
+    blurb:
+      "Price dominates scoring, spare capacity still steers around overloaded models, and topic match only breaks ties. Use when the fleet is billing-sensitive.",
+    values: {
+      capacity_weight: 0.5,
+      cost_weight: 0.9,
+      tag_weight: 0.4,
+      temperature: 0,
+      soft_cap: 8,
+      difficulty: false,
+      tier_source: "hybrid",
+    },
+  },
+];
+
+function routerProfileFromSettings(s: AutoRouterSettingsView | null): string {
+  for (const p of ROUTER_PROFILES) {
+    const v = p.values;
+    if (
+      (s?.capacity_weight ?? 0.6) === v.capacity_weight &&
+      (s?.cost_weight ?? 0.4) === v.cost_weight &&
+      (s?.tag_weight ?? 0.5) === v.tag_weight &&
+      (s?.temperature ?? 0) === v.temperature &&
+      (s?.default_soft_cap ?? 8) === v.soft_cap &&
+      (s?.difficulty_enabled ?? false) === v.difficulty &&
+      (s?.tier_source ?? "hybrid") === v.tier_source
+    ) {
+      return p.key;
+    }
+  }
+  return "custom";
+}
+
 export function AutoRouterSettingsForm({
   settings,
   models,
@@ -437,6 +508,34 @@ export function AutoRouterSettingsForm({
   const [tierSource, setTierSource] = useState<"hybrid" | "derived" | "declared">(
     settings?.tier_source ?? "hybrid",
   );
+  const [profile, setProfile] = useState<string>(() => routerProfileFromSettings(settings));
+  const [advanced, setAdvanced] = useState(false);
+
+  function applyProfile(key: string) {
+    setProfile(key);
+    const preset = ROUTER_PROFILES.find((p) => p.key === key);
+    if (!preset) {
+      // "Custom" keeps the current values and just opens the advanced editor.
+      setAdvanced(true);
+      return;
+    }
+    const v = preset.values;
+    setCapacityWeight(v.capacity_weight);
+    setCostWeight(v.cost_weight);
+    setTagWeight(v.tag_weight);
+    setTemperature(v.temperature);
+    setSoftCap(String(v.soft_cap));
+    setDifficultyEnabled(v.difficulty);
+    setTierSource(v.tier_source);
+  }
+
+  // Any hand edit to a scoring value means the presets no longer describe it.
+  function custom<T>(set: (value: T) => void): (value: T) => void {
+    return (value) => {
+      setProfile("custom");
+      set(value);
+    };
+  }
 
   function save() {
     setStatus(null);
@@ -473,15 +572,12 @@ export function AutoRouterSettingsForm({
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-4">
-        <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => setEnabled(e.target.checked)}
-            className="h-4 w-4"
-          />
-          Enable intent classifier
-        </label>
+        <ToggleRow
+          label="Use an intent classifier"
+          hint="A tiny model tags each auto request by topic so routing can match models to what the request is actually about. Off = heuristics, then capacity and cost."
+          checked={enabled}
+          onChange={() => setEnabled((value) => !value)}
+        />
         <div className="grid gap-4 sm:grid-cols-2">
           <div className="space-y-1">
             <Label htmlFor="classifier_model">Classifier model</Label>
@@ -497,6 +593,9 @@ export function AutoRouterSettingsForm({
                   .map((m) => ({ value: m.model_name, label: m.model_name })),
               ]}
             />
+            <p className="text-[11px] text-muted-foreground">
+              A tiny non-thinking model; anything slower delays every auto request.
+            </p>
           </div>
           <div className="space-y-1">
             <Label htmlFor="classifier_timeout_ms">Timeout (ms)</Label>
@@ -506,17 +605,30 @@ export function AutoRouterSettingsForm({
               value={timeout}
               onChange={(e) => setTimeoutMs(e.target.value)}
             />
+            <p className="text-[11px] text-muted-foreground">
+              On timeout the request routes without tags rather than failing.
+            </p>
           </div>
         </div>
 
-        <div className="space-y-4 border-t border-border/60 pt-4">
-          <div>
-            <div className="text-sm font-medium">Scoring</div>
-            <p className="mt-0.5 text-xs text-muted-foreground">
-              Weights used to rank candidates for an <code>auto</code> request. Changes apply
-              within 15 seconds, no restart required.
-            </p>
-          </div>
+        <ProfilePicker
+          label="Routing profile"
+          profiles={ROUTER_PROFILES}
+          active={profile}
+          onSelect={applyProfile}
+          customCard="Hand-tuned scoring weights or tiering — edit them under Advanced."
+          customBlurb="The values under Advanced no longer match a preset. Picking a profile above overwrites them."
+        />
+
+        <AdvancedDisclosure
+          label="Advanced — scoring weights, spread, difficulty tiering"
+          open={advanced}
+          onToggle={() => setAdvanced((value) => !value)}
+        >
+          <p className="text-xs text-muted-foreground">
+            Weights used to rank candidates for an <code>auto</code> request. Changes apply within
+            15 seconds, no restart required.
+          </p>
 
           <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
             <ScoringSlider
@@ -524,7 +636,7 @@ export function AutoRouterSettingsForm({
               label="Capacity"
               hint="How much idle capacity matters when choosing between models."
               value={capacityWeight}
-              onChange={setCapacityWeight}
+              onChange={custom(setCapacityWeight)}
               min={0}
               max={1}
               step={0.05}
@@ -534,7 +646,7 @@ export function AutoRouterSettingsForm({
               label="Cost"
               hint="How much price matters when choosing between models."
               value={costWeight}
-              onChange={setCostWeight}
+              onChange={custom(setCostWeight)}
               min={0}
               max={1}
               step={0.05}
@@ -544,7 +656,7 @@ export function AutoRouterSettingsForm({
               label="Tag"
               hint="How much a topic match matters, relative to capacity and cost."
               value={tagWeight}
-              onChange={setTagWeight}
+              onChange={custom(setTagWeight)}
               min={0}
               max={1}
               step={0.05}
@@ -557,7 +669,7 @@ export function AutoRouterSettingsForm({
               label="Temperature"
               hint="0 always picks the top-scoring model. Higher values spread traffic across close scorers."
               value={temperature}
-              onChange={setTemperature}
+              onChange={custom(setTemperature)}
               min={0}
               max={2}
               step={0.1}
@@ -570,7 +682,7 @@ export function AutoRouterSettingsForm({
                 type="number"
                 min={1}
                 value={softCap}
-                onChange={(e) => setSoftCap(e.target.value)}
+                onChange={(e) => custom(setSoftCap)(e.target.value)}
               />
               <p className="text-xs text-muted-foreground">
                 Assumed concurrency ceiling for models with no explicit max in-flight limit.
@@ -578,28 +690,24 @@ export function AutoRouterSettingsForm({
             </div>
           </div>
 
-          <div className="space-y-1.5">
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={difficultyEnabled}
-                onChange={(e) => setDifficultyEnabled(e.target.checked)}
-                className="h-4 w-4"
-              />
-              Difficulty tiering
-            </label>
-            <p className="text-xs text-muted-foreground">
-              Route harder requests to stronger models. Strength is ranked by price within each
-              topic unless a model declares its own level.
-            </p>
-          </div>
+          <ToggleRow
+            label="Difficulty tiering"
+            hint="Route harder requests to stronger models. Strength is ranked by price within each topic unless a model declares its own level."
+            checked={difficultyEnabled}
+            onChange={() => {
+              setProfile("custom");
+              setDifficultyEnabled((value) => !value);
+            }}
+          />
 
           <div className="max-w-xs space-y-1">
             <Label htmlFor="tier_source">Tier source</Label>
             <Select
               id="tier_source"
               value={tierSource}
-              onValueChange={(value) => setTierSource(value as "hybrid" | "derived" | "declared")}
+              onValueChange={(value) =>
+                custom(setTierSource)(value as "hybrid" | "derived" | "declared")
+              }
               options={[
                 { value: "hybrid", label: "Hybrid" },
                 { value: "derived", label: "Derived from cost" },
@@ -607,7 +715,7 @@ export function AutoRouterSettingsForm({
               ]}
             />
           </div>
-        </div>
+        </AdvancedDisclosure>
 
         <Button onClick={save} disabled={pending}>
           {pending ? "Saving..." : "Save auto routing"}
@@ -628,7 +736,7 @@ export function AutoRouterSettingsForm({
   );
 }
 
-type BoonSectionKey = "vision" | "structured" | "tool_loop" | "image_generation";
+type BoonSectionKey = "vision" | "structured" | "tool_loop" | "image_generation" | "speculation";
 
 function ToggleSwitch({
   checked,
@@ -778,6 +886,264 @@ function ToggleRow({
   );
 }
 
+// ---------------------------------------------------------------------------
+// Shared settings scaffolding: a named-preset chooser plus a collapsed
+// "Advanced" disclosure. Each preset sets every policy value in its section at
+// once; any hand edit under Advanced flips the selection to "custom".
+
+type SettingsProfile = {
+  key: string;
+  label: string;
+  card: string;
+  blurb: string;
+  recommended?: boolean;
+};
+
+function ProfileCard({
+  active,
+  onClick,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      aria-pressed={active}
+      className={cn(
+        "rounded-lg border p-3 text-left transition-colors",
+        active
+          ? "border-primary/50 bg-primary/10 ring-1 ring-primary/20"
+          : "border-border/70 bg-background/40 hover:border-border hover:bg-muted/20",
+      )}
+    >
+      {children}
+    </button>
+  );
+}
+
+function ProfilePicker({
+  label = "Policy profile",
+  profiles,
+  active,
+  onSelect,
+  customCard,
+  customBlurb,
+}: {
+  label?: string;
+  profiles: SettingsProfile[];
+  active: string;
+  onSelect: (key: string) => void;
+  customCard: string;
+  customBlurb: string;
+}) {
+  const activePreset = profiles.find((p) => p.key === active);
+  return (
+    <div className="space-y-2">
+      <Label>{label}</Label>
+      <div
+        className={cn(
+          "grid gap-2",
+          profiles.length >= 3 ? "sm:grid-cols-2 lg:grid-cols-4" : "sm:grid-cols-3",
+        )}
+      >
+        {profiles.map((p) => (
+          <ProfileCard key={p.key} active={active === p.key} onClick={() => onSelect(p.key)}>
+            <span className="flex items-center gap-2 text-sm font-medium">
+              {p.label}
+              {p.recommended && (
+                <Badge className="border-primary/40 bg-primary/10 text-[10px] text-primary">
+                  recommended
+                </Badge>
+              )}
+            </span>
+            <span className="mt-1 block text-[11px] leading-snug text-muted-foreground">
+              {p.card}
+            </span>
+          </ProfileCard>
+        ))}
+        <ProfileCard active={!activePreset} onClick={() => onSelect("custom")}>
+          <span className="block text-sm font-medium">Custom</span>
+          <span className="mt-1 block text-[11px] leading-snug text-muted-foreground">
+            {customCard}
+          </span>
+        </ProfileCard>
+      </div>
+      <p className="text-[11px] leading-snug text-muted-foreground">
+        {activePreset ? activePreset.blurb : customBlurb}
+      </p>
+    </div>
+  );
+}
+
+function AdvancedDisclosure({
+  label,
+  open,
+  onToggle,
+  children,
+}: {
+  label: string;
+  open: boolean;
+  onToggle: () => void;
+  children: ReactNode;
+}) {
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={open}
+        className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <ChevronDown
+          className={cn("h-3.5 w-3.5 transition-transform duration-200", open && "rotate-180")}
+        />
+        {label}
+      </button>
+      {open && (
+        <div className="mt-3 space-y-4 rounded-lg border border-border/60 bg-background/25 p-4">
+          {children}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Speculation policy profiles: one click sets every threshold, cadence value,
+// and category gate below. "Custom" is not a preset — it is what the panel
+// reports once any advanced value no longer matches a preset.
+type SpecProfileKey = "calibrated" | "cautious" | "custom";
+
+type SpecProfileValues = {
+  agree_min: number;
+  lp_min: number;
+  abort_agree: number;
+  abort_lp: number;
+  first_chunk_tokens: number;
+  chunk_tokens: number;
+  decide_by_tokens: number;
+  max_draft_tokens: number;
+  pace_ms: number;
+  timeout_ms: number;
+  unlisted: boolean;
+  gates: SpeculationCategoryGate[];
+};
+
+const SPEC_PROFILES: (SettingsProfile & {
+  key: Exclude<SpecProfileKey, "custom">;
+  values: SpecProfileValues;
+})[] = [
+  {
+    key: "calibrated",
+    label: "Calibrated",
+    recommended: true,
+    card: "Per-category gates from the judged-prompt calibration. Best coverage at high precision.",
+    blurb:
+      "Drafts are attempted only in the categories where verification measured reliably precise (coding, math, summaries, prose), each with its own tuned floor; categories that never verify well go straight to the target before any draft cost. Requires a classify model.",
+    values: {
+      agree_min: 0.5,
+      lp_min: -1.0,
+      abort_agree: 0.45,
+      abort_lp: -1.6,
+      first_chunk_tokens: 80,
+      chunk_tokens: 250,
+      decide_by_tokens: 450,
+      max_draft_tokens: 2048,
+      pace_ms: 9,
+      timeout_ms: 45000,
+      unlisted: false,
+      gates: [
+        { tag: "infrastructure", speculate: false },
+        { tag: "planning", speculate: false },
+        { tag: "database", speculate: false },
+        { tag: "regex", speculate: false },
+        { tag: "explanation", speculate: false },
+        { tag: "debugging", speculate: false },
+        { tag: "coding", speculate: true, agree_min: 0.4, lp_min: -0.8 },
+        { tag: "math", speculate: true, agree_min: 0.4, lp_min: -0.9 },
+        { tag: "summarization", speculate: true, agree_min: 0.4, lp_min: -1.0 },
+        { tag: "writing", speculate: true, agree_min: 0.4, lp_min: -1.9 },
+      ],
+    },
+  },
+  {
+    key: "cautious",
+    label: "Cautious",
+    card: "One strict global gate, no category routing. Works without a classify model.",
+    blurb:
+      "Every request is drafted and held to the same strict floor (the server defaults). Fewer requests end up shipping from the drafter, but this needs no classifier and no calibration data — a reasonable starting point on a fleet you have not measured yet.",
+    values: {
+      agree_min: 0.5,
+      lp_min: -1.0,
+      abort_agree: 0.45,
+      abort_lp: -1.6,
+      first_chunk_tokens: 80,
+      chunk_tokens: 250,
+      decide_by_tokens: 450,
+      max_draft_tokens: 2048,
+      pace_ms: 9,
+      timeout_ms: 45000,
+      unlisted: true,
+      gates: [],
+    },
+  },
+];
+
+// The server stores gate thresholds with concrete defaults (0.5 / -1.0), so a
+// preset row that omits them still round-trips equal.
+function specGatesEqual(a: SpeculationCategoryGate[], b: SpeculationCategoryGate[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((g, i) => {
+    const h = b[i];
+    return (
+      g.tag === h.tag &&
+      (g.speculate ?? true) === (h.speculate ?? true) &&
+      (g.agree_min ?? 0.5) === (h.agree_min ?? 0.5) &&
+      (g.lp_min ?? -1.0) === (h.lp_min ?? -1.0)
+    );
+  });
+}
+
+function specProfileFromSettings(s: BoonSettingsView | null): SpecProfileKey {
+  for (const p of SPEC_PROFILES) {
+    const v = p.values;
+    if (
+      (s?.speculation_agree_min ?? 0.5) === v.agree_min &&
+      (s?.speculation_lp_min ?? -1.0) === v.lp_min &&
+      (s?.speculation_abort_agree ?? 0.45) === v.abort_agree &&
+      (s?.speculation_abort_lp ?? -1.6) === v.abort_lp &&
+      (s?.speculation_first_chunk_tokens ?? 80) === v.first_chunk_tokens &&
+      (s?.speculation_chunk_tokens ?? 250) === v.chunk_tokens &&
+      (s?.speculation_decide_by_tokens ?? 450) === v.decide_by_tokens &&
+      (s?.speculation_max_draft_tokens ?? 2048) === v.max_draft_tokens &&
+      (s?.speculation_pace_ms ?? 9) === v.pace_ms &&
+      (s?.speculation_timeout_ms ?? 45000) === v.timeout_ms &&
+      (s?.speculation_unlisted_categories_speculate ?? true) === v.unlisted &&
+      specGatesEqual(s?.speculation_category_gates ?? [], v.gates)
+    ) {
+      return p.key;
+    }
+  }
+  return "custom";
+}
+
+function SpecStep({ n, title, text }: { n: number; title: string; text: string }) {
+  return (
+    <li className="rounded-lg border border-border/60 bg-background/35 p-3">
+      <p className="flex items-center gap-2 text-sm font-medium">
+        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/15 text-[11px] font-semibold text-primary">
+          {n}
+        </span>
+        {title}
+      </p>
+      <p className="mt-1.5 text-[11px] leading-snug text-muted-foreground">{text}</p>
+    </li>
+  );
+}
+
 export function BoonsSettingsForm({
   settings,
   models,
@@ -824,7 +1190,84 @@ export function BoonsSettingsForm({
   const [imageToolDescription, setImageToolDescription] = useState(
     settings?.image_generation_tool_description ?? "",
   );
+  const [specEnabled, setSpecEnabled] = useState(settings?.speculation_enabled ?? false);
+  const [specDraftModel, setSpecDraftModel] = useState(settings?.speculation_draft_model ?? "");
+  const [specClassifyModel, setSpecClassifyModel] = useState(
+    settings?.speculation_classify_model ?? "",
+  );
+  const [specAgreeMin, setSpecAgreeMin] = useState(String(settings?.speculation_agree_min ?? 0.5));
+  const [specLpMin, setSpecLpMin] = useState(String(settings?.speculation_lp_min ?? -1.0));
+  const [specAbortAgree, setSpecAbortAgree] = useState(
+    String(settings?.speculation_abort_agree ?? 0.45),
+  );
+  const [specAbortLp, setSpecAbortLp] = useState(String(settings?.speculation_abort_lp ?? -1.6));
+  const [specFirstChunk, setSpecFirstChunk] = useState(
+    String(settings?.speculation_first_chunk_tokens ?? 80),
+  );
+  const [specChunk, setSpecChunk] = useState(String(settings?.speculation_chunk_tokens ?? 250));
+  const [specDecideBy, setSpecDecideBy] = useState(
+    String(settings?.speculation_decide_by_tokens ?? 450),
+  );
+  const [specMaxDraft, setSpecMaxDraft] = useState(
+    String(settings?.speculation_max_draft_tokens ?? 2048),
+  );
+  const [specPaceMs, setSpecPaceMs] = useState(String(settings?.speculation_pace_ms ?? 9));
+  const [specTimeout, setSpecTimeout] = useState(String(settings?.speculation_timeout_ms ?? 45000));
+  const [specKwargs, setSpecKwargs] = useState(
+    settings?.speculation_draft_chat_template_kwargs
+      ? JSON.stringify(settings.speculation_draft_chat_template_kwargs)
+      : "",
+  );
+  const [specUrlTemplate, setSpecUrlTemplate] = useState(
+    settings?.speculation_verify_url_template ?? "",
+  );
+  const [specUnlisted, setSpecUnlisted] = useState(
+    settings?.speculation_unlisted_categories_speculate ?? true,
+  );
+  const [specGates, setSpecGates] = useState<SpeculationCategoryGate[]>(
+    settings?.speculation_category_gates ?? [],
+  );
+  const [specProfile, setSpecProfile] = useState<SpecProfileKey>(() =>
+    specProfileFromSettings(settings),
+  );
+  const [specAdvanced, setSpecAdvanced] = useState(false);
   const [expanded, setExpanded] = useState<BoonSectionKey | null>(null);
+
+  function updateSpecGate(index: number, patch: Partial<SpeculationCategoryGate>) {
+    setSpecProfile("custom");
+    setSpecGates((gates) => gates.map((g, i) => (i === index ? { ...g, ...patch } : g)));
+  }
+
+  function applySpecProfile(key: SpecProfileKey) {
+    setSpecProfile(key);
+    const preset = SPEC_PROFILES.find((p) => p.key === key);
+    if (!preset) {
+      // "Custom" keeps the current values and just opens the advanced editor.
+      setSpecAdvanced(true);
+      return;
+    }
+    const v = preset.values;
+    setSpecAgreeMin(String(v.agree_min));
+    setSpecLpMin(String(v.lp_min));
+    setSpecAbortAgree(String(v.abort_agree));
+    setSpecAbortLp(String(v.abort_lp));
+    setSpecFirstChunk(String(v.first_chunk_tokens));
+    setSpecChunk(String(v.chunk_tokens));
+    setSpecDecideBy(String(v.decide_by_tokens));
+    setSpecMaxDraft(String(v.max_draft_tokens));
+    setSpecPaceMs(String(v.pace_ms));
+    setSpecTimeout(String(v.timeout_ms));
+    setSpecUnlisted(v.unlisted);
+    setSpecGates(v.gates.map((g) => ({ ...g })));
+  }
+
+  // Any hand edit to a policy value means the presets no longer describe it.
+  function specCustom(set: (value: string) => void): (value: string) => void {
+    return (value) => {
+      setSpecProfile("custom");
+      set(value);
+    };
+  }
 
   const visionModels = models.filter(
     (m) => m.model_name !== "auto" && (m.supports_vision || tagsInclude(m.tags, "vision")),
@@ -842,6 +1285,29 @@ export function BoonsSettingsForm({
 
   function save() {
     setStatus(null);
+    // Draft kwargs is free-form JSON; refuse to save silently-broken input.
+    let specKwargsParsed: Record<string, unknown> | undefined;
+    const kwargsText = specKwargs.trim();
+    if (kwargsText === "") {
+      specKwargsParsed = {}; // empty object clears server-side
+    } else {
+      try {
+        const parsed: unknown = JSON.parse(kwargsText);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          throw new Error("must be a JSON object");
+        }
+        specKwargsParsed = parsed as Record<string, unknown>;
+      } catch (e) {
+        setStatus({
+          ok: false,
+          message: `Draft chat_template_kwargs is not a JSON object: ${e instanceof Error ? e.message : String(e)}`,
+        });
+        return;
+      }
+    }
+    const specGatesClean = specGates
+      .map((g) => ({ ...g, tag: g.tag.trim() }))
+      .filter((g) => g.tag.length > 0);
     const body: UpdateBoonSettings = {
       vision_enabled: enabled,
       vision_fallback_model: model.trim() ? model.trim() : "",
@@ -865,6 +1331,26 @@ export function BoonsSettingsForm({
         .filter(Boolean),
       image_generation_max_images_per_request: Math.min(Number(imageMaxCount) || 2, 4),
       image_generation_timeout_ms: Number(imageTimeout) || 120000,
+      speculation_enabled: specEnabled,
+      speculation_draft_model: specDraftModel.trim() ? specDraftModel.trim() : "",
+      // Deprecated: verification resolves per target from the model's own
+      // scoring endpoint; the global override is retired.
+      speculation_verify_model: "",
+      speculation_classify_model: specClassifyModel.trim() ? specClassifyModel.trim() : "",
+      speculation_agree_min: Number(specAgreeMin) || 0.5,
+      speculation_lp_min: Number(specLpMin) || -1.0,
+      speculation_abort_agree: Number(specAbortAgree) || 0.45,
+      speculation_abort_lp: Number(specAbortLp) || -1.6,
+      speculation_first_chunk_tokens: Number(specFirstChunk) || 80,
+      speculation_chunk_tokens: Number(specChunk) || 250,
+      speculation_decide_by_tokens: Number(specDecideBy) || 450,
+      speculation_max_draft_tokens: Number(specMaxDraft) || 2048,
+      speculation_pace_ms: Math.max(Number(specPaceMs) || 0, 0),
+      speculation_timeout_ms: Number(specTimeout) || 45000,
+      speculation_draft_chat_template_kwargs: specKwargsParsed,
+      speculation_category_gates: specGatesClean,
+      speculation_unlisted_categories_speculate: specUnlisted,
+      speculation_verify_url_template: specUrlTemplate.trim(),
     };
     start(async () => {
       const result = await setBoonSettingsAction(body);
@@ -1220,6 +1706,357 @@ export function BoonsSettingsForm({
             </div>
           </BoonPanel>
 
+          <BoonPanel
+            title="Speculation"
+            description="Answers with a fast drafter whenever the target model itself verifies the draft; unverified drafts fall through to the target."
+            icon={Rabbit}
+            enabled={specEnabled}
+            expanded={expanded === "speculation"}
+            onToggle={() => toggleSection("speculation")}
+            summary={
+              <>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {specDraftModel || "no drafter"}
+                </Badge>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {specProfile === "custom"
+                    ? "custom policy"
+                    : `${SPEC_PROFILES.find((p) => p.key === specProfile)?.label ?? specProfile} profile`}
+                </Badge>
+              </>
+            }
+          >
+            <div className="space-y-4">
+              <ToggleRow
+                label="Enable speculation boon"
+                hint="Applies to opted-in models. Nothing reaches the client before it is verified, so a failed draft only costs latency, never quality."
+                checked={specEnabled}
+                onChange={() => setSpecEnabled((value) => !value)}
+              />
+              <ol className="grid gap-2 sm:grid-cols-3">
+                <SpecStep
+                  n={1}
+                  title="Classify"
+                  text="A tiny model tags the request. Categories where drafting never pays off skip straight to the target — before any draft cost."
+                />
+                <SpecStep
+                  n={2}
+                  title="Draft"
+                  text="The drafter writes the whole answer at its own, much faster, speed."
+                />
+                <SpecStep
+                  n={3}
+                  title="Verify, then release"
+                  text="The target model scores every draft token in one cheap pass. Only verified text reaches the client; anything else falls through to the target seamlessly."
+                />
+              </ol>
+              <p className="text-[11px] text-muted-foreground">
+                Each model configures its own cascade on the Models page: tick Speculation there,
+                pick its drafter, and set its scoring endpoint. This panel holds only the fleet
+                defaults and thresholds.
+              </p>
+              <div className="grid gap-4 sm:grid-cols-2">
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_draft_model">Default drafter — writes the answer</Label>
+                  <Select
+                    id="speculation_draft_model"
+                    value={specDraftModel}
+                    onValueChange={setSpecDraftModel}
+                    searchPlaceholder="Filter models"
+                    options={[
+                      { value: "", label: "None" },
+                      ...chatModels.map((m) => ({ value: m.model_name, label: m.model_name })),
+                    ]}
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    Fleet default; a model can pick its own drafter on the Models page. Needs a
+                    5-10x speed gap over the target to pay off.
+                  </p>
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_classify_model">Classifier — triage only</Label>
+                  <Select
+                    id="speculation_classify_model"
+                    value={specClassifyModel}
+                    onValueChange={setSpecClassifyModel}
+                    searchPlaceholder="Filter models"
+                    options={[
+                      { value: "", label: "None (one gate for everything)" },
+                      ...chatModels.map((m) => ({ value: m.model_name, label: m.model_name })),
+                    ]}
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    A tiny non-thinking model that tags each request. Needed by the Calibrated
+                    profile; with None every request uses the same gate.
+                  </p>
+                </div>
+              </div>
+              <ProfilePicker
+                profiles={SPEC_PROFILES}
+                active={specProfile}
+                onSelect={(key) => applySpecProfile(key as SpecProfileKey)}
+                customCard="Hand-tuned floors, cadence, or category gates — edit them under Advanced."
+                customBlurb="The values under Advanced no longer match a preset. Picking a profile above overwrites them."
+              />
+              <AdvancedDisclosure
+                label="Advanced — scoring endpoint rule, decision floors, verify cadence, category gates"
+                open={specAdvanced}
+                onToggle={() => setSpecAdvanced((value) => !value)}
+              >
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_verify_url_template">Scoring endpoint rule</Label>
+                  <Input
+                    id="speculation_verify_url_template"
+                    value={specUrlTemplate}
+                    onChange={(e) => setSpecUrlTemplate(e.target.value)}
+                    placeholder="http://{upstream}.serving.svc.cluster.local:8000/v1"
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    How the gateway finds a speculating model&apos;s scoring endpoint when the
+                    model doesn&apos;t set its own: <code>{"{upstream}"}</code> and{" "}
+                    <code>{"{model}"}</code> expand per model. Set this only once the fleet&apos;s
+                    backends survive <code>prompt_logprobs</code> scoring — pointing it at
+                    unpatched pods kills them. Blank = models without their own endpoint
+                    don&apos;t speculate.
+                  </p>
+                </div>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_agree_min">Ship floor: agreement (0-1)</Label>
+                  <Input
+                    id="speculation_agree_min"
+                    type="number"
+                    step="0.05"
+                    min={0}
+                    max={1}
+                    value={specAgreeMin}
+                    onChange={(e) => specCustom(setSpecAgreeMin)(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_lp_min">Ship floor: mean logprob</Label>
+                  <Input
+                    id="speculation_lp_min"
+                    type="number"
+                    step="0.1"
+                    max={0}
+                    value={specLpMin}
+                    onChange={(e) => specCustom(setSpecLpMin)(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_abort_agree">Abort floor: agreement</Label>
+                  <Input
+                    id="speculation_abort_agree"
+                    type="number"
+                    step="0.05"
+                    min={0}
+                    max={1}
+                    value={specAbortAgree}
+                    onChange={(e) => specCustom(setSpecAbortAgree)(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_abort_lp">Abort floor: mean logprob</Label>
+                  <Input
+                    id="speculation_abort_lp"
+                    type="number"
+                    step="0.1"
+                    max={0}
+                    value={specAbortLp}
+                    onChange={(e) => specCustom(setSpecAbortLp)(e.target.value)}
+                  />
+                </div>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                Between the abort floors and the ship floors the decision is deferred while the
+                draft grows — a draft&apos;s opening is its lowest-scoring region.
+              </p>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_first_chunk_tokens">First verify at (tokens)</Label>
+                  <Input
+                    id="speculation_first_chunk_tokens"
+                    type="number"
+                    value={specFirstChunk}
+                    onChange={(e) => specCustom(setSpecFirstChunk)(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_chunk_tokens">Then every (tokens)</Label>
+                  <Input
+                    id="speculation_chunk_tokens"
+                    type="number"
+                    value={specChunk}
+                    onChange={(e) => specCustom(setSpecChunk)(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_decide_by_tokens">Defer patience (tokens)</Label>
+                  <Input
+                    id="speculation_decide_by_tokens"
+                    type="number"
+                    value={specDecideBy}
+                    onChange={(e) => specCustom(setSpecDecideBy)(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_max_draft_tokens">Draft token cap</Label>
+                  <Input
+                    id="speculation_max_draft_tokens"
+                    type="number"
+                    value={specMaxDraft}
+                    onChange={(e) => specCustom(setSpecMaxDraft)(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_pace_ms">Release pacing (ms/token)</Label>
+                  <Input
+                    id="speculation_pace_ms"
+                    type="number"
+                    min={0}
+                    value={specPaceMs}
+                    onChange={(e) => specCustom(setSpecPaceMs)(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_timeout_ms">Pre-release budget (ms)</Label>
+                  <Input
+                    id="speculation_timeout_ms"
+                    type="number"
+                    value={specTimeout}
+                    onChange={(e) => specCustom(setSpecTimeout)(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="speculation_draft_chat_template_kwargs">
+                  Draft chat_template_kwargs (JSON)
+                </Label>
+                <Input
+                  id="speculation_draft_chat_template_kwargs"
+                  value={specKwargs}
+                  onChange={(e) => setSpecKwargs(e.target.value)}
+                  placeholder='{"reasoning": false}'
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  Sent with draft calls only (e.g. to turn a drafter&apos;s thinking off — measured
+                  faster and more reliable). Blank clears it.
+                </p>
+              </div>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label>Category gates</Label>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      setSpecProfile("custom");
+                      setSpecGates((gates) => [
+                        ...gates,
+                        { tag: "", speculate: true, agree_min: 0.5, lp_min: -1.0 },
+                      ]);
+                    }}
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    Add category
+                  </Button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  The classify model maps each request onto these tags; the first matching row
+                  wins, so list excluded categories first. &quot;Speculate&quot; off = the target
+                  answers directly, before any draft cost.
+                </p>
+                {specGates.length === 0 && (
+                  <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-sm text-muted-foreground">
+                    No category gates: the global ship floors above apply to every request.
+                  </p>
+                )}
+                {specGates.map((gate, i) => (
+                  <div
+                    key={i}
+                    className="grid items-end gap-2 rounded-md border border-border/60 bg-muted/20 p-2 sm:grid-cols-[1fr_auto_auto_auto_auto]"
+                  >
+                    <div className="space-y-1">
+                      <Label htmlFor={`spec_gate_tag_${i}`} className="text-[11px]">
+                        Tag
+                      </Label>
+                      <Input
+                        id={`spec_gate_tag_${i}`}
+                        value={gate.tag}
+                        onChange={(e) => updateSpecGate(i, { tag: e.target.value })}
+                        placeholder="coding"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-[11px]">Speculate</Label>
+                      <div className="flex h-9 items-center">
+                        <Checkbox
+                          checked={gate.speculate ?? true}
+                          onChange={(checked) => updateSpecGate(i, { speculate: checked })}
+                          aria-label={`Speculate for ${gate.tag || "this category"}`}
+                        />
+                      </div>
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor={`spec_gate_agree_${i}`} className="text-[11px]">
+                        Agreement ≥
+                      </Label>
+                      <Input
+                        id={`spec_gate_agree_${i}`}
+                        type="number"
+                        step="0.05"
+                        min={0}
+                        max={1}
+                        className="w-24"
+                        disabled={!(gate.speculate ?? true)}
+                        value={String(gate.agree_min ?? 0.5)}
+                        onChange={(e) => updateSpecGate(i, { agree_min: Number(e.target.value) })}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor={`spec_gate_lp_${i}`} className="text-[11px]">
+                        Logprob ≥
+                      </Label>
+                      <Input
+                        id={`spec_gate_lp_${i}`}
+                        type="number"
+                        step="0.1"
+                        max={0}
+                        className="w-24"
+                        disabled={!(gate.speculate ?? true)}
+                        value={String(gate.lp_min ?? -1.0)}
+                        onChange={(e) => updateSpecGate(i, { lp_min: Number(e.target.value) })}
+                      />
+                    </div>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setSpecProfile("custom");
+                        setSpecGates((gates) => gates.filter((_, j) => j !== i));
+                      }}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                ))}
+                <ToggleRow
+                  label="Unlisted categories use the global gate"
+                  hint="Off = requests whose category has no row above never speculate (the target answers directly)."
+                  checked={specUnlisted}
+                  onChange={() => {
+                    setSpecProfile("custom");
+                    setSpecUnlisted((value) => !value);
+                  }}
+                />
+              </div>
+              </AdvancedDisclosure>
+            </div>
+          </BoonPanel>
+
         </div>
 
         <div className="flex flex-wrap items-center gap-3 border-t border-border/60 pt-4">
@@ -1525,6 +2362,60 @@ export function KnowledgeSettingsForm({ settings }: { settings: KnowledgeSetting
   return <KnowledgeSettingsFormBody settings={settings} />;
 }
 
+// Knowledge retrieval profiles: one click sets the four values that decide
+// what gets injected (chunk count, score floor, token budget, query turns).
+// Ingestion and operational limits are not part of a profile — they live
+// under Advanced and never flip the selection to "custom".
+type KnowledgeProfileValues = {
+  top_k: number;
+  min_score: number;
+  max_context_tokens: number;
+  query_turns: number;
+};
+
+const KNOWLEDGE_PROFILES: (SettingsProfile & { values: KnowledgeProfileValues })[] = [
+  {
+    key: "standard",
+    label: "Standard",
+    recommended: true,
+    card: "A handful of solid hits within a modest token budget.",
+    blurb:
+      "The server defaults: 5 chunks per query, matches scoring under 0.35 dropped, at most 1,500 injected tokens, query built from the last 2 turns. A good fit for most collections.",
+    values: { top_k: 5, min_score: 0.35, max_context_tokens: 1500, query_turns: 2 },
+  },
+  {
+    key: "precise",
+    label: "Precise",
+    card: "Fewer, higher-confidence hits — clean answers over recall.",
+    blurb:
+      "3 chunks, only strong matches (score ≥ 0.5), an 800-token budget, query from the last turn only. Prefer when wrong context is worse than no context.",
+    values: { top_k: 3, min_score: 0.5, max_context_tokens: 800, query_turns: 1 },
+  },
+  {
+    key: "broad",
+    label: "Broad",
+    card: "Cast a wide net — more chunks, looser floor, bigger budget.",
+    blurb:
+      "10 chunks with a 0.25 score floor, up to 4,000 injected tokens, query from the last 4 turns. Prefer for exploratory questions over large collections.",
+    values: { top_k: 10, min_score: 0.25, max_context_tokens: 4000, query_turns: 4 },
+  },
+];
+
+function knowledgeProfileFromSettings(s: KnowledgeSettingsView): string {
+  for (const p of KNOWLEDGE_PROFILES) {
+    const v = p.values;
+    if (
+      s.top_k === v.top_k &&
+      s.min_score === v.min_score &&
+      s.max_context_tokens === v.max_context_tokens &&
+      s.query_turns === v.query_turns
+    ) {
+      return p.key;
+    }
+  }
+  return "custom";
+}
+
 // Split from `KnowledgeSettingsForm` above so its `useState` initializers only
 // ever run against a real, freshly-loaded `KnowledgeSettingsView` -- this
 // component only mounts once the parent has confirmed `settings` is non-null,
@@ -1552,6 +2443,32 @@ function KnowledgeSettingsFormBody({ settings }: { settings: KnowledgeSettingsVi
     String(settings.index_stale_after_secs),
   );
   const [debugSnapshot, setDebugSnapshot] = useState(settings.debug_snapshot);
+  const [profile, setProfile] = useState<string>(() => knowledgeProfileFromSettings(settings));
+  const [advanced, setAdvanced] = useState(false);
+
+  function applyProfile(key: string) {
+    setProfile(key);
+    const preset = KNOWLEDGE_PROFILES.find((p) => p.key === key);
+    if (!preset) {
+      // "Custom" keeps the current values and just opens the advanced editor.
+      setAdvanced(true);
+      return;
+    }
+    const v = preset.values;
+    setTopK(String(v.top_k));
+    setMinScore(String(v.min_score));
+    setMaxContextTokens(String(v.max_context_tokens));
+    setQueryTurns(String(v.query_turns));
+  }
+
+  // Any hand edit to a retrieval-policy value means the presets no longer
+  // describe it; ingestion/operational fields deliberately don't do this.
+  function custom(set: (value: string) => void): (value: string) => void {
+    return (value) => {
+      setProfile("custom");
+      set(value);
+    };
+  }
 
   function save() {
     setStatus(null);
@@ -1605,145 +2522,170 @@ function KnowledgeSettingsFormBody({ settings }: { settings: KnowledgeSettingsVi
           onChange={() => setEnabled((value) => !value)}
         />
 
-        <p className="text-xs text-muted-foreground">
-          Every field below must be a positive number — the server silently keeps the previous value
-          for zero or negative input rather than treating it as &quot;off&quot;.
-        </p>
+        <ProfilePicker
+          label="Retrieval profile"
+          profiles={KNOWLEDGE_PROFILES}
+          active={profile}
+          onSelect={applyProfile}
+          customCard="Hand-tuned retrieval values — edit them under Advanced."
+          customBlurb="The retrieval values under Advanced no longer match a preset. Picking a profile above overwrites them."
+        />
 
-        <div className="grid gap-4 sm:grid-cols-2">
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_top_k">Top K</Label>
-            <Input
-              id="knowledge_top_k"
-              type="number"
-              min="1"
-              value={topK}
-              onChange={(e) => setTopK(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Chunks retrieved per query before scoring.</p>
+        <AdvancedDisclosure
+          label="Advanced — retrieval values, ingestion & operational limits"
+          open={advanced}
+          onToggle={() => setAdvanced((value) => !value)}
+        >
+          <p className="text-xs text-muted-foreground">
+            Every field must be a positive number — the server silently keeps the previous value
+            for zero or negative input rather than treating it as &quot;off&quot;.
+          </p>
+
+          <div className="text-sm font-medium">Retrieval</div>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_top_k">Top K</Label>
+              <Input
+                id="knowledge_top_k"
+                type="number"
+                min="1"
+                value={topK}
+                onChange={(e) => custom(setTopK)(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Chunks retrieved per query before scoring.</p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_min_score">Minimum score</Label>
+              <Input
+                id="knowledge_min_score"
+                type="number"
+                step="0.01"
+                min="0.01"
+                max="1"
+                value={minScore}
+                onChange={(e) => custom(setMinScore)(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Hits scoring below this are dropped before injection.</p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_max_context_tokens">Max context tokens</Label>
+              <Input
+                id="knowledge_max_context_tokens"
+                type="number"
+                min="1"
+                value={maxContextTokens}
+                onChange={(e) => custom(setMaxContextTokens)(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Token budget for injected retrieval per request.</p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_query_turns">Query turns</Label>
+              <Input
+                id="knowledge_query_turns"
+                type="number"
+                min="1"
+                value={queryTurns}
+                onChange={(e) => custom(setQueryTurns)(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Trailing conversation turns folded into the retrieval query.</p>
+            </div>
           </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_min_score">Minimum score</Label>
-            <Input
-              id="knowledge_min_score"
-              type="number"
-              step="0.01"
-              min="0.01"
-              max="1"
-              value={minScore}
-              onChange={(e) => setMinScore(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Hits scoring below this are dropped before injection.</p>
+
+          <div className="border-t border-border/60 pt-3 text-sm font-medium">
+            Ingestion &amp; operations
           </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_max_context_tokens">Max context tokens</Label>
-            <Input
-              id="knowledge_max_context_tokens"
-              type="number"
-              min="1"
-              value={maxContextTokens}
-              onChange={(e) => setMaxContextTokens(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Token budget for injected retrieval per request.</p>
+          <p className="-mt-2 text-xs text-muted-foreground">
+            Plumbing limits, not retrieval policy — changing these never leaves the profile above.
+          </p>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_embed_timeout_ms">Embed timeout (ms)</Label>
+              <Input
+                id="knowledge_embed_timeout_ms"
+                type="number"
+                min="1"
+                value={embedTimeoutMs}
+                onChange={(e) => setEmbedTimeoutMs(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                Query-embedding call budget. On timeout the request proceeds ungrounded rather than
+                failing.
+              </p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_query_cache_ttl_s">Query cache TTL (secs)</Label>
+              <Input
+                id="knowledge_query_cache_ttl_s"
+                type="number"
+                min="1"
+                value={queryCacheTtlS}
+                onChange={(e) => setQueryCacheTtlS(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                How long a query&apos;s embedding vector is cached, keyed per embedder.
+              </p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_max_upload_bytes">Max upload size</Label>
+              <Input
+                id="knowledge_max_upload_bytes"
+                type="number"
+                min="1"
+                value={maxUploadBytes}
+                onChange={(e) => setMaxUploadBytes(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                {formatBytes(Number(maxUploadBytes) || 0)} per document upload.
+              </p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_max_chunks_per_collection">Max chunks per collection</Label>
+              <Input
+                id="knowledge_max_chunks_per_collection"
+                type="number"
+                min="1"
+                value={maxChunksPerCollection}
+                onChange={(e) => setMaxChunksPerCollection(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Indexing stops adding chunks once a collection reaches this cap.</p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_index_batch_size">Index batch size</Label>
+              <Input
+                id="knowledge_index_batch_size"
+                type="number"
+                min="1"
+                value={indexBatchSize}
+                onChange={(e) => setIndexBatchSize(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Chunks embedded per indexer batch.</p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_index_timeout_ms">Index timeout (ms)</Label>
+              <Input
+                id="knowledge_index_timeout_ms"
+                type="number"
+                min="1"
+                value={indexTimeoutMs}
+                onChange={(e) => setIndexTimeoutMs(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">Per-batch embedding call budget during background indexing.</p>
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="knowledge_index_stale_after_secs">Stale after (secs)</Label>
+              <Input
+                id="knowledge_index_stale_after_secs"
+                type="number"
+                min="1"
+                value={indexStaleAfterSecs}
+                onChange={(e) => setIndexStaleAfterSecs(e.target.value)}
+              />
+              <p className="text-xs text-muted-foreground">
+                A document stuck indexing past this age is treated as failed and eligible for retry.
+              </p>
+            </div>
           </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_embed_timeout_ms">Embed timeout (ms)</Label>
-            <Input
-              id="knowledge_embed_timeout_ms"
-              type="number"
-              min="1"
-              value={embedTimeoutMs}
-              onChange={(e) => setEmbedTimeoutMs(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              Query-embedding call budget. On timeout the request proceeds ungrounded rather than
-              failing.
-            </p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_query_cache_ttl_s">Query cache TTL (secs)</Label>
-            <Input
-              id="knowledge_query_cache_ttl_s"
-              type="number"
-              min="1"
-              value={queryCacheTtlS}
-              onChange={(e) => setQueryCacheTtlS(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              How long a query&apos;s embedding vector is cached, keyed per embedder.
-            </p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_query_turns">Query turns</Label>
-            <Input
-              id="knowledge_query_turns"
-              type="number"
-              min="1"
-              value={queryTurns}
-              onChange={(e) => setQueryTurns(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Trailing conversation turns folded into the retrieval query.</p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_max_upload_bytes">Max upload size</Label>
-            <Input
-              id="knowledge_max_upload_bytes"
-              type="number"
-              min="1"
-              value={maxUploadBytes}
-              onChange={(e) => setMaxUploadBytes(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              {formatBytes(Number(maxUploadBytes) || 0)} per document upload.
-            </p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_max_chunks_per_collection">Max chunks per collection</Label>
-            <Input
-              id="knowledge_max_chunks_per_collection"
-              type="number"
-              min="1"
-              value={maxChunksPerCollection}
-              onChange={(e) => setMaxChunksPerCollection(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Indexing stops adding chunks once a collection reaches this cap.</p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_index_batch_size">Index batch size</Label>
-            <Input
-              id="knowledge_index_batch_size"
-              type="number"
-              min="1"
-              value={indexBatchSize}
-              onChange={(e) => setIndexBatchSize(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Chunks embedded per indexer batch.</p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_index_timeout_ms">Index timeout (ms)</Label>
-            <Input
-              id="knowledge_index_timeout_ms"
-              type="number"
-              min="1"
-              value={indexTimeoutMs}
-              onChange={(e) => setIndexTimeoutMs(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">Per-batch embedding call budget during background indexing.</p>
-          </div>
-          <div className="space-y-1">
-            <Label htmlFor="knowledge_index_stale_after_secs">Stale after (secs)</Label>
-            <Input
-              id="knowledge_index_stale_after_secs"
-              type="number"
-              min="1"
-              value={indexStaleAfterSecs}
-              onChange={(e) => setIndexStaleAfterSecs(e.target.value)}
-            />
-            <p className="text-xs text-muted-foreground">
-              A document stuck indexing past this age is treated as failed and eligible for retry.
-            </p>
-          </div>
-        </div>
+        </AdvancedDisclosure>
 
         <div className="flex items-start justify-between gap-4 rounded-lg border border-amber-500/40 bg-amber-500/10 px-4 py-3">
           <div className="min-w-0">
@@ -1819,61 +2761,86 @@ export function CharoSettingsForm({
   return (
     <Card>
       <CardHeader>
-        <CardTitle>Charo assistant</CardTitle>
+        <CardTitle>Playground assistant</CardTitle>
         <CardDescription>
-          Charo is the guided assistant in Playground. Give it a brain model to let it run
-          tools (like the capacity benchmark) and answer with live results. Without a brain
-          model it stays a plain model-tester: the persona rides the model under test and no
-          tools are offered. Every token is billed to the reserved internal tenant.
+          The dashboard&apos;s built-in assistant, available in Playground. Give it an agent
+          model to let it run tools (like the capacity benchmark) and answer with live results.
+          Without one it acts as a plain model tester: no tools, and its persona rides the model
+          under test. Every token is billed to the reserved internal tenant.
         </CardDescription>
       </CardHeader>
       <CardContent className="space-y-5">
-        <label className="flex items-center gap-2 text-sm">
-          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} className="h-4 w-4" />
-          Enable Playground in the dashboard
-        </label>
+        <ToggleRow
+          label="Enable Playground in the dashboard"
+          hint="Off hides the Playground page and the assistant launcher entirely."
+          checked={enabled}
+          onChange={() => setEnabled((value) => !value)}
+        />
 
         <div className="space-y-1.5">
-          <label className="text-sm font-medium">Brain model</label>
+          <label className="text-sm font-medium">Agent model</label>
           <Select
-            aria-label="Brain model"
+            aria-label="Agent model"
             value={brain}
             onValueChange={setBrain}
             searchPlaceholder="Filter models"
             options={[
-              { value: "", label: "None (legacy tester mode)" },
+              { value: "", label: "None (plain model tester)" },
               ...brainCandidates.map((m) => ({ value: m.model_name, label: m.model_name })),
             ]}
           />
           <p className="text-xs text-muted-foreground">
-            Only function-calling models can be a brain. {brainCandidates.length === 0 && "No enabled model supports function calling yet."}
+            Runs the assistant&apos;s tool loop, so only function-calling models qualify.{" "}
+            {brainCandidates.length === 0 && "No enabled model supports function calling yet."}
           </p>
         </div>
 
         <div className="space-y-2">
           <div className="text-sm font-medium">Tools</div>
           <label className="flex items-center gap-2 text-sm">
-            <input type="checkbox" checked={runBench} onChange={(e) => setRunBench(e.target.checked)} className="h-4 w-4" />
+            <Checkbox checked={runBench} onChange={setRunBench} />
             Capacity benchmark (<code>run_benchmark</code>)
           </label>
         </div>
 
-        <div className="grid grid-cols-3 gap-3">
-          <label className="space-y-1 text-sm">
-            <span className="text-muted-foreground">Max concurrency</span>
-            <input type="number" min={1} value={maxConc} onChange={(e) => setMaxConc(Number(e.target.value))}
-              className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm" />
-          </label>
-          <label className="space-y-1 text-sm">
-            <span className="text-muted-foreground">Max duration (s)</span>
-            <input type="number" min={1} value={maxDur} onChange={(e) => setMaxDur(Number(e.target.value))}
-              className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm" />
-          </label>
-          <label className="space-y-1 text-sm">
-            <span className="text-muted-foreground">Max requests</span>
-            <input type="number" min={1} value={maxReq} onChange={(e) => setMaxReq(Number(e.target.value))}
-              className="h-9 w-full rounded-md border border-border bg-background px-3 text-sm" />
-          </label>
+        <div className="space-y-1.5">
+          <div className="text-sm font-medium">Benchmark limits</div>
+          <p className="text-xs text-muted-foreground">
+            Ceilings for benchmarks the assistant starts, so a casual ask can&apos;t swamp the
+            fleet.
+          </p>
+          <div className="grid grid-cols-3 gap-3">
+            <div className="space-y-1">
+              <Label htmlFor="assistant_bench_max_concurrency">Max concurrency</Label>
+              <Input
+                id="assistant_bench_max_concurrency"
+                type="number"
+                min={1}
+                value={maxConc}
+                onChange={(e) => setMaxConc(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="assistant_bench_max_duration_s">Max duration (s)</Label>
+              <Input
+                id="assistant_bench_max_duration_s"
+                type="number"
+                min={1}
+                value={maxDur}
+                onChange={(e) => setMaxDur(Number(e.target.value))}
+              />
+            </div>
+            <div className="space-y-1">
+              <Label htmlFor="assistant_bench_max_requests">Max requests</Label>
+              <Input
+                id="assistant_bench_max_requests"
+                type="number"
+                min={1}
+                value={maxReq}
+                onChange={(e) => setMaxReq(Number(e.target.value))}
+              />
+            </div>
+          </div>
         </div>
 
         <Button onClick={save} disabled={pending}>{pending ? "Saving..." : "Save assistant"}</Button>
@@ -1966,12 +2933,7 @@ export function SlurmSettingsForm({ settings }: { settings: SlurmSettingsView | 
       </CardHeader>
       <CardContent className="space-y-4">
         <label className="flex items-center gap-2 text-sm">
-          <input
-            type="checkbox"
-            checked={enabled}
-            onChange={(e) => setEnabled(e.target.checked)}
-            className="h-4 w-4 rounded border-border"
-          />
+          <Checkbox checked={enabled} onChange={setEnabled} />
           Enable Slurm provisioning
         </label>
         {!enabled && settings?.enabled && (

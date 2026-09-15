@@ -163,6 +163,17 @@ pub struct ManifestModel {
     pub route_bias: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_eligible: Option<bool>,
+    /// This model's own drafter for speculation; empty clears it (fleet
+    /// default applies). Absent leaves the stored value alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft_model: Option<String>,
+    /// Direct scoring URL for this model's drafts; empty clears it (the model
+    /// stops speculating). Absent leaves the stored value alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_api_base: Option<String>,
+    /// Name the scoring backend serves when it differs from `upstream_model`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_upstream_model: Option<String>,
     /// This model's endpoints, matched by `name` within the model. Absent
     /// leaves the model's endpoints alone entirely; endpoints present on the
     /// gateway but missing from the list are never deleted.
@@ -266,6 +277,9 @@ pub struct ModelConfig {
     pub energy_slots_per_node: i64,
     pub route_bias: f64,
     pub auto_eligible: bool,
+    pub draft_model: String,
+    pub verify_api_base: String,
+    pub verify_upstream_model: String,
 }
 
 impl Default for ModelConfig {
@@ -307,6 +321,9 @@ impl Default for ModelConfig {
             energy_slots_per_node: 0,
             route_bias: 1.0,
             auto_eligible: true,
+            draft_model: String::new(),
+            verify_api_base: String::new(),
+            verify_upstream_model: String::new(),
         }
     }
 }
@@ -347,6 +364,9 @@ impl From<&ModelRoute> for ModelConfig {
             energy_slots_per_node: m.energy_slots_per_node,
             route_bias: m.route_bias,
             auto_eligible: m.auto_eligible,
+            draft_model: m.draft_model.clone(),
+            verify_api_base: m.verify_api_base.clone(),
+            verify_upstream_model: m.verify_upstream_model.clone(),
         }
     }
 }
@@ -456,6 +476,15 @@ impl ModelConfig {
         );
         note(self.route_bias != other.route_bias, "route_bias");
         note(self.auto_eligible != other.auto_eligible, "auto_eligible");
+        note(self.draft_model != other.draft_model, "draft_model");
+        note(
+            self.verify_api_base != other.verify_api_base,
+            "verify_api_base",
+        );
+        note(
+            self.verify_upstream_model != other.verify_upstream_model,
+            "verify_upstream_model",
+        );
         out
     }
 }
@@ -657,6 +686,15 @@ pub fn resolve_model(
     }
     if let Some(v) = entry.auto_eligible {
         next.auto_eligible = v;
+    }
+    if let Some(v) = &entry.draft_model {
+        next.draft_model = v.trim().to_string();
+    }
+    if let Some(v) = &entry.verify_api_base {
+        next.verify_api_base = v.trim().to_string();
+    }
+    if let Some(v) = &entry.verify_upstream_model {
+        next.verify_upstream_model = v.trim().to_string();
     }
 
     if let Some(raw) = &entry.tags {
@@ -902,6 +940,9 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
         energy_slots_per_node: Some(m.energy_slots_per_node),
         route_bias: Some(m.route_bias),
         auto_eligible: Some(m.auto_eligible),
+        draft_model: Some(m.draft_model.clone()),
+        verify_api_base: Some(m.verify_api_base.clone()),
+        verify_upstream_model: Some(m.verify_upstream_model.clone()),
         endpoints: None,
     }
 }
@@ -949,6 +990,9 @@ mod tests {
             energy_slots_per_node: 8,
             route_bias: 1.0,
             auto_eligible: true,
+            draft_model: String::new(),
+            verify_api_base: String::new(),
+            verify_upstream_model: String::new(),
             created_at: now,
             updated_at: now,
         }
