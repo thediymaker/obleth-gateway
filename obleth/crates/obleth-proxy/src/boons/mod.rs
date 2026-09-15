@@ -181,14 +181,20 @@ fn speculation_eligible(
     settings: &obleth_config::BoonSettings,
     key: &obleth_config::ResolvedKey,
 ) -> bool {
-    !key.internal
-        && settings.speculation.active()
-        && route.boons.iter().any(|b| b == "speculation")
-        && settings
-            .speculation
-            .draft_model
-            .as_deref()
-            .is_some_and(|d| d != route.model_name)
+    if key.internal
+        || !settings.speculation.active()
+        || !route.boons.iter().any(|b| b == "speculation")
+    {
+        return false;
+    }
+    // Both helpers resolve per target: its own drafter (fleet default as
+    // fallback) and its own scoring endpoint. Missing either means the model
+    // cannot speculate, decided here before anything is armed.
+    if route.verify_api_base.trim().is_empty() {
+        return false;
+    }
+    let drafter = speculation::effective_draft_model(route, &settings.speculation);
+    !drafter.is_empty() && drafter != route.model_name
 }
 
 /// Per-request boon control header (comma-separated tokens), also echoed on
@@ -1048,7 +1054,9 @@ mod tests {
             energy_slots_per_node: 0,
             route_bias: 1.0,
             auto_eligible: true,
-            verifier_for: String::new(),
+            draft_model: String::new(),
+            verify_api_base: String::new(),
+            verify_upstream_model: String::new(),
             endpoints: vec![],
         }
     }
@@ -1091,7 +1099,7 @@ mod tests {
     }
 
     #[test]
-    fn speculation_eligible_requires_grant_active_external_key_and_distinct_drafter() {
+    fn speculation_eligible_requires_grant_scoring_endpoint_and_distinct_drafter() {
         let mut route = test_route();
         let mut key = test_key_with_policy(None);
         let mut settings = obleth_config::BoonSettings::default();
@@ -1102,12 +1110,16 @@ mod tests {
         );
         settings.speculation.enabled = true;
         settings.speculation.draft_model = Some("drafter".into());
-        settings.speculation.verify_model = Some("verifier".into());
         assert!(
             !speculation_eligible(&route, &settings, &key),
             "boon not granted on the model"
         );
         route.boons = vec!["speculation".into()];
+        assert!(
+            !speculation_eligible(&route, &settings, &key),
+            "the target has no scoring endpoint, so it cannot speculate"
+        );
+        route.verify_api_base = "http://scorer.test:8000/v1".into();
         assert!(speculation_eligible(&route, &settings, &key));
 
         key.internal = true;
@@ -1117,10 +1129,20 @@ mod tests {
         );
         key.internal = false;
 
-        settings.speculation.draft_model = Some(route.model_name.clone());
+        // The model's own drafter beats the fleet default...
+        route.draft_model = "special-drafter".into();
+        assert!(speculation_eligible(&route, &settings, &key));
+        // ...including when that choice is the (invalid) self-draft.
+        route.draft_model = route.model_name.clone();
         assert!(
             !speculation_eligible(&route, &settings, &key),
             "a model must not draft for itself"
+        );
+        route.draft_model = String::new();
+        settings.speculation.draft_model = Some(route.model_name.clone());
+        assert!(
+            !speculation_eligible(&route, &settings, &key),
+            "the fleet-default drafter must not be the target either"
         );
     }
 

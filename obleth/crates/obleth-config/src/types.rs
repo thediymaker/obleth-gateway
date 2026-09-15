@@ -426,13 +426,20 @@ pub struct ModelRoute {
     /// reads as an exclusion.
     #[serde(default = "default_auto_eligible")]
     pub auto_eligible: bool,
-    /// Name of the model this deployment can score speculation drafts for.
-    /// A scoring deployment is registered with a direct (non-gateway) URL whose
-    /// backend supports `prompt_logprobs`; a model may name itself. Empty means
-    /// it cannot score drafts. The speculation boon resolves each target's
-    /// verifier from this field when no explicit override is configured.
+    /// Which small model writes this model's speculation drafts. Empty falls
+    /// back to the fleet default in the boon settings.
     #[serde(default)]
-    pub verifier_for: String,
+    pub draft_model: String,
+    /// Direct (non-gateway) URL of a deployment of THIS model whose backend
+    /// supports `prompt_logprobs`; it scores every draft token. Empty means
+    /// this model cannot speculate.
+    #[serde(default)]
+    pub verify_api_base: String,
+    /// The model name that scoring backend serves, when it differs from this
+    /// model's own `upstream_model` (a canary serving its own name). Empty =
+    /// same as `upstream_model`.
+    #[serde(default)]
+    pub verify_upstream_model: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
@@ -582,13 +589,20 @@ pub struct ResolvedModel {
     /// before this field existed must not read as an exclusion.
     #[serde(default = "default_auto_eligible")]
     pub auto_eligible: bool,
-    /// Name of the model this deployment can score speculation drafts for.
-    /// A scoring deployment is registered with a direct (non-gateway) URL whose
-    /// backend supports `prompt_logprobs`; a model may name itself. Empty means
-    /// it cannot score drafts. The speculation boon resolves each target's
-    /// verifier from this field when no explicit override is configured.
+    /// Which small model writes this model's speculation drafts. Empty falls
+    /// back to the fleet default in the boon settings.
     #[serde(default)]
-    pub verifier_for: String,
+    pub draft_model: String,
+    /// Direct (non-gateway) URL of a deployment of THIS model whose backend
+    /// supports `prompt_logprobs`; it scores every draft token. Empty means
+    /// this model cannot speculate.
+    #[serde(default)]
+    pub verify_api_base: String,
+    /// The model name that scoring backend serves, when it differs from this
+    /// model's own `upstream_model` (a canary serving its own name). Empty =
+    /// same as `upstream_model`.
+    #[serde(default)]
+    pub verify_upstream_model: String,
     /// Upstream endpoints for this model. When empty, the data plane falls back
     /// to the legacy single `api_base`/`api_key` pair above (older cached
     /// payloads and un-migrated rows).
@@ -1812,16 +1826,12 @@ impl Default for SpeculationBoonSettings {
 }
 
 impl SpeculationBoonSettings {
-    /// True when the boon is enabled and a drafter is configured. No global
-    /// verifier is required: it resolves per target from each model's
-    /// `verifier_for` declaration, with `verify_model` kept only as an
-    /// explicit global override.
+    /// True when the boon is switched on. Everything else is per target: the
+    /// drafter comes from the model's own `draft_model` (this `draft_model`
+    /// here is only the fleet default) and verification uses the model's
+    /// `verify_api_base`.
     pub fn active(&self) -> bool {
         self.enabled
-            && self
-                .draft_model
-                .as_ref()
-                .is_some_and(|m| !m.trim().is_empty())
     }
 }
 
@@ -2446,13 +2456,20 @@ pub struct ModelBackup {
     /// taken before the column existed restore without excluding anything.
     #[serde(default = "default_auto_eligible")]
     pub auto_eligible: bool,
-    /// Name of the model this deployment can score speculation drafts for.
-    /// A scoring deployment is registered with a direct (non-gateway) URL whose
-    /// backend supports `prompt_logprobs`; a model may name itself. Empty means
-    /// it cannot score drafts. The speculation boon resolves each target's
-    /// verifier from this field when no explicit override is configured.
+    /// Which small model writes this model's speculation drafts. Empty falls
+    /// back to the fleet default in the boon settings.
     #[serde(default)]
-    pub verifier_for: String,
+    pub draft_model: String,
+    /// Direct (non-gateway) URL of a deployment of THIS model whose backend
+    /// supports `prompt_logprobs`; it scores every draft token. Empty means
+    /// this model cannot speculate.
+    #[serde(default)]
+    pub verify_api_base: String,
+    /// The model name that scoring backend serves, when it differs from this
+    /// model's own `upstream_model` (a canary serving its own name). Empty =
+    /// same as `upstream_model`.
+    #[serde(default)]
+    pub verify_upstream_model: String,
     #[serde(default)]
     pub request_timeout_secs: Option<i64>,
     #[serde(default)]
@@ -2632,21 +2649,14 @@ mod tests {
     }
 
     #[test]
-    fn speculation_settings_active_needs_a_drafter_but_no_global_verifier() {
-        let mut s = SpeculationBoonSettings {
-            enabled: true,
-            ..Default::default()
-        };
-        assert!(!s.active(), "no drafter configured");
-        s.draft_model = Some("  ".into());
-        assert!(!s.active(), "blank drafter is not configured");
-        s.draft_model = Some("north-mini-code".into());
+    fn speculation_settings_active_is_just_the_switch() {
+        let mut s = SpeculationBoonSettings::default();
+        assert!(!s.active(), "disabled by default");
+        s.enabled = true;
         assert!(
             s.active(),
-            "verifier resolves per target from verifier_for; no global setting required"
+            "drafter and verifier both resolve per target model; no global requirement"
         );
-        s.enabled = false;
-        assert!(!s.active());
     }
 
     #[test]

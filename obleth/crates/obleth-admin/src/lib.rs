@@ -719,11 +719,16 @@ pub struct CreateModel {
     /// means eligible.
     #[serde(default)]
     pub auto_eligible: Option<bool>,
-    /// Which model this deployment can score speculation drafts for. Requires a
-    /// direct backend URL supporting `prompt_logprobs`; a model may name
-    /// itself. Empty or omitted means it cannot score drafts.
+    /// This model's own speculation drafter. Empty or omitted = fleet default.
     #[serde(default)]
-    pub verifier_for: Option<String>,
+    pub draft_model: Option<String>,
+    /// Direct URL of a deployment of this model that scores its drafts
+    /// (`prompt_logprobs`). Empty or omitted = the model cannot speculate.
+    #[serde(default)]
+    pub verify_api_base: Option<String>,
+    /// Name that scoring backend serves, if not this model's `upstream_model`.
+    #[serde(default)]
+    pub verify_upstream_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -772,10 +777,17 @@ pub struct UpdateModel {
     /// leaves the current value unchanged.
     #[serde(default)]
     pub auto_eligible: Option<bool>,
-    /// Which model this deployment can score speculation drafts for. Empty
-    /// clears it; omitted leaves the current value unchanged.
+    /// This model's own speculation drafter. Empty clears it (fleet default);
+    /// omitted leaves the current value unchanged.
     #[serde(default)]
-    pub verifier_for: Option<String>,
+    pub draft_model: Option<String>,
+    /// Direct scoring URL for this model's drafts. Empty clears it (the model
+    /// stops speculating); omitted leaves the current value unchanged.
+    #[serde(default)]
+    pub verify_api_base: Option<String>,
+    /// Name the scoring backend serves, if not `upstream_model`. Empty clears.
+    #[serde(default)]
+    pub verify_upstream_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -4069,7 +4081,9 @@ async fn create_model(
             body.energy_slots_per_node.unwrap_or(0),
             body.route_bias.unwrap_or(1.0),
             body.auto_eligible.unwrap_or(true),
-            body.verifier_for.as_deref().unwrap_or(""),
+            body.draft_model.as_deref().unwrap_or(""),
+            body.verify_api_base.as_deref().unwrap_or(""),
+            body.verify_upstream_model.as_deref().unwrap_or(""),
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -4181,9 +4195,13 @@ async fn update_model(
                 .unwrap_or(existing.energy_slots_per_node),
             body.route_bias.unwrap_or(existing.route_bias),
             body.auto_eligible.unwrap_or(existing.auto_eligible),
-            body.verifier_for
+            body.draft_model.as_deref().unwrap_or(&existing.draft_model),
+            body.verify_api_base
                 .as_deref()
-                .unwrap_or(&existing.verifier_for),
+                .unwrap_or(&existing.verify_api_base),
+            body.verify_upstream_model
+                .as_deref()
+                .unwrap_or(&existing.verify_upstream_model),
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -5147,7 +5165,9 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         energy_slots_per_node: model.energy_slots_per_node,
         route_bias: model.route_bias,
         auto_eligible: model.auto_eligible,
-        verifier_for: model.verifier_for.clone(),
+        draft_model: model.draft_model.clone(),
+        verify_api_base: model.verify_api_base.clone(),
+        verify_upstream_model: model.verify_upstream_model.clone(),
         endpoints,
     };
     if model.enabled {
@@ -5279,6 +5299,8 @@ mod tests {
                     0,
                     1.0,
                     true,
+                    "",
+                    "",
                     "",
                 )
                 .await

@@ -1031,12 +1031,15 @@ function CreateModelWizard({
                     defaultChecked
                   />
                 </ChipGroup>
-                <DraftScorerField selfName={modelName} modelNames={modelNames} initial="" />
               </section>
 
               <section className={cn("space-y-3", step !== 4 && "hidden")}>
                 {createType === "chat" ? (
-                  <ChatCapabilityFields mcpServers={mcpServers} />
+                  <ChatCapabilityFields
+                    mcpServers={mcpServers}
+                    modelNames={modelNames}
+                    selfName={modelName}
+                  />
                 ) : (
                   <div className="rounded-md border border-border/70 bg-background/35 p-4">
                     <p className="text-sm font-medium">No chat-only capability flags for this route type.</p>
@@ -1249,16 +1252,16 @@ function ModelDetailPanel({
       </TabsContent>
 
       <TabsContent value="connection">
-        <ConnectionTab
-          model={model}
-          editType={editType}
-          setEditType={setEditType}
-          modelNames={modelNames}
-        />
+        <ConnectionTab model={model} editType={editType} setEditType={setEditType} />
       </TabsContent>
 
       <TabsContent value="capabilities">
-        <CapabilitiesTab model={model} editType={editType} mcpServers={mcpServers} />
+        <CapabilitiesTab
+          model={model}
+          editType={editType}
+          mcpServers={mcpServers}
+          modelNames={modelNames}
+        />
       </TabsContent>
 
       <TabsContent value="capacity">
@@ -1394,12 +1397,10 @@ function ConnectionTab({
   model,
   editType,
   setEditType,
-  modelNames = [],
 }: {
   model: ModelRoute;
   editType: string;
   setEditType: (value: string) => void;
-  modelNames?: string[];
 }) {
   const flashSaved = useContext(SaveFlashContext);
   const [state, formAction, pending] = useActionState(
@@ -1482,11 +1483,6 @@ function ConnectionTab({
                   defaultChecked={model.auto_eligible}
                 />
               </ChipGroup>
-              <DraftScorerField
-                selfName={model.model_name}
-                modelNames={modelNames}
-                initial={model.verifier_for ?? ""}
-              />
             </FormSection>
           </div>
           {state?.ok === false && (
@@ -1510,10 +1506,12 @@ function CapabilitiesTab({
   model,
   editType,
   mcpServers = [],
+  modelNames = [],
 }: {
   model: ModelRoute;
   editType: string;
   mcpServers?: McpServer[];
+  modelNames?: string[];
 }) {
   const flashSaved = useContext(SaveFlashContext);
   const [state, formAction, pending] = useActionState(
@@ -1547,7 +1545,12 @@ function CapabilitiesTab({
           <div className="grid gap-4 p-4">
             <Field label="Context window" name="context_window" type="number" defaultValue={String(model.context_window)} />
             {editType === "chat" && (
-              <ChatCapabilityFields model={model} mcpServers={mcpServers} />
+              <ChatCapabilityFields
+                model={model}
+                mcpServers={mcpServers}
+                modelNames={modelNames}
+                selfName={model.model_name}
+              />
             )}
           </div>
           {state?.ok === false && (
@@ -2413,62 +2416,6 @@ function FormSection({ title, columns = 2, children }: { title: string; columns?
 
 // A labeled cluster of chip checkboxes. `info` renders an info tooltip beside the
 // label; the legacy `hint` still renders inline when provided.
-// The "can score drafts" capability as the operator thinks of it: a checkbox
-// (backend supports prompt_logprobs) plus, only when checked, WHO it scores
-// for — defaulting to itself. A separate scoring canary (whose backend serves
-// its own name) is the one case the dropdown exists for. Unchecked submits
-// verifier_for="" (cannot score).
-function DraftScorerField({
-  selfName,
-  modelNames,
-  initial,
-}: {
-  selfName: string;
-  modelNames: string[];
-  initial: string;
-}) {
-  const [canScore, setCanScore] = useState(Boolean(initial));
-  const [scoresFor, setScoresFor] = useState<string>(
-    initial && initial !== selfName ? initial : "__self__",
-  );
-  const value = !canScore ? "" : scoresFor === "__self__" ? selfName : scoresFor;
-  return (
-    <ChipGroup
-      label="Draft scoring"
-      info="Used by the speculation boon: a scoring deployment checks a fast drafter's answer token-by-token. Needs the patched backend (prompt_logprobs) on a direct, non-gateway URL."
-    >
-      <input type="hidden" name="verifier_for" value={value} />
-      <ChipCheckbox
-        name="verifier_for_enabled"
-        label="Can score drafts (prompt_logprobs)"
-        checked={canScore}
-        onChange={setCanScore}
-      />
-      {canScore && (
-        <div className="mt-1 w-full max-w-xs space-y-1">
-          <p className="text-[11px] font-medium text-muted-foreground">Scores drafts for</p>
-          <Select
-            aria-label="Scores drafts for"
-            value={scoresFor}
-            onValueChange={setScoresFor}
-            searchPlaceholder="Filter models"
-            options={[
-              { value: "__self__", label: "Itself (this model)" },
-              ...modelNames
-                .filter((n) => n !== selfName)
-                .map((n) => ({ value: n, label: n })),
-            ]}
-          />
-          <p className="text-[11px] leading-snug text-muted-foreground">
-            Usually itself. Pick another model only when this deployment is a scoring canary for
-            it (its backend serves a different name than the model it verifies).
-          </p>
-        </div>
-      )}
-    </ChipGroup>
-  );
-}
-
 function ChipGroup({ label, hint, info, children }: { label: string; hint?: string; info?: string; children: ReactNode }) {
   return (
     <div>
@@ -2579,7 +2526,17 @@ function TagLevelPicker({ tag, level, onChange }: { tag: string; level: number; 
 // search). Rather than letting that misconfiguration through, the Tools group
 // is disabled until both capabilities are on, and any existing grants are
 // cleared the moment either is turned off.
-export function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute; mcpServers: McpServer[] }) {
+export function ChatCapabilityFields({
+  model,
+  mcpServers,
+  modelNames = [],
+  selfName = "",
+}: {
+  model?: ModelRoute;
+  mcpServers: McpServer[];
+  modelNames?: string[];
+  selfName?: string;
+}) {
   const [fnCalling, setFnCalling] = useState(model?.supports_function_calling ?? false);
   const [toolChoice, setToolChoice] = useState(model?.supports_tool_choice ?? false);
   const [granted, setGranted] = useState<Set<string>>(() => new Set(model?.tool_servers ?? []));
@@ -2588,6 +2545,12 @@ export function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute
   // like the native-capability chips, since nothing else in this component
   // reacts to them.
   const [knowledgeChecked, setKnowledgeChecked] = useState(model?.boons?.includes("knowledge") ?? false);
+  // Speculation is the other boon with follow-up fields: the model's own
+  // drafter and its scoring endpoint live right here, on the model.
+  const [speculationChecked, setSpeculationChecked] = useState(
+    model?.boons?.includes("speculation") ?? false,
+  );
+  const [draftModel, setDraftModel] = useState(model?.draft_model ?? "");
   const [tagState, setTagState] = useState<Record<string, { checked: boolean; level: number }>>(() => {
     const state: Record<string, { checked: boolean; level: number }> = {};
     for (const tag of MODEL_TAGS) {
@@ -2649,6 +2612,15 @@ export function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute
               checked={knowledgeChecked}
               onChange={setKnowledgeChecked}
             />
+          ) : boon.value === "speculation" ? (
+            <ChipCheckbox
+              key={boon.value}
+              name={`boon_${boon.value}`}
+              label={boon.label}
+              hint={boon.description}
+              checked={speculationChecked}
+              onChange={setSpeculationChecked}
+            />
           ) : (
             <ChipCheckbox
               key={boon.value}
@@ -2660,6 +2632,54 @@ export function ChatCapabilityFields({ model, mcpServers }: { model?: ModelRoute
           ),
         )}
       </ChipGroup>
+      {speculationChecked && (
+        <div className="space-y-3 rounded-md border border-border/60 bg-muted/20 p-3">
+          <div>
+            <p className="text-xs font-medium">Speculation &mdash; this model&apos;s own cascade</p>
+            <p className="mt-0.5 max-w-prose text-[11px] leading-snug text-muted-foreground">
+              A fast drafter writes the answer and a scoring deployment of{" "}
+              <span className="font-medium text-foreground">this model</span> verifies every token
+              before anything reaches the client. Unverified drafts fall through to the model
+              itself.
+            </p>
+          </div>
+          <div className="grid gap-3 sm:grid-cols-3">
+            <div className="space-y-1">
+              <p className="text-[11px] font-medium text-muted-foreground">Drafter</p>
+              <input type="hidden" name="draft_model" value={draftModel} />
+              <Select
+                aria-label="Drafter"
+                value={draftModel}
+                onValueChange={setDraftModel}
+                searchPlaceholder="Filter models"
+                options={[
+                  { value: "", label: "Fleet default (Settings → Boons)" },
+                  ...modelNames
+                    .filter((n) => n !== selfName)
+                    .map((n) => ({ value: n, label: n })),
+                ]}
+              />
+              <p className="text-[11px] leading-snug text-muted-foreground">
+                A small model 5-10x faster than this one.
+              </p>
+            </div>
+            <Field
+              label="Scoring endpoint URL"
+              name="verify_api_base"
+              defaultValue={model?.verify_api_base ?? ""}
+              placeholder="http://direct-svc:8000/v1"
+              hint="Direct (non-gateway) URL of a deployment of this model whose backend supports prompt_logprobs. Blank = speculation stays off for this model."
+            />
+            <Field
+              label="Scoring endpoint serves (optional)"
+              name="verify_upstream_model"
+              defaultValue={model?.verify_upstream_model ?? ""}
+              placeholder="same as upstream model"
+              hint="Only if the scoring backend serves a different name than this model's upstream (e.g. a canary serving its own name)."
+            />
+          </div>
+        </div>
+      )}
       {knowledgeChecked &&
         (model ? (
           <ModelKnowledgeCollectionsField modelId={model.id} />

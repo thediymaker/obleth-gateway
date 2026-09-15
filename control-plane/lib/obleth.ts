@@ -123,12 +123,15 @@ export interface ModelRoute {
    * candidate pool while leaving it addressable by name.
    */
   auto_eligible: boolean;
+  /** This model's own speculation drafter. Empty = the fleet default. */
+  draft_model: string;
   /**
-   * Which model this deployment can score speculation drafts for. Requires a
-   * direct backend URL supporting prompt_logprobs; a model may name itself.
-   * Empty = cannot score drafts.
+   * Direct URL of a deployment of this model that scores its drafts
+   * (prompt_logprobs). Empty = the model cannot speculate.
    */
-  verifier_for: string;
+  verify_api_base: string;
+  /** Name that scoring backend serves, if not this model's upstream_model. */
+  verify_upstream_model: string;
   context_window: number;
   admission_weight: number;
   max_in_flight: number | null;
