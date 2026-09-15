@@ -227,17 +227,34 @@ pub(crate) fn effective_draft_model(route: &ResolvedModel, s: &SpeculationBoonSe
         .to_string()
 }
 
+/// The scoring address for one target: its own `verify_api_base`, else the
+/// fleet template with `{upstream}`/`{model}` substituted. Empty = cannot
+/// speculate.
+pub(crate) fn scoring_base(route: &ResolvedModel, template: &str) -> String {
+    let own = route.verify_api_base.trim();
+    if !own.is_empty() {
+        return own.to_string();
+    }
+    let template = template.trim();
+    if template.is_empty() {
+        return String::new();
+    }
+    template
+        .replace("{upstream}", &route.upstream_model)
+        .replace("{model}", &route.model_name)
+}
+
 /// The verifier for one target, synthesized from the target itself with the
 /// wire target swapped to its scoring endpoint. Billing therefore lands under
 /// the target's name at the target's rates, which is honest: the scorer IS
 /// the target's family. Returns `None` when the model has no scoring endpoint.
-pub(crate) fn scoring_route(route: &ResolvedModel) -> Option<Arc<ResolvedModel>> {
-    let base = route.verify_api_base.trim();
+pub(crate) fn scoring_route(route: &ResolvedModel, template: &str) -> Option<Arc<ResolvedModel>> {
+    let base = scoring_base(route, template);
     if base.is_empty() {
         return None;
     }
     let mut verifier = (*route).clone();
-    verifier.api_base = base.to_string();
+    verifier.api_base = base;
     let served = route.verify_upstream_model.trim();
     if !served.is_empty() {
         verifier.upstream_model = served.to_string();
@@ -697,7 +714,7 @@ pub async fn run(
     // Verification is the target's own scoring endpoint: a direct-URL
     // deployment of this model whose backend supports prompt_logprobs (its
     // own pods once patched, a canary until then). Not a registered route.
-    let Some(verifier_model) = scoring_route(&req.route) else {
+    let Some(verifier_model) = scoring_route(&req.route, &s.verify_url_template) else {
         tracing::info!(
             target = %req.route.model_name,
             "target has no scoring endpoint configured; answering directly"
@@ -1349,6 +1366,19 @@ mod tests {
     }
 
     #[test]
+    fn scoring_base_prefers_the_model_then_the_fleet_template() {
+        let mut route = target("glm-5-3");
+        assert_eq!(scoring_base(&route, ""), "");
+        let tpl = "http://{upstream}.serving.svc.cluster.local:8000/v1";
+        assert_eq!(
+            scoring_base(&route, tpl),
+            "http://glm-5-3-mxfp4.serving.svc.cluster.local:8000/v1"
+        );
+        route.verify_api_base = "http://canary:8000/v1".into();
+        assert_eq!(scoring_base(&route, tpl), "http://canary:8000/v1");
+    }
+
+    #[test]
     fn drafter_and_scorer_come_from_the_target_model() {
         let mut route = target("glm-5-3");
         let mut s = SpeculationBoonSettings {
@@ -1365,13 +1395,13 @@ mod tests {
         assert_eq!(effective_draft_model(&route, &s), "");
 
         // Scorer: none configured = cannot speculate.
-        assert!(scoring_route(&route).is_none());
+        assert!(scoring_route(&route, "").is_none());
 
         // A canary endpoint serving its own name: URL and served name swap,
         // identity (name, rates) stays the target's.
         route.verify_api_base = "http://canary.test:8000/v1".into();
         route.verify_upstream_model = "glm-5-3-verify-canary".into();
-        let v = scoring_route(&route).expect("scoring endpoint set");
+        let v = scoring_route(&route, "").expect("scoring endpoint set");
         assert_eq!(v.model_name, "glm-5-3");
         assert_eq!(v.api_base, "http://canary.test:8000/v1");
         assert_eq!(v.upstream_model, "glm-5-3-verify-canary");
@@ -1380,7 +1410,7 @@ mod tests {
         // Once the target's own pods are patched, only the URL is set and the
         // scorer serves the target's own upstream name.
         route.verify_upstream_model = String::new();
-        let v = scoring_route(&route).expect("scoring endpoint set");
+        let v = scoring_route(&route, "").expect("scoring endpoint set");
         assert_eq!(v.upstream_model, "glm-5-3-mxfp4");
     }
 

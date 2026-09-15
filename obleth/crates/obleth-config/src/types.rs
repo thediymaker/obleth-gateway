@@ -1774,6 +1774,15 @@ pub struct SpeculationBoonSettings {
     /// answers directly).
     #[serde(default = "default_spec_unlisted_speculate")]
     pub unlisted_categories_speculate: bool,
+    /// Fleet rule for locating a model's scoring endpoint when the model does
+    /// not set its own `verify_api_base`: a URL with `{upstream}` and/or
+    /// `{model}` placeholders (e.g.
+    /// `http://{upstream}.serving.svc.cluster.local:8000/v1`). Only set this
+    /// once the fleet's backends can survive `prompt_logprobs` scoring —
+    /// pointing it at unpatched pods kills them. Empty = models without their
+    /// own endpoint cannot speculate.
+    #[serde(default)]
+    pub verify_url_template: String,
 }
 
 fn default_spec_unlisted_speculate() -> bool {
@@ -1821,6 +1830,7 @@ impl Default for SpeculationBoonSettings {
             classify_model: None,
             category_gates: Vec::new(),
             unlisted_categories_speculate: default_spec_unlisted_speculate(),
+            verify_url_template: String::new(),
         }
     }
 }

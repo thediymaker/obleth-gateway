@@ -1218,6 +1218,9 @@ export function BoonsSettingsForm({
       ? JSON.stringify(settings.speculation_draft_chat_template_kwargs)
       : "",
   );
+  const [specUrlTemplate, setSpecUrlTemplate] = useState(
+    settings?.speculation_verify_url_template ?? "",
+  );
   const [specUnlisted, setSpecUnlisted] = useState(
     settings?.speculation_unlisted_categories_speculate ?? true,
   );
@@ -1347,6 +1350,7 @@ export function BoonsSettingsForm({
       speculation_draft_chat_template_kwargs: specKwargsParsed,
       speculation_category_gates: specGatesClean,
       speculation_unlisted_categories_speculate: specUnlisted,
+      speculation_verify_url_template: specUrlTemplate.trim(),
     };
     start(async () => {
       const result = await setBoonSettingsAction(body);
@@ -1795,10 +1799,27 @@ export function BoonsSettingsForm({
                 customBlurb="The values under Advanced no longer match a preset. Picking a profile above overwrites them."
               />
               <AdvancedDisclosure
-                label="Advanced — decision floors, verify cadence, category gates"
+                label="Advanced — scoring endpoint rule, decision floors, verify cadence, category gates"
                 open={specAdvanced}
                 onToggle={() => setSpecAdvanced((value) => !value)}
               >
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_verify_url_template">Scoring endpoint rule</Label>
+                  <Input
+                    id="speculation_verify_url_template"
+                    value={specUrlTemplate}
+                    onChange={(e) => setSpecUrlTemplate(e.target.value)}
+                    placeholder="http://{upstream}.serving.svc.cluster.local:8000/v1"
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    How the gateway finds a speculating model&apos;s scoring endpoint when the
+                    model doesn&apos;t set its own: <code>{"{upstream}"}</code> and{" "}
+                    <code>{"{model}"}</code> expand per model. Set this only once the fleet&apos;s
+                    backends survive <code>prompt_logprobs</code> scoring — pointing it at
+                    unpatched pods kills them. Blank = models without their own endpoint
+                    don&apos;t speculate.
+                  </p>
+                </div>
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <div className="space-y-1">
                   <Label htmlFor="speculation_agree_min">Ship floor: agreement (0-1)</Label>

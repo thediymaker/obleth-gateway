@@ -929,6 +929,7 @@ export interface BoonSettingsView {
   speculation_draft_chat_template_kwargs: Record<string, unknown> | null;
   speculation_category_gates: SpeculationCategoryGate[];
   speculation_unlisted_categories_speculate: boolean;
+  speculation_verify_url_template: string;
 }
 
 // One per-category gate of the speculation boon. Missing thresholds fall back
@@ -989,6 +990,7 @@ export interface UpdateBoonSettings {
   /** Replaces the whole gate list; an empty list clears it. */
   speculation_category_gates?: SpeculationCategoryGate[];
   speculation_unlisted_categories_speculate?: boolean;
+  speculation_verify_url_template?: string;
 }
 
 // Live status of the optional neural compression sidecar (a health probe of
