@@ -1749,10 +1749,11 @@ export function BoonsSettingsForm({
                 />
               </ol>
               <p className="text-[11px] text-muted-foreground">
-                The target model is whichever model has Speculation ticked on the Models page —
-                this panel only configures the helpers around it.
+                The target is whichever model has Speculation ticked on the Models page, and
+                verification is automatic: the deployment marked &quot;scores drafts for&quot; that
+                model does the judging. This panel only configures the fleet-wide helpers.
               </p>
-              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+              <div className="grid gap-4 sm:grid-cols-2">
                 <div className="space-y-1">
                   <Label htmlFor="speculation_draft_model">Drafter — writes the answer</Label>
                   <Select
@@ -1767,31 +1768,6 @@ export function BoonsSettingsForm({
                   />
                   <p className="text-[11px] text-muted-foreground">
                     A small model 5-10x faster than the target; the speed gap is the whole payoff.
-                  </p>
-                </div>
-                <div className="space-y-1">
-                  <Label htmlFor="speculation_verify_model">Verifier — judges the draft</Label>
-                  <Select
-                    id="speculation_verify_model"
-                    value={specVerifyModel}
-                    onValueChange={setSpecVerifyModel}
-                    searchPlaceholder="Filter models"
-                    options={[
-                      { value: "", label: "Auto — the target's scoring deployment (recommended)" },
-                      ...chatModels.map((m) => ({
-                        value: m.model_name,
-                        label: m.verifier_for
-                          ? `${m.model_name} — scores for ${m.verifier_for}`
-                          : m.model_name,
-                      })),
-                    ]}
-                  />
-                  <p className="text-[11px] text-muted-foreground">
-                    Auto resolves per target: whichever model declares &quot;Scores drafts
-                    for&quot; = the target on the Models page (the target itself, or a canary of
-                    it). Verifying against the target&apos;s own family is what makes a shipped
-                    draft as good as its own answer; pick a model here only to force one global
-                    verifier.
                   </p>
                 </div>
                 <div className="space-y-1">
@@ -1820,10 +1796,33 @@ export function BoonsSettingsForm({
                 customBlurb="The values under Advanced no longer match a preset. Picking a profile above overwrites them."
               />
               <AdvancedDisclosure
-                label="Advanced — decision floors, verify cadence, category gates"
+                label="Advanced — verifier override, decision floors, verify cadence, category gates"
                 open={specAdvanced}
                 onToggle={() => setSpecAdvanced((value) => !value)}
               >
+                <div className="max-w-md space-y-1">
+                  <Label htmlFor="speculation_verify_model">Verifier override</Label>
+                  <Select
+                    id="speculation_verify_model"
+                    value={specVerifyModel}
+                    onValueChange={setSpecVerifyModel}
+                    searchPlaceholder="Filter models"
+                    options={[
+                      { value: "", label: "Auto — the target's scoring deployment (recommended)" },
+                      ...chatModels.map((m) => ({
+                        value: m.model_name,
+                        label: m.verifier_for
+                          ? `${m.model_name} — scores for ${m.verifier_for}`
+                          : m.model_name,
+                      })),
+                    ]}
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    Auto resolves per target from &quot;scores drafts for&quot; on the Models page.
+                    Forcing one global verifier here only makes sense while a single family
+                    speculates.
+                  </p>
+                </div>
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <div className="space-y-1">
                   <Label htmlFor="speculation_agree_min">Ship floor: agreement (0-1)</Label>
