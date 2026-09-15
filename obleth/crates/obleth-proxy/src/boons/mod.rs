@@ -190,7 +190,7 @@ fn speculation_eligible(
     // Both helpers resolve per target: its own drafter (fleet default as
     // fallback) and its own scoring endpoint. Missing either means the model
     // cannot speculate, decided here before anything is armed.
-    if route.verify_api_base.trim().is_empty() {
+    if speculation::scoring_base(route, &settings.speculation.verify_url_template).is_empty() {
         return false;
     }
     let drafter = speculation::effective_draft_model(route, &settings.speculation);

@@ -2007,6 +2007,7 @@ pub struct BoonSettingsView {
     #[schema(value_type = Vec<Object>)]
     pub speculation_category_gates: serde_json::Value,
     pub speculation_unlisted_categories_speculate: bool,
+    pub speculation_verify_url_template: String,
 }
 
 impl BoonSettingsView {
@@ -2062,6 +2063,7 @@ impl BoonSettingsView {
             speculation_category_gates: serde_json::to_value(&s.speculation.category_gates)
                 .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
             speculation_unlisted_categories_speculate: s.speculation.unlisted_categories_speculate,
+            speculation_verify_url_template: s.speculation.verify_url_template.clone(),
         }
     }
 }
@@ -2214,6 +2216,10 @@ pub struct UpdateBoonSettings {
     /// (false). Omit to leave unchanged.
     #[serde(default)]
     pub speculation_unlisted_categories_speculate: Option<bool>,
+    /// Fleet rule for locating scoring endpoints ({upstream}/{model}
+    /// placeholders). Empty string clears; omitted keeps the current value.
+    #[serde(default)]
+    pub speculation_verify_url_template: Option<String>,
 }
 
 #[utoipa::path(
@@ -2558,6 +2564,10 @@ async fn put_boon_settings(
             unlisted_categories_speculate: body
                 .speculation_unlisted_categories_speculate
                 .unwrap_or(existing.speculation.unlisted_categories_speculate),
+            verify_url_template: body
+                .speculation_verify_url_template
+                .map(|t| t.trim().to_string())
+                .unwrap_or_else(|| existing.speculation.verify_url_template.clone()),
         },
     };
 
@@ -2595,6 +2605,7 @@ async fn put_boon_settings(
                 "speculation_lp_min": settings.speculation.lp_min,
                 "speculation_category_gates": settings.speculation.category_gates.len(),
                 "speculation_unlisted_categories_speculate": settings.speculation.unlisted_categories_speculate,
+                "speculation_verify_url_template": settings.speculation.verify_url_template,
             }),
         )
         .await?;

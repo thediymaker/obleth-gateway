@@ -2551,6 +2551,7 @@ export function ChatCapabilityFields({
     model?.boons?.includes("speculation") ?? false,
   );
   const [draftModel, setDraftModel] = useState(model?.draft_model ?? "");
+  const [specWiringOpen, setSpecWiringOpen] = useState(false);
   const [tagState, setTagState] = useState<Record<string, { checked: boolean; level: number }>>(() => {
     const state: Record<string, { checked: boolean; level: number }> = {};
     for (const tag of MODEL_TAGS) {
@@ -2643,40 +2644,59 @@ export function ChatCapabilityFields({
               itself.
             </p>
           </div>
-          <div className="grid gap-3 sm:grid-cols-3">
-            <div className="space-y-1">
-              <p className="text-[11px] font-medium text-muted-foreground">Drafter</p>
-              <input type="hidden" name="draft_model" value={draftModel} />
-              <Select
-                aria-label="Drafter"
-                value={draftModel}
-                onValueChange={setDraftModel}
-                searchPlaceholder="Filter models"
-                options={[
-                  { value: "", label: "Fleet default (Settings → Boons)" },
-                  ...modelNames
-                    .filter((n) => n !== selfName)
-                    .map((n) => ({ value: n, label: n })),
-                ]}
+          <div className="max-w-sm space-y-1">
+            <p className="text-[11px] font-medium text-muted-foreground">Drafter</p>
+            <input type="hidden" name="draft_model" value={draftModel} />
+            <Select
+              aria-label="Drafter"
+              value={draftModel}
+              onValueChange={setDraftModel}
+              searchPlaceholder="Filter models"
+              options={[
+                { value: "", label: "Fleet default (Settings → Boons)" },
+                ...modelNames
+                  .filter((n) => n !== selfName)
+                  .map((n) => ({ value: n, label: n })),
+              ]}
+            />
+            <p className="text-[11px] leading-snug text-muted-foreground">
+              A small model 5-10x faster than this one. Verification is automatic: this
+              model&apos;s own backend scores every draft.
+            </p>
+          </div>
+          <div>
+            <button
+              type="button"
+              onClick={() => setSpecWiringOpen((value) => !value)}
+              aria-expanded={specWiringOpen}
+              className="flex items-center gap-1.5 text-[11px] font-medium text-muted-foreground transition-colors hover:text-foreground"
+            >
+              <ChevronDown
+                className={cn(
+                  "h-3 w-3 transition-transform duration-200",
+                  specWiringOpen && "rotate-180",
+                )}
               />
-              <p className="text-[11px] leading-snug text-muted-foreground">
-                A small model 5-10x faster than this one.
-              </p>
+              Advanced wiring — scoring endpoint override
+            </button>
+            {/* The fields must stay in the form even when collapsed so a save
+                never silently clears a configured override. */}
+            <div className={cn("mt-2 grid gap-3 sm:grid-cols-2", !specWiringOpen && "hidden")}>
+              <Field
+                label="Scoring endpoint URL"
+                name="verify_api_base"
+                defaultValue={model?.verify_api_base ?? ""}
+                placeholder="fleet rule (Settings → Boons)"
+                hint="Override only when this model's drafts must be scored somewhere other than the fleet rule's address — a direct URL whose backend supports prompt_logprobs."
+              />
+              <Field
+                label="Scoring endpoint serves (optional)"
+                name="verify_upstream_model"
+                defaultValue={model?.verify_upstream_model ?? ""}
+                placeholder="same as upstream model"
+                hint="Only if the scoring backend serves a different name than this model's upstream."
+              />
             </div>
-            <Field
-              label="Scoring endpoint URL"
-              name="verify_api_base"
-              defaultValue={model?.verify_api_base ?? ""}
-              placeholder="http://direct-svc:8000/v1"
-              hint="Direct (non-gateway) URL of a deployment of this model whose backend supports prompt_logprobs. Blank = speculation stays off for this model."
-            />
-            <Field
-              label="Scoring endpoint serves (optional)"
-              name="verify_upstream_model"
-              defaultValue={model?.verify_upstream_model ?? ""}
-              placeholder="same as upstream model"
-              hint="Only if the scoring backend serves a different name than this model's upstream (e.g. a canary serving its own name)."
-            />
           </div>
         </div>
       )}
