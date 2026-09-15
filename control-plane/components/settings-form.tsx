@@ -781,6 +781,140 @@ function ToggleRow({
   );
 }
 
+// Speculation policy profiles: one click sets every threshold, cadence value,
+// and category gate below. "Custom" is not a preset — it is what the panel
+// reports once any advanced value no longer matches a preset.
+type SpecProfileKey = "calibrated" | "cautious" | "custom";
+
+type SpecProfileValues = {
+  agree_min: number;
+  lp_min: number;
+  abort_agree: number;
+  abort_lp: number;
+  first_chunk_tokens: number;
+  chunk_tokens: number;
+  decide_by_tokens: number;
+  max_draft_tokens: number;
+  pace_ms: number;
+  timeout_ms: number;
+  unlisted: boolean;
+  gates: SpeculationCategoryGate[];
+};
+
+const SPEC_PROFILES: {
+  key: Exclude<SpecProfileKey, "custom">;
+  label: string;
+  card: string;
+  blurb: string;
+  values: SpecProfileValues;
+}[] = [
+  {
+    key: "calibrated",
+    label: "Calibrated",
+    card: "Per-category gates from the judged-prompt calibration. Best coverage at high precision.",
+    blurb:
+      "Drafts are attempted only in the categories where verification measured reliably precise (coding, math, summaries, prose), each with its own tuned floor; categories that never verify well go straight to the target before any draft cost. Requires a classify model.",
+    values: {
+      agree_min: 0.5,
+      lp_min: -1.0,
+      abort_agree: 0.45,
+      abort_lp: -1.6,
+      first_chunk_tokens: 80,
+      chunk_tokens: 250,
+      decide_by_tokens: 450,
+      max_draft_tokens: 2048,
+      pace_ms: 9,
+      timeout_ms: 45000,
+      unlisted: false,
+      gates: [
+        { tag: "infrastructure", speculate: false },
+        { tag: "planning", speculate: false },
+        { tag: "database", speculate: false },
+        { tag: "regex", speculate: false },
+        { tag: "explanation", speculate: false },
+        { tag: "debugging", speculate: false },
+        { tag: "coding", speculate: true, agree_min: 0.4, lp_min: -0.8 },
+        { tag: "math", speculate: true, agree_min: 0.4, lp_min: -0.9 },
+        { tag: "summarization", speculate: true, agree_min: 0.4, lp_min: -1.0 },
+        { tag: "writing", speculate: true, agree_min: 0.4, lp_min: -1.9 },
+      ],
+    },
+  },
+  {
+    key: "cautious",
+    label: "Cautious",
+    card: "One strict global gate, no category routing. Works without a classify model.",
+    blurb:
+      "Every request is drafted and held to the same strict floor (the server defaults). Fewer requests end up shipping from the drafter, but this needs no classifier and no calibration data — a reasonable starting point on a fleet you have not measured yet.",
+    values: {
+      agree_min: 0.5,
+      lp_min: -1.0,
+      abort_agree: 0.45,
+      abort_lp: -1.6,
+      first_chunk_tokens: 80,
+      chunk_tokens: 250,
+      decide_by_tokens: 450,
+      max_draft_tokens: 2048,
+      pace_ms: 9,
+      timeout_ms: 45000,
+      unlisted: true,
+      gates: [],
+    },
+  },
+];
+
+// The server stores gate thresholds with concrete defaults (0.5 / -1.0), so a
+// preset row that omits them still round-trips equal.
+function specGatesEqual(a: SpeculationCategoryGate[], b: SpeculationCategoryGate[]): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((g, i) => {
+    const h = b[i];
+    return (
+      g.tag === h.tag &&
+      (g.speculate ?? true) === (h.speculate ?? true) &&
+      (g.agree_min ?? 0.5) === (h.agree_min ?? 0.5) &&
+      (g.lp_min ?? -1.0) === (h.lp_min ?? -1.0)
+    );
+  });
+}
+
+function specProfileFromSettings(s: BoonSettingsView | null): SpecProfileKey {
+  for (const p of SPEC_PROFILES) {
+    const v = p.values;
+    if (
+      (s?.speculation_agree_min ?? 0.5) === v.agree_min &&
+      (s?.speculation_lp_min ?? -1.0) === v.lp_min &&
+      (s?.speculation_abort_agree ?? 0.45) === v.abort_agree &&
+      (s?.speculation_abort_lp ?? -1.6) === v.abort_lp &&
+      (s?.speculation_first_chunk_tokens ?? 80) === v.first_chunk_tokens &&
+      (s?.speculation_chunk_tokens ?? 250) === v.chunk_tokens &&
+      (s?.speculation_decide_by_tokens ?? 450) === v.decide_by_tokens &&
+      (s?.speculation_max_draft_tokens ?? 2048) === v.max_draft_tokens &&
+      (s?.speculation_pace_ms ?? 9) === v.pace_ms &&
+      (s?.speculation_timeout_ms ?? 45000) === v.timeout_ms &&
+      (s?.speculation_unlisted_categories_speculate ?? true) === v.unlisted &&
+      specGatesEqual(s?.speculation_category_gates ?? [], v.gates)
+    ) {
+      return p.key;
+    }
+  }
+  return "custom";
+}
+
+function SpecStep({ n, title, text }: { n: number; title: string; text: string }) {
+  return (
+    <li className="rounded-lg border border-border/60 bg-background/35 p-3">
+      <p className="flex items-center gap-2 text-sm font-medium">
+        <span className="flex h-5 w-5 items-center justify-center rounded-full bg-primary/15 text-[11px] font-semibold text-primary">
+          {n}
+        </span>
+        {title}
+      </p>
+      <p className="mt-1.5 text-[11px] leading-snug text-muted-foreground">{text}</p>
+    </li>
+  );
+}
+
 export function BoonsSettingsForm({
   settings,
   models,
@@ -862,10 +996,46 @@ export function BoonsSettingsForm({
   const [specGates, setSpecGates] = useState<SpeculationCategoryGate[]>(
     settings?.speculation_category_gates ?? [],
   );
+  const [specProfile, setSpecProfile] = useState<SpecProfileKey>(() =>
+    specProfileFromSettings(settings),
+  );
+  const [specAdvanced, setSpecAdvanced] = useState(false);
   const [expanded, setExpanded] = useState<BoonSectionKey | null>(null);
 
   function updateSpecGate(index: number, patch: Partial<SpeculationCategoryGate>) {
+    setSpecProfile("custom");
     setSpecGates((gates) => gates.map((g, i) => (i === index ? { ...g, ...patch } : g)));
+  }
+
+  function applySpecProfile(key: SpecProfileKey) {
+    setSpecProfile(key);
+    const preset = SPEC_PROFILES.find((p) => p.key === key);
+    if (!preset) {
+      // "Custom" keeps the current values and just opens the advanced editor.
+      setSpecAdvanced(true);
+      return;
+    }
+    const v = preset.values;
+    setSpecAgreeMin(String(v.agree_min));
+    setSpecLpMin(String(v.lp_min));
+    setSpecAbortAgree(String(v.abort_agree));
+    setSpecAbortLp(String(v.abort_lp));
+    setSpecFirstChunk(String(v.first_chunk_tokens));
+    setSpecChunk(String(v.chunk_tokens));
+    setSpecDecideBy(String(v.decide_by_tokens));
+    setSpecMaxDraft(String(v.max_draft_tokens));
+    setSpecPaceMs(String(v.pace_ms));
+    setSpecTimeout(String(v.timeout_ms));
+    setSpecUnlisted(v.unlisted);
+    setSpecGates(v.gates.map((g) => ({ ...g })));
+  }
+
+  // Any hand edit to a policy value means the presets no longer describe it.
+  function specCustom(set: (value: string) => void): (value: string) => void {
+    return (value) => {
+      setSpecProfile("custom");
+      set(value);
+    };
   }
 
   const visionModels = models.filter(
@@ -1318,7 +1488,9 @@ export function BoonsSettingsForm({
                   verify: {specVerifyModel || "none"}
                 </Badge>
                 <Badge className="border-border bg-background text-[10px] text-muted-foreground">
-                  {specGates.length ? `${specGates.length} category gates` : "global gate"}
+                  {specProfile === "custom"
+                    ? "custom policy"
+                    : `${SPEC_PROFILES.find((p) => p.key === specProfile)?.label ?? specProfile} profile`}
                 </Badge>
               </>
             }
@@ -1330,17 +1502,30 @@ export function BoonsSettingsForm({
                 checked={specEnabled}
                 onChange={() => setSpecEnabled((value) => !value)}
               />
-              <p className="text-sm text-muted-foreground">
-                The drafter writes a candidate answer and the verifier — a deployment of the target
-                model&apos;s family whose backend supports <code>prompt_logprobs</code>, registered
-                with a direct (non-gateway) URL — scores every draft token in one cheap prefill.
-                Verified spans stream to the client; a draft that fails mid-stream is continued by
-                the target model seamlessly. The classify model routes each request to its category
-                gate before any draft is paid for.
+              <ol className="grid gap-2 sm:grid-cols-3">
+                <SpecStep
+                  n={1}
+                  title="Classify"
+                  text="A tiny model tags the request. Categories where drafting never pays off skip straight to the target — before any draft cost."
+                />
+                <SpecStep
+                  n={2}
+                  title="Draft"
+                  text="The drafter writes the whole answer at its own, much faster, speed."
+                />
+                <SpecStep
+                  n={3}
+                  title="Verify, then release"
+                  text="The target model scores every draft token in one cheap pass. Only verified text reaches the client; anything else falls through to the target seamlessly."
+                />
+              </ol>
+              <p className="text-[11px] text-muted-foreground">
+                The target model is whichever model has Speculation ticked on the Models page —
+                this panel only configures the helpers around it.
               </p>
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
                 <div className="space-y-1">
-                  <Label htmlFor="speculation_draft_model">Drafter model</Label>
+                  <Label htmlFor="speculation_draft_model">Drafter — writes the answer</Label>
                   <Select
                     id="speculation_draft_model"
                     value={specDraftModel}
@@ -1352,11 +1537,11 @@ export function BoonsSettingsForm({
                     ]}
                   />
                   <p className="text-[11px] text-muted-foreground">
-                    Needs a large speed gap over the target (5-10x) to pay off.
+                    A small model 5-10x faster than the target; the speed gap is the whole payoff.
                   </p>
                 </div>
                 <div className="space-y-1">
-                  <Label htmlFor="speculation_verify_model">Verifier model</Label>
+                  <Label htmlFor="speculation_verify_model">Verifier — judges the draft</Label>
                   <Select
                     id="speculation_verify_model"
                     value={specVerifyModel}
@@ -1368,26 +1553,98 @@ export function BoonsSettingsForm({
                     ]}
                   />
                   <p className="text-[11px] text-muted-foreground">
-                    Defines &quot;verified&quot; — must be the target&apos;s model family.
+                    The target model itself (or a canary of it), registered with a direct backend
+                    URL that supports <code>prompt_logprobs</code>. This is what makes a shipped
+                    draft as good as the target&apos;s own answer.
                   </p>
                 </div>
                 <div className="space-y-1">
-                  <Label htmlFor="speculation_classify_model">Classify model</Label>
+                  <Label htmlFor="speculation_classify_model">Classifier — triage only</Label>
                   <Select
                     id="speculation_classify_model"
                     value={specClassifyModel}
                     onValueChange={setSpecClassifyModel}
                     searchPlaceholder="Filter models"
                     options={[
-                      { value: "", label: "None (global gate only)" },
+                      { value: "", label: "None (one gate for everything)" },
                       ...chatModels.map((m) => ({ value: m.model_name, label: m.model_name })),
                     ]}
                   />
                   <p className="text-[11px] text-muted-foreground">
-                    A tiny non-thinking model; a reasoning model burns the classify budget.
+                    A tiny non-thinking model that tags each request. Needed by the Calibrated
+                    profile; with None every request uses the same gate.
                   </p>
                 </div>
               </div>
+              <div className="space-y-2">
+                <Label>Policy profile</Label>
+                <div className="grid gap-2 sm:grid-cols-3">
+                  {SPEC_PROFILES.map((p) => (
+                    <button
+                      key={p.key}
+                      type="button"
+                      onClick={() => applySpecProfile(p.key)}
+                      aria-pressed={specProfile === p.key}
+                      className={cn(
+                        "rounded-lg border p-3 text-left transition-colors",
+                        specProfile === p.key
+                          ? "border-primary/50 bg-primary/10 ring-1 ring-primary/20"
+                          : "border-border/70 bg-background/40 hover:border-border hover:bg-muted/20",
+                      )}
+                    >
+                      <span className="flex items-center gap-2 text-sm font-medium">
+                        {p.label}
+                        {p.key === "calibrated" && (
+                          <Badge className="border-primary/40 bg-primary/10 text-[10px] text-primary">
+                            recommended
+                          </Badge>
+                        )}
+                      </span>
+                      <span className="mt-1 block text-[11px] leading-snug text-muted-foreground">
+                        {p.card}
+                      </span>
+                    </button>
+                  ))}
+                  <button
+                    type="button"
+                    onClick={() => applySpecProfile("custom")}
+                    aria-pressed={specProfile === "custom"}
+                    className={cn(
+                      "rounded-lg border p-3 text-left transition-colors",
+                      specProfile === "custom"
+                        ? "border-primary/50 bg-primary/10 ring-1 ring-primary/20"
+                        : "border-border/70 bg-background/40 hover:border-border hover:bg-muted/20",
+                    )}
+                  >
+                    <span className="block text-sm font-medium">Custom</span>
+                    <span className="mt-1 block text-[11px] leading-snug text-muted-foreground">
+                      Hand-tuned floors, cadence, or category gates — edit them under Advanced.
+                    </span>
+                  </button>
+                </div>
+                <p className="text-[11px] leading-snug text-muted-foreground">
+                  {specProfile === "custom"
+                    ? "The values under Advanced no longer match a preset. Picking a profile above overwrites them."
+                    : SPEC_PROFILES.find((p) => p.key === specProfile)?.blurb}
+                </p>
+              </div>
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setSpecAdvanced((value) => !value)}
+                  aria-expanded={specAdvanced}
+                  className="flex items-center gap-1.5 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
+                >
+                  <ChevronDown
+                    className={cn(
+                      "h-3.5 w-3.5 transition-transform duration-200",
+                      specAdvanced && "rotate-180",
+                    )}
+                  />
+                  Advanced — decision floors, verify cadence, category gates
+                </button>
+                {specAdvanced && (
+                  <div className="mt-3 space-y-4 rounded-lg border border-border/60 bg-background/25 p-4">
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <div className="space-y-1">
                   <Label htmlFor="speculation_agree_min">Ship floor: agreement (0-1)</Label>
@@ -1398,7 +1655,7 @@ export function BoonsSettingsForm({
                     min={0}
                     max={1}
                     value={specAgreeMin}
-                    onChange={(e) => setSpecAgreeMin(e.target.value)}
+                    onChange={(e) => specCustom(setSpecAgreeMin)(e.target.value)}
                   />
                 </div>
                 <div className="space-y-1">
@@ -1409,7 +1666,7 @@ export function BoonsSettingsForm({
                     step="0.1"
                     max={0}
                     value={specLpMin}
-                    onChange={(e) => setSpecLpMin(e.target.value)}
+                    onChange={(e) => specCustom(setSpecLpMin)(e.target.value)}
                   />
                 </div>
                 <div className="space-y-1">
@@ -1421,7 +1678,7 @@ export function BoonsSettingsForm({
                     min={0}
                     max={1}
                     value={specAbortAgree}
-                    onChange={(e) => setSpecAbortAgree(e.target.value)}
+                    onChange={(e) => specCustom(setSpecAbortAgree)(e.target.value)}
                   />
                 </div>
                 <div className="space-y-1">
@@ -1432,7 +1689,7 @@ export function BoonsSettingsForm({
                     step="0.1"
                     max={0}
                     value={specAbortLp}
-                    onChange={(e) => setSpecAbortLp(e.target.value)}
+                    onChange={(e) => specCustom(setSpecAbortLp)(e.target.value)}
                   />
                 </div>
               </div>
@@ -1447,7 +1704,7 @@ export function BoonsSettingsForm({
                     id="speculation_first_chunk_tokens"
                     type="number"
                     value={specFirstChunk}
-                    onChange={(e) => setSpecFirstChunk(e.target.value)}
+                    onChange={(e) => specCustom(setSpecFirstChunk)(e.target.value)}
                   />
                 </div>
                 <div className="space-y-1">
@@ -1456,7 +1713,7 @@ export function BoonsSettingsForm({
                     id="speculation_chunk_tokens"
                     type="number"
                     value={specChunk}
-                    onChange={(e) => setSpecChunk(e.target.value)}
+                    onChange={(e) => specCustom(setSpecChunk)(e.target.value)}
                   />
                 </div>
                 <div className="space-y-1">
@@ -1465,7 +1722,7 @@ export function BoonsSettingsForm({
                     id="speculation_decide_by_tokens"
                     type="number"
                     value={specDecideBy}
-                    onChange={(e) => setSpecDecideBy(e.target.value)}
+                    onChange={(e) => specCustom(setSpecDecideBy)(e.target.value)}
                   />
                 </div>
                 <div className="space-y-1">
@@ -1474,7 +1731,7 @@ export function BoonsSettingsForm({
                     id="speculation_max_draft_tokens"
                     type="number"
                     value={specMaxDraft}
-                    onChange={(e) => setSpecMaxDraft(e.target.value)}
+                    onChange={(e) => specCustom(setSpecMaxDraft)(e.target.value)}
                   />
                 </div>
                 <div className="space-y-1">
@@ -1484,7 +1741,7 @@ export function BoonsSettingsForm({
                     type="number"
                     min={0}
                     value={specPaceMs}
-                    onChange={(e) => setSpecPaceMs(e.target.value)}
+                    onChange={(e) => specCustom(setSpecPaceMs)(e.target.value)}
                   />
                 </div>
                 <div className="space-y-1">
@@ -1493,7 +1750,7 @@ export function BoonsSettingsForm({
                     id="speculation_timeout_ms"
                     type="number"
                     value={specTimeout}
-                    onChange={(e) => setSpecTimeout(e.target.value)}
+                    onChange={(e) => specCustom(setSpecTimeout)(e.target.value)}
                   />
                 </div>
               </div>
@@ -1519,12 +1776,13 @@ export function BoonsSettingsForm({
                     type="button"
                     variant="outline"
                     size="sm"
-                    onClick={() =>
+                    onClick={() => {
+                      setSpecProfile("custom");
                       setSpecGates((gates) => [
                         ...gates,
                         { tag: "", speculate: true, agree_min: 0.5, lp_min: -1.0 },
-                      ])
-                    }
+                      ]);
+                    }}
                   >
                     <Plus className="h-3.5 w-3.5" />
                     Add category
@@ -1602,7 +1860,10 @@ export function BoonsSettingsForm({
                       type="button"
                       variant="ghost"
                       size="sm"
-                      onClick={() => setSpecGates((gates) => gates.filter((_, j) => j !== i))}
+                      onClick={() => {
+                        setSpecProfile("custom");
+                        setSpecGates((gates) => gates.filter((_, j) => j !== i));
+                      }}
                     >
                       <Trash2 className="h-3.5 w-3.5" />
                     </Button>
@@ -1612,8 +1873,14 @@ export function BoonsSettingsForm({
                   label="Unlisted categories use the global gate"
                   hint="Off = requests whose category has no row above never speculate (the target answers directly)."
                   checked={specUnlisted}
-                  onChange={() => setSpecUnlisted((value) => !value)}
+                  onChange={() => {
+                    setSpecProfile("custom");
+                    setSpecUnlisted((value) => !value);
+                  }}
                 />
+              </div>
+                  </div>
+                )}
               </div>
             </div>
           </BoonPanel>
