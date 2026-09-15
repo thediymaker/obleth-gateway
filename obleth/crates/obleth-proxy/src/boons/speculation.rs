@@ -213,6 +213,37 @@ impl Gate {
 /// Resolve the gate for a request classified into `tags`. `None` = this
 /// request must not speculate at all (category excluded, or unlisted while
 /// `unlisted_categories_speculate` is off).
+/// Choose the scoring deployment for `target` from the registered models'
+/// `verifier_for` declarations. A declaration matches when it names the
+/// target's client-facing name or its upstream family (an alias like
+/// `glm-5-3-boon` with `upstream_model: glm-5-3` is verified by anything that
+/// scores for `glm-5-3`). The target itself wins when it declares itself;
+/// otherwise the lexicographically-first declared scorer, so the choice is
+/// stable across registry refreshes.
+pub(crate) fn pick_verifier<'a>(
+    target: &ResolvedModel,
+    models: impl Iterator<Item = &'a ResolvedModel>,
+) -> Option<&'a ResolvedModel> {
+    let fam = [target.model_name.as_str(), target.upstream_model.as_str()];
+    let mut best: Option<&'a ResolvedModel> = None;
+    for m in models {
+        if !m.enabled || m.model_type != "chat" {
+            continue;
+        }
+        let scores_for = m.verifier_for.trim();
+        if scores_for.is_empty() || !fam.contains(&scores_for) {
+            continue;
+        }
+        if m.model_name == target.model_name {
+            return Some(m);
+        }
+        if best.is_none_or(|b| m.model_name < b.model_name) {
+            best = Some(m);
+        }
+    }
+    best
+}
+
 pub(crate) fn resolve_gate(s: &SpeculationBoonSettings, tags: &[String]) -> Option<Gate> {
     for g in &s.category_gates {
         if tags.iter().any(|t| t == &g.tag) {
@@ -646,9 +677,6 @@ pub async fn run(
     let Some(draft_name) = s.draft_model.as_deref() else {
         return Outcome::Abstain("no draft model");
     };
-    let Some(verify_name) = s.verify_model.as_deref() else {
-        return Outcome::Abstain("no verify model");
-    };
     // The target must not be its own drafter (a self-cascade only adds cost).
     if draft_name == req.route.model_name {
         return Outcome::Abstain("target is the drafter");
@@ -657,9 +685,35 @@ pub async fn run(
         tracing::warn!(model = %draft_name, "speculation drafter is not registered; skipping");
         return Outcome::Abstain("drafter unresolved");
     };
-    let Some(verifier_model) = crate::proxy::resolve_model(req.state, verify_name).await else {
-        tracing::warn!(model = %verify_name, "speculation verifier is not registered; skipping");
-        return Outcome::Abstain("verifier unresolved");
+    // The verifier derives from the target: whichever registered model declares
+    // `verifier_for` = this target (the target itself, or a scoring canary of
+    // it). The global `verify_model` remains only as an explicit override.
+    let verifier_model = match s
+        .verify_model
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        Some(name) => match crate::proxy::resolve_model(req.state, name).await {
+            Some(m) => m,
+            None => {
+                tracing::warn!(model = %name, "speculation verifier override is not registered; skipping");
+                return Outcome::Abstain("verifier unresolved");
+            }
+        },
+        None => {
+            let registry = req.state.model_registry.load();
+            match pick_verifier(&req.route, registry.iter().map(|c| &c.model)) {
+                Some(m) => Arc::new(m.clone()),
+                None => {
+                    tracing::info!(
+                        target = %req.route.model_name,
+                        "no registered model declares verifier_for this target; target answers directly"
+                    );
+                    return Outcome::Abstain("no scoring deployment for target");
+                }
+            }
+        }
     };
     if !drafter.enabled || !verifier_model.enabled {
         return Outcome::Abstain("helper disabled");
@@ -1292,6 +1346,56 @@ fn drive_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scorer(name: &str, upstream: &str, verifier_for: &str) -> ResolvedModel {
+        serde_json::from_value(serde_json::json!({
+            "model_name": name,
+            "upstream_model": upstream,
+            "api_base": "http://scorer.test/v1",
+            "api_key": null,
+            "admission_weight": 1,
+            "max_in_flight": null,
+            "enabled": true,
+            "cache_enabled": false,
+            "cache_ttl_secs": 0,
+            "verifier_for": verifier_for,
+        }))
+        .expect("minimal resolved model")
+    }
+
+    #[test]
+    fn pick_verifier_prefers_self_then_family_then_stable_order() {
+        let target = scorer("glm-5-3-boon", "glm-5-3", "");
+        // A canary declaring the target's upstream family matches.
+        let canary = scorer("glm-5-3-verify-canary", "glm-5-3-verify-canary", "glm-5-3");
+        // A scorer for something else never matches.
+        let other = scorer("m3-scorer", "m3-scorer", "minimax-m3");
+        let models = [other.clone(), canary.clone()];
+        let picked = pick_verifier(&target, models.iter()).expect("canary matches family");
+        assert_eq!(picked.model_name, "glm-5-3-verify-canary");
+
+        // The target declaring itself wins over any canary.
+        let self_target = scorer("glm-5-3", "glm-5-3", "glm-5-3");
+        let models = [canary.clone(), self_target.clone()];
+        let picked = pick_verifier(&self_target, models.iter()).expect("self wins");
+        assert_eq!(picked.model_name, "glm-5-3");
+
+        // Two family canaries: lexicographically-first for stability.
+        let canary_b = scorer("glm-5-3-verify-b", "glm-5-3-verify-b", "glm-5-3");
+        let models = [canary.clone(), canary_b.clone()];
+        assert_eq!(
+            pick_verifier(&target, models.iter()).unwrap().model_name,
+            "glm-5-3-verify-b"
+        );
+
+        // Disabled or non-chat scorers are skipped; none left means None.
+        let mut off = canary.clone();
+        off.enabled = false;
+        let mut embed = canary_b.clone();
+        embed.model_type = "embedding".to_string();
+        let models = [off, embed, other];
+        assert!(pick_verifier(&target, models.iter()).is_none());
+    }
 
     fn settings() -> SpeculationBoonSettings {
         SpeculationBoonSettings {

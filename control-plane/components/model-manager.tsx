@@ -1027,6 +1027,12 @@ function CreateModelWizard({
                     defaultChecked
                   />
                 </ChipGroup>
+                <Field
+                  label="Scores drafts for"
+                  name="verifier_for"
+                  defaultValue=""
+                  hint="Name the model this deployment can verify speculation drafts for — requires a direct backend URL that supports prompt_logprobs; a model may name itself. Blank = cannot score drafts."
+                />
               </section>
 
               <section className={cn("space-y-3", step !== 4 && "hidden")}>
@@ -1468,6 +1474,12 @@ function ConnectionTab({
                   defaultChecked={model.auto_eligible}
                 />
               </ChipGroup>
+              <Field
+                label="Scores drafts for"
+                name="verifier_for"
+                defaultValue={model.verifier_for ?? ""}
+                hint="Name the model this deployment can verify speculation drafts for — requires a direct backend URL that supports prompt_logprobs; a model may name itself. Blank = cannot score drafts."
+              />
             </FormSection>
           </div>
           {state?.ok === false && (

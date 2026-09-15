@@ -123,6 +123,12 @@ export interface ModelRoute {
    * candidate pool while leaving it addressable by name.
    */
   auto_eligible: boolean;
+  /**
+   * Which model this deployment can score speculation drafts for. Requires a
+   * direct backend URL supporting prompt_logprobs; a model may name itself.
+   * Empty = cannot score drafts.
+   */
+  verifier_for: string;
   context_window: number;
   admission_weight: number;
   max_in_flight: number | null;

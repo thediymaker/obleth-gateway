@@ -719,6 +719,11 @@ pub struct CreateModel {
     /// means eligible.
     #[serde(default)]
     pub auto_eligible: Option<bool>,
+    /// Which model this deployment can score speculation drafts for. Requires a
+    /// direct backend URL supporting `prompt_logprobs`; a model may name
+    /// itself. Empty or omitted means it cannot score drafts.
+    #[serde(default)]
+    pub verifier_for: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -767,6 +772,10 @@ pub struct UpdateModel {
     /// leaves the current value unchanged.
     #[serde(default)]
     pub auto_eligible: Option<bool>,
+    /// Which model this deployment can score speculation drafts for. Empty
+    /// clears it; omitted leaves the current value unchanged.
+    #[serde(default)]
+    pub verifier_for: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -4060,6 +4069,7 @@ async fn create_model(
             body.energy_slots_per_node.unwrap_or(0),
             body.route_bias.unwrap_or(1.0),
             body.auto_eligible.unwrap_or(true),
+            body.verifier_for.as_deref().unwrap_or(""),
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -4171,6 +4181,9 @@ async fn update_model(
                 .unwrap_or(existing.energy_slots_per_node),
             body.route_bias.unwrap_or(existing.route_bias),
             body.auto_eligible.unwrap_or(existing.auto_eligible),
+            body.verifier_for
+                .as_deref()
+                .unwrap_or(&existing.verifier_for),
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -5134,6 +5147,7 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         energy_slots_per_node: model.energy_slots_per_node,
         route_bias: model.route_bias,
         auto_eligible: model.auto_eligible,
+        verifier_for: model.verifier_for.clone(),
         endpoints,
     };
     if model.enabled {
@@ -5265,6 +5279,7 @@ mod tests {
                     0,
                     1.0,
                     true,
+                    "",
                 )
                 .await
                 .expect("create fixture model")

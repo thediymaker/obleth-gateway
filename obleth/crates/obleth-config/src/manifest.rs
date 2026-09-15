@@ -163,6 +163,10 @@ pub struct ManifestModel {
     pub route_bias: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_eligible: Option<bool>,
+    /// Which model this deployment can score speculation drafts for; empty
+    /// clears it. Absent leaves the stored value alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verifier_for: Option<String>,
     /// This model's endpoints, matched by `name` within the model. Absent
     /// leaves the model's endpoints alone entirely; endpoints present on the
     /// gateway but missing from the list are never deleted.
@@ -266,6 +270,7 @@ pub struct ModelConfig {
     pub energy_slots_per_node: i64,
     pub route_bias: f64,
     pub auto_eligible: bool,
+    pub verifier_for: String,
 }
 
 impl Default for ModelConfig {
@@ -307,6 +312,7 @@ impl Default for ModelConfig {
             energy_slots_per_node: 0,
             route_bias: 1.0,
             auto_eligible: true,
+            verifier_for: String::new(),
         }
     }
 }
@@ -347,6 +353,7 @@ impl From<&ModelRoute> for ModelConfig {
             energy_slots_per_node: m.energy_slots_per_node,
             route_bias: m.route_bias,
             auto_eligible: m.auto_eligible,
+            verifier_for: m.verifier_for.clone(),
         }
     }
 }
@@ -456,6 +463,7 @@ impl ModelConfig {
         );
         note(self.route_bias != other.route_bias, "route_bias");
         note(self.auto_eligible != other.auto_eligible, "auto_eligible");
+        note(self.verifier_for != other.verifier_for, "verifier_for");
         out
     }
 }
@@ -657,6 +665,9 @@ pub fn resolve_model(
     }
     if let Some(v) = entry.auto_eligible {
         next.auto_eligible = v;
+    }
+    if let Some(v) = &entry.verifier_for {
+        next.verifier_for = v.trim().to_string();
     }
 
     if let Some(raw) = &entry.tags {
@@ -902,6 +913,7 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
         energy_slots_per_node: Some(m.energy_slots_per_node),
         route_bias: Some(m.route_bias),
         auto_eligible: Some(m.auto_eligible),
+        verifier_for: Some(m.verifier_for.clone()),
         endpoints: None,
     }
 }
@@ -949,6 +961,7 @@ mod tests {
             energy_slots_per_node: 8,
             route_bias: 1.0,
             auto_eligible: true,
+            verifier_for: String::new(),
             created_at: now,
             updated_at: now,
         }

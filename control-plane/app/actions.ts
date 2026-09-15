@@ -149,6 +149,7 @@ const modelFieldsSchema = {
   energy_slots_per_node: z.preprocess(blankToUndef, z.coerce.number().int().nonnegative().default(0)),
   route_bias: z.preprocess(blankToUndef, z.coerce.number().min(0.1).max(3).default(1)),
   auto_eligible: checkbox,
+  verifier_for: optionalText,
   context_window: positiveIntWithDefault(8192),
   admission_weight: positiveIntWithDefault(100),
   supports_function_calling: checkbox,
@@ -694,6 +695,7 @@ export async function createModelAction(
     energy_slots_per_node: formData.get("energy_slots_per_node"),
     route_bias: formData.get("route_bias"),
     auto_eligible: formData.get("auto_eligible"),
+    verifier_for: formData.get("verifier_for"),
     context_window: formData.get("context_window"),
     admission_weight: formData.get("admission_weight"),
     supports_function_calling: formData.get("supports_function_calling"),
@@ -954,6 +956,7 @@ function toModelUpdateBody(model: ModelRoute) {
     energy_slots_per_node: model.energy_slots_per_node,
     route_bias: model.route_bias,
     auto_eligible: model.auto_eligible,
+    verifier_for: model.verifier_for,
     context_window: model.context_window,
     admission_weight: model.admission_weight,
     max_in_flight: model.max_in_flight,
@@ -1006,6 +1009,7 @@ export async function updateModelConnectionAction(
       energy_slots_per_node: numOr(formData.get("energy_slots_per_node"), current.energy_slots_per_node),
       route_bias: numOr(formData.get("route_bias"), current.route_bias),
       auto_eligible: formData.get("auto_eligible") === "on",
+      verifier_for: String(formData.get("verifier_for") ?? current.verifier_for ?? ""),
       ...(newKey ? { api_key: newKey } : {}),
     }, { auditActor: session.email });
   } catch (e) {
