@@ -1714,7 +1714,7 @@ export function BoonsSettingsForm({
                   {specDraftModel || "no drafter"}
                 </Badge>
                 <Badge className="border-border bg-background text-[10px] text-muted-foreground">
-                  verify: {specVerifyModel || "none"}
+                  verify: {specVerifyModel || "auto"}
                 </Badge>
                 <Badge className="border-border bg-background text-[10px] text-muted-foreground">
                   {specProfile === "custom"
@@ -1777,14 +1777,21 @@ export function BoonsSettingsForm({
                     onValueChange={setSpecVerifyModel}
                     searchPlaceholder="Filter models"
                     options={[
-                      { value: "", label: "None" },
-                      ...chatModels.map((m) => ({ value: m.model_name, label: m.model_name })),
+                      { value: "", label: "Auto — the target's scoring deployment (recommended)" },
+                      ...chatModels.map((m) => ({
+                        value: m.model_name,
+                        label: m.verifier_for
+                          ? `${m.model_name} — scores for ${m.verifier_for}`
+                          : m.model_name,
+                      })),
                     ]}
                   />
                   <p className="text-[11px] text-muted-foreground">
-                    The target model itself (or a canary of it), registered with a direct backend
-                    URL that supports <code>prompt_logprobs</code>. This is what makes a shipped
-                    draft as good as the target&apos;s own answer.
+                    Auto resolves per target: whichever model declares &quot;Scores drafts
+                    for&quot; = the target on the Models page (the target itself, or a canary of
+                    it). Verifying against the target&apos;s own family is what makes a shipped
+                    draft as good as its own answer; pick a model here only to force one global
+                    verifier.
                   </p>
                 </div>
                 <div className="space-y-1">

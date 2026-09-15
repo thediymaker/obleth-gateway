@@ -130,7 +130,7 @@ impl Store {
                     max_in_flight, capacity_mode, capacity_tuned_at, supports_function_calling,
                     supports_system_messages, supports_response_schema, supports_tool_choice,
                     supports_vision, enabled, cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                    route_bias, auto_eligible, request_timeout_secs, max_retries, retry_backoff_ms,
+                    route_bias, auto_eligible, verifier_for, request_timeout_secs, max_retries, retry_backoff_ms,
                     endpoint_selection_mode, debug_diagnostics, energy_slots_per_node,
                     health_checks_enabled, health_alerts_enabled, health_check_interval_secs,
                     health_failure_threshold, health_maintenance_until, health_maintenance_note,
@@ -379,7 +379,7 @@ impl Store {
                         supports_function_calling, supports_system_messages,
                         supports_response_schema, supports_tool_choice, supports_vision, enabled,
                         cache_enabled, cache_ttl_secs, tags, boons, tool_servers, route_bias,
-                        auto_eligible,
+                        auto_eligible, verifier_for,
                         request_timeout_secs,
                         max_retries, retry_backoff_ms, endpoint_selection_mode,
                         health_checks_enabled, health_alerts_enabled, health_check_interval_secs,
@@ -388,7 +388,7 @@ impl Store {
                         debug_diagnostics, energy_slots_per_node)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-                        $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43)
+                        $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44)
                  on conflict (id) do update set
                         model_name = excluded.model_name,
                         description = excluded.description,
@@ -419,6 +419,7 @@ impl Store {
                         tool_servers = excluded.tool_servers,
                         route_bias = excluded.route_bias,
                         auto_eligible = excluded.auto_eligible,
+                        verifier_for = excluded.verifier_for,
                         request_timeout_secs = excluded.request_timeout_secs,
                         max_retries = excluded.max_retries,
                         retry_backoff_ms = excluded.retry_backoff_ms,
@@ -464,6 +465,7 @@ impl Store {
             .bind(sqlx::types::Json(&m.tool_servers))
             .bind(m.route_bias)
             .bind(m.auto_eligible)
+            .bind(m.verifier_for.trim())
             .bind(m.request_timeout_secs)
             .bind(m.max_retries)
             .bind(m.retry_backoff_ms)
@@ -682,6 +684,7 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
             .unwrap_or_default(),
         route_bias: row.try_get("route_bias")?,
         auto_eligible: row.try_get("auto_eligible")?,
+        verifier_for: row.try_get("verifier_for").unwrap_or_default(),
         request_timeout_secs: row.try_get("request_timeout_secs")?,
         max_retries: row.try_get("max_retries")?,
         retry_backoff_ms: row.try_get("retry_backoff_ms")?,
@@ -794,6 +797,7 @@ mod tests {
                 // Excluded from auto, so the export/restore assertions below
                 // distinguish a carried value from the eligible default.
                 false,
+                "",
             )
             .await
             .expect("create model");
