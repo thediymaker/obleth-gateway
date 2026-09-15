@@ -536,13 +536,13 @@ fn finalize_stats(stats: &Arc<Mutex<StreamStats>>, usage: Option<(u32, u32)>) {
 /// Extract the next complete SSE event (up to and including the `\n\n`
 /// delimiter) from the buffer, draining it. Returns `None` while no full event
 /// is buffered yet.
-fn split_event(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
+pub(crate) fn split_event(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     let pos = buf.windows(2).position(|w| w == b"\n\n")?;
     Some(buf.drain(..pos + 2).collect())
 }
 
 /// Pull the `data:` payloads out of one SSE event.
-fn parse_data_lines(event: &[u8]) -> Vec<String> {
+pub(crate) fn parse_data_lines(event: &[u8]) -> Vec<String> {
     let text = String::from_utf8_lossy(event);
     text.lines()
         .filter_map(|line| line.trim_start().strip_prefix("data:"))
@@ -624,7 +624,7 @@ fn marker_text(name: &str, arguments: &str) -> String {
 }
 
 /// A `chat.completion.chunk` carrying a single content delta.
-fn content_chunk(id: &str, model: &str, created: i64, text: &str) -> String {
+pub(crate) fn content_chunk(id: &str, model: &str, created: i64, text: &str) -> String {
     let chunk = json!({
         "id": id,
         "object": "chat.completion.chunk",
@@ -668,7 +668,7 @@ fn reasoning_chunk(id: &str, model: &str, created: i64, text: &str) -> String {
 }
 
 /// A trailing usage-only chunk (emitted when the client asked for usage).
-fn usage_chunk(id: &str, model: &str, created: i64, input: u32, output: u32) -> String {
+pub(crate) fn usage_chunk(id: &str, model: &str, created: i64, input: u32, output: u32) -> String {
     let chunk = json!({
         "id": id,
         "object": "chat.completion.chunk",
@@ -704,7 +704,12 @@ fn forward_delta(v: &Value) -> Value {
 /// delta — the chunk a normal OpenAI stream sends right before the usage chunk
 /// and `[DONE]`. `finish_reason` defaults to `"stop"` when the upstream did not
 /// report one.
-fn finish_chunk(id: &str, model: &str, created: i64, finish_reason: Option<Value>) -> String {
+pub(crate) fn finish_chunk(
+    id: &str,
+    model: &str,
+    created: i64,
+    finish_reason: Option<Value>,
+) -> String {
     let chunk = json!({
         "id": id,
         "object": "chat.completion.chunk",
@@ -719,7 +724,7 @@ fn finish_chunk(id: &str, model: &str, created: i64, finish_reason: Option<Value
     format!("data: {chunk}\n\n")
 }
 
-fn done() -> &'static str {
+pub(crate) fn done() -> &'static str {
     "data: [DONE]\n\n"
 }
 

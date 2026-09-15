@@ -128,8 +128,8 @@ export function Companion({
           opacity: ready ? 1 : 0,
         }}
         role="button"
-        aria-label="Open Charo, the model tester"
-        title="Charo — click to test a model"
+        aria-label="Open the assistant"
+        title="Assistant — click to test a model"
       >
         <Sprite state={dragging ? "held" : state} lookAngle={look} size={SIZE} />
       </motion.div>

@@ -1041,6 +1041,9 @@ mod tests {
             energy_slots_per_node: 0,
             route_bias: 1.0,
             auto_eligible: true,
+            draft_model: String::new(),
+            verify_api_base: String::new(),
+            verify_upstream_model: String::new(),
             endpoints: Vec::new(),
         }
     }

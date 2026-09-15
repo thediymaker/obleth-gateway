@@ -86,6 +86,23 @@ async function save() {
   });
 }
 
+// The scoring controls live under the collapsed Advanced disclosure.
+async function openAdvanced() {
+  const button = [...host.querySelectorAll("button")].find((b) =>
+    b.textContent?.startsWith("Advanced —"),
+  )!;
+  await act(async () => {
+    button.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+}
+
+function profileCard(label: string) {
+  // The label span may also carry the "recommended" badge's text.
+  return [...host.querySelectorAll<HTMLButtonElement>("button[aria-pressed]")].find(
+    (b) => b.querySelector("span")?.textContent?.replace(/recommended$/, "") === label,
+  )!;
+}
+
 beforeEach(async () => {
   Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
   vi.mocked(setAutoRouterSettingsAction).mockReset();
@@ -101,14 +118,15 @@ afterEach(async () => {
   host.remove();
 });
 
-it("reflects incoming settings in the scoring controls and their readouts", () => {
+it("reflects incoming settings in the scoring controls and their readouts", async () => {
+  await openAdvanced();
   expect(range("capacity_weight").value).toBe("0.7");
   expect(range("cost_weight").value).toBe("0.2");
   expect(range("tag_weight").value).toBe("0.3");
   expect(range("temperature").value).toBe("0.4");
   expect(host.querySelector<HTMLInputElement>("#default_soft_cap")!.value).toBe("12");
   expect(selectTrigger("tier_source").textContent).toBe("Derived from cost");
-  expect(host.querySelector<HTMLInputElement>('input[type="checkbox"]')).not.toBeNull();
+  expect(host.querySelector('[role="switch"]')).not.toBeNull();
 
   // Numeric readouts beside each slider.
   expect(host.textContent).toContain("0.70");
@@ -119,10 +137,12 @@ it("reflects incoming settings in the scoring controls and their readouts", () =
 
 it("shows Deterministic at temperature 0 instead of a bare number", async () => {
   await render({ ...settings, temperature: 0 });
+  await openAdvanced();
   expect(host.textContent).toContain("Deterministic");
 });
 
 it("submits changed scoring values, the soft cap, tiering toggle, and tier source", async () => {
+  await openAdvanced();
   await act(async () => {
     setNativeValue(range("capacity_weight"), "0.5", "input");
   });
@@ -130,10 +150,10 @@ it("submits changed scoring values, the soft cap, tiering toggle, and tier sourc
     setNativeValue(host.querySelector<HTMLInputElement>("#default_soft_cap")!, "20", "input");
   });
   await act(async () => {
-    // Index 1: the classifier checkbox ("Enable intent classifier") comes first
-    // in the DOM, "Difficulty tiering" is the second checkbox in the form.
-    const toggle = host.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')[1]!;
-    toggle.click();
+    const toggle = host.querySelector<HTMLButtonElement>(
+      '[role="switch"][aria-label="Difficulty tiering"]',
+    )!;
+    toggle.dispatchEvent(new MouseEvent("click", { bubbles: true }));
   });
   await chooseOption("tier_source", "Declared only");
 
@@ -152,10 +172,38 @@ it("submits changed scoring values, the soft cap, tiering toggle, and tier sourc
 
 it("falls back to the backend defaults when no settings are saved yet", async () => {
   await render(null);
+  await openAdvanced();
   expect(range("capacity_weight").value).toBe("0.6");
   expect(range("cost_weight").value).toBe("0.4");
   expect(range("tag_weight").value).toBe("0.5");
   expect(range("temperature").value).toBe("0");
   expect(host.querySelector<HTMLInputElement>("#default_soft_cap")!.value).toBe("8");
   expect(selectTrigger("tier_source").textContent).toBe("Hybrid");
+});
+
+it("recognizes preset values, applies a picked profile, and flips to custom on a hand edit", async () => {
+  // The beforeEach settings (0.7/0.2/0.3, cap 12, derived) match no preset.
+  expect(profileCard("Custom").getAttribute("aria-pressed")).toBe("true");
+
+  // The backend defaults are exactly the Balanced preset.
+  await render(null);
+  expect(profileCard("Balanced").getAttribute("aria-pressed")).toBe("true");
+
+  // Picking a profile rewrites every scoring value it owns.
+  await act(async () => {
+    profileCard("Best answer").dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  });
+  await save();
+  const body = vi.mocked(setAutoRouterSettingsAction).mock.calls[0][0];
+  expect(body.tag_weight).toBe(0.9);
+  expect(body.cost_weight).toBe(0.05);
+  expect(body.difficulty_enabled).toBe(true);
+
+  // A hand edit under Advanced no longer matches the preset.
+  await openAdvanced();
+  await act(async () => {
+    setNativeValue(range("tag_weight"), "0.8", "input");
+  });
+  expect(profileCard("Best answer").getAttribute("aria-pressed")).toBe("false");
+  expect(profileCard("Custom").getAttribute("aria-pressed")).toBe("true");
 });

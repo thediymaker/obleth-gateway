@@ -12,6 +12,10 @@
 //!   `generate_image` tool so a chat model can produce images through a
 //!   registered image model. The tool returns a text receipt; the image itself
 //!   is attached to the final assistant message out of band.
+//! - **speculation** ([`speculation`]): answers with a fast drafter model
+//!   whenever the target model itself verifies the draft (one prompt_logprobs
+//!   prefill scores every draft token); unverified drafts fall through to the
+//!   target. Runs pre-dispatch in the proxy, not through [`ResponsePlan`].
 //!
 //! Vision rewrites only the request. Structured output additionally rewrites the
 //! **response**: when it arms a [`ResponsePlan`], the proxy forces a
@@ -41,6 +45,7 @@ pub(crate) mod image_gen;
 pub(crate) mod knowledge;
 pub mod mcp_tools;
 pub mod respond;
+pub(crate) mod speculation;
 pub(crate) mod structural_json;
 pub mod structured;
 pub mod tool_loop;
@@ -165,6 +170,33 @@ fn image_gen_eligible(
         && route.supports_function_calling
 }
 
+/// The speculation boon is eligible when the model was granted it, the boon is
+/// globally active (enabled with a drafter and a verifier configured), the key
+/// is not an internal probe (probes must measure the target model itself), and
+/// the drafter is not the target. Request-body eligibility (bypass params,
+/// multimodal content) is decided separately by
+/// [`speculation::eligible_messages`].
+fn speculation_eligible(
+    route: &obleth_config::ResolvedModel,
+    settings: &obleth_config::BoonSettings,
+    key: &obleth_config::ResolvedKey,
+) -> bool {
+    if key.internal
+        || !settings.speculation.active()
+        || !route.boons.iter().any(|b| b == "speculation")
+    {
+        return false;
+    }
+    // Both helpers resolve per target: its own drafter (fleet default as
+    // fallback) and its own scoring endpoint. Missing either means the model
+    // cannot speculate, decided here before anything is armed.
+    if speculation::scoring_base(route, &settings.speculation.verify_url_template).is_empty() {
+        return false;
+    }
+    let drafter = speculation::effective_draft_model(route, &settings.speculation);
+    !drafter.is_empty() && drafter != route.model_name
+}
+
 /// Per-request boon control header (comma-separated tokens), also echoed on
 /// responses listing the boons that were applied. Recognized request tokens:
 /// - `off`   — disable ALL boon processing for this request (wins over others).
@@ -206,6 +238,11 @@ pub struct EnrichOutcome {
     /// for the `x-obleth-compression` response header. `Some` only when the
     /// compression boon actually ran (saw tokens) on this request.
     pub compression_tokens: Option<(u32, u32)>,
+    /// Armed by the speculation boon. Consumed by the proxy BEFORE upstream
+    /// dispatch (unlike `response_plan`): a committed cascade returns the
+    /// response itself, and an abstaining one falls through to the completely
+    /// normal dispatch path. Never armed together with a `response_plan`.
+    pub speculation: Option<speculation::SpeculationPlan>,
 }
 
 /// Response-side work armed by request enrichment. Captures everything the
@@ -740,6 +777,26 @@ impl BoonEngine {
                 guardrails: existing_guardrails,
             });
         }
+
+        // ---- speculation boon ----
+        // Armed LAST, over the fully enriched body, and only when NO response
+        // plan exists: a buffered transform (structured output, tool loop) or
+        // output guardrails owns the response and must see the target model's
+        // answer, and the boon's stream would bypass output scanning. Runs
+        // pre-dispatch in the proxy; an abstain there falls through to the
+        // normal path untouched.
+        if outcome.response_plan.is_none() && speculation_eligible(route, &settings, key) {
+            if let Some(messages) = speculation::eligible_messages(json) {
+                outcome.applied.push("speculation");
+                outcome.speculation = Some(speculation::SpeculationPlan {
+                    request: json.clone(),
+                    messages,
+                    settings: settings.speculation.clone(),
+                    client_stream,
+                    include_usage,
+                });
+            }
+        }
         outcome
     }
 }
@@ -997,6 +1054,9 @@ mod tests {
             energy_slots_per_node: 0,
             route_bias: 1.0,
             auto_eligible: true,
+            draft_model: String::new(),
+            verify_api_base: String::new(),
+            verify_upstream_model: String::new(),
             endpoints: vec![],
         }
     }
@@ -1036,6 +1096,54 @@ mod tests {
         };
         k.compression_policy = policy;
         k
+    }
+
+    #[test]
+    fn speculation_eligible_requires_grant_scoring_endpoint_and_distinct_drafter() {
+        let mut route = test_route();
+        let mut key = test_key_with_policy(None);
+        let mut settings = obleth_config::BoonSettings::default();
+
+        assert!(
+            !speculation_eligible(&route, &settings, &key),
+            "nothing configured"
+        );
+        settings.speculation.enabled = true;
+        settings.speculation.draft_model = Some("drafter".into());
+        assert!(
+            !speculation_eligible(&route, &settings, &key),
+            "boon not granted on the model"
+        );
+        route.boons = vec!["speculation".into()];
+        assert!(
+            !speculation_eligible(&route, &settings, &key),
+            "the target has no scoring endpoint, so it cannot speculate"
+        );
+        route.verify_api_base = "http://scorer.test:8000/v1".into();
+        assert!(speculation_eligible(&route, &settings, &key));
+
+        key.internal = true;
+        assert!(
+            !speculation_eligible(&route, &settings, &key),
+            "internal probes must measure the target model itself"
+        );
+        key.internal = false;
+
+        // The model's own drafter beats the fleet default...
+        route.draft_model = "special-drafter".into();
+        assert!(speculation_eligible(&route, &settings, &key));
+        // ...including when that choice is the (invalid) self-draft.
+        route.draft_model = route.model_name.clone();
+        assert!(
+            !speculation_eligible(&route, &settings, &key),
+            "a model must not draft for itself"
+        );
+        route.draft_model = String::new();
+        settings.speculation.draft_model = Some(route.model_name.clone());
+        assert!(
+            !speculation_eligible(&route, &settings, &key),
+            "the fleet-default drafter must not be the target either"
+        );
     }
 
     #[test]

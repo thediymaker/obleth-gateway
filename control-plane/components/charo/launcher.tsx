@@ -42,7 +42,7 @@ export function CharoLauncher({
   state: CharoState;
   onOpen: () => void;
 }) {
-  const label = `Open Charo model tester. ${STATUS_LABEL[state]}.`;
+  const label = `Open the assistant. ${STATUS_LABEL[state]}.`;
   return (
     <button
       type="button"

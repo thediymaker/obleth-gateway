@@ -81,6 +81,9 @@ const SCHEMA_V18: &str = include_str!("../../../../schema/postgres/0018_knowledg
 const SCHEMA_V19: &str = include_str!("../../../../schema/postgres/0019_model_auto_eligible.sql");
 const SCHEMA_V20: &str =
     include_str!("../../../../schema/postgres/0020_knowledge_chunk_unique.sql");
+const SCHEMA_V23: &str =
+    include_str!("../../../../schema/postgres/0023_model_speculation_fields.sql");
+const SCHEMA_V22: &str = include_str!("../../../../schema/postgres/0022_model_verifier_for.sql");
 const SCHEMA_V21: &str =
     include_str!("../../../../schema/postgres/0021_knowledge_reindex_requested.sql");
 
@@ -225,6 +228,8 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V19).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V20).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V21).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V22).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V23).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1288,6 +1293,9 @@ impl Store {
         energy_slots_per_node: i64,
         route_bias: f64,
         auto_eligible: bool,
+        draft_model: &str,
+        verify_api_base: &str,
+        verify_upstream_model: &str,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -1297,8 +1305,9 @@ impl Store {
                 cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                 admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                 supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
-                energy_slots_per_node, route_bias, auto_eligible
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)
+                energy_slots_per_node, route_bias, auto_eligible,
+                draft_model, verify_api_base, verify_upstream_model
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
              returning id, model_name, description, upstream_model, api_base, api_key, model_type,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
@@ -1306,7 +1315,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
         .bind(Uuid::new_v4())
@@ -1337,6 +1346,9 @@ impl Store {
         .bind(energy_slots_per_node.max(0))
         .bind(route_bias)
         .bind(auto_eligible)
+        .bind(draft_model.trim())
+        .bind(verify_api_base.trim())
+        .bind(verify_upstream_model.trim())
         .fetch_one(&self.pool)
         .await?;
         model_from_row(&row)
@@ -1352,7 +1364,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
+                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                     created_at, updated_at
              from models order by model_name",
         )
@@ -1371,7 +1383,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
+                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                     created_at, updated_at
              from models where id = $1",
         )
@@ -1392,7 +1404,7 @@ impl Store {
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     capacity_mode, capacity_tuned_at,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
+                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                     created_at, updated_at
              from models where model_name = $1",
         )
@@ -1432,6 +1444,9 @@ impl Store {
         energy_slots_per_node: i64,
         route_bias: f64,
         auto_eligible: bool,
+        draft_model: &str,
+        verify_api_base: &str,
+        verify_upstream_model: &str,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -1447,6 +1462,7 @@ impl Store {
                 supports_vision = $21, boons = $22, tool_servers = $23,
                 energy_slots_per_node = $24, route_bias = $25,
                 auto_eligible = $26,
+                draft_model = $27, verify_api_base = $28, verify_upstream_model = $29,
                 updated_at = now()
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, model_type,
@@ -1456,7 +1472,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1487,6 +1503,9 @@ impl Store {
         .bind(energy_slots_per_node.max(0))
         .bind(route_bias)
         .bind(auto_eligible)
+        .bind(draft_model.trim())
+        .bind(verify_api_base.trim())
+        .bind(verify_upstream_model.trim())
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1519,7 +1538,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1548,7 +1567,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1578,7 +1597,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1604,7 +1623,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1623,7 +1642,8 @@ impl Store {
                     context_window, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible
+                    debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
+                    draft_model, verify_api_base, verify_upstream_model
              from models where enabled = true",
         )
         .fetch_all(&self.pool)
@@ -1724,6 +1744,11 @@ impl Store {
                     // migration; older SQL statements or pre-migration rows
                     // degrade to eligible, never to a silent exclusion.
                     auto_eligible: row.try_get("auto_eligible").unwrap_or(true),
+                    // Tolerant reads: columns added in the speculation-fields
+                    // migration; pre-migration rows degrade to "cannot speculate".
+                    draft_model: row.try_get("draft_model").unwrap_or_default(),
+                    verify_api_base: row.try_get("verify_api_base").unwrap_or_default(),
+                    verify_upstream_model: row.try_get("verify_upstream_model").unwrap_or_default(),
                     endpoints,
                 },
             ));
@@ -1793,7 +1818,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
         .bind(id)
@@ -1830,7 +1855,7 @@ impl Store {
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
                        request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
         .bind(id)
@@ -2850,7 +2875,7 @@ impl Store {
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                        capacity_mode, capacity_tuned_at,
-                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
         .bind(server_name)
@@ -3437,6 +3462,11 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         // SQL statements or pre-migration rows degrade to eligible, never to a
         // silent exclusion from the auto router.
         auto_eligible: row.try_get("auto_eligible").unwrap_or(true),
+        // Tolerant reads: columns added in the speculation-fields migration;
+        // pre-migration rows degrade to "cannot speculate".
+        draft_model: row.try_get("draft_model").unwrap_or_default(),
+        verify_api_base: row.try_get("verify_api_base").unwrap_or_default(),
+        verify_upstream_model: row.try_get("verify_upstream_model").unwrap_or_default(),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
@@ -3825,6 +3855,9 @@ mod tests {
                 0,
                 1.0,
                 true,
+                "",
+                "",
+                "",
             )
             .await
             .expect("create model");
@@ -4099,6 +4132,9 @@ mod tests {
                 0,
                 1.0,
                 true,
+                "",
+                "",
+                "",
             )
             .await
             .expect("create model");
@@ -4232,6 +4268,9 @@ mod tests {
                 0,
                 1.0,
                 true,
+                "",
+                "",
+                "",
             )
             .await
             .expect("create model");
@@ -4429,6 +4468,9 @@ mod tests {
                 args.22,
                 args.23,
                 true,
+                "",
+                "",
+                "",
             )
             .await
             .expect("create model");
@@ -4497,6 +4539,9 @@ mod tests {
                 args.22,
                 args.23,
                 true,
+                "",
+                "",
+                "",
             )
             .await
             .expect("update model");
@@ -4621,7 +4666,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true,
+                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
             )
             .await
             .expect("create model");
@@ -4699,7 +4744,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true,
+                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
             )
             .await
             .expect("model");
@@ -4778,7 +4823,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true,
+                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
             )
             .await
             .expect("create model");
@@ -4974,7 +5019,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true,
+                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
             )
             .await
             .expect("create model");
@@ -5067,6 +5112,9 @@ mod tests {
                 args.22,
                 args.23,
                 true,
+                "",
+                "",
+                "",
             )
             .await
             .expect("create model with both grants");
@@ -5101,6 +5149,9 @@ mod tests {
                 args.22,
                 args.23,
                 true,
+                "",
+                "",
+                "",
             )
             .await
             .expect("create model with kept grant");
@@ -5149,7 +5200,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true,
+                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
             )
             .await
             .expect("create model");
@@ -5222,6 +5273,9 @@ mod tests {
                 0,
                 1.0,
                 true,
+                "",
+                "",
+                "",
             )
             .await
             .expect("create model");
@@ -5295,6 +5349,9 @@ mod tests {
                 0,
                 1.0,
                 true,
+                "",
+                "",
+                "",
             )
             .await
             .expect("create model");
@@ -5361,7 +5418,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true,
+                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
             )
             .await
             .expect("create model");
@@ -5471,6 +5528,9 @@ mod tests {
                 8,
                 1.0,
                 true,
+                "",
+                "",
+                "",
             )
             .await
             .expect("create model");
@@ -5543,7 +5603,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true,
+                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
             )
             .await
             .expect("create model");
@@ -5594,7 +5654,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, false,
+                &args.19, &args.20, &args.21, args.22, args.23, false, "", "", "",
             )
             .await
             .expect("create model");
@@ -5666,7 +5726,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true,
+                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
             )
             .await
             .expect("create model");
@@ -5708,7 +5768,7 @@ mod tests {
             .create_model(
                 args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
                 args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true,
+                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
             )
             .await
             .expect("create model");

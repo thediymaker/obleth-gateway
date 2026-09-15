@@ -719,6 +719,16 @@ pub struct CreateModel {
     /// means eligible.
     #[serde(default)]
     pub auto_eligible: Option<bool>,
+    /// This model's own speculation drafter. Empty or omitted = fleet default.
+    #[serde(default)]
+    pub draft_model: Option<String>,
+    /// Direct URL of a deployment of this model that scores its drafts
+    /// (`prompt_logprobs`). Empty or omitted = the model cannot speculate.
+    #[serde(default)]
+    pub verify_api_base: Option<String>,
+    /// Name that scoring backend serves, if not this model's `upstream_model`.
+    #[serde(default)]
+    pub verify_upstream_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -767,6 +777,17 @@ pub struct UpdateModel {
     /// leaves the current value unchanged.
     #[serde(default)]
     pub auto_eligible: Option<bool>,
+    /// This model's own speculation drafter. Empty clears it (fleet default);
+    /// omitted leaves the current value unchanged.
+    #[serde(default)]
+    pub draft_model: Option<String>,
+    /// Direct scoring URL for this model's drafts. Empty clears it (the model
+    /// stops speculating); omitted leaves the current value unchanged.
+    #[serde(default)]
+    pub verify_api_base: Option<String>,
+    /// Name the scoring backend serves, if not `upstream_model`. Empty clears.
+    #[serde(default)]
+    pub verify_upstream_model: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1965,6 +1986,28 @@ pub struct BoonSettingsView {
     pub image_generation_allowed_sizes: Vec<String>,
     pub image_generation_max_images_per_request: u32,
     pub image_generation_timeout_ms: u64,
+    pub speculation_enabled: bool,
+    pub speculation_draft_model: Option<String>,
+    pub speculation_verify_model: Option<String>,
+    pub speculation_classify_model: Option<String>,
+    pub speculation_agree_min: f64,
+    pub speculation_lp_min: f64,
+    pub speculation_abort_agree: f64,
+    pub speculation_abort_lp: f64,
+    pub speculation_first_chunk_tokens: u32,
+    pub speculation_chunk_tokens: u32,
+    pub speculation_decide_by_tokens: u32,
+    pub speculation_max_draft_tokens: u32,
+    pub speculation_pace_ms: u64,
+    pub speculation_timeout_ms: u64,
+    /// `chat_template_kwargs` sent with draft calls, or null when unset.
+    #[schema(value_type = Object)]
+    pub speculation_draft_chat_template_kwargs: Option<serde_json::Value>,
+    /// Per-category gates as `[{tag, speculate, agree_min, lp_min}]`.
+    #[schema(value_type = Vec<Object>)]
+    pub speculation_category_gates: serde_json::Value,
+    pub speculation_unlisted_categories_speculate: bool,
+    pub speculation_verify_url_template: String,
 }
 
 impl BoonSettingsView {
@@ -1999,6 +2042,28 @@ impl BoonSettingsView {
             image_generation_allowed_sizes: s.image_generation.allowed_sizes.clone(),
             image_generation_max_images_per_request: s.image_generation.max_images_per_request,
             image_generation_timeout_ms: s.image_generation.timeout_ms,
+            speculation_enabled: s.speculation.enabled,
+            speculation_draft_model: s.speculation.draft_model.clone(),
+            speculation_verify_model: s.speculation.verify_model.clone(),
+            speculation_classify_model: s.speculation.classify_model.clone(),
+            speculation_agree_min: s.speculation.agree_min,
+            speculation_lp_min: s.speculation.lp_min,
+            speculation_abort_agree: s.speculation.abort_agree,
+            speculation_abort_lp: s.speculation.abort_lp,
+            speculation_first_chunk_tokens: s.speculation.first_chunk_tokens,
+            speculation_chunk_tokens: s.speculation.chunk_tokens,
+            speculation_decide_by_tokens: s.speculation.decide_by_tokens,
+            speculation_max_draft_tokens: s.speculation.max_draft_tokens,
+            speculation_pace_ms: s.speculation.pace_ms,
+            speculation_timeout_ms: s.speculation.timeout_ms,
+            speculation_draft_chat_template_kwargs: s
+                .speculation
+                .draft_chat_template_kwargs
+                .clone(),
+            speculation_category_gates: serde_json::to_value(&s.speculation.category_gates)
+                .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+            speculation_unlisted_categories_speculate: s.speculation.unlisted_categories_speculate,
+            speculation_verify_url_template: s.speculation.verify_url_template.clone(),
         }
     }
 }
@@ -2091,6 +2156,70 @@ pub struct UpdateBoonSettings {
     /// Generation timeout (ms). Omit/zero leaves unchanged.
     #[serde(default)]
     pub image_generation_timeout_ms: Option<u64>,
+    /// Enable or disable the speculation boon globally. Omit to leave unchanged.
+    #[serde(default)]
+    pub speculation_enabled: Option<bool>,
+    /// `model_name` of the registered chat model that drafts. Empty string
+    /// clears it (which deactivates the boon).
+    #[serde(default)]
+    pub speculation_draft_model: Option<String>,
+    /// `model_name` of the registered model that scores drafts via
+    /// prompt_logprobs. Empty string clears it (which deactivates the boon).
+    #[serde(default)]
+    pub speculation_verify_model: Option<String>,
+    /// `model_name` of the tiny classify model for per-category gates. Empty
+    /// string clears it (the default gate then applies to everything).
+    #[serde(default)]
+    pub speculation_classify_model: Option<String>,
+    /// Ship floor on rank-1 agreement, in `[0,1]`. Omit to leave unchanged.
+    #[serde(default)]
+    pub speculation_agree_min: Option<f64>,
+    /// Ship floor on mean logprob (≤ 0). Omit to leave unchanged.
+    #[serde(default)]
+    pub speculation_lp_min: Option<f64>,
+    /// Abort floor on agreement, in `[0,1]`. Omit to leave unchanged.
+    #[serde(default)]
+    pub speculation_abort_agree: Option<f64>,
+    /// Abort floor on mean logprob (≤ 0). Omit to leave unchanged.
+    #[serde(default)]
+    pub speculation_abort_lp: Option<f64>,
+    /// Draft tokens before the first verification. Omit/zero leaves unchanged.
+    #[serde(default)]
+    pub speculation_first_chunk_tokens: Option<u32>,
+    /// Draft tokens between verifications. Omit/zero leaves unchanged.
+    #[serde(default)]
+    pub speculation_chunk_tokens: Option<u32>,
+    /// Defer patience in draft tokens. Omit/zero leaves unchanged.
+    #[serde(default)]
+    pub speculation_decide_by_tokens: Option<u32>,
+    /// Drafter max_tokens cap. Omit/zero leaves unchanged.
+    #[serde(default)]
+    pub speculation_max_draft_tokens: Option<u32>,
+    /// Milliseconds between released deltas (0 = burst). Omit leaves unchanged.
+    #[serde(default)]
+    pub speculation_pace_ms: Option<u64>,
+    /// Pre-release wall-clock budget (ms). Omit/zero leaves unchanged.
+    #[serde(default)]
+    pub speculation_timeout_ms: Option<u64>,
+    /// `chat_template_kwargs` for draft calls. An empty object `{}` clears it;
+    /// omit (or null) to leave unchanged.
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub speculation_draft_chat_template_kwargs: Option<serde_json::Value>,
+    /// Replaces the per-category gate list. Entries are
+    /// `{tag, speculate?, agree_min?, lp_min?}`; an empty list clears all
+    /// per-category gates. Omit to leave unchanged.
+    #[serde(default)]
+    #[schema(value_type = Vec<Object>)]
+    pub speculation_category_gates: Option<serde_json::Value>,
+    /// Whether unlisted categories use the default gate (true) or abstain
+    /// (false). Omit to leave unchanged.
+    #[serde(default)]
+    pub speculation_unlisted_categories_speculate: Option<bool>,
+    /// Fleet rule for locating scoring endpoints ({upstream}/{model}
+    /// placeholders). Empty string clears; omitted keeps the current value.
+    #[serde(default)]
+    pub speculation_verify_url_template: Option<String>,
 }
 
 #[utoipa::path(
@@ -2202,6 +2331,84 @@ async fn put_boon_settings(
         None => existing.image_generation.tool_description.clone(),
     };
 
+    // Speculation helper models: same merge-and-validate shape as
+    // `image_generation_model` above — validate only fields the caller
+    // actually supplied, and require registered chat models.
+    let spec_draft_model = match body.speculation_draft_model.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.speculation.draft_model.clone(),
+    };
+    let spec_verify_model = match body.speculation_verify_model.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.speculation.verify_model.clone(),
+    };
+    let spec_classify_model = match body.speculation_classify_model.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.speculation.classify_model.clone(),
+    };
+    for (field, supplied, value) in [
+        (
+            "speculation_draft_model",
+            body.speculation_draft_model.is_some(),
+            spec_draft_model.as_deref(),
+        ),
+        (
+            "speculation_verify_model",
+            body.speculation_verify_model.is_some(),
+            spec_verify_model.as_deref(),
+        ),
+        (
+            "speculation_classify_model",
+            body.speculation_classify_model.is_some(),
+            spec_classify_model.as_deref(),
+        ),
+    ] {
+        if !supplied {
+            continue;
+        }
+        if let Some(name) = value {
+            match state.store.get_model_by_name(name).await {
+                Ok(model) if model.model_type == "chat" => {}
+                Ok(model) => {
+                    return Err(AdminError::BadRequest(format!(
+                        "{field} `{name}` has model_type `{}`; it must be `chat`",
+                        model.model_type
+                    )))
+                }
+                Err(obleth_store::StoreError::NotFound) => {
+                    return Err(AdminError::BadRequest(format!(
+                        "{field} `{name}` is not a registered model"
+                    )))
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    let spec_category_gates = match body.speculation_category_gates {
+        Some(v) => serde_json::from_value::<Vec<obleth_config::SpeculationCategoryGate>>(v)
+            .map_err(|e| {
+                AdminError::BadRequest(format!(
+                    "speculation_category_gates must be a list of {{tag, speculate?, agree_min?, lp_min?}}: {e}"
+                ))
+            })?,
+        None => existing.speculation.category_gates.clone(),
+    };
+    let spec_draft_kwargs = match body.speculation_draft_chat_template_kwargs {
+        // An empty object clears; any other object replaces; omit keeps.
+        Some(v) if v.as_object().is_some_and(|o| o.is_empty()) => None,
+        Some(v) if v.is_object() => Some(v),
+        Some(v) if v.is_null() => existing.speculation.draft_chat_template_kwargs.clone(),
+        Some(_) => {
+            return Err(AdminError::BadRequest(
+                "speculation_draft_chat_template_kwargs must be a JSON object".to_string(),
+            ))
+        }
+        None => existing.speculation.draft_chat_template_kwargs.clone(),
+    };
+
     let settings = BoonSettings {
         vision: VisionBoonSettings {
             enabled: body.vision_enabled.unwrap_or(existing.vision.enabled),
@@ -2306,6 +2513,62 @@ async fn put_boon_settings(
                 .filter(|ms| *ms > 0)
                 .unwrap_or(existing.image_generation.timeout_ms),
         },
+        speculation: obleth_config::SpeculationBoonSettings {
+            enabled: body
+                .speculation_enabled
+                .unwrap_or(existing.speculation.enabled),
+            draft_model: spec_draft_model,
+            verify_model: spec_verify_model,
+            classify_model: spec_classify_model,
+            agree_min: body
+                .speculation_agree_min
+                .filter(|v| (0.0..=1.0).contains(v))
+                .unwrap_or(existing.speculation.agree_min),
+            lp_min: body
+                .speculation_lp_min
+                .filter(|v| *v <= 0.0)
+                .unwrap_or(existing.speculation.lp_min),
+            abort_agree: body
+                .speculation_abort_agree
+                .filter(|v| (0.0..=1.0).contains(v))
+                .unwrap_or(existing.speculation.abort_agree),
+            abort_lp: body
+                .speculation_abort_lp
+                .filter(|v| *v <= 0.0)
+                .unwrap_or(existing.speculation.abort_lp),
+            first_chunk_tokens: body
+                .speculation_first_chunk_tokens
+                .filter(|n| *n > 0)
+                .unwrap_or(existing.speculation.first_chunk_tokens),
+            chunk_tokens: body
+                .speculation_chunk_tokens
+                .filter(|n| *n > 0)
+                .unwrap_or(existing.speculation.chunk_tokens),
+            decide_by_tokens: body
+                .speculation_decide_by_tokens
+                .filter(|n| *n > 0)
+                .unwrap_or(existing.speculation.decide_by_tokens),
+            max_draft_tokens: body
+                .speculation_max_draft_tokens
+                .filter(|n| *n > 0)
+                .unwrap_or(existing.speculation.max_draft_tokens),
+            pace_ms: body
+                .speculation_pace_ms
+                .unwrap_or(existing.speculation.pace_ms),
+            draft_chat_template_kwargs: spec_draft_kwargs,
+            timeout_ms: body
+                .speculation_timeout_ms
+                .filter(|ms| *ms > 0)
+                .unwrap_or(existing.speculation.timeout_ms),
+            category_gates: spec_category_gates,
+            unlisted_categories_speculate: body
+                .speculation_unlisted_categories_speculate
+                .unwrap_or(existing.speculation.unlisted_categories_speculate),
+            verify_url_template: body
+                .speculation_verify_url_template
+                .map(|t| t.trim().to_string())
+                .unwrap_or_else(|| existing.speculation.verify_url_template.clone()),
+        },
     };
 
     state.store.put_boon_settings(&settings).await?;
@@ -2334,6 +2597,15 @@ async fn put_boon_settings(
                 "image_generation_allowed_sizes": settings.image_generation.allowed_sizes,
                 "image_generation_max_images_per_request": settings.image_generation.max_images_per_request,
                 "image_generation_timeout_ms": settings.image_generation.timeout_ms,
+                "speculation_enabled": settings.speculation.enabled,
+                "speculation_draft_model": settings.speculation.draft_model,
+                "speculation_verify_model": settings.speculation.verify_model,
+                "speculation_classify_model": settings.speculation.classify_model,
+                "speculation_agree_min": settings.speculation.agree_min,
+                "speculation_lp_min": settings.speculation.lp_min,
+                "speculation_category_gates": settings.speculation.category_gates.len(),
+                "speculation_unlisted_categories_speculate": settings.speculation.unlisted_categories_speculate,
+                "speculation_verify_url_template": settings.speculation.verify_url_template,
             }),
         )
         .await?;
@@ -3820,6 +4092,9 @@ async fn create_model(
             body.energy_slots_per_node.unwrap_or(0),
             body.route_bias.unwrap_or(1.0),
             body.auto_eligible.unwrap_or(true),
+            body.draft_model.as_deref().unwrap_or(""),
+            body.verify_api_base.as_deref().unwrap_or(""),
+            body.verify_upstream_model.as_deref().unwrap_or(""),
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -3931,6 +4206,13 @@ async fn update_model(
                 .unwrap_or(existing.energy_slots_per_node),
             body.route_bias.unwrap_or(existing.route_bias),
             body.auto_eligible.unwrap_or(existing.auto_eligible),
+            body.draft_model.as_deref().unwrap_or(&existing.draft_model),
+            body.verify_api_base
+                .as_deref()
+                .unwrap_or(&existing.verify_api_base),
+            body.verify_upstream_model
+                .as_deref()
+                .unwrap_or(&existing.verify_upstream_model),
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -4894,6 +5176,9 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         energy_slots_per_node: model.energy_slots_per_node,
         route_bias: model.route_bias,
         auto_eligible: model.auto_eligible,
+        draft_model: model.draft_model.clone(),
+        verify_api_base: model.verify_api_base.clone(),
+        verify_upstream_model: model.verify_upstream_model.clone(),
         endpoints,
     };
     if model.enabled {
@@ -5025,6 +5310,9 @@ mod tests {
                     0,
                     1.0,
                     true,
+                    "",
+                    "",
+                    "",
                 )
                 .await
                 .expect("create fixture model")
