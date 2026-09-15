@@ -1,7 +1,18 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { Bell, Route, Database, Info, Server, Bot, Archive, BookOpen, Zap } from "lucide-react";
+import {
+  Bell,
+  Route,
+  Database,
+  Info,
+  Server,
+  Bot,
+  Archive,
+  BookOpen,
+  Sparkles,
+  Zap,
+} from "lucide-react";
 import {
   AlertSettingsForm,
   AutoRouterSettingsForm,
@@ -64,6 +75,10 @@ export function SettingsTabs({
           <Route className="h-3.5 w-3.5" />
           Routing
         </TabsTrigger>
+        <TabsTrigger value="boons">
+          <Sparkles className="h-3.5 w-3.5" />
+          Boons
+        </TabsTrigger>
         <TabsTrigger value="compression">
           <Archive className="h-3.5 w-3.5" />
           Compression
@@ -99,10 +114,11 @@ export function SettingsTabs({
       </TabsContent>
 
       <TabsContent value="routing">
-        <div className="space-y-6">
-          <AutoRouterSettingsForm settings={autoRouter} models={models} />
-          <BoonsSettingsForm settings={boons} models={models} />
-        </div>
+        <AutoRouterSettingsForm settings={autoRouter} models={models} />
+      </TabsContent>
+
+      <TabsContent value="boons">
+        <BoonsSettingsForm settings={boons} models={models} />
       </TabsContent>
 
       <TabsContent value="compression">
