@@ -10,6 +10,8 @@ import {
   Database,
   Eye,
   Image as ImageIcon,
+  Plus,
+  Rabbit,
   RefreshCw,
   Save,
   Send,
@@ -51,6 +53,7 @@ import type {
   NodeAlias,
   SlurmHealthView,
   SlurmSettingsView,
+  SpeculationCategoryGate,
   UpdateAlertSettings,
   UpdateAutoRouterSettings,
   UpdateBoonSettings,
@@ -628,7 +631,7 @@ export function AutoRouterSettingsForm({
   );
 }
 
-type BoonSectionKey = "vision" | "structured" | "tool_loop" | "image_generation";
+type BoonSectionKey = "vision" | "structured" | "tool_loop" | "image_generation" | "speculation";
 
 function ToggleSwitch({
   checked,
@@ -824,7 +827,46 @@ export function BoonsSettingsForm({
   const [imageToolDescription, setImageToolDescription] = useState(
     settings?.image_generation_tool_description ?? "",
   );
+  const [specEnabled, setSpecEnabled] = useState(settings?.speculation_enabled ?? false);
+  const [specDraftModel, setSpecDraftModel] = useState(settings?.speculation_draft_model ?? "");
+  const [specVerifyModel, setSpecVerifyModel] = useState(settings?.speculation_verify_model ?? "");
+  const [specClassifyModel, setSpecClassifyModel] = useState(
+    settings?.speculation_classify_model ?? "",
+  );
+  const [specAgreeMin, setSpecAgreeMin] = useState(String(settings?.speculation_agree_min ?? 0.5));
+  const [specLpMin, setSpecLpMin] = useState(String(settings?.speculation_lp_min ?? -1.0));
+  const [specAbortAgree, setSpecAbortAgree] = useState(
+    String(settings?.speculation_abort_agree ?? 0.45),
+  );
+  const [specAbortLp, setSpecAbortLp] = useState(String(settings?.speculation_abort_lp ?? -1.6));
+  const [specFirstChunk, setSpecFirstChunk] = useState(
+    String(settings?.speculation_first_chunk_tokens ?? 80),
+  );
+  const [specChunk, setSpecChunk] = useState(String(settings?.speculation_chunk_tokens ?? 250));
+  const [specDecideBy, setSpecDecideBy] = useState(
+    String(settings?.speculation_decide_by_tokens ?? 450),
+  );
+  const [specMaxDraft, setSpecMaxDraft] = useState(
+    String(settings?.speculation_max_draft_tokens ?? 2048),
+  );
+  const [specPaceMs, setSpecPaceMs] = useState(String(settings?.speculation_pace_ms ?? 9));
+  const [specTimeout, setSpecTimeout] = useState(String(settings?.speculation_timeout_ms ?? 45000));
+  const [specKwargs, setSpecKwargs] = useState(
+    settings?.speculation_draft_chat_template_kwargs
+      ? JSON.stringify(settings.speculation_draft_chat_template_kwargs)
+      : "",
+  );
+  const [specUnlisted, setSpecUnlisted] = useState(
+    settings?.speculation_unlisted_categories_speculate ?? true,
+  );
+  const [specGates, setSpecGates] = useState<SpeculationCategoryGate[]>(
+    settings?.speculation_category_gates ?? [],
+  );
   const [expanded, setExpanded] = useState<BoonSectionKey | null>(null);
+
+  function updateSpecGate(index: number, patch: Partial<SpeculationCategoryGate>) {
+    setSpecGates((gates) => gates.map((g, i) => (i === index ? { ...g, ...patch } : g)));
+  }
 
   const visionModels = models.filter(
     (m) => m.model_name !== "auto" && (m.supports_vision || tagsInclude(m.tags, "vision")),
@@ -842,6 +884,29 @@ export function BoonsSettingsForm({
 
   function save() {
     setStatus(null);
+    // Draft kwargs is free-form JSON; refuse to save silently-broken input.
+    let specKwargsParsed: Record<string, unknown> | undefined;
+    const kwargsText = specKwargs.trim();
+    if (kwargsText === "") {
+      specKwargsParsed = {}; // empty object clears server-side
+    } else {
+      try {
+        const parsed: unknown = JSON.parse(kwargsText);
+        if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+          throw new Error("must be a JSON object");
+        }
+        specKwargsParsed = parsed as Record<string, unknown>;
+      } catch (e) {
+        setStatus({
+          ok: false,
+          message: `Draft chat_template_kwargs is not a JSON object: ${e instanceof Error ? e.message : String(e)}`,
+        });
+        return;
+      }
+    }
+    const specGatesClean = specGates
+      .map((g) => ({ ...g, tag: g.tag.trim() }))
+      .filter((g) => g.tag.length > 0);
     const body: UpdateBoonSettings = {
       vision_enabled: enabled,
       vision_fallback_model: model.trim() ? model.trim() : "",
@@ -865,6 +930,23 @@ export function BoonsSettingsForm({
         .filter(Boolean),
       image_generation_max_images_per_request: Math.min(Number(imageMaxCount) || 2, 4),
       image_generation_timeout_ms: Number(imageTimeout) || 120000,
+      speculation_enabled: specEnabled,
+      speculation_draft_model: specDraftModel.trim() ? specDraftModel.trim() : "",
+      speculation_verify_model: specVerifyModel.trim() ? specVerifyModel.trim() : "",
+      speculation_classify_model: specClassifyModel.trim() ? specClassifyModel.trim() : "",
+      speculation_agree_min: Number(specAgreeMin) || 0.5,
+      speculation_lp_min: Number(specLpMin) || -1.0,
+      speculation_abort_agree: Number(specAbortAgree) || 0.45,
+      speculation_abort_lp: Number(specAbortLp) || -1.6,
+      speculation_first_chunk_tokens: Number(specFirstChunk) || 80,
+      speculation_chunk_tokens: Number(specChunk) || 250,
+      speculation_decide_by_tokens: Number(specDecideBy) || 450,
+      speculation_max_draft_tokens: Number(specMaxDraft) || 2048,
+      speculation_pace_ms: Math.max(Number(specPaceMs) || 0, 0),
+      speculation_timeout_ms: Number(specTimeout) || 45000,
+      speculation_draft_chat_template_kwargs: specKwargsParsed,
+      speculation_category_gates: specGatesClean,
+      speculation_unlisted_categories_speculate: specUnlisted,
     };
     start(async () => {
       const result = await setBoonSettingsAction(body);
@@ -1216,6 +1298,322 @@ export function BoonsSettingsForm({
                   What the model reads when deciding to call the tool. Clear it to restore the
                   default.
                 </p>
+              </div>
+            </div>
+          </BoonPanel>
+
+          <BoonPanel
+            title="Speculation"
+            description="Answers with a fast drafter whenever the target model itself verifies the draft; unverified drafts fall through to the target."
+            icon={Rabbit}
+            enabled={specEnabled}
+            expanded={expanded === "speculation"}
+            onToggle={() => toggleSection("speculation")}
+            summary={
+              <>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {specDraftModel || "no drafter"}
+                </Badge>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  verify: {specVerifyModel || "none"}
+                </Badge>
+                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                  {specGates.length ? `${specGates.length} category gates` : "global gate"}
+                </Badge>
+              </>
+            }
+          >
+            <div className="space-y-4">
+              <ToggleRow
+                label="Enable speculation boon"
+                hint="Applies to opted-in models. Nothing reaches the client before it is verified, so a failed draft only costs latency, never quality."
+                checked={specEnabled}
+                onChange={() => setSpecEnabled((value) => !value)}
+              />
+              <p className="text-sm text-muted-foreground">
+                The drafter writes a candidate answer and the verifier — a deployment of the target
+                model&apos;s family whose backend supports <code>prompt_logprobs</code>, registered
+                with a direct (non-gateway) URL — scores every draft token in one cheap prefill.
+                Verified spans stream to the client; a draft that fails mid-stream is continued by
+                the target model seamlessly. The classify model routes each request to its category
+                gate before any draft is paid for.
+              </p>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_draft_model">Drafter model</Label>
+                  <Select
+                    id="speculation_draft_model"
+                    value={specDraftModel}
+                    onValueChange={setSpecDraftModel}
+                    searchPlaceholder="Filter models"
+                    options={[
+                      { value: "", label: "None" },
+                      ...chatModels.map((m) => ({ value: m.model_name, label: m.model_name })),
+                    ]}
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    Needs a large speed gap over the target (5-10x) to pay off.
+                  </p>
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_verify_model">Verifier model</Label>
+                  <Select
+                    id="speculation_verify_model"
+                    value={specVerifyModel}
+                    onValueChange={setSpecVerifyModel}
+                    searchPlaceholder="Filter models"
+                    options={[
+                      { value: "", label: "None" },
+                      ...chatModels.map((m) => ({ value: m.model_name, label: m.model_name })),
+                    ]}
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    Defines &quot;verified&quot; — must be the target&apos;s model family.
+                  </p>
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_classify_model">Classify model</Label>
+                  <Select
+                    id="speculation_classify_model"
+                    value={specClassifyModel}
+                    onValueChange={setSpecClassifyModel}
+                    searchPlaceholder="Filter models"
+                    options={[
+                      { value: "", label: "None (global gate only)" },
+                      ...chatModels.map((m) => ({ value: m.model_name, label: m.model_name })),
+                    ]}
+                  />
+                  <p className="text-[11px] text-muted-foreground">
+                    A tiny non-thinking model; a reasoning model burns the classify budget.
+                  </p>
+                </div>
+              </div>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_agree_min">Ship floor: agreement (0-1)</Label>
+                  <Input
+                    id="speculation_agree_min"
+                    type="number"
+                    step="0.05"
+                    min={0}
+                    max={1}
+                    value={specAgreeMin}
+                    onChange={(e) => setSpecAgreeMin(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_lp_min">Ship floor: mean logprob</Label>
+                  <Input
+                    id="speculation_lp_min"
+                    type="number"
+                    step="0.1"
+                    max={0}
+                    value={specLpMin}
+                    onChange={(e) => setSpecLpMin(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_abort_agree">Abort floor: agreement</Label>
+                  <Input
+                    id="speculation_abort_agree"
+                    type="number"
+                    step="0.05"
+                    min={0}
+                    max={1}
+                    value={specAbortAgree}
+                    onChange={(e) => setSpecAbortAgree(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_abort_lp">Abort floor: mean logprob</Label>
+                  <Input
+                    id="speculation_abort_lp"
+                    type="number"
+                    step="0.1"
+                    max={0}
+                    value={specAbortLp}
+                    onChange={(e) => setSpecAbortLp(e.target.value)}
+                  />
+                </div>
+              </div>
+              <p className="text-[11px] text-muted-foreground">
+                Between the abort floors and the ship floors the decision is deferred while the
+                draft grows — a draft&apos;s opening is its lowest-scoring region.
+              </p>
+              <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_first_chunk_tokens">First verify at (tokens)</Label>
+                  <Input
+                    id="speculation_first_chunk_tokens"
+                    type="number"
+                    value={specFirstChunk}
+                    onChange={(e) => setSpecFirstChunk(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_chunk_tokens">Then every (tokens)</Label>
+                  <Input
+                    id="speculation_chunk_tokens"
+                    type="number"
+                    value={specChunk}
+                    onChange={(e) => setSpecChunk(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_decide_by_tokens">Defer patience (tokens)</Label>
+                  <Input
+                    id="speculation_decide_by_tokens"
+                    type="number"
+                    value={specDecideBy}
+                    onChange={(e) => setSpecDecideBy(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_max_draft_tokens">Draft token cap</Label>
+                  <Input
+                    id="speculation_max_draft_tokens"
+                    type="number"
+                    value={specMaxDraft}
+                    onChange={(e) => setSpecMaxDraft(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_pace_ms">Release pacing (ms/token)</Label>
+                  <Input
+                    id="speculation_pace_ms"
+                    type="number"
+                    min={0}
+                    value={specPaceMs}
+                    onChange={(e) => setSpecPaceMs(e.target.value)}
+                  />
+                </div>
+                <div className="space-y-1">
+                  <Label htmlFor="speculation_timeout_ms">Pre-release budget (ms)</Label>
+                  <Input
+                    id="speculation_timeout_ms"
+                    type="number"
+                    value={specTimeout}
+                    onChange={(e) => setSpecTimeout(e.target.value)}
+                  />
+                </div>
+              </div>
+              <div className="space-y-1">
+                <Label htmlFor="speculation_draft_chat_template_kwargs">
+                  Draft chat_template_kwargs (JSON)
+                </Label>
+                <Input
+                  id="speculation_draft_chat_template_kwargs"
+                  value={specKwargs}
+                  onChange={(e) => setSpecKwargs(e.target.value)}
+                  placeholder='{"reasoning": false}'
+                />
+                <p className="text-[11px] text-muted-foreground">
+                  Sent with draft calls only (e.g. to turn a drafter&apos;s thinking off — measured
+                  faster and more reliable). Blank clears it.
+                </p>
+              </div>
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <Label>Category gates</Label>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() =>
+                      setSpecGates((gates) => [
+                        ...gates,
+                        { tag: "", speculate: true, agree_min: 0.5, lp_min: -1.0 },
+                      ])
+                    }
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    Add category
+                  </Button>
+                </div>
+                <p className="text-[11px] text-muted-foreground">
+                  The classify model maps each request onto these tags; the first matching row
+                  wins, so list excluded categories first. &quot;Speculate&quot; off = the target
+                  answers directly, before any draft cost.
+                </p>
+                {specGates.length === 0 && (
+                  <p className="rounded-md border border-border bg-muted/30 px-3 py-2 text-sm text-muted-foreground">
+                    No category gates: the global ship floors above apply to every request.
+                  </p>
+                )}
+                {specGates.map((gate, i) => (
+                  <div
+                    key={i}
+                    className="grid items-end gap-2 rounded-md border border-border/60 bg-muted/20 p-2 sm:grid-cols-[1fr_auto_auto_auto_auto]"
+                  >
+                    <div className="space-y-1">
+                      <Label htmlFor={`spec_gate_tag_${i}`} className="text-[11px]">
+                        Tag
+                      </Label>
+                      <Input
+                        id={`spec_gate_tag_${i}`}
+                        value={gate.tag}
+                        onChange={(e) => updateSpecGate(i, { tag: e.target.value })}
+                        placeholder="coding"
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label className="text-[11px]">Speculate</Label>
+                      <div className="flex h-9 items-center">
+                        <input
+                          type="checkbox"
+                          checked={gate.speculate ?? true}
+                          onChange={(e) => updateSpecGate(i, { speculate: e.target.checked })}
+                          className="h-4 w-4"
+                        />
+                      </div>
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor={`spec_gate_agree_${i}`} className="text-[11px]">
+                        Agreement ≥
+                      </Label>
+                      <Input
+                        id={`spec_gate_agree_${i}`}
+                        type="number"
+                        step="0.05"
+                        min={0}
+                        max={1}
+                        className="w-24"
+                        disabled={!(gate.speculate ?? true)}
+                        value={String(gate.agree_min ?? 0.5)}
+                        onChange={(e) => updateSpecGate(i, { agree_min: Number(e.target.value) })}
+                      />
+                    </div>
+                    <div className="space-y-1">
+                      <Label htmlFor={`spec_gate_lp_${i}`} className="text-[11px]">
+                        Logprob ≥
+                      </Label>
+                      <Input
+                        id={`spec_gate_lp_${i}`}
+                        type="number"
+                        step="0.1"
+                        max={0}
+                        className="w-24"
+                        disabled={!(gate.speculate ?? true)}
+                        value={String(gate.lp_min ?? -1.0)}
+                        onChange={(e) => updateSpecGate(i, { lp_min: Number(e.target.value) })}
+                      />
+                    </div>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setSpecGates((gates) => gates.filter((_, j) => j !== i))}
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </Button>
+                  </div>
+                ))}
+                <ToggleRow
+                  label="Unlisted categories use the global gate"
+                  hint="Off = requests whose category has no row above never speculate (the target answers directly)."
+                  checked={specUnlisted}
+                  onChange={() => setSpecUnlisted((value) => !value)}
+                />
               </div>
             </div>
           </BoonPanel>
