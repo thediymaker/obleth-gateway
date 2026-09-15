@@ -370,6 +370,7 @@ export function ModelManager({
           slurmEnabled={slurmEnabled}
           mcpServers={mcpServers}
           recipeCards={recipeCards}
+          modelNames={models.map((m) => m.model_name)}
           onCancel={closeCreateWizard}
           onSubmit={submitModel}
         />
@@ -615,6 +616,7 @@ export function ModelManager({
                               model={model}
                               summary={summary}
                               mcpServers={mcpServers}
+                              modelNames={models.map((m) => m.model_name)}
                               isManaged={managed[model.id] ?? false}
                               pending={pending}
                               onCacheToggle={() => {
@@ -711,6 +713,7 @@ function CreateModelWizard({
   slurmEnabled,
   mcpServers,
   recipeCards,
+  modelNames,
   onCancel,
   onSubmit,
 }: {
@@ -719,6 +722,7 @@ function CreateModelWizard({
   slurmEnabled: boolean;
   mcpServers: McpServer[];
   recipeCards: RecipeCard[];
+  modelNames: string[];
   onCancel: () => void;
   onSubmit: (formData: FormData) => void;
 }) {
@@ -1027,12 +1031,7 @@ function CreateModelWizard({
                     defaultChecked
                   />
                 </ChipGroup>
-                <Field
-                  label="Scores drafts for"
-                  name="verifier_for"
-                  defaultValue=""
-                  hint="Name the model this deployment can verify speculation drafts for — requires a direct backend URL that supports prompt_logprobs; a model may name itself. Blank = cannot score drafts."
-                />
+                <DraftScorerField selfName={modelName} modelNames={modelNames} initial="" />
               </section>
 
               <section className={cn("space-y-3", step !== 4 && "hidden")}>
@@ -1112,6 +1111,7 @@ function ModelDetailPanel({
   mcpServers = [],
   isManaged = false,
   pending,
+  modelNames = [],
   onCacheToggle,
 }: {
   model: ModelRoute;
@@ -1119,6 +1119,7 @@ function ModelDetailPanel({
   mcpServers?: McpServer[];
   isManaged?: boolean;
   pending: boolean;
+  modelNames?: string[];
   onCacheToggle: () => void;
 }) {
   // The panel only mounts for the expanded card, so per-model detail loads
@@ -1248,7 +1249,12 @@ function ModelDetailPanel({
       </TabsContent>
 
       <TabsContent value="connection">
-        <ConnectionTab model={model} editType={editType} setEditType={setEditType} />
+        <ConnectionTab
+          model={model}
+          editType={editType}
+          setEditType={setEditType}
+          modelNames={modelNames}
+        />
       </TabsContent>
 
       <TabsContent value="capabilities">
@@ -1388,10 +1394,12 @@ function ConnectionTab({
   model,
   editType,
   setEditType,
+  modelNames = [],
 }: {
   model: ModelRoute;
   editType: string;
   setEditType: (value: string) => void;
+  modelNames?: string[];
 }) {
   const flashSaved = useContext(SaveFlashContext);
   const [state, formAction, pending] = useActionState(
@@ -1474,11 +1482,10 @@ function ConnectionTab({
                   defaultChecked={model.auto_eligible}
                 />
               </ChipGroup>
-              <Field
-                label="Scores drafts for"
-                name="verifier_for"
-                defaultValue={model.verifier_for ?? ""}
-                hint="Name the model this deployment can verify speculation drafts for — requires a direct backend URL that supports prompt_logprobs; a model may name itself. Blank = cannot score drafts."
+              <DraftScorerField
+                selfName={model.model_name}
+                modelNames={modelNames}
+                initial={model.verifier_for ?? ""}
               />
             </FormSection>
           </div>
@@ -2406,6 +2413,62 @@ function FormSection({ title, columns = 2, children }: { title: string; columns?
 
 // A labeled cluster of chip checkboxes. `info` renders an info tooltip beside the
 // label; the legacy `hint` still renders inline when provided.
+// The "can score drafts" capability as the operator thinks of it: a checkbox
+// (backend supports prompt_logprobs) plus, only when checked, WHO it scores
+// for — defaulting to itself. A separate scoring canary (whose backend serves
+// its own name) is the one case the dropdown exists for. Unchecked submits
+// verifier_for="" (cannot score).
+function DraftScorerField({
+  selfName,
+  modelNames,
+  initial,
+}: {
+  selfName: string;
+  modelNames: string[];
+  initial: string;
+}) {
+  const [canScore, setCanScore] = useState(Boolean(initial));
+  const [scoresFor, setScoresFor] = useState<string>(
+    initial && initial !== selfName ? initial : "__self__",
+  );
+  const value = !canScore ? "" : scoresFor === "__self__" ? selfName : scoresFor;
+  return (
+    <ChipGroup
+      label="Draft scoring"
+      info="Used by the speculation boon: a scoring deployment checks a fast drafter's answer token-by-token. Needs the patched backend (prompt_logprobs) on a direct, non-gateway URL."
+    >
+      <input type="hidden" name="verifier_for" value={value} />
+      <ChipCheckbox
+        name="verifier_for_enabled"
+        label="Can score drafts (prompt_logprobs)"
+        checked={canScore}
+        onChange={setCanScore}
+      />
+      {canScore && (
+        <div className="mt-1 w-full max-w-xs space-y-1">
+          <p className="text-[11px] font-medium text-muted-foreground">Scores drafts for</p>
+          <Select
+            aria-label="Scores drafts for"
+            value={scoresFor}
+            onValueChange={setScoresFor}
+            searchPlaceholder="Filter models"
+            options={[
+              { value: "__self__", label: "Itself (this model)" },
+              ...modelNames
+                .filter((n) => n !== selfName)
+                .map((n) => ({ value: n, label: n })),
+            ]}
+          />
+          <p className="text-[11px] leading-snug text-muted-foreground">
+            Usually itself. Pick another model only when this deployment is a scoring canary for
+            it (its backend serves a different name than the model it verifies).
+          </p>
+        </div>
+      )}
+    </ChipGroup>
+  );
+}
+
 function ChipGroup({ label, hint, info, children }: { label: string; hint?: string; info?: string; children: ReactNode }) {
   return (
     <div>
