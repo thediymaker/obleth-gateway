@@ -444,7 +444,7 @@ export function useCharoStream(options?: { model?: string; generation?: Generati
             patchTurn(assistantId, (m) => ({
               ...m,
               content:
-                "No brain model is configured yet, so I can't free-chat — set one in Settings, or pick an activity above and I'll run it.",
+                "No agent model is configured yet, so I can't free-chat — set one under Settings → Assistant, or pick an activity above and I'll run it.",
               streaming: false,
             }));
             setState("result");

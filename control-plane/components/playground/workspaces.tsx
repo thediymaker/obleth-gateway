@@ -11,7 +11,7 @@ import type { PlaygroundSession } from "./playground";
 import { conversationRows } from "./conversation-rows";
 
 const noop = () => {};
-const modelName = (name: string) => name === "charo" ? "Charo assistant" : name || "Choose a model";
+const modelName = (name: string) => name === "charo" ? "Assistant" : name || "Choose a model";
 
 export function UnifiedWorkspace({ storageKey, session, update, models, loading }: {
   storageKey: string; session: PlaygroundSession; update: (patch: Partial<PlaygroundSession>) => void; models: ModelRoute[]; loading: boolean;
@@ -71,7 +71,7 @@ export function UnifiedWorkspace({ storageKey, session, update, models, loading 
         <DropdownMenuContent align="start" className="max-h-[min(24rem,var(--radix-dropdown-menu-content-available-height))] w-72 max-w-[calc(100vw-2rem)] overflow-y-auto rounded-xl p-2 shadow-xl">
           <DropdownMenuLabel className="text-xs text-muted-foreground">Models · select up to four</DropdownMenuLabel>
           <DropdownMenuSeparator />
-          {[{ name: "charo", label: "Charo assistant", detail: "Guided tools and benchmarks" }, { name: "auto", label: "Automatic routing", detail: "Let the gateway choose" }, ...models.filter((m) => ["chat", "image"].includes(m.model_type) && !["auto", "charo"].includes(m.model_name)).map((m) => ({ name: m.model_name, label: m.model_name, detail: m.model_type === "image" ? "Image model" : "Chat model" }))].map((model) => {
+          {[{ name: "charo", label: "Assistant", detail: "Guided tools and benchmarks" }, { name: "auto", label: "Automatic routing", detail: "Let the gateway choose" }, ...models.filter((m) => ["chat", "image"].includes(m.model_type) && !["auto", "charo"].includes(m.model_name)).map((m) => ({ name: m.model_name, label: m.model_name, detail: m.model_type === "image" ? "Image model" : "Chat model" }))].map((model) => {
             const existing = session.models.indexOf(model.name);
             const selected = existing >= 0 && recipients.includes(existing);
             const available = session.models.findIndex((name, i) => !name || (!recipients.includes(i) && streams[i].messages.length === 0));
