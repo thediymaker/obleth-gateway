@@ -213,35 +213,39 @@ impl Gate {
 /// Resolve the gate for a request classified into `tags`. `None` = this
 /// request must not speculate at all (category excluded, or unlisted while
 /// `unlisted_categories_speculate` is off).
-/// Choose the scoring deployment for `target` from the registered models'
-/// `verifier_for` declarations. A declaration matches when it names the
-/// target's client-facing name or its upstream family (an alias like
-/// `glm-5-3-boon` with `upstream_model: glm-5-3` is verified by anything that
-/// scores for `glm-5-3`). The target itself wins when it declares itself;
-/// otherwise the lexicographically-first declared scorer, so the choice is
-/// stable across registry refreshes.
-pub(crate) fn pick_verifier<'a>(
-    target: &ResolvedModel,
-    models: impl Iterator<Item = &'a ResolvedModel>,
-) -> Option<&'a ResolvedModel> {
-    let fam = [target.model_name.as_str(), target.upstream_model.as_str()];
-    let mut best: Option<&'a ResolvedModel> = None;
-    for m in models {
-        if !m.enabled || m.model_type != "chat" {
-            continue;
-        }
-        let scores_for = m.verifier_for.trim();
-        if scores_for.is_empty() || !fam.contains(&scores_for) {
-            continue;
-        }
-        if m.model_name == target.model_name {
-            return Some(m);
-        }
-        if best.is_none_or(|b| m.model_name < b.model_name) {
-            best = Some(m);
-        }
+/// The drafter for one target: the model's own `draft_model`, else the fleet
+/// default from the boon settings, else empty (cannot speculate).
+pub(crate) fn effective_draft_model(route: &ResolvedModel, s: &SpeculationBoonSettings) -> String {
+    let own = route.draft_model.trim();
+    if !own.is_empty() {
+        return own.to_string();
     }
-    best
+    s.draft_model
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// The verifier for one target, synthesized from the target itself with the
+/// wire target swapped to its scoring endpoint. Billing therefore lands under
+/// the target's name at the target's rates, which is honest: the scorer IS
+/// the target's family. Returns `None` when the model has no scoring endpoint.
+pub(crate) fn scoring_route(route: &ResolvedModel) -> Option<Arc<ResolvedModel>> {
+    let base = route.verify_api_base.trim();
+    if base.is_empty() {
+        return None;
+    }
+    let mut verifier = (*route).clone();
+    verifier.api_base = base.to_string();
+    let served = route.verify_upstream_model.trim();
+    if !served.is_empty() {
+        verifier.upstream_model = served.to_string();
+    }
+    // The scoring endpoint is a single direct URL; the target's endpoint list
+    // must not override it.
+    verifier.endpoints = Vec::new();
+    Some(Arc::new(verifier))
 }
 
 pub(crate) fn resolve_gate(s: &SpeculationBoonSettings, tags: &[String]) -> Option<Gate> {
@@ -674,50 +678,32 @@ pub async fn run(
     stats: Arc<Mutex<SpecStats>>,
 ) -> Outcome {
     let s = &plan.settings;
-    let Some(draft_name) = s.draft_model.as_deref() else {
+    // The drafter is the target's own choice; the fleet default is the fallback.
+    let draft_name = effective_draft_model(&req.route, s);
+    if draft_name.is_empty() {
         return Outcome::Abstain("no draft model");
-    };
+    }
     // The target must not be its own drafter (a self-cascade only adds cost).
     if draft_name == req.route.model_name {
         return Outcome::Abstain("target is the drafter");
     }
-    let Some(drafter) = crate::proxy::resolve_model(req.state, draft_name).await else {
+    let Some(drafter) = crate::proxy::resolve_model(req.state, &draft_name).await else {
         tracing::warn!(model = %draft_name, "speculation drafter is not registered; skipping");
         return Outcome::Abstain("drafter unresolved");
     };
-    // The verifier derives from the target: whichever registered model declares
-    // `verifier_for` = this target (the target itself, or a scoring canary of
-    // it). The global `verify_model` remains only as an explicit override.
-    let verifier_model = match s
-        .verify_model
-        .as_deref()
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-    {
-        Some(name) => match crate::proxy::resolve_model(req.state, name).await {
-            Some(m) => m,
-            None => {
-                tracing::warn!(model = %name, "speculation verifier override is not registered; skipping");
-                return Outcome::Abstain("verifier unresolved");
-            }
-        },
-        None => {
-            let registry = req.state.model_registry.load();
-            match pick_verifier(&req.route, registry.iter().map(|c| &c.model)) {
-                Some(m) => Arc::new(m.clone()),
-                None => {
-                    tracing::info!(
-                        target = %req.route.model_name,
-                        "no registered model declares verifier_for this target; target answers directly"
-                    );
-                    return Outcome::Abstain("no scoring deployment for target");
-                }
-            }
-        }
-    };
-    if !drafter.enabled || !verifier_model.enabled {
+    if !drafter.enabled {
         return Outcome::Abstain("helper disabled");
     }
+    // Verification is the target's own scoring endpoint: a direct-URL
+    // deployment of this model whose backend supports prompt_logprobs (its
+    // own pods once patched, a canary until then). Not a registered route.
+    let Some(verifier_model) = scoring_route(&req.route) else {
+        tracing::info!(
+            target = %req.route.model_name,
+            "target has no scoring endpoint configured; answering directly"
+        );
+        return Outcome::Abstain("no scoring endpoint");
+    };
 
     // Per-category gate: classify the request with this boon's own tag
     // vocabulary (fail-open to empty tags = the unlisted default). A
@@ -1347,54 +1333,55 @@ fn drive_stream(
 mod tests {
     use super::*;
 
-    fn scorer(name: &str, upstream: &str, verifier_for: &str) -> ResolvedModel {
+    fn target(name: &str) -> ResolvedModel {
         serde_json::from_value(serde_json::json!({
             "model_name": name,
-            "upstream_model": upstream,
-            "api_base": "http://scorer.test/v1",
+            "upstream_model": format!("{name}-mxfp4"),
+            "api_base": "http://gateway.test/v1",
             "api_key": null,
             "admission_weight": 1,
             "max_in_flight": null,
             "enabled": true,
             "cache_enabled": false,
             "cache_ttl_secs": 0,
-            "verifier_for": verifier_for,
         }))
         .expect("minimal resolved model")
     }
 
     #[test]
-    fn pick_verifier_prefers_self_then_family_then_stable_order() {
-        let target = scorer("glm-5-3-boon", "glm-5-3", "");
-        // A canary declaring the target's upstream family matches.
-        let canary = scorer("glm-5-3-verify-canary", "glm-5-3-verify-canary", "glm-5-3");
-        // A scorer for something else never matches.
-        let other = scorer("m3-scorer", "m3-scorer", "minimax-m3");
-        let models = [other.clone(), canary.clone()];
-        let picked = pick_verifier(&target, models.iter()).expect("canary matches family");
-        assert_eq!(picked.model_name, "glm-5-3-verify-canary");
+    fn drafter_and_scorer_come_from_the_target_model() {
+        let mut route = target("glm-5-3");
+        let mut s = SpeculationBoonSettings {
+            draft_model: Some("fleet-default-drafter".into()),
+            ..Default::default()
+        };
 
-        // The target declaring itself wins over any canary.
-        let self_target = scorer("glm-5-3", "glm-5-3", "glm-5-3");
-        let models = [canary.clone(), self_target.clone()];
-        let picked = pick_verifier(&self_target, models.iter()).expect("self wins");
-        assert_eq!(picked.model_name, "glm-5-3");
+        // Drafter: the model's own choice wins; fleet default is the fallback.
+        assert_eq!(effective_draft_model(&route, &s), "fleet-default-drafter");
+        route.draft_model = "north-mini-code".into();
+        assert_eq!(effective_draft_model(&route, &s), "north-mini-code");
+        route.draft_model = "  ".into();
+        s.draft_model = None;
+        assert_eq!(effective_draft_model(&route, &s), "");
 
-        // Two family canaries: lexicographically-first for stability.
-        let canary_b = scorer("glm-5-3-verify-b", "glm-5-3-verify-b", "glm-5-3");
-        let models = [canary.clone(), canary_b.clone()];
-        assert_eq!(
-            pick_verifier(&target, models.iter()).unwrap().model_name,
-            "glm-5-3-verify-b"
-        );
+        // Scorer: none configured = cannot speculate.
+        assert!(scoring_route(&route).is_none());
 
-        // Disabled or non-chat scorers are skipped; none left means None.
-        let mut off = canary.clone();
-        off.enabled = false;
-        let mut embed = canary_b.clone();
-        embed.model_type = "embedding".to_string();
-        let models = [off, embed, other];
-        assert!(pick_verifier(&target, models.iter()).is_none());
+        // A canary endpoint serving its own name: URL and served name swap,
+        // identity (name, rates) stays the target's.
+        route.verify_api_base = "http://canary.test:8000/v1".into();
+        route.verify_upstream_model = "glm-5-3-verify-canary".into();
+        let v = scoring_route(&route).expect("scoring endpoint set");
+        assert_eq!(v.model_name, "glm-5-3");
+        assert_eq!(v.api_base, "http://canary.test:8000/v1");
+        assert_eq!(v.upstream_model, "glm-5-3-verify-canary");
+        assert!(v.endpoints.is_empty());
+
+        // Once the target's own pods are patched, only the URL is set and the
+        // scorer serves the target's own upstream name.
+        route.verify_upstream_model = String::new();
+        let v = scoring_route(&route).expect("scoring endpoint set");
+        assert_eq!(v.upstream_model, "glm-5-3-mxfp4");
     }
 
     fn settings() -> SpeculationBoonSettings {

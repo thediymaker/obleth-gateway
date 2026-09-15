@@ -1192,7 +1192,6 @@ export function BoonsSettingsForm({
   );
   const [specEnabled, setSpecEnabled] = useState(settings?.speculation_enabled ?? false);
   const [specDraftModel, setSpecDraftModel] = useState(settings?.speculation_draft_model ?? "");
-  const [specVerifyModel, setSpecVerifyModel] = useState(settings?.speculation_verify_model ?? "");
   const [specClassifyModel, setSpecClassifyModel] = useState(
     settings?.speculation_classify_model ?? "",
   );
@@ -1331,7 +1330,9 @@ export function BoonsSettingsForm({
       image_generation_timeout_ms: Number(imageTimeout) || 120000,
       speculation_enabled: specEnabled,
       speculation_draft_model: specDraftModel.trim() ? specDraftModel.trim() : "",
-      speculation_verify_model: specVerifyModel.trim() ? specVerifyModel.trim() : "",
+      // Deprecated: verification resolves per target from the model's own
+      // scoring endpoint; the global override is retired.
+      speculation_verify_model: "",
       speculation_classify_model: specClassifyModel.trim() ? specClassifyModel.trim() : "",
       speculation_agree_min: Number(specAgreeMin) || 0.5,
       speculation_lp_min: Number(specLpMin) || -1.0,
@@ -1714,9 +1715,6 @@ export function BoonsSettingsForm({
                   {specDraftModel || "no drafter"}
                 </Badge>
                 <Badge className="border-border bg-background text-[10px] text-muted-foreground">
-                  verify: {specVerifyModel || "auto"}
-                </Badge>
-                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
                   {specProfile === "custom"
                     ? "custom policy"
                     : `${SPEC_PROFILES.find((p) => p.key === specProfile)?.label ?? specProfile} profile`}
@@ -1749,13 +1747,13 @@ export function BoonsSettingsForm({
                 />
               </ol>
               <p className="text-[11px] text-muted-foreground">
-                The target is whichever model has Speculation ticked on the Models page, and
-                verification is automatic: the deployment marked &quot;scores drafts for&quot; that
-                model does the judging. This panel only configures the fleet-wide helpers.
+                Each model configures its own cascade on the Models page: tick Speculation there,
+                pick its drafter, and set its scoring endpoint. This panel holds only the fleet
+                defaults and thresholds.
               </p>
               <div className="grid gap-4 sm:grid-cols-2">
                 <div className="space-y-1">
-                  <Label htmlFor="speculation_draft_model">Drafter — writes the answer</Label>
+                  <Label htmlFor="speculation_draft_model">Default drafter — writes the answer</Label>
                   <Select
                     id="speculation_draft_model"
                     value={specDraftModel}
@@ -1767,7 +1765,8 @@ export function BoonsSettingsForm({
                     ]}
                   />
                   <p className="text-[11px] text-muted-foreground">
-                    A small model 5-10x faster than the target; the speed gap is the whole payoff.
+                    Fleet default; a model can pick its own drafter on the Models page. Needs a
+                    5-10x speed gap over the target to pay off.
                   </p>
                 </div>
                 <div className="space-y-1">
@@ -1796,33 +1795,10 @@ export function BoonsSettingsForm({
                 customBlurb="The values under Advanced no longer match a preset. Picking a profile above overwrites them."
               />
               <AdvancedDisclosure
-                label="Advanced — verifier override, decision floors, verify cadence, category gates"
+                label="Advanced — decision floors, verify cadence, category gates"
                 open={specAdvanced}
                 onToggle={() => setSpecAdvanced((value) => !value)}
               >
-                <div className="max-w-md space-y-1">
-                  <Label htmlFor="speculation_verify_model">Verifier override</Label>
-                  <Select
-                    id="speculation_verify_model"
-                    value={specVerifyModel}
-                    onValueChange={setSpecVerifyModel}
-                    searchPlaceholder="Filter models"
-                    options={[
-                      { value: "", label: "Auto — the target's scoring deployment (recommended)" },
-                      ...chatModels.map((m) => ({
-                        value: m.model_name,
-                        label: m.verifier_for
-                          ? `${m.model_name} — scores for ${m.verifier_for}`
-                          : m.model_name,
-                      })),
-                    ]}
-                  />
-                  <p className="text-[11px] text-muted-foreground">
-                    Auto resolves per target from &quot;scores drafts for&quot; on the Models page.
-                    Forcing one global verifier here only makes sense while a single family
-                    speculates.
-                  </p>
-                </div>
               <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
                 <div className="space-y-1">
                   <Label htmlFor="speculation_agree_min">Ship floor: agreement (0-1)</Label>

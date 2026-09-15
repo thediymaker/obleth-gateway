@@ -46,7 +46,7 @@ const MODEL_COLUMNS: &str = "id, model_name, description, upstream_model, api_ba
      supports_system_messages, supports_response_schema, supports_tool_choice,
      supports_vision, enabled, cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
      request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
-     debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, verifier_for,
+     debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
      created_at, updated_at";
 
 const ENDPOINT_COLUMNS: &str = "id, model_id, name, api_base, api_key, priority, weight, enabled,
@@ -76,10 +76,11 @@ impl Store {
                     supports_vision, enabled, cache_enabled, cache_ttl_secs, tags, boons,
                     tool_servers, request_timeout_secs, max_retries, retry_backoff_ms,
                     endpoint_selection_mode, debug_diagnostics, energy_slots_per_node,
-                    route_bias, auto_eligible, verifier_for
+                    route_bias, auto_eligible,
+                    draft_model, verify_api_base, verify_upstream_model
                  ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                     $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-                    $32, $33, $34, $35, $36)
+                    $32, $33, $34, $35, $36, $37, $38)
                  on conflict (model_name) do update set
                     description = excluded.description,
                     upstream_model = excluded.upstream_model,
@@ -114,7 +115,9 @@ impl Store {
                     energy_slots_per_node = excluded.energy_slots_per_node,
                     route_bias = excluded.route_bias,
                     auto_eligible = excluded.auto_eligible,
-                    verifier_for = excluded.verifier_for,
+                    draft_model = excluded.draft_model,
+                    verify_api_base = excluded.verify_api_base,
+                    verify_upstream_model = excluded.verify_upstream_model,
                     updated_at = now()
                  returning {MODEL_COLUMNS}, (xmax = 0) as inserted"
             );
@@ -157,7 +160,9 @@ impl Store {
                 .bind(c.energy_slots_per_node)
                 .bind(c.route_bias)
                 .bind(c.auto_eligible)
-                .bind(c.verifier_for.trim())
+                .bind(c.draft_model.trim())
+                .bind(c.verify_api_base.trim())
+                .bind(c.verify_upstream_model.trim())
                 .fetch_one(&mut *tx)
                 .await?;
 
