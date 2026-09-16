@@ -410,6 +410,18 @@ async fn main() -> anyhow::Result<()> {
         alerts: alerts.clone(),
         local_cache_tx: Some(local_cache_tx),
         output_stats: output_stats.clone(),
+        // Simulate's opt-in real classification: same classifier instance,
+        // same cache, same timeout as the data plane.
+        classify: Some(std::sync::Arc::new({
+            let st = app_state.clone();
+            move |prompt: String, tags: Vec<String>| {
+                let st = st.clone();
+                Box::pin(async move { proxy::classify_for_simulate(&st, prompt, tags).await })
+                    as std::pin::Pin<
+                        Box<dyn std::future::Future<Output = router::Intent> + Send>,
+                    >
+            }
+        })),
     };
     obleth_admin::model_health::spawn_worker(admin_state.clone());
     obleth_admin::usage_retention::spawn_worker(admin_state.clone());

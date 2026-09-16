@@ -2250,6 +2250,39 @@ fn message_text(content: Option<&serde_json::Value>) -> String {
     }
 }
 
+/// Bridge for the admin simulate endpoint: run the live intent classifier
+/// exactly as `derive_intent` would — same brain resolution, same shared
+/// cache, same timeout — on an already-built prompt and tag menu. Returns
+/// `Intent::default()` (empty tags) when the classifier is off, unconfigured,
+/// or unresolvable, which is the same "no signal, fall back to heuristics"
+/// shape the data plane reads.
+pub async fn classify_for_simulate(
+    state: &AppState,
+    prompt: String,
+    available_tags: Vec<String>,
+) -> crate::router::Intent {
+    let settings = state.classifier.settings();
+    if !settings.classifier_active() || available_tags.is_empty() {
+        return crate::router::Intent::default();
+    }
+    let Some(name) = settings.classifier_model.as_deref() else {
+        return crate::router::Intent::default();
+    };
+    if name == crate::router::AUTO_MODEL_NAME {
+        return crate::router::Intent::default();
+    }
+    let Some(brain) = resolve_model(state, name).await else {
+        return crate::router::Intent::default();
+    };
+    if prompt.trim().is_empty() {
+        return crate::router::Intent::default();
+    }
+    state
+        .classifier
+        .classify(&state.http, &brain, &prompt, &available_tags)
+        .await
+}
+
 pub(crate) async fn resolve_model(state: &AppState, name: &str) -> Option<Arc<ResolvedModel>> {
     if let Some(r) = state.model_cache.get(name).await {
         return Some(r);

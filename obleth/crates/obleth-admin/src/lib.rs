@@ -13,6 +13,7 @@ pub mod energy_probe;
 mod error;
 pub mod knowledge;
 pub mod model_health;
+pub mod router_readiness;
 mod models_io;
 mod openapi;
 pub mod recipes;
@@ -98,7 +99,27 @@ pub struct AdminState {
     /// output tokens the live router uses. `Default` (empty) in a standalone
     /// admin process; scoring then falls back to the documented default.
     pub output_stats: obleth_config::routing::OutputStats,
+    /// Bridge to the data plane's intent classifier, for `simulate` calls that
+    /// opt into a real classification (`classify: true`). Injected by the
+    /// binary that owns the classifier so this crate never depends on the
+    /// proxy; `None` (a standalone admin process) means simulate stays
+    /// heuristic-only and says so.
+    pub classify: Option<ClassifyFn>,
 }
+
+/// A boxed call into the data plane's classifier: `(prompt, available_tags)`
+/// to the derived [`obleth_config::routing::Intent`]. Timeout, caching and
+/// every failure-lowers-difficulty guarantee live behind the closure, in the
+/// classifier itself.
+pub type ClassifyFn = std::sync::Arc<
+    dyn Fn(
+            String,
+            Vec<String>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = obleth_config::routing::Intent> + Send>,
+        > + Send
+        + Sync,
+>;
 
 /// Build the `/api/v1` router. `/health` and the OpenAPI doc are public; every
 /// other route requires a bearer admin token.
@@ -313,6 +334,10 @@ pub fn router(state: AdminState) -> Router {
             get(get_auto_router_settings).put(put_auto_router_settings),
         )
         .route("/api/v1/router/simulate", post(simulate_route))
+        .route(
+            "/api/v1/router/readiness",
+            get(router_readiness::get_router_readiness),
+        )
         .route(
             "/api/v1/settings/boons",
             get(get_boon_settings).put(put_boon_settings),
@@ -1803,6 +1828,13 @@ pub struct SimulateRouteRequest {
     /// was used is echoed back as `uniform`.
     #[serde(default)]
     pub uniform: Option<f64>,
+    /// Ask the LIVE intent classifier (the same brain, cache and timeout the
+    /// data plane uses) instead of the keyword heuristic. Costs one small
+    /// model call. Ignored — heuristics as before — when the classifier is
+    /// disabled, unconfigured, or this admin runs without a data plane; the
+    /// response's `tag_source` says which one actually ran.
+    #[serde(default)]
+    pub classify: bool,
 }
 
 /// Run the whole `auto` routing pipeline against the live fleet and return the
@@ -1917,7 +1949,41 @@ async fn simulate_route(
     features.needs_tool_choice |= body.needs_tool_choice;
     features.needs_response_schema |= body.needs_response_schema;
 
-    let mut intent = heuristic_intent(&json, est_input_tokens);
+    let mut intent = None;
+    if body.classify {
+        if let Some(classify) = state.classify.as_ref() {
+            let settings = state
+                .store
+                .get_auto_router_settings()
+                .await?
+                .unwrap_or_default();
+            if settings.classifier_active() {
+                // Same menu the data plane offers: only tags a candidate
+                // actually carries. The prompt is the synthesized body's text,
+                // which for a plain `prompt` is exactly what a client would
+                // have sent.
+                let mut menu: Vec<String> = Vec::new();
+                for c in &candidates {
+                    for t in &c.model.tags {
+                        if !menu.contains(t) {
+                            menu.push(t.clone());
+                        }
+                    }
+                }
+                let text = simulate_prompt_text(&json);
+                if !menu.is_empty() && !text.trim().is_empty() {
+                    let derived = classify(text, menu).await;
+                    // Empty tags = the classifier's documented failure shape;
+                    // fall back to heuristics exactly as the data plane does.
+                    if !derived.tags.is_empty() {
+                        intent = Some(derived);
+                    }
+                }
+            }
+        }
+    }
+    let mut intent =
+        intent.unwrap_or_else(|| heuristic_intent(&json, est_input_tokens));
     if let Some(difficulty) = difficulty_from_header(body.effort.as_deref()) {
         intent.difficulty = difficulty;
         intent.source = IntentSource::Header;
@@ -1957,6 +2023,39 @@ async fn simulate_route(
         uniform,
         &intent,
     )))
+}
+
+/// The classifier prompt for a simulated request: the system message (if any)
+/// plus the first user message's text — the same compact shape the data
+/// plane's classifier reads, so a simulated classification is of the same
+/// prompt a live one would see.
+fn simulate_prompt_text(json: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
+        let mut have_user = false;
+        for msg in messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            let text = match msg.get("content") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(serde_json::Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            };
+            if role == "system" && !text.is_empty() {
+                parts.push(text);
+            } else if role == "user" && !have_user && !text.is_empty() {
+                parts.push(text);
+                have_user = true;
+            }
+            if have_user {
+                break;
+            }
+        }
+    }
+    parts.join("\n")
 }
 
 /// View of the persisted model-"boons" settings, flattened per boon
@@ -5369,6 +5468,7 @@ mod tests {
                 clickhouse: clickhouse::Client::default(),
                 admin_token: TEST_ADMIN_TOKEN.to_string(),
                 output_stats: Default::default(),
+                classify: None,
                 health: ModelHealthRuntime {
                     scheduled_enabled: false,
                     default_interval_secs: 60,
