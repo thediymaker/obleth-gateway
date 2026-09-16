@@ -1565,15 +1565,18 @@ function tagsFromForm(formData: FormData): string[] {
     if (!key.startsWith("tag_") || key.startsWith("tag_level_") || value !== "on") continue;
     const base = key.slice("tag_".length);
     const level = clampTagLevel(formData.get(`tag_level_${base}`));
-    tags.push(level > 1 ? `${base}:${level}` : base);
+    // 0 = "Auto": saved bare, the level derives from cost rank under hybrid
+    // tier sourcing. An explicit level — INCLUDING 1 — keeps its suffix, so
+    // "pinned weak on purpose" survives the round trip.
+    tags.push(level > 0 ? `${base}:${level}` : base);
   }
   return tags;
 }
 
 function clampTagLevel(raw: FormDataEntryValue | null): number {
   const n = Number(raw);
-  if (!Number.isFinite(n)) return 1;
-  return Math.min(3, Math.max(1, Math.trunc(n)));
+  if (!Number.isFinite(n)) return 0;
+  return Math.min(3, Math.max(0, Math.trunc(n)));
 }
 
 // Collects checked boon checkboxes (named `boon_<name>`) from a model form into

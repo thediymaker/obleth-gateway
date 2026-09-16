@@ -2492,7 +2492,7 @@ function TagLevelPicker({ tag, level, onChange }: { tag: string; level: number; 
       aria-label={`${tag} strength level`}
       className="inline-flex items-center gap-0.5 rounded-md border border-border bg-muted/40 p-0.5"
     >
-      {([1, 2, 3] as const).map((lvl) => (
+      {([0, 1, 2, 3] as const).map((lvl) => (
         <label key={lvl} className="cursor-pointer">
           <input
             type="radio"
@@ -2500,7 +2500,7 @@ function TagLevelPicker({ tag, level, onChange }: { tag: string; level: number; 
             value={lvl}
             checked={level === lvl}
             onChange={() => onChange(lvl)}
-            aria-label={`${tag}: ${TAG_LEVEL_LABELS[lvl]} (level ${lvl})`}
+            aria-label={lvl === 0 ? `${tag}: Auto (level derives from cost rank)` : `${tag}: ${TAG_LEVEL_LABELS[lvl]} (level ${lvl})`}
             className="peer sr-only"
           />
           <span
@@ -2557,7 +2557,12 @@ export function ChatCapabilityFields({
     for (const tag of MODEL_TAGS) {
       const match = model?.tags?.map(parseTagLevel).find((t) => t.base === tag);
       const nativeVision = tag === "vision" && Boolean(model?.supports_vision);
-      state[tag] = { checked: Boolean(match) || nativeVision, level: match?.level ?? 1 };
+      // A bare saved tag means "Auto": the level derives from cost rank under
+      // hybrid tier sourcing. Only an explicit :level suffix pins a level.
+      state[tag] = {
+        checked: Boolean(match) || nativeVision,
+        level: match ? (match.declared ? match.level : 0) : 0,
+      };
     }
     return state;
   });

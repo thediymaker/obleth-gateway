@@ -809,10 +809,32 @@ export interface ScoredCandidateView {
   level: number;
   spare: number;
   cost_score: number;
+  /**
+   * Estimated dollars for this request on this model: unit prices weighted by
+   * the prompt estimate and the model's observed average completion length.
+   * What `cost_score` normalizes over.
+   */
+  est_cost: number;
   tag_score: number;
   bias: number;
   score: number;
   chosen: boolean;
+}
+
+export interface ReadinessFindingView {
+  severity: "warn" | "info";
+  code: string;
+  title: string;
+  detail: string;
+  models: string[];
+}
+
+/// The routing readiness report: known auto-misroute shapes as findings.
+export interface RouterReadinessView {
+  findings: ReadinessFindingView[];
+  pool_size: number;
+  classifier_active: boolean;
+  difficulty_enabled: boolean;
 }
 
 export interface RejectionView {
@@ -880,6 +902,13 @@ export interface SimulateRouteRequest {
    * comparing two simulations so only the weight change moves the result.
    */
   uniform?: number;
+  /**
+   * Derive intent through the LIVE classifier (same brain, cache and timeout
+   * the data plane uses) instead of the keyword heuristic. One small model
+   * call. Falls back to heuristics when the classifier is off; the response's
+   * tag_source says which one ran.
+   */
+  classify?: boolean;
 }
 
 export interface BoonSettingsView {
@@ -1945,12 +1974,17 @@ export const obleth = {
     }),
   /// Run the whole `auto` pipeline against the live fleet and return the
   /// decision it would make, without dispatching anything. Read-only: no audit
-  /// entry, no upstream call, and no classifier round trip.
+  /// entry and no upstream dispatch; `classify: true` opts into one small
+  /// classifier call so the simulated tags match what serving would derive.
   simulateRoute: (body: SimulateRouteRequest) =>
     api<RouteExplainView>("/router/simulate", {
       method: "POST",
       body: JSON.stringify(body),
     }),
+  /// Routing readiness lints: the known auto-misroute shapes, as findings.
+  getRouterReadiness: reactCache(() =>
+    api<RouterReadinessView>("/router/readiness"),
+  ),
   getBoonSettings: reactCache(() => api<BoonSettingsView>("/settings/boons")),
   setBoonSettings: (body: UpdateBoonSettings, options?: AuditOptions) =>
     api<BoonSettingsView>("/settings/boons", {

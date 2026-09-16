@@ -596,6 +596,38 @@ export function AutoRouterSettingsForm({
             <p className="text-[11px] text-muted-foreground">
               A tiny non-thinking model; anything slower delays every auto request.
             </p>
+            {(() => {
+              // One-click brain: the cheapest enabled non-reasoning chat model
+              // already registered. Fresh installs should not have to know
+              // which of their models makes a good classifier.
+              const suggestion = models
+                .filter(
+                  (m) =>
+                    m.enabled &&
+                    m.model_type === "chat" &&
+                    m.model_name !== "auto" &&
+                    !(m.tags ?? []).some((t) => t === "reasoning" || t.startsWith("reasoning:")),
+                )
+                .sort(
+                  (a, b) =>
+                    a.input_cost_per_token +
+                    a.output_cost_per_token -
+                    (b.input_cost_per_token + b.output_cost_per_token),
+                )[0];
+              if (!suggestion || suggestion.model_name === model.trim()) return null;
+              return (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setModel(suggestion.model_name);
+                    setEnabled(true);
+                  }}
+                  className="text-[11px] font-medium text-primary underline-offset-2 hover:underline"
+                >
+                  Suggest: use {suggestion.model_name} (cheapest fast model)
+                </button>
+              );
+            })()}
           </div>
           <div className="space-y-1">
             <Label htmlFor="classifier_timeout_ms">Timeout (ms)</Label>

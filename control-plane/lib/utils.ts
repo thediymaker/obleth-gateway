@@ -55,6 +55,9 @@ export function parseTagLevel(raw: string): { base: string; level: number; decla
   };
 }
 
-// Human labels for the three strength levels; the ladder's numbers are an
-// implementation detail an operator should not have to decode.
-export const TAG_LEVEL_LABELS: Record<number, string> = { 1: "Basic", 2: "Strong", 3: "Best" };
+// Human labels for the strength ladder; the numbers are an implementation
+// detail an operator should not have to decode. 0 is the UI-only "Auto"
+// sentinel: the tag is saved bare, and under hybrid tier sourcing the level
+// derives from the model's cost rank instead of being pinned.
+export const TAG_LEVEL_AUTO = 0;
+export const TAG_LEVEL_LABELS: Record<number, string> = { 0: "Auto", 1: "Basic", 2: "Strong", 3: "Best" };

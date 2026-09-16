@@ -82,10 +82,13 @@ describe("routing tag strength levels", () => {
     expect(level3.checked).toBe(true);
   });
 
-  it("renders a bare tag checked at level 1", async () => {
-    await renderFields(model({ tags: ["coding"] }));
+  it("renders a bare tag checked at Auto, and an explicit :1 pinned at 1", async () => {
+    // Bare = "derive my level from cost rank" (Auto, value 0); tag:1 = pinned
+    // weak on purpose. The picker must show the operator which one is stored.
+    await renderFields(model({ tags: ["coding", "math:1"] }));
     expect(host.querySelector<HTMLInputElement>('[name="tag_coding"]')!.checked).toBe(true);
-    expect(host.querySelector<HTMLInputElement>('[name="tag_level_coding"][value="1"]')!.checked).toBe(true);
+    expect(host.querySelector<HTMLInputElement>('[name="tag_level_coding"][value="0"]')!.checked).toBe(true);
+    expect(host.querySelector<HTMLInputElement>('[name="tag_level_math"][value="1"]')!.checked).toBe(true);
   });
 
   it("shows no level control for an unchecked tag", async () => {
@@ -99,7 +102,7 @@ describe("routing tag strength levels", () => {
   });
 
   it.each([
-    ["coding:0", 1], // below range clamps up
+    ["coding:0", 1], // below range clamps up (an explicit suffix stays declared)
     ["coding:9", 3], // above range clamps down
     ["coding:x", 1], // unparseable falls back to 1
   ] as const)("clamps a malformed stored level (%s) into 1..3 without dropping the tag", async (raw, expectedLevel) => {
@@ -114,7 +117,8 @@ describe("routing tag strength levels", () => {
     expect(data.get("tag_coding")).toBe("on");
     expect(data.get("tag_level_coding")).toBe("3");
     expect(data.get("tag_math")).toBe("on");
-    expect(data.get("tag_level_math")).toBe("1");
+    // Bare tag loads as Auto (0), which tagsFromForm saves bare again.
+    expect(data.get("tag_level_math")).toBe("0");
     expect(data.get("tag_general")).toBeNull();
   });
 });
