@@ -108,6 +108,9 @@ async fn main() -> anyhow::Result<()> {
         .build();
 
     let model_registry = router::ModelRegistry::new();
+    // Rolling completion-length averages, shared with the admin state below so
+    // simulate scores with the live numbers.
+    let output_stats = router::OutputStats::default();
 
     let (local_cache_tx, mut local_cache_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let key_cache_direct = key_cache.clone();
@@ -284,6 +287,7 @@ async fn main() -> anyhow::Result<()> {
         tool_cache,
         model_registry: model_registry.clone(),
         classifier: classifier.clone(),
+        output_stats: output_stats.clone(),
         boons: boons.clone(),
         metrics: metrics.clone(),
         fail_open: cfg.fail_open,
@@ -405,6 +409,7 @@ async fn main() -> anyhow::Result<()> {
         ssrf: obleth_admin::ssrf::SsrfPolicy::from_env(),
         alerts: alerts.clone(),
         local_cache_tx: Some(local_cache_tx),
+        output_stats: output_stats.clone(),
     };
     obleth_admin::model_health::spawn_worker(admin_state.clone());
     obleth_admin::usage_retention::spawn_worker(admin_state.clone());

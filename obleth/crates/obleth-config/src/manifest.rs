@@ -34,7 +34,7 @@ use utoipa::ToSchema;
 
 use crate::types::{
     is_valid_capacity_mode, is_valid_endpoint_selection_mode, is_valid_model_type, normalize_boons,
-    normalize_tag_levels, normalize_tool_servers, parse_tag_level, ModelEndpoint, ModelRoute,
+    normalize_tool_servers, parse_tag_level, ModelEndpoint, ModelRoute,
     CAPACITY_MODES, DEFAULT_CAPACITY_MODE, DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE,
     DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES, MODEL_TYPES,
 };
@@ -699,17 +699,10 @@ pub fn resolve_model(
 
     if let Some(raw) = &entry.tags {
         // Store the suffixed form so a declared strength level survives, the
-        // same shape `serialize_tag_levels` writes on every other path.
-        next.tags = normalize_tag_levels(raw)
-            .into_iter()
-            .map(|(base, level)| {
-                if level == 1 {
-                    base
-                } else {
-                    format!("{base}:{level}")
-                }
-            })
-            .collect();
+        // same shape `serialize_tag_levels` writes on every other path. An
+        // explicit `:1` stays explicit: bare = derive from cost rank under
+        // hybrid tiering, `tag:1` = pinned to the bottom tier.
+        next.tags = crate::canonical_tags(raw);
         let dropped: Vec<&str> = raw
             .iter()
             .filter(|t| parse_tag_level(t).is_none())

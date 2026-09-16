@@ -1329,6 +1329,63 @@ where
     out
 }
 
+/// The *explicitly* declared strength ladder: one entry per valid tag that
+/// carries a `:1|2|3` suffix, first occurrence wins. A bare tag declares
+/// nothing here — under `TierSource::Hybrid` it falls through to the
+/// cost-derived level, which is what makes tiering useful on a fleet whose
+/// operator never typed a suffix. (`TierSource::Declared` still reads a
+/// missing declaration as level 1, so the old "bare = 1" reading survives
+/// where it was the documented contract.)
+pub fn declared_tag_levels<I, S>(tags: I) -> Vec<(String, u8)>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<(String, u8)> = Vec::new();
+    for tag in tags {
+        let raw = tag.as_ref();
+        if !raw.contains(':') {
+            continue;
+        }
+        if let Some((base, level)) = parse_tag_level(raw) {
+            if !out.iter().any(|(b, _)| b == &base) {
+                out.push((base, level));
+            }
+        }
+    }
+    out
+}
+
+/// Canonical storage form of a tag list: trimmed, lowercased, validated
+/// against the vocabulary, de-duplicated by base (first occurrence wins) —
+/// and, unlike the old collapse-to-bare form, an explicit `:1` suffix is
+/// PRESERVED. Bare and `tag:1` mean different things under
+/// `TierSource::Hybrid` (auto-derived vs pinned weak), so the save path must
+/// not erase the distinction the operator typed.
+pub fn canonical_tags<I, S>(tags: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<String> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for tag in tags {
+        let raw = tag.as_ref().trim().to_ascii_lowercase();
+        if let Some((base, level)) = parse_tag_level(&raw) {
+            if seen.contains(&base) {
+                continue;
+            }
+            seen.push(base.clone());
+            if raw.contains(':') {
+                out.push(format!("{base}:{level}"));
+            } else {
+                out.push(base);
+            }
+        }
+    }
+    out
+}
+
 /// The declared strength ladder: one entry per valid tag, first occurrence
 /// wins. Companion to [`normalize_tags`], which returns the same tags stripped
 /// down to their bare vocabulary form for overlap matching.
@@ -2569,6 +2626,39 @@ pub struct RestoreReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_levels_come_only_from_explicit_suffixes() {
+        let tags = vec!["coding".to_string(), "math:2".to_string(), "vision:1".to_string()];
+        let declared = declared_tag_levels(&tags);
+        // Bare "coding" declares nothing: under hybrid tiering it derives from
+        // cost rank instead of silently pinning the model to level 1.
+        assert_eq!(
+            declared,
+            vec![("math".to_string(), 2), ("vision".to_string(), 1)]
+        );
+    }
+
+    #[test]
+    fn canonical_tags_preserve_an_explicit_level_one() {
+        // bare = "derive my level", tag:1 = "pinned weak on purpose". The save
+        // path must keep the operator's distinction.
+        let tags = vec![
+            "coding:1".to_string(),
+            "math".to_string(),
+            "vision:3".to_string(),
+            "Vision:2".to_string(), // duplicate base: first occurrence wins
+            "astrology".to_string(), // not in the vocabulary: dropped
+        ];
+        assert_eq!(
+            canonical_tags(&tags),
+            vec![
+                "coding:1".to_string(),
+                "math".to_string(),
+                "vision:3".to_string()
+            ]
+        );
+    }
 
     #[test]
     fn auto_router_defaults_match_router_constants() {

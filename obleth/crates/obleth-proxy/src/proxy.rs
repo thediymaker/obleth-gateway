@@ -266,6 +266,8 @@ async fn proxy_handler_inner(
         let candidates = state.model_registry.load();
         // Cheap shared-map read; the full scheduler snapshot is dashboard-only.
         let busyness = state.fairshare.model_load();
+        // Observed completion lengths, for the per-request cost estimate.
+        let expected_output = state.output_stats.snapshot();
         let allowed = if resolved.internal {
             None
         } else {
@@ -328,6 +330,7 @@ async fn proxy_handler_inner(
                 &candidates,
                 &features,
                 &busyness,
+                &expected_output,
                 allowed,
                 &intent.tags,
                 grants,
@@ -355,6 +358,7 @@ async fn proxy_handler_inner(
                 &candidates,
                 &features,
                 &busyness,
+                &expected_output,
                 allowed,
                 &intent.tags,
                 grants,
@@ -1971,6 +1975,13 @@ async fn settle_request(
     energy_slots: i64,
     cache_put: Option<(&str, i64, &str, String)>,
 ) {
+    // Feed the router's per-request cost estimate: one EWMA sample of how
+    // long this model's answers actually run. Successful requests only — an
+    // error body's usage says nothing about the model's answering behavior.
+    if status_code == 200 && output_tokens > 0 {
+        state.output_stats.observe(model, output_tokens as u64);
+    }
+
     // store the full response for identical future requests
     if let Some((ck, ttl, content_type, body)) = cache_put {
         let cached = obleth_config::CachedResponse {
@@ -4255,6 +4266,7 @@ mod tests {
         let (picked, mut explain) = crate::router::route(
             &candidates,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &[],

@@ -153,22 +153,17 @@ pub struct UpsertManagedModel {
 /// tag whose base falls outside [`obleth_config::MODEL_TAGS`] is dropped, same
 /// as the old bare-only `normalize_tags` write path. Storing the suffixed
 /// form (rather than the bare-only [`obleth_config::normalize_tags`] output)
-/// is what lets a declared strength level survive a save.
+/// is what lets a declared strength level survive a save. An explicit `:1` is
+/// preserved rather than collapsed to the bare tag: bare means "derive my
+/// level from cost rank" under `TierSource::Hybrid`, while `tag:1` pins the
+/// model to the bottom tier on purpose — a distinction the save path must
+/// not erase.
 fn serialize_tag_levels<I, S>(tags: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    obleth_config::normalize_tag_levels(tags)
-        .into_iter()
-        .map(|(base, level)| {
-            if level == 1 {
-                base
-            } else {
-                format!("{base}:{level}")
-            }
-        })
-        .collect()
+    obleth_config::canonical_tags(tags)
 }
 
 #[derive(Clone)]
@@ -1716,7 +1711,7 @@ impl Store {
                     supports_tool_choice: row.try_get("supports_tool_choice")?,
                     supports_vision: row.try_get("supports_vision").unwrap_or(false),
                     tags: obleth_config::normalize_tags(&raw_tags),
-                    declared_levels: obleth_config::normalize_tag_levels(&raw_tags),
+                    declared_levels: obleth_config::declared_tag_levels(&raw_tags),
                     boons: row
                         .try_get::<sqlx::types::Json<Vec<String>>, _>("boons")
                         .map(|j| j.0)

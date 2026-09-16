@@ -40,6 +40,10 @@ pub struct AppState {
     /// Intent classifier for `auto` routing; its settings are refreshed by the
     /// same background task that refreshes `model_registry`.
     pub classifier: Classifier,
+    /// Rolling per-model completion-length averages, recorded at settle time
+    /// and read by the `auto` scorer (and, same-process, the admin simulate
+    /// endpoint) so cost is estimated per request rather than per token.
+    pub output_stats: crate::router::OutputStats,
     /// Engine for model "boons" (e.g. the vision boon). Its settings are
     /// refreshed by the same background task that refreshes `model_registry`.
     pub boons: BoonEngine,

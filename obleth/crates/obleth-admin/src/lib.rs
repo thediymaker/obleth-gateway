@@ -93,6 +93,11 @@ pub struct AdminState {
     /// Direct in-process moka cache invalidation. Set by the binary that owns
     /// the key cache; None when admin and proxy run in separate processes.
     pub local_cache_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// The data plane's rolling per-model completion-length averages, shared
+    /// in-process so the simulate endpoint scores with the same expected
+    /// output tokens the live router uses. `Default` (empty) in a standalone
+    /// admin process; scoring then falls back to the documented default.
+    pub output_stats: obleth_config::routing::OutputStats,
 }
 
 /// Build the `/api/v1` router. `/health` and the OpenAPI doc are public; every
@@ -1944,6 +1949,7 @@ async fn simulate_route(
         &candidates,
         &features,
         &busyness,
+        &state.output_stats.snapshot(),
         allowed.as_deref(),
         &intent.tags,
         grants,
@@ -5164,7 +5170,7 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         // that doesn't touch tags). The hot-path cache needs the bare
         // vocabulary for the router's overlap match, plus the parsed ladder.
         tags: obleth_config::normalize_tags(&model.tags),
-        declared_levels: obleth_config::normalize_tag_levels(&model.tags),
+        declared_levels: obleth_config::declared_tag_levels(&model.tags),
         boons: model.boons.clone(),
         tool_servers: model.tool_servers.clone(),
         knowledge_collections,
@@ -5362,6 +5368,7 @@ mod tests {
                 // Never dialled: no route under test reads ClickHouse.
                 clickhouse: clickhouse::Client::default(),
                 admin_token: TEST_ADMIN_TOKEN.to_string(),
+                output_stats: Default::default(),
                 health: ModelHealthRuntime {
                     scheduled_enabled: false,
                     default_interval_secs: 60,
