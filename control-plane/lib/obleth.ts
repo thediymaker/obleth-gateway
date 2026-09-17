@@ -105,11 +105,23 @@ export interface CreatedKey {
 export interface ModelRoute {
   id: string;
   model_name: string;
+  /**
+   * Extra client-facing names that resolve to this same route, so an old
+   * spelling keeps working after the canonical name is cleaned up. Only
+   * `model_name` is advertised by the gateway's discovery endpoints.
+   */
+  aliases: string[];
   description: string;
   upstream_model: string;
   api_base: string;
   api_key: string | null;
   model_type: string;
+  /**
+   * Weight/activation format this deployment serves, from the gateway's fixed
+   * vocabulary. Descriptive only — it never affects routing. "unknown" means
+   * undeclared, which is not the same claim as "none" (full precision).
+   */
+  quantization: string;
   input_cost_per_token: number;
   output_cost_per_token: number;
   cost_per_image: number;

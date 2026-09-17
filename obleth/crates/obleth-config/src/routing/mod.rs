@@ -1122,10 +1122,12 @@ mod tests {
     fn model(name: &str) -> ResolvedModel {
         ResolvedModel {
             model_name: name.to_string(),
+            aliases: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
             api_key: None,
             model_type: crate::DEFAULT_MODEL_TYPE.to_string(),
+            quantization: crate::DEFAULT_QUANTIZATION.to_string(),
             admission_weight: 100,
             max_in_flight: None,
             enabled: true,

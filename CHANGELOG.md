@@ -4,6 +4,14 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## Unreleased
+
+- **Model names no longer have to carry the serving format.** A model's weight/activation format is now a field on the route — `quantization`, from a fixed vocabulary (`fp8`, `mxfp4`, `awq`, `gguf`, …) — instead of something operators had to spell into the name clients call. A model can also answer to **aliases**: extra client-facing names that resolve to the same route, so `glm-5-3-mxfp4` can be renamed to `glm-5-3` with the old spelling registered as an alias and every pinned client left working. An alias costs nothing per request (it resolves in the same single cache lookup as the canonical name) and is folded to the canonical name before accounting, so a model's usage is no longer split across the spellings clients happen to use. `GET /v1/models` now reports the gateway's clean name for a backend that only knows itself by its quantized one, lists each route once, and carries `quantization`, `tags`, and `aliases` on every entry it recognizes.
+
+- **A new `GET /model/info` endpoint.** Served from the gateway's own registry rather than from the backends, so it lists every registered model whether or not its backend answers this second, and reports the facts a client cannot infer from a name: serving format, routing tags, context window, per-token and per-unit prices, capability flags, granted boons, aliases, and last-observed health. The envelope follows LiteLLM's `/model/info` so existing tooling reads it unchanged, with obleth's additions alongside the conventional keys. Available at both `/model/info` and `/v1/model/info`, and it never reports how to reach a backend. Tenants with a model allowlist see only the models they may call.
+
+- **Provider import lifts the format out of discovered names.** Importing a catalog that advertises `Qwen/Qwen3-8B-FP8` now suggests `qwen3-8b` with `quantization: fp8` and the provider's full id pre-filled as an alias, instead of registering the suffix as part of the name.
+
 ## v1.1.0
 
 Institutional knowledge retrieval, an auto-router you can tune and inspect, and chat models that produce images.

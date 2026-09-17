@@ -124,7 +124,8 @@ impl Store {
         .collect::<Result<Vec<_>>>()?;
 
         let models = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, model_type,
+            "select id, model_name, aliases, description, upstream_model, api_base, api_key,
+                    model_type, quantization,
                     input_cost_per_token, output_cost_per_token, cost_per_image,
                     cost_per_audio_second, cost_per_character, context_window, admission_weight,
                     max_in_flight, capacity_mode, capacity_tuned_at, supports_function_calling,
@@ -385,10 +386,11 @@ impl Store {
                         health_checks_enabled, health_alerts_enabled, health_check_interval_secs,
                         health_failure_threshold, health_maintenance_until,
                         health_maintenance_note, created_at,
-                        debug_diagnostics, energy_slots_per_node)
+                        debug_diagnostics, energy_slots_per_node, aliases, quantization)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-                        $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46)
+                        $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46,
+                        $47, $48)
                  on conflict (id) do update set
                         model_name = excluded.model_name,
                         description = excluded.description,
@@ -434,6 +436,8 @@ impl Store {
                         health_maintenance_note = excluded.health_maintenance_note,
                         debug_diagnostics = excluded.debug_diagnostics,
                         energy_slots_per_node = excluded.energy_slots_per_node,
+                        aliases = excluded.aliases,
+                        quantization = excluded.quantization,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -483,6 +487,10 @@ impl Store {
             .bind(m.created_at)
             .bind(m.debug_diagnostics)
             .bind(m.energy_slots_per_node)
+            .bind(sqlx::types::Json(obleth_config::normalize_aliases(
+                &m.aliases,
+            )))
+            .bind(obleth_config::normalize_quantization(&m.quantization))
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -651,11 +659,18 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
     Ok(ModelBackup {
         id: row.try_get("id")?,
         model_name: row.try_get("model_name")?,
+        aliases: row
+            .try_get::<sqlx::types::Json<Vec<String>>, _>("aliases")
+            .map(|j| j.0)
+            .unwrap_or_default(),
         description: row.try_get("description")?,
         upstream_model: row.try_get("upstream_model")?,
         api_base: row.try_get("api_base")?,
         api_key: row.try_get("api_key")?,
         model_type: row.try_get("model_type")?,
+        quantization: row
+            .try_get::<String, _>("quantization")
+            .unwrap_or_else(|_| obleth_config::DEFAULT_QUANTIZATION.to_string()),
         input_cost_per_token: row.try_get("input_cost_per_token")?,
         output_cost_per_token: row.try_get("output_cost_per_token")?,
         cost_per_image: row.try_get("cost_per_image")?,
@@ -805,6 +820,8 @@ mod tests {
                 false,
                 "",
                 "",
+                "",
+                &[],
                 "",
             )
             .await

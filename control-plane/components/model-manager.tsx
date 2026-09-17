@@ -177,6 +177,35 @@ const MODEL_TYPE_LABELS: Record<string, string> = Object.fromEntries(
   MODEL_TYPE_OPTIONS.map((o) => [o.value, o.label]),
 );
 
+// Serving-format vocabulary; mirrors obleth-config `QUANTIZATIONS`. This is a
+// description of the deployment, not part of the model's identity — it exists
+// so the format does not have to be spelled into the API model name, where
+// re-quantizing would break every pinned client.
+const QUANTIZATION_OPTIONS = [
+  { value: "unknown", label: "Not declared" },
+  { value: "none", label: "None (full precision)" },
+  { value: "fp16", label: "FP16" },
+  { value: "bf16", label: "BF16" },
+  { value: "fp8", label: "FP8" },
+  { value: "nvfp4", label: "NVFP4" },
+  { value: "mxfp4", label: "MXFP4" },
+  { value: "int8", label: "INT8" },
+  { value: "int4", label: "INT4" },
+  { value: "awq", label: "AWQ" },
+  { value: "gptq", label: "GPTQ" },
+  { value: "gguf", label: "GGUF" },
+] as const;
+
+const QUANTIZATION_LABELS: Record<string, string> = Object.fromEntries(
+  QUANTIZATION_OPTIONS.map((o) => [o.value, o.label]),
+);
+
+const QUANTIZATION_HINT =
+  "Reported on /v1/models and /model/info. Keep it out of the API model name: a name like `glm-5-3-fp8` has to change when the deployment is re-quantized, and every client pinned to it breaks.";
+
+const ALIASES_HINT =
+  "One name per line. Extra names that resolve to this same route — register the old spelling here when you clean up an API model name, and pinned clients keep working. Only the API model name itself is advertised by /v1/models.";
+
 const CREATE_MODEL_STEPS = [
   {
     label: "Hosting",
@@ -525,6 +554,21 @@ export function ModelManager({
                               {model.model_type && model.model_type !== "chat" && (
                                 <Badge className="border-primary/40 bg-primary/15 text-[10px] text-primary">
                                   {MODEL_TYPE_LABELS[model.model_type] ?? model.model_type}
+                                </Badge>
+                              )}
+                              {model.quantization && model.quantization !== "unknown" && (
+                                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                                  {QUANTIZATION_LABELS[model.quantization] ?? model.quantization}
+                                </Badge>
+                              )}
+                              {(model.aliases?.length ?? 0) > 0 && (
+                                <Badge
+                                  className="border-border bg-background text-[10px] text-muted-foreground"
+                                  title={model.aliases!.join(", ")}
+                                >
+                                  {model.aliases!.length === 1
+                                    ? "1 alias"
+                                    : `${model.aliases!.length} aliases`}
                                 </Badge>
                               )}
                               <Badge className="border-border bg-background text-[10px] text-muted-foreground">{formatModelCost(model)}</Badge>
@@ -980,6 +1024,19 @@ function CreateModelWizard({
                   />
                 </div>
                 <div className="md:col-span-2">
+                  <SelectField
+                    label="Quantization"
+                    name="quantization"
+                    value={createQuantization}
+                    onChange={setCreateQuantization}
+                    options={QUANTIZATION_OPTIONS}
+                    hint={QUANTIZATION_HINT}
+                  />
+                </div>
+                <div className="md:col-span-2">
+                  <AliasesField hint={ALIASES_HINT} />
+                </div>
+                <div className="md:col-span-2">
                   <Field label="Description (optional)" name="description" placeholder="Qwen3 235B instruction model for production chat and tool use" />
                 </div>
               </section>
@@ -1415,6 +1472,11 @@ function ConnectionTab({
   setEditType: (value: string) => void;
 }) {
   const flashSaved = useContext(SaveFlashContext);
+  // Local to this tab: unlike `editType`, which gates cost fields in the
+  // Capabilities tab too, nothing outside this form reads the format.
+  const [editQuantization, setEditQuantization] = useState<string>(
+    model.quantization || "unknown",
+  );
   const [state, formAction, pending] = useActionState(
     async (prev: ModelActionState | null, formData: FormData) => {
       const result = await updateModelConnectionAction(prev, formData);
@@ -1446,6 +1508,15 @@ function ConnectionTab({
                 options={MODEL_TYPE_OPTIONS}
                 hint={modelTypeHint(editType)}
               />
+              <SelectField
+                label="Quantization"
+                name="quantization"
+                value={editQuantization}
+                onChange={setEditQuantization}
+                options={QUANTIZATION_OPTIONS}
+                hint={QUANTIZATION_HINT}
+              />
+              <AliasesField defaultValue={(model.aliases ?? []).join("\n")} hint={ALIASES_HINT} />
               <Field label="Description" name="description" defaultValue={model.description} />
               <ChipGroup label="Status">
                 <ChipCheckbox name="enabled" label="Route enabled" defaultChecked={model.enabled} />
@@ -3036,6 +3107,35 @@ function Field({
         step={step}
         min={min}
         max={max}
+      />
+      {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
+    </div>
+  );
+}
+
+/// A multi-line list of alias names. A textarea rather than a chip list
+/// because aliases are free-form strings an operator pastes in, not a fixed
+/// vocabulary to pick from.
+function AliasesField({
+  defaultValue,
+  hint,
+}: {
+  defaultValue?: string;
+  hint?: string;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label htmlFor="model-aliases">Aliases (optional)</Label>
+      <textarea
+        id="model-aliases"
+        name="aliases"
+        rows={3}
+        defaultValue={defaultValue}
+        placeholder={"glm-5-3-fp8\nglm-5-3-mxfp4"}
+        autoCapitalize="none"
+        autoCorrect="off"
+        spellCheck={false}
+        className="flex w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
       />
       {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
     </div>

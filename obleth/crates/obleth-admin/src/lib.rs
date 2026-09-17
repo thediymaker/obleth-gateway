@@ -707,11 +707,20 @@ pub struct FairshareLiveView {
 pub struct CreateModel {
     pub model_name: String,
     pub description: Option<String>,
+    /// Extra client-facing names this model answers to, so a name can be
+    /// cleaned up (`glm-5-3-fp8` -> `glm-5-3`) without breaking pinned
+    /// clients. Each must be unused by any other model's name or aliases.
+    #[serde(default)]
+    pub aliases: Option<Vec<String>>,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
     #[serde(default)]
     pub model_type: Option<String>,
+    /// Serving format from the fixed `QUANTIZATIONS` vocabulary. Omitted means
+    /// `unknown` — undeclared, not "full precision".
+    #[serde(default)]
+    pub quantization: Option<String>,
     pub input_cost_per_token: Option<f64>,
     pub output_cost_per_token: Option<f64>,
     #[serde(default)]
@@ -764,11 +773,19 @@ pub struct CreateModel {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateModel {
     pub description: Option<String>,
+    /// Replaces the alias list wholesale; omitted leaves it unchanged. An
+    /// empty list removes every alias, which also evicts their resolver keys.
+    #[serde(default)]
+    pub aliases: Option<Vec<String>>,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
     #[serde(default)]
     pub model_type: Option<String>,
+    /// Serving format from the fixed `QUANTIZATIONS` vocabulary; omitted
+    /// leaves the current value unchanged.
+    #[serde(default)]
+    pub quantization: Option<String>,
     pub input_cost_per_token: Option<f64>,
     pub output_cost_per_token: Option<f64>,
     #[serde(default)]
@@ -4152,6 +4169,64 @@ async fn resync_all_keys(state: &AdminState) -> Result<()> {
     Ok(())
 }
 
+/// Validate a declared serving format against the fixed vocabulary.
+///
+/// Unlike most enum-ish fields, this one is *rejected* rather than normalized
+/// to the default on the write path: `normalize_quantization` silently folds an
+/// unknown value to `unknown`, and an operator who types `fp-8` in the model
+/// form deserves to be told, not to have the field quietly emptied. The
+/// normalizer still runs in the store, for values arriving from a backend's own
+/// spelling (`FP8`, `w4a16-awq`) where folding is the point.
+fn validate_quantization(raw: &str) -> Result<String> {
+    let q = raw.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return Ok(obleth_config::DEFAULT_QUANTIZATION.to_string());
+    }
+    if !obleth_config::is_valid_quantization(&q) {
+        return Err(AdminError::BadRequest(format!(
+            "unknown quantization '{raw}' (expected one of: {})",
+            obleth_config::QUANTIZATIONS.join(", ")
+        )));
+    }
+    Ok(q)
+}
+
+/// Normalize an alias list and reject any name already claimed elsewhere.
+///
+/// A client sending `model: "x"` cannot tell whether `x` is a canonical name or
+/// an alias, so `x` must identify exactly one route: an alias may not collide
+/// with any model's `model_name`, with another model's alias, or with the
+/// model's own name. `editing` is the row being written, whose own names are
+/// not collisions with itself.
+async fn validate_aliases(
+    state: &AdminState,
+    raw: &[String],
+    editing: Option<Uuid>,
+    model_name: &str,
+) -> Result<Vec<String>> {
+    let aliases = obleth_config::normalize_aliases(raw);
+    for alias in &aliases {
+        if alias == model_name {
+            return Err(AdminError::BadRequest(format!(
+                "alias '{alias}' is the model's own name"
+            )));
+        }
+        if alias == obleth_config::routing::AUTO_MODEL_NAME {
+            return Err(AdminError::BadRequest(format!(
+                "alias '{alias}' is reserved for automatic model selection"
+            )));
+        }
+        if let Some((owner_id, owner_name)) = state.store.model_name_owner(alias).await? {
+            if Some(owner_id) != editing {
+                return Err(AdminError::BadRequest(format!(
+                    "alias '{alias}' is already taken by model '{owner_name}'"
+                )));
+            }
+        }
+    }
+    Ok(aliases)
+}
+
 #[utoipa::path(
     post, path = "/api/v1/models", tag = "models",
     request_body = CreateModel,
@@ -4168,6 +4243,14 @@ async fn create_model(
     if !body.api_base.trim().is_empty() {
         state.ssrf.validate(&body.api_base)?;
     }
+    let quantization = validate_quantization(body.quantization.as_deref().unwrap_or_default())?;
+    let aliases = validate_aliases(
+        &state,
+        body.aliases.as_deref().unwrap_or_default(),
+        None,
+        body.model_name.trim(),
+    )
+    .await?;
     let model = state
         .store
         .create_model(
@@ -4199,6 +4282,8 @@ async fn create_model(
             body.draft_model.as_deref().unwrap_or(""),
             body.verify_api_base.as_deref().unwrap_or(""),
             body.verify_upstream_model.as_deref().unwrap_or(""),
+            &aliases,
+            &quantization,
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -4269,6 +4354,14 @@ async fn update_model(
     }
     let existing = state.store.get_model(id).await?;
     let api_key = body.api_key.as_deref().or(existing.api_key.as_deref());
+    let quantization = match body.quantization.as_deref() {
+        Some(q) => validate_quantization(q)?,
+        None => existing.quantization.clone(),
+    };
+    let aliases = match body.aliases.as_deref() {
+        Some(list) => validate_aliases(&state, list, Some(id), &existing.model_name).await?,
+        None => existing.aliases.clone(),
+    };
     let model = state
         .store
         .update_model(
@@ -4317,6 +4410,8 @@ async fn update_model(
             body.verify_upstream_model
                 .as_deref()
                 .unwrap_or(&existing.verify_upstream_model),
+            &aliases,
+            &quantization,
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -4324,7 +4419,7 @@ async fn update_model(
         // no longer exists; reset so the scheduler re-verifies immediately.
         state.store.reset_model_health(id).await?;
     }
-    sync_model(&state, &model).await?;
+    sync_model_from(&state, &model, Some(&existing)).await?;
     state
         .store
         .record_audit(
@@ -5015,11 +5110,17 @@ async fn delete_model(
 ) -> Result<StatusCode> {
     let model = state.store.get_model(id).await?;
     state.store.delete_model(id).await?;
-    let _ = state.redis.delete_resolved_model(&model.model_name).await;
-    let _ = state
-        .redis
-        .publish_invalidation(&format!("model:{}", model.model_name))
-        .await;
+    // Aliases are resolver keys of their own, so a delete has to clear all of
+    // them or the model stays reachable under its old names.
+    for name in
+        std::iter::once(model.model_name.as_str()).chain(model.aliases.iter().map(String::as_str))
+    {
+        let _ = state.redis.delete_resolved_model(name).await;
+        let _ = state
+            .redis
+            .publish_invalidation(&format!("model:{name}"))
+            .await;
+    }
     state
         .store
         .record_audit(
@@ -5229,6 +5330,22 @@ async fn push_key(state: &AdminState, hash: &str, resolved: &ResolvedKey) -> Res
 }
 
 async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
+    sync_model_from(state, model, None).await
+}
+
+/// Republish a model into the resolver cache, evicting the keys it no longer
+/// owns.
+///
+/// `previous` is the row as it was before this write, and is only needed when
+/// aliases may have changed: an alias that was just dropped still has a live
+/// `obleth:model:<alias>` key pointing at this model, and nothing else in the
+/// system would ever clear it. Passing `None` (create, capacity toggle, any
+/// write that cannot touch aliases) publishes without an eviction pass.
+async fn sync_model_from(
+    state: &AdminState,
+    model: &ModelRoute,
+    previous: Option<&ModelRoute>,
+) -> Result<()> {
     // Endpoints carry the per-cluster wire targets and health; the data plane
     // prefers them over the legacy single api_base/api_key when present.
     let endpoints = state
@@ -5243,10 +5360,12 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         .unwrap_or_default();
     let resolved = ResolvedModel {
         model_name: model.model_name.clone(),
+        aliases: model.aliases.clone(),
         upstream_model: model.upstream_model.clone(),
         api_base: model.api_base.clone(),
         api_key: model.api_key.clone(),
         model_type: model.model_type.clone(),
+        quantization: model.quantization.clone(),
         admission_weight: model.admission_weight,
         max_in_flight: model.max_in_flight.and_then(|n| usize::try_from(n).ok()),
         enabled: model.enabled,
@@ -5285,18 +5404,36 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         verify_upstream_model: model.verify_upstream_model.clone(),
         endpoints,
     };
-    if model.enabled {
+    // Aliases the write removed: their keys would otherwise keep resolving to
+    // this model forever. Done before the publish so a name moved from alias to
+    // canonical (or between the two lists) is re-added, not left evicted.
+    if let Some(previous) = previous {
+        for stale in previous
+            .aliases
+            .iter()
+            .filter(|a| !model.aliases.contains(a))
+        {
+            let _ = state.redis.delete_resolved_model(stale).await;
+            let _ = state
+                .redis
+                .publish_invalidation(&format!("model:{stale}"))
+                .await;
+        }
+    }
+    // Every name the model answers to gets its own resolver key, so the data
+    // plane keeps resolving an alias in exactly one lookup — aliases cost
+    // nothing on the request path.
+    for name in resolved.addressable_names() {
+        if model.enabled {
+            state.redis.put_resolved_model(name, &resolved).await?;
+        } else {
+            let _ = state.redis.delete_resolved_model(name).await;
+        }
         state
             .redis
-            .put_resolved_model(&model.model_name, &resolved)
+            .publish_invalidation(&format!("model:{name}"))
             .await?;
-    } else {
-        let _ = state.redis.delete_resolved_model(&model.model_name).await;
     }
-    state
-        .redis
-        .publish_invalidation(&format!("model:{}", model.model_name))
-        .await?;
     Ok(())
 }
 
@@ -5416,6 +5553,8 @@ mod tests {
                     true,
                     "",
                     "",
+                    "",
+                    &[],
                     "",
                 )
                 .await

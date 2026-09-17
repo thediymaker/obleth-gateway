@@ -314,8 +314,16 @@ impl Admission {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelRoute {
     pub id: Uuid,
-    /// Name clients pass in `model` (e.g. `qwen3-vl-32b-instruct`).
+    /// Name clients pass in `model` (e.g. `qwen3-vl-32b-instruct`). Kept free
+    /// of deployment detail — the serving format belongs in `quantization`,
+    /// not in the name — so re-quantizing does not break every caller.
     pub model_name: String,
+    /// Additional client-facing names that resolve to this same route. Exists
+    /// so a name can be cleaned up without breaking pinned clients: register
+    /// the old `…-fp8` spelling as an alias and it keeps working, while only
+    /// `model_name` is advertised by the discovery endpoints.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     /// Human-facing summary for operators and dashboards.
     pub description: String,
     /// Value sent to the upstream in the `model` field.
@@ -329,6 +337,12 @@ pub struct ModelRoute {
     /// `audio_transcription`, `audio_speech`, `image`). Defaults to `chat`.
     #[serde(default = "default_model_type")]
     pub model_type: String,
+    /// Weight/activation format this deployment serves, from the fixed
+    /// [`QUANTIZATIONS`] vocabulary. Descriptive only — it never affects
+    /// routing; it is reported so clients can tell a `fp8` deployment from a
+    /// `bf16` one without reading it out of the model's name.
+    #[serde(default = "default_quantization")]
+    pub quantization: String,
     pub input_cost_per_token: f64,
     pub output_cost_per_token: f64,
     /// Per-generated-image cost in USD (`image` models).
@@ -491,6 +505,13 @@ pub struct ModelHealthDetail {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResolvedModel {
     pub model_name: String,
+    /// Extra names this route answers to. Carried on the hot-path view so the
+    /// discovery endpoints can report them, and so a resolver warm-up knows
+    /// every key to publish; request matching itself is a direct key lookup on
+    /// whichever name the client sent. `#[serde(default)]` keeps older cached
+    /// payloads deserializable as "no aliases".
+    #[serde(default)]
+    pub aliases: Vec<String>,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
@@ -499,6 +520,11 @@ pub struct ResolvedModel {
     /// `chat`.
     #[serde(default = "default_model_type")]
     pub model_type: String,
+    /// Serving format from the fixed [`QUANTIZATIONS`] vocabulary, reported by
+    /// the discovery endpoints. `#[serde(default …)]` keeps older cached
+    /// payloads deserializable as `unknown`.
+    #[serde(default = "default_quantization")]
+    pub quantization: String,
     pub admission_weight: i64,
     pub max_in_flight: Option<usize>,
     pub enabled: bool,
@@ -608,6 +634,16 @@ pub struct ResolvedModel {
     /// payloads and un-migrated rows).
     #[serde(default)]
     pub endpoints: Vec<ResolvedEndpoint>,
+}
+
+impl ResolvedModel {
+    /// Every client-facing name that must resolve to this route: the canonical
+    /// `model_name` first, then each alias. This is the set of resolver keys a
+    /// warm-up or a cache invalidation has to cover, so publishing and eviction
+    /// stay in step with whatever aliases the model currently declares.
+    pub fn addressable_names(&self) -> impl Iterator<Item = &str> {
+        std::iter::once(self.model_name.as_str()).chain(self.aliases.iter().map(String::as_str))
+    }
 }
 
 /// Hot-path view of one upstream endpoint of a model. Several endpoints of the
@@ -1306,6 +1342,91 @@ pub fn normalize_model_type(model_type: &str) -> String {
     } else {
         DEFAULT_MODEL_TYPE.to_string()
     }
+}
+
+/// Fixed vocabulary of weight/activation formats a model can be served in.
+/// This is a *description* of the deployment, not part of the model's identity:
+/// the client-facing `model_name` stays clean (`glm-5-3`) and the format it
+/// happens to be quantized to is reported here and on the discovery endpoints,
+/// so re-quantizing a deployment is an edit rather than a rename.
+///
+/// `unknown` is the default — a model whose format nobody has declared. `none`
+/// is the distinct, deliberate statement that the weights are unquantized.
+pub const QUANTIZATIONS: &[&str] = &[
+    "unknown", "none", "fp16", "bf16", "fp8", "nvfp4", "mxfp4", "int8", "int4", "awq", "gptq",
+    "gguf",
+];
+
+/// The format assigned to a model when none is declared.
+pub const DEFAULT_QUANTIZATION: &str = "unknown";
+
+fn default_quantization() -> String {
+    DEFAULT_QUANTIZATION.to_string()
+}
+
+/// True when `quantization` is part of the fixed [`QUANTIZATIONS`] vocabulary.
+pub fn is_valid_quantization(quantization: &str) -> bool {
+    QUANTIZATIONS.contains(&quantization)
+}
+
+/// Normalize an arbitrary quantization string to the canonical storage form:
+/// trimmed and lowercased, with `-` and `_` separators folded away so the
+/// spellings backends actually print (`FP8`, `fp8-e4m3`, `w4a16-awq`, `Q4_K_M`)
+/// land on a vocabulary value. Anything still unrecognized becomes
+/// [`DEFAULT_QUANTIZATION`] rather than being rejected — an undeclared format
+/// is not a reason to fail a model edit.
+pub fn normalize_quantization(quantization: &str) -> String {
+    let raw = quantization.trim().to_ascii_lowercase();
+    if raw.is_empty() {
+        return DEFAULT_QUANTIZATION.to_string();
+    }
+    if is_valid_quantization(&raw) {
+        return raw;
+    }
+    // Collapse to alphanumerics so a suffixed or separator-spelled variant is
+    // matched by the vocabulary value it prefixes. Longest first, so `nvfp4`
+    // and `mxfp4` win over the `fp4` neither of them is.
+    let flat: String = raw.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let mut vocab: Vec<&str> = QUANTIZATIONS
+        .iter()
+        .copied()
+        .filter(|q| *q != "unknown" && *q != "none")
+        .collect();
+    vocab.sort_by_key(|q| std::cmp::Reverse(q.len()));
+    for q in vocab {
+        if flat.starts_with(q) || flat.ends_with(q) {
+            return q.to_string();
+        }
+    }
+    DEFAULT_QUANTIZATION.to_string()
+}
+
+/// Maximum extra client-facing names one model may answer to. Bounded because
+/// every alias becomes its own Redis key and its own entry in the resolver's
+/// warm set.
+pub const MAX_MODEL_ALIASES: usize = 16;
+
+/// Normalize a list of alias names to the canonical storage form: trimmed,
+/// blanks dropped, de-duplicated, order-stable by first appearance, and capped
+/// at [`MAX_MODEL_ALIASES`]. Matching is exact and case-sensitive, exactly as
+/// it is for `model_name` — an alias is a name the resolver can be asked for,
+/// so it obeys the same rules as the name it stands in for.
+pub fn normalize_aliases<I, S>(aliases: I) -> Vec<String>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut out: Vec<String> = Vec::new();
+    for alias in aliases {
+        let a = alias.as_ref().trim().to_string();
+        if a.is_empty() || out.len() >= MAX_MODEL_ALIASES {
+            continue;
+        }
+        if !out.contains(&a) {
+            out.push(a);
+        }
+    }
+    out
 }
 
 /// Normalize an arbitrary list of tag strings to the canonical form used for
@@ -2478,6 +2599,10 @@ pub struct ApiKeyBackup {
 pub struct ModelBackup {
     pub id: Uuid,
     pub model_name: String,
+    /// Extra names this route answers to. Defaulted so backups taken before
+    /// aliases existed restore as a model with none.
+    #[serde(default)]
+    pub aliases: Vec<String>,
     #[serde(default)]
     pub description: String,
     pub upstream_model: String,
@@ -2485,6 +2610,10 @@ pub struct ModelBackup {
     pub api_key: Option<String>,
     #[serde(default = "default_model_type")]
     pub model_type: String,
+    /// Declared serving format. Defaulted so backups taken before the column
+    /// existed restore as `unknown` rather than failing to parse.
+    #[serde(default = "default_quantization")]
+    pub quantization: String,
     pub input_cost_per_token: f64,
     pub output_cost_per_token: f64,
     #[serde(default)]
@@ -3133,5 +3262,112 @@ mod tests {
         assert!(parsed.vision.enabled);
         assert!(!parsed.image_generation.enabled);
         assert_eq!(parsed.image_generation.max_images_per_request, 2);
+    }
+
+    #[test]
+    fn quantization_vocabulary_values_are_all_valid() {
+        for q in QUANTIZATIONS {
+            assert!(is_valid_quantization(q), "{q}");
+            // Every vocabulary value is its own normal form, or a round trip
+            // through storage would rewrite it.
+            assert_eq!(normalize_quantization(q), *q, "{q}");
+        }
+        assert!(is_valid_quantization(DEFAULT_QUANTIZATION));
+    }
+
+    #[test]
+    fn normalize_quantization_folds_the_spellings_backends_print() {
+        // Case and separators are noise.
+        assert_eq!(normalize_quantization("FP8"), "fp8");
+        assert_eq!(normalize_quantization("  BF16 "), "bf16");
+        // Suffixed and prefixed variants land on the format they describe.
+        assert_eq!(normalize_quantization("fp8-e4m3"), "fp8");
+        assert_eq!(normalize_quantization("w4a16-awq"), "awq");
+        assert_eq!(normalize_quantization("Q4_K_M-gguf"), "gguf");
+        // The two 4-bit float formats stay distinct: neither collapses into
+        // the other, and neither is read as a bare `fp4`.
+        assert_eq!(normalize_quantization("MXFP4"), "mxfp4");
+        assert_eq!(normalize_quantization("nvfp4-a16"), "nvfp4");
+        // Undeclared is not the same claim as unquantized.
+        assert_eq!(normalize_quantization(""), "unknown");
+        assert_eq!(normalize_quantization("   "), "unknown");
+        assert_eq!(normalize_quantization("something-else"), "unknown");
+        assert_eq!(normalize_quantization("none"), "none");
+    }
+
+    #[test]
+    fn normalize_aliases_trims_dedupes_and_caps() {
+        assert_eq!(
+            normalize_aliases(["glm-5-3-fp8", "  glm-5-3-mxfp4  ", "", "glm-5-3-fp8"]),
+            vec!["glm-5-3-fp8".to_string(), "glm-5-3-mxfp4".to_string()]
+        );
+        // Case is significant, because alias lookup is exact — the same rule
+        // `model_name` follows.
+        assert_eq!(
+            normalize_aliases(["Glm-5-3", "glm-5-3"]),
+            vec!["Glm-5-3".to_string(), "glm-5-3".to_string()]
+        );
+        // Bounded: every alias becomes its own resolver key.
+        let many: Vec<String> = (0..MAX_MODEL_ALIASES + 5)
+            .map(|i| format!("a{i}"))
+            .collect();
+        assert_eq!(normalize_aliases(&many).len(), MAX_MODEL_ALIASES);
+    }
+
+    #[test]
+    fn addressable_names_lists_the_canonical_name_first() {
+        let mut model = ResolvedModel {
+            model_name: "glm-5-3".into(),
+            aliases: vec!["glm-5-3-fp8".into(), "glm-5-3-mxfp4".into()],
+            upstream_model: "glm-5-3-mxfp4".into(),
+            api_base: "http://upstream/v1".into(),
+            api_key: None,
+            model_type: DEFAULT_MODEL_TYPE.to_string(),
+            quantization: "mxfp4".into(),
+            admission_weight: 100,
+            max_in_flight: None,
+            enabled: true,
+            cache_enabled: false,
+            cache_ttl_secs: 0,
+            input_cost_per_token: 0.0,
+            output_cost_per_token: 0.0,
+            cost_per_image: 0.0,
+            cost_per_audio_second: 0.0,
+            cost_per_character: 0.0,
+            context_window: 0,
+            supports_function_calling: false,
+            supports_system_messages: true,
+            supports_response_schema: false,
+            supports_tool_choice: false,
+            supports_vision: false,
+            tags: Vec::new(),
+            declared_levels: Vec::new(),
+            boons: Vec::new(),
+            tool_servers: Vec::new(),
+            knowledge_collections: Vec::new(),
+            request_timeout_secs: None,
+            max_retries: 0,
+            retry_backoff_ms: DEFAULT_RETRY_BACKOFF_MS,
+            endpoint_selection_mode: DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
+            debug_diagnostics: false,
+            energy_slots_per_node: 0,
+            route_bias: 1.0,
+            auto_eligible: true,
+            draft_model: String::new(),
+            verify_api_base: String::new(),
+            verify_upstream_model: String::new(),
+            endpoints: Vec::new(),
+        };
+        assert_eq!(
+            model.addressable_names().collect::<Vec<_>>(),
+            vec!["glm-5-3", "glm-5-3-fp8", "glm-5-3-mxfp4"]
+        );
+        // A model with no aliases is still addressable by its own name, so a
+        // publish loop over this iterator is never a no-op.
+        model.aliases.clear();
+        assert_eq!(
+            model.addressable_names().collect::<Vec<_>>(),
+            vec!["glm-5-3"]
+        );
     }
 }

@@ -40,6 +40,59 @@ export interface DiscoveredRow {
   modelName: string;
   ownedBy?: string;
   status: DiscoveredStatus;
+  /**
+   * Serving format read off the upstream id, from the gateway's fixed
+   * `QUANTIZATIONS` vocabulary. "unknown" when the id says nothing about it.
+   */
+  quantization: string;
+  /**
+   * The suffix that was lifted out of `modelName` into `quantization`, if
+   * any — offered as an alias so a client already calling the provider by its
+   * full id keeps working through the gateway.
+   */
+  suggestedAlias?: string;
+}
+
+// Quantization tokens as they actually appear in provider model ids, mapped to
+// the gateway's vocabulary value. Longest first, so `nvfp4`/`mxfp4` are not
+// read as a bare `fp4`, and `w4a16-awq` lands on `awq`.
+const QUANT_TOKENS: readonly { token: string; value: string }[] = [
+  { token: "nvfp4", value: "nvfp4" },
+  { token: "mxfp4", value: "mxfp4" },
+  { token: "gptq", value: "gptq" },
+  { token: "gguf", value: "gguf" },
+  { token: "bf16", value: "bf16" },
+  { token: "fp16", value: "fp16" },
+  { token: "int8", value: "int8" },
+  { token: "int4", value: "int4" },
+  { token: "fp8", value: "fp8" },
+  { token: "awq", value: "awq" },
+];
+
+/**
+ * Split a normalized model name into the clean name and the serving format its
+ * suffix declared.
+ *
+ * Providers ship the format in the id (`Qwen3-8B-FP8`, `glm-5-3-mxfp4`), which
+ * is exactly what makes a registered name brittle: re-quantizing the deployment
+ * forces a rename, and every pinned client breaks. So the token is lifted out
+ * of the name into the `quantization` field, and the full original is offered
+ * back as an alias.
+ *
+ * Only a trailing token is stripped, and only when something is left over — a
+ * model genuinely named `fp8` keeps its name. Callers may always override: the
+ * wizard shows the suggestion in an editable field.
+ */
+export function splitQuantizationSuffix(modelName: string): {
+  name: string;
+  quantization: string;
+} {
+  for (const { token, value } of QUANT_TOKENS) {
+    // Dot is a legal separator in an obleth model name, so accept either.
+    const m = modelName.match(new RegExp(`^(.+?)[.-]${token}$`));
+    if (m && m[1]) return { name: m[1], quantization: value };
+  }
+  return { name: modelName, quantization: "unknown" };
 }
 
 export interface ExistingRouteRef {
@@ -62,9 +115,21 @@ export function classifyDiscovered(
     existing.map((r) => `${normalizeBase(r.api_base)} ${r.upstream_model}`),
   );
   return models.map((m) => {
-    const modelName = normalizeModelApiNameFinal(m.id);
-    const exists = names.has(modelName) || pairs.has(`${normBase} ${m.id}`);
-    return { id: m.id, modelName, ownedBy: m.owned_by, status: exists ? "existing" : "new" };
+    const full = normalizeModelApiNameFinal(m.id);
+    const { name: modelName, quantization } = splitQuantizationSuffix(full);
+    // "Already registered" is judged on both spellings: a route created before
+    // the suffix was split out still carries the full name, and re-importing it
+    // must not read as a new model.
+    const exists =
+      names.has(modelName) || names.has(full) || pairs.has(`${normBase} ${m.id}`);
+    return {
+      id: m.id,
+      modelName,
+      ownedBy: m.owned_by,
+      status: exists ? "existing" : "new",
+      quantization,
+      suggestedAlias: modelName === full ? undefined : full,
+    };
   });
 }
 
@@ -87,6 +152,10 @@ export interface RowState {
   modelName: string;
   included: boolean;
   overrides: Partial<BatchDefaults>;
+  /** Vocabulary value for this row, seeded from the upstream id. */
+  quantization?: string;
+  /** Aliases to register alongside the clean name. */
+  aliases?: string[];
 }
 
 function stripUndefined<T extends object>(obj: T): Partial<T> {
@@ -121,6 +190,10 @@ export function buildImportPayload(
         model_type: merged.model_type,
         enabled: merged.enabled,
       };
+      if (r.quantization && r.quantization !== "unknown") entry.quantization = r.quantization;
+      // Only ever non-empty when the name was cleaned up, so the provider's own
+      // id keeps resolving.
+      if (r.aliases && r.aliases.length > 0) entry.aliases = r.aliases;
       if (apiKey) entry.api_key = apiKey;
       if (merged.description) entry.description = merged.description;
       if (merged.context_window != null) entry.context_window = merged.context_window;

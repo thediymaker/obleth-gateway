@@ -308,13 +308,17 @@ async fn main() -> anyhow::Result<()> {
 
     match store.all_resolved_models().await {
         Ok(models) => {
-            for (name, resolved) in &models {
-                if let Err(e) = redis.put_resolved_model(name, resolved).await {
-                    tracing::warn!(error = %e, "failed to warm model into redis");
+            for (_, resolved) in &models {
+                // One key per addressable name: the canonical `model_name` plus
+                // every alias. Resolution stays a single lookup on whatever
+                // name the client sent, so an alias costs nothing per request.
+                let shared = Arc::new(resolved.clone());
+                for name in resolved.addressable_names() {
+                    if let Err(e) = redis.put_resolved_model(name, resolved).await {
+                        tracing::warn!(error = %e, "failed to warm model into redis");
+                    }
+                    model_cache.insert(name.to_string(), shared.clone()).await;
                 }
-                model_cache
-                    .insert(name.clone(), Arc::new(resolved.clone()))
-                    .await;
             }
             tracing::info!(count = models.len(), "warmed model cache");
             let tier_source = classifier.settings().tier_source;

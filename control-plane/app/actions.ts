@@ -141,6 +141,10 @@ const modelFieldsSchema = {
   upstream_model: optionalText,
   api_base: optionalText,
   model_type: z.preprocess(blankToUndef, z.string().default("chat")),
+  // Free-form here; the gateway owns the vocabulary and rejects anything
+  // outside it, so the dashboard does not need a second copy of the list to
+  // fall out of date.
+  quantization: z.preprocess(blankToUndef, z.string().default("unknown")),
   input_cost_per_token: nonNegNumber(0),
   output_cost_per_token: nonNegNumber(0),
   cost_per_image: nonNegNumber(0),
@@ -689,6 +693,7 @@ export async function createModelAction(
     upstream_model: formData.get("upstream_model"),
     api_base: formData.get("api_base"),
     model_type: formData.get("model_type"),
+    quantization: formData.get("quantization"),
     input_cost_per_token: formData.get("input_cost_per_token"),
     output_cost_per_token: formData.get("output_cost_per_token"),
     cost_per_image: formData.get("cost_per_image"),
@@ -734,6 +739,7 @@ export async function createModelAction(
       max_in_flight: numOrNull(formData.get("max_in_flight")),
       supports_vision: tagsInclude(tags, "vision"),
       tags,
+      aliases: aliasesFromForm(formData),
       boons: boonsFromForm(formData),
       tool_servers: toolServersFromForm(formData),
     }, { auditActor: session.email });
@@ -951,6 +957,8 @@ function toModelUpdateBody(model: ModelRoute) {
     upstream_model: model.upstream_model,
     api_base: model.api_base,
     model_type: model.model_type,
+    quantization: model.quantization,
+    aliases: model.aliases ?? [],
     description: model.description,
     input_cost_per_token: model.input_cost_per_token,
     output_cost_per_token: model.output_cost_per_token,
@@ -1005,6 +1013,8 @@ export async function updateModelConnectionAction(
       upstream_model: String(formData.get("upstream_model") ?? current.upstream_model),
       api_base: String(formData.get("api_base") ?? current.api_base),
       model_type: String(formData.get("model_type") ?? current.model_type),
+      quantization: String(formData.get("quantization") ?? current.quantization),
+      aliases: aliasesFromForm(formData),
       description: String(formData.get("description") ?? ""),
       enabled: formData.get("enabled") === "on",
       input_cost_per_token: numOr(formData.get("input_cost_per_token"), current.input_cost_per_token),
@@ -1571,6 +1581,17 @@ function tagsFromForm(formData: FormData): string[] {
     tags.push(level > 0 ? `${base}:${level}` : base);
   }
   return tags;
+}
+
+// Parses the aliases textarea (one name per line, commas also accepted) into
+// the list the gateway stores. Order is preserved; the gateway does the
+// trimming, de-duplication, and collision checks, so a name rejected there
+// surfaces as a save error rather than being silently dropped here.
+function aliasesFromForm(formData: FormData): string[] {
+  return String(formData.get("aliases") ?? "")
+    .split(/[\n,]/)
+    .map((a) => a.trim())
+    .filter((a) => a.length > 0);
 }
 
 function clampTagLevel(raw: FormDataEntryValue | null): number {

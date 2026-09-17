@@ -1021,6 +1021,8 @@ mod tests {
     pub(super) fn test_route() -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
             model_name: "test".to_string(),
+            aliases: Vec::new(),
+            quantization: "unknown".into(),
             upstream_model: "test".to_string(),
             api_base: "http://localhost".to_string(),
             api_key: None,

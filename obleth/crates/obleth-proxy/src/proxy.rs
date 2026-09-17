@@ -217,6 +217,26 @@ async fn proxy_handler_inner(
     if method == Method::GET && path == "/v1/models" && model == "unknown" {
         return models_list_response(&state).await;
     }
+    // ---- model detail (`GET /v1/models/{id}`) ----
+    // Answered from the registry for any name the gateway has a route for,
+    // because the listing above advertises the gateway's clean `model_name`:
+    // forwarding that name to a backend that only knows itself by its
+    // quantized one would 404 on an id the gateway had just published. An id
+    // no route claims still falls through to the upstream, so a wildcard
+    // passthrough keeps working.
+    if method == Method::GET && path.starts_with("/v1/models/") {
+        let id = path.trim_start_matches("/v1/models/");
+        if let Some(entry) = registered_model_entry(&state, id) {
+            return (StatusCode::OK, axum::Json(entry)).into_response();
+        }
+    }
+    // ---- model detail (`GET /model/info`) ----
+    // Answered from the registry, not from the upstreams: this endpoint reports
+    // what the gateway was configured with, which is the only place facts like
+    // `quantization` and the routing tags exist at all.
+    if method == Method::GET && is_model_info_endpoint(&path) {
+        return model_info_response(&state, &resolved);
+    }
 
     // Request-log metadata, captured once so every `finalize` path (cache hit,
     // rejection, upstream error, streamed success) records the same session and
@@ -381,7 +401,21 @@ async fn proxy_handler_inner(
             }
         }
     } else {
-        resolve_model(&state, &model).await
+        let route = resolve_model(&state, &model).await;
+        // An alias resolves to the same route as the canonical name, so adopt
+        // the canonical name for everything downstream: admission, budgets, the
+        // response cache, the per-tenant allowlist, and the usage ledger. This
+        // is the same move `auto` makes after it picks — without it, one
+        // model's traffic would split across every spelling clients happen to
+        // have pinned, and a tenant allowed `glm-5-3` would be refused for
+        // asking the same model by its old name.
+        if let Some(r) = route.as_ref() {
+            if r.model_name != model {
+                tracing::debug!(alias = %model, model = %r.model_name, "resolved model alias");
+                model = r.model_name.clone();
+            }
+        }
+        route
     };
 
     if requires_registered_model(&path) {
@@ -2499,12 +2533,15 @@ fn maybe_alert_key_budget(
 /// aibrix gateway), so Slurm-hosted models on their own endpoints never show up.
 /// We instead ask every distinct upstream that backs a registered model (the
 /// default base plus each model's endpoints) for its own `/v1/models` and union
-/// the entries **verbatim** — each model keeps the real `id` and `owned_by` its
-/// serving engine reports (litellm `openai`, vLLM `vllm`, llama.cpp `llamacpp`,
-/// Ollama `library`, …). The one addition: entries whose id matches a
-/// registered model are annotated with that route's modality (`model_type` +
-/// `mode`) so clients don't have to guess it from the id. Lookups are
-/// best-effort and concurrent, so a slow or down upstream is simply skipped.
+/// the entries. Lookups are best-effort and concurrent, so a slow or down
+/// upstream is simply skipped.
+///
+/// An entry the gateway recognizes is then rewritten onto the gateway's own
+/// name and annotated — see [`canonicalize_models`], which is where the
+/// `glm-5-3-mxfp4` a backend calls itself becomes the registered `glm-5-3`.
+/// Everything else stays as its upstream reported it, `owned_by` included
+/// (litellm `openai`, vLLM `vllm`, llama.cpp `llamacpp`, Ollama `library`, …),
+/// so a wildcard passthrough is never dressed up as a registered route.
 async fn models_list_response(state: &AppState) -> Response<Body> {
     let candidates = state.model_registry.load();
 
@@ -2553,57 +2590,141 @@ async fn models_list_response(state: &AppState) -> Response<Body> {
     )
     .await;
 
-    // Ids the gateway can vouch for: a client-facing `model_name` always wins
-    // over an `upstream_model` alias, because `model_name` is what request
-    // resolution actually matches on.
-    let mut types_by_id: std::collections::HashMap<String, String> =
-        std::collections::HashMap::new();
-    for c in candidates.iter() {
-        if !c.model.upstream_model.is_empty() {
-            types_by_id
-                .entry(c.model.upstream_model.clone())
-                .or_insert_with(|| c.model.model_type.clone());
-        }
-    }
-    for c in candidates.iter() {
-        types_by_id.insert(c.model.model_name.clone(), c.model.model_type.clone());
-    }
-
     let mut merged = merge_upstream_models(results);
-    annotate_model_types(&mut merged, &types_by_id);
+    canonicalize_models(&mut merged, &model_facts_index(&candidates));
     (StatusCode::OK, axum::Json(merged)).into_response()
 }
 
-/// Annotate aggregated `/v1/models` entries with the registered route's
-/// modality, so clients can group models (chat vs. image vs. audio) from
-/// gateway-reported fact instead of guessing from the id. Each matched entry
-/// gains `model_type` (obleth's [`MODEL_TYPES`](obleth_config::MODEL_TYPES)
-/// vocabulary) and `mode` (the LiteLLM-convention alias many clients already
-/// read, where `image` is spelled `image_generation`). Entries whose id
-/// matches no registered model — wildcard passthroughs — stay verbatim.
-fn annotate_model_types(
+/// What the gateway knows about one registered route, as the discovery
+/// endpoints report it.
+#[derive(Debug, Clone, PartialEq)]
+struct ModelFacts {
+    /// The one name the gateway advertises for this route.
+    model_name: String,
+    model_type: String,
+    quantization: String,
+    aliases: Vec<String>,
+    tags: Vec<String>,
+}
+
+/// Index every name a registered route can be recognized by — its
+/// `model_name`, its aliases, and the `upstream_model` its backend reports —
+/// onto the facts the gateway advertises for it.
+///
+/// The `upstream_model` key is what lets a listing come back clean: a backend
+/// serving `glm-5-3-mxfp4` reports that id in its own catalog, and this index
+/// is how the aggregate recognizes it as the registered `glm-5-3`. Insertion
+/// order sets precedence deliberately — `model_name` is written last and wins,
+/// because it is the name request resolution matches on.
+fn model_facts_index(
+    candidates: &[obleth_config::routing::Candidate],
+) -> std::collections::HashMap<String, std::sync::Arc<ModelFacts>> {
+    let mut by_name: std::collections::HashMap<String, std::sync::Arc<ModelFacts>> =
+        std::collections::HashMap::new();
+    let facts: Vec<std::sync::Arc<ModelFacts>> = candidates
+        .iter()
+        .map(|c| {
+            std::sync::Arc::new(ModelFacts {
+                model_name: c.model.model_name.clone(),
+                model_type: c.model.model_type.clone(),
+                quantization: c.model.quantization.clone(),
+                aliases: c.model.aliases.clone(),
+                tags: c.model.tags.clone(),
+            })
+        })
+        .collect();
+    for (c, f) in candidates.iter().zip(facts.iter()) {
+        if !c.model.upstream_model.is_empty() {
+            by_name
+                .entry(c.model.upstream_model.clone())
+                .or_insert_with(|| f.clone());
+        }
+    }
+    for (c, f) in candidates.iter().zip(facts.iter()) {
+        for alias in &c.model.aliases {
+            by_name.entry(alias.clone()).or_insert_with(|| f.clone());
+        }
+    }
+    for f in facts {
+        by_name.insert(f.model_name.clone(), f);
+    }
+    by_name
+}
+
+/// Rewrite aggregated `/v1/models` entries onto the gateway's own names, and
+/// annotate them with what the gateway knows.
+///
+/// Two jobs, one pass:
+///
+/// * **Canonicalize.** An entry a registered route claims is re-`id`'d to that
+///   route's `model_name`. This is what keeps deployment detail out of the
+///   advertised catalog: a backend that serves `glm-5-3-mxfp4` (or a client
+///   pinned to that old spelling as an alias) is listed once, as `glm-5-3`.
+///   Two upstream ids collapsing onto one route therefore de-dupe here, after
+///   the rewrite, which [`merge_upstream_models`] could not have seen.
+/// * **Annotate.** Each matched entry gains `model_type` (obleth's
+///   [`MODEL_TYPES`](obleth_config::MODEL_TYPES) vocabulary), `mode` (the
+///   LiteLLM-convention alias many clients already read, where `image` is
+///   spelled `image_generation`), `quantization`, `tags`, and the `aliases`
+///   that still resolve to it — so a client that had pinned an old name can
+///   see where it went.
+///
+/// Entries no route claims — wildcard passthroughs — stay verbatim, with no
+/// guessed fields.
+fn canonicalize_models(
     list: &mut serde_json::Value,
-    types_by_id: &std::collections::HashMap<String, String>,
+    facts_by_name: &std::collections::HashMap<String, std::sync::Arc<ModelFacts>>,
 ) {
     let Some(data) = list.get_mut("data").and_then(|d| d.as_array_mut()) else {
         return;
     };
-    for entry in data {
-        let Some(model_type) = entry
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut out: Vec<serde_json::Value> = Vec::with_capacity(data.len());
+    for mut entry in data.drain(..) {
+        let id = entry
             .get("id")
             .and_then(|i| i.as_str())
-            .and_then(|id| types_by_id.get(id))
-        else {
-            continue;
-        };
-        let mode = match model_type.as_str() {
-            "image" => "image_generation",
-            other => other,
-        };
-        if let Some(obj) = entry.as_object_mut() {
-            obj.insert("model_type".into(), model_type.clone().into());
-            obj.insert("mode".into(), mode.into());
+            .unwrap_or_default()
+            .to_string();
+        match facts_by_name.get(&id) {
+            Some(f) => {
+                if !seen.insert(f.model_name.clone()) {
+                    continue;
+                }
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("id".into(), f.model_name.clone().into());
+                    obj.insert("model_type".into(), f.model_type.clone().into());
+                    obj.insert("mode".into(), mode_for_model_type(&f.model_type).into());
+                    obj.insert("quantization".into(), f.quantization.clone().into());
+                    obj.insert("tags".into(), serde_json::json!(f.tags));
+                    obj.insert("aliases".into(), serde_json::json!(f.aliases));
+                }
+                out.push(entry);
+            }
+            None => {
+                if !seen.insert(id) {
+                    continue;
+                }
+                out.push(entry);
+            }
         }
+    }
+    // Re-sorted because the rewrite above moves ids.
+    out.sort_by(|a, b| {
+        a.get("id")
+            .and_then(|i| i.as_str())
+            .cmp(&b.get("id").and_then(|i| i.as_str()))
+    });
+    *data = out;
+}
+
+/// The LiteLLM-convention spelling of a modality, which many OpenAI-compatible
+/// clients read instead of obleth's own `model_type`. Identical to the obleth
+/// vocabulary except that `image` is spelled `image_generation`.
+fn mode_for_model_type(model_type: &str) -> &str {
+    match model_type {
+        "image" => "image_generation",
+        other => other,
     }
 }
 
@@ -2664,12 +2785,138 @@ async fn fetch_upstream_models(
     inner(state, base, api_key).await.unwrap_or_default()
 }
 
-/// The OpenAI model-discovery endpoints: `GET /v1/models` (list) and the
-/// `GET /v1/models/{id}` / `{"model": …}` detail probe. These are the only
-/// paths the gateway proxies without resolving to a registered model, so they
-/// are exempt from the unmapped-path rejection.
+/// One OpenAI model object for a name the gateway has a route for — canonical
+/// or alias — carrying the same annotations [`canonicalize_models`] adds to the
+/// listing. `None` for a name no route claims, which lets the caller fall
+/// through to the upstream passthrough.
+///
+/// `owned_by` is reported as `obleth` rather than guessed: unlike the
+/// aggregated listing, which repeats what an upstream said about itself, this
+/// answer is the gateway's own. `created` is omitted rather than fabricated —
+/// the hot-path view of a route does not carry a registration timestamp.
+///
+/// Deliberately not filtered by the tenant's model allowlist, matching
+/// `GET /v1/models`: these are the OpenAI-compatible discovery endpoints, and a
+/// model name is not a secret — calling it is what the allowlist gates. The
+/// gateway-native `/model/info` does filter, because its semantics are ours to
+/// choose.
+fn registered_model_entry(state: &AppState, id: &str) -> Option<serde_json::Value> {
+    if id.is_empty() {
+        return None;
+    }
+    let candidates = state.model_registry.load();
+    let facts = model_facts_index(&candidates).get(id)?.clone();
+    Some(serde_json::json!({
+        "id": facts.model_name,
+        "object": "model",
+        "owned_by": "obleth",
+        "model_type": facts.model_type,
+        "mode": mode_for_model_type(&facts.model_type),
+        "quantization": facts.quantization,
+        "tags": facts.tags,
+        "aliases": facts.aliases,
+    }))
+}
+
+/// Serve `GET /model/info` from the gateway's own registry.
+///
+/// Where `/v1/models` answers "what can I call right now" by asking the
+/// backends, this answers "what has this gateway been told about each model" —
+/// so it lists every registered, enabled route whether or not its backend is
+/// reachable this second, and reports the configured facts a client cannot
+/// infer from a name: the serving format, the routing tags, the context
+/// window, the per-token prices, the capability flags, the aliases that still
+/// resolve here.
+///
+/// The envelope follows LiteLLM's `/model/info` so tools already written
+/// against a LiteLLM proxy read it unchanged: `{"data": [{model_name,
+/// litellm_params, model_info}]}`, with LiteLLM's conventional keys
+/// (`mode`, `max_input_tokens`, `supports_*`, `*_cost_per_token`) present and
+/// obleth's own additions alongside them.
+///
+/// Deliberately absent from `litellm_params`: `api_base` and `api_key`. This
+/// is a tenant-facing endpoint, and a backend's internal URL is not a client's
+/// business — the upstream *name* is reported, the route to it is not.
+///
+/// Tenants with a model allowlist see only the models they may call. Listing a
+/// model a caller would be refused would be advertising a 403.
+fn model_info_response(state: &AppState, resolved: &ResolvedKey) -> Response<Body> {
+    let candidates = state.model_registry.load();
+    let allowed = if resolved.internal {
+        None
+    } else {
+        resolved.allowed_models.as_deref()
+    };
+    let data: Vec<serde_json::Value> = candidates
+        .iter()
+        .filter(|c| c.model.enabled)
+        .filter(|c| match allowed {
+            Some(list) => list.iter().any(|m| m == &c.model.model_name),
+            None => true,
+        })
+        .map(|c| model_info_entry(&c.model, c.healthy))
+        .collect();
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({ "data": data })),
+    )
+        .into_response()
+}
+
+/// One `/model/info` entry. Split out so the payload shape is unit-testable
+/// without a registry or a request.
+fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
+    serde_json::json!({
+        "model_name": model.model_name,
+        "litellm_params": {
+            // The name the backend serves, which is where a quantization
+            // suffix legitimately lives — the client-facing name above stays
+            // clean regardless of how this deployment is built.
+            "model": model.upstream_model,
+        },
+        "model_info": {
+            // LiteLLM-convention keys, so an existing client reads them as-is.
+            "mode": mode_for_model_type(&model.model_type),
+            "max_input_tokens": model.context_window,
+            "input_cost_per_token": model.input_cost_per_token,
+            "output_cost_per_token": model.output_cost_per_token,
+            "supports_function_calling": model.supports_function_calling,
+            "supports_system_messages": model.supports_system_messages,
+            "supports_response_schema": model.supports_response_schema,
+            "supports_vision": model.supports_vision,
+            // obleth's own additions.
+            "model_type": model.model_type,
+            "quantization": model.quantization,
+            "aliases": model.aliases,
+            "tags": model.tags,
+            "boons": model.boons,
+            "supports_tool_choice": model.supports_tool_choice,
+            "context_window": model.context_window,
+            "cost_per_image": model.cost_per_image,
+            "cost_per_audio_second": model.cost_per_audio_second,
+            "cost_per_character": model.cost_per_character,
+            // Health as the gateway last observed it. False means the model is
+            // registered and addressable but currently failing its probe or
+            // held in a maintenance window.
+            "healthy": healthy,
+        },
+    })
+}
+
+/// The OpenAI model-discovery endpoints: `GET /v1/models` (list), the
+/// `GET /v1/models/{id}` / `{"model": …}` detail probe, and obleth's
+/// registry-backed `/model/info`. These are the only paths the gateway serves
+/// without resolving to a registered model, so they are exempt from the
+/// unmapped-path rejection.
 fn is_models_endpoint(path: &str) -> bool {
-    path == "/v1/models" || path.starts_with("/v1/models/")
+    path == "/v1/models" || path.starts_with("/v1/models/") || is_model_info_endpoint(path)
+}
+
+/// The `/model/info` detail listing, accepted both bare and under `/v1` —
+/// LiteLLM serves it at the bare path, and a client that appends the OpenAI
+/// `/v1` prefix to every request should not be the one to find that out.
+fn is_model_info_endpoint(path: &str) -> bool {
+    path == "/model/info" || path == "/v1/model/info"
 }
 
 fn requires_registered_model(path: &str) -> bool {
@@ -3756,9 +4003,33 @@ mod tests {
         assert_eq!(owner_of("minimax-m2-7-fast"), "openai");
     }
 
+    /// A registered route as the discovery endpoints see it, with only the
+    /// fields those endpoints read set to anything interesting.
+    fn candidate(
+        model_name: &str,
+        upstream_model: &str,
+        model_type: &str,
+        quantization: &str,
+        aliases: &[&str],
+        tags: &[&str],
+    ) -> obleth_config::routing::Candidate {
+        let mut model = model_with(Vec::new());
+        model.model_name = model_name.to_string();
+        model.upstream_model = upstream_model.to_string();
+        model.model_type = model_type.to_string();
+        model.quantization = quantization.to_string();
+        model.aliases = aliases.iter().map(|a| a.to_string()).collect();
+        model.tags = tags.iter().map(|t| t.to_string()).collect();
+        obleth_config::routing::Candidate {
+            model,
+            healthy: true,
+            levels: Vec::new(),
+        }
+    }
+
     #[test]
     fn models_listing_annotates_registered_modalities() {
-        use super::annotate_model_types;
+        use super::{canonicalize_models, model_facts_index};
         let mut list = serde_json::json!({
             "object": "list",
             "data": [
@@ -3767,12 +4038,18 @@ mod tests {
                 {"id": "wildcard-passthrough", "object": "model", "owned_by": "library"},
             ]
         });
-        let types: std::collections::HashMap<String, String> = [
-            ("flux-2-dev".to_string(), "image".to_string()),
-            ("gemma4-31b-it".to_string(), "chat".to_string()),
-        ]
-        .into();
-        annotate_model_types(&mut list, &types);
+        let candidates = vec![
+            candidate(
+                "flux-2-dev",
+                "flux-2-dev",
+                "image",
+                "bf16",
+                &[],
+                &["creative"],
+            ),
+            candidate("gemma4-31b-it", "gemma4-31b-it", "chat", "fp8", &[], &[]),
+        ];
+        canonicalize_models(&mut list, &model_facts_index(&candidates));
 
         let field = |id: &str, key: &str| {
             list["data"]
@@ -3789,14 +4066,150 @@ mod tests {
         assert_eq!(field("flux-2-dev", "mode"), "image_generation");
         assert_eq!(field("gemma4-31b-it", "model_type"), "chat");
         assert_eq!(field("gemma4-31b-it", "mode"), "chat");
+        // The serving format is reported as a field, which is the whole point
+        // of keeping it out of the name.
+        assert_eq!(field("flux-2-dev", "quantization"), "bf16");
+        assert_eq!(field("gemma4-31b-it", "quantization"), "fp8");
+        assert_eq!(field("flux-2-dev", "tags"), serde_json::json!(["creative"]));
         // An id no route claims stays verbatim — no guessed fields.
         assert!(field("wildcard-passthrough", "model_type").is_null());
         assert!(field("wildcard-passthrough", "mode").is_null());
+        assert!(field("wildcard-passthrough", "quantization").is_null());
+    }
+
+    #[test]
+    fn models_listing_reports_the_clean_name_not_the_upstream_spelling() {
+        use super::{canonicalize_models, merge_upstream_models, model_facts_index};
+        // The backend knows itself only by its quantized name, and a second
+        // upstream reports the same route under the old name a client pinned.
+        let payload = vec![
+            vec![serde_json::json!({
+                "id": "glm-5-3-mxfp4", "object": "model", "owned_by": "vllm"
+            })],
+            vec![serde_json::json!({
+                "id": "glm-5-3-fp8", "object": "model", "owned_by": "vllm"
+            })],
+        ];
+        let mut list = merge_upstream_models(payload);
+        let candidates = vec![candidate(
+            "glm-5-3",
+            "glm-5-3-mxfp4",
+            "chat",
+            "mxfp4",
+            &["glm-5-3-fp8"],
+            &["coding"],
+        )];
+        canonicalize_models(&mut list, &model_facts_index(&candidates));
+
+        let data = list["data"].as_array().unwrap();
+        // One entry, under the gateway's clean name — the two upstream
+        // spellings collapse onto the single route they both name.
+        assert_eq!(data.len(), 1);
+        assert_eq!(data[0]["id"], "glm-5-3");
+        assert_eq!(data[0]["quantization"], "mxfp4");
+        // The old name is advertised as an alias, so a client that had pinned
+        // it can see where it went instead of finding it simply gone.
+        assert_eq!(data[0]["aliases"], serde_json::json!(["glm-5-3-fp8"]));
+        // `owned_by` is still whatever the upstream said; only the id is ours.
+        assert_eq!(data[0]["owned_by"], "vllm");
+    }
+
+    #[test]
+    fn model_facts_index_prefers_the_client_facing_name() {
+        use super::model_facts_index;
+        // A pathological-but-legal fleet: one model's `upstream_model` is
+        // another model's client-facing `model_name`. Resolution matches on
+        // `model_name`, so the index has to agree with it.
+        let candidates = vec![
+            candidate("shared-name", "shared-name-fp8", "chat", "fp8", &[], &[]),
+            candidate("other", "shared-name", "chat", "none", &[], &[]),
+        ];
+        let index = model_facts_index(&candidates);
+        assert_eq!(index["shared-name"].model_name, "shared-name");
+        assert_eq!(index["shared-name-fp8"].model_name, "shared-name");
+        assert_eq!(index["other"].model_name, "other");
+    }
+
+    #[test]
+    fn model_info_entry_carries_litellm_keys_and_obleth_additions() {
+        use super::model_info_entry;
+        let mut model = model_with(Vec::new());
+        model.model_name = "glm-5-3".into();
+        model.upstream_model = "glm-5-3-mxfp4".into();
+        model.api_base = "http://glm-5-3.internal.svc:8000/v1".into();
+        model.api_key = Some("sk-secret".into());
+        model.quantization = "mxfp4".into();
+        model.aliases = vec!["glm-5-3-mxfp4".into()];
+        model.tags = vec!["coding".into()];
+        model.context_window = 200_000;
+
+        let entry = model_info_entry(&model, false);
+        assert_eq!(entry["model_name"], "glm-5-3");
+        // LiteLLM-convention keys a client may already be reading.
+        assert_eq!(entry["litellm_params"]["model"], "glm-5-3-mxfp4");
+        assert_eq!(entry["model_info"]["mode"], "chat");
+        assert_eq!(entry["model_info"]["max_input_tokens"], 200_000);
+        // obleth's additions, including the format that used to live in the name.
+        assert_eq!(entry["model_info"]["quantization"], "mxfp4");
+        assert_eq!(
+            entry["model_info"]["aliases"],
+            serde_json::json!(["glm-5-3-mxfp4"])
+        );
+        assert_eq!(entry["model_info"]["tags"], serde_json::json!(["coding"]));
+        // Registered but failing its probe: addressable, and honestly labelled.
+        assert_eq!(entry["model_info"]["healthy"], false);
+        // A tenant-facing endpoint never reports how to reach the backend.
+        let rendered = entry.to_string();
+        assert!(!rendered.contains("sk-secret"), "{rendered}");
+        assert!(!rendered.contains("internal.svc"), "{rendered}");
+    }
+
+    #[test]
+    fn model_detail_answers_for_the_clean_name_and_its_aliases() {
+        use super::model_facts_index;
+        // The lookup `registered_model_entry` performs, without an AppState:
+        // the detail probe has to accept the clean name the listing publishes
+        // and the aliases that still resolve, or a client following the
+        // listing would ask for an id the gateway itself advertised and 404.
+        let candidates = vec![candidate(
+            "glm-5-3",
+            "glm-5-3-mxfp4",
+            "chat",
+            "mxfp4",
+            &["glm-5-3-fp8"],
+            &[],
+        )];
+        let index = model_facts_index(&candidates);
+        for id in ["glm-5-3", "glm-5-3-fp8", "glm-5-3-mxfp4"] {
+            assert_eq!(
+                index.get(id).map(|f| f.model_name.as_str()),
+                Some("glm-5-3"),
+                "{id}"
+            );
+        }
+        // An unclaimed id still has no entry, so the request falls through to
+        // the upstream passthrough rather than being answered with a guess.
+        assert!(index.get("wildcard-passthrough").is_none());
+    }
+
+    #[test]
+    fn model_info_paths_are_recognized_bare_and_under_v1() {
+        use super::{is_model_info_endpoint, is_models_endpoint};
+        for path in ["/model/info", "/v1/model/info"] {
+            assert!(is_model_info_endpoint(path), "{path}");
+            // Also exempt from the unmapped-path rejection, or the route would
+            // 404 before its handler ran.
+            assert!(is_models_endpoint(path), "{path}");
+        }
+        assert!(!is_model_info_endpoint("/model/info/extra"));
+        assert!(!is_model_info_endpoint("/v1/models"));
     }
 
     fn model_with(endpoints: Vec<ResolvedEndpoint>) -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
             model_name: "m".into(),
+            aliases: Vec::new(),
+            quantization: "unknown".into(),
             upstream_model: "m".into(),
             api_base: "http://primary/v1".into(),
             api_key: Some("model-key".into()),
@@ -4244,6 +4657,8 @@ mod tests {
     fn minimal_model(name: &str) -> ResolvedModel {
         ResolvedModel {
             model_name: name.to_string(),
+            aliases: Vec::new(),
+            quantization: "unknown".into(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
             api_key: None,
