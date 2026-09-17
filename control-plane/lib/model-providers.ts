@@ -15,7 +15,7 @@ export interface ModelProvider {
 const PROVIDERS: Array<{ pattern: RegExp; provider: ModelProvider }> = [
   { pattern: /qwen|qwq|qvq|\bgte-/, provider: { id: "qwen", label: "Qwen", src: "/providers/qwen.png" } },
   { pattern: /gemma|gemini|paligemma/, provider: { id: "google", label: "Google", src: "/providers/google.png" } },
-  { pattern: /llama/, provider: { id: "meta", label: "Meta", src: "/providers/meta.png" } },
+  { pattern: /llama|\bmuse\b/, provider: { id: "meta", label: "Meta", src: "/providers/meta.png" } },
   { pattern: /minimax/, provider: { id: "minimax", label: "MiniMax", src: "/providers/minimax.png" } },
   { pattern: /mistral|mixtral|devstral|magistral|ministral|codestral|pixtral/, provider: { id: "mistral", label: "Mistral AI", src: "/providers/mistral.png" } },
   { pattern: /gpt|whisper|dall-e|o[134](?:-mini)?\b|text-embedding-(?:ada|3)/, provider: { id: "openai", label: "OpenAI", src: "/providers/openai.png" } },

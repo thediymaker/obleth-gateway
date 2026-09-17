@@ -11,6 +11,7 @@ const CASES: Array<[string, string]> = [
   ["gemma-3-27b-it", "google"],
   ["embeddinggemma-300m", "google"],
   ["Llama-3.3-70B-Instruct", "meta"],
+  ["muse-glimmer-30b", "meta"],
   ["MiniMax-M2", "minimax"],
   ["Mistral-Small-3.2-24B-Instruct", "mistral"],
   ["gpt-oss-120b", "openai"],
@@ -84,6 +85,14 @@ describe("providerForModel", () => {
     // First pattern wins, and the base vendor sits higher in the table — a
     // Llama-derived Hermes reads as Meta rather than Nous.
     expect(providerForModel("Hermes-4-Llama-3.1-405B")?.id).toBe("meta");
+  });
+
+  it("anchors the short `muse` alias so it cannot swallow unrelated names", () => {
+    // `muse` is an ordinary English word, so the table anchors it with \b on
+    // both sides: a hyphen still terminates it, but a longer word does not.
+    expect(providerForModel("muse-glimmer-30b")?.id).toBe("meta");
+    expect(providerForModel("amuse-bouche-7b")).toBeNull();
+    expect(providerForModel("musegen-1b")).toBeNull();
   });
 
   it("returns null for names with no known vendor", () => {
