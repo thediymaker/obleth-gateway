@@ -50,12 +50,12 @@ const model = (over: Partial<ModelRoute> = {}): ModelRoute => ({
 let root: Root;
 let host: HTMLDivElement;
 
-async function renderFields(m: ModelRoute) {
+async function renderFields(m: ModelRoute, boonBlockers: Record<string, string> = {}) {
   await act(async () => {
     root.render(
       <TooltipProvider>
         <form>
-          <ChatCapabilityFields model={m} mcpServers={[]} />
+          <ChatCapabilityFields model={m} mcpServers={[]} boonBlockers={boonBlockers} />
         </form>
       </TooltipProvider>,
     );
@@ -120,5 +120,44 @@ describe("routing tag strength levels", () => {
     // Bare tag loads as Auto (0), which tagsFromForm saves bare again.
     expect(data.get("tag_level_math")).toBe("0");
     expect(data.get("tag_general")).toBeNull();
+  });
+});
+
+describe("boons that are not configured globally", () => {
+  const OFF = "it is switched off in Settings → Boons.";
+
+  it("refuses a new grant for a boon whose global switch is off", async () => {
+    await renderFields(model({ boons: [] }), { image_generation: OFF });
+    const checkbox = host.querySelector<HTMLInputElement>('[name="boon_image_generation"]')!;
+    expect(checkbox.disabled).toBe(true);
+    expect(host.textContent).toContain("can’t be granted");
+    expect(host.textContent).toContain(OFF);
+  });
+
+  it("leaves an existing grant operable so an unrelated save can't silently revoke it", async () => {
+    // A disabled checkbox submits nothing, so disabling a granted boon would
+    // drop it from the form the next time capabilities were saved.
+    await renderFields(model({ boons: ["image_generation"] }), { image_generation: OFF });
+    const checkbox = host.querySelector<HTMLInputElement>('[name="boon_image_generation"]')!;
+    expect(checkbox.disabled).toBe(false);
+    expect(checkbox.checked).toBe(true);
+    expect(new FormData(host.querySelector("form")!).get("boon_image_generation")).toBe("on");
+    expect(host.textContent).toContain("is granted but inactive");
+  });
+
+  it("gates the controlled chips (knowledge, speculation) the same way", async () => {
+    await renderFields(model({ boons: [] }), {
+      knowledge: "retrieval is switched off in Settings → Knowledge.",
+      speculation: OFF,
+    });
+    expect(host.querySelector<HTMLInputElement>('[name="boon_knowledge"]')!.disabled).toBe(true);
+    expect(host.querySelector<HTMLInputElement>('[name="boon_speculation"]')!.disabled).toBe(true);
+  });
+
+  it("says nothing when every boon is configured", async () => {
+    await renderFields(model({ boons: ["compression"] }));
+    expect(host.querySelector<HTMLInputElement>('[name="boon_compression"]')!.disabled).toBe(false);
+    expect(host.textContent).not.toContain("can’t be granted");
+    expect(host.textContent).not.toContain("granted but inactive");
   });
 });

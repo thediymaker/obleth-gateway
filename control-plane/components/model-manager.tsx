@@ -92,6 +92,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import type { AutotuneReport, AutotuneWorkload, CacheStats, KnowledgeCollection, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelImportReport, ModelKnowledgeCollections, ModelReplica, ModelRoute } from "@/lib/obleth";
+import type { BoonBlockers } from "@/lib/boon-availability";
 import { providerForModel } from "@/lib/model-providers";
 import { normalizeModelApiNameDraft, normalizeModelApiNameFinal } from "@/lib/model-name";
 import { EditForm } from "@/components/edit-form";
@@ -213,6 +214,7 @@ export function ModelManager({
   managed = {},
   slurmEnabled = false,
   recipeCards = [],
+  boonBlockers = {},
 }: {
   models: ModelRoute[];
   cacheStats?: CacheStats;
@@ -221,6 +223,7 @@ export function ModelManager({
   managed?: Record<string, boolean>;
   slurmEnabled?: boolean;
   recipeCards?: RecipeCard[];
+  boonBlockers?: BoonBlockers;
 }) {
   const [pending, start] = useTransition();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -371,6 +374,7 @@ export function ModelManager({
           mcpServers={mcpServers}
           recipeCards={recipeCards}
           modelNames={models.map((m) => m.model_name)}
+          boonBlockers={boonBlockers}
           onCancel={closeCreateWizard}
           onSubmit={submitModel}
         />
@@ -617,6 +621,7 @@ export function ModelManager({
                               summary={summary}
                               mcpServers={mcpServers}
                               modelNames={models.map((m) => m.model_name)}
+                              boonBlockers={boonBlockers}
                               isManaged={managed[model.id] ?? false}
                               pending={pending}
                               onCacheToggle={() => {
@@ -714,6 +719,7 @@ function CreateModelWizard({
   mcpServers,
   recipeCards,
   modelNames,
+  boonBlockers,
   onCancel,
   onSubmit,
 }: {
@@ -723,11 +729,13 @@ function CreateModelWizard({
   mcpServers: McpServer[];
   recipeCards: RecipeCard[];
   modelNames: string[];
+  boonBlockers: BoonBlockers;
   onCancel: () => void;
   onSubmit: (formData: FormData) => void;
 }) {
   const [step, setStep] = useState(0);
   const [createType, setCreateType] = useState<string>("chat");
+  const [createQuantization, setCreateQuantization] = useState<string>("unknown");
   const [modelName, setModelName] = useState("");
   const [endpointMode, setEndpointMode] = useState<string>("static");
   const [localError, setLocalError] = useState<string | null>(null);
@@ -1039,6 +1047,7 @@ function CreateModelWizard({
                     mcpServers={mcpServers}
                     modelNames={modelNames}
                     selfName={modelName}
+                    boonBlockers={boonBlockers}
                   />
                 ) : (
                   <div className="rounded-md border border-border/70 bg-background/35 p-4">
@@ -1115,6 +1124,7 @@ function ModelDetailPanel({
   isManaged = false,
   pending,
   modelNames = [],
+  boonBlockers = {},
   onCacheToggle,
 }: {
   model: ModelRoute;
@@ -1123,6 +1133,7 @@ function ModelDetailPanel({
   isManaged?: boolean;
   pending: boolean;
   modelNames?: string[];
+  boonBlockers?: BoonBlockers;
   onCacheToggle: () => void;
 }) {
   // The panel only mounts for the expanded card, so per-model detail loads
@@ -1261,6 +1272,7 @@ function ModelDetailPanel({
           editType={editType}
           mcpServers={mcpServers}
           modelNames={modelNames}
+          boonBlockers={boonBlockers}
         />
       </TabsContent>
 
@@ -1507,11 +1519,13 @@ function CapabilitiesTab({
   editType,
   mcpServers = [],
   modelNames = [],
+  boonBlockers = {},
 }: {
   model: ModelRoute;
   editType: string;
   mcpServers?: McpServer[];
   modelNames?: string[];
+  boonBlockers?: BoonBlockers;
 }) {
   const flashSaved = useContext(SaveFlashContext);
   const [state, formAction, pending] = useActionState(
@@ -1550,6 +1564,7 @@ function CapabilitiesTab({
                 mcpServers={mcpServers}
                 modelNames={modelNames}
                 selfName={model.model_name}
+                boonBlockers={boonBlockers}
               />
             )}
           </div>
@@ -2531,11 +2546,13 @@ export function ChatCapabilityFields({
   mcpServers,
   modelNames = [],
   selfName = "",
+  boonBlockers = {},
 }: {
   model?: ModelRoute;
   mcpServers: McpServer[];
   modelNames?: string[];
   selfName?: string;
+  boonBlockers?: BoonBlockers;
 }) {
   const [fnCalling, setFnCalling] = useState(model?.supports_function_calling ?? false);
   const [toolChoice, setToolChoice] = useState(model?.supports_tool_choice ?? false);
@@ -2567,6 +2584,15 @@ export function ChatCapabilityFields({
     return state;
   });
   const toolsReady = fnCalling && toolChoice;
+  // Boons whose global switch (or helper model) is missing in Settings. The
+  // grant alone does nothing in that state, so the form says so rather than
+  // letting the misconfiguration land and surface later as "the model says it
+  // can't do that".
+  const blockedBoons = MODEL_BOONS.flatMap((boon) => {
+    const reason = boonBlockers[boon.value];
+    if (!reason) return [];
+    return [{ value: boon.value, label: boon.label, reason, held: model?.boons?.includes(boon.value) ?? false }];
+  });
 
   useEffect(() => {
     if (!toolsReady) {
@@ -2608,13 +2634,25 @@ export function ChatCapabilityFields({
         })}
       </ChipGroup>
       <ChipGroup label="Boons" info="Gateway capabilities granted that the model lacks natively. Configure in Settings → Boons.">
-        {MODEL_BOONS.map((boon) =>
-          boon.value === "knowledge" ? (
+        {MODEL_BOONS.map((boon) => {
+          const blocked = boonBlockers[boon.value];
+          const held = model?.boons?.includes(boon.value) ?? false;
+          // A boon already granted keeps its operable chip even while its
+          // global switch is off: the chip is how an admin ungrants it, and a
+          // disabled checkbox submits nothing — which would silently revoke the
+          // grant on the next unrelated save of this form. Only a NEW grant is
+          // refused, since it would be inert the moment it was made.
+          const disabled = Boolean(blocked) && !held;
+          const hint = blocked
+            ? `${boon.description}\n\n${held ? "Granted but inactive" : "Unavailable"} — ${blocked}`
+            : boon.description;
+          return boon.value === "knowledge" ? (
             <ChipCheckbox
               key={boon.value}
               name={`boon_${boon.value}`}
               label={boon.label}
-              hint={boon.description}
+              hint={hint}
+              disabled={disabled}
               checked={knowledgeChecked}
               onChange={setKnowledgeChecked}
             />
@@ -2623,7 +2661,8 @@ export function ChatCapabilityFields({
               key={boon.value}
               name={`boon_${boon.value}`}
               label={boon.label}
-              hint={boon.description}
+              hint={hint}
+              disabled={disabled}
               checked={speculationChecked}
               onChange={setSpeculationChecked}
             />
@@ -2632,12 +2671,24 @@ export function ChatCapabilityFields({
               key={boon.value}
               name={`boon_${boon.value}`}
               label={boon.label}
-              hint={boon.description}
-              defaultChecked={model?.boons?.includes(boon.value) ?? false}
+              hint={hint}
+              disabled={disabled}
+              defaultChecked={held}
             />
-          ),
-        )}
+          );
+        })}
       </ChipGroup>
+      {blockedBoons.length > 0 && (
+        <ul className="max-w-prose space-y-0.5 text-[11px] leading-snug text-amber-500/90">
+          {blockedBoons.map((boon) => (
+            <li key={boon.value}>
+              <span className="font-medium text-foreground">{boon.label}</span>
+              {boon.held ? " is granted but inactive — " : " can’t be granted — "}
+              {boon.reason}
+            </li>
+          ))}
+        </ul>
+      )}
       {speculationChecked && (
         <div className="space-y-3 rounded-md border border-border/60 bg-muted/20 p-3">
           <div>
