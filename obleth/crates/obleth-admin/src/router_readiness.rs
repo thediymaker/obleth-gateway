@@ -328,11 +328,7 @@ mod tests {
         let mut coder = model("coder");
         coder.tags = vec!["coding".to_string()];
         let cands = vec![cand(coder)];
-        let r = build_readiness(
-            &AutoRouterSettings::default(),
-            &cands,
-            &Default::default(),
-        );
+        let r = build_readiness(&AutoRouterSettings::default(), &cands, &Default::default());
         let math = r
             .findings
             .iter()
@@ -376,7 +372,11 @@ mod tests {
             &[cand(a), cand(b)],
             &Default::default(),
         );
-        let ties: Vec<_> = r.findings.iter().filter(|f| f.code == "price_tie").collect();
+        let ties: Vec<_> = r
+            .findings
+            .iter()
+            .filter(|f| f.code == "price_tie")
+            .collect();
         assert_eq!(ties.len(), 1);
         assert_eq!(
             ties[0].models,

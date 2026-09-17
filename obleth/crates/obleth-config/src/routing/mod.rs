@@ -244,23 +244,23 @@ impl RequestFeatures {
 
         // Same message-part scan shape as `heuristic_intent`, but as a hard
         // capability: any image part makes vision a requirement.
-        let needs_vision = json
-            .get("messages")
-            .and_then(|m| m.as_array())
-            .is_some_and(|messages| {
-                messages.iter().any(|msg| {
-                    msg.get("content")
-                        .and_then(|c| c.as_array())
-                        .is_some_and(|parts| {
-                            parts.iter().any(|part| {
-                                matches!(
-                                    part.get("type").and_then(|t| t.as_str()),
-                                    Some("image_url") | Some("input_image")
-                                )
+        let needs_vision =
+            json.get("messages")
+                .and_then(|m| m.as_array())
+                .is_some_and(|messages| {
+                    messages.iter().any(|msg| {
+                        msg.get("content")
+                            .and_then(|c| c.as_array())
+                            .is_some_and(|parts| {
+                                parts.iter().any(|part| {
+                                    matches!(
+                                        part.get("type").and_then(|t| t.as_str()),
+                                        Some("image_url") | Some("input_image")
+                                    )
+                                })
                             })
-                        })
-                })
-            });
+                    })
+                });
 
         Self {
             est_input_tokens,
@@ -1832,7 +1832,10 @@ mod tests {
             stats.observe("m", 100);
         }
         let avg = stats.snapshot()["m"];
-        assert!(avg < 150.0, "EWMA must converge toward recent behavior, got {avg}");
+        assert!(
+            avg < 150.0,
+            "EWMA must converge toward recent behavior, got {avg}"
+        );
         assert!(stats.snapshot().get("unseen").is_none());
     }
 

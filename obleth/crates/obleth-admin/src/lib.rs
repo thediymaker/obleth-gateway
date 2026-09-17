@@ -13,10 +13,10 @@ pub mod energy_probe;
 mod error;
 pub mod knowledge;
 pub mod model_health;
-pub mod router_readiness;
 mod models_io;
 mod openapi;
 pub mod recipes;
+pub mod router_readiness;
 pub mod slurm_resources;
 pub mod slurm_settings;
 pub mod ssrf;
@@ -1982,8 +1982,7 @@ async fn simulate_route(
             }
         }
     }
-    let mut intent =
-        intent.unwrap_or_else(|| heuristic_intent(&json, est_input_tokens));
+    let mut intent = intent.unwrap_or_else(|| heuristic_intent(&json, est_input_tokens));
     if let Some(difficulty) = difficulty_from_header(body.effort.as_deref()) {
         intent.difficulty = difficulty;
         intent.source = IntentSource::Header;

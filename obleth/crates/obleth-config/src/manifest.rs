@@ -34,8 +34,8 @@ use utoipa::ToSchema;
 
 use crate::types::{
     is_valid_capacity_mode, is_valid_endpoint_selection_mode, is_valid_model_type, normalize_boons,
-    normalize_tool_servers, parse_tag_level, ModelEndpoint, ModelRoute,
-    CAPACITY_MODES, DEFAULT_CAPACITY_MODE, DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE,
+    normalize_tool_servers, parse_tag_level, ModelEndpoint, ModelRoute, CAPACITY_MODES,
+    DEFAULT_CAPACITY_MODE, DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE,
     DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES, MODEL_TYPES,
 };
 

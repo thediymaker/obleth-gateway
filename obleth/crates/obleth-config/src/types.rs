@@ -2629,7 +2629,11 @@ mod tests {
 
     #[test]
     fn declared_levels_come_only_from_explicit_suffixes() {
-        let tags = vec!["coding".to_string(), "math:2".to_string(), "vision:1".to_string()];
+        let tags = vec![
+            "coding".to_string(),
+            "math:2".to_string(),
+            "vision:1".to_string(),
+        ];
         let declared = declared_tag_levels(&tags);
         // Bare "coding" declares nothing: under hybrid tiering it derives from
         // cost rank instead of silently pinning the model to level 1.
@@ -2647,7 +2651,7 @@ mod tests {
             "coding:1".to_string(),
             "math".to_string(),
             "vision:3".to_string(),
-            "Vision:2".to_string(), // duplicate base: first occurrence wins
+            "Vision:2".to_string(),  // duplicate base: first occurrence wins
             "astrology".to_string(), // not in the vocabulary: dropped
         ];
         assert_eq!(
