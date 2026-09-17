@@ -4416,8 +4416,10 @@ mod tests {
     /// must see the same suffix decoded into `declared_levels` while `tags`
     /// itself stays bare for the router's overlap match). Also proves the
     /// two behaviors that must NOT change: an unknown tag base is dropped,
-    /// and a level-1 (untiered) tag is stored bare, byte-identical to every
-    /// row written before tiering existed.
+    /// and a bare tag stays bare, byte-identical to every row written before
+    /// tiering existed. Since `2b86f63` a bare tag also declares *nothing*:
+    /// it derives its level from cost rank under `TierSource::Hybrid`, so
+    /// only an explicit `:N` suffix reaches `declared_levels`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn declared_tag_level_survives_save_then_read() {
         let Some(url) = crate::test_support::test_db_url() else {
@@ -4485,7 +4487,8 @@ mod tests {
         // The data-plane cache view must decode the suffix into
         // `declared_levels` while keeping `tags` bare, since the router's
         // exact-match overlap logic (`router::select_model`) compares against
-        // bare vocabulary strings.
+        // bare vocabulary strings. Bare `math` declares nothing -- it derives
+        // from cost rank instead of silently pinning the model to level 1.
         let resolved = store
             .all_resolved_models()
             .await
@@ -4498,13 +4501,12 @@ mod tests {
             resolved.tags,
             vec!["coding".to_string(), "math".to_string()]
         );
-        assert_eq!(
-            resolved.declared_levels,
-            vec![("coding".to_string(), 3), ("math".to_string(), 1)]
-        );
+        assert_eq!(resolved.declared_levels, vec![("coding".to_string(), 3)]);
 
-        // A save that lowers the declared level back to 1 must store the bare
-        // tag, byte-identical to every model saved before tiering existed.
+        // A save that lowers the declared level to an explicit 1 must KEEP the
+        // suffix: bare ("derive my level") and `tag:1` ("pinned weak on
+        // purpose") mean different things under hybrid tiering, so the save
+        // path must not erase the distinction the operator typed.
         let updated_tags = vec!["coding:1".to_string()];
         let updated = store
             .update_model(
@@ -4540,9 +4542,9 @@ mod tests {
             )
             .await
             .expect("update model");
-        assert_eq!(updated.tags, vec!["coding".to_string()]);
+        assert_eq!(updated.tags, vec!["coding:1".to_string()]);
         let reread_after_update = store.get_model(model.id).await.expect("get model");
-        assert_eq!(reread_after_update.tags, vec!["coding".to_string()]);
+        assert_eq!(reread_after_update.tags, vec!["coding:1".to_string()]);
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
