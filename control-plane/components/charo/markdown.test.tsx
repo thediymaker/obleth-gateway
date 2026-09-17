@@ -43,3 +43,26 @@ describe("CharoMarkdown", () => {
     expect(() => html("**unclosed `chaos | ---")).not.toThrow();
   });
 });
+
+describe("generated images", () => {
+  // The image-generation boon appends `![alt](data:image/png;base64,…)` to the
+  // assistant message. react-markdown's default transform blanks that src,
+  // which is what made a working generation render as a broken image.
+  const PNG = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
+
+  it("keeps an image data URL as the src", () => {
+    const out = html(`Here you go\n\n![a cat in a hat](${PNG})`);
+    expect(out).toContain(`src="${PNG}"`);
+    expect(out).toContain('alt="a cat in a hat"');
+  });
+
+  it("still blocks a non-image data URL, and renders no broken image for it", () => {
+    const out = html("![x](data:text/html;base64,PHNjcmlwdD4=)");
+    expect(out).not.toContain("data:text/html");
+    expect(out).not.toContain("<img");
+  });
+
+  it("leaves ordinary http images alone", () => {
+    expect(html("![x](https://example.test/a.png)")).toContain('src="https://example.test/a.png"');
+  });
+});
