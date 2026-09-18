@@ -8,6 +8,7 @@ import type { TraceSummary } from "@/lib/charo/trace";
 import type { StepOutcome } from "@/lib/charo/bench/types";
 import { ensureActivitiesRegistered, getActivity } from "@/lib/charo/activities";
 import { stripHiddenReasoning } from "@/lib/charo/visible-text";
+import { hasGeneratedImage, stripGeneratedImages } from "@/lib/charo/generated-images";
 
 export interface ChatTurn {
   id: string;
@@ -75,11 +76,37 @@ function verdictSummary(result: { type: string; data: unknown }): unknown {
 const TRACE_POLL_MS = 1200;
 const TRACE_POLL_TRIES = 12;
 
-function toWire(turns: ChatTurn[]): WireMessage[] {
-  return turns
-    .filter((t) => !t.error)
-    .map((t) => {
-      if (t.role === "user" && t.image) {
+/**
+ * Flatten turns into wire messages.
+ *
+ * `supportsVision` describes the model this history is bound for, and is
+ * `undefined` when that is not known (the brain path picks its own model):
+ *
+ * - Generated-image payloads are stripped from assistant text in every case —
+ *   base64 sent back as text is unreadable to the model and cost one session
+ *   570,891 prompt tokens against a 131,072 window. See `generated-images`.
+ * - `true`: the most recent generation is re-attached as a real `image_url`
+ *   part, which a vision encoder charges ~300 tokens for, so "make it darker"
+ *   still works. Older generations stay placeholders.
+ * - `false`: a user's own attachment is dropped too. A non-multimodal model
+ *   rejects an image part outright ("is not a multimodal model"), which would
+ *   otherwise 400 every turn after an upload.
+ * - `undefined`: behave as before for user attachments — send them, and let
+ *   the model decide.
+ */
+export function toWire(turns: ChatTurn[], supportsVision?: boolean): WireMessage[] {
+  const kept = turns.filter((t) => !t.error);
+  // Only the latest generation is re-attached: each one costs encoder tokens,
+  // and the earlier ones are still described by their placeholder text.
+  const reattachAt = supportsVision
+    ? kept.reduce(
+        (found, t, i) => (t.role === "assistant" && hasGeneratedImage(t.content) ? i : found),
+        -1,
+      )
+    : -1;
+  return kept.map((t, i) => {
+    if (t.role === "user") {
+      if (t.image && supportsVision !== false) {
         return {
           role: "user" as const,
           content: [
@@ -88,11 +115,20 @@ function toWire(turns: ChatTurn[]): WireMessage[] {
           ],
         };
       }
+      return { role: t.role, content: t.content };
+    }
+    const { text, images } = stripGeneratedImages(stripHiddenReasoning(t.content));
+    if (i === reattachAt && images.length > 0) {
       return {
-        role: t.role,
-        content: t.role === "assistant" ? stripHiddenReasoning(t.content) : t.content,
+        role: "assistant" as const,
+        content: [
+          { type: "text" as const, text },
+          ...images.map((url) => ({ type: "image_url" as const, image_url: { url } })),
+        ],
       };
-    });
+    }
+    return { role: t.role, content: text };
+  });
 }
 
 /**
@@ -134,7 +170,7 @@ async function readSSE(
   }
 }
 
-export function useCharoStream(options?: { model?: string; generation?: GenerationSettings; storageKey?: string }) {
+export function useCharoStream(options?: { model?: string; supportsVision?: boolean; generation?: GenerationSettings; storageKey?: string }) {
   const [messages, setMessages] = useState<ChatTurn[]>([]);
   const [state, setState] = useState<CharoState>("idle");
   const [busy, setBusy] = useState(false);
@@ -413,6 +449,10 @@ export function useCharoStream(options?: { model?: string; generation?: Generati
 
       try {
         const target = options?.model || activeTarget;
+        // `supportsVision` describes `options.model` only. When the brain
+        // picked the target itself (`activeTarget`), its capabilities are not
+        // known here, so the conservative `undefined` applies.
+        const targetVision = target === options?.model ? options?.supportsVision : undefined;
         if (target) {
           // Target mode: talk to the chosen model directly, raw (no persona).
           // Relay only the turns authored after the target was set — the
@@ -421,7 +461,7 @@ export function useCharoStream(options?: { model?: string; generation?: Generati
           const startIdx = history.findIndex((m) => m.id === targetStartRef.current);
           const convo = (startIdx >= 0 ? history.slice(startIdx + 1) : history)
             .filter((m) => !m.showLauncher && !m.workflowActivityId && !m.pendingConfirm);
-          const targetWire = toWire(convo);
+          const targetWire = toWire(convo, targetVision);
           const sawError = await runLegacyChat(target, targetWire, assistantId, ac.signal, { bare: true });
           patchTurn(assistantId, (m) => (m.pendingConfirm ? m : { ...m, streaming: false }));
           setState(sawError ? "error" : "result");

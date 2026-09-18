@@ -16,7 +16,19 @@ const modelName = (name: string) => name === "charo" ? "Assistant" : name || "Ch
 export function UnifiedWorkspace({ storageKey, session, update, models, loading }: {
   storageKey: string; session: PlaygroundSession; update: (patch: Partial<PlaygroundSession>) => void; models: ModelRoute[]; loading: boolean;
 }) {
-  const options = (index: number) => ({ storageKey: `${storageKey}:${index}`, model: session.models[index] === "charo" ? undefined : session.models[index], generation: session.generation });
+  // `supportsVision` decides whether a generated image can be replayed to this
+  // slot's model as a real image part or has to stay a text placeholder — see
+  // `toWire`. Undefined while the registry is still loading, which is the
+  // conservative reading.
+  const options = (index: number) => {
+    const name = session.models[index];
+    return {
+      storageKey: `${storageKey}:${index}`,
+      model: name === "charo" ? undefined : name,
+      supportsVision: models.find((m) => m.model_name === name)?.supports_vision,
+      generation: session.generation,
+    };
+  };
   // Stable slots retain independent histories and cancellation controllers.
   const first = useCharoStream(options(0));
   const second = useCharoStream(options(1));
