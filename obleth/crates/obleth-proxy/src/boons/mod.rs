@@ -323,6 +323,17 @@ impl BoonEngine {
             return outcome;
         }
         let settings = self.settings();
+
+        // ---- replayed image attachments ----
+        // Independent of every boon switch and of `route`: the base64 in an
+        // assistant message was put there by this gateway, and a client that
+        // replays it is sending back megabytes the model cannot read. Stripping
+        // it is reverting our own insertion, so it runs for any model — but
+        // still after `opt_out`, which means "do not touch my request".
+        if is_chat && image_gen::strip_replayed_attachments(json) {
+            outcome.rewritten = true;
+        }
+
         let Some(route) = route else {
             return outcome;
         };

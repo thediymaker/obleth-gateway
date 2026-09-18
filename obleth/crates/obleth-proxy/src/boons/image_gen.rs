@@ -13,11 +13,13 @@
 //! appended to the final assistant message as markdown.
 
 use std::collections::HashMap;
+use std::sync::LazyLock;
 use std::time::Duration;
 
 use obleth_config::{
     ImageGenerationBoonSettings, ResolvedKey, ResolvedModel, IMAGE_GENERATION_MAX_PER_REQUEST,
 };
+use regex::Regex;
 use serde_json::{json, Value};
 
 use crate::state::AppState;
@@ -347,6 +349,94 @@ pub(super) fn attachment(images: &[GeneratedImage]) -> Option<String> {
     Some(format!("\n\n{}", lines.join("\n\n")))
 }
 
+/// An attachment this boon wrote into an earlier assistant message. The alt
+/// text is captured so the placeholder can keep it; the payload is matched
+/// loosely (any base64-ish run) because it only has to be recognized, never
+/// decoded.
+static REPLAYED_ATTACHMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"!\[([^\]]*)\]\(data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]*\)")
+        .expect("attachment pattern is valid")
+});
+
+/// What replaces a stripped attachment: the model still learns an image was
+/// produced, and what of, without carrying the bytes.
+fn placeholder(alt: &str) -> String {
+    let alt = alt.trim();
+    if alt.is_empty() {
+        "[generated image]".to_string()
+    } else {
+        format!("[generated image: {alt}]")
+    }
+}
+
+/// Replace every attachment in one piece of assistant text. `None` when there
+/// was nothing to strip, so an untouched message is left byte-identical.
+fn strip_attachments_from_text(text: &str) -> Option<String> {
+    if !REPLAYED_ATTACHMENT.is_match(text) {
+        return None;
+    }
+    Some(
+        REPLAYED_ATTACHMENT
+            .replace_all(text, |caps: &regex::Captures| {
+                placeholder(caps.get(1).map_or("", |m| m.as_str()))
+            })
+            .into_owned(),
+    )
+}
+
+/// Drop the base64 attachments this boon appended to *earlier* assistant
+/// messages that a client has replayed as history. Returns true when the body
+/// was modified.
+///
+/// The module note above explains why the tool *return value* is a text
+/// receipt: a data URL re-dispatched each turn turns one picture into megabytes
+/// of prompt tokens. The attachment on the final assistant message has exactly
+/// the same problem one turn later, once a client sends that message back —
+/// measured at 570,891 prompt tokens for a single ~2 MB image against a 131k
+/// window, which is a hard 400 rather than a slow request.
+///
+/// Only `assistant` messages are touched, and only this boon's own markdown: a
+/// data URL a caller wrote themselves is theirs to send. A vision model that
+/// should genuinely see a past generation wants it as an `image_url` content
+/// part, which this leaves alone — markdown in a text body is never readable
+/// by a model either way.
+pub(super) fn strip_replayed_attachments(body: &mut Value) -> bool {
+    let Some(messages) = body.pointer_mut("/messages").and_then(|m| m.as_array_mut()) else {
+        return false;
+    };
+    let mut stripped = false;
+    for message in messages.iter_mut() {
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        match message.get_mut("content") {
+            // The shape the gateway itself writes.
+            Some(Value::String(text)) => {
+                if let Some(clean) = strip_attachments_from_text(text) {
+                    *text = clean;
+                    stripped = true;
+                }
+            }
+            // A client that round-trips content as parts.
+            Some(Value::Array(parts)) => {
+                for part in parts.iter_mut() {
+                    if part.get("type").and_then(Value::as_str) != Some("text") {
+                        continue;
+                    }
+                    if let Some(Value::String(text)) = part.get_mut("text") {
+                        if let Some(clean) = strip_attachments_from_text(text) {
+                            *text = clean;
+                            stripped = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    stripped
+}
+
 /// Append the generated images to `/choices/0/message/content`. Returns true
 /// when the completion was modified. A completion without that pointer (an
 /// error body, a malformed reply) is left byte-identical.
@@ -571,6 +661,133 @@ mod tests {
             max_images_per_request: 2,
             ..Default::default()
         }
+    }
+
+    /// A data URL of the shape `attachment` writes, short enough to read.
+    const PNG_URL: &str = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==";
+
+    #[test]
+    fn strip_replays_swaps_the_payload_for_a_placeholder() {
+        let mut body = serde_json::json!({
+            "messages": [
+                { "role": "user", "content": "draw a cat" },
+                { "role": "assistant", "content": format!("Here you go\n\n![a cat in a hat]({PNG_URL})") },
+                { "role": "user", "content": "now a dog" },
+            ],
+        });
+        assert!(strip_replayed_attachments(&mut body));
+        let content = body["messages"][1]["content"].as_str().expect("content");
+        assert_eq!(content, "Here you go\n\n[generated image: a cat in a hat]");
+        assert!(!content.contains("base64"));
+        // Untouched roles stay byte-identical.
+        assert_eq!(body["messages"][0]["content"], "draw a cat");
+        assert_eq!(body["messages"][2]["content"], "now a dog");
+    }
+
+    #[test]
+    fn strip_replays_handles_every_attachment_in_one_message() {
+        let mut body = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": format!("two\n\n![one]({PNG_URL})\n\n![two]({PNG_URL})"),
+            }],
+        });
+        assert!(strip_replayed_attachments(&mut body));
+        let content = body["messages"][0]["content"].as_str().expect("content");
+        assert_eq!(
+            content,
+            "two\n\n[generated image: one]\n\n[generated image: two]"
+        );
+    }
+
+    #[test]
+    fn strip_replays_keeps_an_empty_alt_readable() {
+        assert_eq!(
+            strip_attachments_from_text(&format!("![]({PNG_URL})")).expect("stripped"),
+            "[generated image]"
+        );
+    }
+
+    #[test]
+    fn strip_replays_reaches_text_parts_of_an_array_content() {
+        let mut body = serde_json::json!({
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    { "type": "text", "text": format!("![x]({PNG_URL})") },
+                    { "type": "image_url", "image_url": { "url": PNG_URL } },
+                ],
+            }],
+        });
+        assert!(strip_replayed_attachments(&mut body));
+        assert_eq!(
+            body["messages"][0]["content"][0]["text"],
+            "[generated image: x]"
+        );
+        // An `image_url` part is how a vision model is legitimately shown a
+        // past generation — leave it alone.
+        assert_eq!(
+            body["messages"][0]["content"][1]["image_url"]["url"],
+            PNG_URL
+        );
+    }
+
+    #[test]
+    fn strip_replays_leaves_a_caller_authored_data_url_alone() {
+        // Same markdown, but on a user message: not ours to rewrite.
+        let mut body = serde_json::json!({
+            "messages": [{ "role": "user", "content": format!("what is this? ![x]({PNG_URL})") }],
+        });
+        assert!(!strip_replayed_attachments(&mut body));
+        assert!(body["messages"][0]["content"]
+            .as_str()
+            .expect("content")
+            .contains("base64"));
+    }
+
+    #[test]
+    fn strip_replays_reports_no_change_when_there_is_nothing_to_strip() {
+        let mut body = serde_json::json!({
+            "messages": [{ "role": "assistant", "content": "just words" }],
+        });
+        assert!(!strip_replayed_attachments(&mut body));
+        assert!(strip_attachments_from_text("just words").is_none());
+        // A non-image data URL is not this boon's markup.
+        assert!(strip_attachments_from_text("![x](data:text/html;base64,PHNjcmlwdD4=)").is_none());
+    }
+
+    #[test]
+    fn strip_replays_tolerates_a_body_without_messages() {
+        let mut body = serde_json::json!({ "model": "m" });
+        assert!(!strip_replayed_attachments(&mut body));
+    }
+
+    /// The round trip the bug actually took: `attachment` writes the markdown,
+    /// a client replays it, and the strip takes the bytes back out.
+    #[test]
+    fn attachment_output_is_recognized_by_the_strip() {
+        let images = vec![GeneratedImage {
+            url: PNG_URL.to_string(),
+            size: "512x512".to_string(),
+            prompt: "a cat in a hat".to_string(),
+        }];
+        let mut body = serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": "Here you go" } }],
+        });
+        assert!(attach_to_completion(&images, &mut body));
+        let replayed = body["choices"][0]["message"]["content"]
+            .as_str()
+            .expect("content")
+            .to_string();
+        assert!(replayed.contains("base64"));
+
+        let mut next = serde_json::json!({
+            "messages": [{ "role": "assistant", "content": replayed }],
+        });
+        assert!(strip_replayed_attachments(&mut next));
+        let content = next["messages"][0]["content"].as_str().expect("content");
+        assert!(!content.contains("base64"));
+        assert!(content.contains("[generated image: a cat in a hat]"));
     }
 
     #[test]
