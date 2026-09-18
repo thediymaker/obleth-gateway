@@ -86,6 +86,8 @@ const SCHEMA_V23: &str =
 const SCHEMA_V22: &str = include_str!("../../../../schema/postgres/0022_model_verifier_for.sql");
 const SCHEMA_V21: &str =
     include_str!("../../../../schema/postgres/0021_knowledge_reindex_requested.sql");
+const SCHEMA_V24: &str =
+    include_str!("../../../../schema/postgres/0024_model_aliases_and_quantization.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -153,22 +155,17 @@ pub struct UpsertManagedModel {
 /// tag whose base falls outside [`obleth_config::MODEL_TAGS`] is dropped, same
 /// as the old bare-only `normalize_tags` write path. Storing the suffixed
 /// form (rather than the bare-only [`obleth_config::normalize_tags`] output)
-/// is what lets a declared strength level survive a save.
+/// is what lets a declared strength level survive a save. An explicit `:1` is
+/// preserved rather than collapsed to the bare tag: bare means "derive my
+/// level from cost rank" under `TierSource::Hybrid`, while `tag:1` pins the
+/// model to the bottom tier on purpose — a distinction the save path must
+/// not erase.
 fn serialize_tag_levels<I, S>(tags: I) -> Vec<String>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    obleth_config::normalize_tag_levels(tags)
-        .into_iter()
-        .map(|(base, level)| {
-            if level == 1 {
-                base
-            } else {
-                format!("{base}:{level}")
-            }
-        })
-        .collect()
+    obleth_config::canonical_tags(tags)
 }
 
 #[derive(Clone)]
@@ -230,6 +227,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V21).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V22).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V23).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V24).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1296,6 +1294,8 @@ impl Store {
         draft_model: &str,
         verify_api_base: &str,
         verify_upstream_model: &str,
+        aliases: &[String],
+        quantization: &str,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -1306,9 +1306,9 @@ impl Store {
                 admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                 supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
                 energy_slots_per_node, route_bias, auto_eligible,
-                draft_model, verify_api_base, verify_upstream_model
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29)
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+                draft_model, verify_api_base, verify_upstream_model, aliases, quantization
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1349,6 +1349,8 @@ impl Store {
         .bind(draft_model.trim())
         .bind(verify_api_base.trim())
         .bind(verify_upstream_model.trim())
+        .bind(sqlx::types::Json(obleth_config::normalize_aliases(aliases)))
+        .bind(obleth_config::normalize_quantization(quantization))
         .fetch_one(&self.pool)
         .await?;
         model_from_row(&row)
@@ -1356,7 +1358,7 @@ impl Store {
 
     pub async fn list_models(&self) -> Result<Vec<ModelRoute>> {
         let rows = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, model_type,
+            "select id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
                     input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1375,7 +1377,7 @@ impl Store {
 
     pub async fn get_model(&self, id: Uuid) -> Result<ModelRoute> {
         let row = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, model_type,
+            "select id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
                     input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1396,7 +1398,7 @@ impl Store {
 
     pub async fn get_model_by_name(&self, model_name: &str) -> Result<ModelRoute> {
         let row = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, model_type,
+            "select id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
                     input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1413,6 +1415,33 @@ impl Store {
         .await?
         .ok_or(StoreError::NotFound)?;
         model_from_row(&row)
+    }
+
+    /// Which model, if any, already answers to `name` — either as its
+    /// `model_name` or as one of its aliases. Returned as `(id, model_name)` so
+    /// a caller validating a write can both skip the row it is editing and name
+    /// the conflicting model in its error.
+    ///
+    /// The two namespaces are deliberately checked together: a client sending
+    /// `model: "x"` cannot tell whether `x` is a canonical name or an alias, so
+    /// `x` has to mean exactly one route no matter which column it lives in.
+    pub async fn model_name_owner(&self, name: &str) -> Result<Option<(Uuid, String)>> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Ok(None);
+        }
+        let row = sqlx::query(
+            "select id, model_name from models
+             where model_name = $1 or aliases @> to_jsonb($1::text)
+             limit 1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            Some(r) => Ok(Some((r.try_get("id")?, r.try_get("model_name")?))),
+            None => Ok(None),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1447,6 +1476,8 @@ impl Store {
         draft_model: &str,
         verify_api_base: &str,
         verify_upstream_model: &str,
+        aliases: &[String],
+        quantization: &str,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -1463,9 +1494,10 @@ impl Store {
                 energy_slots_per_node = $24, route_bias = $25,
                 auto_eligible = $26,
                 draft_model = $27, verify_api_base = $28, verify_upstream_model = $29,
+                aliases = $30, quantization = $31,
                 updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1506,6 +1538,8 @@ impl Store {
         .bind(draft_model.trim())
         .bind(verify_api_base.trim())
         .bind(verify_upstream_model.trim())
+        .bind(sqlx::types::Json(obleth_config::normalize_aliases(aliases)))
+        .bind(obleth_config::normalize_quantization(quantization))
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1531,7 +1565,7 @@ impl Store {
         let row = sqlx::query(
             "update models set max_in_flight = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1560,7 +1594,7 @@ impl Store {
         let row = sqlx::query(
             "update models set capacity_mode = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1590,7 +1624,7 @@ impl Store {
             "update models set max_in_flight = $2, capacity_mode = 'tuned',
                     capacity_tuned_at = now(), updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1616,7 +1650,7 @@ impl Store {
         let row = sqlx::query(
             "update models set admission_weight = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1636,7 +1670,7 @@ impl Store {
 
     pub async fn all_resolved_models(&self) -> Result<Vec<(String, ResolvedModel)>> {
         let rows = sqlx::query(
-            "select id, model_name, upstream_model, api_base, api_key, model_type, admission_weight, max_in_flight, enabled,
+            "select id, model_name, upstream_model, api_base, api_key, model_type, aliases, quantization, admission_weight, max_in_flight, enabled,
                     cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character,
                     context_window, supports_function_calling, supports_system_messages,
@@ -1693,10 +1727,17 @@ impl Store {
                 name.clone(),
                 ResolvedModel {
                     model_name: name,
+                    aliases: row
+                        .try_get::<sqlx::types::Json<Vec<String>>, _>("aliases")
+                        .map(|j| j.0)
+                        .unwrap_or_default(),
                     upstream_model: row.try_get("upstream_model")?,
                     api_base: row.try_get("api_base")?,
                     api_key: cipher().decrypt_opt(row.try_get("api_key")?)?,
                     model_type: row.try_get("model_type")?,
+                    quantization: row
+                        .try_get::<String, _>("quantization")
+                        .unwrap_or_else(|_| obleth_config::DEFAULT_QUANTIZATION.to_string()),
                     admission_weight: row.try_get("admission_weight")?,
                     max_in_flight: row
                         .try_get::<Option<i64>, _>("max_in_flight")?
@@ -1716,7 +1757,7 @@ impl Store {
                     supports_tool_choice: row.try_get("supports_tool_choice")?,
                     supports_vision: row.try_get("supports_vision").unwrap_or(false),
                     tags: obleth_config::normalize_tags(&raw_tags),
-                    declared_levels: obleth_config::normalize_tag_levels(&raw_tags),
+                    declared_levels: obleth_config::declared_tag_levels(&raw_tags),
                     boons: row
                         .try_get::<sqlx::types::Json<Vec<String>>, _>("boons")
                         .map(|j| j.0)
@@ -1811,7 +1852,7 @@ impl Store {
         let row = sqlx::query(
             "update models set cache_enabled = $2, cache_ttl_secs = $3, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1847,7 +1888,7 @@ impl Store {
                     retry_backoff_ms = $4, endpoint_selection_mode = $5,
                     debug_diagnostics = $6, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -2868,7 +2909,7 @@ impl Store {
             "update models
                 set tool_servers = tool_servers - $1, updated_at = now()
               where tool_servers ? $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type,
+             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -3462,6 +3503,17 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         // SQL statements or pre-migration rows degrade to eligible, never to a
         // silent exclusion from the auto router.
         auto_eligible: row.try_get("auto_eligible").unwrap_or(true),
+        // Tolerant reads: columns added in the aliases/quantization migration.
+        // An alias list that failed to read degrades to empty, which costs a
+        // stale resolver key at worst; a format that failed to read degrades to
+        // `unknown`, never to a wrong claim about how the model is served.
+        aliases: row
+            .try_get::<sqlx::types::Json<Vec<String>>, _>("aliases")
+            .map(|j| j.0)
+            .unwrap_or_default(),
+        quantization: row
+            .try_get::<String, _>("quantization")
+            .unwrap_or_else(|_| obleth_config::DEFAULT_QUANTIZATION.to_string()),
         // Tolerant reads: columns added in the speculation-fields migration;
         // pre-migration rows degrade to "cannot speculate".
         draft_model: row.try_get("draft_model").unwrap_or_default(),
@@ -3771,6 +3823,150 @@ mod tests {
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` points at a
     /// throwaway Postgres. Skips silently otherwise so unit runs stay hermetic.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn model_aliases_and_quantization_roundtrip() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let name = format!("m-{}", Uuid::new_v4());
+        let alias = format!("{name}-mxfp4");
+        let model = store
+            .create_model(
+                &name,
+                "alias round trip",
+                "upstream-model-mxfp4",
+                "http://127.0.0.1:8081",
+                None,
+                obleth_config::DEFAULT_MODEL_TYPE,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                8192,
+                100,
+                None,
+                false,
+                true,
+                false,
+                false,
+                false,
+                &[],
+                &[],
+                &[],
+                0,
+                1.0,
+                true,
+                "",
+                "",
+                "",
+                // A blank entry and a duplicate: normalization drops both.
+                &[alias.clone(), String::new(), alias.clone()],
+                // A backend's own spelling, folded onto the vocabulary value.
+                "FP8-e4m3",
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+        assert_eq!(model.aliases, vec![alias.clone()]);
+        assert_eq!(model.quantization, "fp8");
+
+        // Both columns survive the read paths the admin API and the data plane
+        // use, not just the INSERT's own RETURNING clause.
+        let fetched = store.get_model(model.id).await.expect("get model");
+        assert_eq!(fetched.aliases, vec![alias.clone()]);
+        assert_eq!(fetched.quantization, "fp8");
+        let by_name = store.get_model_by_name(&name).await.expect("get by name");
+        assert_eq!(by_name.aliases, vec![alias.clone()]);
+
+        // The hot-path view carries them, so the resolver can publish a key per
+        // addressable name and the discovery endpoints can report the format.
+        let resolved = store
+            .all_resolved_models()
+            .await
+            .expect("resolved models")
+            .into_iter()
+            .find(|(n, _)| n == &name)
+            .expect("model present")
+            .1;
+        assert_eq!(resolved.aliases, vec![alias.clone()]);
+        assert_eq!(resolved.quantization, "fp8");
+        assert_eq!(
+            resolved.addressable_names().collect::<Vec<_>>(),
+            vec![name.as_str(), alias.as_str()]
+        );
+
+        // A name is looked up across both namespaces, because a client sending
+        // `model: "x"` cannot tell which column `x` lives in.
+        assert_eq!(
+            store.model_name_owner(&alias).await.expect("owner"),
+            Some((model.id, name.clone()))
+        );
+        assert_eq!(
+            store.model_name_owner(&name).await.expect("owner"),
+            Some((model.id, name.clone()))
+        );
+        assert!(store
+            .model_name_owner("no-such-model")
+            .await
+            .expect("owner")
+            .is_none());
+
+        // An update replaces the alias list wholesale: an omitted alias is gone,
+        // which is what lets `sync_model_from` know to evict its resolver key.
+        let updated = store
+            .update_model(
+                model.id,
+                "alias round trip",
+                "upstream-model-mxfp4",
+                "http://127.0.0.1:8081",
+                None,
+                obleth_config::DEFAULT_MODEL_TYPE,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                8192,
+                100,
+                None,
+                false,
+                true,
+                false,
+                false,
+                false,
+                true,
+                &[],
+                &[],
+                &[],
+                0,
+                1.0,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "mxfp4",
+            )
+            .await
+            .expect("update model");
+        assert!(updated.aliases.is_empty());
+        assert_eq!(updated.quantization, "mxfp4");
+        assert!(store
+            .model_name_owner(&alias)
+            .await
+            .expect("owner")
+            .is_none());
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` points at a
+    /// throwaway Postgres. Skips silently otherwise so unit runs stay hermetic.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn tenant_key_audit_roundtrip() {
         let Some(url) = crate::test_support::test_db_url() else {
             eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
@@ -3857,6 +4053,8 @@ mod tests {
                 true,
                 "",
                 "",
+                "",
+                &[],
                 "",
             )
             .await
@@ -4135,6 +4333,8 @@ mod tests {
                 "",
                 "",
                 "",
+                &[],
+                "",
             )
             .await
             .expect("create model");
@@ -4270,6 +4470,8 @@ mod tests {
                 true,
                 "",
                 "",
+                "",
+                &[],
                 "",
             )
             .await
@@ -4421,8 +4623,10 @@ mod tests {
     /// must see the same suffix decoded into `declared_levels` while `tags`
     /// itself stays bare for the router's overlap match). Also proves the
     /// two behaviors that must NOT change: an unknown tag base is dropped,
-    /// and a level-1 (untiered) tag is stored bare, byte-identical to every
-    /// row written before tiering existed.
+    /// and a bare tag stays bare, byte-identical to every row written before
+    /// tiering existed. Since `2b86f63` a bare tag also declares *nothing*:
+    /// it derives its level from cost rank under `TierSource::Hybrid`, so
+    /// only an explicit `:N` suffix reaches `declared_levels`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn declared_tag_level_survives_save_then_read() {
         let Some(url) = crate::test_support::test_db_url() else {
@@ -4471,6 +4675,8 @@ mod tests {
                 "",
                 "",
                 "",
+                &[],
+                "",
             )
             .await
             .expect("create model");
@@ -4490,7 +4696,8 @@ mod tests {
         // The data-plane cache view must decode the suffix into
         // `declared_levels` while keeping `tags` bare, since the router's
         // exact-match overlap logic (`router::select_model`) compares against
-        // bare vocabulary strings.
+        // bare vocabulary strings. Bare `math` declares nothing -- it derives
+        // from cost rank instead of silently pinning the model to level 1.
         let resolved = store
             .all_resolved_models()
             .await
@@ -4503,13 +4710,12 @@ mod tests {
             resolved.tags,
             vec!["coding".to_string(), "math".to_string()]
         );
-        assert_eq!(
-            resolved.declared_levels,
-            vec![("coding".to_string(), 3), ("math".to_string(), 1)]
-        );
+        assert_eq!(resolved.declared_levels, vec![("coding".to_string(), 3)]);
 
-        // A save that lowers the declared level back to 1 must store the bare
-        // tag, byte-identical to every model saved before tiering existed.
+        // A save that lowers the declared level to an explicit 1 must KEEP the
+        // suffix: bare ("derive my level") and `tag:1` ("pinned weak on
+        // purpose") mean different things under hybrid tiering, so the save
+        // path must not erase the distinction the operator typed.
         let updated_tags = vec!["coding:1".to_string()];
         let updated = store
             .update_model(
@@ -4542,12 +4748,14 @@ mod tests {
                 "",
                 "",
                 "",
+                &[],
+                "",
             )
             .await
             .expect("update model");
-        assert_eq!(updated.tags, vec!["coding".to_string()]);
+        assert_eq!(updated.tags, vec!["coding:1".to_string()]);
         let reread_after_update = store.get_model(model.id).await.expect("get model");
-        assert_eq!(reread_after_update.tags, vec!["coding".to_string()]);
+        assert_eq!(reread_after_update.tags, vec!["coding:1".to_string()]);
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
@@ -4664,9 +4872,36 @@ mod tests {
         let args = default_test_model(&model_name);
         let model = store
             .create_model(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
             )
             .await
             .expect("create model");
@@ -4742,9 +4977,36 @@ mod tests {
         let args = default_test_model(&model_name);
         let model = store
             .create_model(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
             )
             .await
             .expect("model");
@@ -4821,9 +5083,36 @@ mod tests {
         let args = default_test_model(&model_name);
         let model = store
             .create_model(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
             )
             .await
             .expect("create model");
@@ -5017,9 +5306,36 @@ mod tests {
         let args = default_test_model(&model_name);
         let model = store
             .create_model(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
             )
             .await
             .expect("create model");
@@ -5115,6 +5431,8 @@ mod tests {
                 "",
                 "",
                 "",
+                &[],
+                "",
             )
             .await
             .expect("create model with both grants");
@@ -5151,6 +5469,8 @@ mod tests {
                 true,
                 "",
                 "",
+                "",
+                &[],
                 "",
             )
             .await
@@ -5198,9 +5518,36 @@ mod tests {
         let args = default_test_model(&model_name);
         let model = store
             .create_model(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
             )
             .await
             .expect("create model");
@@ -5275,6 +5622,8 @@ mod tests {
                 true,
                 "",
                 "",
+                "",
+                &[],
                 "",
             )
             .await
@@ -5352,6 +5701,8 @@ mod tests {
                 "",
                 "",
                 "",
+                &[],
+                "",
             )
             .await
             .expect("create model");
@@ -5416,9 +5767,36 @@ mod tests {
         let args = default_test_model(&model_name);
         let model = store
             .create_model(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
             )
             .await
             .expect("create model");
@@ -5531,6 +5909,8 @@ mod tests {
                 "",
                 "",
                 "",
+                &[],
+                "",
             )
             .await
             .expect("create model");
@@ -5601,9 +5981,36 @@ mod tests {
         args.23 = 1.4;
         let model = store
             .create_model(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
             )
             .await
             .expect("create model");
@@ -5652,9 +6059,36 @@ mod tests {
         let args = default_test_model(&model_name);
         let model = store
             .create_model(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, false, "", "", "",
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
+                false,
+                "",
+                "",
+                "",
+                &[],
+                "",
             )
             .await
             .expect("create model");
@@ -5724,9 +6158,36 @@ mod tests {
         let args = default_test_model(&model_name);
         let model = store
             .create_model(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
             )
             .await
             .expect("create model");
@@ -5766,9 +6227,36 @@ mod tests {
         let args = default_test_model(&model_name);
         let model = store
             .create_model(
-                args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9,
-                args.10, args.11, args.12, args.13, args.14, args.15, args.16, args.17, args.18,
-                &args.19, &args.20, &args.21, args.22, args.23, true, "", "", "",
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &args.21,
+                args.22,
+                args.23,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
             )
             .await
             .expect("create model");

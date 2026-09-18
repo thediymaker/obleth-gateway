@@ -16,6 +16,7 @@ pub mod model_health;
 mod models_io;
 mod openapi;
 pub mod recipes;
+pub mod router_readiness;
 pub mod slurm_resources;
 pub mod slurm_settings;
 pub mod ssrf;
@@ -93,7 +94,32 @@ pub struct AdminState {
     /// Direct in-process moka cache invalidation. Set by the binary that owns
     /// the key cache; None when admin and proxy run in separate processes.
     pub local_cache_tx: Option<tokio::sync::mpsc::UnboundedSender<String>>,
+    /// The data plane's rolling per-model completion-length averages, shared
+    /// in-process so the simulate endpoint scores with the same expected
+    /// output tokens the live router uses. `Default` (empty) in a standalone
+    /// admin process; scoring then falls back to the documented default.
+    pub output_stats: obleth_config::routing::OutputStats,
+    /// Bridge to the data plane's intent classifier, for `simulate` calls that
+    /// opt into a real classification (`classify: true`). Injected by the
+    /// binary that owns the classifier so this crate never depends on the
+    /// proxy; `None` (a standalone admin process) means simulate stays
+    /// heuristic-only and says so.
+    pub classify: Option<ClassifyFn>,
 }
+
+/// A boxed call into the data plane's classifier: `(prompt, available_tags)`
+/// to the derived [`obleth_config::routing::Intent`]. Timeout, caching and
+/// every failure-lowers-difficulty guarantee live behind the closure, in the
+/// classifier itself.
+pub type ClassifyFn = std::sync::Arc<
+    dyn Fn(
+            String,
+            Vec<String>,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = obleth_config::routing::Intent> + Send>,
+        > + Send
+        + Sync,
+>;
 
 /// Build the `/api/v1` router. `/health` and the OpenAPI doc are public; every
 /// other route requires a bearer admin token.
@@ -308,6 +334,10 @@ pub fn router(state: AdminState) -> Router {
             get(get_auto_router_settings).put(put_auto_router_settings),
         )
         .route("/api/v1/router/simulate", post(simulate_route))
+        .route(
+            "/api/v1/router/readiness",
+            get(router_readiness::get_router_readiness),
+        )
         .route(
             "/api/v1/settings/boons",
             get(get_boon_settings).put(put_boon_settings),
@@ -677,11 +707,20 @@ pub struct FairshareLiveView {
 pub struct CreateModel {
     pub model_name: String,
     pub description: Option<String>,
+    /// Extra client-facing names this model answers to, so a name can be
+    /// cleaned up (`glm-5-3-fp8` -> `glm-5-3`) without breaking pinned
+    /// clients. Each must be unused by any other model's name or aliases.
+    #[serde(default)]
+    pub aliases: Option<Vec<String>>,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
     #[serde(default)]
     pub model_type: Option<String>,
+    /// Serving format from the fixed `QUANTIZATIONS` vocabulary. Omitted means
+    /// `unknown` — undeclared, not "full precision".
+    #[serde(default)]
+    pub quantization: Option<String>,
     pub input_cost_per_token: Option<f64>,
     pub output_cost_per_token: Option<f64>,
     #[serde(default)]
@@ -734,11 +773,19 @@ pub struct CreateModel {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateModel {
     pub description: Option<String>,
+    /// Replaces the alias list wholesale; omitted leaves it unchanged. An
+    /// empty list removes every alias, which also evicts their resolver keys.
+    #[serde(default)]
+    pub aliases: Option<Vec<String>>,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
     #[serde(default)]
     pub model_type: Option<String>,
+    /// Serving format from the fixed `QUANTIZATIONS` vocabulary; omitted
+    /// leaves the current value unchanged.
+    #[serde(default)]
+    pub quantization: Option<String>,
     pub input_cost_per_token: Option<f64>,
     pub output_cost_per_token: Option<f64>,
     #[serde(default)]
@@ -1798,6 +1845,13 @@ pub struct SimulateRouteRequest {
     /// was used is echoed back as `uniform`.
     #[serde(default)]
     pub uniform: Option<f64>,
+    /// Ask the LIVE intent classifier (the same brain, cache and timeout the
+    /// data plane uses) instead of the keyword heuristic. Costs one small
+    /// model call. Ignored — heuristics as before — when the classifier is
+    /// disabled, unconfigured, or this admin runs without a data plane; the
+    /// response's `tag_source` says which one actually ran.
+    #[serde(default)]
+    pub classify: bool,
 }
 
 /// Run the whole `auto` routing pipeline against the live fleet and return the
@@ -1912,7 +1966,40 @@ async fn simulate_route(
     features.needs_tool_choice |= body.needs_tool_choice;
     features.needs_response_schema |= body.needs_response_schema;
 
-    let mut intent = heuristic_intent(&json, est_input_tokens);
+    let mut intent = None;
+    if body.classify {
+        if let Some(classify) = state.classify.as_ref() {
+            let settings = state
+                .store
+                .get_auto_router_settings()
+                .await?
+                .unwrap_or_default();
+            if settings.classifier_active() {
+                // Same menu the data plane offers: only tags a candidate
+                // actually carries. The prompt is the synthesized body's text,
+                // which for a plain `prompt` is exactly what a client would
+                // have sent.
+                let mut menu: Vec<String> = Vec::new();
+                for c in &candidates {
+                    for t in &c.model.tags {
+                        if !menu.contains(t) {
+                            menu.push(t.clone());
+                        }
+                    }
+                }
+                let text = simulate_prompt_text(&json);
+                if !menu.is_empty() && !text.trim().is_empty() {
+                    let derived = classify(text, menu).await;
+                    // Empty tags = the classifier's documented failure shape;
+                    // fall back to heuristics exactly as the data plane does.
+                    if !derived.tags.is_empty() {
+                        intent = Some(derived);
+                    }
+                }
+            }
+        }
+    }
+    let mut intent = intent.unwrap_or_else(|| heuristic_intent(&json, est_input_tokens));
     if let Some(difficulty) = difficulty_from_header(body.effort.as_deref()) {
         intent.difficulty = difficulty;
         intent.source = IntentSource::Header;
@@ -1944,6 +2031,7 @@ async fn simulate_route(
         &candidates,
         &features,
         &busyness,
+        &state.output_stats.snapshot(),
         allowed.as_deref(),
         &intent.tags,
         grants,
@@ -1951,6 +2039,39 @@ async fn simulate_route(
         uniform,
         &intent,
     )))
+}
+
+/// The classifier prompt for a simulated request: the system message (if any)
+/// plus the first user message's text — the same compact shape the data
+/// plane's classifier reads, so a simulated classification is of the same
+/// prompt a live one would see.
+fn simulate_prompt_text(json: &serde_json::Value) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
+        let mut have_user = false;
+        for msg in messages {
+            let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            let text = match msg.get("content") {
+                Some(serde_json::Value::String(s)) => s.clone(),
+                Some(serde_json::Value::Array(parts)) => parts
+                    .iter()
+                    .filter_map(|p| p.get("text").and_then(|t| t.as_str()))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                _ => String::new(),
+            };
+            if role == "system" && !text.is_empty() {
+                parts.push(text);
+            } else if role == "user" && !have_user && !text.is_empty() {
+                parts.push(text);
+                have_user = true;
+            }
+            if have_user {
+                break;
+            }
+        }
+    }
+    parts.join("\n")
 }
 
 /// View of the persisted model-"boons" settings, flattened per boon
@@ -4048,6 +4169,64 @@ async fn resync_all_keys(state: &AdminState) -> Result<()> {
     Ok(())
 }
 
+/// Validate a declared serving format against the fixed vocabulary.
+///
+/// Unlike most enum-ish fields, this one is *rejected* rather than normalized
+/// to the default on the write path: `normalize_quantization` silently folds an
+/// unknown value to `unknown`, and an operator who types `fp-8` in the model
+/// form deserves to be told, not to have the field quietly emptied. The
+/// normalizer still runs in the store, for values arriving from a backend's own
+/// spelling (`FP8`, `w4a16-awq`) where folding is the point.
+fn validate_quantization(raw: &str) -> Result<String> {
+    let q = raw.trim().to_ascii_lowercase();
+    if q.is_empty() {
+        return Ok(obleth_config::DEFAULT_QUANTIZATION.to_string());
+    }
+    if !obleth_config::is_valid_quantization(&q) {
+        return Err(AdminError::BadRequest(format!(
+            "unknown quantization '{raw}' (expected one of: {})",
+            obleth_config::QUANTIZATIONS.join(", ")
+        )));
+    }
+    Ok(q)
+}
+
+/// Normalize an alias list and reject any name already claimed elsewhere.
+///
+/// A client sending `model: "x"` cannot tell whether `x` is a canonical name or
+/// an alias, so `x` must identify exactly one route: an alias may not collide
+/// with any model's `model_name`, with another model's alias, or with the
+/// model's own name. `editing` is the row being written, whose own names are
+/// not collisions with itself.
+async fn validate_aliases(
+    state: &AdminState,
+    raw: &[String],
+    editing: Option<Uuid>,
+    model_name: &str,
+) -> Result<Vec<String>> {
+    let aliases = obleth_config::normalize_aliases(raw);
+    for alias in &aliases {
+        if alias == model_name {
+            return Err(AdminError::BadRequest(format!(
+                "alias '{alias}' is the model's own name"
+            )));
+        }
+        if alias == obleth_config::routing::AUTO_MODEL_NAME {
+            return Err(AdminError::BadRequest(format!(
+                "alias '{alias}' is reserved for automatic model selection"
+            )));
+        }
+        if let Some((owner_id, owner_name)) = state.store.model_name_owner(alias).await? {
+            if Some(owner_id) != editing {
+                return Err(AdminError::BadRequest(format!(
+                    "alias '{alias}' is already taken by model '{owner_name}'"
+                )));
+            }
+        }
+    }
+    Ok(aliases)
+}
+
 #[utoipa::path(
     post, path = "/api/v1/models", tag = "models",
     request_body = CreateModel,
@@ -4064,6 +4243,14 @@ async fn create_model(
     if !body.api_base.trim().is_empty() {
         state.ssrf.validate(&body.api_base)?;
     }
+    let quantization = validate_quantization(body.quantization.as_deref().unwrap_or_default())?;
+    let aliases = validate_aliases(
+        &state,
+        body.aliases.as_deref().unwrap_or_default(),
+        None,
+        body.model_name.trim(),
+    )
+    .await?;
     let model = state
         .store
         .create_model(
@@ -4095,6 +4282,8 @@ async fn create_model(
             body.draft_model.as_deref().unwrap_or(""),
             body.verify_api_base.as_deref().unwrap_or(""),
             body.verify_upstream_model.as_deref().unwrap_or(""),
+            &aliases,
+            &quantization,
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -4165,6 +4354,14 @@ async fn update_model(
     }
     let existing = state.store.get_model(id).await?;
     let api_key = body.api_key.as_deref().or(existing.api_key.as_deref());
+    let quantization = match body.quantization.as_deref() {
+        Some(q) => validate_quantization(q)?,
+        None => existing.quantization.clone(),
+    };
+    let aliases = match body.aliases.as_deref() {
+        Some(list) => validate_aliases(&state, list, Some(id), &existing.model_name).await?,
+        None => existing.aliases.clone(),
+    };
     let model = state
         .store
         .update_model(
@@ -4213,6 +4410,8 @@ async fn update_model(
             body.verify_upstream_model
                 .as_deref()
                 .unwrap_or(&existing.verify_upstream_model),
+            &aliases,
+            &quantization,
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -4220,7 +4419,7 @@ async fn update_model(
         // no longer exists; reset so the scheduler re-verifies immediately.
         state.store.reset_model_health(id).await?;
     }
-    sync_model(&state, &model).await?;
+    sync_model_from(&state, &model, Some(&existing)).await?;
     state
         .store
         .record_audit(
@@ -4911,11 +5110,17 @@ async fn delete_model(
 ) -> Result<StatusCode> {
     let model = state.store.get_model(id).await?;
     state.store.delete_model(id).await?;
-    let _ = state.redis.delete_resolved_model(&model.model_name).await;
-    let _ = state
-        .redis
-        .publish_invalidation(&format!("model:{}", model.model_name))
-        .await;
+    // Aliases are resolver keys of their own, so a delete has to clear all of
+    // them or the model stays reachable under its old names.
+    for name in
+        std::iter::once(model.model_name.as_str()).chain(model.aliases.iter().map(String::as_str))
+    {
+        let _ = state.redis.delete_resolved_model(name).await;
+        let _ = state
+            .redis
+            .publish_invalidation(&format!("model:{name}"))
+            .await;
+    }
     state
         .store
         .record_audit(
@@ -5125,6 +5330,22 @@ async fn push_key(state: &AdminState, hash: &str, resolved: &ResolvedKey) -> Res
 }
 
 async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
+    sync_model_from(state, model, None).await
+}
+
+/// Republish a model into the resolver cache, evicting the keys it no longer
+/// owns.
+///
+/// `previous` is the row as it was before this write, and is only needed when
+/// aliases may have changed: an alias that was just dropped still has a live
+/// `obleth:model:<alias>` key pointing at this model, and nothing else in the
+/// system would ever clear it. Passing `None` (create, capacity toggle, any
+/// write that cannot touch aliases) publishes without an eviction pass.
+async fn sync_model_from(
+    state: &AdminState,
+    model: &ModelRoute,
+    previous: Option<&ModelRoute>,
+) -> Result<()> {
     // Endpoints carry the per-cluster wire targets and health; the data plane
     // prefers them over the legacy single api_base/api_key when present.
     let endpoints = state
@@ -5139,10 +5360,12 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         .unwrap_or_default();
     let resolved = ResolvedModel {
         model_name: model.model_name.clone(),
+        aliases: model.aliases.clone(),
         upstream_model: model.upstream_model.clone(),
         api_base: model.api_base.clone(),
         api_key: model.api_key.clone(),
         model_type: model.model_type.clone(),
+        quantization: model.quantization.clone(),
         admission_weight: model.admission_weight,
         max_in_flight: model.max_in_flight.and_then(|n| usize::try_from(n).ok()),
         enabled: model.enabled,
@@ -5164,7 +5387,7 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         // that doesn't touch tags). The hot-path cache needs the bare
         // vocabulary for the router's overlap match, plus the parsed ladder.
         tags: obleth_config::normalize_tags(&model.tags),
-        declared_levels: obleth_config::normalize_tag_levels(&model.tags),
+        declared_levels: obleth_config::declared_tag_levels(&model.tags),
         boons: model.boons.clone(),
         tool_servers: model.tool_servers.clone(),
         knowledge_collections,
@@ -5181,18 +5404,36 @@ async fn sync_model(state: &AdminState, model: &ModelRoute) -> Result<()> {
         verify_upstream_model: model.verify_upstream_model.clone(),
         endpoints,
     };
-    if model.enabled {
+    // Aliases the write removed: their keys would otherwise keep resolving to
+    // this model forever. Done before the publish so a name moved from alias to
+    // canonical (or between the two lists) is re-added, not left evicted.
+    if let Some(previous) = previous {
+        for stale in previous
+            .aliases
+            .iter()
+            .filter(|a| !model.aliases.contains(a))
+        {
+            let _ = state.redis.delete_resolved_model(stale).await;
+            let _ = state
+                .redis
+                .publish_invalidation(&format!("model:{stale}"))
+                .await;
+        }
+    }
+    // Every name the model answers to gets its own resolver key, so the data
+    // plane keeps resolving an alias in exactly one lookup — aliases cost
+    // nothing on the request path.
+    for name in resolved.addressable_names() {
+        if model.enabled {
+            state.redis.put_resolved_model(name, &resolved).await?;
+        } else {
+            let _ = state.redis.delete_resolved_model(name).await;
+        }
         state
             .redis
-            .put_resolved_model(&model.model_name, &resolved)
+            .publish_invalidation(&format!("model:{name}"))
             .await?;
-    } else {
-        let _ = state.redis.delete_resolved_model(&model.model_name).await;
     }
-    state
-        .redis
-        .publish_invalidation(&format!("model:{}", model.model_name))
-        .await?;
     Ok(())
 }
 
@@ -5313,6 +5554,8 @@ mod tests {
                     "",
                     "",
                     "",
+                    &[],
+                    "",
                 )
                 .await
                 .expect("create fixture model")
@@ -5362,6 +5605,8 @@ mod tests {
                 // Never dialled: no route under test reads ClickHouse.
                 clickhouse: clickhouse::Client::default(),
                 admin_token: TEST_ADMIN_TOKEN.to_string(),
+                output_stats: Default::default(),
+                classify: None,
                 health: ModelHealthRuntime {
                     scheduled_enabled: false,
                     default_interval_secs: 60,

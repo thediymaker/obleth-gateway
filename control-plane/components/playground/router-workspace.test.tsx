@@ -38,7 +38,7 @@ function makeExplain(body: SimulateRouteRequest): RouteExplainView {
     sampled: false,
     // bias is clamped to [0.1, 3.0] by the gateway (0 is unreachable); 1.0 is
     // its neutral default.
-    scored: [{ model: "model-a", level: 1, spare: 0.9, cost_score: 0.8, tag_score: 0, bias: 1.0, score: 0.86, chosen: true }],
+    scored: [{ model: "model-a", level: 1, spare: 0.9, cost_score: 0.8, est_cost: 0.00025, tag_score: 0, bias: 1.0, score: 0.86, chosen: true }],
     rejected: [],
   };
 }

@@ -615,9 +615,34 @@ async fn fetch_catalog_direct(
     api_base: &str,
     api_key: Option<&str>,
 ) -> std::result::Result<Arc<Catalog>, CatalogError> {
-    let url = format!("{}/models", api_base.trim_end_matches('/'));
+    let mut first_error: Option<CatalogError> = None;
+    for url in obleth_config::catalog_urls(api_base) {
+        match fetch_catalog_url(state, &url, api_key).await {
+            Ok(catalog) => return Ok(catalog),
+            Err(error) => {
+                // Only a 404 is worth a second path: unreachable, auth and 5xx
+                // answers would come back identically from either spelling.
+                let path_may_be_wrong = error.http == Some(404);
+                first_error.get_or_insert(error);
+                if !path_may_be_wrong {
+                    break;
+                }
+            }
+        }
+    }
+    // Report the error from the configured path, so the message names a URL the
+    // operator can check rather than the fallback spelling.
+    Err(first_error.expect("at least one candidate URL is always attempted"))
+}
+
+/// One catalog GET and its parse into a [`Catalog`].
+async fn fetch_catalog_url(
+    state: &AdminState,
+    url: &str,
+    api_key: Option<&str>,
+) -> std::result::Result<Arc<Catalog>, CatalogError> {
     let timeout = Duration::from_secs(state.health.timeout_secs.max(1));
-    let mut request = state.health.http.get(&url).timeout(timeout);
+    let mut request = state.health.http.get(url).timeout(timeout);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }

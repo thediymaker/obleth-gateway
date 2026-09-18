@@ -92,6 +92,7 @@ import {
   TooltipTrigger,
 } from "@/components/ui/tooltip";
 import type { AutotuneReport, AutotuneWorkload, CacheStats, KnowledgeCollection, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelImportReport, ModelKnowledgeCollections, ModelReplica, ModelRoute } from "@/lib/obleth";
+import type { BoonBlockers } from "@/lib/boon-availability";
 import { providerForModel } from "@/lib/model-providers";
 import { normalizeModelApiNameDraft, normalizeModelApiNameFinal } from "@/lib/model-name";
 import { EditForm } from "@/components/edit-form";
@@ -176,6 +177,35 @@ const MODEL_TYPE_LABELS: Record<string, string> = Object.fromEntries(
   MODEL_TYPE_OPTIONS.map((o) => [o.value, o.label]),
 );
 
+// Serving-format vocabulary; mirrors obleth-config `QUANTIZATIONS`. This is a
+// description of the deployment, not part of the model's identity — it exists
+// so the format does not have to be spelled into the API model name, where
+// re-quantizing would break every pinned client.
+const QUANTIZATION_OPTIONS = [
+  { value: "unknown", label: "Not declared" },
+  { value: "none", label: "None (full precision)" },
+  { value: "fp16", label: "FP16" },
+  { value: "bf16", label: "BF16" },
+  { value: "fp8", label: "FP8" },
+  { value: "nvfp4", label: "NVFP4" },
+  { value: "mxfp4", label: "MXFP4" },
+  { value: "int8", label: "INT8" },
+  { value: "int4", label: "INT4" },
+  { value: "awq", label: "AWQ" },
+  { value: "gptq", label: "GPTQ" },
+  { value: "gguf", label: "GGUF" },
+] as const;
+
+const QUANTIZATION_LABELS: Record<string, string> = Object.fromEntries(
+  QUANTIZATION_OPTIONS.map((o) => [o.value, o.label]),
+);
+
+const QUANTIZATION_HINT =
+  "Reported on /v1/models and /model/info. Keep it out of the API model name: a name like `glm-5-3-fp8` has to change when the deployment is re-quantized, and every client pinned to it breaks.";
+
+const ALIASES_HINT =
+  "One name per line. Extra names that resolve to this same route — register the old spelling here when you clean up an API model name, and pinned clients keep working. Only the API model name itself is advertised by /v1/models.";
+
 const CREATE_MODEL_STEPS = [
   {
     label: "Hosting",
@@ -213,6 +243,7 @@ export function ModelManager({
   managed = {},
   slurmEnabled = false,
   recipeCards = [],
+  boonBlockers = {},
 }: {
   models: ModelRoute[];
   cacheStats?: CacheStats;
@@ -221,6 +252,7 @@ export function ModelManager({
   managed?: Record<string, boolean>;
   slurmEnabled?: boolean;
   recipeCards?: RecipeCard[];
+  boonBlockers?: BoonBlockers;
 }) {
   const [pending, start] = useTransition();
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -371,6 +403,7 @@ export function ModelManager({
           mcpServers={mcpServers}
           recipeCards={recipeCards}
           modelNames={models.map((m) => m.model_name)}
+          boonBlockers={boonBlockers}
           onCancel={closeCreateWizard}
           onSubmit={submitModel}
         />
@@ -523,6 +556,21 @@ export function ModelManager({
                                   {MODEL_TYPE_LABELS[model.model_type] ?? model.model_type}
                                 </Badge>
                               )}
+                              {model.quantization && model.quantization !== "unknown" && (
+                                <Badge className="border-border bg-background text-[10px] text-muted-foreground">
+                                  {QUANTIZATION_LABELS[model.quantization] ?? model.quantization}
+                                </Badge>
+                              )}
+                              {(model.aliases?.length ?? 0) > 0 && (
+                                <Badge
+                                  className="border-border bg-background text-[10px] text-muted-foreground"
+                                  title={model.aliases!.join(", ")}
+                                >
+                                  {model.aliases!.length === 1
+                                    ? "1 alias"
+                                    : `${model.aliases!.length} aliases`}
+                                </Badge>
+                              )}
                               <Badge className="border-border bg-background text-[10px] text-muted-foreground">{formatModelCost(model)}</Badge>
                               <Badge className="border-border bg-background text-[10px] text-muted-foreground">{formatNumber(model.context_window)} ctx</Badge>
                               {(model.tags?.length ?? 0) > 0 && (
@@ -617,6 +665,7 @@ export function ModelManager({
                               summary={summary}
                               mcpServers={mcpServers}
                               modelNames={models.map((m) => m.model_name)}
+                              boonBlockers={boonBlockers}
                               isManaged={managed[model.id] ?? false}
                               pending={pending}
                               onCacheToggle={() => {
@@ -714,6 +763,7 @@ function CreateModelWizard({
   mcpServers,
   recipeCards,
   modelNames,
+  boonBlockers,
   onCancel,
   onSubmit,
 }: {
@@ -723,11 +773,13 @@ function CreateModelWizard({
   mcpServers: McpServer[];
   recipeCards: RecipeCard[];
   modelNames: string[];
+  boonBlockers: BoonBlockers;
   onCancel: () => void;
   onSubmit: (formData: FormData) => void;
 }) {
   const [step, setStep] = useState(0);
   const [createType, setCreateType] = useState<string>("chat");
+  const [createQuantization, setCreateQuantization] = useState<string>("unknown");
   const [modelName, setModelName] = useState("");
   const [endpointMode, setEndpointMode] = useState<string>("static");
   const [localError, setLocalError] = useState<string | null>(null);
@@ -972,6 +1024,19 @@ function CreateModelWizard({
                   />
                 </div>
                 <div className="md:col-span-2">
+                  <SelectField
+                    label="Quantization"
+                    name="quantization"
+                    value={createQuantization}
+                    onChange={setCreateQuantization}
+                    options={QUANTIZATION_OPTIONS}
+                    hint={QUANTIZATION_HINT}
+                  />
+                </div>
+                <div className="md:col-span-2">
+                  <AliasesField hint={ALIASES_HINT} />
+                </div>
+                <div className="md:col-span-2">
                   <Field label="Description (optional)" name="description" placeholder="Qwen3 235B instruction model for production chat and tool use" />
                 </div>
               </section>
@@ -1039,6 +1104,7 @@ function CreateModelWizard({
                     mcpServers={mcpServers}
                     modelNames={modelNames}
                     selfName={modelName}
+                    boonBlockers={boonBlockers}
                   />
                 ) : (
                   <div className="rounded-md border border-border/70 bg-background/35 p-4">
@@ -1115,6 +1181,7 @@ function ModelDetailPanel({
   isManaged = false,
   pending,
   modelNames = [],
+  boonBlockers = {},
   onCacheToggle,
 }: {
   model: ModelRoute;
@@ -1123,6 +1190,7 @@ function ModelDetailPanel({
   isManaged?: boolean;
   pending: boolean;
   modelNames?: string[];
+  boonBlockers?: BoonBlockers;
   onCacheToggle: () => void;
 }) {
   // The panel only mounts for the expanded card, so per-model detail loads
@@ -1261,6 +1329,7 @@ function ModelDetailPanel({
           editType={editType}
           mcpServers={mcpServers}
           modelNames={modelNames}
+          boonBlockers={boonBlockers}
         />
       </TabsContent>
 
@@ -1403,6 +1472,11 @@ function ConnectionTab({
   setEditType: (value: string) => void;
 }) {
   const flashSaved = useContext(SaveFlashContext);
+  // Local to this tab: unlike `editType`, which gates cost fields in the
+  // Capabilities tab too, nothing outside this form reads the format.
+  const [editQuantization, setEditQuantization] = useState<string>(
+    model.quantization || "unknown",
+  );
   const [state, formAction, pending] = useActionState(
     async (prev: ModelActionState | null, formData: FormData) => {
       const result = await updateModelConnectionAction(prev, formData);
@@ -1434,6 +1508,15 @@ function ConnectionTab({
                 options={MODEL_TYPE_OPTIONS}
                 hint={modelTypeHint(editType)}
               />
+              <SelectField
+                label="Quantization"
+                name="quantization"
+                value={editQuantization}
+                onChange={setEditQuantization}
+                options={QUANTIZATION_OPTIONS}
+                hint={QUANTIZATION_HINT}
+              />
+              <AliasesField defaultValue={(model.aliases ?? []).join("\n")} hint={ALIASES_HINT} />
               <Field label="Description" name="description" defaultValue={model.description} />
               <ChipGroup label="Status">
                 <ChipCheckbox name="enabled" label="Route enabled" defaultChecked={model.enabled} />
@@ -1507,11 +1590,13 @@ function CapabilitiesTab({
   editType,
   mcpServers = [],
   modelNames = [],
+  boonBlockers = {},
 }: {
   model: ModelRoute;
   editType: string;
   mcpServers?: McpServer[];
   modelNames?: string[];
+  boonBlockers?: BoonBlockers;
 }) {
   const flashSaved = useContext(SaveFlashContext);
   const [state, formAction, pending] = useActionState(
@@ -1550,6 +1635,7 @@ function CapabilitiesTab({
                 mcpServers={mcpServers}
                 modelNames={modelNames}
                 selfName={model.model_name}
+                boonBlockers={boonBlockers}
               />
             )}
           </div>
@@ -2492,7 +2578,7 @@ function TagLevelPicker({ tag, level, onChange }: { tag: string; level: number; 
       aria-label={`${tag} strength level`}
       className="inline-flex items-center gap-0.5 rounded-md border border-border bg-muted/40 p-0.5"
     >
-      {([1, 2, 3] as const).map((lvl) => (
+      {([0, 1, 2, 3] as const).map((lvl) => (
         <label key={lvl} className="cursor-pointer">
           <input
             type="radio"
@@ -2500,7 +2586,7 @@ function TagLevelPicker({ tag, level, onChange }: { tag: string; level: number; 
             value={lvl}
             checked={level === lvl}
             onChange={() => onChange(lvl)}
-            aria-label={`${tag}: ${TAG_LEVEL_LABELS[lvl]} (level ${lvl})`}
+            aria-label={lvl === 0 ? `${tag}: Auto (level derives from cost rank)` : `${tag}: ${TAG_LEVEL_LABELS[lvl]} (level ${lvl})`}
             className="peer sr-only"
           />
           <span
@@ -2531,11 +2617,13 @@ export function ChatCapabilityFields({
   mcpServers,
   modelNames = [],
   selfName = "",
+  boonBlockers = {},
 }: {
   model?: ModelRoute;
   mcpServers: McpServer[];
   modelNames?: string[];
   selfName?: string;
+  boonBlockers?: BoonBlockers;
 }) {
   const [fnCalling, setFnCalling] = useState(model?.supports_function_calling ?? false);
   const [toolChoice, setToolChoice] = useState(model?.supports_tool_choice ?? false);
@@ -2557,11 +2645,25 @@ export function ChatCapabilityFields({
     for (const tag of MODEL_TAGS) {
       const match = model?.tags?.map(parseTagLevel).find((t) => t.base === tag);
       const nativeVision = tag === "vision" && Boolean(model?.supports_vision);
-      state[tag] = { checked: Boolean(match) || nativeVision, level: match?.level ?? 1 };
+      // A bare saved tag means "Auto": the level derives from cost rank under
+      // hybrid tier sourcing. Only an explicit :level suffix pins a level.
+      state[tag] = {
+        checked: Boolean(match) || nativeVision,
+        level: match ? (match.declared ? match.level : 0) : 0,
+      };
     }
     return state;
   });
   const toolsReady = fnCalling && toolChoice;
+  // Boons whose global switch (or helper model) is missing in Settings. The
+  // grant alone does nothing in that state, so the form says so rather than
+  // letting the misconfiguration land and surface later as "the model says it
+  // can't do that".
+  const blockedBoons = MODEL_BOONS.flatMap((boon) => {
+    const reason = boonBlockers[boon.value];
+    if (!reason) return [];
+    return [{ value: boon.value, label: boon.label, reason, held: model?.boons?.includes(boon.value) ?? false }];
+  });
 
   useEffect(() => {
     if (!toolsReady) {
@@ -2603,13 +2705,25 @@ export function ChatCapabilityFields({
         })}
       </ChipGroup>
       <ChipGroup label="Boons" info="Gateway capabilities granted that the model lacks natively. Configure in Settings → Boons.">
-        {MODEL_BOONS.map((boon) =>
-          boon.value === "knowledge" ? (
+        {MODEL_BOONS.map((boon) => {
+          const blocked = boonBlockers[boon.value];
+          const held = model?.boons?.includes(boon.value) ?? false;
+          // A boon already granted keeps its operable chip even while its
+          // global switch is off: the chip is how an admin ungrants it, and a
+          // disabled checkbox submits nothing — which would silently revoke the
+          // grant on the next unrelated save of this form. Only a NEW grant is
+          // refused, since it would be inert the moment it was made.
+          const disabled = Boolean(blocked) && !held;
+          const hint = blocked
+            ? `${boon.description}\n\n${held ? "Granted but inactive" : "Unavailable"} — ${blocked}`
+            : boon.description;
+          return boon.value === "knowledge" ? (
             <ChipCheckbox
               key={boon.value}
               name={`boon_${boon.value}`}
               label={boon.label}
-              hint={boon.description}
+              hint={hint}
+              disabled={disabled}
               checked={knowledgeChecked}
               onChange={setKnowledgeChecked}
             />
@@ -2618,7 +2732,8 @@ export function ChatCapabilityFields({
               key={boon.value}
               name={`boon_${boon.value}`}
               label={boon.label}
-              hint={boon.description}
+              hint={hint}
+              disabled={disabled}
               checked={speculationChecked}
               onChange={setSpeculationChecked}
             />
@@ -2627,12 +2742,24 @@ export function ChatCapabilityFields({
               key={boon.value}
               name={`boon_${boon.value}`}
               label={boon.label}
-              hint={boon.description}
-              defaultChecked={model?.boons?.includes(boon.value) ?? false}
+              hint={hint}
+              disabled={disabled}
+              defaultChecked={held}
             />
-          ),
-        )}
+          );
+        })}
       </ChipGroup>
+      {blockedBoons.length > 0 && (
+        <ul className="max-w-prose space-y-0.5 text-[11px] leading-snug text-amber-500/90">
+          {blockedBoons.map((boon) => (
+            <li key={boon.value}>
+              <span className="font-medium text-foreground">{boon.label}</span>
+              {boon.held ? " is granted but inactive — " : " can’t be granted — "}
+              {boon.reason}
+            </li>
+          ))}
+        </ul>
+      )}
       {speculationChecked && (
         <div className="space-y-3 rounded-md border border-border/60 bg-muted/20 p-3">
           <div>
@@ -2980,6 +3107,35 @@ function Field({
         step={step}
         min={min}
         max={max}
+      />
+      {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
+    </div>
+  );
+}
+
+/// A multi-line list of alias names. A textarea rather than a chip list
+/// because aliases are free-form strings an operator pastes in, not a fixed
+/// vocabulary to pick from.
+function AliasesField({
+  defaultValue,
+  hint,
+}: {
+  defaultValue?: string;
+  hint?: string;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label htmlFor="model-aliases">Aliases (optional)</Label>
+      <textarea
+        id="model-aliases"
+        name="aliases"
+        rows={3}
+        defaultValue={defaultValue}
+        placeholder={"glm-5-3-fp8\nglm-5-3-mxfp4"}
+        autoCapitalize="none"
+        autoCorrect="off"
+        spellCheck={false}
+        className="flex w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
       />
       {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
     </div>

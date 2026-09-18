@@ -87,6 +87,16 @@ pub struct SpeculationPlan {
     pub client_stream: bool,
     /// The client asked for `stream_options.include_usage`.
     pub include_usage: bool,
+    /// The image-generation boon armed the tool loop for this request, so the
+    /// target could answer it by drawing something. The cascade cannot: the
+    /// drafter is a different model and the scoring endpoint only scores, so a
+    /// committed cascade means no image at all.
+    ///
+    /// When this is set, an unclassified request abstains instead of
+    /// speculating — the cost of being wrong is a missing picture, not a slow
+    /// answer, so silence from the classifier has to mean "let the target
+    /// have it". See the guard in [`run`].
+    pub image_tool_pending: bool,
 }
 
 /// Token/latency stats the streaming driver reports back for settlement,
@@ -748,6 +758,17 @@ pub async fn run(
                 }
             }
         }
+    }
+    // With the image tool on the table, only a positive classification may
+    // claim the request. No tags means the classifier was unavailable, or had
+    // nothing to say, and guessing wrong here costs the user the picture they
+    // asked for.
+    if plan.image_tool_pending && tags.is_empty() {
+        tracing::info!(
+            target = %req.route.model_name,
+            "image tool is armed and the request is unclassified; target model answers directly"
+        );
+        return Outcome::Abstain("image tool pending, intent unclassified");
     }
     let Some(gate) = resolve_gate(s, &tags) else {
         tracing::info!(

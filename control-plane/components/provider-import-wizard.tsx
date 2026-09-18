@@ -109,6 +109,11 @@ export function ProviderImportWizard({
           modelName: d.modelName,
           included: d.status === "new",
           overrides: {},
+          // Seeded from the upstream id: a provider that names itself
+          // `Qwen3-8B-FP8` registers as `qwen3-8b` with quantization `fp8`,
+          // and keeps answering to the full id as an alias.
+          quantization: d.quantization,
+          aliases: d.suggestedAlias ? [d.suggestedAlias] : [],
         };
       }
       setRows(initial);
@@ -321,12 +326,20 @@ export function ProviderImportWizard({
                         {d.id}
                       </p>
                       {!isExisting ? (
-                        <Input
-                          value={r?.modelName ?? ""}
-                          onChange={(e) => setRow(d.id, { modelName: e.target.value })}
-                          onBlur={(e) => setRow(d.id, { modelName: normalizeModelApiNameFinal(e.target.value) })}
-                          className="mt-1 h-7 font-mono text-xs lowercase"
-                        />
+                        <>
+                          <Input
+                            value={r?.modelName ?? ""}
+                            onChange={(e) => setRow(d.id, { modelName: e.target.value })}
+                            onBlur={(e) => setRow(d.id, { modelName: normalizeModelApiNameFinal(e.target.value) })}
+                            className="mt-1 h-7 font-mono text-xs lowercase"
+                          />
+                          {d.suggestedAlias && (
+                            <p className="mt-0.5 text-[11px] text-muted-foreground">
+                              {d.quantization} lifted out of the name; still answers to{" "}
+                              <code className="font-mono">{d.suggestedAlias}</code>
+                            </p>
+                          )}
+                        </>
                       ) : (
                         <p className="mt-0.5 text-[11px] text-muted-foreground">→ {d.modelName}</p>
                       )}

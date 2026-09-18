@@ -64,7 +64,7 @@ const model = (over: Record<string, unknown> = {}) => ({
 });
 
 describe("model tag strength levels round-trip through updateModelCapabilitiesAction", () => {
-  it("serializes level 1 bare and level 3 with a suffix", async () => {
+  it("serializes Auto bare, and every explicit level — including 1 — with a suffix", async () => {
     mockAdmin();
     const updateModel = vi.fn().mockResolvedValue({});
     vi.doMock("@/lib/obleth", () => ({
@@ -75,18 +75,24 @@ describe("model tag strength levels round-trip through updateModelCapabilitiesAc
     const { updateModelCapabilitiesAction } = await import("./actions");
     const fd = new FormData();
     fd.set("id", "m-1");
+    // Auto (0): saved bare, the level derives from cost rank under hybrid
+    // tier sourcing.
     fd.set("tag_coding", "on");
-    fd.set("tag_level_coding", "1");
+    fd.set("tag_level_coding", "0");
     fd.set("tag_math", "on");
     fd.set("tag_level_math", "3");
+    // Explicit level 1 keeps its suffix: "pinned weak on purpose" is a
+    // different statement from "derive it for me".
+    fd.set("tag_general", "on");
+    fd.set("tag_level_general", "1");
     await updateModelCapabilitiesAction(null, fd);
     expect(updateModel).toHaveBeenCalledWith(
       "m-1",
-      expect.objectContaining({ tags: expect.arrayContaining(["coding", "math:3"]) }),
+      expect.objectContaining({ tags: expect.arrayContaining(["coding", "math:3", "general:1"]) }),
       expect.anything(),
     );
     const body = updateModel.mock.calls[0][1];
-    expect(body.tags).toEqual(["coding", "math:3"]);
+    expect(body.tags).toEqual(["coding", "math:3", "general:1"]);
   });
 
   it("sets supports_vision from a suffixed vision:2 tag", async () => {
@@ -118,23 +124,24 @@ describe("model tag strength levels round-trip through updateModelCapabilitiesAc
     }));
     const { updateModelCapabilitiesAction } = await import("./actions");
     // Field values exactly as ChatCapabilityFields would submit them, loaded
-    // from a model with ["coding:3", "math"] and never touched.
+    // from a model with ["coding:3", "math"] and never touched: the bare tag
+    // loads as Auto (0) and must save bare again.
     const fd = new FormData();
     fd.set("id", "m-1");
     fd.set("tag_coding", "on");
     fd.set("tag_level_coding", "3");
     fd.set("tag_math", "on");
-    fd.set("tag_level_math", "1");
+    fd.set("tag_level_math", "0");
     await updateModelCapabilitiesAction(null, fd);
     const body = updateModel.mock.calls[0][1];
     expect(body.tags).toEqual(["coding:3", "math"]);
   });
 
   it.each([
-    ["0", "coding"], // below range clamps up to 1, which serializes bare
+    ["-2", "coding"], // below range clamps up to Auto, which serializes bare
     ["9", "coding:3"], // above range clamps down to 3
-    ["x", "coding"], // unparseable falls back to 1, which serializes bare
-  ])("clamps a malformed submitted level (%s) into 1..3 without dropping the tag", async (rawLevel, expectedTag) => {
+    ["x", "coding"], // unparseable falls back to Auto, which serializes bare
+  ])("clamps a malformed submitted level (%s) into 0..3 without dropping the tag", async (rawLevel, expectedTag) => {
     mockAdmin();
     const updateModel = vi.fn().mockResolvedValue({});
     vi.doMock("@/lib/obleth", () => ({

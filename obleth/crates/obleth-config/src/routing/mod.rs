@@ -209,6 +209,10 @@ pub struct RequestFeatures {
     pub needs_function_calling: bool,
     pub needs_tool_choice: bool,
     pub needs_response_schema: bool,
+    /// The request carries image parts. A model that cannot see them would
+    /// silently answer from the text alone, so this is a hard requirement,
+    /// not a preference the tag score can trade away.
+    pub needs_vision: bool,
 }
 
 impl RequestFeatures {
@@ -238,12 +242,33 @@ impl RequestFeatures {
             .and_then(|v| v.as_str())
             .is_some_and(|t| t == "json_schema" || t == "json_object");
 
+        // Same message-part scan shape as `heuristic_intent`, but as a hard
+        // capability: any image part makes vision a requirement.
+        let needs_vision =
+            json.get("messages")
+                .and_then(|m| m.as_array())
+                .is_some_and(|messages| {
+                    messages.iter().any(|msg| {
+                        msg.get("content")
+                            .and_then(|c| c.as_array())
+                            .is_some_and(|parts| {
+                                parts.iter().any(|part| {
+                                    matches!(
+                                        part.get("type").and_then(|t| t.as_str()),
+                                        Some("image_url") | Some("input_image")
+                                    )
+                                })
+                            })
+                    })
+                });
+
         Self {
             est_input_tokens,
             max_tokens,
             needs_function_calling,
             needs_tool_choice,
             needs_response_schema,
+            needs_vision,
         }
     }
 }
@@ -256,6 +281,10 @@ pub struct BoonGrants {
     /// The structured-output boon is enabled in settings: models with the
     /// `structured_output` boon can serve `response_format` requests.
     pub structured_active: bool,
+    /// The vision boon is enabled and points at a describer: models with the
+    /// `vision` boon can serve image requests (the gateway relays images to
+    /// the describer at dispatch time).
+    pub vision_active: bool,
 }
 
 impl BoonGrants {
@@ -263,6 +292,7 @@ impl BoonGrants {
     pub fn from_settings(settings: &crate::BoonSettings) -> Self {
         BoonGrants {
             structured_active: settings.structured_output.active(),
+            vision_active: settings.vision.active(),
         }
     }
 }
@@ -270,7 +300,7 @@ impl BoonGrants {
 /// Every hard-filter reason string, in the order the filters are applied. A
 /// candidate is attributed to the *first* filter it fails, so this order is
 /// part of the explanation's contract, not just presentation.
-const REJECTION_REASONS: [&str; 10] = [
+const REJECTION_REASONS: [&str; 11] = [
     "disabled",
     "auto_excluded",
     "unhealthy",
@@ -279,9 +309,56 @@ const REJECTION_REASONS: [&str; 10] = [
     "function_calling",
     "tool_choice",
     "response_schema",
+    "vision",
     "tenant_allowlist",
     "below_tier_floor",
 ];
+
+/// Expected completion length, in tokens, for a model the gateway has not yet
+/// observed answering. Used by the per-request cost estimate in [`evaluate`]:
+/// with no history every model gets this same figure, so ranking degrades to
+/// the old unit-price comparison instead of inventing a difference.
+pub const DEFAULT_EXPECTED_OUTPUT_TOKENS: f64 = 500.0;
+
+/// Rolling per-model average of observed completion lengths, shared between
+/// the data plane (which records every settled request) and anything that
+/// scores candidates (the router, and the admin simulate endpoint — same
+/// process, same numbers, so the playground cannot drift from serving).
+///
+/// An EWMA rather than a windowed mean: no history to store, and a model
+/// whose behavior changes (a template fix, a thinking knob) converges within
+/// a few dozen requests. In-memory only — a restart forgets and re-learns,
+/// which costs at most a brief return to unit-price ranking.
+#[derive(Clone, Default)]
+pub struct OutputStats(std::sync::Arc<std::sync::RwLock<HashMap<String, f64>>>);
+
+impl OutputStats {
+    const ALPHA: f64 = 0.2;
+
+    /// Record one settled request's completion length for `model`.
+    pub fn observe(&self, model: &str, output_tokens: u64) {
+        let mut map = match self.0.write() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let sample = output_tokens as f64;
+        match map.get_mut(model) {
+            Some(avg) => *avg = *avg + Self::ALPHA * (sample - *avg),
+            None => {
+                map.insert(model.to_string(), sample);
+            }
+        }
+    }
+
+    /// Snapshot for one scoring pass. Auto requests only, so the clone is off
+    /// the hot path for every request that names its model.
+    pub fn snapshot(&self) -> HashMap<String, f64> {
+        match self.0.read() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+}
 
 /// One scored survivor, holding a borrow of its candidate so [`select_model`]
 /// can clone the winning [`ResolvedModel`] without re-running anything.
@@ -290,6 +367,10 @@ struct ScoredRef<'a> {
     level: u8,
     spare: f64,
     cost_score: f64,
+    /// Estimated dollars for THIS request on this model: unit prices times
+    /// the request's prompt estimate and the model's observed completion
+    /// length. What `cost_score` normalizes over.
+    est_cost: f64,
     tag_score: f64,
     bias: f64,
     score: f64,
@@ -340,6 +421,7 @@ fn evaluate<'a>(
     candidates: &'a [Candidate],
     features: &RequestFeatures,
     busyness: &HashMap<String, usize>,
+    expected_output: &HashMap<String, f64>,
     allowed_models: Option<&[String]>,
     desired_tags: &[String],
     grants: BoonGrants,
@@ -359,6 +441,10 @@ fn evaluate<'a>(
     let schema_via_boon = |c: &Candidate| {
         grants.structured_active && c.model.boons.iter().any(|b| b == "structured_output")
     };
+    // Likewise vision: the vision boon relays images to a describer, so a
+    // text-only model that carries it can serve an image request.
+    let vision_via_boon =
+        |c: &Candidate| grants.vision_active && c.model.boons.iter().any(|b| b == "vision");
 
     // Which domains the tier filter reasons over. Needed for the verdict when
     // tiering is on, and reported when narrating; skipped entirely otherwise so
@@ -434,6 +520,12 @@ fn evaluate<'a>(
         {
             return Some("response_schema");
         }
+        // A model that cannot see the request's images would answer from the
+        // text alone and look successful while ignoring half the prompt —
+        // silent enough that no tag weight is allowed to trade it away.
+        if features.needs_vision && !c.model.supports_vision && !vision_via_boon(c) {
+            return Some("vision");
+        }
         if let Some(allowed) = allowed_models {
             if !allowed.iter().any(|m| m == &c.model.model_name) {
                 return Some("tenant_allowlist");
@@ -498,9 +590,23 @@ fn evaluate<'a>(
     };
 
     // ---- stage 3: scoring ----
+    // Cost is estimated PER REQUEST, not per token: unit prices weighted by
+    // the request's prompt estimate and each model's observed completion
+    // length. Unit prices alone made an unbounded thinker look "cheapest"
+    // while it wrote 50x the tokens of every other candidate; the observed
+    // average is what turns that into the cost it actually is. Models with no
+    // history all get the same default, which degrades exactly to the old
+    // unit-price ranking rather than inventing a difference.
+    let est_in = features.est_input_tokens as f64;
     let costs: Vec<f64> = eligible
         .iter()
-        .map(|c| c.model.input_cost_per_token + c.model.output_cost_per_token)
+        .map(|c| {
+            let expected_out = expected_output
+                .get(&c.model.model_name)
+                .copied()
+                .unwrap_or(DEFAULT_EXPECTED_OUTPUT_TOKENS);
+            c.model.input_cost_per_token * est_in + c.model.output_cost_per_token * expected_out
+        })
         .collect();
     let min_cost = costs.iter().copied().fold(f64::INFINITY, f64::min);
     let max_cost = costs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
@@ -551,6 +657,7 @@ fn evaluate<'a>(
             },
             spare,
             cost_score,
+            est_cost: *cost,
             tag_score,
             bias,
             score: score * bias,
@@ -641,6 +748,7 @@ pub fn select_model(
     candidates: &[Candidate],
     features: &RequestFeatures,
     busyness: &HashMap<String, usize>,
+    expected_output: &HashMap<String, f64>,
     allowed_models: Option<&[String]>,
     desired_tags: &[String],
     grants: BoonGrants,
@@ -652,6 +760,7 @@ pub fn select_model(
         candidates,
         features,
         busyness,
+        expected_output,
         allowed_models,
         desired_tags,
         grants,
@@ -684,6 +793,7 @@ pub fn route(
     candidates: &[Candidate],
     features: &RequestFeatures,
     busyness: &HashMap<String, usize>,
+    expected_output: &HashMap<String, f64>,
     allowed_models: Option<&[String]>,
     desired_tags: &[String],
     grants: BoonGrants,
@@ -695,6 +805,7 @@ pub fn route(
         candidates,
         features,
         busyness,
+        expected_output,
         allowed_models,
         desired_tags,
         grants,
@@ -727,6 +838,7 @@ pub fn explain_selection(
     candidates: &[Candidate],
     features: &RequestFeatures,
     busyness: &HashMap<String, usize>,
+    expected_output: &HashMap<String, f64>,
     allowed_models: Option<&[String]>,
     desired_tags: &[String],
     grants: BoonGrants,
@@ -738,6 +850,7 @@ pub fn explain_selection(
         candidates,
         features,
         busyness,
+        expected_output,
         allowed_models,
         desired_tags,
         grants,
@@ -796,6 +909,7 @@ fn narrate(
                 level: s.level,
                 spare: s.spare,
                 cost_score: s.cost_score,
+                est_cost: s.est_cost,
                 tag_score: s.tag_score,
                 bias: s.bias,
                 score: s.score,
@@ -1008,10 +1122,12 @@ mod tests {
     fn model(name: &str) -> ResolvedModel {
         ResolvedModel {
             model_name: name.to_string(),
+            aliases: Vec::new(),
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
             api_key: None,
             model_type: crate::DEFAULT_MODEL_TYPE.to_string(),
+            quantization: crate::DEFAULT_QUANTIZATION.to_string(),
             admission_weight: 100,
             max_in_flight: None,
             enabled: true,
@@ -1070,6 +1186,7 @@ mod tests {
             &[],
             &RequestFeatures::default(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -1096,6 +1213,7 @@ mod tests {
             &candidates,
             &features,
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -1121,6 +1239,7 @@ mod tests {
             &candidates,
             &features,
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -1141,6 +1260,7 @@ mod tests {
         let chosen = select_model(
             &candidates,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &[],
@@ -1167,6 +1287,7 @@ mod tests {
             &candidates,
             &RequestFeatures::default(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -1188,6 +1309,7 @@ mod tests {
         let chosen = select_model(
             &candidates,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &[],
@@ -1213,6 +1335,7 @@ mod tests {
         let explain = explain_selection(
             &[cand, healthy(model("beta"))],
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &[],
@@ -1245,6 +1368,7 @@ mod tests {
             &candidates,
             &features,
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -1270,6 +1394,7 @@ mod tests {
             &candidates,
             &RequestFeatures::default(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -1293,6 +1418,7 @@ mod tests {
         let chosen = select_model(
             &candidates,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &[],
@@ -1318,6 +1444,7 @@ mod tests {
             &candidates,
             &RequestFeatures::default(),
             &busyness,
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -1336,6 +1463,7 @@ mod tests {
         let chosen = select_model(
             &candidates,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             Some(&allowed),
             &[],
@@ -1382,6 +1510,7 @@ mod tests {
             &candidates,
             &RequestFeatures::default(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &desired,
             BoonGrants::default(),
@@ -1406,6 +1535,7 @@ mod tests {
         let chosen = select_model(
             &candidates,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &[],
@@ -1497,10 +1627,12 @@ mod tests {
         };
         let grants = BoonGrants {
             structured_active: true,
+            vision_active: false,
         };
         assert!(select_model(
             &candidates,
             &features,
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &[],
@@ -1526,6 +1658,7 @@ mod tests {
             &candidates,
             &features,
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -1536,10 +1669,12 @@ mod tests {
         .is_none());
         let grants = BoonGrants {
             structured_active: true,
+            vision_active: false,
         };
         let chosen = select_model(
             &candidates,
             &features,
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &[],
@@ -1550,6 +1685,160 @@ mod tests {
         )
         .unwrap();
         assert_eq!(chosen.model_name, "emulated");
+    }
+
+    #[test]
+    fn image_request_filters_out_text_only_models() {
+        let mut blind = model("blind");
+        blind.supports_vision = false;
+        blind.input_cost_per_token = 0.0; // would otherwise win on cost
+        let mut sighted = model("sighted");
+        sighted.supports_vision = true;
+        sighted.input_cost_per_token = 0.000_100;
+        sighted.output_cost_per_token = 0.000_100;
+        let candidates = vec![healthy(blind), healthy(sighted)];
+        let features = RequestFeatures {
+            needs_vision: true,
+            ..Default::default()
+        };
+        let chosen = select_model(
+            &candidates,
+            &features,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(chosen.model_name, "sighted");
+    }
+
+    #[test]
+    fn vision_boon_satisfies_the_vision_filter() {
+        let mut relayed = model("relayed");
+        relayed.supports_vision = false;
+        relayed.boons = vec!["vision".to_string()];
+        let candidates = vec![healthy(relayed)];
+        let features = RequestFeatures {
+            needs_vision: true,
+            ..Default::default()
+        };
+        // Boon carried but not active gateway-wide: still filtered.
+        assert!(select_model(
+            &candidates,
+            &features,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            1
+        )
+        .is_none());
+        let grants = BoonGrants {
+            structured_active: false,
+            vision_active: true,
+        };
+        let chosen = select_model(
+            &candidates,
+            &features,
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            &[],
+            grants,
+            &RouterWeights::default(),
+            0.0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(chosen.model_name, "relayed");
+    }
+
+    #[test]
+    fn features_detect_image_parts() {
+        let body = serde_json::json!({
+            "messages": [{"role":"user","content":[
+                {"type":"text","text":"what is in this picture?"},
+                {"type":"image_url","image_url":{"url":"http://example.invalid/x.png"}}
+            ]}]
+        });
+        assert!(RequestFeatures::from_request(&body, 10, 0).needs_vision);
+        let text_only = serde_json::json!({
+            "messages": [{"role":"user","content":"hello"}]
+        });
+        assert!(!RequestFeatures::from_request(&text_only, 10, 0).needs_vision);
+    }
+
+    #[test]
+    fn observed_output_length_beats_unit_price() {
+        // The thinker is cheapest per token but writes 25k tokens per answer;
+        // the coder costs more per token and writes 500. Per REQUEST the coder
+        // is cheaper, and that is the cost the router must rank on.
+        let mut thinker = model("thinker");
+        thinker.input_cost_per_token = 0.000_000_05;
+        thinker.output_cost_per_token = 0.000_000_1;
+        let mut coder = model("coder");
+        coder.input_cost_per_token = 0.000_000_07;
+        coder.output_cost_per_token = 0.000_000_27;
+        let candidates = vec![healthy(thinker), healthy(coder)];
+
+        // No history: unit prices decide, thinker looks cheapest.
+        let chosen = select_model(
+            &candidates,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            &HashMap::new(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(chosen.model_name, "thinker");
+
+        // With observed completion lengths the ranking flips.
+        let stats = OutputStats::default();
+        stats.observe("thinker", 25_000);
+        stats.observe("coder", 500);
+        let chosen = select_model(
+            &candidates,
+            &RequestFeatures::default(),
+            &HashMap::new(),
+            &stats.snapshot(),
+            None,
+            &[],
+            BoonGrants::default(),
+            &RouterWeights::default(),
+            0.0,
+            1,
+        )
+        .unwrap();
+        assert_eq!(chosen.model_name, "coder");
+    }
+
+    #[test]
+    fn output_stats_ewma_converges_and_defaults_apply() {
+        let stats = OutputStats::default();
+        stats.observe("m", 1_000);
+        assert_eq!(stats.snapshot().get("m").copied(), Some(1_000.0));
+        for _ in 0..50 {
+            stats.observe("m", 100);
+        }
+        let avg = stats.snapshot()["m"];
+        assert!(
+            avg < 150.0,
+            "EWMA must converge toward recent behavior, got {avg}"
+        );
+        assert!(stats.snapshot().get("unseen").is_none());
     }
 
     #[test]
@@ -1564,10 +1853,12 @@ mod tests {
         };
         let grants = BoonGrants {
             structured_active: true,
+            vision_active: false,
         };
         assert!(select_model(
             &candidates,
             &features,
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &[],
@@ -1601,6 +1892,7 @@ mod tests {
             &candidates,
             &RequestFeatures::default(),
             &busyness,
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -1620,6 +1912,7 @@ mod tests {
             &candidates,
             &RequestFeatures::default(),
             &busyness,
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -1647,6 +1940,7 @@ mod tests {
             let chosen = select_model(
                 &candidates,
                 &RequestFeatures::default(),
+                &HashMap::new(),
                 &HashMap::new(),
                 None,
                 &[],
@@ -1680,6 +1974,7 @@ mod tests {
             &candidates,
             &RequestFeatures::default(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -1691,6 +1986,7 @@ mod tests {
         let high = select_model(
             &candidates,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &[],
@@ -1716,6 +2012,7 @@ mod tests {
         let chosen = select_model(
             &candidates,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &[],
@@ -1863,6 +2160,11 @@ mod tests {
     fn tiered(name: &str, cost: f64, levels: &[(&str, u8)]) -> Candidate {
         let mut m = model(name);
         m.input_cost_per_token = cost;
+        // Cost is estimated per request (prompt estimate x input price +
+        // expected output x output price); with the fixtures' zero-token
+        // prompt an input-only price would make every model free. Price the
+        // output too so "cheap" stays cheap under the request-cost estimate.
+        m.output_cost_per_token = cost;
         m.tags = levels.iter().map(|(d, _)| d.to_string()).collect();
         let mut c = healthy(m);
         c.levels = levels.iter().map(|(d, l)| (d.to_string(), *l)).collect();
@@ -1887,6 +2189,7 @@ mod tests {
             &cands,
             &RequestFeatures::default(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &desired,
             BoonGrants::default(),
@@ -1908,6 +2211,7 @@ mod tests {
         let chosen = select_model(
             &cands,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &desired,
@@ -1934,6 +2238,7 @@ mod tests {
             &cands,
             &RequestFeatures::default(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &desired,
             BoonGrants::default(),
@@ -1954,6 +2259,7 @@ mod tests {
                 select_model(
                     &cands,
                     &RequestFeatures::default(),
+                    &HashMap::new(),
                     &HashMap::new(),
                     None,
                     &desired,
@@ -1978,6 +2284,7 @@ mod tests {
         let chosen = select_model(
             &cands,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &[],
@@ -2008,6 +2315,7 @@ mod tests {
             &cands,
             &RequestFeatures::default(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &desired,
             BoonGrants::default(),
@@ -2036,6 +2344,7 @@ mod tests {
             &cands,
             &RequestFeatures::default(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &desired,
             BoonGrants::default(),
@@ -2061,6 +2370,7 @@ mod tests {
         assert!(select_model(
             &cands,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &desired,
@@ -2101,6 +2411,7 @@ mod tests {
         let chosen = select_model(
             &cands,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &desired,
@@ -2223,6 +2534,7 @@ mod tests {
             &cands,
             &features,
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -2255,6 +2567,7 @@ mod tests {
                 &cands,
                 &RequestFeatures::default(),
                 &HashMap::new(),
+                &HashMap::new(),
                 k.allowed.as_deref(),
                 &k.tags,
                 BoonGrants::default(),
@@ -2265,6 +2578,7 @@ mod tests {
             let ex = explain_selection(
                 &cands,
                 &RequestFeatures::default(),
+                &HashMap::new(),
                 &HashMap::new(),
                 k.allowed.as_deref(),
                 &k.tags,
@@ -2297,6 +2611,7 @@ mod tests {
                 &cands,
                 &RequestFeatures::default(),
                 &HashMap::new(),
+                &HashMap::new(),
                 k.allowed.as_deref(),
                 &k.tags,
                 BoonGrants::default(),
@@ -2314,6 +2629,7 @@ mod tests {
             let alone = select_model(
                 &cands,
                 &RequestFeatures::default(),
+                &HashMap::new(),
                 &HashMap::new(),
                 k.allowed.as_deref(),
                 &k.tags,
@@ -2338,6 +2654,7 @@ mod tests {
                 &cands,
                 &RequestFeatures::default(),
                 &HashMap::new(),
+                &HashMap::new(),
                 k.allowed.as_deref(),
                 &k.tags,
                 BoonGrants::default(),
@@ -2349,6 +2666,7 @@ mod tests {
             let loud = evaluate(
                 &cands,
                 &RequestFeatures::default(),
+                &HashMap::new(),
                 &HashMap::new(),
                 k.allowed.as_deref(),
                 &k.tags,
@@ -2403,6 +2721,7 @@ mod tests {
             &cands,
             &RequestFeatures::default(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -2432,6 +2751,7 @@ mod tests {
             &cands,
             &RequestFeatures::default(),
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &desired,
             BoonGrants::default(),
@@ -2454,6 +2774,7 @@ mod tests {
         let clamped = explain_selection(
             &cands,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &desired,
@@ -2486,6 +2807,7 @@ mod tests {
             explain_selection(
                 &cands,
                 &RequestFeatures::default(),
+                &HashMap::new(),
                 &HashMap::new(),
                 None,
                 &[],
@@ -2524,6 +2846,7 @@ mod tests {
                 &cands,
                 &RequestFeatures::default(),
                 &HashMap::new(),
+                &HashMap::new(),
                 None,
                 &[],
                 BoonGrants::default(),
@@ -2536,6 +2859,7 @@ mod tests {
             let replay = explain_selection(
                 &cands,
                 &RequestFeatures::default(),
+                &HashMap::new(),
                 &HashMap::new(),
                 None,
                 &[],
@@ -2561,6 +2885,7 @@ mod tests {
         let ex = explain_selection(
             &cands,
             &features,
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &[],
@@ -2599,6 +2924,7 @@ mod tests {
             &cands,
             &features,
             &HashMap::new(),
+            &HashMap::new(),
             None,
             &[],
             BoonGrants::default(),
@@ -2623,6 +2949,7 @@ mod tests {
         let ex = explain_selection(
             &cands,
             &RequestFeatures::default(),
+            &HashMap::new(),
             &HashMap::new(),
             None,
             &intent.tags,

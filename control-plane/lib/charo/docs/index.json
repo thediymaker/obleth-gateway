@@ -1,5 +1,5 @@
 {
-  "generatedAt": "2026-09-11T00:05:05.586Z",
+  "generatedAt": "2026-09-16T05:12:45.854Z",
   "chunks": [
     {
       "id": "concepts/architecture#caching-layers-hot-path",
@@ -2025,6 +2025,34 @@
       "text": "Set or clear a tenant's policy with `PATCH /api/v1/tenants/{id}/guardrails`. Send\n`{\"policy\": null}` to remove it (disables guardrails for the tenant).\n\n```bash\ncurl -X PATCH http://localhost:9180/api/v1/tenants/$ID/guardrails \\\n  -H \"Authorization: Bearer $TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\n    \"policy\": {\n      \"action\": \"redact\",\n      \"input_scanners\": [\"pii\", \"prompt_injection\"],\n      \"output_scanners\": [\"pii\"],\n      \"guard_model\": \"qwen3-235b\",\n      \"ban_keywords\": [],\n      \"fail_open\": true\n    }\n  }'\n```\n\n| Field | Type | Notes |\n|---|---|---|\n| `action` | string | `block`, `redact`, or `log_only` |\n| `input_scanners` | string[] | Any of `prompt_injection`, `pii`, `ban_keywords`, `harm` |\n| `output_scanners` | string[] | Any of `pii`, `ban_keywords`, `harm` |\n| `guard_model` | string \\| null | `model_name` for the tier-2 `harm` scanner (required if `harm` is used) |\n| `ban_keywords` | string[] | Tenant keyword list for the `ban_keywords` scanner |\n| `fail_open` | boolean | `true` (default) passes through on scanner error; `false` rejects with `503` |\n\n> The tier-2 `harm` scanner only runs when `guard_model` is set and that model is\n> registered. Tier-1 scanners need no model."
     },
     {
+      "id": "guides/identity-tokens#1-generate-a-signing-keypair",
+      "route": "guides/identity-tokens",
+      "title": "Identity Tokens",
+      "heading": "1. Generate a signing keypair",
+      "text": "ES256 (P-256) keys are small and fast to verify. Generate one **once**, offline:\n\n```bash\nopenssl ecparam -name prime256v1 -genkey -noout -out signing-key.pem\nopenssl ec -in signing-key.pem -pubout -out signing-key.pub.pem\n```\n\nThe private key goes into your provider's secret storage — an environment\nvariable, a Kubernetes Secret, a KMS entry. It is never sent to the gateway, and\nthe gateway has no setting to receive it. The public key is published in the next\nstep.\n\nNothing in this step contacts obleth. Key generation is purely local: the\ngateway learns about the key only when it fetches your JWKS document, and only\ntrusts it because you named that document in `OBLETH_JWT_ISSUERS`."
+    },
+    {
+      "id": "guides/identity-tokens#2-publish-the-public-key-as-a-jwks-document",
+      "route": "guides/identity-tokens",
+      "title": "Identity Tokens",
+      "heading": "2. Publish the public key as a JWKS document",
+      "text": "Serve a JSON document, unauthenticated, at a stable URL. Every key needs a\n`kid`, because the gateway looks keys up by `kid` alone and silently skips\nentries without one.\n\n```json\n{\n  \"keys\": [\n    {\n      \"kty\": \"EC\",\n      \"crv\": \"P-256\",\n      \"alg\": \"ES256\",\n      \"use\": \"sig\",\n      \"kid\": \"2026-09-a\",\n      \"x\": \"…base64url…\",\n      \"y\": \"…base64url…\"\n    }\n  ]\n}\n```\n\nNode can derive the `x`/`y` pair from the public PEM directly, which avoids\ntranscribing them by hand:\n\n```js\nimport { createPublicKey } from \"node:crypto\";\nimport { readFileSync } from \"node:fs\";\n\nconst jwk = createPublicKey(readFileSync(\"signing-key.pub.pem\")).export({\n  format: \"jwk\",\n});\nconsole.log(JSON.stringify({ ...jwk, alg: \"ES256\", use: \"sig\", kid: \"2026-09-a\" }));\n```\n\nAny stable string works as a `kid` as long as it changes when the key does; a\ndate-stamped label is enough. This endpoint is public by design — it contains\nonly public keys, and the gateway fetches it without credentials."
+    },
+    {
+      "id": "guides/identity-tokens#3-mint-a-token",
+      "route": "guides/identity-tokens",
+      "title": "Identity Tokens",
+      "heading": "3. Mint a token",
+      "text": "After authenticating the user, sign a token whose claims match the issuer entry\nexactly. Keep `exp` short — minutes to hours — since expiry, not revocation, is\nthe primary bound on a leaked token.\n\n```js\nimport { SignJWT, importPKCS8 } from \"jose\";\n\nconst key = await importPKCS8(process.env.SIGNING_KEY_PEM, \"ES256\");\n\nconst token = await new SignJWT({ device_id: deviceId, uid: user.id })\n  .setProtectedHeader({ alg: \"ES256\", kid: \"2026-09-a\" })\n  .setIssuer(\"https://idp.example.com\")   // must equal `issuer`\n  .setAudience(\"obleth\")                   // must equal `audience`\n  .setSubject(user.id)                     // read from `subject_claim`\n  .setIssuedAt()\n  .setExpirationTime(\"1h\")\n  .sign(key);\n```\n\n`iss`, `aud`, `sub`, and `exp` are mandatory. `device_id` and `uid` here are the\nclaims named by `device_claim` and `identity_claims` in the example\nconfiguration — rename them to whatever your provider already emits, then point\nthe gateway config at those names rather than changing the provider."
+    },
+    {
+      "id": "guides/identity-tokens#4-verify-end-to-end",
+      "route": "guides/identity-tokens",
+      "title": "Identity Tokens",
+      "heading": "4. Verify end to end",
+      "text": "```bash\ncurl -sS https://gateway.example.com/v1/chat/completions \\\n  -H \"Authorization: Bearer $TOKEN\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"model\":\"my-model\",\"messages\":[{\"role\":\"user\",\"content\":\"ping\"}]}'\n```\n\nA `200` means the token verified and an identity key exists or was just created\n— check the Keys page for a new `identity` badge. A `401` carries no detail by\ndesign; read the reason from [Troubleshooting](#troubleshooting) below."
+    },
+    {
       "id": "guides/identity-tokens#apply-the-configuration",
       "route": "guides/identity-tokens",
       "title": "Identity Tokens",
@@ -2039,11 +2067,25 @@
       "text": "Set `OBLETH_JWT_ISSUERS` on the gateway to a JSON array. One entry per trusted issuer:\n\n```json\n[\n  {\n    \"issuer\": \"https://idp.example.com\",\n    \"jwks_url\": \"https://idp.example.com/.well-known/jwks.json\",\n    \"audience\": \"obleth\",\n    \"algorithms\": [\"ES256\"],\n    \"subject_claim\": \"sub\",\n    \"device_claim\": \"device_id\",\n    \"identity_claims\": [\"uid\"],\n    \"tenant\": \"cli-users\",\n    \"jit_provision\": true\n  }\n]\n```\n\n| Field | Required | Default | Meaning |\n|---|---|---|---|\n| `issuer` | yes | — | Must equal the token's `iss` exactly. |\n| `jwks_url` | no | discovery | Signing-key document. When omitted, `jwks_uri` is read from `<issuer>/.well-known/openid-configuration` at boot. |\n| `audience` | yes | — | Must appear in the token's `aud`. |\n| `algorithms` | no | `[\"RS256\",\"ES256\"]` | Allowed signature algorithms. Asymmetric only; `HS*` is refused at boot. |\n| `subject_claim` | no | `sub` | Claim that identifies the user. |\n| `device_claim` | no | — | Claim recorded as `device_id` on usage rows (letters, digits, `_`, `-`; at most 64 characters). |\n| `identity_claims` | no | `[]` | Extra claims stored on the identity key at creation, e.g. an immutable user id. |\n| `tenant` | yes | — | Tenant that identity keys are created under. Must match the tenant your account system already uses. |\n| `jit_provision` | no | `true` | Create the identity key on first sight. When `false`, unknown identities receive 401. |\n\nAn invalid configuration stops the gateway from starting. The JWKS URL is"
     },
     {
+      "id": "guides/identity-tokens#how-the-trust-works",
+      "route": "guides/identity-tokens",
+      "title": "Identity Tokens",
+      "heading": "How the trust works",
+      "text": "Three parties are involved, and trust is granted in exactly one of them.\n\n| Party | Holds | Role |\n|---|---|---|\n| Identity provider | The **private** signing key | Authenticates the user, then signs a short-lived token naming them |\n| Its JWKS endpoint | The **public** key, published | Lets anyone verify a signature without calling the issuer per request |\n| obleth gateway | `OBLETH_JWT_ISSUERS` | Trusts the issuers named there, and no others |\n\nEnd to end:\n\n1. A user authenticates to your identity provider by whatever means it already uses.\n2. The provider signs a JWT carrying that user's subject, an `aud` naming the gateway, and a short `exp`. The private key never leaves the provider.\n3. The gateway fetches the provider's JWKS at boot and caches the public keys by `kid`, refreshing every 15 minutes.\n4. The user sends the token as `Authorization: Bearer …`. The gateway selects the issuer by `iss`, verifies the signature against the cached public key, and checks `aud`, `exp`, `nbf`, and `iat` — all offline.\n5. The subject claim resolves to an identity key, and the request proceeds under that key's tenant and budgets."
+    },
+    {
       "id": "guides/identity-tokens#identity-keys",
       "route": "guides/identity-tokens",
       "title": "Identity Tokens",
       "heading": "Identity keys",
       "text": "Identity keys appear on the Keys pages with an `identity` badge, the subject, and the issuer host. They have no secret, so there is nothing to copy or rotate. Disabling one blocks that user's token traffic immediately, ahead of the token's own expiry. Deleting one removes it; the next verified token recreates it with fresh budgets. Disable, not delete, is the revocation control for identity keys.\n\nThe Management API returns `kind`, `identity_issuer`, `identity_subject`, and `identity_claims` on each key. `identity_subject` is the field external account systems should join on."
+    },
+    {
+      "id": "guides/identity-tokens#issuing-tokens",
+      "route": "guides/identity-tokens",
+      "title": "Identity Tokens",
+      "heading": "Issuing tokens",
+      "text": "This half runs on your identity provider, not on the gateway. If your provider\nis a full OIDC server (Keycloak, Okta, Entra, Auth0, Dex), it already does all\nof it — create a client whose audience is the value you configured, and skip to\n[Apply the configuration](#apply-the-configuration). The steps below are for\nminting tokens from an application you control, such as a portal that hands\nshort-lived credentials to a CLI."
     },
     {
       "id": "guides/identity-tokens#key-handling",
@@ -2058,6 +2100,13 @@
       "title": "Identity Tokens",
       "heading": "Overview",
       "text": "The data plane accepts two kinds of bearer credential on `Authorization: Bearer`:\n\n- an **API key** (`sk_…`), minted from the dashboard or Management API, and\n- an **identity token**: a short-lived JWT access token minted by an OIDC identity provider you trust.\n\nA token is verified offline against the issuer's published signing keys (JWKS). A verified `(issuer, subject)` pair maps to an **identity key** — a real key row of kind `identity` under a tenant you name — created on first use. From that point the request is handled exactly like one made with an API key: tenant status, schedules, budgets, model allowlists, guardrails, and disable all apply."
+    },
+    {
+      "id": "guides/identity-tokens#rotating-the-signing-key",
+      "route": "guides/identity-tokens",
+      "title": "Identity Tokens",
+      "heading": "Rotating the signing key",
+      "text": "Rotation is additive, and the order matters because the gateway caches keys for\nup to 15 minutes:\n\n1. Generate a second keypair with a new `kid`.\n2. Publish **both** public keys in the JWKS document. Wait for the gateway to\n   pick it up — a token bearing an unknown `kid` also triggers one immediate\n   refetch per minute, so this is usually quick.\n3. Switch the provider to signing with the new key.\n4. Keep the old public key published until every token signed with it has\n   expired, then remove it.\n\nSkipping step 2 rejects live traffic: tokens arrive carrying a `kid` the gateway\nhas never seen. Removing the old key too early rejects tokens that are still\ninside their validity window."
     },
     {
       "id": "guides/identity-tokens#tenant-mismatch",
@@ -2085,7 +2134,14 @@
       "route": "guides/identity-tokens",
       "title": "Identity Tokens",
       "heading": "What the token must carry",
-      "text": "The gateway treats a credential as a token only when it is a compact JWS: three\nbase64url segments starting with `eyJ`, at most 8,192 bytes. Anything else is\nlooked up as an API key.\n\nThe header must name an algorithm from the issuer's `algorithms` list and a\n`kid`. Key lookup is by `kid` alone, so a token without one is rejected and a\nJWKS entry without one is skipped when the document is loaded. Publish a new\nsigning key before you sign with it, and keep the retiring key published until\nthe last token carrying it has expired.\n\nClaims: `iss` and `aud` must match the issuer entry, the subject claim must be a\nnon-empty string, and `exp` is required. `nbf` and `iat` are enforced when\npresent, with 60 seconds of clock skew; an `iat` in the future beyond that skew\nis rejected."
+      "text": "The gateway treats a credential as a token only when it is a compact JWS: three\nbase64url segments starting with `eyJ`, at most 8,192 bytes. Anything else is\nlooked up as an API key.\n\nThe header must name an algorithm from the issuer's `algorithms` list and a\n`kid`. Key lookup is by `kid` alone, so a token without one is rejected and a\nJWKS entry without one is skipped when the document is loaded. See\n[Rotating the signing key](#rotating-the-signing-key) for the order to publish\nand retire keys in.\n\nClaims: `iss` and `aud` must match the issuer entry, the subject claim must be a\nnon-empty string, and `exp` is required. `nbf` and `iat` are enforced when\npresent, with 60 seconds of clock skew; an `iat` in the future beyond that skew\nis rejected."
+    },
+    {
+      "id": "guides/identity-tokens#why-a-token-cannot-be-forged",
+      "route": "guides/identity-tokens",
+      "title": "Identity Tokens",
+      "heading": "Why a token cannot be forged",
+      "text": "Generating a keypair is free and offline — anyone can do it. What an attacker cannot do is get their public key into your provider's JWKS document, and the gateway never fetches any other one. A token signed with a self-generated key therefore fails verification: `unknown_kid` if no published key carries its `kid`, `bad_signature` if one does. Both return `401`.\n\nForging a token requires the issuer's private key, write access to the JWKS response, or environment access on the gateway to add an issuer of your own — each of which already implies control of the system. Two common downgrade attacks are closed structurally: symmetric (`HS*`) algorithms are refused at boot, so the published public key can never be replayed as an HMAC secret, and `none` is not an accepted algorithm.\n\nThe signing key is a tenant-wide credential. Anyone holding it can mint a valid\ntoken for **any** subject, and with `jit_provision` enabled the gateway will\ncreate an identity key for that subject on first use. Protect it like the admin\ntoken: secret storage, no source control, rotate on exposure."
     },
     {
       "id": "guides/import-models#1-connect",

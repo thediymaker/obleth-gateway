@@ -64,6 +64,12 @@ export function RouterWorkspace({ session, update }: {
   const needsToolChoice = session.routerNeedsToolChoice ?? false;
   const needsResponseSchema = session.routerNeedsResponseSchema ?? false;
 
+  // Default ON: the whole point of the playground is predicting what serving
+  // would do, and serving classifies with the brain when one is configured.
+  // The endpoint falls back to heuristics (and says so via tag_source) when
+  // the classifier is off, so leaving this on is always safe.
+  const [classifyLive, setClassifyLive] = useState(true);
+
   const [capacityWeight, setCapacityWeight] = useState(0.6);
   const [costWeight, setCostWeight] = useState(0.4);
   const [tagWeight, setTagWeight] = useState(0.5);
@@ -106,6 +112,7 @@ export function RouterWorkspace({ session, update }: {
     if (needsFunctionCalling) shared.needs_function_calling = true;
     if (needsToolChoice) shared.needs_tool_choice = true;
     if (needsResponseSchema) shared.needs_response_schema = true;
+    if (classifyLive) shared.classify = true;
     const editedBody: SimulateRouteRequest = {
       ...shared,
       capacity_weight: capacityWeight,
@@ -143,7 +150,7 @@ export function RouterWorkspace({ session, update }: {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     prompt, tenantId, effort, maxTokens, needsFunctionCalling, needsToolChoice, needsResponseSchema,
-    capacityWeight, costWeight, tagWeight, softCap, temperature, difficultyEnabled,
+    classifyLive, capacityWeight, costWeight, tagWeight, softCap, temperature, difficultyEnabled,
   ]);
 
   // Debounce every input, including range-input drags (which fire per frame)
@@ -248,10 +255,16 @@ export function RouterWorkspace({ session, update }: {
           <WeightSlider id="router-temperature" label="Temperature" hint="0 always picks the top scorer; higher spreads traffic across close scorers." value={temperature} onChange={setTemperature} min={0} max={2} step={0.1} valueLabel={temperature === 0 ? "Deterministic" : temperature.toFixed(1)} />
           <WeightSlider id="router-soft-cap" label="Default soft cap" hint="Assumed concurrency ceiling for models with no explicit limit." value={softCap} onChange={setSoftCap} min={1} max={64} step={1} valueLabel={String(Math.round(softCap))} />
         </div>
-        <label className="flex items-center gap-2 text-xs">
-          <input type="checkbox" checked={difficultyEnabled} onChange={(e) => setDifficultyEnabled(e.target.checked)} className="h-3.5 w-3.5" />
-          Difficulty tiering
-        </label>
+        <div className="flex flex-wrap items-center gap-4">
+          <label className="flex items-center gap-2 text-xs">
+            <input type="checkbox" checked={difficultyEnabled} onChange={(e) => setDifficultyEnabled(e.target.checked)} className="h-3.5 w-3.5" />
+            Difficulty tiering
+          </label>
+          <label className="flex items-center gap-2 text-xs" title="Derive tags and difficulty with the live classifier model (one small model call per simulation), exactly as serving does. Unchecked, a keyword heuristic guesses instead — its tags can differ from what a real request would get.">
+            <input type="checkbox" checked={classifyLive} onChange={(e) => setClassifyLive(e.target.checked)} className="h-3.5 w-3.5" />
+            Live classifier
+          </label>
+        </div>
         {applyStatus && <p role="status" className="text-xs text-muted-foreground">{applyStatus}</p>}
       </div>
 

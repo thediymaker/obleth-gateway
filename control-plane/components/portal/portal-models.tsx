@@ -130,6 +130,14 @@ function ModelRow({ model }: { model: ModelRoute }) {
                   {model.description}
                 </p>
               )}
+              {(model.aliases?.length ?? 0) > 0 && (
+                // Worth surfacing to a developer: a name they may already have
+                // hard-coded still reaches this model.
+                <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                  also answers to{" "}
+                  <span className="font-mono">{model.aliases.join(", ")}</span>
+                </p>
+              )}
               <div className="mt-2 flex flex-wrap items-center gap-1.5 md:hidden">
                 <ModelBadges model={model} capabilities={capabilities} />
               </div>
@@ -172,6 +180,11 @@ function ModelBadges({
       {model.model_type && model.model_type !== "chat" && (
         <Badge className="border-primary/40 bg-primary/15 text-[10px] text-primary">
           {model.model_type}
+        </Badge>
+      )}
+      {model.quantization && model.quantization !== "unknown" && (
+        <Badge className="border-border bg-background/70 text-[10px] uppercase text-muted-foreground">
+          {model.quantization}
         </Badge>
       )}
       <Badge className="border-border bg-background/70 text-[10px] text-muted-foreground">

@@ -142,6 +142,7 @@ use obleth_config::{
         crate::put_alert_settings,
         crate::test_alert_settings,
         crate::get_auto_router_settings,
+        crate::router_readiness::get_router_readiness,
         crate::put_auto_router_settings,
         crate::simulate_route,
         crate::get_boon_settings,

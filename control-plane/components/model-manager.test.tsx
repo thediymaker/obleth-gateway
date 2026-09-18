@@ -31,7 +31,8 @@ vi.mock("@/app/actions", () => ({
 
 const model = (over: Partial<ModelRoute> = {}): ModelRoute => ({
   id: "u", model_name: "m", description: "", upstream_model: "up", api_base: "http://a",
-  api_key: null, model_type: "chat", input_cost_per_token: 0, output_cost_per_token: 0,
+  api_key: null, model_type: "chat", quantization: "unknown", aliases: [],
+  input_cost_per_token: 0, output_cost_per_token: 0,
   cost_per_image: 0, cost_per_audio_second: 0, cost_per_character: 0, energy_slots_per_node: 1,
   route_bias: 1,
   auto_eligible: true,
@@ -50,12 +51,12 @@ const model = (over: Partial<ModelRoute> = {}): ModelRoute => ({
 let root: Root;
 let host: HTMLDivElement;
 
-async function renderFields(m: ModelRoute) {
+async function renderFields(m: ModelRoute, boonBlockers: Record<string, string> = {}) {
   await act(async () => {
     root.render(
       <TooltipProvider>
         <form>
-          <ChatCapabilityFields model={m} mcpServers={[]} />
+          <ChatCapabilityFields model={m} mcpServers={[]} boonBlockers={boonBlockers} />
         </form>
       </TooltipProvider>,
     );
@@ -82,10 +83,13 @@ describe("routing tag strength levels", () => {
     expect(level3.checked).toBe(true);
   });
 
-  it("renders a bare tag checked at level 1", async () => {
-    await renderFields(model({ tags: ["coding"] }));
+  it("renders a bare tag checked at Auto, and an explicit :1 pinned at 1", async () => {
+    // Bare = "derive my level from cost rank" (Auto, value 0); tag:1 = pinned
+    // weak on purpose. The picker must show the operator which one is stored.
+    await renderFields(model({ tags: ["coding", "math:1"] }));
     expect(host.querySelector<HTMLInputElement>('[name="tag_coding"]')!.checked).toBe(true);
-    expect(host.querySelector<HTMLInputElement>('[name="tag_level_coding"][value="1"]')!.checked).toBe(true);
+    expect(host.querySelector<HTMLInputElement>('[name="tag_level_coding"][value="0"]')!.checked).toBe(true);
+    expect(host.querySelector<HTMLInputElement>('[name="tag_level_math"][value="1"]')!.checked).toBe(true);
   });
 
   it("shows no level control for an unchecked tag", async () => {
@@ -99,7 +103,7 @@ describe("routing tag strength levels", () => {
   });
 
   it.each([
-    ["coding:0", 1], // below range clamps up
+    ["coding:0", 1], // below range clamps up (an explicit suffix stays declared)
     ["coding:9", 3], // above range clamps down
     ["coding:x", 1], // unparseable falls back to 1
   ] as const)("clamps a malformed stored level (%s) into 1..3 without dropping the tag", async (raw, expectedLevel) => {
@@ -114,7 +118,47 @@ describe("routing tag strength levels", () => {
     expect(data.get("tag_coding")).toBe("on");
     expect(data.get("tag_level_coding")).toBe("3");
     expect(data.get("tag_math")).toBe("on");
-    expect(data.get("tag_level_math")).toBe("1");
+    // Bare tag loads as Auto (0), which tagsFromForm saves bare again.
+    expect(data.get("tag_level_math")).toBe("0");
     expect(data.get("tag_general")).toBeNull();
+  });
+});
+
+describe("boons that are not configured globally", () => {
+  const OFF = "it is switched off in Settings → Boons.";
+
+  it("refuses a new grant for a boon whose global switch is off", async () => {
+    await renderFields(model({ boons: [] }), { image_generation: OFF });
+    const checkbox = host.querySelector<HTMLInputElement>('[name="boon_image_generation"]')!;
+    expect(checkbox.disabled).toBe(true);
+    expect(host.textContent).toContain("can’t be granted");
+    expect(host.textContent).toContain(OFF);
+  });
+
+  it("leaves an existing grant operable so an unrelated save can't silently revoke it", async () => {
+    // A disabled checkbox submits nothing, so disabling a granted boon would
+    // drop it from the form the next time capabilities were saved.
+    await renderFields(model({ boons: ["image_generation"] }), { image_generation: OFF });
+    const checkbox = host.querySelector<HTMLInputElement>('[name="boon_image_generation"]')!;
+    expect(checkbox.disabled).toBe(false);
+    expect(checkbox.checked).toBe(true);
+    expect(new FormData(host.querySelector("form")!).get("boon_image_generation")).toBe("on");
+    expect(host.textContent).toContain("is granted but inactive");
+  });
+
+  it("gates the controlled chips (knowledge, speculation) the same way", async () => {
+    await renderFields(model({ boons: [] }), {
+      knowledge: "retrieval is switched off in Settings → Knowledge.",
+      speculation: OFF,
+    });
+    expect(host.querySelector<HTMLInputElement>('[name="boon_knowledge"]')!.disabled).toBe(true);
+    expect(host.querySelector<HTMLInputElement>('[name="boon_speculation"]')!.disabled).toBe(true);
+  });
+
+  it("says nothing when every boon is configured", async () => {
+    await renderFields(model({ boons: ["compression"] }));
+    expect(host.querySelector<HTMLInputElement>('[name="boon_compression"]')!.disabled).toBe(false);
+    expect(host.textContent).not.toContain("can’t be granted");
+    expect(host.textContent).not.toContain("granted but inactive");
   });
 });

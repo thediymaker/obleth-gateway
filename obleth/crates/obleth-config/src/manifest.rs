@@ -33,10 +33,12 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::types::{
-    is_valid_capacity_mode, is_valid_endpoint_selection_mode, is_valid_model_type, normalize_boons,
-    normalize_tag_levels, normalize_tool_servers, parse_tag_level, ModelEndpoint, ModelRoute,
-    CAPACITY_MODES, DEFAULT_CAPACITY_MODE, DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE,
-    DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES, MODEL_TYPES,
+    is_valid_capacity_mode, is_valid_endpoint_selection_mode, is_valid_model_type,
+    is_valid_quantization, normalize_aliases, normalize_boons, normalize_tool_servers,
+    parse_tag_level, ModelEndpoint, ModelRoute, CAPACITY_MODES, DEFAULT_CAPACITY_MODE,
+    DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE, DEFAULT_QUANTIZATION,
+    DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES, MAX_MODEL_ALIASES, MODEL_TYPES,
+    QUANTIZATIONS,
 };
 
 /// File-format discriminator for model manifests.
@@ -99,6 +101,17 @@ pub struct ManifestModel {
     pub has_api_key: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_type: Option<String>,
+    /// Extra client-facing names for this model. The whole list is replaced
+    /// when present, so removing an alias is spelled by omitting it from the
+    /// list rather than by any delete syntax; absent leaves aliases alone.
+    /// Blank and duplicate entries are dropped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aliases: Option<Vec<String>>,
+    /// Serving format from the fixed `QUANTIZATIONS` vocabulary. An
+    /// unrecognized value is rejected rather than silently defaulted, on the
+    /// same reasoning as `model_type`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quantization: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub input_cost_per_token: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -245,10 +258,12 @@ pub const IMPORT_ACTION_UNCHANGED: &str = "unchanged";
 #[derive(Debug, Clone, PartialEq)]
 pub struct ModelConfig {
     pub description: String,
+    pub aliases: Vec<String>,
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
     pub model_type: String,
+    pub quantization: String,
     pub input_cost_per_token: f64,
     pub output_cost_per_token: f64,
     pub cost_per_image: f64,
@@ -288,10 +303,12 @@ impl Default for ModelConfig {
     fn default() -> Self {
         Self {
             description: String::new(),
+            aliases: Vec::new(),
             upstream_model: String::new(),
             api_base: String::new(),
             api_key: None,
             model_type: DEFAULT_MODEL_TYPE.to_string(),
+            quantization: DEFAULT_QUANTIZATION.to_string(),
             input_cost_per_token: 0.0,
             output_cost_per_token: 0.0,
             cost_per_image: 0.0,
@@ -332,10 +349,12 @@ impl From<&ModelRoute> for ModelConfig {
     fn from(m: &ModelRoute) -> Self {
         Self {
             description: m.description.clone(),
+            aliases: m.aliases.clone(),
             upstream_model: m.upstream_model.clone(),
             api_base: m.api_base.clone(),
             api_key: m.api_key.clone(),
             model_type: m.model_type.clone(),
+            quantization: m.quantization.clone(),
             input_cost_per_token: m.input_cost_per_token,
             output_cost_per_token: m.output_cost_per_token,
             cost_per_image: m.cost_per_image,
@@ -387,6 +406,7 @@ impl ModelConfig {
             }
         };
         note(self.description != other.description, "description");
+        note(self.aliases != other.aliases, "aliases");
         note(
             self.upstream_model != other.upstream_model,
             "upstream_model",
@@ -394,6 +414,7 @@ impl ModelConfig {
         note(self.api_base != other.api_base, "api_base");
         note(self.api_key != other.api_key, "api_key");
         note(self.model_type != other.model_type, "model_type");
+        note(self.quantization != other.quantization, "quantization");
         note(
             self.input_cost_per_token != other.input_cost_per_token,
             "input_cost_per_token",
@@ -590,6 +611,16 @@ pub fn resolve_model(
         }
         next.model_type = t;
     }
+    if let Some(v) = &entry.quantization {
+        let q = v.trim().to_ascii_lowercase();
+        if !is_valid_quantization(&q) {
+            return Err(reject(format!(
+                "unknown quantization '{v}' (expected one of: {})",
+                QUANTIZATIONS.join(", ")
+            )));
+        }
+        next.quantization = q;
+    }
     if let Some(v) = &entry.capacity_mode {
         let m = v.trim().to_ascii_lowercase();
         if !is_valid_capacity_mode(&m) {
@@ -697,19 +728,25 @@ pub fn resolve_model(
         next.verify_upstream_model = v.trim().to_string();
     }
 
+    if let Some(raw) = &entry.aliases {
+        next.aliases = normalize_aliases(raw);
+        // An alias colliding with a real `model_name` is caught by the
+        // importer, which is the only layer that can see the other rows. Here
+        // we can only report what normalization threw away.
+        let dropped = raw.len() - next.aliases.len();
+        if dropped > 0 {
+            warnings.push(format!(
+                "dropped {dropped} blank, duplicate, or over-cap alias(es) (at most {MAX_MODEL_ALIASES} are kept)"
+            ));
+        }
+    }
+
     if let Some(raw) = &entry.tags {
         // Store the suffixed form so a declared strength level survives, the
-        // same shape `serialize_tag_levels` writes on every other path.
-        next.tags = normalize_tag_levels(raw)
-            .into_iter()
-            .map(|(base, level)| {
-                if level == 1 {
-                    base
-                } else {
-                    format!("{base}:{level}")
-                }
-            })
-            .collect();
+        // same shape `serialize_tag_levels` writes on every other path. An
+        // explicit `:1` stays explicit: bare = derive from cost rank under
+        // hybrid tiering, `tag:1` = pinned to the bottom tier.
+        next.tags = crate::canonical_tags(raw);
         let dropped: Vec<&str> = raw
             .iter()
             .filter(|t| parse_tag_level(t).is_none())
@@ -907,11 +944,13 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
     ManifestModel {
         model_name: m.model_name.clone(),
         description: Some(m.description.clone()),
+        aliases: Some(m.aliases.clone()),
         upstream_model: Some(m.upstream_model.clone()),
         api_base: Some(m.api_base.clone()),
         api_key: None,
         has_api_key: Some(m.api_key.as_deref().is_some_and(|k| !k.is_empty())),
         model_type: Some(m.model_type.clone()),
+        quantization: Some(m.quantization.clone()),
         input_cost_per_token: Some(m.input_cost_per_token),
         output_cost_per_token: Some(m.output_cost_per_token),
         cost_per_image: Some(m.cost_per_image),
@@ -956,11 +995,13 @@ mod tests {
         ModelRoute {
             id: uuid::Uuid::new_v4(),
             model_name: name.to_string(),
+            aliases: Vec::new(),
             description: "original".into(),
             upstream_model: "upstream/original".into(),
             api_base: "http://127.0.0.1:8000/v1".into(),
             api_key: Some("sk-original".into()),
             model_type: "chat".into(),
+            quantization: "unknown".into(),
             input_cost_per_token: 1.0,
             output_cost_per_token: 2.0,
             cost_per_image: 0.0,
@@ -1143,6 +1184,55 @@ mod tests {
         assert_eq!(err.model_name, "m");
         assert!(err.message.contains("embeddings"), "{}", err.message);
         assert!(err.message.contains("embedding"), "{}", err.message);
+    }
+
+    #[test]
+    fn an_unknown_quantization_is_rejected_rather_than_silently_defaulting() {
+        let existing = route("m");
+        let mut e = entry("m");
+        e.quantization = Some("fp-8".into()); // real value is "fp8"
+
+        let err = resolve_model(&e, Some(&existing), &[]).unwrap_err();
+
+        assert_eq!(err.model_name, "m");
+        assert!(err.message.contains("fp-8"), "{}", err.message);
+        // The vocabulary is listed, so the fix is in the error.
+        assert!(err.message.contains("mxfp4"), "{}", err.message);
+    }
+
+    #[test]
+    fn aliases_replace_the_whole_list_and_report_what_was_dropped() {
+        let mut existing = route("m");
+        existing.aliases = vec!["m-fp8".into(), "m-old".into()];
+        let mut e = entry("m");
+        // Omitting a stored alias is how one is removed; blanks and duplicates
+        // are dropped with a warning rather than failing the import.
+        e.aliases = Some(vec!["m-fp8".into(), "".into(), "m-fp8".into()]);
+
+        let r = resolve_model(&e, Some(&existing), &[]).unwrap();
+
+        assert_eq!(r.config.aliases, vec!["m-fp8".to_string()]);
+        assert!(r.changed_fields.contains(&"aliases".to_string()));
+        assert!(
+            r.warnings.iter().any(|w| w.contains("dropped 2")),
+            "{:?}",
+            r.warnings
+        );
+    }
+
+    #[test]
+    fn an_absent_alias_list_leaves_the_stored_aliases_alone() {
+        let mut existing = route("m");
+        existing.aliases = vec!["m-fp8".into()];
+        existing.quantization = "fp8".into();
+        let e = entry("m");
+
+        let r = resolve_model(&e, Some(&existing), &[]).unwrap();
+
+        assert_eq!(r.config.aliases, vec!["m-fp8".to_string()]);
+        assert_eq!(r.config.quantization, "fp8");
+        assert!(!r.changed_fields.contains(&"aliases".to_string()));
+        assert!(!r.changed_fields.contains(&"quantization".to_string()));
     }
 
     #[test]

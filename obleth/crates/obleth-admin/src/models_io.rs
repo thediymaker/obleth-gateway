@@ -21,7 +21,7 @@ use obleth_store::ModelImportWrite;
 use serde::Deserialize;
 use std::collections::{HashMap, HashSet};
 
-use crate::{audit_actor, sync_model, AdminError, AdminState, Result};
+use crate::{audit_actor, sync_model_from, AdminError, AdminState, Result};
 
 #[derive(Debug, Deserialize, utoipa::IntoParams)]
 pub(crate) struct ImportQuery {
@@ -230,6 +230,60 @@ pub(crate) async fn import_models(
         });
     }
 
+    // ---- alias uniqueness, judged against the post-import state ----
+    //
+    // A name a client can send has to identify exactly one route, so an alias
+    // may not collide with any `model_name` or with another model's alias. The
+    // check runs on the state the file *would* produce, not on today's rows: a
+    // manifest may legitimately move an alias from one model to another in a
+    // single file, which a check against the current rows alone would read as a
+    // collision with the row it is moving off.
+    //
+    // Names held by models this file does not touch form the fixed backdrop.
+    // Conflicts already present among those rows are not this import's fault
+    // and are not reported against it.
+    {
+        let touched: HashSet<&str> = writes.iter().map(|w| w.model_name.as_str()).collect();
+        let mut owner: HashMap<String, String> = HashMap::new();
+        for m in existing.values() {
+            owner.insert(m.model_name.clone(), m.model_name.clone());
+            if !touched.contains(m.model_name.as_str()) {
+                for alias in &m.aliases {
+                    owner.insert(alias.clone(), m.model_name.clone());
+                }
+            }
+        }
+        for w in &writes {
+            owner.insert(w.model_name.clone(), w.model_name.clone());
+        }
+        // Sorted so a file with several conflicts reports them in a stable
+        // order rather than in hash order.
+        let mut incoming: Vec<&ModelImportWrite> = writes.iter().collect();
+        incoming.sort_by(|a, b| a.model_name.cmp(&b.model_name));
+        for w in incoming {
+            let model = &w.model_name;
+            for alias in &w.config.aliases {
+                if alias == obleth_config::routing::AUTO_MODEL_NAME {
+                    errors.push(format!(
+                        "model '{model}': alias '{alias}' is reserved for automatic model selection"
+                    ));
+                    continue;
+                }
+                match owner.get(alias) {
+                    Some(other) if other == model => errors.push(format!(
+                        "model '{model}': alias '{alias}' is the model's own name"
+                    )),
+                    Some(other) => errors.push(format!(
+                        "model '{model}': alias '{alias}' is already taken by model '{other}'"
+                    )),
+                    None => {
+                        owner.insert(alias.clone(), model.clone());
+                    }
+                }
+            }
+        }
+    }
+
     if !errors.is_empty() {
         return Err(AdminError::BadRequest(format!(
             "manifest rejected, nothing was written ({} problem(s)):\n{}",
@@ -277,7 +331,14 @@ pub(crate) async fn import_models(
     // Postgres is written; now push the new state to Redis so the data plane
     // picks it up without waiting for its periodic refresh.
     for outcome in &outcomes {
-        sync_model(&state, &outcome.model).await?;
+        // The pre-import row, so an alias this file dropped has its resolver
+        // key evicted rather than left pointing at the model forever.
+        sync_model_from(
+            &state,
+            &outcome.model,
+            existing.get(&outcome.model.model_name),
+        )
+        .await?;
     }
 
     state

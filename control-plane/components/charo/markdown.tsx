@@ -1,8 +1,24 @@
 "use client";
 
-import ReactMarkdown from "react-markdown";
+import ReactMarkdown, { defaultUrlTransform } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { cn } from "@/lib/utils";
+
+// react-markdown rewrites the src of any URL whose protocol is not
+// http/https/mailto/xmpp/irc to the empty string, and `data:` is not on that
+// list. The image-generation boon attaches its result as
+// `![alt](data:image/png;base64,…)`, so under the default transform every
+// generated image renders as a broken-image icon with the alt text beside it.
+//
+// Only base64 image data URLs are let back through — `data:text/html` and
+// friends stay blocked, and everything else still goes through the library's
+// own transform rather than around it. The dashboard CSP already allows
+// `img-src data:`.
+const IMAGE_DATA_URL = /^data:image\/(?:png|jpeg|jpg|gif|webp);base64,[a-z0-9+/=]+$/i;
+
+function markdownUrlTransform(url: string): string {
+  return IMAGE_DATA_URL.test(url) ? url : defaultUrlTransform(url);
+}
 
 /**
  * Chat-tuned markdown for assistant messages: compact type scale (13.5px
@@ -15,6 +31,7 @@ export function CharoMarkdown({ text, className }: { text: string; className?: s
     <div className={cn("min-w-0 break-words text-[13.5px] leading-relaxed text-foreground/90", className)}>
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
+        urlTransform={markdownUrlTransform}
         components={{
           p: ({ children }) => <p className="my-2 first:mt-0 last:mb-0">{children}</p>,
           strong: ({ children }) => <strong className="font-semibold text-foreground">{children}</strong>,
@@ -53,6 +70,18 @@ export function CharoMarkdown({ text, className }: { text: string; className?: s
             <blockquote className="my-2 border-l-2 border-border pl-3 text-muted-foreground">{children}</blockquote>
           ),
           hr: () => <hr className="my-2 border-border/60" />,
+          // Generated images arrive as data URLs; keep them inside the bubble.
+          // A src the transform above rejected comes through blank — render
+          // nothing rather than a broken-image icon.
+          img: ({ src, alt }) =>
+            typeof src === "string" && src.length > 0 ? (
+              // eslint-disable-next-line @next/next/no-img-element
+              <img
+                src={src}
+                alt={alt ?? ""}
+                className="my-2 block max-w-full rounded-md border border-border"
+              />
+            ) : null,
         }}
       >
         {text}

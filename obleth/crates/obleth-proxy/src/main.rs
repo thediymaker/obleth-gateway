@@ -12,6 +12,7 @@ mod mcp;
 mod metrics;
 mod output_monitor;
 mod proxy;
+mod responses;
 mod router;
 mod state;
 
@@ -108,6 +109,9 @@ async fn main() -> anyhow::Result<()> {
         .build();
 
     let model_registry = router::ModelRegistry::new();
+    // Rolling completion-length averages, shared with the admin state below so
+    // simulate scores with the live numbers.
+    let output_stats = router::OutputStats::default();
 
     let (local_cache_tx, mut local_cache_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let key_cache_direct = key_cache.clone();
@@ -284,6 +288,7 @@ async fn main() -> anyhow::Result<()> {
         tool_cache,
         model_registry: model_registry.clone(),
         classifier: classifier.clone(),
+        output_stats: output_stats.clone(),
         boons: boons.clone(),
         metrics: metrics.clone(),
         fail_open: cfg.fail_open,
@@ -304,13 +309,17 @@ async fn main() -> anyhow::Result<()> {
 
     match store.all_resolved_models().await {
         Ok(models) => {
-            for (name, resolved) in &models {
-                if let Err(e) = redis.put_resolved_model(name, resolved).await {
-                    tracing::warn!(error = %e, "failed to warm model into redis");
+            for (_, resolved) in &models {
+                // One key per addressable name: the canonical `model_name` plus
+                // every alias. Resolution stays a single lookup on whatever
+                // name the client sent, so an alias costs nothing per request.
+                let shared = Arc::new(resolved.clone());
+                for name in resolved.addressable_names() {
+                    if let Err(e) = redis.put_resolved_model(name, resolved).await {
+                        tracing::warn!(error = %e, "failed to warm model into redis");
+                    }
+                    model_cache.insert(name.to_string(), shared.clone()).await;
                 }
-                model_cache
-                    .insert(name.clone(), Arc::new(resolved.clone()))
-                    .await;
             }
             tracing::info!(count = models.len(), "warmed model cache");
             let tier_source = classifier.settings().tier_source;
@@ -405,6 +414,17 @@ async fn main() -> anyhow::Result<()> {
         ssrf: obleth_admin::ssrf::SsrfPolicy::from_env(),
         alerts: alerts.clone(),
         local_cache_tx: Some(local_cache_tx),
+        output_stats: output_stats.clone(),
+        // Simulate's opt-in real classification: same classifier instance,
+        // same cache, same timeout as the data plane.
+        classify: Some(std::sync::Arc::new({
+            let st = app_state.clone();
+            move |prompt: String, tags: Vec<String>| {
+                let st = st.clone();
+                Box::pin(async move { proxy::classify_for_simulate(&st, prompt, tags).await })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = router::Intent> + Send>>
+            }
+        })),
     };
     obleth_admin::model_health::spawn_worker(admin_state.clone());
     obleth_admin::usage_retention::spawn_worker(admin_state.clone());

@@ -197,6 +197,30 @@ fn speculation_eligible(
     !drafter.is_empty() && drafter != route.model_name
 }
 
+/// Whether a response plan leaves room for the speculation boon.
+///
+/// `None` always does. A plan built only by the image-generation boon does
+/// too: that boon arms the tool loop on every request to a model granted it,
+/// so treating its presence as "something else owns the response" is what made
+/// the two boons silently exclusive. Speculation abstains by falling through,
+/// so the tool loop still answers whenever the cascade declines.
+///
+/// Nothing else yields. Structured output and output guardrails must see the
+/// target's own answer, and a real MCP tool loop — more than the one synthetic
+/// image entry, or a client passing its own tools through — is the model
+/// actually being given tools to use.
+fn plan_yields_to_speculation(plan: Option<&ResponsePlan>, image_tool_pending: bool) -> bool {
+    let Some(plan) = plan else {
+        return true;
+    };
+    if plan.structured.is_some() || plan.guardrails.is_some() || !image_tool_pending {
+        return false;
+    }
+    plan.tool_loop
+        .as_ref()
+        .is_some_and(|t| t.tool_servers.len() == 1 && !t.passthrough_unmapped)
+}
+
 /// Per-request boon control header (comma-separated tokens), also echoed on
 /// responses listing the boons that were applied. Recognized request tokens:
 /// - `off`   — disable ALL boon processing for this request (wins over others).
@@ -241,7 +265,10 @@ pub struct EnrichOutcome {
     /// Armed by the speculation boon. Consumed by the proxy BEFORE upstream
     /// dispatch (unlike `response_plan`): a committed cascade returns the
     /// response itself, and an abstaining one falls through to the completely
-    /// normal dispatch path. Never armed together with a `response_plan`.
+    /// normal dispatch path. May be armed alongside a `response_plan` when
+    /// that plan is only the image boon's tool loop (see
+    /// [`plan_yields_to_speculation`]) — the plan must stay intact, because it
+    /// answers the request whenever the cascade abstains.
     pub speculation: Option<speculation::SpeculationPlan>,
 }
 
@@ -323,6 +350,17 @@ impl BoonEngine {
             return outcome;
         }
         let settings = self.settings();
+
+        // ---- replayed image attachments ----
+        // Independent of every boon switch and of `route`: the base64 in an
+        // assistant message was put there by this gateway, and a client that
+        // replays it is sending back megabytes the model cannot read. Stripping
+        // it is reverting our own insertion, so it runs for any model — but
+        // still after `opt_out`, which means "do not touch my request".
+        if is_chat && image_gen::strip_replayed_attachments(json) {
+            outcome.rewritten = true;
+        }
+
         let Some(route) = route else {
             return outcome;
         };
@@ -779,13 +817,28 @@ impl BoonEngine {
         }
 
         // ---- speculation boon ----
-        // Armed LAST, over the fully enriched body, and only when NO response
-        // plan exists: a buffered transform (structured output, tool loop) or
-        // output guardrails owns the response and must see the target model's
-        // answer, and the boon's stream would bypass output scanning. Runs
-        // pre-dispatch in the proxy; an abstain there falls through to the
-        // normal path untouched.
-        if outcome.response_plan.is_none() && speculation_eligible(route, &settings, key) {
+        // Armed LAST, over the fully enriched body. A buffered transform
+        // (structured output, the MCP tool loop) or output guardrails owns the
+        // response and must see the target model's own answer, and the boon's
+        // stream would bypass output scanning — so those still rule it out.
+        //
+        // The image-generation boon is the exception, and it has to be: it
+        // arms the tool loop on EVERY request to a model that was granted it,
+        // whether or not a picture was wanted, which silently made the two
+        // boons mutually exclusive. Granting a model image generation stopped
+        // it speculating entirely, with nothing said anywhere.
+        //
+        // They compose because speculation runs pre-dispatch and abstains by
+        // falling through: whichever claims the request wins, and an abstain
+        // leaves the tool loop to answer exactly as it does today. The
+        // decision is per request rather than per model — the classifier that
+        // already gates speculation by category decides, and an unclassified
+        // request abstains so the picture is never the thing that goes
+        // missing. See `SpeculationPlan::image_tool_pending`.
+        let image_tool_pending = image_gen_cfg.is_some();
+        if plan_yields_to_speculation(outcome.response_plan.as_ref(), image_tool_pending)
+            && speculation_eligible(route, &settings, key)
+        {
             if let Some(messages) = speculation::eligible_messages(json) {
                 outcome.applied.push("speculation");
                 outcome.speculation = Some(speculation::SpeculationPlan {
@@ -794,6 +847,7 @@ impl BoonEngine {
                     settings: settings.speculation.clone(),
                     client_stream,
                     include_usage,
+                    image_tool_pending,
                 });
             }
         }
@@ -1021,6 +1075,8 @@ mod tests {
     pub(super) fn test_route() -> obleth_config::ResolvedModel {
         obleth_config::ResolvedModel {
             model_name: "test".to_string(),
+            aliases: Vec::new(),
+            quantization: "unknown".into(),
             upstream_model: "test".to_string(),
             api_base: "http://localhost".to_string(),
             api_key: None,
@@ -1096,6 +1152,71 @@ mod tests {
         };
         k.compression_policy = policy;
         k
+    }
+
+    fn image_only_loop() -> tool_loop::ToolLoopPlan {
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            image_gen::GENERATE_IMAGE_TOOL.to_string(),
+            image_gen::IMAGE_SYNTHETIC_SERVER.to_string(),
+        );
+        tool_loop::ToolLoopPlan {
+            tool_servers: servers,
+            request: serde_json::json!({}),
+            settings: obleth_config::ToolLoopSettings::default(),
+            passthrough_unmapped: false,
+            image_gen: None,
+        }
+    }
+
+    fn plan_with(tool_loop: Option<tool_loop::ToolLoopPlan>) -> ResponsePlan {
+        ResponsePlan {
+            structured: None,
+            tool_loop,
+            client_stream: false,
+            include_usage: false,
+            guardrails: None,
+        }
+    }
+
+    #[test]
+    fn an_image_only_tool_loop_leaves_room_for_speculation() {
+        // Granting image generation used to disable speculation outright,
+        // because the boon arms the tool loop on every request.
+        assert!(plan_yields_to_speculation(None, false));
+        assert!(plan_yields_to_speculation(
+            Some(&plan_with(Some(image_only_loop()))),
+            true
+        ));
+    }
+
+    #[test]
+    fn a_real_tool_loop_or_buffered_transform_still_owns_the_response() {
+        // Two servers: the model is genuinely being given tools.
+        let mut two = image_only_loop();
+        two.tool_servers
+            .insert("search".to_string(), "mcp-search".to_string());
+        assert!(!plan_yields_to_speculation(
+            Some(&plan_with(Some(two))),
+            true
+        ));
+
+        // The client passed its own tools through.
+        let mut passthrough = image_only_loop();
+        passthrough.passthrough_unmapped = true;
+        assert!(!plan_yields_to_speculation(
+            Some(&plan_with(Some(passthrough))),
+            true
+        ));
+
+        // One server, but not the image boon's — a single granted MCP tool.
+        assert!(!plan_yields_to_speculation(
+            Some(&plan_with(Some(image_only_loop()))),
+            false
+        ));
+
+        // A plan with no tool loop at all is structured output or guardrails.
+        assert!(!plan_yields_to_speculation(Some(&plan_with(None)), true));
     }
 
     #[test]

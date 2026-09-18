@@ -17,13 +17,17 @@ let host: HTMLDivElement;
 //
 // The untagged fixture below carries bias = 1.0 (the router's own default,
 // and a value within the reachable [0.1, 3.0] clamp range — 0 is not).
+//
+// `est_cost` is the raw dollar estimate the gateway reports alongside the
+// normalized `cost_score`; it is displayed, not an input to the formula, so it
+// only has to stay ordered consistently with `cost_score` (higher = cheaper).
 
 // base  = 0.6*0.9 + 0.4*0.7           = 0.82
 // blend = base (no requested tags)    = 0.82
 // score = 0.82 * 1.0                  = 0.82
-const chosenUntagged = { model: "gpt-oss-120b", level: 2, spare: 0.9, cost_score: 0.7, tag_score: 0, bias: 1.0, score: 0.82, chosen: true };
+const chosenUntagged = { model: "gpt-oss-120b", level: 2, spare: 0.9, cost_score: 0.7, est_cost: 0.0004, tag_score: 0, bias: 1.0, score: 0.82, chosen: true };
 // base  = 0.6*0.3 + 0.4*0.5 = 0.38; untagged -> blend = base = 0.38; score = 0.38 * 1.0 = 0.38
-const otherUntagged = { model: "small-model", level: 1, spare: 0.3, cost_score: 0.5, tag_score: 0, bias: 1.0, score: 0.38, chosen: false };
+const otherUntagged = { model: "small-model", level: 1, spare: 0.3, cost_score: 0.5, est_cost: 0.0007, tag_score: 0, bias: 1.0, score: 0.38, chosen: false };
 
 const untagged: RouteExplainView = {
   chosen: "gpt-oss-120b",
@@ -49,7 +53,7 @@ const untagged: RouteExplainView = {
 //   base  = 0.6*0.8 + 0.4*0.6                     = 0.72
 //   blend = 0.5*1.0 (tag_score) + 0.5*0.72 (base) = 0.86
 //   score = 0.86 * 1.3                            = 1.118
-const taggedRow = { model: "gpt-oss-120b", level: 2, spare: 0.8, cost_score: 0.6, tag_score: 1.0, bias: 1.3, score: 1.118, chosen: true };
+const taggedRow = { model: "gpt-oss-120b", level: 2, spare: 0.8, cost_score: 0.6, est_cost: 0.00055, tag_score: 1.0, bias: 1.3, score: 1.118, chosen: true };
 const tagged: RouteExplainView = { ...untagged, tags: ["coding"], scored: [taggedRow] };
 
 // For the baseline/edited comparison: same shape as `untagged`, but a
@@ -60,7 +64,7 @@ const edited: RouteExplainView = {
   chosen: "small-model",
   scored: [
     { ...chosenUntagged, chosen: false },
-    { model: "small-model", level: 1, spare: 0.95, cost_score: 0.9, tag_score: 0, bias: 1.0, score: 0.93, chosen: true },
+    { model: "small-model", level: 1, spare: 0.95, cost_score: 0.9, est_cost: 0.00012, tag_score: 0, bias: 1.0, score: 0.93, chosen: true },
   ],
 };
 

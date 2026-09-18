@@ -37,7 +37,9 @@ import type {
   ModelRoute,
   SlurmSettingsView,
   UsageRetentionView,
+  RouterReadinessView,
 } from "@/lib/obleth";
+import { RouterReadinessCard } from "@/components/router-readiness-card";
 
 export function SettingsTabs({
   alertSettings,
@@ -49,6 +51,7 @@ export function SettingsTabs({
   knowledge,
   models,
   retention,
+  routerReadiness,
   slurm,
   versionCard,
 }: {
@@ -61,6 +64,7 @@ export function SettingsTabs({
   knowledge: KnowledgeSettingsView | null;
   models: ModelRoute[];
   retention: UsageRetentionView | null;
+  routerReadiness: RouterReadinessView | null;
   slurm: SlurmSettingsView | null;
   versionCard: ReactNode;
 }) {
@@ -114,7 +118,10 @@ export function SettingsTabs({
       </TabsContent>
 
       <TabsContent value="routing">
-        <AutoRouterSettingsForm settings={autoRouter} models={models} />
+        <div className="space-y-6">
+          <RouterReadinessCard readiness={routerReadiness} />
+          <AutoRouterSettingsForm settings={autoRouter} models={models} />
+        </div>
       </TabsContent>
 
       <TabsContent value="boons">

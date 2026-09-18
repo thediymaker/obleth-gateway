@@ -17,6 +17,11 @@ pub struct ScoredCandidate {
     pub level: u8,
     pub spare: f64,
     pub cost_score: f64,
+    /// Estimated dollars for this request on this model (unit prices times
+    /// the prompt estimate and the model's observed average completion
+    /// length). What `cost_score` normalizes over — surfacing it is what lets
+    /// an operator see that a "cheap" model writes 25k tokens per answer.
+    pub est_cost: f64,
     /// Fraction of the request's intent tags this model carries. Always `0.0`
     /// when the request had no tags, matching the router's neutral path where
     /// the tag term is skipped entirely rather than scored as a miss.
