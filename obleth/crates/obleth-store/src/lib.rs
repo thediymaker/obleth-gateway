@@ -1300,7 +1300,7 @@ impl Store {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
             "insert into models (
-                id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
+                id, model_name, description, upstream_model, api_base, api_key, model_type,
                 input_cost_per_token, output_cost_per_token,
                 cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                 admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
