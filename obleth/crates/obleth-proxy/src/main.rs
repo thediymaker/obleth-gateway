@@ -12,6 +12,7 @@ mod mcp;
 mod metrics;
 mod output_monitor;
 mod proxy;
+mod responses;
 mod router;
 mod state;
 

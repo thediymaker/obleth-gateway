@@ -52,6 +52,11 @@ const CONN_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
 pub async fn proxy_handler(state: State<AppState>, req: Request<Body>) -> Response<Body> {
     let request_id = Uuid::new_v4();
+    // `/v1/responses` is served by translating to chat completions and back,
+    // around the unchanged pipeline — see `crate::responses`.
+    if req.method() == Method::POST && req.uri().path() == crate::responses::RESPONSES_PATH {
+        return responses_shim(state, req, request_id).await;
+    }
     let mut resp = proxy_handler_inner(state, req, request_id).await;
     // Ensure every response — including error paths that build their own response —
     // carries the request id so callers (e.g. the Charo model-test console) can always
@@ -63,6 +68,172 @@ pub async fn proxy_handler(state: State<AppState>, req: Request<Body>) -> Respon
         }
     }
     resp
+}
+
+/// Largest `/v1/responses` body accepted. The translated body is held in
+/// memory, and the pipeline's own limits apply after that.
+const RESPONSES_BODY_MAX: usize = 32 * 1024 * 1024;
+
+/// Run a Responses request as a chat request and translate the answer back.
+///
+/// Everything between the two conversions is the ordinary pipeline: the same
+/// routing, admission, boons and accounting a native chat call gets. That is
+/// the whole point of translating at the edge rather than teaching the
+/// pipeline a second request schema.
+async fn responses_shim(
+    state: State<AppState>,
+    req: Request<Body>,
+    request_id: Uuid,
+) -> Response<Body> {
+    let (mut parts, body) = req.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "request body too large or unreadable",
+        );
+    };
+    let Ok(incoming) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return error_json(StatusCode::BAD_REQUEST, "invalid JSON body");
+    };
+    // Refused rather than ignored: these promise server-side conversation
+    // storage, and this gateway keeps usage metadata, never prompt or output
+    // text. Silently dropping them would leave a client trusting a history
+    // that does not exist.
+    if let Some(field) = crate::responses::unsupported_field(&incoming) {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "`{field}` needs server-side response storage, which this gateway does not do. \
+                 Send the conversation in `input` on each request."
+            ),
+        );
+    }
+
+    let streaming = incoming.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
+    let model = incoming
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let chat_body = crate::responses::to_chat_request(&incoming);
+    let chat_bytes = match serde_json::to_vec(&chat_body) {
+        Ok(b) => b,
+        Err(_) => {
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "request translation failed",
+            )
+        }
+    };
+
+    // Re-point at the chat path so `is_chat_path` holds and every boon runs,
+    // and record the surface the caller actually used so telemetry does not
+    // report Responses traffic as chat.
+    let query = parts
+        .uri
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let Ok(uri) = format!("{}{query}", crate::responses::CHAT_PATH).parse() else {
+        return error_json(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "request translation failed",
+        );
+    };
+    parts.uri = uri;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    if let Ok(v) = header::HeaderValue::from_str("responses") {
+        parts.headers.insert(crate::responses::SURFACE_HEADER, v);
+    }
+    let chat_req = Request::from_parts(parts, Body::from(chat_bytes));
+
+    let mut resp = proxy_handler_inner(state, chat_req, request_id).await;
+    if !resp.headers().contains_key("x-obleth-request-id") {
+        if let Ok(value) = header::HeaderValue::from_str(&request_id.to_string()) {
+            resp.headers_mut().insert("x-obleth-request-id", value);
+        }
+    }
+    // An error from the pipeline (budget, admission, upstream) is already in
+    // the shape a caller can read; re-dressing it as a Responses object would
+    // only hide the status.
+    if !resp.status().is_success() {
+        return resp;
+    }
+    if streaming {
+        translate_response_stream(resp, request_id, model)
+    } else {
+        translate_response_body(resp, request_id).await
+    }
+}
+
+/// Buffer a translated chat reply and hand back the Responses object.
+async fn translate_response_body(resp: Response<Body>, request_id: Uuid) -> Response<Body> {
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
+        return error_json(StatusCode::BAD_GATEWAY, "upstream response too large");
+    };
+    let Ok(chat) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        // Not JSON: hand it back untouched rather than inventing a shape.
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    let translated = crate::responses::from_chat_response(&chat, &request_id.to_string());
+    let mut builder = Response::builder().status(parts.status);
+    for (name, value) in parts.headers.iter() {
+        if name != header::CONTENT_LENGTH {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(translated.to_string()))
+        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+}
+
+/// Re-emit a chat SSE stream as Responses events, frame by frame.
+fn translate_response_stream(
+    resp: Response<Body>,
+    request_id: Uuid,
+    model: String,
+) -> Response<Body> {
+    let (parts, body) = resp.into_parts();
+    let id = request_id.to_string();
+    let stream = async_stream::stream! {
+        let mut translator = crate::responses::StreamTranslator::new(&id, &model);
+        let mut upstream = body.into_data_stream();
+        // SSE frames can split across chunks, so lines are reassembled here
+        // rather than assuming one chunk is one frame.
+        let mut buffer = String::new();
+        while let Some(item) = upstream.next().await {
+            let Ok(chunk) = item else { break };
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
+            while let Some(idx) = buffer.find('\n') {
+                let line = buffer[..idx].trim().to_string();
+                buffer.drain(..=idx);
+                let Some(payload) = line.strip_prefix("data:") else { continue };
+                let payload = payload.trim();
+                if payload.is_empty() || payload == "[DONE]" {
+                    continue;
+                }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else { continue };
+                for frame in translator.on_chunk(&value) {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                }
+            }
+        }
+        for frame in translator.finish() {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+        }
+    };
+    let mut builder = Response::builder().status(parts.status);
+    for (name, value) in parts.headers.iter() {
+        if name != header::CONTENT_LENGTH && name != header::CONTENT_TYPE {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
 }
 
 #[tracing::instrument(
@@ -266,7 +437,7 @@ async fn proxy_handler_inner(
     let req_meta = RequestMeta {
         session_id: conversation.value,
         session_id_source: conversation.source.as_str(),
-        request_type: effective_request_type(&resolved, &path),
+        request_type: surfaced_request_type(&resolved, &path, &headers),
         device_id,
     };
     // Surface the conversation id on the OTLP/Jaeger root span for cross-request
@@ -3472,6 +3643,27 @@ fn effective_request_type(resolved: &ResolvedKey, path: &str) -> &'static str {
     }
 }
 
+/// [`effective_request_type`], except a request the Responses shim translated
+/// is recorded as `responses`. It runs down the chat path by design, so the
+/// path alone would report the caller's surface as chat and make adoption of
+/// the new API invisible in the ledger.
+fn surfaced_request_type(resolved: &ResolvedKey, path: &str, headers: &HeaderMap) -> &'static str {
+    if !resolved.synthetic && is_responses_surface(headers) {
+        return "responses";
+    }
+    effective_request_type(resolved, path)
+}
+
+/// True when the Responses shim translated this request. The header is set by
+/// the shim itself, never by a caller: it is stripped from the client's
+/// headers on the way in because the shim rebuilds them.
+fn is_responses_surface(headers: &HeaderMap) -> bool {
+    headers
+        .get(crate::responses::SURFACE_HEADER)
+        .and_then(|v| v.to_str().ok())
+        == Some("responses")
+}
+
 /// Whether chat-only boons (knowledge, compression, tools, structured output,
 /// the MCP tool loop) apply to this request.
 ///
@@ -3724,9 +3916,9 @@ fn now_ms() -> i64 {
 mod tests {
     use super::{
         backoff_for, build_targets, build_upstream_url, effective_request_type, has_path_traversal,
-        is_chat_path, is_models_collection, is_models_endpoint, is_retryable_status,
-        prepare_upstream_body, request_type_for_path, resolve_conversation, session_hash_order,
-        tenant_active_now, weighted_order, RequestMeta,
+        is_chat_path, is_models_collection, is_models_endpoint, is_responses_surface,
+        is_retryable_status, prepare_upstream_body, request_type_for_path, resolve_conversation,
+        session_hash_order, tenant_active_now, weighted_order, RequestMeta,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::http::HeaderMap;
@@ -3862,6 +4054,28 @@ mod tests {
             ),
             "https://inference.example.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn a_translated_responses_call_is_distinguished_from_a_native_chat_one() {
+        // The shim runs the request down the chat path on purpose, so the path
+        // alone cannot tell the two surfaces apart — the header does.
+        let mut headers = HeaderMap::new();
+        assert!(!is_responses_surface(&headers));
+        assert_eq!(request_type_for_path("/v1/chat/completions"), "chat");
+
+        headers.insert(
+            crate::responses::SURFACE_HEADER,
+            "responses".parse().unwrap(),
+        );
+        assert!(is_responses_surface(&headers));
+
+        let mut other = HeaderMap::new();
+        other.insert(
+            crate::responses::SURFACE_HEADER,
+            "something-else".parse().unwrap(),
+        );
+        assert!(!is_responses_surface(&other));
     }
 
     #[test]
