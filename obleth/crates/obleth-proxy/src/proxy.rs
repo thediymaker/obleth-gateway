@@ -2864,13 +2864,18 @@ fn registered_model_entry(state: &AppState, id: &str) -> Option<serde_json::Valu
 /// window, the per-token prices, the capability flags, the aliases that still
 /// resolve here.
 ///
-/// The envelope follows LiteLLM's `/model/info` so tools already written
-/// against a LiteLLM proxy read it unchanged: `{"data": [{model_name,
-/// litellm_params, model_info}]}`, with LiteLLM's conventional keys
-/// (`mode`, `max_input_tokens`, `supports_*`, `*_cost_per_token`) present and
-/// obleth's own additions alongside them.
+/// The envelope keeps the *shape* of LiteLLM's `/model/info`, so a client
+/// written against that proxy needs no new parsing: `{"data": [{model_name,
+/// obleth_params, model_info}]}`, with the conventional `model_info` keys
+/// (`mode`, `max_input_tokens`, `supports_*`, `*_cost_per_token`) in place.
 ///
-/// Deliberately absent from `litellm_params`: `api_base` and `api_key`. This
+/// The per-route object is `obleth_params`, not `litellm_params`: the shape is
+/// borrowed, the contents are this gateway's, and they have diverged — the
+/// serving format, the routing tags and the aliases have no LiteLLM
+/// equivalent. Naming it after another proxy implied a compatibility that
+/// stopped being true.
+///
+/// Deliberately absent from `obleth_params`: `api_base` and `api_key`. This
 /// is a tenant-facing endpoint, and a backend's internal URL is not a client's
 /// business — the upstream *name* is reported, the route to it is not.
 ///
@@ -2904,14 +2909,15 @@ fn model_info_response(state: &AppState, resolved: &ResolvedKey) -> Response<Bod
 fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
     serde_json::json!({
         "model_name": model.model_name,
-        "litellm_params": {
+        "obleth_params": {
             // The name the backend serves, which is where a quantization
             // suffix legitimately lives — the client-facing name above stays
             // clean regardless of how this deployment is built.
             "model": model.upstream_model,
         },
         "model_info": {
-            // LiteLLM-convention keys, so an existing client reads them as-is.
+            // Conventional keys kept under their usual names, so a client
+            // written against the LiteLLM shape reads them as-is.
             "mode": mode_for_model_type(&model.model_type),
             "max_input_tokens": model.context_window,
             "input_cost_per_token": model.input_cost_per_token,
@@ -4188,7 +4194,7 @@ mod tests {
     }
 
     #[test]
-    fn model_info_entry_carries_litellm_keys_and_obleth_additions() {
+    fn model_info_entry_uses_obleth_params_and_keeps_the_conventional_keys() {
         use super::model_info_entry;
         let mut model = model_with(Vec::new());
         model.model_name = "glm-5-3".into();
@@ -4202,8 +4208,10 @@ mod tests {
 
         let entry = model_info_entry(&model, false);
         assert_eq!(entry["model_name"], "glm-5-3");
-        // LiteLLM-convention keys a client may already be reading.
-        assert_eq!(entry["litellm_params"]["model"], "glm-5-3-mxfp4");
+        // The per-route object is ours; the upstream name lives in it.
+        assert_eq!(entry["obleth_params"]["model"], "glm-5-3-mxfp4");
+        // The old LiteLLM-branded key is gone, not duplicated.
+        assert!(entry.get("litellm_params").is_none());
         assert_eq!(entry["model_info"]["mode"], "chat");
         assert_eq!(entry["model_info"]["max_input_tokens"], 200_000);
         // obleth's additions, including the format that used to live in the name.
