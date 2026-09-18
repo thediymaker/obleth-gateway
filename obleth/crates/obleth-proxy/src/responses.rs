@@ -235,6 +235,21 @@ pub(crate) fn from_chat_response(chat: &Value, id: &str) -> Value {
         .unwrap_or("stop");
 
     let mut output: Vec<Value> = Vec::new();
+    // A reasoning model puts its scratchpad beside the answer, under either
+    // spelling; it is a distinct item here, not part of the reply text.
+    if let Some(text) = message
+        .and_then(|m| m.get("reasoning_content").or_else(|| m.get("reasoning")))
+        .and_then(Value::as_str)
+        .filter(|t| !t.is_empty())
+    {
+        output.push(json!({
+            "type": "reasoning",
+            "id": format!("rs_{id}"),
+            "status": "completed",
+            "summary": [],
+            "content": [{ "type": "reasoning_text", "text": text }],
+        }));
+    }
     if let Some(text) = message
         .and_then(|m| m.get("content"))
         .and_then(Value::as_str)
@@ -305,10 +320,17 @@ fn status_for(finish_reason: &str) -> &'static str {
 ///
 /// The event vocabulary is the one a Responses client actually consumes:
 /// `response.created`, `response.in_progress`, `response.output_item.added`,
-/// `response.content_part.added`, a run of `response.output_text.delta`, then
-/// the matching `.done` events and `response.completed`. Indices and
-/// `item_id` are carried on every event because clients address the item they
-/// are updating rather than assuming a single one.
+/// `response.content_part.added`, a run of deltas, then the matching `.done`
+/// events and `response.completed`. Indices and `item_id` ride on every event
+/// because clients address the item they are updating.
+///
+/// Two kinds of item are produced. Reasoning models here stream their
+/// scratchpad as `delta.reasoning` (or `delta.reasoning_content`) with no
+/// `content` at all until they finish thinking — glm-5-3 does exactly this —
+/// so that becomes a `reasoning` item emitting `response.reasoning_text.delta`,
+/// and the answer that follows becomes the `message` item. Reading only
+/// `content` would show a client nothing for the whole thinking phase and then
+/// drop the reasoning entirely.
 ///
 /// Tool calls are emitted as whole `function_call` items at the end rather
 /// than argument deltas: the gateway's own tool loop resolves a call before
@@ -316,27 +338,48 @@ fn status_for(finish_reason: &str) -> &'static str {
 /// render.
 pub(crate) struct StreamTranslator {
     response_id: String,
-    item_id: String,
+    request_id: String,
     model: String,
     seq: u64,
-    opened: bool,
+    started: bool,
     completed: bool,
-    text: String,
+    /// The item currently streaming, if any.
+    open: Option<ItemKind>,
+    next_index: usize,
+    reasoning: ItemState,
+    message: ItemState,
     tool_calls: Vec<Value>,
     usage: Option<Value>,
     finish_reason: String,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ItemKind {
+    Reasoning,
+    Message,
+}
+
+#[derive(Default)]
+struct ItemState {
+    id: String,
+    index: usize,
+    text: String,
+    used: bool,
 }
 
 impl StreamTranslator {
     pub(crate) fn new(request_id: &str, model: &str) -> Self {
         Self {
             response_id: format!("resp_{request_id}"),
-            item_id: format!("msg_{request_id}"),
+            request_id: request_id.to_string(),
             model: model.to_string(),
             seq: 0,
-            opened: false,
+            started: false,
             completed: false,
-            text: String::new(),
+            open: None,
+            next_index: 0,
+            reasoning: ItemState::default(),
+            message: ItemState::default(),
             tool_calls: Vec::new(),
             usage: None,
             finish_reason: "stop".to_string(),
@@ -370,47 +413,128 @@ impl StreamTranslator {
         v
     }
 
-    fn message_item(&self, status: &str, with_text: bool) -> Value {
-        json!({
-            "id": self.item_id,
-            "type": "message",
-            "status": status,
-            "role": "assistant",
-            "content": if with_text {
-                json!([{ "type": "output_text", "text": self.text, "annotations": [] }])
-            } else {
-                json!([])
-            },
-        })
+    fn item_json(&self, kind: ItemKind, status: &str, with_text: bool) -> Value {
+        match kind {
+            ItemKind::Reasoning => json!({
+                "id": self.reasoning.id,
+                "type": "reasoning",
+                "status": status,
+                "summary": [],
+                "content": if with_text {
+                    json!([{ "type": "reasoning_text", "text": self.reasoning.text }])
+                } else {
+                    json!([])
+                },
+            }),
+            ItemKind::Message => json!({
+                "id": self.message.id,
+                "type": "message",
+                "status": status,
+                "role": "assistant",
+                "content": if with_text {
+                    json!([{ "type": "output_text", "text": self.message.text, "annotations": [] }])
+                } else {
+                    json!([])
+                },
+            }),
+        }
     }
 
-    /// Everything that must precede the first text delta, emitted lazily so a
-    /// reply that turns out to be tool-calls-only never opens a message item.
-    fn open(&mut self) -> Vec<String> {
-        if self.opened {
+    /// `response.created` and `response.in_progress`, emitted once before the
+    /// first item of any kind.
+    fn start(&mut self) -> Vec<String> {
+        if self.started {
             return Vec::new();
         }
-        self.opened = true;
-        let created = self.envelope("in_progress", json!([]));
-        let in_progress = created.clone();
-        let item = self.message_item("in_progress", false);
+        self.started = true;
+        let envelope = self.envelope("in_progress", json!([]));
         vec![
-            self.frame("response.created", json!({ "response": created })),
-            self.frame("response.in_progress", json!({ "response": in_progress })),
-            self.frame(
-                "response.output_item.added",
-                json!({ "output_index": 0, "item": item }),
-            ),
-            self.frame(
-                "response.content_part.added",
-                json!({
-                    "item_id": self.item_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "part": { "type": "output_text", "text": "", "annotations": [] },
-                }),
-            ),
+            self.frame("response.created", json!({ "response": envelope.clone() })),
+            self.frame("response.in_progress", json!({ "response": envelope })),
         ]
+    }
+
+    /// Switch the open item, closing whatever was streaming first. Returns the
+    /// frames for both halves of the transition.
+    fn switch_to(&mut self, kind: ItemKind) -> Vec<String> {
+        if self.open == Some(kind) {
+            return Vec::new();
+        }
+        let mut out = self.close_open();
+        out.extend(self.start());
+
+        let index = self.next_index;
+        self.next_index += 1;
+        let (id, part_type) = match kind {
+            ItemKind::Reasoning => (format!("rs_{}", self.request_id), "reasoning_text"),
+            ItemKind::Message => (format!("msg_{}", self.request_id), "output_text"),
+        };
+        let state = match kind {
+            ItemKind::Reasoning => &mut self.reasoning,
+            ItemKind::Message => &mut self.message,
+        };
+        state.id = id.clone();
+        state.index = index;
+        state.used = true;
+        self.open = Some(kind);
+
+        let item = self.item_json(kind, "in_progress", false);
+        out.push(self.frame(
+            "response.output_item.added",
+            json!({ "output_index": index, "item": item }),
+        ));
+        out.push(self.frame(
+            "response.content_part.added",
+            json!({
+                "item_id": id,
+                "output_index": index,
+                "content_index": 0,
+                "part": { "type": part_type, "text": "" },
+            }),
+        ));
+        out
+    }
+
+    /// Emit the `.done` events for whatever item is streaming.
+    fn close_open(&mut self) -> Vec<String> {
+        let Some(kind) = self.open.take() else {
+            return Vec::new();
+        };
+        let (id, index, text, delta_name, part_type) = match kind {
+            ItemKind::Reasoning => (
+                self.reasoning.id.clone(),
+                self.reasoning.index,
+                self.reasoning.text.clone(),
+                "response.reasoning_text.done",
+                "reasoning_text",
+            ),
+            ItemKind::Message => (
+                self.message.id.clone(),
+                self.message.index,
+                self.message.text.clone(),
+                "response.output_text.done",
+                "output_text",
+            ),
+        };
+        let mut out = vec![self.frame(
+            delta_name,
+            json!({ "item_id": id, "output_index": index, "content_index": 0, "text": text }),
+        )];
+        out.push(self.frame(
+            "response.content_part.done",
+            json!({
+                "item_id": id,
+                "output_index": index,
+                "content_index": 0,
+                "part": { "type": part_type, "text": text },
+            }),
+        ));
+        let item = self.item_json(kind, "completed", true);
+        out.push(self.frame(
+            "response.output_item.done",
+            json!({ "output_index": index, "item": item }),
+        ));
+        out
     }
 
     /// Feed one parsed `chat.completion.chunk`.
@@ -423,18 +547,40 @@ impl StreamTranslator {
                 "total_tokens": u.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
             }));
         }
+        // Both spellings: LiteLLM normalises to `reasoning_content`, a vLLM
+        // server straight behind the gateway sends `reasoning`.
+        let reasoning = chunk
+            .pointer("/choices/0/delta/reasoning_content")
+            .or_else(|| chunk.pointer("/choices/0/delta/reasoning"))
+            .and_then(Value::as_str)
+            .filter(|t| !t.is_empty());
+        if let Some(text) = reasoning {
+            out.extend(self.switch_to(ItemKind::Reasoning));
+            self.reasoning.text.push_str(text);
+            let (id, index) = (self.reasoning.id.clone(), self.reasoning.index);
+            out.push(self.frame(
+                "response.reasoning_text.delta",
+                json!({
+                    "item_id": id,
+                    "output_index": index,
+                    "content_index": 0,
+                    "delta": text,
+                }),
+            ));
+        }
         if let Some(text) = chunk
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
             .filter(|t| !t.is_empty())
         {
-            out.extend(self.open());
-            self.text.push_str(text);
+            out.extend(self.switch_to(ItemKind::Message));
+            self.message.text.push_str(text);
+            let (id, index) = (self.message.id.clone(), self.message.index);
             out.push(self.frame(
                 "response.output_text.delta",
                 json!({
-                    "item_id": self.item_id,
-                    "output_index": 0,
+                    "item_id": id,
+                    "output_index": index,
                     "content_index": 0,
                     "delta": text,
                 }),
@@ -483,39 +629,21 @@ impl StreamTranslator {
             return Vec::new();
         }
         self.completed = true;
-        let mut out = Vec::new();
+        let mut out = self.close_open();
+        out.extend(self.start());
+
         let mut output: Vec<Value> = Vec::new();
-
-        if self.opened {
-            let text = self.text.clone();
-            let item_id = self.item_id.clone();
-            out.push(self.frame(
-                "response.output_text.done",
-                json!({ "item_id": item_id, "output_index": 0, "content_index": 0, "text": text }),
-            ));
-            let text = self.text.clone();
-            let item_id = self.item_id.clone();
-            out.push(self.frame(
-                "response.content_part.done",
-                json!({
-                    "item_id": item_id,
-                    "output_index": 0,
-                    "content_index": 0,
-                    "part": { "type": "output_text", "text": text, "annotations": [] },
-                }),
-            ));
-            let item = self.message_item("completed", true);
-            output.push(item.clone());
-            out.push(self.frame(
-                "response.output_item.done",
-                json!({ "output_index": 0, "item": item }),
-            ));
+        if self.reasoning.used {
+            output.push(self.item_json(ItemKind::Reasoning, "completed", true));
         }
-
+        if self.message.used {
+            output.push(self.item_json(ItemKind::Message, "completed", true));
+        }
         for (i, call) in self.tool_calls.clone().iter().enumerate() {
-            let index = output.len();
+            let index = self.next_index;
+            self.next_index += 1;
             let item = json!({
-                "id": format!("fc_{}_{i}", self.response_id),
+                "id": format!("fc_{}_{i}", self.request_id),
                 "type": "function_call",
                 "status": "completed",
                 "call_id": call.get("call_id").cloned().unwrap_or(json!("")),
@@ -856,6 +984,105 @@ mod tests {
         assert_eq!(added["item"]["type"], "function_call");
         // Argument fragments are joined in order.
         assert_eq!(added["item"]["arguments"], "{\"a\":1}");
+    }
+
+    fn reasoning_delta(text: &str) -> Value {
+        json!({ "choices": [{ "index": 0, "delta": { "reasoning": text }, "finish_reason": Value::Null }] })
+    }
+
+    #[test]
+    fn a_reasoning_model_streams_its_scratchpad_as_a_reasoning_item() {
+        // glm-5-3 sends `delta.reasoning` with no `content` until it stops
+        // thinking; reading only `content` showed the client nothing.
+        let mut t = StreamTranslator::new("req1", "glm-5-3");
+        let mut frames = t.on_chunk(&reasoning_delta("thinking"));
+        frames.extend(t.on_chunk(&delta("answer")));
+        frames.extend(t.finish());
+        let parsed = parse(&frames);
+        let events: Vec<&str> = parsed.iter().map(|(e, _)| e.as_str()).collect();
+        assert_eq!(
+            events,
+            vec![
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added", // reasoning
+                "response.content_part.added",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done", // closed when content starts
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.output_item.added", // message
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        let (_, done) = parsed
+            .iter()
+            .find(|(e, _)| e == "response.completed")
+            .expect("completed");
+        let output = done["response"]["output"].as_array().expect("output");
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"][0]["text"], "thinking");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "answer");
+    }
+
+    #[test]
+    fn the_two_reasoning_spellings_are_both_read() {
+        // LiteLLM normalises to `reasoning_content`; a vLLM server behind the
+        // gateway sends `reasoning`.
+        for key in ["reasoning", "reasoning_content"] {
+            let mut t = StreamTranslator::new("req1", "m");
+            let chunk = json!({ "choices": [{ "delta": { key: "hmm" } }] });
+            let frames = t.on_chunk(&chunk);
+            let parsed = parse(&frames);
+            assert!(
+                parsed
+                    .iter()
+                    .any(|(e, d)| e == "response.reasoning_text.delta" && d["delta"] == "hmm"),
+                "{key} should produce a reasoning delta"
+            );
+        }
+    }
+
+    #[test]
+    fn reasoning_only_output_still_completes_with_the_item() {
+        // A budget spent entirely on thinking: no message item, but the
+        // reasoning must not vanish.
+        let mut t = StreamTranslator::new("req1", "m");
+        let mut frames = t.on_chunk(&reasoning_delta("thought"));
+        frames.extend(t.on_chunk(&json!({
+            "choices": [{ "delta": {}, "finish_reason": "length" }] })));
+        frames.extend(t.finish());
+        let parsed = parse(&frames);
+        let (_, done) = parsed
+            .iter()
+            .find(|(e, _)| e == "response.completed")
+            .expect("completed");
+        assert_eq!(done["response"]["status"], "incomplete");
+        assert_eq!(done["response"]["output"][0]["type"], "reasoning");
+        assert_eq!(
+            done["response"]["output"][0]["content"][0]["text"],
+            "thought"
+        );
+    }
+
+    #[test]
+    fn a_non_streaming_reply_carries_reasoning_as_its_own_item() {
+        let chat = json!({
+            "model": "m", "created": 1,
+            "choices": [{ "finish_reason": "stop", "message": {
+                "role": "assistant", "reasoning_content": "thought", "content": "answer" } }],
+        });
+        let out = from_chat_response(&chat, "req1");
+        assert_eq!(out["output"][0]["type"], "reasoning");
+        assert_eq!(out["output"][0]["content"][0]["text"], "thought");
+        assert_eq!(out["output"][1]["type"], "message");
+        assert_eq!(out["output"][1]["content"][0]["text"], "answer");
     }
 
     #[test]
