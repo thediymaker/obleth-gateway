@@ -20,6 +20,16 @@ git tag v0.3.0
 git push origin main v0.3.0
 ```
 
+```bash
+# 3. Once the tag pipeline is green, move every running deployment to the
+#    release. The chart's empty image tags resolve to v{appVersion}, so one
+#    chart upgrade carries the compressor and every other component along;
+#    --reuse-values keeps any deliberate per-environment overrides (such as
+#    edge :dev tags) intact. A release is not done until this has run.
+helm upgrade obleth oci://ghcr.io/thediymaker/charts/obleth \
+  --version 0.3.0 --namespace obleth --reuse-values
+```
+
 Pushing the tag triggers `.github/workflows/release.yml`, which:
 
 1. **verify** — fails fast if the tag doesn't match the version in the files
