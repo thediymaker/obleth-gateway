@@ -607,6 +607,17 @@ async fn fetch_upstream_catalog(
     Ok(catalog)
 }
 
+/// The catalog URLs to try, in order. The canonical OpenAI path is
+/// `{api_base}/models`, but AIBrix's metadata service mounts its list at
+/// `/v1/models/` and builds FastAPI with `redirect_slashes` off, so the
+/// canonical path 404s there with no redirect to follow — every model behind
+/// such a gateway was reported as an unreachable catalog. Trying the
+/// trailing-slash form costs one extra GET only on an actual 404.
+fn catalog_urls(api_base: &str) -> [String; 2] {
+    let base = api_base.trim_end_matches('/');
+    [format!("{base}/models"), format!("{base}/models/")]
+}
+
 /// Uncached catalog fetch. The validation endpoint uses this directly so an
 /// operator who just registered a model upstream sees current truth, not a
 /// ≤60 s-old snapshot.
@@ -615,9 +626,34 @@ async fn fetch_catalog_direct(
     api_base: &str,
     api_key: Option<&str>,
 ) -> std::result::Result<Arc<Catalog>, CatalogError> {
-    let url = format!("{}/models", api_base.trim_end_matches('/'));
+    let mut first_error: Option<CatalogError> = None;
+    for url in catalog_urls(api_base) {
+        match fetch_catalog_url(state, &url, api_key).await {
+            Ok(catalog) => return Ok(catalog),
+            Err(error) => {
+                // Only a 404 is worth a second path: unreachable, auth and 5xx
+                // answers would come back identically from either spelling.
+                let path_may_be_wrong = error.http == Some(404);
+                first_error.get_or_insert(error);
+                if !path_may_be_wrong {
+                    break;
+                }
+            }
+        }
+    }
+    // Report the error from the configured path, so the message names a URL the
+    // operator can check rather than the fallback spelling.
+    Err(first_error.expect("at least one candidate URL is always attempted"))
+}
+
+/// One catalog GET and its parse into a [`Catalog`].
+async fn fetch_catalog_url(
+    state: &AdminState,
+    url: &str,
+    api_key: Option<&str>,
+) -> std::result::Result<Arc<Catalog>, CatalogError> {
     let timeout = Duration::from_secs(state.health.timeout_secs.max(1));
-    let mut request = state.health.http.get(&url).timeout(timeout);
+    let mut request = state.health.http.get(url).timeout(timeout);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
@@ -1654,6 +1690,29 @@ mod tests {
     fn probe_request_costly_and_unknown_modes_are_none() {
         assert!(build_probe_request("https://up/v1", "image", "m").is_none());
         assert!(build_probe_request("https://up/v1", "something-else", "m").is_none());
+    }
+
+    #[test]
+    fn catalog_urls_try_the_canonical_path_then_the_trailing_slash() {
+        // AIBrix's metadata service only answers the second spelling.
+        assert_eq!(
+            catalog_urls("http://gateway/v1"),
+            [
+                "http://gateway/v1/models".to_string(),
+                "http://gateway/v1/models/".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_urls_normalize_a_trailing_slash_on_the_api_base() {
+        assert_eq!(
+            catalog_urls("http://gateway/v1/"),
+            [
+                "http://gateway/v1/models".to_string(),
+                "http://gateway/v1/models/".to_string(),
+            ]
+        );
     }
 
     #[test]
