@@ -265,7 +265,10 @@ pub struct EnrichOutcome {
     /// Armed by the speculation boon. Consumed by the proxy BEFORE upstream
     /// dispatch (unlike `response_plan`): a committed cascade returns the
     /// response itself, and an abstaining one falls through to the completely
-    /// normal dispatch path. Never armed together with a `response_plan`.
+    /// normal dispatch path. May be armed alongside a `response_plan` when
+    /// that plan is only the image boon's tool loop (see
+    /// [`plan_yields_to_speculation`]) — the plan must stay intact, because it
+    /// answers the request whenever the cascade abstains.
     pub speculation: Option<speculation::SpeculationPlan>,
 }
 

@@ -316,6 +316,30 @@ fn status_for(finish_reason: &str) -> &'static str {
     }
 }
 
+/// Drain the `data:` payloads of every complete line in an SSE byte buffer,
+/// leaving any partial trailing line in place.
+///
+/// The buffer is split on the newline BYTE and only complete lines are
+/// decoded: a UTF-8 continuation byte can never be 0x0A, so the split cannot
+/// land inside a character. Decoding each network chunk independently
+/// corrupted CJK and emoji whenever a codepoint straddled a chunk boundary —
+/// each half became U+FFFD.
+pub(crate) fn drain_sse_data_lines(buffer: &mut Vec<u8>) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Some(idx) = buffer.iter().position(|b| *b == b'\n') {
+        let line_bytes: Vec<u8> = buffer.drain(..=idx).collect();
+        let line = String::from_utf8_lossy(&line_bytes);
+        let Some(payload) = line.trim().strip_prefix("data:") else {
+            continue;
+        };
+        let payload = payload.trim();
+        if !payload.is_empty() {
+            out.push(payload.to_string());
+        }
+    }
+    out
+}
+
 /// Translates a Chat Completions SSE stream into Responses events.
 ///
 /// The event vocabulary is the one a Responses client actually consumes:
@@ -328,9 +352,7 @@ fn status_for(finish_reason: &str) -> &'static str {
 /// scratchpad as `delta.reasoning` (or `delta.reasoning_content`) with no
 /// `content` at all until they finish thinking — glm-5-3 does exactly this —
 /// so that becomes a `reasoning` item emitting `response.reasoning_text.delta`,
-/// and the answer that follows becomes the `message` item. Reading only
-/// `content` would show a client nothing for the whole thinking phase and then
-/// drop the reasoning entirely.
+/// and the answer that follows becomes the `message` item.
 ///
 /// Tool calls are emitted as whole `function_call` items at the end rather
 /// than argument deltas: the gateway's own tool loop resolves a call before
@@ -343,11 +365,14 @@ pub(crate) struct StreamTranslator {
     seq: u64,
     started: bool,
     completed: bool,
-    /// The item currently streaming, if any.
-    open: Option<ItemKind>,
+    /// The item currently streaming, if any. Each opening is a NEW item with
+    /// its own id: a model that interleaves reasoning and content produces one
+    /// item per segment, in order, rather than one reused id appearing at two
+    /// output indices — clients key UI state by `item_id`.
+    current: Option<CurrentItem>,
+    /// Completed items in stream order, echoed on `response.completed`.
+    done_items: Vec<Value>,
     next_index: usize,
-    reasoning: ItemState,
-    message: ItemState,
     tool_calls: Vec<Value>,
     usage: Option<Value>,
     finish_reason: String,
@@ -359,12 +384,46 @@ enum ItemKind {
     Message,
 }
 
-#[derive(Default)]
-struct ItemState {
+struct CurrentItem {
+    kind: ItemKind,
     id: String,
     index: usize,
     text: String,
-    used: bool,
+}
+
+impl CurrentItem {
+    /// The item as JSON, `completed` with its text or `in_progress` and empty.
+    fn json(&self, status: &str, with_text: bool) -> Value {
+        let content = |part_type: &str| {
+            if with_text {
+                json!([{ "type": part_type, "text": self.text }])
+            } else {
+                json!([])
+            }
+        };
+        match self.kind {
+            ItemKind::Reasoning => json!({
+                "id": self.id,
+                "type": "reasoning",
+                "status": status,
+                "summary": [],
+                "content": content("reasoning_text"),
+            }),
+            ItemKind::Message => {
+                let mut v = json!({
+                    "id": self.id,
+                    "type": "message",
+                    "status": status,
+                    "role": "assistant",
+                    "content": content("output_text"),
+                });
+                if with_text {
+                    v["content"][0]["annotations"] = json!([]);
+                }
+                v
+            }
+        }
+    }
 }
 
 impl StreamTranslator {
@@ -376,10 +435,9 @@ impl StreamTranslator {
             seq: 0,
             started: false,
             completed: false,
-            open: None,
+            current: None,
+            done_items: Vec::new(),
             next_index: 0,
-            reasoning: ItemState::default(),
-            message: ItemState::default(),
             tool_calls: Vec::new(),
             usage: None,
             finish_reason: "stop".to_string(),
@@ -413,33 +471,6 @@ impl StreamTranslator {
         v
     }
 
-    fn item_json(&self, kind: ItemKind, status: &str, with_text: bool) -> Value {
-        match kind {
-            ItemKind::Reasoning => json!({
-                "id": self.reasoning.id,
-                "type": "reasoning",
-                "status": status,
-                "summary": [],
-                "content": if with_text {
-                    json!([{ "type": "reasoning_text", "text": self.reasoning.text }])
-                } else {
-                    json!([])
-                },
-            }),
-            ItemKind::Message => json!({
-                "id": self.message.id,
-                "type": "message",
-                "status": status,
-                "role": "assistant",
-                "content": if with_text {
-                    json!([{ "type": "output_text", "text": self.message.text, "annotations": [] }])
-                } else {
-                    json!([])
-                },
-            }),
-        }
-    }
-
     /// `response.created` and `response.in_progress`, emitted once before the
     /// first item of any kind.
     fn start(&mut self) -> Vec<String> {
@@ -454,10 +485,9 @@ impl StreamTranslator {
         ]
     }
 
-    /// Switch the open item, closing whatever was streaming first. Returns the
-    /// frames for both halves of the transition.
+    /// Switch the streaming item, closing whatever was open first.
     fn switch_to(&mut self, kind: ItemKind) -> Vec<String> {
-        if self.open == Some(kind) {
+        if self.current.as_ref().is_some_and(|c| c.kind == kind) {
             return Vec::new();
         }
         let mut out = self.close_open();
@@ -465,23 +495,26 @@ impl StreamTranslator {
 
         let index = self.next_index;
         self.next_index += 1;
-        let (id, part_type) = match kind {
-            ItemKind::Reasoning => (format!("rs_{}", self.request_id), "reasoning_text"),
-            ItemKind::Message => (format!("msg_{}", self.request_id), "output_text"),
+        let prefix = match kind {
+            ItemKind::Reasoning => "rs",
+            ItemKind::Message => "msg",
         };
-        let state = match kind {
-            ItemKind::Reasoning => &mut self.reasoning,
-            ItemKind::Message => &mut self.message,
+        let part_type = match kind {
+            ItemKind::Reasoning => "reasoning_text",
+            ItemKind::Message => "output_text",
         };
-        state.id = id.clone();
-        state.index = index;
-        state.used = true;
-        self.open = Some(kind);
-
-        let item = self.item_json(kind, "in_progress", false);
+        let item = CurrentItem {
+            kind,
+            id: format!("{prefix}_{}_{index}", self.request_id),
+            index,
+            text: String::new(),
+        };
+        let added = item.json("in_progress", false);
+        let id = item.id.clone();
+        self.current = Some(item);
         out.push(self.frame(
             "response.output_item.added",
-            json!({ "output_index": index, "item": item }),
+            json!({ "output_index": index, "item": added }),
         ));
         out.push(self.frame(
             "response.content_part.added",
@@ -495,44 +528,60 @@ impl StreamTranslator {
         out
     }
 
-    /// Emit the `.done` events for whatever item is streaming.
+    /// Emit the `.done` events for the streaming item and archive it.
     fn close_open(&mut self) -> Vec<String> {
-        let Some(kind) = self.open.take() else {
+        let Some(item) = self.current.take() else {
             return Vec::new();
         };
-        let (id, index, text, delta_name, part_type) = match kind {
-            ItemKind::Reasoning => (
-                self.reasoning.id.clone(),
-                self.reasoning.index,
-                self.reasoning.text.clone(),
-                "response.reasoning_text.done",
-                "reasoning_text",
-            ),
-            ItemKind::Message => (
-                self.message.id.clone(),
-                self.message.index,
-                self.message.text.clone(),
-                "response.output_text.done",
-                "output_text",
-            ),
+        let (done_name, part_type) = match item.kind {
+            ItemKind::Reasoning => ("response.reasoning_text.done", "reasoning_text"),
+            ItemKind::Message => ("response.output_text.done", "output_text"),
         };
         let mut out = vec![self.frame(
-            delta_name,
-            json!({ "item_id": id, "output_index": index, "content_index": 0, "text": text }),
+            done_name,
+            json!({
+                "item_id": item.id,
+                "output_index": item.index,
+                "content_index": 0,
+                "text": item.text,
+            }),
         )];
         out.push(self.frame(
             "response.content_part.done",
             json!({
+                "item_id": item.id,
+                "output_index": item.index,
+                "content_index": 0,
+                "part": { "type": part_type, "text": item.text },
+            }),
+        ));
+        let done = item.json("completed", true);
+        out.push(self.frame(
+            "response.output_item.done",
+            json!({ "output_index": item.index, "item": done.clone() }),
+        ));
+        self.done_items.push(done);
+        out
+    }
+
+    /// The text delta for whichever item is streaming.
+    fn delta_frame(&mut self, kind: ItemKind, text: &str) -> Vec<String> {
+        let mut out = self.switch_to(kind);
+        let current = self.current.as_mut().expect("switch_to opened an item");
+        current.text.push_str(text);
+        let (id, index) = (current.id.clone(), current.index);
+        let delta_name = match kind {
+            ItemKind::Reasoning => "response.reasoning_text.delta",
+            ItemKind::Message => "response.output_text.delta",
+        };
+        out.push(self.frame(
+            delta_name,
+            json!({
                 "item_id": id,
                 "output_index": index,
                 "content_index": 0,
-                "part": { "type": part_type, "text": text },
+                "delta": text,
             }),
-        ));
-        let item = self.item_json(kind, "completed", true);
-        out.push(self.frame(
-            "response.output_item.done",
-            json!({ "output_index": index, "item": item }),
         ));
         out
     }
@@ -555,36 +604,14 @@ impl StreamTranslator {
             .and_then(Value::as_str)
             .filter(|t| !t.is_empty());
         if let Some(text) = reasoning {
-            out.extend(self.switch_to(ItemKind::Reasoning));
-            self.reasoning.text.push_str(text);
-            let (id, index) = (self.reasoning.id.clone(), self.reasoning.index);
-            out.push(self.frame(
-                "response.reasoning_text.delta",
-                json!({
-                    "item_id": id,
-                    "output_index": index,
-                    "content_index": 0,
-                    "delta": text,
-                }),
-            ));
+            out.extend(self.delta_frame(ItemKind::Reasoning, text));
         }
         if let Some(text) = chunk
             .pointer("/choices/0/delta/content")
             .and_then(Value::as_str)
             .filter(|t| !t.is_empty())
         {
-            out.extend(self.switch_to(ItemKind::Message));
-            self.message.text.push_str(text);
-            let (id, index) = (self.message.id.clone(), self.message.index);
-            out.push(self.frame(
-                "response.output_text.delta",
-                json!({
-                    "item_id": id,
-                    "output_index": index,
-                    "content_index": 0,
-                    "delta": text,
-                }),
-            ));
+            out.extend(self.delta_frame(ItemKind::Message, text));
         }
         if let Some(calls) = chunk
             .pointer("/choices/0/delta/tool_calls")
@@ -632,13 +659,7 @@ impl StreamTranslator {
         let mut out = self.close_open();
         out.extend(self.start());
 
-        let mut output: Vec<Value> = Vec::new();
-        if self.reasoning.used {
-            output.push(self.item_json(ItemKind::Reasoning, "completed", true));
-        }
-        if self.message.used {
-            output.push(self.item_json(ItemKind::Message, "completed", true));
-        }
+        let mut output: Vec<Value> = self.done_items.clone();
         for (i, call) in self.tool_calls.clone().iter().enumerate() {
             let index = self.next_index;
             self.next_index += 1;
@@ -939,7 +960,7 @@ mod tests {
             .find(|(e, _)| e == "response.output_text.delta")
             .expect("delta");
         assert_eq!(d["delta"], "hi");
-        assert_eq!(d["item_id"], "msg_req1");
+        assert_eq!(d["item_id"], "msg_req1_0");
         assert_eq!(d["output_index"], 0);
         assert_eq!(d["content_index"], 0);
     }
@@ -1083,6 +1104,71 @@ mod tests {
         assert_eq!(out["output"][0]["content"][0]["text"], "thought");
         assert_eq!(out["output"][1]["type"], "message");
         assert_eq!(out["output"][1]["content"][0]["text"], "answer");
+    }
+
+    #[test]
+    fn interleaved_reasoning_gets_a_fresh_item_each_segment() {
+        // reasoning -> content -> reasoning: each segment is its own item with
+        // its own id and index. Reusing one id at two output indices broke
+        // clients that key UI state by item_id.
+        let mut t = StreamTranslator::new("req1", "m");
+        let mut frames = t.on_chunk(&reasoning_delta("first thought"));
+        frames.extend(t.on_chunk(&delta("partial answer")));
+        frames.extend(t.on_chunk(&reasoning_delta("second thought")));
+        frames.extend(t.finish());
+        let parsed = parse(&frames);
+
+        let added: Vec<&Value> = parsed
+            .iter()
+            .filter(|(e, _)| e == "response.output_item.added")
+            .map(|(_, d)| &d["item"])
+            .collect();
+        assert_eq!(added.len(), 3);
+        assert_eq!(added[0]["id"], "rs_req1_0");
+        assert_eq!(added[1]["id"], "msg_req1_1");
+        assert_eq!(added[2]["id"], "rs_req1_2");
+
+        let (_, done) = parsed
+            .iter()
+            .find(|(e, _)| e == "response.completed")
+            .expect("completed");
+        let output = done["response"]["output"].as_array().expect("output");
+        assert_eq!(output.len(), 3, "three segments, three items");
+        assert_eq!(output[0]["content"][0]["text"], "first thought");
+        assert_eq!(output[1]["content"][0]["text"], "partial answer");
+        assert_eq!(output[2]["content"][0]["text"], "second thought");
+        // Every added item has a matching done at the same output_index.
+        let dones = parsed
+            .iter()
+            .filter(|(e, _)| e == "response.output_item.done")
+            .count();
+        assert_eq!(dones, 3);
+    }
+
+    #[test]
+    fn sse_lines_survive_a_chunk_split_inside_a_multibyte_character() {
+        // "猫" is three bytes; split the stream between its first and second.
+        let frame = "data: {\"text\":\"猫\"}\n".as_bytes();
+        let (a, b) = frame.split_at(frame.iter().position(|c| *c >= 0x80).unwrap() + 1);
+
+        let mut buffer: Vec<u8> = Vec::new();
+        buffer.extend_from_slice(a);
+        assert!(
+            drain_sse_data_lines(&mut buffer).is_empty(),
+            "no complete line yet"
+        );
+        buffer.extend_from_slice(b);
+        let lines = drain_sse_data_lines(&mut buffer);
+        assert_eq!(lines, vec!["{\"text\":\"猫\"}".to_string()]);
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn sse_draining_skips_blank_and_non_data_lines_and_keeps_partials() {
+        let mut buffer = b"event: ping\n\ndata: one\ndata: tw".to_vec();
+        assert_eq!(drain_sse_data_lines(&mut buffer), vec!["one".to_string()]);
+        // The partial "data: tw" stays buffered for the next chunk.
+        assert_eq!(buffer, b"data: tw".to_vec());
     }
 
     #[test]

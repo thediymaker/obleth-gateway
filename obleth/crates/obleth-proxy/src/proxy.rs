@@ -50,8 +50,13 @@ const NO_BUFFER_HEADER: (&str, &str) = ("x-accel-buffering", "no");
 /// fresh connection replace the dead one, short enough to stay invisible in TTFT.
 const CONN_RETRY_BACKOFF: Duration = Duration::from_millis(50);
 
-pub async fn proxy_handler(state: State<AppState>, req: Request<Body>) -> Response<Body> {
+pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Response<Body> {
     let request_id = Uuid::new_v4();
+    // The surface marker is the gateway's own annotation (see
+    // `crate::responses::SURFACE_HEADER`); stripped here unconditionally so a
+    // caller cannot stamp a direct chat call as Responses traffic and pollute
+    // the adoption metric. The shim re-inserts it after this strip.
+    req.headers_mut().remove(crate::responses::SURFACE_HEADER);
     // `/v1/responses` is served by translating to chat completions and back,
     // around the unchanged pipeline — see `crate::responses`.
     if req.method() == Method::POST && req.uri().path() == crate::responses::RESPONSES_PATH {
@@ -200,21 +205,17 @@ fn translate_response_stream(
     let stream = async_stream::stream! {
         let mut translator = crate::responses::StreamTranslator::new(&id, &model);
         let mut upstream = body.into_data_stream();
-        // SSE frames can split across chunks, so lines are reassembled here
-        // rather than assuming one chunk is one frame.
-        let mut buffer = String::new();
+        // Bytes in, complete lines out — see `drain_sse_data_lines` for why
+        // the split happens on bytes rather than decoded text.
+        let mut buffer: Vec<u8> = Vec::new();
         while let Some(item) = upstream.next().await {
             let Ok(chunk) = item else { break };
-            buffer.push_str(&String::from_utf8_lossy(&chunk));
-            while let Some(idx) = buffer.find('\n') {
-                let line = buffer[..idx].trim().to_string();
-                buffer.drain(..=idx);
-                let Some(payload) = line.strip_prefix("data:") else { continue };
-                let payload = payload.trim();
-                if payload.is_empty() || payload == "[DONE]" {
+            buffer.extend_from_slice(&chunk);
+            for payload in crate::responses::drain_sse_data_lines(&mut buffer) {
+                if payload == "[DONE]" {
                     continue;
                 }
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(payload) else { continue };
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else { continue };
                 for frame in translator.on_chunk(&value) {
                     yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
                 }
@@ -3655,8 +3656,8 @@ fn surfaced_request_type(resolved: &ResolvedKey, path: &str, headers: &HeaderMap
 }
 
 /// True when the Responses shim translated this request. The header is set by
-/// the shim itself, never by a caller: it is stripped from the client's
-/// headers on the way in because the shim rebuilds them.
+/// the shim itself, never by a caller: `proxy_handler` strips it from every
+/// incoming request before dispatch, and only the shim re-inserts it.
 fn is_responses_surface(headers: &HeaderMap) -> bool {
     headers
         .get(crate::responses::SURFACE_HEADER)
