@@ -1327,6 +1327,27 @@ pub fn normalize_endpoint_selection_mode(mode: &str) -> String {
     }
 }
 
+/// Both spellings of an already-built model-catalog URL, canonical first:
+/// `…/models`, then `…/models/`.
+///
+/// The canonical spelling has no trailing slash, but AIBrix's metadata service
+/// mounts its list at `/v1/models/` and builds FastAPI with `redirect_slashes`
+/// off, so the canonical path 404s there with no redirect to follow. A caller
+/// that stops at the first 404 silently loses every model behind such a
+/// gateway — which made obleth's own `/v1/models` advertise 6 of 45 routes,
+/// and separately made model health report an unreachable catalog. The rule
+/// lives here so a third caller cannot miss it.
+pub fn catalog_url_variants(models_url: &str) -> [String; 2] {
+    let trimmed = models_url.trim_end_matches('/');
+    [trimmed.to_string(), format!("{trimmed}/")]
+}
+
+/// [`catalog_url_variants`] for a caller holding an api_base rather than a
+/// built URL: appends `models` to the base first.
+pub fn catalog_urls(base: &str) -> [String; 2] {
+    catalog_url_variants(&format!("{}/models", base.trim_end_matches('/')))
+}
+
 /// True when `model_type` is part of the fixed [`MODEL_TYPES`] vocabulary.
 pub fn is_valid_model_type(model_type: &str) -> bool {
     MODEL_TYPES.contains(&model_type)
@@ -2754,6 +2775,41 @@ pub struct RestoreReport {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn catalog_urls_try_the_canonical_path_then_the_trailing_slash() {
+        assert_eq!(
+            catalog_urls("http://gateway/v1"),
+            [
+                "http://gateway/v1/models".to_string(),
+                "http://gateway/v1/models/".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_urls_normalize_trailing_slashes_on_the_base() {
+        assert_eq!(
+            catalog_urls("http://gateway/v1/"),
+            catalog_urls("http://gateway/v1")
+        );
+    }
+
+    #[test]
+    fn catalog_url_variants_offer_both_spellings_of_a_built_url() {
+        assert_eq!(
+            catalog_url_variants("http://gateway/v1/models"),
+            [
+                "http://gateway/v1/models".to_string(),
+                "http://gateway/v1/models/".to_string(),
+            ]
+        );
+        // Idempotent: a caller that already added the slash gets the same pair.
+        assert_eq!(
+            catalog_url_variants("http://gateway/v1/models/"),
+            catalog_url_variants("http://gateway/v1/models")
+        );
+    }
+
     use super::*;
 
     #[test]

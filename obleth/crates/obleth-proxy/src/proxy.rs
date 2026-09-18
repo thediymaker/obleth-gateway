@@ -211,11 +211,26 @@ async fn proxy_handler_inner(
     // ---- model listing (OpenAI `GET /v1/models`) ----
     // Answer the plain list call from the gateway's own registry so every
     // registered model — including Slurm-hosted ones on their own endpoints — is
-    // listed, not just whatever a single upstream reports. A request that names a
-    // model (the non-standard `{"model": …}` detail probe) falls through and is
-    // forwarded upstream untouched, as does `GET /v1/models/{id}`.
-    if method == Method::GET && path == "/v1/models" && model == "unknown" {
-        return models_list_response(&state).await;
+    // listed, not just whatever a single upstream reports.
+    //
+    // `/v1/models/` is the same collection: the trailing slash carries no id.
+    // Without it here the request fell into the detail branch below with an
+    // empty id, missed the registry, and was forwarded upstream, so a client
+    // that added a slash got one backend's raw catalog instead of this
+    // gateway's listing.
+    if method == Method::GET && is_models_collection(&path) {
+        // A request that names a model is the non-standard `{"model": …}`
+        // detail probe. Answer it from the registry when the name is one of
+        // ours, for the same reason the `/v1/models/{id}` branch below does:
+        // forwarding a name this gateway publishes to a backend that knows
+        // itself by another one 404s on an id we just advertised. An unknown
+        // name still falls through, so a wildcard passthrough keeps working.
+        if model == "unknown" {
+            return models_list_response(&state).await;
+        }
+        if let Some(entry) = registered_model_entry(&state, &model) {
+            return (StatusCode::OK, axum::Json(entry)).into_response();
+        }
     }
     // ---- model detail (`GET /v1/models/{id}`) ----
     // Answered from the registry for any name the gateway has a route for,
@@ -224,7 +239,7 @@ async fn proxy_handler_inner(
     // quantized one would 404 on an id the gateway had just published. An id
     // no route claims still falls through to the upstream, so a wildcard
     // passthrough keeps working.
-    if method == Method::GET && path.starts_with("/v1/models/") {
+    if method == Method::GET && !is_models_collection(&path) && path.starts_with("/v1/models/") {
         let id = path.trim_start_matches("/v1/models/");
         if let Some(entry) = registered_model_entry(&state, id) {
             return (StatusCode::OK, axum::Json(entry)).into_response();
@@ -2757,18 +2772,23 @@ fn merge_upstream_models(
 /// Best-effort `GET {base}/v1/models`, returning the upstream's `data` entries
 /// verbatim. Any timeout/error/parse failure yields an empty list so one bad
 /// upstream never breaks or stalls the aggregate listing.
+///
+/// Both spellings of the path are tried, canonical first — see
+/// [`obleth_config::catalog_urls`]. Without the fallback an AIBrix gateway
+/// answers the canonical path with a 404 and every model behind it drops
+/// silently out of the listing: measured here as 6 of 45 routes advertised,
+/// with the 40 behind one such gateway all missing.
 async fn fetch_upstream_models(
     state: &AppState,
     base: &str,
     api_key: Option<&str>,
 ) -> Vec<serde_json::Value> {
-    async fn inner(
+    async fn fetch_one(
         state: &AppState,
-        base: &str,
+        url: &str,
         api_key: Option<&str>,
     ) -> Option<Vec<serde_json::Value>> {
-        let url = build_upstream_url(base, "/v1/models", "");
-        let mut req = state.http.get(&url);
+        let mut req = state.http.get(url);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
@@ -2782,7 +2802,23 @@ async fn fetch_upstream_models(
         let v: serde_json::Value = resp.json().await.ok()?;
         Some(v.get("data")?.as_array()?.clone())
     }
-    inner(state, base, api_key).await.unwrap_or_default()
+    // `build_upstream_url` first, so the base's own quirks (an api_base already
+    // ending in `/v1`, or one pasted as a full endpoint URL) are handled where
+    // every other upstream call handles them.
+    let url = build_upstream_url(base, "/v1/models", "");
+    for candidate in obleth_config::catalog_url_variants(&url) {
+        if let Some(entries) = fetch_one(state, &candidate, api_key).await {
+            return entries;
+        }
+    }
+    Vec::new()
+}
+
+/// True for the model-listing collection itself, in either spelling. The
+/// trailing slash carries no id, so `/v1/models/` lists rather than being read
+/// as a detail lookup for the empty string.
+fn is_models_collection(path: &str) -> bool {
+    path == "/v1/models" || path == "/v1/models/"
 }
 
 /// One OpenAI model object for a name the gateway has a route for — canonical
@@ -3681,9 +3717,9 @@ fn now_ms() -> i64 {
 mod tests {
     use super::{
         backoff_for, build_targets, build_upstream_url, effective_request_type, has_path_traversal,
-        is_chat_path, is_models_endpoint, is_retryable_status, prepare_upstream_body,
-        request_type_for_path, resolve_conversation, session_hash_order, tenant_active_now,
-        weighted_order, RequestMeta,
+        is_chat_path, is_models_collection, is_models_endpoint, is_retryable_status,
+        prepare_upstream_body, request_type_for_path, resolve_conversation, session_hash_order,
+        tenant_active_now, weighted_order, RequestMeta,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::http::HeaderMap;
@@ -3819,6 +3855,27 @@ mod tests {
             ),
             "https://inference.example.com/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn models_collection_covers_both_spellings_but_not_a_detail_path() {
+        assert!(is_models_collection("/v1/models"));
+        // The slash carries no id: this lists, it does not look up "".
+        assert!(is_models_collection("/v1/models/"));
+
+        // A real id is a detail lookup, not the collection.
+        assert!(!is_models_collection("/v1/models/glm-5-3"));
+        assert!(!is_models_collection("/v1/models/glm-5-3/"));
+        assert!(!is_models_collection("/v1/model/info"));
+        assert!(!is_models_collection("/v1/chat/completions"));
+    }
+
+    #[test]
+    fn both_collection_spellings_are_model_discovery_endpoints() {
+        // Both must stay reachable without resolving a model, or the listing
+        // is rejected as an unmapped path before it can be served.
+        assert!(is_models_endpoint("/v1/models"));
+        assert!(is_models_endpoint("/v1/models/"));
     }
 
     #[test]
