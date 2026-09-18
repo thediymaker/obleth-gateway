@@ -218,19 +218,20 @@ async fn proxy_handler_inner(
     // empty id, missed the registry, and was forwarded upstream, so a client
     // that added a slash got one backend's raw catalog instead of this
     // gateway's listing.
+    //
+    // The listing is returned whatever the body says. A GET to a collection
+    // carries no body in the OpenAI API, but clients send one anyway — a REST
+    // client reuses the tab it made a chat call in, and the stale `{"model":
+    // …}` rides along. Treating that as a per-model probe made a plain "list
+    // your models" request depend on a field it should not have: a name this
+    // gateway knew returned one entry instead of the list, and a name it did
+    // not know was forwarded to an upstream and came back as that service's
+    // 404, so the listing appeared broken and the fix looked like adding a
+    // trailing slash. Detail lookups have their own path, `/v1/models/{id}`,
+    // which still falls through for an unknown id so a wildcard passthrough
+    // keeps working.
     if method == Method::GET && is_models_collection(&path) {
-        // A request that names a model is the non-standard `{"model": …}`
-        // detail probe. Answer it from the registry when the name is one of
-        // ours, for the same reason the `/v1/models/{id}` branch below does:
-        // forwarding a name this gateway publishes to a backend that knows
-        // itself by another one 404s on an id we just advertised. An unknown
-        // name still falls through, so a wildcard passthrough keeps working.
-        if model == "unknown" {
-            return models_list_response(&state).await;
-        }
-        if let Some(entry) = registered_model_entry(&state, &model) {
-            return (StatusCode::OK, axum::Json(entry)).into_response();
-        }
+        return models_list_response(&state).await;
     }
     // ---- model detail (`GET /v1/models/{id}`) ----
     // Answered from the registry for any name the gateway has a route for,
