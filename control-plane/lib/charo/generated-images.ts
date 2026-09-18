@@ -14,10 +14,19 @@
 /** Matches one attachment, capturing its alt text. */
 const ATTACHMENT = /!\[([^\]]*)\]\((data:image\/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=\s]*)\)/g;
 
-/** What the model sees in place of the bytes: that an image exists, and of what. */
+/**
+ * What the model sees in place of the bytes: a receipt of the `generate_image`
+ * call that produced it. A bare "[generated image: ...]" marker reads as if the
+ * assistant conjured the picture with prose, and models then mimic that on the
+ * next turn — describing the requested image instead of calling the tool
+ * (measured 4/5 vs 10/10 tool-call rate). Keep this wording in lockstep with
+ * the gateway's strip_replayed_attachments placeholder in image_gen.rs.
+ */
 function placeholder(alt: string): string {
   const trimmed = alt.trim();
-  return trimmed ? `[generated image: ${trimmed}]` : "[generated image]";
+  return trimmed
+    ? `[image rendered by generate_image(prompt="${trimmed.replaceAll('"', "'")}") and shown to the user]`
+    : "[image rendered by the generate_image tool and shown to the user]";
 }
 
 /**

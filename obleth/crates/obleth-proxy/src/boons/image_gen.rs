@@ -109,7 +109,10 @@ fn nudge_text() -> &'static str {
     "You can create images. When the user asks for a picture, drawing, diagram, or \
      logo, call the `generate_image` tool with a detailed prompt instead of \
      explaining that you cannot draw. The image is attached to your reply \
-     automatically."
+     automatically. Images from earlier turns appear as placeholders: those were \
+     created by earlier `generate_image` calls. To show any new or revised image \
+     you must call `generate_image` again — describing an image in words never \
+     displays one."
 }
 
 /// Whether `generate_image` is already owned by something else: a tool the
@@ -359,13 +362,20 @@ static REPLAYED_ATTACHMENT: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// What replaces a stripped attachment: the model still learns an image was
-/// produced, and what of, without carrying the bytes.
+/// produced, and what of, without carrying the bytes. Phrased as a receipt of
+/// a `generate_image` call: a bare "[generated image: ...]" marker reads as if
+/// the assistant conjured the picture with prose, and models then mimic that
+/// by describing the next image instead of calling the tool (measured 4/5 vs
+/// 10/10 tool-call rate on follow-up asks).
 fn placeholder(alt: &str) -> String {
     let alt = alt.trim();
     if alt.is_empty() {
-        "[generated image]".to_string()
+        "[image rendered by the generate_image tool and shown to the user]".to_string()
     } else {
-        format!("[generated image: {alt}]")
+        format!(
+            "[image rendered by generate_image(prompt=\"{}\") and shown to the user]",
+            alt.replace('"', "'")
+        )
     }
 }
 
@@ -677,7 +687,10 @@ mod tests {
         });
         assert!(strip_replayed_attachments(&mut body));
         let content = body["messages"][1]["content"].as_str().expect("content");
-        assert_eq!(content, "Here you go\n\n[generated image: a cat in a hat]");
+        assert_eq!(
+            content,
+            "Here you go\n\n[image rendered by generate_image(prompt=\"a cat in a hat\") and shown to the user]"
+        );
         assert!(!content.contains("base64"));
         // Untouched roles stay byte-identical.
         assert_eq!(body["messages"][0]["content"], "draw a cat");
@@ -696,7 +709,7 @@ mod tests {
         let content = body["messages"][0]["content"].as_str().expect("content");
         assert_eq!(
             content,
-            "two\n\n[generated image: one]\n\n[generated image: two]"
+            "two\n\n[image rendered by generate_image(prompt=\"one\") and shown to the user]\n\n[image rendered by generate_image(prompt=\"two\") and shown to the user]"
         );
     }
 
@@ -704,7 +717,7 @@ mod tests {
     fn strip_replays_keeps_an_empty_alt_readable() {
         assert_eq!(
             strip_attachments_from_text(&format!("![]({PNG_URL})")).expect("stripped"),
-            "[generated image]"
+            "[image rendered by the generate_image tool and shown to the user]"
         );
     }
 
@@ -722,7 +735,7 @@ mod tests {
         assert!(strip_replayed_attachments(&mut body));
         assert_eq!(
             body["messages"][0]["content"][0]["text"],
-            "[generated image: x]"
+            "[image rendered by generate_image(prompt=\"x\") and shown to the user]"
         );
         // An `image_url` part is how a vision model is legitimately shown a
         // past generation — leave it alone.
@@ -787,7 +800,9 @@ mod tests {
         assert!(strip_replayed_attachments(&mut next));
         let content = next["messages"][0]["content"].as_str().expect("content");
         assert!(!content.contains("base64"));
-        assert!(content.contains("[generated image: a cat in a hat]"));
+        assert!(content.contains(
+            "[image rendered by generate_image(prompt=\"a cat in a hat\") and shown to the user]"
+        ));
     }
 
     #[test]

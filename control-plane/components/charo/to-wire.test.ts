@@ -17,7 +17,7 @@ describe("toWire and generated images", () => {
 
   it("strips the payload when the target is not vision-capable", () => {
     const wire = toWire(withImage(), false);
-    expect(wire[1].content).toBe("Here you go\n\n[generated image: a cat]");
+    expect(wire[1].content).toBe("Here you go\n\n[image rendered by generate_image(prompt=\"a cat\") and shown to the user]");
     expect(JSON.stringify(wire)).not.toContain("base64");
   });
 
@@ -30,7 +30,7 @@ describe("toWire and generated images", () => {
     expect(wire[1]).toEqual({
       role: "assistant",
       content: [
-        { type: "text", text: "Here you go\n\n[generated image: a cat]" },
+        { type: "text", text: "Here you go\n\n[image rendered by generate_image(prompt=\"a cat\") and shown to the user]" },
         { type: "image_url", image_url: { url: PNG } },
       ],
     });
@@ -48,7 +48,7 @@ describe("toWire and generated images", () => {
       ],
       true,
     );
-    expect(wire[0].content).toBe("first\n\n[generated image: one]");
+    expect(wire[0].content).toBe("first\n\n[image rendered by generate_image(prompt=\"one\") and shown to the user]");
     expect(JSON.stringify(wire[2].content)).toContain(JPG);
     expect(JSON.stringify(wire[0])).not.toContain("base64");
   });
