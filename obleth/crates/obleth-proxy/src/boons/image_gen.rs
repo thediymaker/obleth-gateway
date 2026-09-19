@@ -106,13 +106,15 @@ pub(super) fn tool_def(cfg: &ImageGenerationBoonSettings) -> Value {
 /// The short system nudge injected for plain chat clients that brought no tools
 /// of their own.
 fn nudge_text() -> &'static str {
-    "You can create images. When the user asks for a picture, drawing, diagram, or \
-     logo, call the `generate_image` tool with a detailed prompt instead of \
-     explaining that you cannot draw. The image is attached to your reply \
-     automatically. Images from earlier turns appear as placeholders: those were \
-     created by earlier `generate_image` calls. To show any new or revised image \
-     you must call `generate_image` again — describing an image in words never \
-     displays one."
+    "A `generate_image` tool is available. When the user wants a picture, drawing, \
+     diagram, or logo, call it with a detailed prompt instead of saying you cannot \
+     draw; the image is attached to your reply automatically. Images from earlier \
+     turns appear as placeholders: those were created by earlier `generate_image` \
+     calls, and to show any new or revised image you must call `generate_image` \
+     again — describing an image in words never displays one. This tool is \
+     background capability, not your purpose: answer every message on its own \
+     terms, and do not mention, offer, or advertise image generation unless the \
+     user brings it up."
 }
 
 /// Whether `generate_image` is already owned by something else: a tool the
