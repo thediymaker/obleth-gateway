@@ -55,6 +55,53 @@ pub(crate) fn parse_top_logprobs(resp: &serde_json::Value) -> Result<Vec<TopLogp
     Ok(entries)
 }
 
+/// Extract the first token's logprob map from a `/v1/completions` response
+/// (the harmony-splice path). The completions endpoint spells the same data
+/// differently: `choices[0].logprobs.top_logprobs[0]` is a `{token: logprob}`
+/// object, not an array of entries. Error texts reuse the "backend returned"
+/// prefix so a degenerate 200 gets the same transient retry as on the chat
+/// path.
+pub(crate) fn parse_completions_top_logprobs(
+    resp: &serde_json::Value,
+) -> Result<Vec<TopLogprob>, String> {
+    let logprobs = resp
+        .pointer("/choices/0/logprobs")
+        .filter(|v| !v.is_null())
+        .ok_or_else(|| "backend returned no logprobs (does it support `logprobs`?)".to_string())?;
+    let first = logprobs
+        .pointer("/top_logprobs/0")
+        .and_then(|t| t.as_object())
+        .ok_or_else(|| "backend returned no `top_logprobs` map".to_string())?;
+    let entries: Vec<TopLogprob> = first
+        .iter()
+        .filter_map(|(token, lp)| {
+            Some(TopLogprob {
+                token: token.clone(),
+                logprob: lp.as_f64()?,
+            })
+        })
+        .collect();
+    if entries.is_empty() {
+        return Err("backend returned an empty `top_logprobs` map".to_string());
+    }
+    Ok(entries)
+}
+
+/// Whether the highest-mass entry is a special control token (`<|channel|>`,
+/// `<|constrain|>`, …) — the harmony signature that routes the retry to the
+/// completions splice instead of the empty-think prefill.
+pub(crate) fn top_entry_is_control_token(entries: &[TopLogprob]) -> bool {
+    entries
+        .iter()
+        .max_by(|a, b| {
+            a.logprob
+                .partial_cmp(&b.logprob)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|e| e.token.starts_with("<|") && e.token.ends_with("|>"))
+        .unwrap_or(false)
+}
+
 /// Normalize a candidate token for label matching: strip surrounding
 /// whitespace (chat templates make the first sampled token ` A`), and for
 /// boolean labels additionally lowercase and strip trailing punctuation
@@ -179,6 +226,65 @@ pub(crate) fn build_answer(q: &Question, labels: &LabelSet, scored: &Scored) -> 
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    /// A canned `/v1/completions` response with the given first-token
+    /// `{token: logprob}` map.
+    fn text_completion(entries: &[(&str, f64)]) -> serde_json::Value {
+        let map: serde_json::Map<String, serde_json::Value> = entries
+            .iter()
+            .map(|(t, l)| (t.to_string(), serde_json::json!(l)))
+            .collect();
+        serde_json::json!({
+            "id": "cmpl-2",
+            "choices": [{
+                "index": 0,
+                "text": entries.first().map(|(t, _)| *t).unwrap_or(""),
+                "logprobs": {
+                    "text_offset": [0],
+                    "token_logprobs": [entries.first().map(|(_, l)| *l).unwrap_or(0.0)],
+                    "tokens": [entries.first().map(|(t, _)| *t).unwrap_or("")],
+                    "top_logprobs": [map]
+                },
+                "finish_reason": "length"
+            }],
+            "usage": {"prompt_tokens": 43, "completion_tokens": 1, "total_tokens": 44}
+        })
+    }
+
+    #[test]
+    fn the_completions_parser_reads_the_top_logprobs_map() {
+        let resp = text_completion(&[("yes", -0.1), ("no", -2.4), ("<|end|>", -9.0)]);
+        let entries = parse_completions_top_logprobs(&resp).unwrap();
+        assert_eq!(entries.len(), 3);
+        let yes = entries.iter().find(|e| e.token == "yes").unwrap();
+        assert!((yes.logprob - -0.1).abs() < 1e-9);
+        // Chat-shaped bodies fail with a named error, not a panic.
+        let err = parse_completions_top_logprobs(&completion(&[("yes", -0.1)])).unwrap_err();
+        assert!(err.contains("top_logprobs"), "{err}");
+        assert!(
+            err.contains("backend returned"),
+            "must stay transient-retryable: {err}"
+        );
+    }
+
+    #[test]
+    fn the_harmony_signature_is_a_control_token_with_the_most_mass() {
+        // gpt-oss observed live: <|channel|> carries all the mass.
+        let harmony = parse_top_logprobs(&completion(&[
+            ("<|channel|>", 0.0),
+            ("<|constrain|>", -20.1),
+            ("yes", -22.0),
+        ]))
+        .unwrap();
+        assert!(top_entry_is_control_token(&harmony));
+        // Think-style scratchpad prose is not: the retry must stay on the
+        // chat-side empty-think prefill.
+        let think = parse_top_logprobs(&completion(&[("Okay", -0.01), ("yes", -9.0)])).unwrap();
+        assert!(!top_entry_is_control_token(&think));
+        // A label winning outright is not a control token either.
+        let plain = parse_top_logprobs(&completion(&[("yes", -0.1), ("no", -2.0)])).unwrap();
+        assert!(!top_entry_is_control_token(&plain));
+    }
 
     /// A canned chat completion with the given first-token top_logprobs.
     fn completion(entries: &[(&str, f64)]) -> serde_json::Value {

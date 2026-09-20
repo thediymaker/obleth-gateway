@@ -192,6 +192,41 @@ pub(crate) fn build_body_prefilled(
     })
 }
 
+/// The same call as a raw `/v1/completions` body with a hand-rendered
+/// harmony prompt whose assistant turn is already open in the **final**
+/// channel.
+///
+/// gpt-oss-family models keep their scratchpad in harmony channels, not a
+/// `<think>` block: the plain chat call's first token is the `<|channel|>`
+/// control token (deterministically — all the mass), and vLLM's harmony
+/// renderer ignores `continue_final_message`, so the chat-side prefill can't
+/// help. Splicing the prompt ourselves and ending it with
+/// `<|start|>assistant<|channel|>final<|message|>` puts the first sampled
+/// token directly on the answer labels — verified against gpt-oss-120b on
+/// vLLM. The system/user texts are identical to the chat variant, so the
+/// per-request prefix-cache sharing survives the format change. Only ever
+/// sent after the plain call's top token was a `<|…|>` control token, so
+/// non-harmony backends never see it.
+pub(crate) fn build_body_spliced(
+    upstream_model: &str,
+    system: &str,
+    user: &str,
+) -> serde_json::Value {
+    let prompt = format!(
+        "<|start|>system<|message|>{system}<|end|>\
+         <|start|>user<|message|>{user}<|end|>\
+         <|start|>assistant<|channel|>final<|message|>"
+    );
+    serde_json::json!({
+        "model": upstream_model,
+        "prompt": prompt,
+        "max_tokens": 1,
+        "temperature": 0,
+        "logprobs": 20,
+        "stream": false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -288,6 +323,22 @@ mod tests {
         assert_eq!(body["stream"], false);
         assert_eq!(body["messages"][0]["role"], "system");
         assert_eq!(body["messages"][1]["role"], "user");
+    }
+
+    #[test]
+    fn the_spliced_body_opens_the_final_channel_and_reuses_the_chat_texts() {
+        let body = build_body_spliced("gpt-oss-120b", "sys text", "user text");
+        let prompt = body["prompt"].as_str().unwrap();
+        assert!(prompt.starts_with("<|start|>system<|message|>sys text<|end|>"));
+        assert!(prompt.contains("<|start|>user<|message|>user text<|end|>"));
+        // The assistant turn is open in the final channel: the next sampled
+        // token is the answer, not a channel opener.
+        assert!(prompt.ends_with("<|start|>assistant<|channel|>final<|message|>"));
+        // Completions-endpoint spelling: `logprobs` is the top-N int.
+        assert_eq!(body["logprobs"], 20);
+        assert_eq!(body["max_tokens"], 1);
+        assert_eq!(body["temperature"], 0);
+        assert!(body.get("messages").is_none());
     }
 
     #[test]

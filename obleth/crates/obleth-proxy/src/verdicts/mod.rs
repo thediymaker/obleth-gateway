@@ -14,9 +14,9 @@
 //! rows. The prompt-prefix / label mechanics live in [`prompt`], the
 //! distribution math in [`answers`], and the wire types in [`types`].
 
-mod answers;
-mod prompt;
-mod types;
+pub(crate) mod answers;
+pub(crate) mod prompt;
+pub(crate) mod types;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -75,6 +75,38 @@ fn remember_think_prefill(model: &str) {
     }
 }
 
+/// Models observed to need the harmony completions splice (see
+/// [`prompt::build_body_spliced`]): their reasoning lives in harmony channels
+/// (gpt-oss), so the plain chat call's first token is the `<|channel|>`
+/// control token — deterministically, with all the mass — and the chat-side
+/// think prefill is ignored by the backend's harmony renderer. Learned and
+/// bounded exactly like [`THINK_PREFILL`].
+static HARMONY_SPLICE: std::sync::LazyLock<std::sync::RwLock<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashSet::new()));
+
+fn needs_harmony_splice(model: &str) -> bool {
+    HARMONY_SPLICE
+        .read()
+        .map(|s| s.contains(model))
+        .unwrap_or(false)
+}
+
+fn remember_harmony_splice(model: &str) {
+    if let Ok(mut s) = HARMONY_SPLICE.write() {
+        s.insert(model.to_string());
+    }
+}
+
+/// The `/v1/completions` URL next to a `/v1/chat/completions` URL — where the
+/// harmony splice is sent. A URL that doesn't end in the chat path is left
+/// alone (only reachable from tests).
+fn completions_url(chat_url: &str) -> String {
+    match chat_url.strip_suffix("/chat/completions") {
+        Some(base) => format!("{base}/completions"),
+        None => chat_url.to_string(),
+    }
+}
+
 /// One prepared upstream call: the question id, its answer labels (for the
 /// zero-label-mass retry decision), and both body variants.
 pub(crate) struct QuestionCall {
@@ -83,6 +115,9 @@ pub(crate) struct QuestionCall {
     pub boolean: bool,
     pub body: serde_json::Value,
     pub prefill_body: serde_json::Value,
+    /// The `/v1/completions` harmony-splice variant (see
+    /// [`prompt::build_body_spliced`]).
+    pub splice_body: serde_json::Value,
 }
 
 /// The outcome of one question's upstream call: parsed first-token
@@ -102,6 +137,8 @@ pub(crate) struct QuestionSuccess {
     pub output_tokens: u32,
     /// The answer came from the empty-think prefill variant.
     pub used_prefill: bool,
+    /// The answer came from the harmony `/v1/completions` splice variant.
+    pub used_splice: bool,
 }
 
 /// Fan the prepared question calls out concurrently against ONE upstream URL.
@@ -110,11 +147,15 @@ pub(crate) struct QuestionSuccess {
 /// byte-identical prompt prefix, and scattering them across replicas would
 /// re-prefill the state on each one instead of hitting the prefix cache.
 ///
-/// Thinking models get one adaptive retry: when the plain call succeeds but
-/// none of its top tokens is an answer label, the question is retried with
-/// the empty-think prefill, and a success teaches [`THINK_PREFILL`] to send
-/// the prefill first for this `model` from then on. Usage of both attempts is
-/// billed.
+/// Reasoning models get one adaptive retry: when the plain call succeeds but
+/// none of its top tokens is an answer label, the failing attempt's own top
+/// token says which envelope the scratchpad lives in. A harmony control token
+/// (`<|channel|>` — gpt-oss) sends the question to `/v1/completions` with a
+/// hand-rendered harmony prompt ending in the open final channel; anything
+/// else (think-style prose) retries with the empty-think prefill. A success
+/// teaches [`HARMONY_SPLICE`] or [`THINK_PREFILL`] respectively, so later
+/// requests on this `model` skip the doomed plain attempt. Usage of both
+/// attempts is billed.
 pub(crate) async fn fan_out(
     http: &reqwest::Client,
     url: &str,
@@ -123,34 +164,51 @@ pub(crate) async fn fan_out(
     calls: Vec<QuestionCall>,
     timeout: Duration,
 ) -> Vec<QuestionOutcome> {
-    let prefill_first = needs_think_prefill(model);
+    let splice_first = needs_harmony_splice(model);
+    let prefill_first = !splice_first && needs_think_prefill(model);
+    let splice_url = completions_url(url);
+    let splice_url = splice_url.as_str();
     let futures = calls.into_iter().map(|call| async move {
         let start_ms = crate::tracer::now_ms();
         let started = Instant::now();
         let in_set_of =
             |s: &QuestionSuccess| answers::label_masses(&s.entries, &call.labels, call.boolean).1;
-        let first_body = if prefill_first {
-            &call.prefill_body
+        let (first_url, first_body, first_spliced) = if splice_first {
+            (splice_url, &call.splice_body, true)
+        } else if prefill_first {
+            (url, &call.prefill_body, false)
         } else {
-            &call.body
+            (url, &call.body, false)
         };
-        let mut result = one_call(http, url, api_key, first_body, timeout).await;
+        let mut result =
+            one_call(http, first_url, api_key, first_body, first_spliced, timeout).await;
         if let Ok(success) = &mut result {
             success.used_prefill = prefill_first;
+            success.used_splice = splice_first;
         }
-        if !prefill_first {
+        if !prefill_first && !splice_first {
             // Sub-threshold label mass on a *successful* plain call is the
-            // thinking-model signature: the first token is scratchpad prose
-            // (possibly leaking a label at ~1e-4). Try once more past an empty
-            // think block before settling.
+            // reasoning-model signature: the first token is scratchpad prose
+            // or a channel opener (possibly leaking a label at ~1e-4). Try
+            // once more past the scratchpad before settling.
             let no_label = matches!(&result, Ok(s) if in_set_of(s) < MIN_IN_SET_MASS);
             if no_label {
                 let plain = result.expect("checked Ok above");
-                match one_call(http, url, api_key, &call.prefill_body, timeout).await {
+                let harmony = answers::top_entry_is_control_token(&plain.entries);
+                let (retry_url, retry_body) = if harmony {
+                    (splice_url, &call.splice_body)
+                } else {
+                    (url, &call.prefill_body)
+                };
+                match one_call(http, retry_url, api_key, retry_body, harmony, timeout).await {
                     Ok(mut retried) => {
                         let retried_mass = in_set_of(&retried);
                         if retried_mass >= MIN_IN_SET_MASS {
-                            remember_think_prefill(model);
+                            if harmony {
+                                remember_harmony_splice(model);
+                            } else {
+                                remember_think_prefill(model);
+                            }
                         }
                         // Keep whichever attempt actually carried answer mass;
                         // bill both either way — both calls really ran.
@@ -159,7 +217,8 @@ pub(crate) async fn fan_out(
                                 retried.input_tokens.saturating_add(plain.input_tokens);
                             retried.output_tokens =
                                 retried.output_tokens.saturating_add(plain.output_tokens);
-                            retried.used_prefill = true;
+                            retried.used_prefill = !harmony;
+                            retried.used_splice = harmony;
                             result = Ok(retried);
                         } else {
                             let mut plain = plain;
@@ -196,9 +255,10 @@ async fn one_call(
     url: &str,
     api_key: Option<&str>,
     body: &serde_json::Value,
+    spliced: bool,
     timeout: Duration,
 ) -> Result<QuestionSuccess, String> {
-    let first = one_attempt(http, url, api_key, body, timeout).await;
+    let first = one_attempt(http, url, api_key, body, spliced, timeout).await;
     // "backend returned …" covers a 200 with missing or empty logprobs —
     // observed live from a crash-looping replica behind a load balancer that
     // answers with degenerate bodies. A backend that genuinely lacks logprobs
@@ -210,7 +270,7 @@ async fn one_call(
             || e.contains("backend returned"));
     if transient {
         tokio::time::sleep(TRANSIENT_RETRY_BACKOFF).await;
-        if let Ok(success) = one_attempt(http, url, api_key, body, timeout).await {
+        if let Ok(success) = one_attempt(http, url, api_key, body, spliced, timeout).await {
             return Ok(success);
         }
         // Fall through to the first attempt's error: it names the original
@@ -224,6 +284,7 @@ async fn one_attempt(
     url: &str,
     api_key: Option<&str>,
     body: &serde_json::Value,
+    spliced: bool,
     timeout: Duration,
 ) -> Result<QuestionSuccess, String> {
     let fut = async {
@@ -243,7 +304,11 @@ async fn one_attempt(
             .json()
             .await
             .map_err(|e| format!("upstream returned invalid JSON: {e}"))?;
-        let entries = answers::parse_top_logprobs(&completion)?;
+        let entries = if spliced {
+            answers::parse_completions_top_logprobs(&completion)?
+        } else {
+            answers::parse_top_logprobs(&completion)?
+        };
         let input_tokens = completion
             .pointer("/usage/prompt_tokens")
             .and_then(|v| v.as_u64())
@@ -257,6 +322,7 @@ async fn one_attempt(
             input_tokens,
             output_tokens,
             used_prefill: false,
+            used_splice: false,
         })
     };
     match tokio::time::timeout(timeout, fut).await {
@@ -750,6 +816,7 @@ async fn handler_inner(
                 boolean: matches!(labels.semantics, prompt::LabelSemantics::Boolean),
                 body: prompt::build_body(&route.upstream_model, &system, user),
                 prefill_body: prompt::build_body_prefilled(&route.upstream_model, &system, user),
+                splice_body: prompt::build_body_spliced(&route.upstream_model, &system, user),
             }
         })
         .collect();
@@ -793,6 +860,7 @@ async fn handler_inner(
                             "input_tokens": success.input_tokens,
                             "output_tokens": success.output_tokens,
                             "think_prefill": success.used_prefill,
+                            "harmony_splice": success.used_splice,
                         });
                         verdicts_map.insert(outcome.id.clone(), answer);
                         ("ok", attrs)
@@ -964,6 +1032,7 @@ mod tests {
             boolean: false,
             body: prompt::build_body("upstream-model", "shared system", user),
             prefill_body: prompt::build_body_prefilled("upstream-model", "shared system", user),
+            splice_body: prompt::build_body_spliced("upstream-model", "shared system", user),
         }
     }
 
@@ -1135,6 +1204,120 @@ mod tests {
             3,
             "prefill only on the second request"
         );
+    }
+
+    /// A gpt-oss-style upstream: the chat endpoint deterministically answers
+    /// `<|channel|>` (all the mass — observed live on gpt-oss-120b), and only
+    /// the raw completions endpoint, given a prompt whose assistant turn is
+    /// already open in the final channel, yields answer labels — in the
+    /// completions `{token: logprob}` map format.
+    async fn serve_harmony_upstream() -> (String, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let chat_hits = Arc::new(AtomicUsize::new(0));
+        let text_hits = Arc::new(AtomicUsize::new(0));
+        let (chat_c, text_c) = (chat_hits.clone(), text_hits.clone());
+        let app = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                axum::routing::post(move || {
+                    let hits = chat_c.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        axum::Json(serde_json::json!({
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "<|channel|>"},
+                                "logprobs": {"content": [{
+                                    "token": "<|channel|>", "logprob": 0.0,
+                                    "top_logprobs": [
+                                        {"token": "<|channel|>", "logprob": 0.0},
+                                        {"token": "<|constrain|>", "logprob": -20.1}
+                                    ]
+                                }]},
+                                "finish_reason": "length"
+                            }],
+                            "usage": {"prompt_tokens": 100, "completion_tokens": 1}
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/completions",
+                axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                    let hits = text_c.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let prompt = body["prompt"].as_str().unwrap_or_default();
+                        assert!(
+                            prompt.ends_with("<|start|>assistant<|channel|>final<|message|>"),
+                            "splice must open the final channel"
+                        );
+                        axum::Json(serde_json::json!({
+                            "choices": [{
+                                "text": " B",
+                                "logprobs": {
+                                    "text_offset": [0],
+                                    "token_logprobs": [-0.2],
+                                    "tokens": [" B"],
+                                    "top_logprobs": [{" B": -0.2, " A": -1.7}]
+                                },
+                                "finish_reason": "length"
+                            }],
+                            "usage": {"prompt_tokens": 90, "completion_tokens": 1}
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (
+            format!("http://{addr}/v1/chat/completions"),
+            chat_hits,
+            text_hits,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_harmony_model_is_retried_via_the_completions_splice_and_remembered() {
+        let (url, chat_hits, text_hits) = serve_harmony_upstream().await;
+        let http = reqwest::Client::new();
+
+        // First request: the plain chat call's top token is <|channel|>, so
+        // the retry goes to /v1/completions, not the think prefill.
+        let outcomes = fan_out(
+            &http,
+            &url,
+            None,
+            "harmony-model-e2e",
+            vec![call("q1", "first")],
+            Duration::from_secs(5),
+        )
+        .await;
+        let success = outcomes[0].result.as_ref().expect("splice should succeed");
+        assert!(success.used_splice);
+        assert!(!success.used_prefill);
+        assert_eq!(success.input_tokens, 190, "both attempts billed");
+        assert_eq!(chat_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(text_hits.load(Ordering::SeqCst), 1);
+        let (masses, in_set) =
+            answers::label_masses(&success.entries, &call("q1", "x").labels, false);
+        assert!(in_set > 0.5 && masses[1] > masses[0], "answer is B");
+
+        // Second request on the same model goes splice-first: no doomed chat
+        // call at all.
+        let outcomes = fan_out(
+            &http,
+            &url,
+            None,
+            "harmony-model-e2e",
+            vec![call("q2", "second")],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(outcomes[0].result.as_ref().unwrap().used_splice);
+        assert_eq!(chat_hits.load(Ordering::SeqCst), 1, "chat not called again");
+        assert_eq!(text_hits.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
