@@ -47,6 +47,25 @@ Every request follows the same pipeline, and each stage is visible in the per-re
   <img alt="Request pipeline: resolve key, estimate cost, fairshare admit, reserve budget, stream upstream, reconcile cost, emit telemetry" src=".github/assets/pipeline-light.svg">
 </picture>
 
+## Verdicts: typed decisions instead of generated text
+
+`POST /v1/verdicts` turns any registered chat model into a fast, structured decision engine. Send a **state** (a string, or structured JSON — a ticket, a document, your application's current state) plus a map of typed questions — **boolean** (yes/no), **choice** (pick one of up to 26 options), **score** (rate against 2–10 ordered levels) — and get back one typed verdict per question with a full probability distribution and a confidence, instead of prose you have to parse and hope over.
+
+```bash
+curl -sS $GATEWAY/v1/verdicts -H "Authorization: Bearer $KEY" -H 'content-type: application/json' -d '{
+  "state": {"ticket": "My card was charged twice for order A-104. Please refund the duplicate."},
+  "model": "auto",
+  "questions": {
+    "is_urgent":   {"type": "boolean", "instructions": "Does this need action today?"},
+    "department":  {"type": "choice",  "instructions": "Which team should handle this?",
+                    "criteria": {"billing": "Payments, refunds", "technical": "Bugs, outages"}},
+    "frustration": {"type": "score",   "instructions": "How frustrated is the customer?",
+                    "criteria": ["Calm", "Frustrated", "Very angry"]}
+  }}'
+```
+
+No new model and no external service: the gateway answers each question with its own single-token call to the route's chat backend (`max_tokens: 1`, greedy, `top_logprobs`), reads the first-token probability distribution over a fixed set of answer labels, and renormalizes it. Probability mass that lands outside the label set lowers the reported confidence rather than corrupting the answer — a verdict is structurally incapable of coming back malformed. Questions in one request are independent and fan out concurrently against a single pinned backend replica, sharing a byte-identical prompt prefix, so with prefix caching (vLLM, SGLang) each extra question costs roughly one cache hit plus one decoded token. Verdict requests run the full pipeline — fairshare admission, budgets, telemetry (`request_type: "verdict"`), and per-question trace spans — and the dashboard playground has a Verdicts mode for trying states and questions interactively.
+
 ## Operations and health
 
 **Health checks that match the model type.** Chat, embedding, speech, transcription, and image models are each verified against their real modality endpoint — a minimal inference probe, not a generic ping. A rejected probe with the model still listed in the upstream's catalog is reported as a likely misconfiguration instead of an outage; a model genuinely missing upstream alerts with catalog evidence. Fixing a model's connection settings clears stale failure state and re-checks within seconds.

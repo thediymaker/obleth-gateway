@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
-const BODY_LIMIT: usize = 64 * 1024 * 1024;
+pub(crate) const BODY_LIMIT: usize = 64 * 1024 * 1024;
 const TAIL_CAP: usize = 16 * 1024;
 /// Upper bound on a response we are willing to cache. Larger responses stream
 /// through uncached so the cache can't be used to balloon Redis memory.
@@ -278,35 +278,8 @@ async fn proxy_handler_inner(
             Err(resp) => return resp,
         };
     let auth_duration = (crate::tracer::now_ms() - auth_start) as u32;
-    if resolved.disabled {
-        return error_json(StatusCode::FORBIDDEN, "api key disabled");
-    }
-    // Internal probe keys bypass tenant lifecycle gating.
-    if !resolved.internal && resolved.status != "active" {
-        return error_json(StatusCode::FORBIDDEN, "tenant is not active");
-    }
-    // Schedule gate: activation start, expiry cutoff, and recurring weekly windows.
-    if !resolved.internal {
-        let now = chrono::Utc::now();
-        if let Err(reason) = tenant_active_now(&resolved, now) {
-            return error_json(StatusCode::FORBIDDEN, reason);
-        }
-        // Phase 5: warn operators when a tenant is within 72h of expiry.
-        if let Some(until) = resolved.active_until {
-            let remaining = until - now;
-            if remaining > chrono::Duration::zero() && remaining <= chrono::Duration::hours(72) {
-                state.alerts.issue(
-                    format!("tenant_expiry:{}", resolved.tenant_id),
-                    "Tenant access expiring soon",
-                    format!(
-                        "tenant `{}` expires at {} (~{}h remaining)",
-                        resolved.tenant_name,
-                        until.to_rfc3339(),
-                        remaining.num_hours()
-                    ),
-                );
-            }
-        }
+    if let Err(resp) = gate_resolved_key(&state, &resolved) {
+        return resp;
     }
 
     // ---- request flight-recorder tracer ----
@@ -2173,7 +2146,7 @@ impl StreamAccounting {
 /// should be stored for identical future requests; callers gate it on a
 /// successful (200) response.
 #[allow(clippy::too_many_arguments)]
-async fn settle_request(
+pub(crate) async fn settle_request(
     state: &AppState,
     request_id: Uuid,
     resolved: &ResolvedKey,
@@ -2365,7 +2338,7 @@ pub(crate) async fn try_resolve_key(
 
 /// Union of routing tags across the candidates the request may actually use.
 /// Restricting the classifier to achievable tags keeps it honest and cheap.
-fn union_candidate_tags(
+pub(crate) fn union_candidate_tags(
     candidates: &[crate::router::Candidate],
     allowed_models: Option<&[String]>,
 ) -> Vec<String> {
@@ -2390,7 +2363,7 @@ fn union_candidate_tags(
 /// `auto`), then cheap heuristics, then a neutral default. Every fallback
 /// lowers difficulty rather than raising it, so a slow or broken brain makes
 /// routing cheaper and never silently more expensive.
-async fn derive_intent(
+pub(crate) async fn derive_intent(
     state: &AppState,
     json: &serde_json::Value,
     est_input_tokens: u64,
@@ -2528,7 +2501,7 @@ pub(crate) async fn resolve_model(state: &AppState, name: &str) -> Option<Arc<Re
     }
 }
 
-fn effective_admission_weight(tenant_weight: i64, route: Option<&ResolvedModel>) -> i64 {
+pub(crate) fn effective_admission_weight(tenant_weight: i64, route: Option<&ResolvedModel>) -> i64 {
     let Some(route) = route else {
         return tenant_weight.max(1);
     };
@@ -2543,7 +2516,7 @@ fn effective_admission_weight(tenant_weight: i64, route: Option<&ResolvedModel>)
 /// when traffic is permitted, or `Err(reason)` with a client-facing message when
 /// the tenant is outside its activation window, expired, or outside its
 /// recurring weekly windows.
-fn tenant_active_now(
+pub(crate) fn tenant_active_now(
     resolved: &ResolvedKey,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), &'static str> {
@@ -2580,7 +2553,10 @@ fn tenant_active_now(
 /// `monthly` budgets roll over at each calendar month (in the tenant timezone),
 /// `term` budgets reset whenever `budget_started_at` changes, and `lifetime`
 /// budgets never reset.
-fn term_period_key(resolved: &ResolvedKey, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+pub(crate) fn term_period_key(
+    resolved: &ResolvedKey,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
     budget_period_key(
         resolved.budget_tokens,
         resolved.budget_cost_usd,
@@ -2591,7 +2567,7 @@ fn term_period_key(resolved: &ResolvedKey, now: chrono::DateTime<chrono::Utc>) -
     )
 }
 
-fn key_term_period_key(
+pub(crate) fn key_term_period_key(
     resolved: &ResolvedKey,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
@@ -3301,9 +3277,9 @@ fn prepare_upstream_body(
 }
 
 /// One resolved upstream target: a base URL plus an optional bearer key.
-struct Target {
-    base: String,
-    api_key: Option<String>,
+pub(crate) struct Target {
+    pub(crate) base: String,
+    pub(crate) api_key: Option<String>,
 }
 
 /// Build the ordered list of upstream targets for a request.
@@ -3316,7 +3292,7 @@ struct Target {
 /// with the rest following for failover. When no usable endpoints exist we fall
 /// back to the model's own `api_base`/`api_key` (or the global default base),
 /// preserving the legacy single-upstream path.
-fn build_targets(
+pub(crate) fn build_targets(
     route: Option<&ResolvedModel>,
     default_base: &str,
     selection_mode: &str,
@@ -3592,17 +3568,17 @@ fn find_int_after(haystack: &str, key: &str) -> Option<u32> {
 /// of where the request terminates (cache hit, rejection, upstream error, or
 /// streamed success). Cheap to clone for the response-stream closure.
 #[derive(Clone)]
-struct RequestMeta {
+pub(crate) struct RequestMeta {
     /// Conversation grouping id (client-supplied or derived), or empty.
-    session_id: String,
+    pub(crate) session_id: String,
     /// How `session_id` was obtained: "client" | "derived" | "none".
-    session_id_source: &'static str,
+    pub(crate) session_id_source: &'static str,
     /// Coarse request class derived from the request path, except synthetic
     /// tenants' requests are stamped `benchmark` instead (see
     /// [`effective_request_type`]).
-    request_type: &'static str,
+    pub(crate) request_type: &'static str,
     /// Device id from the bearer token (identity-key requests), else empty.
-    device_id: String,
+    pub(crate) device_id: String,
 }
 
 /// Classify a request by its OpenAI-style path suffix. Matching the suffix (not
@@ -3613,6 +3589,8 @@ fn request_type_for_path(path: &str) -> &'static str {
         "chat"
     } else if path.ends_with("/responses") {
         "responses"
+    } else if path.ends_with("/verdicts") {
+        "verdict"
     } else if path.ends_with("/completions") {
         "completion"
     } else if path.ends_with("/embeddings") {
@@ -3648,7 +3626,11 @@ fn effective_request_type(resolved: &ResolvedKey, path: &str) -> &'static str {
 /// is recorded as `responses`. It runs down the chat path by design, so the
 /// path alone would report the caller's surface as chat and make adoption of
 /// the new API invisible in the ledger.
-fn surfaced_request_type(resolved: &ResolvedKey, path: &str, headers: &HeaderMap) -> &'static str {
+pub(crate) fn surfaced_request_type(
+    resolved: &ResolvedKey,
+    path: &str,
+    headers: &HeaderMap,
+) -> &'static str {
     if !resolved.synthetic && is_responses_surface(headers) {
         return "responses";
     }
@@ -3679,14 +3661,14 @@ fn is_chat_path(path: &str) -> bool {
 
 /// Provenance of a resolved conversation id.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SessionSource {
+pub(crate) enum SessionSource {
     Client,
     Derived,
     None,
 }
 
 impl SessionSource {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             SessionSource::Client => "client",
             SessionSource::Derived => "derived",
@@ -3696,16 +3678,16 @@ impl SessionSource {
 }
 
 /// A resolved conversation grouping key plus how it was obtained.
-struct Conversation {
-    value: String,
-    source: SessionSource,
+pub(crate) struct Conversation {
+    pub(crate) value: String,
+    pub(crate) source: SessionSource,
 }
 
 /// Resolve a conversation id. Precedence: explicit client signal (header or
 /// body) > deterministic hash of the conversation seed > none. Total: never
 /// errors. The OpenAI `user` field is intentionally NOT a session source (it
 /// identifies an end-user, not a conversation).
-fn resolve_conversation(
+pub(crate) fn resolve_conversation(
     headers: &HeaderMap,
     json: &serde_json::Value,
     tenant_id: Uuid,
@@ -3826,7 +3808,7 @@ fn fnv1a_continue(mut hash: u64, bytes: &[u8]) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finalize(
+pub(crate) fn finalize(
     state: &AppState,
     request_id: Uuid,
     resolved: &ResolvedKey,
@@ -3898,6 +3880,46 @@ fn cached_response(cached: obleth_config::CachedResponse, request_id: Uuid) -> R
                 "cache response build failed",
             )
         })
+}
+
+/// Post-auth key/tenant gates shared by the passthrough pipeline and native
+/// endpoints (e.g. `/v1/verdicts`): key disabled, tenant lifecycle status,
+/// the activation/expiry/weekly schedule window, and the near-expiry operator
+/// alert. Internal probe keys bypass tenant lifecycle gating.
+pub(crate) fn gate_resolved_key(
+    state: &AppState,
+    resolved: &ResolvedKey,
+) -> Result<(), Response<Body>> {
+    if resolved.disabled {
+        return Err(error_json(StatusCode::FORBIDDEN, "api key disabled"));
+    }
+    if !resolved.internal && resolved.status != "active" {
+        return Err(error_json(StatusCode::FORBIDDEN, "tenant is not active"));
+    }
+    // Schedule gate: activation start, expiry cutoff, and recurring weekly windows.
+    if !resolved.internal {
+        let now = chrono::Utc::now();
+        if let Err(reason) = tenant_active_now(resolved, now) {
+            return Err(error_json(StatusCode::FORBIDDEN, reason));
+        }
+        // Phase 5: warn operators when a tenant is within 72h of expiry.
+        if let Some(until) = resolved.active_until {
+            let remaining = until - now;
+            if remaining > chrono::Duration::zero() && remaining <= chrono::Duration::hours(72) {
+                state.alerts.issue(
+                    format!("tenant_expiry:{}", resolved.tenant_id),
+                    "Tenant access expiring soon",
+                    format!(
+                        "tenant `{}` expires at {} (~{}h remaining)",
+                        resolved.tenant_name,
+                        until.to_rfc3339(),
+                        remaining.num_hours()
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn error_json(status: StatusCode, msg: &str) -> Response<Body> {
@@ -4077,6 +4099,15 @@ mod tests {
             "something-else".parse().unwrap(),
         );
         assert!(!is_responses_surface(&other));
+    }
+
+    #[test]
+    fn verdict_requests_are_classified_by_path() {
+        // `/v1/verdicts` is served by its own route (see main.rs), but the
+        // ledger label still derives from the path like every other class.
+        assert_eq!(request_type_for_path("/v1/verdicts"), "verdict");
+        // Not confused with the legacy completions suffix match.
+        assert_eq!(request_type_for_path("/v1/completions"), "completion");
     }
 
     #[test]

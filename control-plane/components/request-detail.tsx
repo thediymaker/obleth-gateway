@@ -74,6 +74,7 @@ function spanLabel(name: string): string {
   };
   if (name in labels) return labels[name];
   if (name.startsWith("boon:tool_loop:iter:")) return `Iter ${name.split(":").pop()}`;
+  if (name.startsWith("verdict:q:")) return `Question ${name.slice("verdict:q:".length)}`;
   if (name.startsWith("mcp:")) return name.slice(4);
   return name;
 }
@@ -92,6 +93,7 @@ function spanHint(name: string): string {
   };
   if (name in hints) return hints[name];
   if (name.startsWith("boon:tool_loop:iter:")) return "Tool call + model turn";
+  if (name.startsWith("verdict:q:")) return "Single-token typed-verdict call";
   if (name.startsWith("mcp:")) return "Tool server call";
   return "";
 }

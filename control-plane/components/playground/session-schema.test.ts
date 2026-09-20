@@ -29,3 +29,34 @@ describe("sessionSchema / routerPrompt cap", () => {
     expect(sessionSchema.safeParse(base).success).toBe(true);
   });
 });
+
+describe("sessionSchema / verdicts mode", () => {
+  // Same localStorage trap the routerPrompt cap pins: a session the schema
+  // rejects wipes EVERY saved session on the next load, so the verdicts
+  // draft fields must round-trip and old sessions without them must parse.
+  it("round-trips a verdicts session with a full question builder draft", () => {
+    const session = {
+      ...base,
+      mode: "verdicts" as const,
+      verdictModel: "glm-5-3",
+      verdictState: JSON.stringify({ ticket: "duplicate charge" }),
+      verdictQuestions: [
+        { id: "is_urgent", type: "boolean" as const, instructions: "Urgent?", trueDesc: "act today" },
+        {
+          id: "department",
+          type: "choice" as const,
+          instructions: "Which team?",
+          options: [{ name: "billing", description: "payments" }, { name: "technical", description: "bugs" }],
+        },
+        { id: "frustration", type: "score" as const, instructions: "How frustrated?", levels: ["calm", "annoyed", "angry"] },
+      ],
+    };
+    const result = z.array(sessionSchema).safeParse([session]);
+    expect(result.success).toBe(true);
+    if (result.success) expect(result.data[0].verdictQuestions).toHaveLength(3);
+  });
+
+  it("still parses sessions predating verdicts mode", () => {
+    expect(sessionSchema.safeParse({ ...base, mode: "chat" }).success).toBe(true);
+  });
+});

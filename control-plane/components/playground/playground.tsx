@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { z } from "zod";
-import { ArrowDownToLine, History, Image as ImageIcon, MessageSquare, Plus, Route, SlidersHorizontal, Trash2 } from "lucide-react";
+import { ArrowDownToLine, History, Image as ImageIcon, MessageSquare, Plus, Route, Scale, SlidersHorizontal, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
@@ -11,6 +11,7 @@ import { useEnabledModels } from "@/components/charo/use-enabled-models";
 import { UnifiedWorkspace } from "./workspaces";
 import { RouterWorkspace } from "./router-workspace";
 import { ImageWorkspace } from "./image-workspace";
+import { VerdictsWorkspace } from "./verdicts-workspace";
 import { migrateLegacySessions } from "./session-migration";
 import { cn } from "@/lib/utils";
 
@@ -28,7 +29,7 @@ export const ROUTER_PROMPT_MAX_LENGTH = 100_000;
 // duplicating the schema, and so its cap can be checked against
 // ROUTER_PROMPT_MAX_LENGTH directly rather than by re-deriving it.
 export const sessionSchema = z.object({
-  id: z.string(), title: z.string(), mode: z.enum(["chat", "compare", "router", "image"]),
+  id: z.string(), title: z.string(), mode: z.enum(["chat", "compare", "router", "image", "verdicts"]),
   models: z.array(z.string()).min(1).max(4), generation: generationSchema,
   recipients: z.array(z.number().int().min(0).max(3)).optional(),
   // Router mode's form draft — everything here is cheap to carry on the
@@ -56,6 +57,21 @@ export const sessionSchema = z.object({
   imageCount: z.number().int().min(1).max(4).optional(),
   imageSteps: z.number().int().min(1).max(150).optional(),
   imageSeed: z.number().int().min(0).max(4_294_967_295).optional(),
+  // Verdicts mode's form draft: the state text, the target model, and the
+  // question builder rows live on the session for the same reason the router
+  // fields do — a mode toggle remounts the workspace. Results are memory-only
+  // (they are cheap to re-run and would otherwise bloat localStorage).
+  verdictModel: z.string().max(200).optional(),
+  verdictState: z.string().max(100_000).optional(),
+  verdictQuestions: z.array(z.object({
+    id: z.string().max(64),
+    type: z.enum(["boolean", "choice", "score"]),
+    instructions: z.string().max(4000),
+    options: z.array(z.object({ name: z.string().max(200), description: z.string().max(1000) })).max(26).optional(),
+    levels: z.array(z.string().max(500)).max(10).optional(),
+    trueDesc: z.string().max(1000).optional(),
+    falseDesc: z.string().max(1000).optional(),
+  })).max(32).optional(),
 });
 export type PlaygroundSession = z.infer<typeof sessionSchema>;
 const fresh = (): PlaygroundSession => ({ id: crypto.randomUUID(), title: "Untitled session", mode: "compare", models: ["charo"], generation: { systemPrompt: "" } });
@@ -135,6 +151,7 @@ export function Playground({ scope }: { scope: string }) {
               <Button type="button" variant={session.mode === "chat" || session.mode === "compare" ? "secondary" : "ghost"} size="sm" aria-pressed={session.mode === "chat" || session.mode === "compare"} onClick={() => update({ mode: "compare" })}><MessageSquare className="mr-1.5 h-3.5 w-3.5" />Chat</Button>
               <Button type="button" variant={session.mode === "router" ? "secondary" : "ghost"} size="sm" aria-pressed={session.mode === "router"} onClick={() => update({ mode: "router" })}><Route className="mr-1.5 h-3.5 w-3.5" />Router</Button>
               <Button type="button" variant={session.mode === "image" ? "secondary" : "ghost"} size="sm" aria-pressed={session.mode === "image"} onClick={() => update({ mode: "image" })}><ImageIcon className="mr-1.5 h-3.5 w-3.5" />Image</Button>
+              <Button type="button" variant={session.mode === "verdicts" ? "secondary" : "ghost"} size="sm" aria-pressed={session.mode === "verdicts"} onClick={() => update({ mode: "verdicts" })}><Scale className="mr-1.5 h-3.5 w-3.5" />Verdicts</Button>
             </div>
             {/* Every mode has request parameters worth hiding until asked for, and every mode puts them in the same place. */}
             <Button variant="outline" size="sm" onClick={() => setShowSettings(!showSettings)} aria-expanded={showSettings}><SlidersHorizontal className="mr-2 h-4 w-4" />Parameters</Button>
@@ -166,6 +183,8 @@ export function Playground({ scope }: { scope: string }) {
               ? <RouterWorkspace session={session} update={update} />
               : session.mode === "image"
               ? <ImageWorkspace storageKey={`${root}:${session.id}:image`} session={session} update={update} models={models} loading={loading} />
+              : session.mode === "verdicts"
+              ? <VerdictsWorkspace session={session} update={update} models={models} loading={loading} />
               : <UnifiedWorkspace storageKey={`${root}:${session.id}:compare`} session={session} update={update} models={models} loading={loading} />}
           </div>
         </div>

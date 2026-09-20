@@ -15,6 +15,7 @@ mod proxy;
 mod responses;
 mod router;
 mod state;
+mod verdicts;
 
 mod boons;
 mod classifier;
@@ -433,6 +434,13 @@ async fn main() -> anyhow::Result<()> {
     // ---- routers ----
     let proxy_app = Router::new()
         .route("/health", get(|| async { "ok" }))
+        // Native typed-verdict endpoint. Registered explicitly (not via the
+        // fallback) so it is never mistaken for a passthrough path and proxied
+        // verbatim to `{api_base}/verdicts`.
+        .route(
+            verdicts::VERDICTS_PATH,
+            axum::routing::post(verdicts::handler),
+        )
         .route("/mcp/:server", axum::routing::any(mcp::mcp_handler))
         .route("/mcp/:server/*rest", axum::routing::any(mcp::mcp_handler))
         .fallback(proxy::proxy_handler)
