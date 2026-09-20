@@ -5,6 +5,15 @@
 //! prompt to one or more routing tags from the fixed vocabulary. Those tags
 //! bias [`crate::router::select_model`] toward the best-matched model.
 //!
+//! The brain is asked verdict-style (see [`crate::verdicts`]): one greedy
+//! single-token call per routing tag (a yes/no) plus one for difficulty (a
+//! 3-level score), fanned out concurrently over a byte-identical prompt
+//! prefix, with the answer read off the first token's `top_logprobs`. This
+//! replaced a free-text "reply with a JSON object" call: it cannot come back
+//! unparseable, costs one output token per question instead of ~48 total,
+//! and yields real probabilities, so tag selection is a threshold instead of
+//! a substring match.
+//!
 //! The classifier is deliberately defensive: it is hard-timeout bounded, caches
 //! results, and returns an empty tag list (difficulty 1) on any error so an
 //! `auto` request is never blocked or failed, and never routed more expensive,
@@ -20,6 +29,9 @@ use moka::future::Cache;
 use obleth_config::{AutoRouterSettings, ResolvedModel};
 
 use crate::router::Intent;
+use crate::verdicts::prompt::{self as vprompt, LabelSemantics};
+use crate::verdicts::types::Question;
+use crate::verdicts::{answers, fan_out, QuestionCall, QuestionOutcome};
 
 /// Hot-swappable classifier configuration plus a short-lived result cache.
 #[derive(Clone)]
@@ -76,7 +88,7 @@ impl Classifier {
         let timeout = Duration::from_millis(self.settings().classifier_timeout_ms.max(1));
         let intent = match tokio::time::timeout(
             timeout,
-            call_brain(http, brain, prompt, available_tags),
+            call_brain(http, brain, prompt, available_tags, timeout),
         )
         .await
         {
@@ -106,54 +118,146 @@ fn cache_key(prompt: &str, available_tags: &[String]) -> u64 {
     hasher.finish()
 }
 
-/// Send the constrained classification request and parse the chosen tags and
-/// difficulty.
+/// Cap on tag questions per classification. Each tag is one single-token
+/// call; a vocabulary larger than this stops being a routing signal, so the
+/// extra tags are simply not asked about (they can still arrive via
+/// heuristics).
+const MAX_TAG_QUESTIONS: usize = 16;
+
+/// Above this renormalized p(yes) a tag question counts as "the tag applies".
+const TAG_THRESHOLD: f64 = 0.5;
+
+/// The fixed question id for the difficulty score; tag questions use
+/// `tag:<name>`.
+const DIFFICULTY_ID: &str = "difficulty";
+
+/// Ask the brain one single-token verdict question per available tag plus one
+/// for difficulty, concurrently, and assemble the [`Intent`] from the
+/// first-token label distributions. Thinking and harmony-format brains are
+/// carried by the same learned retries as `/v1/verdicts` ([`fan_out`]).
 async fn call_brain(
     http: &reqwest::Client,
     brain: &ResolvedModel,
     prompt: &str,
     available_tags: &[String],
+    timeout: Duration,
 ) -> anyhow::Result<Intent> {
-    let tag_list = available_tags.join(", ");
-    let system = format!(
-        "You are a routing classifier. Read the user's request and reply with ONLY \
-         a JSON object, no prose. Choose 1 to 3 tags that best describe it from this \
-         list: [{tag_list}]. Also rate how hard the request is: 1 = simple/factual, \
-         2 = moderate, 3 = hard, needs careful reasoning. \
-         Reply exactly like: {{\"tags\":[\"coding\"],\"difficulty\":2}}"
-    );
-    // Cap the prompt we forward so the classifier stays fast and cheap.
-    let mut user = prompt.trim().to_string();
+    // Cap the prompt we forward so the classifier stays fast and cheap,
+    // floored to a char boundary (`String::truncate` panics mid-code-point).
+    let mut user = prompt.trim();
     if user.len() > 2_000 {
-        user.truncate(2_000);
+        let mut end = 2_000;
+        while !user.is_char_boundary(end) {
+            end -= 1;
+        }
+        user = &user[..end];
+    }
+    // Byte-identical across every question of one classification — the prefix
+    // the backend's cache amortizes, exactly like a verdicts request's state.
+    let system = format!(
+        "You answer routing questions about the REQUEST below. Reply with exactly one \
+         answer label and nothing else — no explanation, no punctuation, no preamble.\n\n\
+         # Request\n{user}"
+    );
+
+    let mut questions: Vec<(String, Question)> =
+        vec![(DIFFICULTY_ID.to_string(), difficulty_question())];
+    for tag in available_tags.iter().take(MAX_TAG_QUESTIONS) {
+        questions.push((format!("tag:{tag}"), tag_question(tag)));
     }
 
-    let request = serde_json::json!({
-        "model": brain.upstream_model,
-        "messages": [
-            { "role": "system", "content": system },
-            { "role": "user", "content": user },
+    let calls: Vec<QuestionCall> = questions
+        .iter()
+        .map(|(id, q)| {
+            let labels = vprompt::labels_for(q);
+            let user_msg = vprompt::render_user(q, &labels);
+            QuestionCall {
+                id: id.clone(),
+                boolean: matches!(labels.semantics, LabelSemantics::Boolean),
+                labels: labels.labels,
+                body: vprompt::build_body(&brain.upstream_model, &system, &user_msg),
+                prefill_body: vprompt::build_body_prefilled(
+                    &brain.upstream_model,
+                    &system,
+                    &user_msg,
+                ),
+                splice_body: vprompt::build_body_spliced(&brain.upstream_model, &system, &user_msg),
+            }
+        })
+        .collect();
+
+    let outcomes = fan_out(
+        http,
+        &build_chat_url(&brain.api_base),
+        brain.api_key.as_deref(),
+        &brain.model_name,
+        calls,
+        timeout,
+    )
+    .await;
+    Ok(intent_from_outcomes(&outcomes))
+}
+
+/// Difficulty as a 3-level score question; level i maps to difficulty i.
+fn difficulty_question() -> Question {
+    Question::Score {
+        instructions: serde_json::json!("How hard is this request to answer well?"),
+        criteria: vec![
+            serde_json::json!("Simple or factual — a small model answers it well"),
+            serde_json::json!("Moderate — needs solid general capability"),
+            serde_json::json!("Hard — needs careful, multi-step reasoning"),
         ],
-        "max_tokens": 48,
-        "temperature": 0.0,
-    });
-
-    let url = build_chat_url(&brain.api_base);
-    let mut req = http.post(url).json(&request);
-    if let Some(key) = &brain.api_key {
-        req = req.bearer_auth(key);
     }
-    let resp = req.send().await?;
-    if !resp.status().is_success() {
-        anyhow::bail!("classifier upstream returned {}", resp.status());
-    }
-    let body: serde_json::Value = resp.json().await?;
-    let content = body
-        .pointer("/choices/0/message/content")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
+}
 
-    Ok(extract_intent(content, available_tags))
+/// One yes/no per routing tag, judged independently so unrelated tags never
+/// compete for one answer slot.
+fn tag_question(tag: &str) -> Question {
+    Question::Boolean {
+        instructions: serde_json::json!(format!(
+            "Does the routing tag '{tag}' describe this request?"
+        )),
+        criteria: None,
+    }
+}
+
+/// Assemble tags and difficulty from the per-question outcomes: tags whose
+/// p(yes) clears [`TAG_THRESHOLD`], strongest first, capped at 3; difficulty
+/// from the score question's argmax. Every failure path yields less — a
+/// failed tag question is an unselected tag, a failed difficulty question is
+/// difficulty 1 — so a confused brain makes routing cheaper, never more
+/// expensive.
+fn intent_from_outcomes(outcomes: &[QuestionOutcome]) -> Intent {
+    let mut difficulty = 1u8;
+    let mut chosen: Vec<(String, f64)> = Vec::new();
+    for outcome in outcomes {
+        let Ok(success) = &outcome.result else {
+            continue;
+        };
+        if outcome.id == DIFFICULTY_ID {
+            // Labels as [`difficulty_question`] renders them: A/B/C = 1/2/3.
+            let labels: Vec<String> = ["A", "B", "C"].iter().map(|s| s.to_string()).collect();
+            let (masses, in_set) = answers::label_masses(&success.entries, &labels, false);
+            if let Ok(scored) = answers::score_masses(&masses, in_set) {
+                difficulty = ((scored.argmax as u8) + 1).clamp(1, obleth_config::MAX_TIER_LEVEL);
+            }
+        } else if let Some(tag) = outcome.id.strip_prefix("tag:") {
+            let labels: Vec<String> = ["yes", "no"].iter().map(|s| s.to_string()).collect();
+            let (masses, in_set) = answers::label_masses(&success.entries, &labels, true);
+            if let Ok(scored) = answers::score_masses(&masses, in_set) {
+                if scored.probs[0] > TAG_THRESHOLD {
+                    chosen.push((tag.to_string(), scored.probs[0]));
+                }
+            }
+        }
+    }
+    chosen.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    chosen.truncate(3);
+    Intent {
+        tags: chosen.into_iter().map(|(t, _)| t).collect(),
+        difficulty,
+        source: crate::router::IntentSource::Classifier,
+    }
 }
 
 fn build_chat_url(api_base: &str) -> String {
@@ -161,109 +265,222 @@ fn build_chat_url(api_base: &str) -> String {
     format!("{base}/chat/completions")
 }
 
-/// Leniently pull tags and a difficulty out of the model's reply. Accepts the
-/// JSON object, a bare JSON array, or free text mentioning tag names. Anything
-/// unparseable yields difficulty 1 — a confused brain must make routing
-/// cheaper, never more expensive.
-fn extract_intent(content: &str, available_tags: &[String]) -> Intent {
-    let difficulty = serde_json::from_str::<serde_json::Value>(content.trim())
-        .ok()
-        .and_then(|v| v.get("difficulty").and_then(|d| d.as_u64()))
-        .map(|d| (d as u8).clamp(1, obleth_config::MAX_TIER_LEVEL))
-        .unwrap_or(1);
-
-    // Tag extraction is unchanged: substring match restricted to the
-    // achievable vocabulary, de-duplicated, capped at 3.
-    let mut tags: Vec<String> = Vec::new();
-    let lower = content.to_ascii_lowercase();
-    for tag in available_tags {
-        if lower.contains(&tag.to_ascii_lowercase()) && !tags.contains(tag) {
-            tags.push(tag.clone());
-        }
-        if tags.len() >= 3 {
-            break;
-        }
-    }
-
-    Intent {
-        tags,
-        difficulty,
-        source: crate::router::IntentSource::Classifier,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::verdicts::answers::TopLogprob;
+    use crate::verdicts::QuestionSuccess;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn tags() -> Vec<String> {
-        vec![
-            "coding".to_string(),
-            "math".to_string(),
-            "vision".to_string(),
-        ]
+    fn ok_outcome(id: &str, entries: &[(&str, f64)]) -> QuestionOutcome {
+        QuestionOutcome {
+            id: id.to_string(),
+            result: Ok(QuestionSuccess {
+                entries: entries
+                    .iter()
+                    .map(|(t, l)| TopLogprob {
+                        token: t.to_string(),
+                        logprob: *l,
+                    })
+                    .collect(),
+                input_tokens: 10,
+                output_tokens: 1,
+                used_prefill: false,
+                used_splice: false,
+            }),
+            start_ms: 0,
+            duration_ms: 1,
+        }
+    }
+
+    fn failed_outcome(id: &str) -> QuestionOutcome {
+        QuestionOutcome {
+            id: id.to_string(),
+            result: Err("upstream returned 500".to_string()),
+            start_ms: 0,
+            duration_ms: 1,
+        }
     }
 
     #[test]
-    fn extract_from_json_array() {
-        let got = extract_intent("[\"coding\"]", &tags());
-        assert_eq!(got.tags, vec!["coding".to_string()]);
+    fn tags_above_threshold_are_chosen_strongest_first_and_capped_at_three() {
+        let outcomes = vec![
+            ok_outcome("difficulty", &[(" B", -0.1), (" A", -2.0), (" C", -3.0)]),
+            ok_outcome("tag:coding", &[(" yes", -0.1), (" no", -2.5)]),
+            ok_outcome("tag:math", &[(" no", -0.05), (" yes", -3.0)]),
+            ok_outcome("tag:vision", &[(" yes", -0.3), (" no", -1.6)]),
+            ok_outcome("tag:tools", &[(" yes", -0.2), (" no", -1.9)]),
+            ok_outcome("tag:writing", &[(" yes", -0.25), (" no", -1.8)]),
+        ];
+        let intent = intent_from_outcomes(&outcomes);
+        // Five tags say yes-ish, but math says no, and only the strongest
+        // three survive, ordered by p(yes).
+        assert_eq!(intent.tags, vec!["coding", "tools", "writing"]);
+        assert_eq!(intent.difficulty, 2, "argmax level B = difficulty 2");
+        assert!(matches!(
+            intent.source,
+            crate::router::IntentSource::Classifier
+        ));
     }
 
     #[test]
-    fn extract_from_free_text() {
-        let got = extract_intent("This looks like a math and coding task.", &tags());
-        assert!(got.tags.contains(&"coding".to_string()));
-        assert!(got.tags.contains(&"math".to_string()));
+    fn failures_and_out_of_set_answers_yield_the_cheap_default() {
+        // A failed difficulty call, a failed tag call, and a tag whose answer
+        // mass is entirely off the labels (a rambling brain) — nothing is
+        // selected and routing stays cheap.
+        let outcomes = vec![
+            failed_outcome("difficulty"),
+            failed_outcome("tag:coding"),
+            ok_outcome("tag:math", &[("The", -0.1), ("Request", -2.0)]),
+        ];
+        let intent = intent_from_outcomes(&outcomes);
+        assert!(intent.tags.is_empty());
+        assert_eq!(intent.difficulty, 1);
     }
 
     #[test]
-    fn extract_ignores_unknown_tags() {
-        let got = extract_intent("[\"astrology\"]", &tags());
-        assert!(got.tags.is_empty());
+    fn a_borderline_tag_below_the_threshold_is_not_selected() {
+        // p(yes) renormalizes to exactly 0.5 — not strictly above the
+        // threshold, so the tag does not apply.
+        let outcomes = vec![ok_outcome("tag:coding", &[(" yes", -1.0), (" no", -1.0)])];
+        let intent = intent_from_outcomes(&outcomes);
+        assert!(intent.tags.is_empty());
     }
 
     #[test]
-    fn extract_parses_tags_and_difficulty() {
-        let got = extract_intent(r#"{"tags":["coding"],"difficulty":3}"#, &tags());
-        assert_eq!(got.tags, vec!["coding".to_string()]);
-        assert_eq!(got.difficulty, 3);
+    fn difficulty_is_clamped_to_the_tier_ceiling() {
+        let outcomes = vec![ok_outcome(
+            "difficulty",
+            &[(" C", -0.05), (" B", -3.0), (" A", -4.0)],
+        )];
+        assert_eq!(intent_from_outcomes(&outcomes).difficulty, 3);
     }
 
-    #[test]
-    fn extract_defaults_difficulty_to_one_when_absent() {
-        let got = extract_intent(r#"["coding"]"#, &tags());
-        assert_eq!(got.tags, vec!["coding".to_string()]);
-        assert_eq!(
-            got.difficulty, 1,
-            "a brain that omits difficulty must route cheap, not expensive"
+    fn brain(api_base: &str) -> ResolvedModel {
+        ResolvedModel {
+            model_name: "brain-test".to_string(),
+            aliases: Vec::new(),
+            quantization: "unknown".into(),
+            upstream_model: "brain-upstream".to_string(),
+            api_base: api_base.to_string(),
+            api_key: None,
+            model_type: "chat".to_string(),
+            admission_weight: 1,
+            max_in_flight: None,
+            enabled: true,
+            cache_enabled: false,
+            cache_ttl_secs: 0,
+            input_cost_per_token: 0.0,
+            output_cost_per_token: 0.0,
+            cost_per_image: 0.0,
+            cost_per_audio_second: 0.0,
+            cost_per_character: 0.0,
+            context_window: 0,
+            supports_function_calling: false,
+            supports_system_messages: false,
+            supports_response_schema: false,
+            supports_tool_choice: false,
+            supports_vision: false,
+            tags: vec![],
+            declared_levels: vec![],
+            boons: vec![],
+            tool_servers: vec![],
+            knowledge_collections: vec![],
+            request_timeout_secs: None,
+            max_retries: 0,
+            retry_backoff_ms: 200,
+            endpoint_selection_mode: "failover".to_string(),
+            debug_diagnostics: false,
+            energy_slots_per_node: 0,
+            route_bias: 1.0,
+            auto_eligible: true,
+            draft_model: String::new(),
+            verify_api_base: String::new(),
+            verify_upstream_model: String::new(),
+            endpoints: vec![],
+        }
+    }
+
+    /// A canned brain: answers every single-token question by looking at
+    /// which question it was asked, exercising the real prompt construction,
+    /// fan-out, and distribution math end to end.
+    #[tokio::test]
+    async fn classify_asks_single_token_questions_and_reads_the_labels() {
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let hits = hits_clone.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    assert_eq!(body["max_tokens"], 1, "single-token calls only");
+                    assert_eq!(body["logprobs"], true);
+                    let question = body["messages"][1]["content"].as_str().unwrap();
+                    let top = if question.contains("How hard") {
+                        serde_json::json!([
+                            {"token": " C", "logprob": -0.1},
+                            {"token": " A", "logprob": -3.0}
+                        ])
+                    } else if question.contains("\'coding\'") {
+                        serde_json::json!([
+                            {"token": " yes", "logprob": -0.05},
+                            {"token": " no", "logprob": -3.5}
+                        ])
+                    } else {
+                        serde_json::json!([
+                            {"token": " no", "logprob": -0.05},
+                            {"token": " yes", "logprob": -3.5}
+                        ])
+                    };
+                    axum::Json(serde_json::json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "x"},
+                            "logprobs": {"content": [{
+                                "token": "x", "logprob": -0.1, "top_logprobs": top
+                            }]},
+                            "finish_reason": "length"
+                        }],
+                        "usage": {"prompt_tokens": 50, "completion_tokens": 1}
+                    }))
+                }
+            }),
         );
-    }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
 
-    #[test]
-    fn extract_clamps_an_out_of_range_difficulty() {
+        let settings: AutoRouterSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        let classifier = Classifier::new(settings);
+        let tags = vec!["coding".to_string(), "math".to_string()];
+        let intent = classifier
+            .classify(
+                &reqwest::Client::new(),
+                &brain(&format!("http://{addr}/v1")),
+                "Write a Rust function that parses logprobs",
+                &tags,
+            )
+            .await;
+        assert_eq!(intent.tags, vec!["coding"]);
+        assert_eq!(intent.difficulty, 3, "argmax level C");
         assert_eq!(
-            extract_intent(r#"{"tags":["math"],"difficulty":99}"#, &tags()).difficulty,
-            3
+            hits.load(Ordering::SeqCst),
+            3,
+            "one call per tag plus difficulty"
         );
-        assert_eq!(
-            extract_intent(r#"{"tags":["math"],"difficulty":0}"#, &tags()).difficulty,
-            1
-        );
-    }
 
-    #[test]
-    fn extract_on_garbage_yields_no_tags_and_difficulty_one() {
-        let got = extract_intent("I'm sorry, I can't help with that.", &tags());
-        assert!(got.tags.is_empty());
-        assert_eq!(got.difficulty, 1);
-    }
-
-    #[test]
-    fn build_url_appends_chat_completions() {
-        assert_eq!(
-            build_chat_url("http://x/v1/"),
-            "http://x/v1/chat/completions"
-        );
+        // The result is cached: a second classify makes no upstream calls.
+        let again = classifier
+            .classify(
+                &reqwest::Client::new(),
+                &brain(&format!("http://{addr}/v1")),
+                "Write a Rust function that parses logprobs",
+                &tags,
+            )
+            .await;
+        assert_eq!(again.tags, vec!["coding"]);
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
     }
 }
