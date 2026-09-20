@@ -113,7 +113,9 @@ pub(crate) struct Usage {
 /// the message of an OpenAI-style 400 error body.
 pub(crate) fn validate(req: &VerdictsRequest) -> Result<(), String> {
     match &req.state {
-        serde_json::Value::String(_) | serde_json::Value::Object(_) | serde_json::Value::Array(_) => {}
+        serde_json::Value::String(_)
+        | serde_json::Value::Object(_)
+        | serde_json::Value::Array(_) => {}
         _ => {
             return Err(
                 "`state` must be a string, object, or array (see the verdicts docs)".to_string(),
@@ -139,7 +141,11 @@ pub(crate) fn validate(req: &VerdictsRequest) -> Result<(), String> {
         if id.len() > MAX_QUESTION_ID_LEN {
             return Err(format!(
                 "question id '{}…' is too long (maximum {MAX_QUESTION_ID_LEN} bytes)",
-                &id[..id.char_indices().nth(20).map(|(i, _)| i).unwrap_or(id.len())]
+                &id[..id
+                    .char_indices()
+                    .nth(20)
+                    .map(|(i, _)| i)
+                    .unwrap_or(id.len())]
             ));
         }
         match q {
@@ -228,16 +234,17 @@ mod tests {
 
     #[test]
     fn state_must_be_string_object_or_array() {
-        for bad in [serde_json::json!(42), serde_json::json!(true), serde_json::Value::Null] {
+        for bad in [
+            serde_json::json!(42),
+            serde_json::json!(true),
+            serde_json::Value::Null,
+        ] {
             let mut body = valid_request();
             body["state"] = bad;
             let req = parse(body);
             assert!(validate(&req).unwrap_err().contains("state"));
         }
-        for good in [
-            serde_json::json!({"k": "v"}),
-            serde_json::json!(["a", "b"]),
-        ] {
+        for good in [serde_json::json!({"k": "v"}), serde_json::json!(["a", "b"])] {
             let mut body = valid_request();
             body["state"] = good;
             assert!(validate(&parse(body)).is_ok());
@@ -259,7 +266,9 @@ mod tests {
         }
         let mut body = valid_request();
         body["questions"] = serde_json::Value::Object(questions);
-        assert!(validate(&parse(body)).unwrap_err().contains("too many questions"));
+        assert!(validate(&parse(body))
+            .unwrap_err()
+            .contains("too many questions"));
 
         let mut body = valid_request();
         body["questions"] = serde_json::json!({
@@ -284,7 +293,9 @@ mod tests {
         body["questions"] = serde_json::json!({
             "many": {"type": "choice", "instructions": "?", "criteria": options}
         });
-        assert!(validate(&parse(body)).unwrap_err().contains("too many options"));
+        assert!(validate(&parse(body))
+            .unwrap_err()
+            .contains("too many options"));
     }
 
     #[test]
@@ -321,8 +332,14 @@ mod tests {
             panic!("expected a boolean question");
         };
         let criteria = criteria.as_ref().expect("criteria should parse");
-        assert_eq!(criteria.yes.as_ref().and_then(|v| v.as_str()), Some("time-sensitive"));
-        assert_eq!(criteria.no.as_ref().and_then(|v| v.as_str()), Some("can wait"));
+        assert_eq!(
+            criteria.yes.as_ref().and_then(|v| v.as_str()),
+            Some("time-sensitive")
+        );
+        assert_eq!(
+            criteria.no.as_ref().and_then(|v| v.as_str()),
+            Some("can wait")
+        );
     }
 
     #[test]

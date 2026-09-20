@@ -16,8 +16,8 @@ use super::types::{BooleanCriteria, Question};
 
 /// Letters used for choice options and score levels, in assignment order.
 const LETTERS: [char; 26] = [
-    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R',
-    'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
+    'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S',
+    'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
 ];
 
 /// What the answer labels of one question mean.
@@ -76,7 +76,9 @@ pub(crate) fn labels_for(q: &Question) -> LabelSet {
             }
         }
         Question::Score { criteria, .. } => LabelSet {
-            labels: (0..criteria.len()).map(|i| LETTERS[i].to_string()).collect(),
+            labels: (0..criteria.len())
+                .map(|i| LETTERS[i].to_string())
+                .collect(),
             semantics: LabelSemantics::Score,
         },
     }
@@ -86,7 +88,10 @@ pub(crate) fn labels_for(q: &Question) -> LabelSet {
 /// instruction naming the label format.
 pub(crate) fn render_user(q: &Question, labels: &LabelSet) -> String {
     match q {
-        Question::Boolean { instructions, criteria } => {
+        Question::Boolean {
+            instructions,
+            criteria,
+        } => {
             let mut out = format!("# Question\n{}\n", render_value(instructions));
             let (yes, no) = match criteria {
                 Some(BooleanCriteria { yes, no }) => (yes.as_ref(), no.as_ref()),
@@ -104,7 +109,10 @@ pub(crate) fn render_user(q: &Question, labels: &LabelSet) -> String {
             out.push_str("\nAnswer \"yes\" or \"no\".");
             out
         }
-        Question::Choice { instructions, criteria } => {
+        Question::Choice {
+            instructions,
+            criteria,
+        } => {
             let mut out = format!("# Question\n{}\n\n# Options\n", render_value(instructions));
             for (label, (option, description)) in labels.labels.iter().zip(criteria.iter()) {
                 match description {
@@ -115,7 +123,10 @@ pub(crate) fn render_user(q: &Question, labels: &LabelSet) -> String {
             out.push_str("\nAnswer with the letter of the best option.");
             out
         }
-        Question::Score { instructions, criteria } => {
+        Question::Score {
+            instructions,
+            criteria,
+        } => {
             let mut out = format!("# Question\n{}\n\n# Levels\n", render_value(instructions));
             for (i, (label, description)) in labels.labels.iter().zip(criteria.iter()).enumerate() {
                 out.push_str(&format!(
@@ -133,11 +144,7 @@ pub(crate) fn render_user(q: &Question, labels: &LabelSet) -> String {
 /// The upstream chat-completions body for one question: greedy, one token,
 /// full first-token distribution. `stream:false` — the answer is one token,
 /// there is nothing to stream.
-pub(crate) fn build_body(
-    upstream_model: &str,
-    system: &str,
-    user: &str,
-) -> serde_json::Value {
+pub(crate) fn build_body(upstream_model: &str, system: &str, user: &str) -> serde_json::Value {
     serde_json::json!({
         "model": upstream_model,
         "messages": [
@@ -227,7 +234,9 @@ mod tests {
         // SentencePiece vocabs; letters are single tokens everywhere.
         let q = Question::Score {
             instructions: serde_json::json!("frustration?"),
-            criteria: (0..10).map(|i| serde_json::json!(format!("level-{i}"))).collect(),
+            criteria: (0..10)
+                .map(|i| serde_json::json!(format!("level-{i}")))
+                .collect(),
         };
         let labels = labels_for(&q);
         assert_eq!(labels.labels.len(), 10);

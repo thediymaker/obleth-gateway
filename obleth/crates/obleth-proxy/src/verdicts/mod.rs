@@ -100,7 +100,10 @@ async fn one_call(
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
-        let resp = req.send().await.map_err(|e| format!("upstream unreachable: {e}"))?;
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| format!("upstream unreachable: {e}"))?;
         let status = resp.status();
         if !status.is_success() {
             return Err(format!("upstream returned {status}"));
@@ -138,7 +141,12 @@ fn estimate(tokenizer: &dyn Tokenizer, system: &str, users: &[String]) -> CostEs
     let system_tokens = tokenizer.count_text(system);
     let input_tokens = users
         .iter()
-        .map(|u| tokenizer.count_text(u).saturating_add(system_tokens).saturating_add(8))
+        .map(|u| {
+            tokenizer
+                .count_text(u)
+                .saturating_add(system_tokens)
+                .saturating_add(8)
+        })
         .fold(0u32, u32::saturating_add);
     CostEstimate {
         input_tokens,
@@ -485,7 +493,10 @@ async fn handler_inner(
         {
             Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {}
             Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {}
-            Ok(obleth_redis::ReserveOutcome::TermExhausted { used_tokens, used_cost }) => {
+            Ok(obleth_redis::ReserveOutcome::TermExhausted {
+                used_tokens,
+                used_cost,
+            }) => {
                 drop(permit);
                 state.alerts.issue(
                     format!("key_term_budget_exhausted:{}", resolved.key_id),
@@ -537,7 +548,10 @@ async fn handler_inner(
                     tracer.take(),
                 );
             }
-            Ok(obleth_redis::ReserveOutcome::TermExhausted { used_tokens, used_cost }) => {
+            Ok(obleth_redis::ReserveOutcome::TermExhausted {
+                used_tokens,
+                used_cost,
+            }) => {
                 drop(permit);
                 state.alerts.issue(
                     format!("term_budget_exhausted:{}", resolved.tenant_id),
@@ -601,7 +615,14 @@ async fn handler_inner(
             body: prompt::build_body(&route.upstream_model, &system, user),
         })
         .collect();
-    let outcomes = fan_out(&state.http, &url, target.api_key.as_deref(), calls, req_timeout).await;
+    let outcomes = fan_out(
+        &state.http,
+        &url,
+        target.api_key.as_deref(),
+        calls,
+        req_timeout,
+    )
+    .await;
     drop(permit);
 
     // ---- assemble answers, spans, and usage ----
@@ -614,8 +635,9 @@ async fn handler_inner(
         let (status, attrs) = match &outcome.result {
             Ok(success) => {
                 usage.prompt_tokens = usage.prompt_tokens.saturating_add(success.input_tokens);
-                usage.completion_tokens =
-                    usage.completion_tokens.saturating_add(success.output_tokens);
+                usage.completion_tokens = usage
+                    .completion_tokens
+                    .saturating_add(success.output_tokens);
                 let question = &request.questions[&outcome.id];
                 let labels = &label_sets[&outcome.id];
                 let boolean = matches!(labels.semantics, prompt::LabelSemantics::Boolean);
@@ -833,7 +855,11 @@ mod tests {
             &http,
             &url,
             None,
-            vec![call("ok", "fine"), call("bad", "FAIL"), call("nolp", "NOLOGPROBS")],
+            vec![
+                call("ok", "fine"),
+                call("bad", "FAIL"),
+                call("nolp", "NOLOGPROBS"),
+            ],
             Duration::from_secs(5),
         )
         .await;

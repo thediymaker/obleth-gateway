@@ -11,7 +11,7 @@
 //! math is tested on canned completions without any HTTP.
 
 use super::prompt::{LabelSemantics, LabelSet};
-use super::types::{Verdict, Question};
+use super::types::{Question, Verdict};
 
 /// One entry of `choices[0].logprobs.content[0].top_logprobs`.
 #[derive(Debug, Clone)]
@@ -221,12 +221,16 @@ mod tests {
         let no_logprobs = serde_json::json!({
             "choices": [{"message": {"content": "A"}, "logprobs": null}]
         });
-        assert!(parse_top_logprobs(&no_logprobs).unwrap_err().contains("no logprobs"));
+        assert!(parse_top_logprobs(&no_logprobs)
+            .unwrap_err()
+            .contains("no logprobs"));
 
         let empty_content = serde_json::json!({
             "choices": [{"logprobs": {"content": []}}]
         });
-        assert!(parse_top_logprobs(&empty_content).unwrap_err().contains("no token"));
+        assert!(parse_top_logprobs(&empty_content)
+            .unwrap_err()
+            .contains("no token"));
     }
 
     #[test]
@@ -234,9 +238,18 @@ mod tests {
         // Chat templates make the first sampled token ` A`; both spellings
         // are the same answer.
         let entries = vec![
-            TopLogprob { token: " A".into(), logprob: (0.5f64).ln() },
-            TopLogprob { token: "A".into(), logprob: (0.2f64).ln() },
-            TopLogprob { token: " B".into(), logprob: (0.3f64).ln() },
+            TopLogprob {
+                token: " A".into(),
+                logprob: (0.5f64).ln(),
+            },
+            TopLogprob {
+                token: "A".into(),
+                logprob: (0.2f64).ln(),
+            },
+            TopLogprob {
+                token: " B".into(),
+                logprob: (0.3f64).ln(),
+            },
         ];
         let (masses, in_set) = label_masses(&entries, &labels(&["A", "B"]), false);
         assert!((masses[0] - 0.7).abs() < 1e-9);
@@ -247,9 +260,18 @@ mod tests {
     #[test]
     fn boolean_matching_is_case_and_punctuation_insensitive() {
         let entries = vec![
-            TopLogprob { token: " Yes".into(), logprob: (0.6f64).ln() },
-            TopLogprob { token: "yes.".into(), logprob: (0.2f64).ln() },
-            TopLogprob { token: " NO".into(), logprob: (0.1f64).ln() },
+            TopLogprob {
+                token: " Yes".into(),
+                logprob: (0.6f64).ln(),
+            },
+            TopLogprob {
+                token: "yes.".into(),
+                logprob: (0.2f64).ln(),
+            },
+            TopLogprob {
+                token: " NO".into(),
+                logprob: (0.1f64).ln(),
+            },
         ];
         let (masses, in_set) = label_masses(&entries, &labels(&["yes", "no"]), true);
         assert!((masses[0] - 0.8).abs() < 1e-9);
@@ -262,9 +284,18 @@ mod tests {
         // 50% of the raw mass is off-label chatter; the reported distribution
         // still sums to 1, and the loss shows up in confidence alone.
         let entries = vec![
-            TopLogprob { token: " A".into(), logprob: (0.5f64).ln() },
-            TopLogprob { token: "The".into(), logprob: (0.3f64).ln() },
-            TopLogprob { token: "<think>".into(), logprob: (0.2f64).ln() },
+            TopLogprob {
+                token: " A".into(),
+                logprob: (0.5f64).ln(),
+            },
+            TopLogprob {
+                token: "The".into(),
+                logprob: (0.3f64).ln(),
+            },
+            TopLogprob {
+                token: "<think>".into(),
+                logprob: (0.2f64).ln(),
+            },
         ];
         let (masses, in_set) = label_masses(&entries, &labels(&["A", "B"]), false);
         let scored = score_masses(&masses, in_set).unwrap();
