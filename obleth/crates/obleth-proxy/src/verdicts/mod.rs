@@ -39,6 +39,20 @@ use crate::state::AppState;
 
 pub(crate) const VERDICTS_PATH: &str = "/v1/verdicts";
 
+/// Below this much raw label mass the "answer" is noise, not a decision — a
+/// thinking model's scratchpad occasionally leaks a label token at ~1e-4
+/// probability, which renormalizes into a confident-looking distribution with
+/// a near-zero confidence. Observed live on GLM: a 50/50 `yes`/`no` at
+/// confidence 0.00 from exactly this leak. Treated the same as zero mass: the
+/// question is retried with the empty-think prefill.
+const MIN_IN_SET_MASS: f64 = 0.05;
+
+/// Fixed, short delay before the one bonus retry granted to a transient
+/// upstream failure (a 5xx from a sick replica behind a load balancer, or a
+/// stale pooled socket). Mirrors `CONN_RETRY_BACKOFF` in the passthrough
+/// pipeline.
+const TRANSIENT_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+
 /// Models observed to need the empty-think prefill (see
 /// [`prompt::build_body_prefilled`]): their plain call's first token is
 /// reasoning prose, never an answer label. Learned at request time from a
@@ -113,6 +127,8 @@ pub(crate) async fn fan_out(
     let futures = calls.into_iter().map(|call| async move {
         let start_ms = crate::tracer::now_ms();
         let started = Instant::now();
+        let in_set_of =
+            |s: &QuestionSuccess| answers::label_masses(&s.entries, &call.labels, call.boolean).1;
         let first_body = if prefill_first {
             &call.prefill_body
         } else {
@@ -123,33 +139,40 @@ pub(crate) async fn fan_out(
             success.used_prefill = prefill_first;
         }
         if !prefill_first {
-            // Zero label mass on a *successful* plain call is the thinking-model
-            // signature (the first token is scratchpad prose). Try once more
-            // past an empty think block before declaring failure.
-            let no_label = matches!(&result, Ok(s) if {
-                let (_, in_set) = answers::label_masses(&s.entries, &call.labels, call.boolean);
-                in_set.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
-            });
+            // Sub-threshold label mass on a *successful* plain call is the
+            // thinking-model signature: the first token is scratchpad prose
+            // (possibly leaking a label at ~1e-4). Try once more past an empty
+            // think block before settling.
+            let no_label = matches!(&result, Ok(s) if in_set_of(s) < MIN_IN_SET_MASS);
             if no_label {
                 let plain = result.expect("checked Ok above");
                 match one_call(http, url, api_key, &call.prefill_body, timeout).await {
                     Ok(mut retried) => {
-                        let (_, in_set) =
-                            answers::label_masses(&retried.entries, &call.labels, call.boolean);
-                        if in_set > 0.0 {
+                        let retried_mass = in_set_of(&retried);
+                        if retried_mass >= MIN_IN_SET_MASS {
                             remember_think_prefill(model);
                         }
-                        // Bill both attempts; the plain call really ran.
-                        retried.input_tokens =
-                            retried.input_tokens.saturating_add(plain.input_tokens);
-                        retried.output_tokens =
-                            retried.output_tokens.saturating_add(plain.output_tokens);
-                        retried.used_prefill = true;
-                        result = Ok(retried);
+                        // Keep whichever attempt actually carried answer mass;
+                        // bill both either way — both calls really ran.
+                        if retried_mass > in_set_of(&plain) {
+                            retried.input_tokens =
+                                retried.input_tokens.saturating_add(plain.input_tokens);
+                            retried.output_tokens =
+                                retried.output_tokens.saturating_add(plain.output_tokens);
+                            retried.used_prefill = true;
+                            result = Ok(retried);
+                        } else {
+                            let mut plain = plain;
+                            plain.input_tokens =
+                                plain.input_tokens.saturating_add(retried.input_tokens);
+                            plain.output_tokens =
+                                plain.output_tokens.saturating_add(retried.output_tokens);
+                            result = Ok(plain);
+                        }
                     }
-                    // Keep the plain result: its zero-label mass produces the
-                    // clearer "no recognizable answer label" error downstream,
-                    // and its usage is still billed.
+                    // Keep the plain result: its label mass (or the clearer
+                    // "no recognizable answer label" error) stands, and its
+                    // usage is still billed.
                     Err(_) => result = Ok(plain),
                 }
             }
@@ -164,7 +187,32 @@ pub(crate) async fn fan_out(
     futures_util::future::join_all(futures).await
 }
 
+/// One upstream call, with one bonus retry on a transient failure (5xx or a
+/// connection error). A sick replica behind a load balancer answering one of
+/// N concurrent single-token calls with a 500 would otherwise fail the whole
+/// request — observed live against a fleet with crash-looping pods.
 async fn one_call(
+    http: &reqwest::Client,
+    url: &str,
+    api_key: Option<&str>,
+    body: &serde_json::Value,
+    timeout: Duration,
+) -> Result<QuestionSuccess, String> {
+    let first = one_attempt(http, url, api_key, body, timeout).await;
+    let transient = matches!(&first,
+        Err(e) if e.contains("upstream returned 5") || e.contains("unreachable"));
+    if transient {
+        tokio::time::sleep(TRANSIENT_RETRY_BACKOFF).await;
+        if let Ok(success) = one_attempt(http, url, api_key, body, timeout).await {
+            return Ok(success);
+        }
+        // Fall through to the first attempt's error: it names the original
+        // failure rather than whatever the retry hit.
+    }
+    first
+}
+
+async fn one_attempt(
     http: &reqwest::Client,
     url: &str,
     api_key: Option<&str>,
@@ -1003,9 +1051,14 @@ mod tests {
                             {"token": " A", "logprob": -1.8}
                         ])
                     } else {
+                        // Thinking prose that also LEAKS a label at ~5e-5
+                        // probability — the live GLM signature. The leak must
+                        // not count as an answer (it renormalizes into a
+                        // confident-looking noise distribution).
                         serde_json::json!([
                             {"token": "The", "logprob": -0.5},
-                            {"token": "State", "logprob": -1.0}
+                            {"token": "State", "logprob": -1.0},
+                            {"token": " A", "logprob": -10.0}
                         ])
                     };
                     axum::Json(serde_json::json!({
@@ -1069,6 +1122,66 @@ mod tests {
             3,
             "prefill only on the second request"
         );
+    }
+
+    #[tokio::test]
+    async fn a_single_transient_500_is_retried_not_fatal() {
+        // One sick replica behind a load balancer answers the first attempt
+        // with a 500; the bonus retry lands on a healthy one.
+        let flake = Arc::new(AtomicUsize::new(0));
+        let flake_clone = flake.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let flake = flake_clone.clone();
+                async move {
+                    if flake.fetch_add(1, Ordering::SeqCst) == 0 {
+                        return (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(serde_json::json!({"error": "sick replica"})),
+                        );
+                    }
+                    (
+                        StatusCode::OK,
+                        axum::Json(serde_json::json!({
+                            "choices": [{
+                                "message": {"role": "assistant", "content": "A"},
+                                "logprobs": {"content": [{
+                                    "token": " A", "logprob": -0.1,
+                                    "top_logprobs": [
+                                        {"token": " A", "logprob": -0.1},
+                                        {"token": " B", "logprob": -2.4}
+                                    ]
+                                }]},
+                                "finish_reason": "length"
+                            }],
+                            "usage": {"prompt_tokens": 100, "completion_tokens": 1}
+                        })),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let http = reqwest::Client::new();
+        let outcomes = fan_out(
+            &http,
+            &format!("http://{addr}/v1/chat/completions"),
+            None,
+            "flaky-model",
+            vec![call("q", "hello")],
+            Duration::from_secs(5),
+        )
+        .await;
+        let success = outcomes[0]
+            .result
+            .as_ref()
+            .expect("the retry should recover from one 500");
+        assert!(!success.used_prefill);
+        assert_eq!(flake.load(Ordering::SeqCst), 2, "first attempt + one retry");
     }
 
     #[test]
