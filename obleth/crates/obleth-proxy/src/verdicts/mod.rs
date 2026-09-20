@@ -199,8 +199,15 @@ async fn one_call(
     timeout: Duration,
 ) -> Result<QuestionSuccess, String> {
     let first = one_attempt(http, url, api_key, body, timeout).await;
+    // "backend returned …" covers a 200 with missing or empty logprobs —
+    // observed live from a crash-looping replica behind a load balancer that
+    // answers with degenerate bodies. A backend that genuinely lacks logprobs
+    // support pays one extra doomed call on a path that already fails.
     let transient = matches!(&first,
-        Err(e) if e.contains("upstream returned 5") || e.contains("unreachable"));
+        Err(e) if e.contains("upstream returned 5")
+            || e.contains("unreachable")
+            || e.contains("invalid JSON")
+            || e.contains("backend returned"));
     if transient {
         tokio::time::sleep(TRANSIENT_RETRY_BACKOFF).await;
         if let Ok(success) = one_attempt(http, url, api_key, body, timeout).await {
@@ -792,7 +799,10 @@ async fn handler_inner(
                     }
                     Err(reason) => {
                         if failure.is_none() {
-                            failure = Some(format!("question '{}': {reason}", outcome.id));
+                            failure = Some(format!(
+                                "question '{}' on model '{model}': {reason}",
+                                outcome.id
+                            ));
                         }
                         ("error", serde_json::json!({ "error": reason }))
                     }
@@ -800,7 +810,10 @@ async fn handler_inner(
             }
             Err(reason) => {
                 if failure.is_none() {
-                    failure = Some(format!("question '{}': {reason}", outcome.id));
+                    failure = Some(format!(
+                        "question '{}' on model '{model}': {reason}",
+                        outcome.id
+                    ));
                 }
                 ("error", serde_json::json!({ "error": reason }))
             }
