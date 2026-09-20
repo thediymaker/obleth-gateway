@@ -159,6 +159,39 @@ pub(crate) fn build_body(upstream_model: &str, system: &str, user: &str) -> serd
     })
 }
 
+/// The same call with the assistant turn pre-opened by an empty think block.
+///
+/// Reasoning models (GLM, Qwen thinking variants, DeepSeek-R1 templates)
+/// spend their first token inside a `<think>` scratchpad, so the plain call's
+/// first-token distribution is thinking prose, not an answer label. Seeding
+/// the assistant message with a closed, empty `<think></think>` and asking
+/// the backend to continue it (`continue_final_message`, supported by vLLM
+/// and SGLang) moves the first generated token past the scratchpad. Verified
+/// against GLM: the top tokens become the answer labels. Only ever sent after
+/// the plain call produced zero label mass, so backends that reject the
+/// fields (llama.cpp, SaaS APIs) never see them on a working model.
+pub(crate) fn build_body_prefilled(
+    upstream_model: &str,
+    system: &str,
+    user: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "model": upstream_model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+            {"role": "assistant", "content": "<think></think>"},
+        ],
+        "add_generation_prompt": false,
+        "continue_final_message": true,
+        "max_tokens": 1,
+        "temperature": 0,
+        "logprobs": true,
+        "top_logprobs": 20,
+        "stream": false,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -39,10 +39,36 @@ use crate::state::AppState;
 
 pub(crate) const VERDICTS_PATH: &str = "/v1/verdicts";
 
-/// One prepared upstream call: the question id plus its chat body.
+/// Models observed to need the empty-think prefill (see
+/// [`prompt::build_body_prefilled`]): their plain call's first token is
+/// reasoning prose, never an answer label. Learned at request time from a
+/// successful prefill retry, keyed by the gateway model name, so later
+/// requests skip the doomed plain attempt. In-process only — worst case after
+/// a restart is one wasted plain call per model; bounded by the registry.
+static THINK_PREFILL: std::sync::LazyLock<std::sync::RwLock<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(|| std::sync::RwLock::new(std::collections::HashSet::new()));
+
+fn needs_think_prefill(model: &str) -> bool {
+    THINK_PREFILL
+        .read()
+        .map(|s| s.contains(model))
+        .unwrap_or(false)
+}
+
+fn remember_think_prefill(model: &str) {
+    if let Ok(mut s) = THINK_PREFILL.write() {
+        s.insert(model.to_string());
+    }
+}
+
+/// One prepared upstream call: the question id, its answer labels (for the
+/// zero-label-mass retry decision), and both body variants.
 pub(crate) struct QuestionCall {
     pub id: String,
+    pub labels: Vec<String>,
+    pub boolean: bool,
     pub body: serde_json::Value,
+    pub prefill_body: serde_json::Value,
 }
 
 /// The outcome of one question's upstream call: parsed first-token
@@ -60,6 +86,8 @@ pub(crate) struct QuestionSuccess {
     pub entries: Vec<answers::TopLogprob>,
     pub input_tokens: u32,
     pub output_tokens: u32,
+    /// The answer came from the empty-think prefill variant.
+    pub used_prefill: bool,
 }
 
 /// Fan the prepared question calls out concurrently against ONE upstream URL.
@@ -67,17 +95,65 @@ pub(crate) struct QuestionSuccess {
 /// A single target for every question is deliberate: the questions share a
 /// byte-identical prompt prefix, and scattering them across replicas would
 /// re-prefill the state on each one instead of hitting the prefix cache.
+///
+/// Thinking models get one adaptive retry: when the plain call succeeds but
+/// none of its top tokens is an answer label, the question is retried with
+/// the empty-think prefill, and a success teaches [`THINK_PREFILL`] to send
+/// the prefill first for this `model` from then on. Usage of both attempts is
+/// billed.
 pub(crate) async fn fan_out(
     http: &reqwest::Client,
     url: &str,
     api_key: Option<&str>,
+    model: &str,
     calls: Vec<QuestionCall>,
     timeout: Duration,
 ) -> Vec<QuestionOutcome> {
+    let prefill_first = needs_think_prefill(model);
     let futures = calls.into_iter().map(|call| async move {
         let start_ms = crate::tracer::now_ms();
         let started = Instant::now();
-        let result = one_call(http, url, api_key, &call.body, timeout).await;
+        let first_body = if prefill_first {
+            &call.prefill_body
+        } else {
+            &call.body
+        };
+        let mut result = one_call(http, url, api_key, first_body, timeout).await;
+        if let Ok(success) = &mut result {
+            success.used_prefill = prefill_first;
+        }
+        if !prefill_first {
+            // Zero label mass on a *successful* plain call is the thinking-model
+            // signature (the first token is scratchpad prose). Try once more
+            // past an empty think block before declaring failure.
+            let no_label = matches!(&result, Ok(s) if {
+                let (_, in_set) = answers::label_masses(&s.entries, &call.labels, call.boolean);
+                in_set.partial_cmp(&0.0) != Some(std::cmp::Ordering::Greater)
+            });
+            if no_label {
+                let plain = result.expect("checked Ok above");
+                match one_call(http, url, api_key, &call.prefill_body, timeout).await {
+                    Ok(mut retried) => {
+                        let (_, in_set) =
+                            answers::label_masses(&retried.entries, &call.labels, call.boolean);
+                        if in_set > 0.0 {
+                            remember_think_prefill(model);
+                        }
+                        // Bill both attempts; the plain call really ran.
+                        retried.input_tokens =
+                            retried.input_tokens.saturating_add(plain.input_tokens);
+                        retried.output_tokens =
+                            retried.output_tokens.saturating_add(plain.output_tokens);
+                        retried.used_prefill = true;
+                        result = Ok(retried);
+                    }
+                    // Keep the plain result: its zero-label mass produces the
+                    // clearer "no recognizable answer label" error downstream,
+                    // and its usage is still billed.
+                    Err(_) => result = Ok(plain),
+                }
+            }
+        }
         QuestionOutcome {
             id: call.id,
             result,
@@ -125,6 +201,7 @@ async fn one_call(
             entries,
             input_tokens,
             output_tokens,
+            used_prefill: false,
         })
     };
     match tokio::time::timeout(timeout, fut).await {
@@ -610,15 +687,22 @@ async fn handler_inner(
         .questions
         .iter()
         .zip(users.iter())
-        .map(|((id, _), user)| QuestionCall {
-            id: id.clone(),
-            body: prompt::build_body(&route.upstream_model, &system, user),
+        .map(|((id, _), user)| {
+            let labels = &label_sets[id];
+            QuestionCall {
+                id: id.clone(),
+                labels: labels.labels.clone(),
+                boolean: matches!(labels.semantics, prompt::LabelSemantics::Boolean),
+                body: prompt::build_body(&route.upstream_model, &system, user),
+                prefill_body: prompt::build_body_prefilled(&route.upstream_model, &system, user),
+            }
         })
         .collect();
     let outcomes = fan_out(
         &state.http,
         &url,
         target.api_key.as_deref(),
+        &model,
         calls,
         req_timeout,
     )
@@ -653,6 +737,7 @@ async fn handler_inner(
                             "in_set_mass": in_set,
                             "input_tokens": success.input_tokens,
                             "output_tokens": success.output_tokens,
+                            "think_prefill": success.used_prefill,
                         });
                         verdicts_map.insert(outcome.id.clone(), answer);
                         ("ok", attrs)
@@ -813,7 +898,11 @@ mod tests {
     fn call(id: &str, user: &str) -> QuestionCall {
         QuestionCall {
             id: id.to_string(),
+            // The canned upstream answers ` A`/` B`, so these labels match.
+            labels: vec!["A".to_string(), "B".to_string()],
+            boolean: false,
             body: prompt::build_body("upstream-model", "shared system", user),
+            prefill_body: prompt::build_body_prefilled("upstream-model", "shared system", user),
         }
     }
 
@@ -825,6 +914,7 @@ mod tests {
             &http,
             &url,
             Some("test-key"),
+            "plain-model",
             vec![call("q1", "first question"), call("q2", "second question")],
             Duration::from_secs(5),
         )
@@ -855,6 +945,7 @@ mod tests {
             &http,
             &url,
             None,
+            "plain-model-2",
             vec![
                 call("ok", "fine"),
                 call("bad", "FAIL"),
@@ -881,6 +972,7 @@ mod tests {
             &http,
             "http://127.0.0.1:1/v1/chat/completions",
             None,
+            "plain-model-3",
             vec![call("q", "hello")],
             Duration::from_secs(2),
         )
@@ -889,6 +981,93 @@ mod tests {
         assert!(
             err.contains("unreachable") || err.contains("timed out"),
             "unexpected error: {err}"
+        );
+    }
+
+    /// A mock thinking model: the plain call's first token is scratchpad
+    /// prose; the empty-think prefill (`continue_final_message`) yields labels.
+    async fn serve_thinking_upstream() -> (String, Arc<AtomicUsize>) {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let hits = hits_clone.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    let prefilled =
+                        body.get("continue_final_message").and_then(|v| v.as_bool()) == Some(true);
+                    let top = if prefilled {
+                        serde_json::json!([
+                            {"token": " B", "logprob": -0.2},
+                            {"token": " A", "logprob": -1.8}
+                        ])
+                    } else {
+                        serde_json::json!([
+                            {"token": "The", "logprob": -0.5},
+                            {"token": "State", "logprob": -1.0}
+                        ])
+                    };
+                    axum::Json(serde_json::json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": ""},
+                            "logprobs": {"content": [{
+                                "token": "x", "logprob": -0.5, "top_logprobs": top
+                            }]},
+                            "finish_reason": "length"
+                        }],
+                        "usage": {"prompt_tokens": 100, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/v1/chat/completions"), hits)
+    }
+
+    #[tokio::test]
+    async fn a_thinking_model_is_retried_with_the_empty_think_prefill_and_remembered() {
+        let (url, hits) = serve_thinking_upstream().await;
+        let http = reqwest::Client::new();
+
+        // First request: plain call yields no label mass, prefill retry
+        // succeeds; both attempts are billed.
+        let outcomes = fan_out(
+            &http,
+            &url,
+            None,
+            "thinking-model-e2e",
+            vec![call("q1", "first")],
+            Duration::from_secs(5),
+        )
+        .await;
+        let success = outcomes[0].result.as_ref().expect("retry should succeed");
+        assert!(success.used_prefill);
+        assert_eq!(success.input_tokens, 200, "both attempts billed");
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "plain + prefill");
+        let (masses, in_set) =
+            answers::label_masses(&success.entries, &call("q1", "x").labels, false);
+        assert!(in_set > 0.0 && masses[1] > masses[0]);
+
+        // Second request against the same model skips the doomed plain call.
+        let outcomes = fan_out(
+            &http,
+            &url,
+            None,
+            "thinking-model-e2e",
+            vec![call("q2", "second")],
+            Duration::from_secs(5),
+        )
+        .await;
+        assert!(outcomes[0].result.as_ref().unwrap().used_prefill);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            3,
+            "prefill only on the second request"
         );
     }
 
