@@ -1103,3 +1103,79 @@ async fn ceiling_dispatch_round_robins_across_pools() {
         );
     }
 }
+
+/// A global ceiling below the pool's own cap: the split between groups has to
+/// come from the slots the pool can really fill, not from the nominal pool
+/// size. Otherwise the big group's cap is unreachable, it never has to yield,
+/// and the small group starves behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ceiling_below_pool_cap_still_reserves_the_small_groups_slot() {
+    // Ceiling of 4, but the pool would allow 32.
+    let fs = FairShare::start(
+        Arc::new(StaticCapacity::new(4)),
+        FairshareAlgorithm::Hierarchical,
+        32,
+    );
+    let chatbot = Uuid::new_v4();
+    let api = Uuid::new_v4();
+    let chat_req = move || {
+        AdmitRequest::new(chatbot, "m", 10)
+            .weight(500)
+            .group("chatbot", 500)
+    };
+    let api_req = move || AdmitRequest::new(api, "m", 10).weight(50).group("api", 50);
+
+    let mut permits = Vec::new();
+    for _ in 0..4 {
+        let adm = fs.admit(chat_req()).await.expect("chatbot admit");
+        assert_eq!(adm.admission, Admission::Fast);
+        permits.push(adm.permit);
+    }
+
+    // The big group has already been queueing and dispatching on its own with
+    // a standing backlog, so the pool's virtual time has moved up to its
+    // served total. A tenant that arrives later is snapped to that value, and
+    // its group's service debt divided by a small group weight then reads far
+    // higher than the big group's.
+    let fs_warm = fs.clone();
+    let warm = tokio::spawn(async move { fs_warm.admit(chat_req()).await });
+    let fs_chat = fs.clone();
+    let chat_waiter = tokio::spawn(async move { fs_chat.admit(chat_req()).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    drop(permits.pop());
+    let warm = tokio::time::timeout(Duration::from_secs(1), warm)
+        .await
+        .expect("queued chatbot request is dispatched")
+        .expect("join")
+        .expect("admit");
+    assert_eq!(warm.admission, Admission::Queued);
+    permits.push(warm.permit);
+
+    // The small group joins while the ceiling is full and the big group still
+    // has a request queued ahead of it, so the next freed slot is contended.
+    let fs_api = fs.clone();
+    let api_waiter = tokio::spawn(async move { fs_api.admit(api_req()).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let snap = fs.snapshot().await.unwrap();
+    assert_eq!(snap.global_in_flight, 4);
+    assert_eq!(snap.global_queued, 2);
+
+    drop(permits.pop());
+
+    let api_admitted = tokio::time::timeout(Duration::from_secs(1), api_waiter)
+        .await
+        .expect("api group must get the freed slot")
+        .expect("join")
+        .expect("api admit");
+    assert_eq!(api_admitted.admission, Admission::Queued);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), chat_waiter)
+            .await
+            .is_err(),
+        "the big group's extra request still waits: the ceiling is full again"
+    );
+
+    drop(api_admitted.permit);
+    drop(permits);
+}

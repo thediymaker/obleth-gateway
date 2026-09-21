@@ -282,14 +282,28 @@ pub async fn run(
                 .map_err(|e| anyhow::anyhow!(e))?;
             let api_base = std::env::var("BENCHMARK_API_BASE")
                 .unwrap_or_else(|_| "http://benchmark-backend:8081".to_string());
-            let seeded = crate::seed::seed_fixture(
+            // The scorecard measures proxy tax and the capacity ramp, so the
+            // demo pools have to be wide enough that admission never binds
+            // below the ramp's own top; the gateway default of 32 would.
+            let model_cap = args
+                .max_conc
+                .max(overhead::OVERHEAD_CONCS.iter().copied().max().unwrap_or(1));
+            let mut seeded = crate::seed::seed_fixture(
                 &admin,
                 &api_base,
                 &scope,
                 crate::seed::FleetChoice::Standard,
-                None,
+                Some(model_cap),
             )
             .await?;
+            // And the global ceiling has to clear the sum of those pools.
+            // Teardown puts the previous ceiling back.
+            let ceiling = model_cap
+                .saturating_mul(seeded.models.len() as u32)
+                .max(model_cap);
+            admin
+                .raise_capacity_for_run(&mut seeded.teardown, ceiling)
+                .await?;
             (seeded, cli.proxy_base.clone())
         }
         Target::Live => {

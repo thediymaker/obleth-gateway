@@ -547,12 +547,23 @@ impl Pool {
             .collect()
     }
 
-    fn compute_group_caps(&self) -> HashMap<String, usize> {
-        group_slot_caps(self.cap, &self.active_groups())
+    /// The number of slots this pool can actually fill right now: its own cap,
+    /// or fewer when the global ceiling leaves less headroom than that. Group
+    /// and tenant splits are taken from this figure, not from the pool cap,
+    /// so a ceiling that binds below the pool still reserves every group's
+    /// share of what is really available. Splitting the nominal cap instead
+    /// hands the largest group a cap it can never reach, and it then never
+    /// has to yield a freed slot to a smaller group.
+    fn effective_cap(&self, headroom: usize) -> usize {
+        self.cap.min(self.in_flight.saturating_add(headroom)).max(1)
     }
 
-    fn can_grant_immediately(&self, req: &AdmitRequest) -> bool {
-        if self.in_flight >= self.cap || self.queued_total > 0 {
+    fn compute_group_caps(&self, effective: usize) -> HashMap<String, usize> {
+        group_slot_caps(effective, &self.active_groups())
+    }
+
+    fn can_grant_immediately(&self, req: &AdmitRequest, effective: usize) -> bool {
+        if self.in_flight >= effective || self.queued_total > 0 {
             return false;
         }
         if !self.tenant_has_slot(&req.tenant) || !self.key_has_slot(&req.key) {
@@ -561,8 +572,8 @@ impl Pool {
         match self.algorithm {
             FairshareAlgorithm::Weighted => true,
             FairshareAlgorithm::Hierarchical => {
-                let caps = self.compute_group_caps();
-                let cap = caps.get(&req.group).copied().unwrap_or(self.cap);
+                let caps = self.compute_group_caps(effective);
+                let cap = caps.get(&req.group).copied().unwrap_or(effective);
                 self.group_in_flight(&req.group) < cap
             }
         }
@@ -667,11 +678,11 @@ impl Pool {
 
     /// Admit one queued waiter if the pool has a free slot. Returns whether a
     /// grant happened so the scheduler can account the global ceiling.
-    fn dispatch_one(&mut self) -> bool {
-        if self.in_flight >= self.cap || self.queued_total == 0 {
+    fn dispatch_one(&mut self, effective: usize) -> bool {
+        if self.in_flight >= effective || self.queued_total == 0 {
             return false;
         }
-        let Some(tenant) = self.pick_tenant() else {
+        let Some(tenant) = self.pick_tenant(effective) else {
             return false;
         };
         let Some(key) = self.pick_key(&tenant) else {
@@ -694,10 +705,10 @@ impl Pool {
         true
     }
 
-    fn pick_tenant(&self) -> Option<Uuid> {
+    fn pick_tenant(&self, effective: usize) -> Option<Uuid> {
         match self.algorithm {
             FairshareAlgorithm::Weighted => self.pick_tenant_weighted(),
-            FairshareAlgorithm::Hierarchical => self.pick_tenant_hierarchical(),
+            FairshareAlgorithm::Hierarchical => self.pick_tenant_hierarchical(effective),
         }
     }
 
@@ -717,8 +728,8 @@ impl Pool {
         best.map(|(t, _)| t)
     }
 
-    fn pick_tenant_hierarchical(&self) -> Option<Uuid> {
-        let caps = self.compute_group_caps();
+    fn pick_tenant_hierarchical(&self, effective: usize) -> Option<Uuid> {
+        let caps = self.compute_group_caps(effective);
         let mut in_flight_by_group: HashMap<&str, usize> = HashMap::new();
         for (tenant, n) in &self.tenant_in_flight {
             if *n > 0 {
@@ -751,7 +762,7 @@ impl Pool {
                 served_by_group.get(group.as_str()).copied().unwrap_or(0.0) / group_weight;
             borrowable.push((*tenant, group_score));
 
-            let cap = caps.get(&group).copied().unwrap_or(self.cap);
+            let cap = caps.get(&group).copied().unwrap_or(effective);
             if in_flight_by_group.get(group.as_str()).copied().unwrap_or(0) >= cap {
                 continue;
             }
@@ -917,7 +928,7 @@ impl Pool {
             .chain(self.served.keys().copied())
             .collect();
         let active = self.active_groups();
-        let group_caps = self.compute_group_caps();
+        let group_caps = self.compute_group_caps(self.cap);
         let total_group_weight: i64 = active.iter().map(|(_, w)| (*w).max(1)).sum();
 
         let mut names: HashSet<String> = active.iter().map(|(n, _)| n.clone()).collect();
@@ -1146,7 +1157,7 @@ impl Scheduler {
                     enqueued,
                 } => {
                     let ceiling = self.capacity.max_in_flight();
-                    let headroom = self.in_flight < ceiling;
+                    let headroom = ceiling.saturating_sub(self.in_flight);
                     let default_cap = self.default_model_cap;
                     let model = req.model.clone();
                     let pool = self.pool_mut(&model);
@@ -1155,7 +1166,8 @@ impl Scheduler {
                         .filter(|c| *c > 0)
                         .unwrap_or(default_cap);
                     pool.track_meta(&req);
-                    if headroom && pool.can_grant_immediately(&req) {
+                    let effective = pool.effective_cap(headroom);
+                    if headroom > 0 && pool.can_grant_immediately(&req, effective) {
                         pool.grant_fast(req, respond);
                         self.in_flight += 1;
                     } else {
@@ -1218,8 +1230,12 @@ impl Scheduler {
                     break;
                 }
                 let idx = (self.cursor + i) % n;
+                let headroom = ceiling.saturating_sub(self.in_flight);
                 let granted = match self.pools.get_mut(self.pool_order[idx].as_str()) {
-                    Some(pool) if pool.queued_total > 0 => pool.dispatch_one(),
+                    Some(pool) if pool.queued_total > 0 => {
+                        let effective = pool.effective_cap(headroom);
+                        pool.dispatch_one(effective)
+                    }
                     _ => false,
                 };
                 if granted {

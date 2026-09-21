@@ -18,6 +18,10 @@ pub struct Teardown {
     pub key_ids: Vec<String>,
     pub model_ids: Vec<String>,
     pub tenant_ids: Vec<String>,
+    /// The gateway's global in-flight ceiling before the run changed it, so
+    /// teardown puts it back. A run that never touched the ceiling leaves this
+    /// unset.
+    pub restore_capacity: Option<u32>,
 }
 
 #[derive(Clone, Debug)]
@@ -502,6 +506,26 @@ impl AdminClient {
                 .req(reqwest::Method::DELETE, &format!("/tenants/{id}"), None)
                 .await;
         }
+        if let Some(cap) = td.restore_capacity {
+            if let Err(e) = self.set_capacity(cap).await {
+                eprintln!(
+                    "warning: failed to restore the gateway in-flight ceiling to {cap} after the run: {e} — set it back via PUT /api/v1/capacity"
+                );
+            }
+        }
+    }
+
+    /// Raise the gateway's global in-flight ceiling for a run and remember
+    /// the previous value in `td` so `teardown` restores it.
+    pub async fn raise_capacity_for_run(
+        &self,
+        td: &mut Teardown,
+        max_in_flight: u32,
+    ) -> Result<u32> {
+        if td.restore_capacity.is_none() {
+            td.restore_capacity = Some(self.get_capacity().await?);
+        }
+        self.set_capacity(max_in_flight).await
     }
 
     pub async fn set_capacity(&self, max_in_flight: u32) -> Result<u32> {

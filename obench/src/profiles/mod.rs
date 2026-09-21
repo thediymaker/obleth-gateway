@@ -156,7 +156,7 @@ async fn build_setup(
         Some(plan.capacity),
     )
     .await?;
-    let teardown = seeded.teardown.clone();
+    let mut teardown = seeded.teardown.clone();
     let key_total: usize = seeded.tenants.iter().map(|t| t.keys.len()).sum();
 
     // `plan.capacity` is the per-model pool size, so the global ceiling has to
@@ -167,9 +167,12 @@ async fn build_setup(
         .saturating_mul(seeded.models.len() as u32)
         .max(plan.capacity);
 
-    // Only the demo path owns a local gateway whose capacity it can set.
+    // Only the demo path owns a local gateway whose capacity it can set. The
+    // previous ceiling rides along in `teardown` so the run puts it back.
     if gateway_observable {
-        let cap = admin.set_capacity(gateway_capacity).await?;
+        let cap = admin
+            .raise_capacity_for_run(&mut teardown, gateway_capacity)
+            .await?;
         println!(
             "seeded {} models x {} slots, {} tenants, {} keys, ceiling {cap}",
             seeded.models.len(),
@@ -356,7 +359,7 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
             Some(plan.capacity),
         )
         .await?;
-        let teardown = seeded.teardown.clone();
+        let mut teardown = seeded.teardown.clone();
         // Demo drives the local gateway (admin sets capacity); live drives the
         // remote proxy as a black box with no admin access.
         let (proxy_base, observable) = match tgt {
@@ -364,9 +367,11 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
             Target::Live => (resolve_live_config(cli, None)?.proxy_url, false),
         };
         if observable {
-            // `plan.capacity` is per-model, so the ceiling clears every pool.
+            // `plan.capacity` is per-model, so the ceiling clears every pool;
+            // teardown restores the previous ceiling.
             let _ = admin
-                .set_capacity(
+                .raise_capacity_for_run(
+                    &mut teardown,
                     plan.capacity
                         .saturating_mul(seeded.models.len() as u32)
                         .max(plan.capacity),
