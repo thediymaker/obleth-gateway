@@ -31,7 +31,7 @@ pub async fn run(
 
         // Extract owned values before the move closure so we avoid borrowing
         // seeded inside the closure body (seeded is moved as seeded2).
-        let tenant_key = seeded.tenants[0].key.clone();
+        let tenant_key = seeded.tenants[0].first_key()?.to_string();
         let model = seeded.models[0].clone();
         let proxy = proxy_base.to_string();
         let input_tokens = cli.input_tokens;

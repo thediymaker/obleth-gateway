@@ -87,6 +87,8 @@ export interface ApiKey {
   /** Contract field: external account systems join on it. */
   identity_subject: string | null;
   identity_claims: Record<string, unknown> | null;
+  weight: number;
+  max_in_flight: number | null;
   budget_tokens: number | null;
   budget_cost_usd: number | null;
   budget_period: string | null;
@@ -607,6 +609,7 @@ export interface TenantFairshareView {
   share_score: number;
   weight_share: number;
   expected_slots: number;
+  max_in_flight?: number | null;
 }
 
 export interface GroupFairshareView {
@@ -621,17 +624,50 @@ export interface GroupFairshareView {
   expected_slots: number;
 }
 
+export interface KeyFairshareView {
+  key_id: string;
+  tenant_id: string;
+  name: string;
+  weight: number;
+  max_in_flight: number | null;
+  in_flight: number;
+  queued: number;
+  served_tokens: number;
+  share_score: number;
+  weight_share: number;
+  expected_slots: number;
+}
+
+export interface ModelPoolView {
+  model: string;
+  cap: number;
+  in_flight: number;
+  queued: number;
+  borrowed: number;
+  groups: GroupFairshareView[];
+  tenants: TenantFairshareView[];
+  keys: KeyFairshareView[];
+}
+
 export interface FairshareLiveView {
   algorithm: string;
   max_in_flight: number;
   global_in_flight: number;
   global_queued: number;
+  /** Global in-flight above apportioned caps, borrowed from idle capacity. */
+  global_borrowed?: number;
   groups: GroupFairshareView[];
   tenants: TenantFairshareView[];
   /** Live in-flight request count keyed by model name. */
   model_in_flight?: Record<string, number>;
   /** Live queued request count keyed by model name. */
   model_queued?: Record<string, number>;
+  /** Hard ceiling on global in-flight admission, independent of pool sums. */
+  hard_ceiling?: number;
+  /** Default per-model in-flight cap applied when a model has none configured. */
+  default_model_max_in_flight?: number;
+  keys?: KeyFairshareView[];
+  pools?: ModelPoolView[];
 }
 
 export interface TenantUsageTimePoint {
@@ -1497,6 +1533,8 @@ export const obleth = {
     body: {
       name: string;
       description?: string;
+      weight?: number;
+      max_in_flight?: number | null;
       budget_tokens?: number | null;
       budget_cost_usd?: number | null;
       budget_period?: string | null;
@@ -1514,6 +1552,8 @@ export const obleth = {
     body: {
       name: string;
       description?: string;
+      weight?: number;
+      max_in_flight?: number | null;
       budget_tokens?: number | null;
       budget_cost_usd?: number | null;
       budget_period?: string | null;

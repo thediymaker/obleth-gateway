@@ -821,19 +821,17 @@ async fn proxy_handler_inner(
     // Telemetry label for everything that isn't a cache hit.
     let cache_status_label = if cache_enabled { "miss" } else { "off" };
 
-    // ---- fairshare admission (global concurrency + weighted/hierarchical queue) ----
+    // ---- fairshare admission (per-model pool; group → tenant → key) ----
     let admission_start = crate::tracer::now_ms();
     let admitted = match state
         .fairshare
-        .admit(obleth_fairshare::AdmitRequest {
-            tenant: resolved.tenant_id,
-            weight: effective_weight,
-            group: resolved.fairshare_group.clone(),
-            group_weight: resolved.group_weight,
-            model: model.clone(),
-            model_max_in_flight: route.as_ref().and_then(|r| r.max_in_flight),
-            cost: est.total(),
-        })
+        .admit(admit_request_for(
+            &resolved,
+            &model,
+            route.as_deref(),
+            effective_weight,
+            est.total(),
+        ))
         .await
     {
         Some(a) => a,
@@ -2510,6 +2508,39 @@ pub(crate) fn effective_admission_weight(tenant_weight: i64, route: Option<&Reso
         .max(1.0) as i64
 }
 
+/// Build the scheduler request for one admission. Every admission carries the
+/// caps from the resolved key on every request; the scheduler treats an
+/// omitted cap as "clear the cap for this pool", so callers must never pass
+/// `None` for a tenant or key that has a cap configured. Caps that are unset,
+/// zero, or negative mean "no cap".
+///
+/// The tenant cap is read from the *per-key* cached `ResolvedKey`, so for the
+/// short window after a tenant's quota changes, two keys of the same tenant can
+/// carry different tenant caps and the last admit wins for that pool. It
+/// self-corrects once the cached keys refresh.
+pub(crate) fn admit_request_for(
+    resolved: &ResolvedKey,
+    model: &str,
+    route: Option<&ResolvedModel>,
+    weight: i64,
+    cost: u32,
+) -> obleth_fairshare::AdmitRequest {
+    let positive = |c: Option<i64>| c.and_then(|c| usize::try_from(c).ok()).filter(|c| *c > 0);
+    obleth_fairshare::AdmitRequest {
+        tenant: resolved.tenant_id,
+        key: resolved.key_id,
+        weight,
+        key_weight: resolved.key_weight.max(1),
+        group: resolved.fairshare_group.clone(),
+        group_weight: resolved.group_weight,
+        model: model.to_string(),
+        model_max_in_flight: route.and_then(|r| r.max_in_flight).filter(|c| *c > 0),
+        tenant_max_in_flight: positive(resolved.max_in_flight),
+        key_max_in_flight: positive(resolved.key_max_in_flight),
+        cost,
+    }
+}
+
 /// OpenAI-style endpoints that must resolve to a registered model route.
 /// Unregistered models must not fall through to the default benchmark fixture upstream.
 /// Evaluate a tenant's schedule against the current instant. Returns `Ok(())`
@@ -3938,10 +3969,10 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        backoff_for, build_targets, build_upstream_url, effective_request_type, has_path_traversal,
-        is_chat_path, is_models_collection, is_models_endpoint, is_responses_surface,
-        is_retryable_status, prepare_upstream_body, request_type_for_path, resolve_conversation,
-        session_hash_order, tenant_active_now, weighted_order, RequestMeta,
+        admit_request_for, backoff_for, build_targets, build_upstream_url, effective_request_type,
+        has_path_traversal, is_chat_path, is_models_collection, is_models_endpoint,
+        is_responses_surface, is_retryable_status, prepare_upstream_body, request_type_for_path,
+        resolve_conversation, session_hash_order, tenant_active_now, weighted_order, RequestMeta,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::http::HeaderMap;
@@ -3999,6 +4030,8 @@ mod tests {
             key_budget_cost_usd: None,
             key_budget_period: None,
             key_budget_started_at: None,
+            key_weight: 100,
+            key_max_in_flight: None,
             allowed_models: None,
             internal: false,
             tracing_enabled: false,
@@ -5048,5 +5081,39 @@ mod tests {
         assert!(obj.contains_key("scored"), "missing `scored`: {obj:?}");
         assert!(obj.contains_key("rejected"), "missing `rejected`: {obj:?}");
         assert_eq!(value["classifier_ms"], serde_json::json!(7));
+    }
+
+    #[test]
+    fn admit_request_carries_key_identity_and_per_model_caps() {
+        let mut resolved = key_with_schedule("UTC", None, None, None);
+        resolved.key_id = Uuid::new_v4();
+        resolved.tenant_id = Uuid::new_v4();
+        resolved.fairshare_group = "grp".into();
+        resolved.group_weight = 7;
+        resolved.key_weight = 250;
+        resolved.key_max_in_flight = Some(2);
+        resolved.max_in_flight = Some(5);
+        let mut route = minimal_model("m");
+        route.max_in_flight = Some(9);
+        let req = admit_request_for(&resolved, "m", Some(&route), 77, 123);
+        assert_eq!(req.tenant, resolved.tenant_id);
+        assert_eq!(req.key, resolved.key_id);
+        assert_eq!(req.weight, 77);
+        assert_eq!(req.key_weight, 250);
+        assert_eq!(req.group, resolved.fairshare_group);
+        assert_eq!(req.group_weight, resolved.group_weight);
+        assert_eq!(req.model, "m");
+        assert_eq!(req.model_max_in_flight, Some(9));
+        assert_eq!(req.tenant_max_in_flight, Some(5));
+        assert_eq!(req.key_max_in_flight, Some(2));
+        assert_eq!(req.cost, 123);
+
+        // Zero and negative caps mean "no cap".
+        resolved.max_in_flight = Some(0);
+        resolved.key_max_in_flight = Some(-1);
+        let req = admit_request_for(&resolved, "m", None, 1, 1);
+        assert_eq!(req.tenant_max_in_flight, None);
+        assert_eq!(req.key_max_in_flight, None);
+        assert_eq!(req.model_max_in_flight, None);
     }
 }

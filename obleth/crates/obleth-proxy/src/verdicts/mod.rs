@@ -591,15 +591,13 @@ async fn handler_inner(
     let admission_start = crate::tracer::now_ms();
     let admitted = match state
         .fairshare
-        .admit(obleth_fairshare::AdmitRequest {
-            tenant: resolved.tenant_id,
-            weight: effective_weight,
-            group: resolved.fairshare_group.clone(),
-            group_weight: resolved.group_weight,
-            model: model.clone(),
-            model_max_in_flight: route.max_in_flight,
-            cost: est.total(),
-        })
+        .admit(crate::proxy::admit_request_for(
+            &resolved,
+            &model,
+            Some(&route),
+            effective_weight,
+            est.total(),
+        ))
         .await
     {
         Some(a) => a,

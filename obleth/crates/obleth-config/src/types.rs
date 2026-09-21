@@ -144,6 +144,11 @@ fn default_key_kind() -> String {
     API_KEY_KIND_SECRET.to_string()
 }
 
+/// Default fairshare weight for a key when unset (legacy records, defaults).
+pub fn default_key_weight() -> i64 {
+    100
+}
+
 /// An API key. The raw secret is never stored; only its hash + a display prefix.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKey {
@@ -184,6 +189,12 @@ pub struct ApiKey {
     /// When this key's current budget term began.
     #[serde(default)]
     pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fairshare weight among this tenant's keys. Default 100.
+    #[serde(default = "default_key_weight")]
+    pub weight: i64,
+    /// Per-model in-flight ceiling for this key. `None` = no cap.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
     pub disabled: bool,
     pub tracing_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -262,6 +273,12 @@ pub struct ResolvedKey {
     /// When the key's current budget term began.
     #[serde(default)]
     pub key_budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fairshare weight among the tenant's keys (see `ApiKey::weight`).
+    #[serde(default = "default_key_weight")]
+    pub key_weight: i64,
+    /// Per-model in-flight ceiling for the key. `None` = no cap.
+    #[serde(default)]
+    pub key_max_in_flight: Option<i64>,
     /// Optional per-tenant model allowlist. Empty/`None` = all models permitted.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
@@ -2607,6 +2624,12 @@ pub struct ApiKeyBackup {
     pub budget_period: Option<String>,
     #[serde(default)]
     pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fairshare weight among this tenant's keys. Default 100.
+    #[serde(default = "default_key_weight")]
+    pub weight: i64,
+    /// Per-model in-flight ceiling for this key. `None` = no cap.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
     pub disabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }

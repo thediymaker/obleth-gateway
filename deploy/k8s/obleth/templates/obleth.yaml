@@ -62,6 +62,7 @@ spec:
             - { name: OBLETH_CLICKHOUSE_USER, value: {{ .Values.clickhouse.user | quote }} }
             - { name: OBLETH_UPSTREAM_BASE_URL, value: {{ include "obleth.upstream" . | quote }} }
             - { name: OBLETH_GLOBAL_MAX_IN_FLIGHT, value: {{ .Values.obleth.globalMaxInFlight | quote }} }
+            - { name: OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT, value: {{ .Values.obleth.defaultModelMaxInFlight | quote }} }
             - { name: OBLETH_FAIL_OPEN, value: {{ .Values.obleth.failOpen | quote }} }
             - { name: OBLETH_ALLOWED_PRIVATE_CIDRS, value: {{ .Values.obleth.allowedPrivateCidrs | quote }} }
             - { name: OBLETH_MODEL_HEALTH_ENABLED, value: {{ .Values.obleth.modelHealthEnabled | quote }} }

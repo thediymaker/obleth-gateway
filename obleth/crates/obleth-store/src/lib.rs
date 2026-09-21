@@ -88,6 +88,7 @@ const SCHEMA_V21: &str =
     include_str!("../../../../schema/postgres/0021_knowledge_reindex_requested.sql");
 const SCHEMA_V24: &str =
     include_str!("../../../../schema/postgres/0024_model_aliases_and_quantization.sql");
+const SCHEMA_V25: &str = include_str!("../../../../schema/postgres/0025_api_key_fairshare.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -228,6 +229,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V22).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V23).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V24).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V25).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -630,16 +632,20 @@ impl Store {
         budget_cost_usd: Option<f64>,
         budget_period: Option<&str>,
         budget_started_at: Option<DateTime<Utc>>,
+        weight: i64,
+        max_in_flight: Option<i64>,
     ) -> Result<(ApiKey, String)> {
         let gen = generate_api_key();
         let row = sqlx::query(
             "insert into api_keys (id, tenant_id, name, description, key_prefix, key_hash,
-                    budget_tokens, budget_cost_usd, budget_period, budget_started_at)
-             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                    budget_tokens, budget_cost_usd, budget_period, budget_started_at,
+                    weight, max_in_flight)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              returning id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                     disabled, tracing_enabled, created_at, updated_at,
-                    kind, identity_issuer, identity_subject, identity_claims",
+                    kind, identity_issuer, identity_subject, identity_claims,
+                    weight, max_in_flight",
         )
         .bind(Uuid::new_v4())
         .bind(tenant_id)
@@ -651,6 +657,8 @@ impl Store {
         .bind(budget_cost_usd)
         .bind(budget_period)
         .bind(budget_started_at)
+        .bind(weight.max(1))
+        .bind(max_in_flight)
         .fetch_one(&self.pool)
         .await?;
         Ok((api_key_from_row(&row)?, gen.secret))
@@ -893,6 +901,8 @@ impl Store {
                     None,
                     None,
                     None,
+                    100,
+                    None,
                 )
                 .await?;
             let enc = cipher().encrypt(&secret);
@@ -966,7 +976,8 @@ impl Store {
                     "select id, tenant_id, name, description, key_prefix,
                             budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                             disabled, tracing_enabled, created_at, updated_at,
-                            kind, identity_issuer, identity_subject, identity_claims
+                            kind, identity_issuer, identity_subject, identity_claims,
+                            weight, max_in_flight
                      from api_keys where tenant_id = $1 order by created_at",
                 )
                 .bind(t)
@@ -978,7 +989,8 @@ impl Store {
                     "select id, tenant_id, name, description, key_prefix,
                             budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                             disabled, tracing_enabled, created_at, updated_at,
-                            kind, identity_issuer, identity_subject, identity_claims
+                            kind, identity_issuer, identity_subject, identity_claims,
+                            weight, max_in_flight
                      from api_keys order by created_at",
                 )
                 .fetch_all(&self.pool)
@@ -999,7 +1011,8 @@ impl Store {
             "select id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                     disabled, tracing_enabled, created_at, updated_at,
-                    kind, identity_issuer, identity_subject, identity_claims
+                    kind, identity_issuer, identity_subject, identity_claims,
+                    weight, max_in_flight
              from api_keys where id = any($1)",
         )
         .bind(ids)
@@ -1018,6 +1031,8 @@ impl Store {
         budget_cost_usd: Option<f64>,
         budget_period: Option<&str>,
         budget_started_at: Option<DateTime<Utc>>,
+        weight: i64,
+        max_in_flight: Option<i64>,
     ) -> Result<(String, ApiKey, ResolvedKey)> {
         self.guard_reserved_key(id).await?;
         let row = sqlx::query(
@@ -1028,12 +1043,15 @@ impl Store {
                  budget_cost_usd = $5,
                  budget_period = $6,
                  budget_started_at = $7,
+                 weight = $8,
+                 max_in_flight = $9,
                  updated_at = now()
              where id = $1
              returning key_hash, id, tenant_id, name, description, key_prefix,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                     disabled, tracing_enabled, created_at, updated_at,
-                    kind, identity_issuer, identity_subject, identity_claims",
+                    kind, identity_issuer, identity_subject, identity_claims,
+                    weight, max_in_flight",
         )
         .bind(id)
         .bind(name)
@@ -1042,6 +1060,8 @@ impl Store {
         .bind(budget_cost_usd)
         .bind(budget_period)
         .bind(budget_started_at)
+        .bind(weight.max(1))
+        .bind(max_in_flight)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1148,6 +1168,7 @@ impl Store {
                     k.budget_cost_usd as key_budget_cost_usd,
                     k.budget_period as key_budget_period,
                     k.budget_started_at as key_budget_started_at,
+                    k.weight as key_weight, k.max_in_flight as key_max_in_flight,
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
@@ -1176,6 +1197,7 @@ impl Store {
                     k.budget_cost_usd as key_budget_cost_usd,
                     k.budget_period as key_budget_period,
                     k.budget_started_at as key_budget_started_at,
+                    k.weight as key_weight, k.max_in_flight as key_max_in_flight,
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
@@ -1208,6 +1230,7 @@ impl Store {
                     k.budget_cost_usd as key_budget_cost_usd,
                     k.budget_period as key_budget_period,
                     k.budget_started_at as key_budget_started_at,
+                    k.weight as key_weight, k.max_in_flight as key_max_in_flight,
                     t.allowed_models,
                     (k.tracing_enabled OR t.tracing_enabled) AS tracing_enabled,
                     t.guardrails_policy,
@@ -3358,6 +3381,8 @@ fn api_key_from_row(row: &PgRow) -> Result<ApiKey> {
         budget_cost_usd: row.try_get("budget_cost_usd")?,
         budget_period: row.try_get("budget_period")?,
         budget_started_at: row.try_get("budget_started_at")?,
+        weight: row.try_get("weight").unwrap_or(100),
+        max_in_flight: row.try_get("max_in_flight").unwrap_or(None),
         disabled: row.try_get("disabled")?,
         tracing_enabled: row.try_get("tracing_enabled").unwrap_or(false),
         created_at: row.try_get("created_at")?,
@@ -3389,6 +3414,8 @@ fn resolved_from_row(row: &PgRow) -> Result<ResolvedKey> {
         key_budget_cost_usd: row.try_get("key_budget_cost_usd")?,
         key_budget_period: row.try_get("key_budget_period")?,
         key_budget_started_at: row.try_get("key_budget_started_at")?,
+        key_weight: row.try_get("key_weight").unwrap_or(100),
+        key_max_in_flight: row.try_get("key_max_in_flight").unwrap_or(None),
         allowed_models: allowed_models_from_row(row)?,
         internal: false,
         tracing_enabled: row.try_get::<bool, _>("tracing_enabled").unwrap_or(false),
@@ -3986,7 +4013,7 @@ mod tests {
         assert_eq!(tenant.weight, 250);
 
         let (key, secret) = store
-            .create_api_key(tenant.id, "k", "", None, None, None, None)
+            .create_api_key(tenant.id, "k", "", None, None, None, None, 100, None)
             .await
             .expect("create key");
         let hash = hash_api_key(&secret);
@@ -4277,7 +4304,7 @@ mod tests {
         );
 
         let (_key, secret) = store
-            .create_api_key(tenant.id, "k", "", None, None, None, None)
+            .create_api_key(tenant.id, "k", "", None, None, None, None, 100, None)
             .await
             .expect("create key");
         let hash = hash_api_key(&secret);
@@ -4287,6 +4314,48 @@ mod tests {
             .expect("resolve")
             .expect("present");
         assert!(resolved.synthetic);
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Per-key fairshare weight and max_in_flight must round-trip through
+    /// create/update and flow through into the resolved hot-path key view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn key_weight_and_cap_round_trip_to_resolved_key() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let name = format!("t-{}", Uuid::new_v4());
+        let tenant = store
+            .create_tenant(&name, 100, 0, None, None)
+            .await
+            .expect("create tenant");
+        fixtures.track_tenant(tenant.id);
+
+        let (key, secret) = store
+            .create_api_key(tenant.id, "alice", "", None, None, None, None, 250, Some(3))
+            .await
+            .unwrap();
+        assert_eq!(key.weight, 250);
+        assert_eq!(key.max_in_flight, Some(3));
+        let hash = obleth_config::hash_api_key(&secret);
+        let resolved = store.resolved_key_by_hash(&hash).await.unwrap().unwrap();
+        assert_eq!(resolved.key_weight, 250);
+        assert_eq!(resolved.key_max_in_flight, Some(3));
+
+        let (_, updated, resolved) = store
+            .update_api_key(key.id, "alice", "", None, None, None, None, 100, None)
+            .await
+            .unwrap();
+        assert_eq!(updated.weight, 100);
+        assert_eq!(updated.max_in_flight, None);
+        assert_eq!(resolved.key_weight, 100);
+        assert_eq!(resolved.key_max_in_flight, None);
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
@@ -4543,7 +4612,7 @@ mod tests {
             .expect("create tenant");
         fixtures.track_tenant(tenant.id);
         store
-            .create_api_key(tenant.id, "k", "", None, None, None, None)
+            .create_api_key(tenant.id, "k", "", None, None, None, None, 100, None)
             .await
             .expect("create key");
 

@@ -91,7 +91,8 @@ impl Store {
             "select id, tenant_id, name, description, key_prefix, key_hash,
                     budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                     disabled, created_at,
-                    kind, identity_issuer, identity_subject, identity_claims
+                    kind, identity_issuer, identity_subject, identity_claims,
+                    weight, max_in_flight
              from api_keys order by created_at",
         )
         .fetch_all(&self.pool)
@@ -117,6 +118,8 @@ impl Store {
                 budget_cost_usd: row.try_get("budget_cost_usd")?,
                 budget_period: row.try_get("budget_period")?,
                 budget_started_at: row.try_get("budget_started_at")?,
+                weight: row.try_get("weight").unwrap_or(100),
+                max_in_flight: row.try_get("max_in_flight").unwrap_or(None),
                 disabled: row.try_get("disabled")?,
                 created_at: row.try_get("created_at")?,
             })
@@ -329,8 +332,9 @@ impl Store {
                 "insert into api_keys (id, tenant_id, name, description, key_prefix, key_hash,
                         budget_tokens, budget_cost_usd, budget_period, budget_started_at,
                         disabled, created_at, kind, identity_issuer, identity_subject,
-                        identity_claims)
-                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+                        identity_claims, weight, max_in_flight)
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
+                         $17, $18)
                  on conflict (id) do update set
                         tenant_id = excluded.tenant_id,
                         name = excluded.name,
@@ -346,6 +350,8 @@ impl Store {
                         identity_issuer = excluded.identity_issuer,
                         identity_subject = excluded.identity_subject,
                         identity_claims = excluded.identity_claims,
+                        weight = excluded.weight,
+                        max_in_flight = excluded.max_in_flight,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -365,6 +371,8 @@ impl Store {
             .bind(&k.identity_issuer)
             .bind(&k.identity_subject)
             .bind(k.identity_claims.clone().map(sqlx::types::Json))
+            .bind(k.weight)
+            .bind(k.max_in_flight)
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -780,7 +788,17 @@ mod tests {
             .expect("create tenant");
         fixtures.track_tenant(tenant.id);
         let (key, secret) = store
-            .create_api_key(tenant.id, "backup-test", "", None, None, None, None)
+            .create_api_key(
+                tenant.id,
+                "backup-test",
+                "",
+                None,
+                None,
+                None,
+                None,
+                100,
+                None,
+            )
             .await
             .expect("create key");
         let hash = obleth_config::hash_api_key(&secret);

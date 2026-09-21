@@ -80,6 +80,9 @@ pub struct AdminState {
     pub redis: RedisStore,
     pub capacity: Arc<StaticCapacity>,
     pub fairshare: FairShare,
+    /// Per-model in-flight cap used for models that don't set their own
+    /// `max_in_flight`, sourced from `cfg.default_model_max_in_flight`.
+    pub default_model_max_in_flight: usize,
     pub fairshare_stats: Arc<Stats>,
     pub clickhouse: clickhouse::Client,
     pub admin_token: String,
@@ -542,6 +545,12 @@ pub struct CreateKey {
     /// When the current key term began.
     #[serde(default)]
     pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fairshare weight among the tenant's keys. Default 100, minimum 1.
+    #[serde(default = "obleth_config::default_key_weight")]
+    pub weight: i64,
+    /// Per-model in-flight ceiling for this key. `null` clears the cap.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -561,6 +570,12 @@ pub struct UpdateKey {
     /// When the current key term began.
     #[serde(default)]
     pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fairshare weight among the tenant's keys. Default 100, minimum 1.
+    #[serde(default = "obleth_config::default_key_weight")]
+    pub weight: i64,
+    /// Per-model in-flight ceiling for this key. `null` clears the cap.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -620,11 +635,13 @@ fn normalize_budget_fields(
     Ok((period, started_at))
 }
 
+/// Total in-flight ceiling across all model pools, not a fairness budget.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetCapacity {
     pub max_in_flight: usize,
 }
 
+/// Total in-flight ceiling across all model pools, not a fairness budget.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CapacityView {
     pub max_in_flight: usize,
@@ -653,7 +670,7 @@ pub struct OverviewSummaryView {
     pub key_count: i64,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct GroupFairshareView {
     pub name: String,
     pub weight: i64,
@@ -669,13 +686,14 @@ pub struct GroupFairshareView {
     pub expected_slots: f64,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TenantFairshareView {
     #[schema(value_type = String)]
     pub tenant_id: Uuid,
     pub name: String,
     pub fairshare_group: String,
     pub weight: i64,
+    pub max_in_flight: Option<usize>,
     pub in_flight: usize,
     pub queued: usize,
     pub served_tokens: f64,
@@ -685,16 +703,57 @@ pub struct TenantFairshareView {
     pub expected_slots: f64,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct KeyFairshareView {
+    #[schema(value_type = String)]
+    pub key_id: Uuid,
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    pub name: String,
+    pub weight: i64,
+    pub max_in_flight: Option<usize>,
+    pub in_flight: usize,
+    pub queued: usize,
+    pub served_tokens: f64,
+    pub share_score: f64,
+    pub weight_share: f64,
+    pub expected_slots: f64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ModelPoolView {
+    pub model: String,
+    pub cap: usize,
+    pub in_flight: usize,
+    pub queued: usize,
+    pub borrowed: usize,
+    pub groups: Vec<GroupFairshareView>,
+    pub tenants: Vec<TenantFairshareView>,
+    pub keys: Vec<KeyFairshareView>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FairshareLiveView {
     pub algorithm: String,
+    /// Slots the gateway can run: the sum of the enabled models' pool sizes,
+    /// taken from the database rather than from the snapshot, so a model that
+    /// has had no traffic yet still counts. The aggregated `weight_share`
+    /// below is normalized against the sum of the caps of the pools that are
+    /// *present in the snapshot*, so the two can differ until every enabled
+    /// model has been used at least once.
     pub max_in_flight: usize,
+    /// Total in-flight ceiling across all pools (`OBLETH_GLOBAL_MAX_IN_FLIGHT`).
+    pub hard_ceiling: usize,
+    pub default_model_max_in_flight: usize,
     pub global_in_flight: usize,
     pub global_queued: i64,
     /// Total occupancy above the apportioned group caps.
     pub global_borrowed: usize,
+    /// Aggregated across pools (see `aggregate_pools`).
     pub groups: Vec<GroupFairshareView>,
     pub tenants: Vec<TenantFairshareView>,
+    pub keys: Vec<KeyFairshareView>,
+    pub pools: Vec<ModelPoolView>,
     /// Live in-flight request count per model name.
     #[serde(default)]
     pub model_in_flight: std::collections::HashMap<String, usize>,
@@ -3205,6 +3264,12 @@ async fn create_key(
     if name.is_empty() {
         return Err(AdminError::BadRequest("key name is required".into()));
     }
+    if body.weight < 1 {
+        return Err(AdminError::BadRequest("weight must be >= 1".into()));
+    }
+    if matches!(body.max_in_flight, Some(c) if c < 1) {
+        return Err(AdminError::BadRequest("max_in_flight must be >= 1".into()));
+    }
     let description = body.description.trim().to_string();
     let (period, started_at) = normalize_budget_fields(
         body.budget_tokens,
@@ -3225,6 +3290,8 @@ async fn create_key(
             body.budget_cost_usd,
             period.as_deref(),
             started_at,
+            body.weight,
+            body.max_in_flight,
         )
         .await?;
     let hash = hash_api_key(&secret);
@@ -3245,6 +3312,8 @@ async fn create_key(
                 "budget_cost_usd": key.budget_cost_usd,
                 "budget_period": key.budget_period,
                 "budget_started_at": key.budget_started_at,
+                "weight": key.weight,
+                "max_in_flight": key.max_in_flight,
             }),
         )
         .await?;
@@ -3301,6 +3370,12 @@ async fn update_key(
     if name.is_empty() {
         return Err(AdminError::BadRequest("key name is required".into()));
     }
+    if body.weight < 1 {
+        return Err(AdminError::BadRequest("weight must be >= 1".into()));
+    }
+    if matches!(body.max_in_flight, Some(c) if c < 1) {
+        return Err(AdminError::BadRequest("max_in_flight must be >= 1".into()));
+    }
     let description = body.description.trim().to_string();
     let (period, started_at) = normalize_budget_fields(
         body.budget_tokens,
@@ -3321,6 +3396,8 @@ async fn update_key(
             body.budget_cost_usd,
             period.as_deref(),
             started_at,
+            body.weight,
+            body.max_in_flight,
         )
         .await?;
     push_key(&state, &hash, &resolved).await?;
@@ -3338,6 +3415,8 @@ async fn update_key(
                 "budget_cost_usd": key.budget_cost_usd,
                 "budget_period": key.budget_period,
                 "budget_started_at": key.budget_started_at,
+                "weight": key.weight,
+                "max_in_flight": key.max_in_flight,
             }),
         )
         .await?;
@@ -3977,6 +4056,139 @@ async fn get_overview_summary(
     }))
 }
 
+/// Slots the gateway can actually run: the sum of the enabled models' pool
+/// sizes, each model's `max_in_flight` or the gateway default.
+pub fn enabled_pool_capacity(models: &[ModelRoute], default_cap: usize) -> usize {
+    models
+        .iter()
+        .filter(|m| m.enabled)
+        .map(|m| {
+            m.max_in_flight
+                .and_then(|c| usize::try_from(c).ok())
+                .filter(|c| *c > 0)
+                .unwrap_or(default_cap)
+        })
+        .sum()
+}
+
+/// Fold per-pool views into one all-models view. Occupancy, backlog, served
+/// tokens and expected slots add; `weight_share` becomes expected slots over
+/// total pool capacity so it stays in [0, 1].
+pub(crate) fn aggregate_pools(
+    pools: &[ModelPoolView],
+) -> (
+    Vec<GroupFairshareView>,
+    Vec<TenantFairshareView>,
+    Vec<KeyFairshareView>,
+) {
+    use std::collections::BTreeMap;
+    let total_cap: usize = pools.iter().map(|p| p.cap).sum();
+    let share = |expected: f64| {
+        if total_cap > 0 {
+            expected / total_cap as f64
+        } else {
+            0.0
+        }
+    };
+
+    let mut groups: BTreeMap<String, GroupFairshareView> = BTreeMap::new();
+    let mut tenants: BTreeMap<Uuid, TenantFairshareView> = BTreeMap::new();
+    let mut keys: BTreeMap<Uuid, KeyFairshareView> = BTreeMap::new();
+    for pool in pools {
+        for g in &pool.groups {
+            let e = groups
+                .entry(g.name.clone())
+                .or_insert_with(|| GroupFairshareView {
+                    name: g.name.clone(),
+                    weight: g.weight,
+                    in_flight: 0,
+                    queued: 0,
+                    slot_cap: 0,
+                    borrowed: 0,
+                    served_tokens: 0.0,
+                    share_score: 0.0,
+                    weight_share: 0.0,
+                    expected_slots: 0.0,
+                });
+            e.in_flight += g.in_flight;
+            e.queued += g.queued;
+            e.slot_cap += g.slot_cap;
+            e.borrowed += g.borrowed;
+            e.served_tokens += g.served_tokens;
+            e.expected_slots += g.expected_slots;
+        }
+        for t in &pool.tenants {
+            let e = tenants
+                .entry(t.tenant_id)
+                .or_insert_with(|| TenantFairshareView {
+                    tenant_id: t.tenant_id,
+                    name: t.name.clone(),
+                    fairshare_group: t.fairshare_group.clone(),
+                    weight: t.weight,
+                    max_in_flight: t.max_in_flight,
+                    in_flight: 0,
+                    queued: 0,
+                    served_tokens: 0.0,
+                    share_score: 0.0,
+                    weight_share: 0.0,
+                    expected_slots: 0.0,
+                });
+            e.in_flight += t.in_flight;
+            e.queued += t.queued;
+            e.served_tokens += t.served_tokens;
+            e.expected_slots += t.expected_slots;
+        }
+        for k in &pool.keys {
+            let e = keys.entry(k.key_id).or_insert_with(|| KeyFairshareView {
+                key_id: k.key_id,
+                tenant_id: k.tenant_id,
+                name: k.name.clone(),
+                weight: k.weight,
+                max_in_flight: k.max_in_flight,
+                in_flight: 0,
+                queued: 0,
+                served_tokens: 0.0,
+                share_score: 0.0,
+                weight_share: 0.0,
+                expected_slots: 0.0,
+            });
+            e.in_flight += k.in_flight;
+            e.queued += k.queued;
+            e.served_tokens += k.served_tokens;
+            e.expected_slots += k.expected_slots;
+        }
+    }
+    let by_score = |a: f64, b: f64| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
+    let mut groups: Vec<_> = groups
+        .into_values()
+        .map(|mut g| {
+            g.share_score = g.served_tokens / g.weight.max(1) as f64;
+            g.weight_share = share(g.expected_slots);
+            g
+        })
+        .collect();
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut tenants: Vec<_> = tenants
+        .into_values()
+        .map(|mut t| {
+            t.share_score = t.served_tokens / t.weight.max(1) as f64;
+            t.weight_share = share(t.expected_slots);
+            t
+        })
+        .collect();
+    tenants.sort_by(|a, b| by_score(a.share_score, b.share_score));
+    let mut keys: Vec<_> = keys
+        .into_values()
+        .map(|mut k| {
+            k.share_score = k.served_tokens / k.weight.max(1) as f64;
+            k.weight_share = share(k.expected_slots);
+            k
+        })
+        .collect();
+    keys.sort_by(|a, b| by_score(a.share_score, b.share_score));
+    (groups, tenants, keys)
+}
+
 #[utoipa::path(
     get, path = "/api/v1/stats", tag = "usage",
     responses((status = 200, body = LiveStats))
@@ -3984,10 +4196,22 @@ async fn get_overview_summary(
 async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
     use obleth_fairshare::CapacityProvider;
     use std::sync::atomic::Ordering;
+    // The live counters are the point of this endpoint; a database hiccup
+    // should degrade the capacity number, not fail the poll.
+    let capacity = state
+        .store
+        .list_models()
+        .await
+        .map(|m| enabled_pool_capacity(&m, state.default_model_max_in_flight))
+        .unwrap_or(0);
     Json(LiveStats {
         in_flight: state.fairshare_stats.in_flight.load(Ordering::Relaxed),
         queued: state.fairshare_stats.queued.load(Ordering::Relaxed),
-        max_in_flight: state.capacity.max_in_flight(),
+        max_in_flight: if capacity > 0 {
+            capacity
+        } else {
+            state.capacity.max_in_flight()
+        },
     })
 }
 
@@ -4002,65 +4226,144 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         .await
         .ok_or(AdminError::Internal("fairshare unavailable".into()))?;
     let tenants = state.store.list_tenants().await?;
-    let names: std::collections::HashMap<Uuid, String> =
+    let tenant_names: std::collections::HashMap<Uuid, String> =
         tenants.into_iter().map(|t| (t.id, t.name)).collect();
-    let hidden_group = snap
-        .groups
+    let key_ids: Vec<Uuid> = snap
+        .pools
         .iter()
-        .find(|g| g.name == model_health::HEALTH_GROUP)
-        .cloned();
-    let hidden_in_flight = hidden_group.as_ref().map(|g| g.in_flight).unwrap_or(0);
-    let hidden_queued = hidden_group.as_ref().map(|g| g.queued).unwrap_or(0);
-    let model_in_flight = snap.model_in_flight.clone();
-    let model_queued = snap.model_queued.clone();
+        .flat_map(|p| p.keys.iter().map(|k| k.key_id))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let key_names: std::collections::HashMap<Uuid, String> = state
+        .store
+        .keys_by_ids(&key_ids)
+        .await?
+        .into_iter()
+        .map(|k| (k.id, k.name))
+        .collect();
+    let models = state.store.list_models().await?;
+    let capacity = enabled_pool_capacity(&models, state.default_model_max_in_flight);
+
+    // Pools outlive their model: a renamed, deleted or disabled model keeps an
+    // empty pool in the scheduler until restart. Every pool with visible
+    // traffic is kept; the idle ones are dropped unless an enabled model still
+    // answers to that name or one of its aliases.
+    let live_names: std::collections::HashSet<&str> = models
+        .iter()
+        .filter(|m| m.enabled)
+        .flat_map(|m| {
+            std::iter::once(m.model_name.as_str()).chain(m.aliases.iter().map(String::as_str))
+        })
+        .collect();
+
+    let health_tenant = model_health::health_tenant_id();
+    let mut hidden_in_flight = 0usize;
+    let mut hidden_queued = 0usize;
+    let mut pools: Vec<ModelPoolView> = snap
+        .pools
+        .iter()
+        .map(|p| {
+            let cap = p.cap;
+            let hidden = p
+                .groups
+                .iter()
+                .find(|g| g.name == model_health::HEALTH_GROUP);
+            let h_in = hidden.map(|g| g.in_flight).unwrap_or(0);
+            let h_q = hidden.map(|g| g.queued).unwrap_or(0);
+            hidden_in_flight += h_in;
+            hidden_queued += h_q;
+            ModelPoolView {
+                model: p.model.clone(),
+                cap,
+                in_flight: p.in_flight.saturating_sub(h_in),
+                queued: p.queued.saturating_sub(h_q),
+                borrowed: p.borrowed,
+                groups: p
+                    .groups
+                    .iter()
+                    .filter(|g| g.name != model_health::HEALTH_GROUP)
+                    .map(|g| GroupFairshareView {
+                        name: g.name.clone(),
+                        weight: g.weight,
+                        in_flight: g.in_flight,
+                        queued: g.queued,
+                        slot_cap: g.slot_cap,
+                        borrowed: g.borrowed,
+                        served_tokens: g.served_tokens,
+                        share_score: g.share_score,
+                        weight_share: g.weight_share,
+                        expected_slots: g.weight_share * cap as f64,
+                    })
+                    .collect(),
+                tenants: p
+                    .tenants
+                    .iter()
+                    .filter(|t| {
+                        t.tenant_id != health_tenant
+                            && t.fairshare_group != model_health::HEALTH_GROUP
+                    })
+                    .map(|t| TenantFairshareView {
+                        tenant_id: t.tenant_id,
+                        name: tenant_names
+                            .get(&t.tenant_id)
+                            .cloned()
+                            .unwrap_or_else(|| t.tenant_id.to_string()),
+                        fairshare_group: t.fairshare_group.clone(),
+                        weight: t.weight,
+                        max_in_flight: t.max_in_flight,
+                        in_flight: t.in_flight,
+                        queued: t.queued,
+                        served_tokens: t.served_tokens,
+                        share_score: t.share_score,
+                        weight_share: t.weight_share,
+                        expected_slots: t.weight_share * cap as f64,
+                    })
+                    .collect(),
+                keys: p
+                    .keys
+                    .iter()
+                    .filter(|k| k.tenant_id != health_tenant)
+                    .map(|k| KeyFairshareView {
+                        key_id: k.key_id,
+                        tenant_id: k.tenant_id,
+                        name: key_names
+                            .get(&k.key_id)
+                            .cloned()
+                            .unwrap_or_else(|| k.key_id.to_string()),
+                        weight: k.weight,
+                        max_in_flight: k.max_in_flight,
+                        in_flight: k.in_flight,
+                        queued: k.queued,
+                        served_tokens: k.served_tokens,
+                        share_score: k.share_score,
+                        weight_share: k.weight_share,
+                        expected_slots: k.weight_share * cap as f64,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    pools.retain(|p| p.in_flight > 0 || p.queued > 0 || live_names.contains(p.model.as_str()));
+    let (groups, tenants, keys) = aggregate_pools(&pools);
     Ok(Json(FairshareLiveView {
         algorithm: snap.algorithm,
-        max_in_flight: snap.max_in_flight,
+        max_in_flight: if capacity > 0 {
+            capacity
+        } else {
+            snap.max_in_flight
+        },
+        hard_ceiling: snap.max_in_flight,
+        default_model_max_in_flight: snap.default_model_max_in_flight,
         global_in_flight: snap.global_in_flight.saturating_sub(hidden_in_flight),
         global_queued: snap.global_queued.saturating_sub(hidden_queued) as i64,
         global_borrowed: snap.global_borrowed,
-        groups: snap
-            .groups
-            .into_iter()
-            .filter(|g| g.name != model_health::HEALTH_GROUP)
-            .map(|g| GroupFairshareView {
-                name: g.name,
-                weight: g.weight,
-                in_flight: g.in_flight,
-                queued: g.queued,
-                slot_cap: g.slot_cap,
-                borrowed: g.borrowed,
-                served_tokens: g.served_tokens,
-                share_score: g.share_score,
-                weight_share: g.weight_share,
-                expected_slots: g.weight_share * snap.max_in_flight as f64,
-            })
-            .collect(),
-        tenants: snap
-            .tenants
-            .into_iter()
-            .filter(|t| {
-                t.tenant_id != model_health::health_tenant_id()
-                    && t.fairshare_group != model_health::HEALTH_GROUP
-            })
-            .map(|t| TenantFairshareView {
-                name: names
-                    .get(&t.tenant_id)
-                    .cloned()
-                    .unwrap_or_else(|| t.tenant_id.to_string()),
-                fairshare_group: t.fairshare_group,
-                expected_slots: t.weight_share * snap.max_in_flight as f64,
-                tenant_id: t.tenant_id,
-                weight: t.weight,
-                in_flight: t.in_flight,
-                queued: t.queued,
-                served_tokens: t.served_tokens,
-                share_score: t.share_score,
-                weight_share: t.weight_share,
-            })
-            .collect(),
-        model_in_flight,
-        model_queued,
+        groups,
+        tenants,
+        keys,
+        pools,
+        model_in_flight: snap.model_in_flight,
+        model_queued: snap.model_queued,
     }))
 }
 
@@ -5593,6 +5896,7 @@ mod tests {
             let fairshare = FairShare::start(
                 capacity.clone(),
                 obleth_config::FairshareAlgorithm::default(),
+                32,
             );
             let http = reqwest::Client::new();
             let alerts = AlertDispatcher::new(http.clone(), AlertSettings::default());
@@ -5602,6 +5906,7 @@ mod tests {
                 capacity,
                 fairshare: fairshare.clone(),
                 fairshare_stats: fairshare.stats(),
+                default_model_max_in_flight: 32,
                 // Never dialled: no route under test reads ClickHouse.
                 clickhouse: clickhouse::Client::default(),
                 admin_token: TEST_ADMIN_TOKEN.to_string(),
@@ -5850,15 +6155,12 @@ mod tests {
         for _ in 0..2 {
             let admitted = t
                 .fairshare
-                .admit(obleth_fairshare::AdmitRequest {
-                    tenant,
-                    weight: 100,
-                    group: "default".to_string(),
-                    group_weight: 100,
-                    model: name.clone(),
-                    model_max_in_flight: Some(4),
-                    cost: 1,
-                })
+                .admit(
+                    obleth_fairshare::AdmitRequest::new(tenant, name.clone(), 1)
+                        .weight(100)
+                        .group("default", 100)
+                        .model_cap(4),
+                )
                 .await
                 .expect("admitted");
             permits.push(admitted);
@@ -6066,6 +6368,160 @@ mod tests {
             "the unsupplied field must be carried forward unchanged, not cleared"
         );
         assert_eq!(body["vision_enabled"], serde_json::json!(true));
+    }
+
+    /// Fairshare weight and per-model cap are set on a key at creation and
+    /// edited afterwards, so both have to survive the round trip through the
+    /// store and come back on the response the dashboard renders.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn key_create_and_update_carry_fairshare_weight_and_cap() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let tenant = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        let post = |body: serde_json::Value| {
+            axum::http::Request::post(format!("/api/v1/tenants/{}/keys", tenant.id))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("build request")
+        };
+
+        let (status, created) = send(
+            &t.app,
+            post(serde_json::json!({ "name": "k", "weight": 250, "max_in_flight": 3 })),
+        )
+        .await;
+        let key_id = created["key"]["id"].as_str().map(|s| s.to_string());
+        let put = |body: serde_json::Value| {
+            axum::http::Request::put(format!(
+                "/api/v1/keys/{}",
+                key_id.clone().unwrap_or_default()
+            ))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("build request")
+        };
+        let updated = send(
+            &t.app,
+            put(serde_json::json!({ "name": "k", "weight": 100, "max_in_flight": null })),
+        )
+        .await;
+        let zero_weight = send(
+            &t.app,
+            post(serde_json::json!({ "name": "k2", "weight": 0 })),
+        )
+        .await;
+        let zero_cap = send(
+            &t.app,
+            post(serde_json::json!({ "name": "k3", "max_in_flight": 0 })),
+        )
+        .await;
+
+        let _ = t.store.delete_tenant(tenant.id).await;
+
+        assert_eq!(status, StatusCode::OK, "body: {created}");
+        assert_eq!(created["key"]["weight"], serde_json::json!(250));
+        assert_eq!(created["key"]["max_in_flight"], serde_json::json!(3));
+        assert_eq!(updated.0, StatusCode::OK, "body: {}", updated.1);
+        assert_eq!(updated.1["weight"], serde_json::json!(100));
+        assert_eq!(
+            updated.1["max_in_flight"],
+            serde_json::Value::Null,
+            "a null cap clears the per-model ceiling"
+        );
+        assert_eq!(zero_weight.0, StatusCode::BAD_REQUEST);
+        assert_eq!(zero_cap.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// The health prober admits through the same scheduler as real traffic, so
+    /// its hidden tenant and group have to be filtered out of every level of
+    /// the live view -- and the pool it created on its own must not show up as
+    /// a model either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn fairshare_live_hides_the_health_prober() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let health_tenant = model_health::health_tenant_id();
+        let probe = t
+            .fairshare
+            .admit(
+                obleth_fairshare::AdmitRequest::new(health_tenant, "probe-model", 1)
+                    .group(model_health::HEALTH_GROUP, 100),
+            )
+            .await
+            .expect("probe admitted");
+        let tenant = Uuid::new_v4();
+        let real = t
+            .fairshare
+            .admit(obleth_fairshare::AdmitRequest::new(tenant, "m", 1))
+            .await
+            .expect("tenant admitted");
+
+        let req = axum::http::Request::get("/api/v1/fairshare/live")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (status, body) = send(&t.app, req).await;
+
+        drop(probe);
+        drop(real);
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let pools = body["pools"].as_array().expect("pools is an array");
+        assert!(
+            pools
+                .iter()
+                .any(|p| p["model"] == serde_json::json!("m") && p["in_flight"] == 1),
+            "the tenant's pool is reported: {body}"
+        );
+        assert!(
+            !pools
+                .iter()
+                .any(|p| p["model"] == serde_json::json!("probe-model")),
+            "the prober's own pool is not a model an operator can act on: {body}"
+        );
+        let health_tenant = serde_json::json!(health_tenant.to_string());
+        let health_group = serde_json::json!(model_health::HEALTH_GROUP);
+        let rows = |level: &str| -> Vec<serde_json::Value> {
+            pools
+                .iter()
+                .flat_map(|p| p[level].as_array().cloned().unwrap_or_default())
+                .chain(body[level].as_array().cloned().unwrap_or_default())
+                .collect()
+        };
+        assert!(
+            rows("groups").iter().all(|g| g["name"] != health_group),
+            "the health group is filtered at every level: {body}"
+        );
+        assert!(
+            rows("tenants")
+                .iter()
+                .all(|t| t["tenant_id"] != health_tenant && t["fairshare_group"] != health_group),
+            "the health tenant is filtered at every level: {body}"
+        );
+        assert!(
+            rows("keys").iter().all(|k| k["tenant_id"] != health_tenant),
+            "the health tenant's key is filtered at every level: {body}"
+        );
+        assert_eq!(
+            body["global_in_flight"],
+            serde_json::json!(1),
+            "only the real request counts"
+        );
+        assert!(
+            body["hard_ceiling"].as_u64().unwrap_or(0) > 0,
+            "the total ceiling is reported: {body}"
+        );
+        assert_eq!(body["default_model_max_in_flight"], serde_json::json!(32));
     }
 
     /// A handler can carry `#[utoipa::path]` and still be missing from the
@@ -6348,5 +6804,131 @@ mod tests {
         assert_eq!(merged.poll_interval_secs, 60); // untouched default
         assert_eq!(merged.energy_cost_per_kwh, 0.15);
         assert_eq!(merged.pue, 1.0);
+    }
+
+    /// A model route with every field filled with sane defaults, for tests
+    /// that only care about a couple of fields (e.g. `enabled`/`max_in_flight`).
+    fn fixture_model_route(name: &str) -> ModelRoute {
+        let now = chrono::Utc::now();
+        ModelRoute {
+            id: Uuid::new_v4(),
+            model_name: name.to_string(),
+            aliases: Vec::new(),
+            description: String::new(),
+            upstream_model: name.to_string(),
+            api_base: "http://upstream.invalid".to_string(),
+            api_key: None,
+            model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
+            quantization: obleth_config::DEFAULT_QUANTIZATION.to_string(),
+            input_cost_per_token: 0.0,
+            output_cost_per_token: 0.0,
+            cost_per_image: 0.0,
+            cost_per_audio_second: 0.0,
+            cost_per_character: 0.0,
+            context_window: 128_000,
+            admission_weight: 100,
+            max_in_flight: None,
+            capacity_mode: obleth_config::DEFAULT_CAPACITY_MODE.to_string(),
+            capacity_tuned_at: None,
+            supports_function_calling: false,
+            supports_system_messages: false,
+            supports_response_schema: false,
+            supports_tool_choice: false,
+            supports_vision: false,
+            enabled: true,
+            cache_enabled: false,
+            cache_ttl_secs: 0,
+            tags: Vec::new(),
+            boons: Vec::new(),
+            tool_servers: Vec::new(),
+            request_timeout_secs: None,
+            max_retries: 0,
+            retry_backoff_ms: obleth_config::DEFAULT_RETRY_BACKOFF_MS,
+            endpoint_selection_mode: obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
+            debug_diagnostics: false,
+            energy_slots_per_node: 0,
+            route_bias: obleth_config::DEFAULT_ROUTE_BIAS,
+            auto_eligible: obleth_config::DEFAULT_AUTO_ELIGIBLE,
+            draft_model: String::new(),
+            verify_api_base: String::new(),
+            verify_upstream_model: String::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn pool(model: &str, cap: usize, tenants: Vec<TenantFairshareView>) -> ModelPoolView {
+        let in_flight = tenants.iter().map(|t| t.in_flight).sum();
+        ModelPoolView {
+            model: model.into(),
+            cap,
+            in_flight,
+            queued: 0,
+            borrowed: 0,
+            groups: vec![GroupFairshareView {
+                name: "g".into(),
+                weight: 100,
+                in_flight,
+                queued: 0,
+                slot_cap: cap,
+                borrowed: 0,
+                served_tokens: 0.0,
+                share_score: 0.0,
+                weight_share: 1.0,
+                expected_slots: cap as f64,
+            }],
+            tenants,
+            keys: vec![],
+        }
+    }
+    fn tv(
+        id: Uuid,
+        in_flight: usize,
+        served: f64,
+        share: f64,
+        expected: f64,
+    ) -> TenantFairshareView {
+        TenantFairshareView {
+            tenant_id: id,
+            name: "t".into(),
+            fairshare_group: "g".into(),
+            weight: 100,
+            max_in_flight: None,
+            in_flight,
+            queued: 0,
+            served_tokens: served,
+            share_score: served / 100.0,
+            weight_share: share,
+            expected_slots: expected,
+        }
+    }
+
+    #[test]
+    fn aggregate_pools_sums_occupancy_and_shares_by_pool_capacity() {
+        let t = Uuid::new_v4();
+        let pools = vec![
+            pool("a", 8, vec![tv(t, 2, 100.0, 0.5, 4.0)]),
+            pool("b", 2, vec![tv(t, 1, 50.0, 1.0, 2.0)]),
+        ];
+        let (groups, tenants, _) = aggregate_pools(&pools);
+        assert_eq!(tenants.len(), 1);
+        assert_eq!(tenants[0].in_flight, 3);
+        assert_eq!(tenants[0].served_tokens, 150.0);
+        assert_eq!(tenants[0].expected_slots, 6.0);
+        assert!((tenants[0].weight_share - 0.6).abs() < 1e-9); // 6 of 10 slots
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].slot_cap, 10);
+    }
+
+    #[test]
+    fn enabled_pool_capacity_uses_model_cap_or_default() {
+        let mut a = fixture_model_route("a");
+        a.max_in_flight = Some(4);
+        let mut b = fixture_model_route("b");
+        b.max_in_flight = None;
+        let mut c = fixture_model_route("c");
+        c.enabled = false;
+        c.max_in_flight = Some(100);
+        assert_eq!(enabled_pool_capacity(&[a, b, c], 32), 36);
     }
 }

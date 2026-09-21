@@ -9,17 +9,16 @@ image:
   pullPolicy: IfNotPresent
 
 obleth:
-  # Fairshare admission state is per-process: each replica runs its own
-  # scheduler and enforces globalMaxInFlight on its own, so N replicas admit up
-  # to N x globalMaxInFlight concurrently. The default is a single replica so
-  # the configured ceiling is the ceiling that reaches your upstream.
-  #
-  # For redundancy, set replicas: N and divide globalMaxInFlight by N. Replicas
-  # cannot lend each other idle capacity, so a quiet pod's share goes unused:
-  # the aggregate ceiling holds, but utilization is lower than one pod at the
-  # full ceiling. Keep hpa.enabled false when you do this — see below.
+  # Fairshare runs one scheduling pool per model, sized by the model's
+  # max_in_flight or defaultModelMaxInFlight. globalMaxInFlight is a total
+  # in-flight ceiling across all pools per replica, not a fairness input; keep
+  # it above the sum of the pool sizes you expect. Admission state is
+  # per-process: N replicas each enforce their own pools and ceiling, so the
+  # aggregate is N x the configured numbers. Keep hpa.enabled false when you
+  # run more than one replica (see below).
   replicas: 1
-  globalMaxInFlight: 256
+  globalMaxInFlight: 1024
+  defaultModelMaxInFlight: 32
   failOpen: true
   # REQUIRED. No default is shipped — supply via `--set obleth.adminToken=...`,
   # a values override, or (preferred) an external Secret. `openssl rand -hex 32`.
@@ -65,12 +64,13 @@ obleth:
     requests: { cpu: "250m", memory: "256Mi" }
     limits: { cpu: "2", memory: "1Gi" }
 
-# Off by default. obleth.globalMaxInFlight is enforced per replica, so an
-# autoscaled replica count moves the aggregate concurrency limit reaching your
-# upstream with no config change: scaling 2 -> 8 pods raises it fourfold. If you
-# enable this, divide globalMaxInFlight by maxReplicas so the ceiling still
-# holds at full scale-out, and accept that the upstream is under-subscribed
-# below that.
+# Off by default. Each replica enforces its own model pools and its own
+# globalMaxInFlight ceiling, so an autoscaled replica count moves the aggregate
+# concurrency limit reaching your upstream with no config change: scaling
+# 2 -> 8 pods raises it fourfold. If you enable this, size globalMaxInFlight
+# (and the pools you care about) so that replicas x those numbers stays within
+# what the upstream can absorb at maxReplicas, and accept that the upstream is
+# under-subscribed below full scale-out.
 hpa:
   enabled: false
   minReplicas: 1

@@ -6,6 +6,7 @@ pub const ALL_PROFILES: &[Profile] = &[
     Profile::Light,
     Profile::Heavy,
     Profile::Extreme,
+    Profile::Fairshare,
     Profile::Auto,
     Profile::Manual,
 ];

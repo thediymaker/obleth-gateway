@@ -103,6 +103,68 @@ pub fn append_fairshare_group_row(
     Ok(())
 }
 
+/// Append one per-model-pool observation to `{profile}-fairshare-pools.csv`.
+pub fn append_pool_row(
+    profile: &str,
+    t_s: f64,
+    pool: &crate::engine::fairshare::PoolSample,
+) -> Result<()> {
+    const HEADER: &str = "t_s,model,cap,in_flight,queued";
+    let path = out_dir().join(format!("{profile}-fairshare-pools.csv"));
+    let need_header = std::fs::metadata(&path)
+        .map(|m| m.len() == 0)
+        .unwrap_or(true);
+    let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+    if need_header {
+        writeln!(f, "{HEADER}")?;
+    }
+    writeln!(
+        f,
+        "{:.3},{},{},{},{}",
+        t_s,
+        csv_field(&pool.model),
+        pool.cap,
+        pool.in_flight,
+        pool.queued,
+    )?;
+    Ok(())
+}
+
+/// Append one per-key observation to `{profile}-fairshare-keys.csv`.
+pub fn append_key_row(
+    profile: &str,
+    t_s: f64,
+    model: &str,
+    sample: &crate::engine::fairshare::KeySample,
+) -> Result<()> {
+    const HEADER: &str = "t_s,model,tenant,key,weight,max_in_flight,in_flight,queued,served_tokens";
+    let path = out_dir().join(format!("{profile}-fairshare-keys.csv"));
+    let need_header = std::fs::metadata(&path)
+        .map(|m| m.len() == 0)
+        .unwrap_or(true);
+    let mut f = OpenOptions::new().create(true).append(true).open(&path)?;
+    if need_header {
+        writeln!(f, "{HEADER}")?;
+    }
+    writeln!(
+        f,
+        "{:.3},{},{},{},{},{},{},{},{:.1}",
+        t_s,
+        csv_field(model),
+        csv_field(&sample.tenant),
+        csv_field(&sample.name),
+        sample.weight,
+        sample
+            .max_in_flight
+            .map(|c| c.to_string())
+            .unwrap_or_default(),
+        sample.in_flight,
+        sample.queued,
+        sample.served_tokens,
+    )?;
+    Ok(())
+}
+
 /// Write the whole-run per-tenant results to `{profile}-fairshare-summary.csv`.
 pub fn write_fairshare_summary_csv(
     profile: &str,
@@ -226,6 +288,33 @@ pub fn render_fairshare(summary: &crate::engine::fairshare::FairshareSummary) ->
             ""
         }
     ));
+    out
+}
+
+/// Render the per-model pool block: one row per admission pool, so a single
+/// unfair or under-served model stands out against the fleet.
+pub fn render_pools(pools: &[crate::engine::fairshare::PoolSummary]) -> String {
+    if pools.is_empty() {
+        return "pools: no per-model samples collected".to_string();
+    }
+    let mut out = format!(
+        "per-model pools\n  {:<24}{:>5}{:>12}{:>10}{:>12}{:>8}{:>8}\n",
+        "model", "cap", "tenant jain", "key jain", "idle+queue", "capviol", "starved"
+    );
+    let mut rows: Vec<_> = pools.iter().collect();
+    rows.sort_by(|a, b| a.model.cmp(&b.model));
+    for p in rows {
+        out.push_str(&format!(
+            "  {:<24}{:>5}{:>12.3}{:>10.3}{:>12}{:>8}{:>8}\n",
+            fit(&p.model, 24),
+            p.cap,
+            p.tenants.jain_index,
+            p.key_jain_index,
+            p.idle_with_backlog_ticks,
+            p.cap_violations,
+            p.tenants.starved.len()
+        ));
+    }
     out
 }
 
@@ -360,6 +449,7 @@ mod tests {
             name: name.into(),
             group: group.into(),
             weight: 100,
+            max_in_flight: None,
             in_flight,
             queued: 2,
             served_tokens: 1000.0,
@@ -545,6 +635,71 @@ mod tests {
         let body = std::fs::read_to_string(&p).unwrap();
         assert_eq!(body.lines().count(), 2, "header + 1 competing tenant");
         assert!(!body.contains("__control_plane__"));
+    }
+
+    // ── per-pool and per-key reporting ────────────────────────────────────────
+
+    #[test]
+    fn pool_and_key_csvs_write_their_header_once() {
+        let _guard = crate::report::TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join("obench-fs-pools");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("BENCH_OUT_DIR", dir.to_str().unwrap());
+
+        let key = crate::engine::fairshare::KeySample {
+            tenant: "obench-course-a".into(),
+            name: "user-e".into(),
+            weight: 100,
+            max_in_flight: Some(1),
+            in_flight: 1,
+            queued: 3,
+            served_tokens: 4200.0,
+        };
+        let pool = crate::engine::fairshare::PoolSample {
+            model: "obench-base".into(),
+            cap: 8,
+            in_flight: 8,
+            queued: 11,
+            tenants: vec![sample("obench-course-a", "obench-chatbot", 4, 0.5)],
+            keys: vec![key.clone()],
+        };
+        append_pool_row("unit", 0.0, &pool).unwrap();
+        append_pool_row("unit", 1.0, &pool).unwrap();
+        append_key_row("unit", 0.0, &pool.model, &key).unwrap();
+        append_key_row("unit", 1.0, &pool.model, &key).unwrap();
+
+        let pools = std::fs::read_to_string(out_dir().join("unit-fairshare-pools.csv")).unwrap();
+        let lines: Vec<&str> = pools.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 rows, got {pools:?}");
+        assert_eq!(lines[0], "t_s,model,cap,in_flight,queued");
+        assert_eq!(lines[1], "0.000,obench-base,8,8,11");
+
+        let keys = std::fs::read_to_string(out_dir().join("unit-fairshare-keys.csv")).unwrap();
+        let lines: Vec<&str> = keys.lines().collect();
+        assert_eq!(lines.len(), 3, "header + 2 rows, got {keys:?}");
+        assert_eq!(
+            lines[0],
+            "t_s,model,tenant,key,weight,max_in_flight,in_flight,queued,served_tokens"
+        );
+        assert!(
+            lines[1].starts_with("0.000,obench-base,obench-course-a,user-e,100,1,1,3,"),
+            "{keys}"
+        );
+    }
+
+    #[test]
+    fn render_pools_lists_every_pool_and_flags_an_empty_run() {
+        let mut a = crate::engine::fairshare::PoolAccumulator::new("obench-base", 8);
+        a.observe(&[sample("t", "g", 8, 1.0)], &[], 1.0);
+        let mut b = crate::engine::fairshare::PoolAccumulator::new("obench-turbo", 4);
+        b.observe(&[sample("t", "g", 4, 1.0)], &[], 1.0);
+        let out = render_pools(&[b.summarize(), a.summarize()]);
+        let rows: Vec<&str> = out.lines().skip(2).collect();
+        assert!(rows[0].contains("obench-base"), "sorted by model: {out}");
+        assert!(rows[1].contains("obench-turbo"), "{out}");
+        assert!(render_pools(&[]).contains("no per-model samples"));
     }
 
     #[test]

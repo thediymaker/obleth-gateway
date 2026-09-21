@@ -22,6 +22,8 @@ pub struct TenantSample {
     pub name: String,
     pub group: String,
     pub weight: i64,
+    /// This tenant's per-model in-flight ceiling, when one is configured.
+    pub max_in_flight: Option<u64>,
     pub in_flight: u64,
     pub queued: u64,
     pub served_tokens: f64,
@@ -63,6 +65,255 @@ impl GroupSample {
     /// Whether this group was taking part in scheduling at this instant.
     pub fn is_participating(&self) -> bool {
         self.in_flight > 0 || self.queued > 0 || self.slot_cap > 0
+    }
+}
+
+/// One key's state in a single poll, inside one pool.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeySample {
+    pub tenant: String,
+    pub name: String,
+    pub weight: i64,
+    pub max_in_flight: Option<u64>,
+    pub in_flight: u64,
+    pub queued: u64,
+    pub served_tokens: f64,
+}
+
+/// One model pool in a single poll.
+#[derive(Clone, Debug)]
+pub struct PoolSample {
+    pub model: String,
+    pub cap: u64,
+    pub in_flight: u64,
+    pub queued: u64,
+    pub tenants: Vec<TenantSample>,
+    pub keys: Vec<KeySample>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct KeyAcc {
+    pub weight: i64,
+    pub slot_seconds: f64,
+    pub active_seconds: f64,
+}
+
+/// One key's convergence inside its tenant, in one pool.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyFairnessResult {
+    pub tenant: String,
+    pub name: String,
+    pub weight: i64,
+    pub slot_seconds: f64,
+    /// This key's slot-seconds over its tenant's slot-seconds in the pool.
+    pub realized_share: f64,
+    /// This key's weight over the summed weight of the tenant's competing keys.
+    pub expected_share: f64,
+    pub share_ratio: f64,
+}
+
+/// Per-pool convergence accumulator: tenant fairness reuses
+/// [`FairshareAccumulator`] with the pool cap as capacity; key fairness is
+/// measured inside each tenant.
+#[derive(Clone, Debug)]
+pub struct PoolAccumulator {
+    model: String,
+    tenants: FairshareAccumulator,
+    keys: BTreeMap<(String, String), KeyAcc>,
+    idle_with_backlog_ticks: u64,
+    cap_violations: u64,
+}
+
+#[derive(Clone, Debug)]
+pub struct PoolSummary {
+    pub model: String,
+    pub cap: u64,
+    pub tenants: FairshareSummary,
+    pub keys: Vec<KeyFairnessResult>,
+    /// Jain's index over key share ratios, across all tenants in the pool.
+    pub key_jain_index: f64,
+    /// Polls folded into this pool, so `idle_with_backlog_ticks` can be read as
+    /// a rate rather than a raw count.
+    pub samples: u64,
+    /// Ticks where the pool had free slots and a standing queue at once:
+    /// the scheduler (or the ceiling) left capacity idle under demand.
+    ///
+    /// Ticks where *every* waiting tenant and key was sitting on its own
+    /// ceiling are excluded: the pool having room nobody is eligible to use is
+    /// the caps working, not wasted capacity. A backlog behind an entity that
+    /// has no cap (or is below it) still counts.
+    pub idle_with_backlog_ticks: u64,
+    /// Samples where a pool, tenant, or key exceeded its cap.
+    pub cap_violations: u64,
+}
+
+impl PoolAccumulator {
+    pub fn new(model: &str, cap: u64) -> Self {
+        let mut tenants = FairshareAccumulator::new();
+        tenants.note_config("", cap);
+        Self {
+            model: model.into(),
+            tenants,
+            keys: BTreeMap::new(),
+            idle_with_backlog_ticks: 0,
+            cap_violations: 0,
+        }
+    }
+
+    pub fn note_cap(&mut self, cap: u64) {
+        self.tenants.note_config("", cap);
+    }
+
+    pub fn observe(&mut self, tenants: &[TenantSample], keys: &[KeySample], dt_s: f64) {
+        let cap = self.tenants.max_in_flight;
+        let in_flight: u64 = tenants.iter().map(|t| t.in_flight).sum();
+        let queued: u64 = tenants.iter().map(|t| t.queued).sum();
+        // Free pool slots are only excused when *every* entity that is waiting
+        // sits on its own ceiling: then the queue is waiting on those caps, not
+        // on the pool. One capped entity elsewhere in the pool explains
+        // nothing, so a backlog behind an uncapped tenant or key is still
+        // wasted capacity.
+        let backlogged = tenants.iter().any(|t| t.queued > 0) || keys.iter().any(|k| k.queued > 0);
+        let backlogged_capped = tenants
+            .iter()
+            .filter(|t| t.queued > 0)
+            .all(|t| matches!(t.max_in_flight, Some(c) if t.in_flight >= c))
+            && keys
+                .iter()
+                .filter(|k| k.queued > 0)
+                .all(|k| matches!(k.max_in_flight, Some(c) if k.in_flight >= c));
+        let entity_at_cap = backlogged && backlogged_capped;
+        // A gateway that does not report a pool size gives nothing to measure
+        // free slots or an overrun against.
+        let pool_cap_known = cap > 0;
+        if pool_cap_known && !entity_at_cap && in_flight < cap && queued > 0 {
+            self.idle_with_backlog_ticks += 1;
+        }
+        if pool_cap_known && in_flight > cap {
+            self.cap_violations += 1;
+        }
+        for t in tenants {
+            if matches!(t.max_in_flight, Some(c) if t.in_flight > c) {
+                self.cap_violations += 1;
+            }
+        }
+        for k in keys {
+            if matches!(k.max_in_flight, Some(c) if k.in_flight > c) {
+                self.cap_violations += 1;
+            }
+            let acc = self
+                .keys
+                .entry((k.tenant.clone(), k.name.clone()))
+                .or_default();
+            acc.weight = k.weight;
+            acc.slot_seconds += k.in_flight as f64 * dt_s;
+            if k.in_flight > 0 || k.queued > 0 {
+                acc.active_seconds += dt_s;
+            }
+        }
+        self.tenants.observe(tenants, dt_s);
+    }
+
+    pub fn summarize(&self) -> PoolSummary {
+        let keys = key_fairness(&self.keys);
+        let ratios: Vec<f64> = keys
+            .iter()
+            .filter(|k| k.expected_share > 0.0)
+            .map(|k| k.share_ratio)
+            .collect();
+        let tenants = self.tenants.summarize();
+        PoolSummary {
+            model: self.model.clone(),
+            cap: self.tenants.max_in_flight,
+            samples: tenants.samples,
+            tenants,
+            key_jain_index: jain_index(&ratios),
+            keys,
+            idle_with_backlog_ticks: self.idle_with_backlog_ticks,
+            cap_violations: self.cap_violations,
+        }
+    }
+}
+
+/// Key fairness inside each tenant: realized = key slot-seconds over the
+/// tenant's slot-seconds; expected = key weight over the competing keys'
+/// summed weight. Keys that never competed are skipped.
+pub fn key_fairness(keys: &BTreeMap<(String, String), KeyAcc>) -> Vec<KeyFairnessResult> {
+    let mut tenant_slots: BTreeMap<&str, f64> = BTreeMap::new();
+    let mut tenant_weight: BTreeMap<&str, i64> = BTreeMap::new();
+    for ((tenant, _), acc) in keys {
+        if acc.active_seconds > 0.0 {
+            *tenant_slots.entry(tenant).or_insert(0.0) += acc.slot_seconds;
+            *tenant_weight.entry(tenant).or_insert(0) += acc.weight.max(1);
+        }
+    }
+    keys.iter()
+        .filter(|(_, acc)| acc.active_seconds > 0.0)
+        .map(|((tenant, name), acc)| {
+            let slots = tenant_slots.get(tenant.as_str()).copied().unwrap_or(0.0);
+            let weight = tenant_weight.get(tenant.as_str()).copied().unwrap_or(1) as f64;
+            let realized_share = if slots > 0.0 {
+                acc.slot_seconds / slots
+            } else {
+                0.0
+            };
+            let expected_share = acc.weight.max(1) as f64 / weight;
+            KeyFairnessResult {
+                tenant: tenant.clone(),
+                name: name.clone(),
+                weight: acc.weight,
+                slot_seconds: acc.slot_seconds,
+                realized_share,
+                expected_share,
+                share_ratio: if expected_share > 0.0 {
+                    realized_share / expected_share
+                } else {
+                    0.0
+                },
+            }
+        })
+        .collect()
+}
+
+/// Fold per-pool findings into the run verdict.
+pub fn apply_pool_verdicts(
+    verdict: crate::engine::stats::Verdict,
+    pools: &[PoolSummary],
+) -> crate::engine::stats::Verdict {
+    use crate::engine::stats::Verdict;
+    let mut issues = Vec::new();
+    for p in pools {
+        if p.cap_violations > 0 {
+            issues.push(format!(
+                "pool {}: {} cap violation sample(s)",
+                p.model, p.cap_violations
+            ));
+        }
+        // One tick can be a poll racing a release, and a handful over a long run
+        // is noise; a sustained fraction of the run is real.
+        if p.idle_with_backlog_ticks > 2 && p.idle_with_backlog_ticks * 10 > p.samples {
+            issues.push(format!(
+                "pool {}: {} tick(s) with free slots and a standing queue",
+                p.model, p.idle_with_backlog_ticks
+            ));
+        }
+        if !p.tenants.starved.is_empty() {
+            issues.push(format!(
+                "pool {}: starved {}",
+                p.model,
+                p.tenants.starved.join(", ")
+            ));
+        }
+    }
+    if issues.is_empty() {
+        return verdict;
+    }
+    match verdict {
+        Verdict::Pass => Verdict::Fail(issues),
+        Verdict::Fail(mut existing) => {
+            existing.extend(issues);
+            Verdict::Fail(existing)
+        }
     }
 }
 
@@ -381,10 +632,23 @@ mod tests {
             name: name.into(),
             group: "g".into(),
             weight: 100,
+            max_in_flight: None,
             in_flight,
             queued,
             served_tokens: served,
             weight_share,
+        }
+    }
+
+    fn k(tenant: &str, name: &str, weight: i64, in_flight: u64, queued: u64) -> KeySample {
+        KeySample {
+            tenant: tenant.into(),
+            name: name.into(),
+            weight,
+            max_in_flight: None,
+            in_flight,
+            queued,
+            served_tokens: 0.0,
         }
     }
 
@@ -518,6 +782,7 @@ mod tests {
                         name: "chatbot".into(),
                         group: "prod".into(),
                         weight: 500,
+                        max_in_flight: None,
                         in_flight: 7,
                         queued: 4,
                         served_tokens: 0.0,
@@ -527,6 +792,7 @@ mod tests {
                         name: "api-batch".into(),
                         group: "dev".into(),
                         weight: 50,
+                        max_in_flight: None,
                         in_flight: 1,
                         queued: 4,
                         served_tokens: 0.0,
@@ -772,6 +1038,7 @@ mod tests {
                 name,
                 group: "g".into(),
                 weight: 100,
+                max_in_flight: None,
                 in_flight: if starving { 0 } else { 4 },
                 queued: 3,
                 served_tokens: if starving { 0.0 } else { 100.0 },
@@ -823,6 +1090,156 @@ mod tests {
             apply_starvation_verdict(Verdict::Fail(vec!["x".into()]), &sum),
             Verdict::Fail(vec!["x".into()])
         );
+    }
+
+    // ── per-pool and per-key convergence ──────────────────────────────────────
+
+    #[test]
+    fn keys_split_their_tenant_by_weight() {
+        let mut acc = PoolAccumulator::new("m", 4);
+        for _ in 0..10 {
+            acc.observe(&[], &[k("t", "a", 100, 1, 1), k("t", "b", 300, 3, 1)], 1.0);
+        }
+        let sum = acc.summarize();
+        let a = sum.keys.iter().find(|r| r.name == "a").unwrap();
+        let b = sum.keys.iter().find(|r| r.name == "b").unwrap();
+        assert!((a.expected_share - 0.25).abs() < 1e-9);
+        assert!((a.realized_share - 0.25).abs() < 1e-9);
+        assert!((b.share_ratio - 1.0).abs() < 1e-9);
+        assert!((sum.key_jain_index - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn one_key_hogging_its_tenant_lowers_key_jain() {
+        let mut acc = PoolAccumulator::new("m", 4);
+        for _ in 0..10 {
+            acc.observe(&[], &[k("t", "a", 100, 4, 0), k("t", "b", 100, 0, 3)], 1.0);
+        }
+        assert!((acc.summarize().key_jain_index - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn idle_capacity_with_a_backlog_is_counted() {
+        let mut acc = PoolAccumulator::new("m", 4);
+        acc.observe(&[s("t", 2, 0, 0.0, 1.0)], &[], 1.0); // fine: under cap, nothing waiting
+        acc.observe(&[s("t", 2, 3, 0.0, 1.0)], &[], 1.0); // 2 of 4 used, 3 waiting -> idle with backlog
+        acc.observe(&[s("t", 4, 3, 0.0, 1.0)], &[], 1.0); // full: fine
+        assert_eq!(acc.summarize().idle_with_backlog_ticks, 1);
+    }
+
+    #[test]
+    fn an_entity_on_its_own_cap_does_not_read_as_idle_capacity() {
+        // 2 of 4 pool slots used with 3 waiting, and everything that is waiting
+        // is at its own ceiling of 2 — the queue is waiting on those caps, not
+        // on the pool. The fairshare fleet seeds exactly this shape.
+        let mut acc = PoolAccumulator::new("m", 4);
+        let mut key = k("t", "a", 100, 2, 3);
+        key.max_in_flight = Some(2);
+        let mut tenant = s("t", 2, 3, 0.0, 1.0);
+        tenant.max_in_flight = Some(2);
+        acc.observe(&[tenant], &[key], 1.0);
+
+        // Same shape with only the tenant's ceiling reported.
+        let mut tenant = s("t", 2, 3, 0.0, 1.0);
+        tenant.max_in_flight = Some(2);
+        acc.observe(&[tenant], &[], 1.0);
+
+        let sum = acc.summarize();
+        assert_eq!(sum.idle_with_backlog_ticks, 0);
+        assert_eq!(sum.cap_violations, 0);
+        assert_eq!(sum.samples, 2);
+    }
+
+    #[test]
+    fn a_capped_key_with_nothing_waiting_does_not_excuse_an_idle_pool() {
+        // The capped key sits on its ceiling but has no backlog; the queue
+        // belongs to an uncapped tenant and 2 of the 4 pool slots are free, so
+        // the scheduler really is leaving capacity idle under demand.
+        let mut acc = PoolAccumulator::new("m", 4);
+        let mut capped = k("t", "a", 100, 2, 0);
+        capped.max_in_flight = Some(2);
+        acc.observe(&[s("t", 2, 3, 0.0, 1.0)], &[capped], 1.0);
+        let sum = acc.summarize();
+        assert_eq!(sum.idle_with_backlog_ticks, 1);
+        assert_eq!(sum.cap_violations, 0);
+    }
+
+    #[test]
+    fn a_pool_with_no_reported_cap_counts_nothing() {
+        // An older gateway omits the pool size. With no cap there is no such
+        // thing as a free slot or an overrun, so neither may be inferred.
+        let mut acc = PoolAccumulator::new("m", 0);
+        acc.observe(&[s("t", 5, 4, 0.0, 1.0)], &[k("t", "a", 100, 5, 4)], 1.0);
+        let sum = acc.summarize();
+        assert_eq!(sum.cap, 0);
+        assert_eq!(sum.idle_with_backlog_ticks, 0);
+        assert_eq!(sum.cap_violations, 0);
+    }
+
+    #[test]
+    fn a_few_idle_ticks_in_a_long_run_do_not_fail_it() {
+        // Three idle-with-backlog ticks out of 100 polls is noise, not a
+        // scheduler leaving the pool idle under demand.
+        let mut acc = PoolAccumulator::new("m", 4);
+        for _ in 0..3 {
+            acc.observe(&[s("t", 1, 5, 0.0, 1.0)], &[], 1.0);
+        }
+        for _ in 0..97 {
+            acc.observe(&[s("t", 4, 5, 0.0, 1.0)], &[], 1.0);
+        }
+        let sum = acc.summarize();
+        assert_eq!(sum.idle_with_backlog_ticks, 3);
+        assert_eq!(sum.samples, 100);
+        assert_eq!(
+            apply_pool_verdicts(crate::engine::stats::Verdict::Pass, &[sum]),
+            crate::engine::stats::Verdict::Pass
+        );
+    }
+
+    #[test]
+    fn pool_issues_append_to_an_already_failing_run() {
+        let mut bad = PoolAccumulator::new("bad", 4);
+        for _ in 0..3 {
+            bad.observe(&[s("t", 1, 5, 0.0, 1.0)], &[], 1.0);
+        }
+        let existing = crate::engine::stats::Verdict::Fail(vec!["error rate too high".into()]);
+        match apply_pool_verdicts(existing, &[bad.summarize()]) {
+            crate::engine::stats::Verdict::Fail(issues) => {
+                assert_eq!(issues[0], "error rate too high");
+                assert!(issues.len() > 1, "{issues:?}");
+                assert!(issues[1..].iter().any(|i| i.contains("bad")), "{issues:?}");
+            }
+            crate::engine::stats::Verdict::Pass => panic!("must stay failed"),
+        }
+    }
+
+    #[test]
+    fn cap_violations_are_counted_per_entity() {
+        let mut acc = PoolAccumulator::new("m", 2);
+        let mut t = s("t", 3, 0, 0.0, 1.0);
+        t.max_in_flight = Some(2);
+        let mut key = k("t", "a", 100, 2, 0);
+        key.max_in_flight = Some(1);
+        acc.observe(&[t], &[key], 1.0);
+        assert_eq!(acc.summarize().cap_violations, 3); // pool 3>2, tenant 3>2, key 2>1
+    }
+
+    #[test]
+    fn pool_verdict_fails_on_idle_backlog_and_cap_violation() {
+        let mut ok = PoolAccumulator::new("ok", 4);
+        ok.observe(&[s("t", 4, 1, 0.0, 1.0)], &[], 1.0);
+        let mut bad = PoolAccumulator::new("bad", 4);
+        for _ in 0..3 {
+            bad.observe(&[s("t", 1, 5, 0.0, 1.0)], &[], 1.0); // three ticks: past the 2-tick grace
+        }
+        let verdict = apply_pool_verdicts(
+            crate::engine::stats::Verdict::Pass,
+            &[ok.summarize(), bad.summarize()],
+        );
+        match verdict {
+            crate::engine::stats::Verdict::Fail(issues) => assert!(issues[0].contains("bad")),
+            _ => panic!("expected failure"),
+        }
     }
 
     #[test]

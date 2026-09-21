@@ -5,6 +5,9 @@ pub struct ProfilePlan {
     pub conc: u32,
     pub duration_s: u64,
     pub warmup_s: u64,
+    /// Per-model admission pool size. The gateway's global ceiling is set to
+    /// this times the number of seeded models, so the pools — not the ceiling —
+    /// are what gates admission.
     pub capacity: u32,
     pub output_tokens: u32,
     pub max_error_rate: f64,
@@ -32,6 +35,8 @@ pub fn base_plan(profile: Profile) -> ProfilePlan {
         // smoke: bounded 30-second, 2-worker CI ping. conc=2 keeps load minimal
         // while still exercising the weighted picker across all fixture models;
         // 30 s is enough to cycle through all 5 models statistically.
+        // capacity is per-model slots, and 64 of them against 2 workers means
+        // admission never gates — deliberate: smoke checks liveness, not queueing.
         // duration_s > 0 is required: 0 means "run until quit" and would hang headless.
         Profile::Smoke => ProfilePlan {
             conc: 2,
@@ -42,20 +47,26 @@ pub fn base_plan(profile: Profile) -> ProfilePlan {
             max_error_rate: 0.0,
             stream: true,
         },
+        // light: 2 slots per model across the 5 fixture models is 10 against 16
+        // workers, so the scheduler arbitrates rather than waving everything
+        // through. (capacity is per-model now, so the old global 64 would have
+        // become 320 and gated nothing.)
         Profile::Light => ProfilePlan {
             conc: 16,
             duration_s: 60,
             warmup_s: 3,
-            capacity: 64,
+            capacity: 2,
             output_tokens: 64,
             max_error_rate: 0.05,
             stream: true,
         },
+        // heavy: 8 slots per model, 40 across the fleet against 64 workers —
+        // sustained contention for the long soak.
         Profile::Heavy => ProfilePlan {
             conc: 64,
             duration_s: 600,
             warmup_s: 5,
-            capacity: 64,
+            capacity: 8,
             output_tokens: 128,
             max_error_rate: 0.05,
             stream: true,
@@ -73,6 +84,19 @@ pub fn base_plan(profile: Profile) -> ProfilePlan {
             max_error_rate: 0.01,
             stream: false,
         },
+        // fairshare: many pools, many keys, every pool saturated. conc is set
+        // in build_setup to 2 x key count, and FAIRSHARE_TRAFFIC drives all
+        // eight seeded models, so 8 slots per model leaves every pool contended
+        // and shares reflect admission rather than offered load.
+        Profile::Fairshare => ProfilePlan {
+            conc: 0,
+            duration_s: 90,
+            warmup_s: 5,
+            capacity: 8,
+            output_tokens: 48,
+            max_error_rate: 0.02,
+            stream: true,
+        },
         Profile::Auto => ProfilePlan {
             conc: 32,
             duration_s: 15,
@@ -82,11 +106,13 @@ pub fn base_plan(profile: Profile) -> ProfilePlan {
             max_error_rate: 0.01,
             stream: false,
         },
+        // manual: the hand-tuned preset, so it starts where heavy does — 8
+        // per-model slots against 64 workers — and every knob is overridable.
         Profile::Manual => ProfilePlan {
             conc: 64,
             duration_s: 60,
             warmup_s: 3,
-            capacity: 64,
+            capacity: 8,
             output_tokens: 64,
             max_error_rate: 0.05,
             stream: true,

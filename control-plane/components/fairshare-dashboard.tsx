@@ -35,44 +35,23 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { colorForGroup, OTHERS_COLOR, PALETTE } from "@/lib/chart-palette";
 import { isWaitingBelowShare } from "@/lib/fairshare";
 import { clamp, formatCompact, formatDecimal, formatPct, formatScore } from "@/lib/format";
-import type { ModelRoute } from "@/lib/obleth";
+import type {
+  FairshareLiveView,
+  GroupFairshareView,
+  KeyFairshareView,
+  ModelPoolView,
+  ModelRoute,
+  TenantFairshareView,
+} from "@/lib/obleth";
 import { cn, formatNumber } from "@/lib/utils";
 
-export interface TenantFairshareView {
-  tenant_id: string;
-  name: string;
-  fairshare_group: string;
-  weight: number;
-  in_flight: number;
-  queued: number;
-  served_tokens: number;
-  share_score: number;
-  weight_share: number;
-  expected_slots: number;
-}
-
-export interface GroupFairshareView {
-  name: string;
-  weight: number;
-  in_flight: number;
-  queued: number;
-  slot_cap: number;
-  served_tokens: number;
-  share_score: number;
-  weight_share: number;
-  expected_slots: number;
-}
-
-export interface FairshareLiveView {
-  algorithm: string;
-  max_in_flight: number;
-  global_in_flight: number;
-  global_queued: number;
-  groups: GroupFairshareView[];
-  tenants: TenantFairshareView[];
-  model_in_flight?: Record<string, number>;
-  model_queued?: Record<string, number>;
-}
+export type {
+  FairshareLiveView,
+  GroupFairshareView,
+  KeyFairshareView,
+  ModelPoolView,
+  TenantFairshareView,
+} from "@/lib/obleth";
 
 interface TenantSeriesRow {
   bucket_ms: number;
@@ -99,23 +78,45 @@ type TenantScope = "all" | "active" | "waiting" | "starved";
 // Root
 // ---------------------------------------------------------------------------
 
+/** Present one pool with the same shape as the all-models view so every panel
+ *  can render either without knowing which it got. */
+export function scopedView(view: FairshareLiveView | undefined, model: string): FairshareLiveView | undefined {
+  if (!view || model === "all") return view;
+  const pool = view.pools?.find((p) => p.model === model);
+  if (!pool) return view;
+  return {
+    ...view,
+    max_in_flight: pool.cap,
+    global_in_flight: pool.in_flight,
+    global_queued: pool.queued,
+    global_borrowed: pool.borrowed,
+    groups: pool.groups,
+    tenants: pool.tenants,
+    keys: pool.keys,
+    model_in_flight: { [pool.model]: pool.in_flight },
+    model_queued: { [pool.model]: pool.queued },
+  };
+}
+
 export function FairshareDashboard({
   tenantNames,
 }: {
   tenantNames: Record<string, string>;
 }) {
   const queryClient = useQueryClient();
-  const { data: view, groupHistory, groupKeys, isFetching, isError, dataUpdatedAt } = useFairshareLive();
+  const { data: rawView, groupHistory, groupKeys, isFetching, isError, dataUpdatedAt } = useFairshareLive();
   const { data: tenantSeries } = useThroughputSeries();
   const { data: modelRoutes } = useModelRoutes();
   const [throughputMetric, setThroughputMetric] = useState<ThroughputMetric>("requests");
   const [section, setSection] = useState("overview");
+  const [scope, setScope] = useState("all");
   const [tenantFilter, setTenantFilter] = useState({ group: "all", scope: "active" as TenantScope });
   const inspectTenants = (group: string, scope: TenantScope) => {
     setTenantFilter({ group, scope });
     setSection("tenants");
   };
 
+  const view = useMemo(() => scopedView(rawView, scope), [rawView, scope]);
   const summary = useMemo(() => summarizeFairshare(view), [view]);
   const throughput = useMemo(
     () => buildThroughput(tenantSeries ?? [], tenantNames, throughputMetric),
@@ -138,6 +139,22 @@ export function FairshareDashboard({
         onRefresh={refresh}
       />
 
+      {rawView?.pools && rawView.pools.length > 0 && (
+        <label className="flex items-center gap-2 text-xs text-muted-foreground">
+          Model
+          <select
+            aria-label="Model scope"
+            value={scope}
+            onChange={(e) => setScope(e.target.value)}
+            className="rounded-md border border-input bg-background px-2 py-1 text-sm text-foreground"
+          >
+            <option value="all">All models</option>
+            {[...rawView.pools].sort((a, b) => a.model.localeCompare(b.model)).map((p) => (
+              <option key={p.model} value={p.model}>{p.model} · {p.in_flight}/{p.cap}</option>
+            ))}
+          </select>
+        </label>
+      )}
       <PressureStrip view={view} summary={summary} />
       <Tabs value={section} onValueChange={setSection}>
         <TabsList aria-label="Fairshare views" className="h-auto max-w-full flex-wrap justify-start">
@@ -631,6 +648,32 @@ function TenantInspector({ tenant, view }: { tenant?: TenantFairshareView; view?
             <dt className="text-muted-foreground">Served tokens</dt><dd className="text-right tabular-nums">{formatCompact(tenant.served_tokens)}</dd>
             <dt className="text-muted-foreground">Tenant weight</dt><dd><WeightCell id={tenant.tenant_id} weight={tenant.weight} /></dd>
           </dl>
+          {view?.keys && (
+            <div className="mt-4">
+              <p className="mb-2 text-xs font-medium">Keys</p>
+              {view.keys.filter((k) => k.tenant_id === tenant.tenant_id).length === 0 ? (
+                <p className="text-xs text-muted-foreground">No active keys</p>
+              ) : (
+                <table className="w-full text-xs tabular-nums" aria-label="Tenant keys">
+                  <thead><tr className="text-muted-foreground"><th className="text-left font-normal">Key</th><th className="text-right font-normal">Active</th><th className="text-right font-normal">Queued</th><th className="text-right font-normal">Served</th><th className="text-right font-normal">Weight</th><th className="text-right font-normal">Cap</th></tr></thead>
+                  <tbody>
+                    {[...view.keys.filter((k) => k.tenant_id === tenant.tenant_id)]
+                      .sort((a, b) => a.share_score - b.share_score)
+                      .map((k) => (
+                        <tr key={k.key_id}>
+                          <td className="truncate text-left">{k.name}</td>
+                          <td className="text-right">{formatNumber(k.in_flight)}</td>
+                          <td className="text-right">{formatNumber(k.queued)}</td>
+                          <td className="text-right">{formatCompact(k.served_tokens)}</td>
+                          <td className="text-right">{k.weight}</td>
+                          <td className="text-right">{k.max_in_flight ?? "–"}</td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          )}
           <p className="mt-4 text-xs text-muted-foreground">Weights change relative priority; they do not reserve slots. Admission also depends on scheduler debt and model capacity.</p>
         </> : <EmptyState className="h-32">No tenant selected</EmptyState>}
       </CardContent>

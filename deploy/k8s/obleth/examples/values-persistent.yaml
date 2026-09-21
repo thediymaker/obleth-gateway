@@ -19,10 +19,13 @@
 #     --set controlPlane.dashboardSessionSecret="$(openssl rand -hex 32)"
 
 obleth:
-  # One replica keeps globalMaxInFlight meaningful: fairshare admission is
-  # per-process, so each replica enforces the ceiling independently. This
-  # profile targets durability, not redundancy — for the latter, raise this and
-  # divide globalMaxInFlight by the same number (see values-production.yaml).
+  # One replica keeps capacity easy to reason about: fairshare runs one pool
+  # per model (default 32 slots via defaultModelMaxInFlight, or the model's own
+  # max_in_flight), and globalMaxInFlight is a total ceiling across those pools
+  # — both are enforced per replica. This profile targets durability, not
+  # redundancy — for the latter, raise this and remember the aggregate
+  # reaching your upstream is replicas x the configured numbers, not a fixed
+  # total (see values-production.yaml).
   replicas: 1
   adminToken: ""        # REQUIRED — set via --set or a Secret
   encryptionKey: ""     # recommended — base64 of 32 bytes

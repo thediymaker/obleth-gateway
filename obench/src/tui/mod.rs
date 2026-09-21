@@ -187,6 +187,7 @@ fn parse_profile(s: &str) -> Option<Profile> {
         "light" => Some(Profile::Light),
         "heavy" => Some(Profile::Heavy),
         "extreme" => Some(Profile::Extreme),
+        "fairshare" => Some(Profile::Fairshare),
         "manual" => Some(Profile::Manual),
         _ => None,
     }
@@ -1156,6 +1157,7 @@ async fn run_dashboard(
         profile_name,
         teardown,
         gateway_observable,
+        gateway_capacity,
         key_labels,
         key_counts,
     } = handles;
@@ -1210,7 +1212,7 @@ async fn run_dashboard(
             rps_history: &hist,
             in_flight: live.global_in_flight,
             queued: live.global_queued,
-            capacity: plan.capacity,
+            capacity: gateway_capacity,
             ui_base: &ui_base,
             gateway_observable,
             key_labels: &key_labels,
@@ -1265,7 +1267,7 @@ async fn run_dashboard(
                 rps_history: &hist,
                 in_flight: 0,
                 queued: 0,
-                capacity: plan.capacity,
+                capacity: gateway_capacity,
                 ui_base: &ui_base,
                 gateway_observable,
                 key_labels: &key_labels,

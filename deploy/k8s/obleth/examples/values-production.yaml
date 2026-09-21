@@ -51,13 +51,16 @@
 # -----------------------------------------------------------------------------
 
 obleth:
-  # Three replicas for redundancy. Fairshare admission state is per-process, so
-  # each replica enforces globalMaxInFlight independently and the ceiling that
-  # reaches the upstream is replicas x globalMaxInFlight. Divide it by the
-  # replica count to keep the aggregate at the intended 256. Replicas cannot
-  # lend each other idle capacity, so a quiet pod's 85 slots go unused.
+  # Three replicas for redundancy. Fairshare runs one pool per model (default
+  # 32 slots via defaultModelMaxInFlight, or the model's own max_in_flight);
+  # globalMaxInFlight is a total ceiling across those pools, not a fairness
+  # input, and both are enforced per replica — the aggregate reaching the
+  # upstream is replicas x the configured numbers. 256 leaves headroom above
+  # the pool sum for several concurrently active models at the default pool
+  # size (an 85 ceiling would bind after only three); raise it further if you
+  # register more. Replicas cannot lend each other idle capacity.
   replicas: 3
-  globalMaxInFlight: 85
+  globalMaxInFlight: 256
   # All credentials come from the pre-created Secret above; no secret values are
   # set inline. The Secret MUST contain every key listed in step 1.
   existingSecret: obleth-secrets
@@ -97,10 +100,12 @@ benchmarkBackend:
 # Stateless data plane: spread across nodes and protected against disruptions.
 #
 # Autoscaling is off because the replica count is load-bearing here:
-# globalMaxInFlight is divided by it above, so a replica count that moves on its
-# own moves the aggregate concurrency limit reaching the upstream. To autoscale
-# anyway, divide globalMaxInFlight by maxReplicas instead (256/20 = 12) and
-# accept that the upstream is under-subscribed below full scale-out.
+# globalMaxInFlight (and every model's pool) is enforced per replica, so a
+# replica count that moves on its own moves the aggregate concurrency limit
+# reaching the upstream. To autoscale anyway, size globalMaxInFlight (and the
+# pools you care about) so that replicas x those numbers stays within what the
+# upstream can absorb at maxReplicas, and accept that the upstream is
+# under-subscribed below full scale-out.
 hpa:
   enabled: false
   minReplicas: 3

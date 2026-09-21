@@ -43,8 +43,12 @@ pub struct Config {
     /// Bootstrap admin token for the Management API.
     pub admin_token: String,
 
-    /// Static global in-flight concurrency budget (the v1 CapacityProvider).
+    /// Total in-flight ceiling across all model pools (memory and
+    /// upstream-connection guard). Not a fairness input; set it above the sum
+    /// of the pool sizes you expect.
     pub global_max_in_flight: usize,
+    /// Pool size for a model that has no explicit `max_in_flight`.
+    pub default_model_max_in_flight: usize,
     /// Fairshare scheduling algorithm (`weighted` or `hierarchical`).
     pub fairshare_algorithm: FairshareAlgorithm,
 
@@ -122,7 +126,8 @@ impl Config {
             clickhouse_user: env_or("OBLETH_CLICKHOUSE_USER", "default"),
             clickhouse_password: env_or("OBLETH_CLICKHOUSE_PASSWORD", ""),
             admin_token: require_secret("OBLETH_ADMIN_TOKEN"),
-            global_max_in_flight: parse_or("OBLETH_GLOBAL_MAX_IN_FLIGHT", 256),
+            global_max_in_flight: parse_or("OBLETH_GLOBAL_MAX_IN_FLIGHT", 1024),
+            default_model_max_in_flight: parse_or("OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT", 32),
             fairshare_algorithm: FairshareAlgorithm::parse(&env_or(
                 "OBLETH_FAIRSHARE_ALGORITHM",
                 "hierarchical",

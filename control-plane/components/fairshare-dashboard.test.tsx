@@ -131,4 +131,37 @@ describe("fairshare operations", () => {
     expect(mocks.invalidate).toHaveBeenCalledWith({ queryKey: ["fairshare-live"] });
     expect(host.querySelector('[aria-label="Fairshare weight"]')).toBeNull();
   });
+
+  it("scopes every panel to one model pool and lists the selected tenant's keys", async () => {
+    mocks.view = {
+      ...mocks.view!,
+      keys: [
+        { key_id: "k1", tenant_id: "below-share", name: "alice", weight: 100, max_in_flight: null, in_flight: 1, queued: 2, served_tokens: 30, share_score: 0.3, weight_share: 0.25, expected_slots: 2 },
+        { key_id: "k2", tenant_id: "below-share", name: "bob", weight: 300, max_in_flight: 1, in_flight: 1, queued: 1, served_tokens: 50, share_score: 0.16, weight_share: 0.75, expected_slots: 6 },
+      ],
+      pools: [
+        { model: "llama", cap: 4, in_flight: 1, queued: 3, borrowed: 0, groups: mocks.view!.groups,
+          tenants: [tenant("below-share", { in_flight: 1, queued: 3, expected_slots: 2 })],
+          keys: [{ key_id: "k1", tenant_id: "below-share", name: "alice", weight: 100, max_in_flight: null, in_flight: 1, queued: 3, served_tokens: 30, share_score: 0.3, weight_share: 1, expected_slots: 4 }] },
+        { model: "qwen", cap: 12, in_flight: 6, queued: 7, borrowed: 0, groups: mocks.view!.groups, tenants: mocks.view!.tenants, keys: [] },
+      ],
+    };
+    await render();
+    // Keys section under the selected tenant, sorted by share score.
+    expect(inspector().textContent).toContain("bob");
+    expect(inspector().textContent).toContain("alice");
+    expect(inspector().textContent.indexOf("bob")).toBeLessThan(inspector().textContent.indexOf("alice"));
+    // Switch scope to the llama pool.
+    const select = host.querySelector<HTMLSelectElement>('select[aria-label="Model scope"]')!;
+    await act(async () => { select.value = "llama"; select.dispatchEvent(new Event("change", { bubbles: true })); });
+    expect(host.textContent).toContain("1 / 4");
+    expect(inspector().textContent).not.toContain("bob");
+    expect([...host.querySelectorAll("li button")].map((b) => b.textContent)).toEqual([expect.stringContaining("below-share")]);
+  });
+
+  it("renders the default fixture, which is an older gateway's payload with no pools", async () => {
+    await render();
+    expect(host.querySelector('select[aria-label="Model scope"]')).toBeNull();
+    expect(inspector().textContent).toContain("below-share");
+  });
 });

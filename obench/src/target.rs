@@ -10,6 +10,12 @@ pub fn validate_combo(target: Target, profile: Profile) -> Result<(), String> {
                 .to_string(),
         );
     }
+    if target == Target::Live && profile == Profile::Fairshare {
+        return Err(
+            "fairshare seeds tenants and keys and reads the scheduler; it needs --target demo"
+                .into(),
+        );
+    }
     Ok(())
 }
 
@@ -86,6 +92,13 @@ mod tests {
     #[test]
     fn fixture_extreme_is_allowed() {
         assert!(validate_combo(Target::Demo, Profile::Extreme).is_ok());
+    }
+
+    #[test]
+    fn live_fairshare_is_rejected_because_it_seeds_and_reads_the_scheduler() {
+        let err = validate_combo(Target::Live, Profile::Fairshare).unwrap_err();
+        assert!(err.contains("--target demo"), "{err}");
+        assert!(validate_combo(Target::Demo, Profile::Fairshare).is_ok());
     }
 
     #[test]

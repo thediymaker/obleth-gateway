@@ -15,6 +15,9 @@ pub enum Profile {
     Light,
     Heavy,
     Extreme,
+    /// Per-pool and per-key convergence across a wide synthetic fleet. Seeds
+    /// its own tenants and keys and reads the scheduler, so it is demo-only.
+    Fairshare,
     Auto,
     Manual,
 }

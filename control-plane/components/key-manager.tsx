@@ -645,6 +645,7 @@ function CreateKeyDialog({
               />
             </Field>
             <BudgetFields />
+            <FairshareFields />
             {createError && <p className="rounded-md border border-destructive/40 px-3 py-2 text-sm text-destructive">{createError}</p>}
             {tenants.length === 0 && (
               <p className="rounded-md border border-border px-3 py-2 text-sm text-muted-foreground">
@@ -851,6 +852,27 @@ function KeyDetailPanel({
               placeholder="Unlimited"
             />
           </Field>
+          <Field label="Weight" htmlFor={`key-weight-${key.id}`}>
+            <Input
+              id={`key-weight-${key.id}`}
+              name="weight"
+              type="number"
+              min={1}
+              step={1}
+              defaultValue={key.weight ?? 100}
+            />
+          </Field>
+          <Field label="Max in flight per model" htmlFor={`key-max-in-flight-${key.id}`}>
+            <Input
+              id={`key-max-in-flight-${key.id}`}
+              name="max_in_flight"
+              type="number"
+              min={1}
+              step={1}
+              defaultValue={key.max_in_flight ?? ""}
+              placeholder="Unlimited"
+            />
+          </Field>
         </div>
         <div className="mt-3 flex flex-wrap items-center justify-between gap-2">
           <StatusMessage message={message} />
@@ -944,6 +966,25 @@ function BudgetFields() {
         </Field>
         <Field label="Period" htmlFor="new-key-budget-period">
           <Select id="new-key-budget-period" name="budget_period" defaultValue="lifetime" options={BUDGET_PERIOD_OPTIONS} />
+        </Field>
+      </div>
+    </div>
+  );
+}
+
+function FairshareFields() {
+  return (
+    <div className="rounded-md border border-border bg-card/40 p-4">
+      <div className="mb-3 flex items-center gap-2">
+        <h3 className="text-sm font-semibold">Fairshare</h3>
+        <InfoTooltip text="Weight sets this key's share of the tenant's capacity relative to the tenant's other keys. Max in flight caps concurrent requests per model." />
+      </div>
+      <div className="grid gap-4 md:grid-cols-2">
+        <Field label="Weight" htmlFor="new-key-weight">
+          <Input id="new-key-weight" name="weight" type="number" min={1} step={1} defaultValue={100} />
+        </Field>
+        <Field label="Max in flight per model" htmlFor="new-key-max-in-flight">
+          <Input id="new-key-max-in-flight" name="max_in_flight" type="number" min={1} step={1} placeholder="Unlimited" />
         </Field>
       </div>
     </div>

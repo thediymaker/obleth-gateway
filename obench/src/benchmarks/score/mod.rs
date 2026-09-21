@@ -282,7 +282,14 @@ pub async fn run(
                 .map_err(|e| anyhow::anyhow!(e))?;
             let api_base = std::env::var("BENCHMARK_API_BASE")
                 .unwrap_or_else(|_| "http://benchmark-backend:8081".to_string());
-            let seeded = crate::seed::seed_fixture(&admin, &api_base, &scope).await?;
+            let seeded = crate::seed::seed_fixture(
+                &admin,
+                &api_base,
+                &scope,
+                crate::seed::FleetChoice::Standard,
+                None,
+            )
+            .await?;
             (seeded, cli.proxy_base.clone())
         }
         Target::Live => {
@@ -313,11 +320,17 @@ pub async fn run(
     }
     // Capacity/streaming/overhead/resilience drive a single tenant; fairshare
     // (below) uses the whole seeded fleet.
-    let key = seeded
-        .tenants
-        .first()
-        .map(|t| t.key.clone())
-        .unwrap_or_default();
+    let key = match seeded.tenants.first().map(|t| t.first_key()) {
+        Some(Ok(k)) => k.to_string(),
+        _ => {
+            // Nothing can be driven without a secret; tear down what seeding
+            // just created rather than leaking it behind a silent empty key.
+            admin.teardown(&seeded.teardown).await;
+            anyhow::bail!(
+                "no API key to drive the score run — the seeded fleet came back without one"
+            );
+        }
+    };
 
     let gateway_version = match target {
         Target::Demo => admin

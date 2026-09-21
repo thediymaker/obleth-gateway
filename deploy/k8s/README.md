@@ -72,17 +72,22 @@ hardened and made redundant):
 | --- | --- | --- | --- | --- | --- |
 | Ephemeral | Bundled, emptyDir | None — wiped on restart | 1 | `--set` | Demos, CI |
 | Persistent | Bundled, PVC | Survives restarts; **no backups/HA** | 1 | `--set` | Single-cluster self-host |
-| External | Yours | Whatever you operate | 3, ceiling divided | `--set` | Self-host w/ managed DBs |
-| Production | Yours (operator/managed) | Backups + HA + PITR (your tooling) | 3, ceiling divided + PDB + anti-affinity | **existingSecret** | Redundant production |
+| External | Yours | Whatever you operate | 3, ceiling above pool sum | `--set` | Self-host w/ managed DBs |
+| Production | Yours (operator/managed) | Backups + HA + PITR (your tooling) | 3, ceiling above pool sum + PDB + anti-affinity | **existingSecret** | Redundant production |
 
-> **Replica count is load-bearing.** Fairshare admission state lives in each
-> gateway process, so every replica enforces `obleth.globalMaxInFlight`
-> independently: N replicas admit up to N × the configured ceiling. The chart
-> therefore defaults to one replica. For redundancy, raise `obleth.replicas` and
-> divide `obleth.globalMaxInFlight` by the same number, accepting that replicas
-> cannot lend each other idle capacity. The HPA is off by default for the same
-> reason — an autoscaled replica count moves the aggregate ceiling with no
-> config change.
+> **Replica count is load-bearing.** Fairshare runs one scheduling pool per
+> model (default `obleth.defaultModelMaxInFlight` slots, or the model's own
+> `max_in_flight`), and `obleth.globalMaxInFlight` is a total ceiling across
+> those pools — not a fairness input. Fairshare admission state lives in each
+> gateway process, so every replica enforces its own pools and ceiling
+> independently: N replicas admit up to N × the configured pool sizes and N ×
+> the configured ceiling. The chart therefore defaults to one replica so the
+> numbers you set are the numbers that reach your upstream. For redundancy,
+> raise `obleth.replicas` and keep `obleth.globalMaxInFlight` above the sum of
+> the pool sizes you expect concurrently active, sizing both so that N × those
+> numbers stays within what your upstream can absorb — replicas cannot lend
+> each other idle capacity. The HPA is off by default for the same reason — an
+> autoscaled replica count moves the aggregate with no config change.
 
 > The bundled datastores are single plain Deployments with no replication or
 > backups — intentionally. Making them HA is the job of purpose-built operators

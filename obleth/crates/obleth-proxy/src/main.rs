@@ -83,7 +83,30 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- fairshare scheduler + capacity ----
     let capacity = Arc::new(StaticCapacity::new(cfg.global_max_in_flight));
-    let fairshare = FairShare::start(capacity.clone(), cfg.fairshare_algorithm);
+    let fairshare = FairShare::start(
+        capacity.clone(),
+        cfg.fairshare_algorithm,
+        cfg.default_model_max_in_flight,
+    );
+    // The ceiling is a safety guard, not a fairness budget: set below the sum
+    // of the pools it silently caps the fleet and hides the pool sizes the
+    // operator configured.
+    match store.list_models().await {
+        Ok(models) => {
+            let pool_sum =
+                obleth_admin::enabled_pool_capacity(&models, cfg.default_model_max_in_flight);
+            if cfg.global_max_in_flight < pool_sum {
+                tracing::warn!(
+                    ceiling = cfg.global_max_in_flight,
+                    pool_sum,
+                    "OBLETH_GLOBAL_MAX_IN_FLIGHT is below the sum of the enabled models' pool \
+                     sizes; the ceiling will bind first and pools will be served round-robin \
+                     — raise it above the pool sum"
+                );
+            }
+        }
+        Err(e) => tracing::warn!(error = %e, "failed to load models for the capacity check"),
+    }
 
     let metrics = Arc::new(Metrics::new());
     let key_cache: Cache<String, Arc<obleth_config::ResolvedKey>> = Cache::builder()
@@ -408,6 +431,7 @@ async fn main() -> anyhow::Result<()> {
         capacity: capacity.clone(),
         fairshare: fairshare.clone(),
         fairshare_stats: fairshare.stats(),
+        default_model_max_in_flight: cfg.default_model_max_in_flight,
         clickhouse: clickhouse_read,
         admin_token: cfg.admin_token.clone(),
         health: health_runtime,

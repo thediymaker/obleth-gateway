@@ -191,6 +191,8 @@ const mcpCreateSchema = z.object({
 const keyFieldsSchema = {
   name: requiredText("Key name is required"),
   description: optionalText,
+  weight: z.preprocess(blankToUndef, z.coerce.number().int().min(1, "Weight must be at least 1").default(100)),
+  max_in_flight: optionalPositiveInt,
   budget_tokens: optionalNonNegInt,
   budget_cost_usd: optionalNonNegNumber,
   budget_period: z.preprocess(
@@ -509,6 +511,8 @@ export async function createKeyAction(
     tenant_id: formData.get("tenant_id"),
     name: formData.get("name"),
     description: formData.get("description"),
+    weight: formData.get("weight"),
+    max_in_flight: formData.get("max_in_flight"),
     budget_tokens: formData.get("budget_tokens"),
     budget_cost_usd: formData.get("budget_cost_usd"),
     budget_period: formData.get("budget_period"),
@@ -524,6 +528,8 @@ export async function createKeyAction(
       {
         name: data.name,
         description: data.description,
+        weight: data.weight,
+        max_in_flight: data.max_in_flight ?? null,
         budget_tokens: data.budget_tokens ?? null,
         budget_cost_usd: data.budget_cost_usd ?? null,
         budget_period: hasBudget ? data.budget_period : null,
@@ -547,6 +553,8 @@ export async function updateKeyAction(
     id: formData.get("id"),
     name: formData.get("name"),
     description: formData.get("description"),
+    weight: formData.get("weight"),
+    max_in_flight: formData.get("max_in_flight"),
     budget_tokens: formData.get("budget_tokens"),
     budget_cost_usd: formData.get("budget_cost_usd"),
     budget_period: formData.get("budget_period"),
@@ -562,6 +570,8 @@ export async function updateKeyAction(
       {
         name: data.name,
         description: data.description,
+        weight: data.weight,
+        max_in_flight: data.max_in_flight ?? null,
         budget_tokens: data.budget_tokens ?? null,
         budget_cost_usd: data.budget_cost_usd ?? null,
         budget_period: hasBudget ? data.budget_period : null,

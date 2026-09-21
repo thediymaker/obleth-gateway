@@ -30,17 +30,24 @@ pub struct ModelSpec {
     pub output_cost_per_token: f64,
     pub context_window: u32,
     pub admission_weight: u32,
+    /// Size of this model's own admission pool. `None` leaves the gateway's
+    /// `default_model_max_in_flight` in force.
+    pub max_in_flight: Option<u32>,
 }
 
 /// One tenant's row in a `/fairshare/live` response.
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct TenantLive {
     #[serde(default)]
+    pub tenant_id: String,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub fairshare_group: String,
     #[serde(default)]
     pub weight: i64,
+    #[serde(default)]
+    pub max_in_flight: Option<u64>,
     #[serde(default)]
     pub in_flight: u64,
     #[serde(default)]
@@ -72,6 +79,42 @@ pub struct GroupLive {
     pub weight_share: f64,
 }
 
+/// One API key's row in a `/fairshare/live` response, inside a model pool.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct KeyLive {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub tenant_id: String,
+    #[serde(default)]
+    pub weight: i64,
+    #[serde(default)]
+    pub max_in_flight: Option<u64>,
+    #[serde(default)]
+    pub in_flight: u64,
+    #[serde(default)]
+    pub queued: u64,
+    #[serde(default)]
+    pub served_tokens: f64,
+}
+
+/// One model's admission pool in a `/fairshare/live` response.
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct PoolLive {
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub cap: u64,
+    #[serde(default)]
+    pub in_flight: u64,
+    #[serde(default)]
+    pub queued: u64,
+    #[serde(default)]
+    pub tenants: Vec<TenantLive>,
+    #[serde(default)]
+    pub keys: Vec<KeyLive>,
+}
+
 /// Every field defaults so a gateway on a different version degrades to partial
 /// data rather than failing the whole poll.
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -88,9 +131,62 @@ pub struct FairshareLive {
     pub groups: Vec<GroupLive>,
     #[serde(default)]
     pub tenants: Vec<TenantLive>,
+    #[serde(default)]
+    pub pools: Vec<PoolLive>,
 }
 
 impl FairshareLive {
+    /// Project each model pool into a per-pool sample, resolving key rows'
+    /// `tenant_id` back to the tenant name the accumulators key on.
+    pub fn pool_samples(&self) -> Vec<crate::engine::fairshare::PoolSample> {
+        self.pools
+            .iter()
+            .map(|p| {
+                let names: std::collections::HashMap<&str, &str> = p
+                    .tenants
+                    .iter()
+                    .map(|t| (t.tenant_id.as_str(), t.name.as_str()))
+                    .collect();
+                crate::engine::fairshare::PoolSample {
+                    model: p.model.clone(),
+                    cap: p.cap,
+                    in_flight: p.in_flight,
+                    queued: p.queued,
+                    tenants: p
+                        .tenants
+                        .iter()
+                        .map(|t| crate::engine::fairshare::TenantSample {
+                            name: t.name.clone(),
+                            group: t.fairshare_group.clone(),
+                            weight: t.weight,
+                            max_in_flight: t.max_in_flight,
+                            in_flight: t.in_flight,
+                            queued: t.queued,
+                            served_tokens: t.served_tokens,
+                            weight_share: t.weight_share,
+                        })
+                        .collect(),
+                    keys: p
+                        .keys
+                        .iter()
+                        .map(|k| crate::engine::fairshare::KeySample {
+                            tenant: names
+                                .get(k.tenant_id.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| k.tenant_id.clone()),
+                            name: k.name.clone(),
+                            weight: k.weight,
+                            max_in_flight: k.max_in_flight,
+                            in_flight: k.in_flight,
+                            queued: k.queued,
+                            served_tokens: k.served_tokens,
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
+    }
+
     /// Project the tenant rows into accumulator samples.
     pub fn tenant_samples(&self) -> Vec<crate::engine::fairshare::TenantSample> {
         self.tenants
@@ -99,6 +195,7 @@ impl FairshareLive {
                 name: t.name.clone(),
                 group: t.fairshare_group.clone(),
                 weight: t.weight,
+                max_in_flight: t.max_in_flight,
                 in_flight: t.in_flight,
                 queued: t.queued,
                 served_tokens: t.served_tokens,
@@ -179,6 +276,7 @@ impl AdminClient {
                             "api_base": spec.api_base,
                             "context_window": spec.context_window,
                             "admission_weight": spec.admission_weight,
+                            "max_in_flight": spec.max_in_flight,
                         })),
                     )
                     .await?;
@@ -211,6 +309,7 @@ impl AdminClient {
                             "output_cost_per_token": spec.output_cost_per_token,
                             "context_window": spec.context_window,
                             "admission_weight": spec.admission_weight,
+                            "max_in_flight": spec.max_in_flight,
                             "enabled": true,
                         })),
                     )
@@ -230,6 +329,7 @@ impl AdminClient {
                         "output_cost_per_token": spec.output_cost_per_token,
                         "context_window": spec.context_window,
                         "admission_weight": spec.admission_weight,
+                        "max_in_flight": spec.max_in_flight,
                         "supports_function_calling": false,
                         "supports_system_messages": true,
                         "supports_response_schema": false,
@@ -273,6 +373,7 @@ impl AdminClient {
         name: &str,
         weight: u32,
         tokens_per_minute: u64,
+        max_in_flight: Option<u32>,
         group: &str,
         synthetic: bool,
     ) -> Result<(String, bool)> {
@@ -293,7 +394,7 @@ impl AdminClient {
                 reqwest::Method::PUT,
                 &format!("/tenants/{id}/quota"),
                 Some(
-                    json!({ "tokens_per_minute": tokens_per_minute, "max_in_flight": Value::Null }),
+                    json!({ "tokens_per_minute": tokens_per_minute, "max_in_flight": max_in_flight }),
                 ),
             )
             .await?;
@@ -317,7 +418,7 @@ impl AdminClient {
         } else {
             let created = self.req(reqwest::Method::POST, "/tenants", Some(json!({
                 "name": name, "weight": weight, "tokens_per_minute": tokens_per_minute, "fairshare_group": group,
-                "synthetic": synthetic,
+                "max_in_flight": max_in_flight, "synthetic": synthetic,
             }))).await?;
             Ok((
                 created["id"].as_str().context("new tenant id")?.to_string(),
@@ -331,7 +432,13 @@ impl AdminClient {
     /// secret is always retrievable and no stale test keys accumulate. obench
     /// never reuses (and never persists) a key — the secret lives only in memory
     /// for the duration of the run and the key is deleted during teardown.
-    pub async fn ensure_key(&self, tenant_id: &str, key_name: &str) -> Result<(String, String)> {
+    pub async fn ensure_key(
+        &self,
+        tenant_id: &str,
+        key_name: &str,
+        weight: u32,
+        max_in_flight: Option<u32>,
+    ) -> Result<(String, String)> {
         let keys = self.req(reqwest::Method::GET, "/keys", None).await?;
         let inv: Vec<(String, String, String)> = keys
             .as_array()
@@ -360,7 +467,7 @@ impl AdminClient {
             .req(
                 reqwest::Method::POST,
                 &format!("/tenants/{tenant_id}/keys"),
-                Some(json!({ "name": key_name })),
+                Some(json!({ "name": key_name, "weight": weight, "max_in_flight": max_in_flight })),
             )
             .await?;
         // Response shape: { "key": { "id": ..., ... }, "secret": "..." }.

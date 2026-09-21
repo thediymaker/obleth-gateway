@@ -67,9 +67,9 @@ export function QuotaControl({
       </div>
       <div className="space-y-1">
         <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider text-muted-foreground">
-          Concurrency cap
+          Max in flight per model
           <InfoTip>
-            Maximum tenant requests actively running at the same time. Clear the field and apply for unlimited tenant concurrency.
+            Maximum requests this tenant can have running at the same time on any one model. Leave blank for no per-model cap.
           </InfoTip>
         </span>
         <Input
@@ -79,7 +79,7 @@ export function QuotaControl({
           value={max}
           onChange={(e) => setMax(e.target.value)}
           placeholder="Unlimited"
-          aria-label="Concurrency cap"
+          aria-label="Max in flight per model"
           title="Clear and apply to make tenant concurrency unlimited"
           className="h-8 min-w-0 text-xs"
         />

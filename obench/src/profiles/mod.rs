@@ -10,6 +10,7 @@ use rand::Rng;
 
 use crate::admin::AdminClient;
 use crate::cli::{Cli, Profile, Scope, Target};
+use crate::engine::fairshare::PoolAccumulator;
 use crate::engine::fleet::{self, TrafficKind};
 use crate::engine::load::{ChatRequest, EmbedRequest, LoadClient, ProxyRequest, RunConfig};
 use crate::engine::stats::{is_stall, Stats, Verdict};
@@ -30,7 +31,10 @@ pub struct RunHandles {
     /// API (the demo path). For a remote `live` run obench has no admin token,
     /// so the dashboard shows client-side metrics only.
     pub gateway_observable: bool,
-    /// Display names of the tenant keys driving load, in counter order.
+    /// The global in-flight ceiling the run set: `plan.capacity` (a per-model
+    /// pool size) times the number of seeded models.
+    pub gateway_capacity: u32,
+    /// Display names of the keys driving load (`tenant/key`), in counter order.
     pub key_labels: Vec<String>,
     /// Per-key dispatched-request counters, parallel to `key_labels`. The load
     /// engine bumps these so the dashboard can show fairshare distribution.
@@ -52,6 +56,8 @@ struct SeededSetup {
     ui_base: String,
     /// See `RunHandles::gateway_observable`.
     gateway_observable: bool,
+    /// See `RunHandles::gateway_capacity`.
+    gateway_capacity: u32,
     /// See `RunHandles::key_labels`.
     key_labels: Vec<String>,
     /// See `RunHandles::key_counts`.
@@ -87,12 +93,14 @@ async fn seed_and_guard(
     scope: &Scope,
     admin: &AdminClient,
     live_override: Option<&crate::config::LiveConfig>,
+    fleet_choice: seed::FleetChoice,
+    model_cap: Option<u32>,
 ) -> Result<SeededRun> {
     let seeded: SeededRun = match tgt {
         Target::Demo => {
             let api_base = std::env::var("BENCHMARK_API_BASE")
                 .unwrap_or_else(|_| FIXTURE_API_BASE_DEFAULT.to_string());
-            seed::seed_fixture(admin, &api_base, scope).await?
+            seed::seed_fixture(admin, &api_base, scope, fleet_choice, model_cap).await?
         }
         Target::Live => {
             let cfg = resolve_live_config(cli, live_override)?;
@@ -119,7 +127,7 @@ async fn build_setup(
     live_override: Option<&crate::config::LiveConfig>,
 ) -> Result<SeededSetup> {
     let admin = AdminClient::new(cli.admin_base.clone(), cli.admin_token.clone());
-    let plan = plan::resolve(profile, cli);
+    let mut plan = plan::resolve(profile, cli);
 
     // Where load is sent + where to watch. Demo drives the local gateway and is
     // fully observable over admin; live drives the remote proxy the user gave and
@@ -133,22 +141,47 @@ async fn build_setup(
         }
     };
 
-    let seeded = seed_and_guard(cli, tgt, &scope, &admin, live_override).await?;
+    let fleet_choice = if profile == Profile::Fairshare {
+        seed::FleetChoice::Fairshare
+    } else {
+        seed::FleetChoice::Standard
+    };
+    let seeded = seed_and_guard(
+        cli,
+        tgt,
+        &scope,
+        &admin,
+        live_override,
+        fleet_choice,
+        Some(plan.capacity),
+    )
+    .await?;
     let teardown = seeded.teardown.clone();
+    let key_total: usize = seeded.tenants.iter().map(|t| t.keys.len()).sum();
+
+    // `plan.capacity` is the per-model pool size, so the global ceiling has to
+    // clear the sum of the pools — otherwise it, not the pools, gates admission
+    // and every pool reads as idle-with-a-backlog.
+    let gateway_capacity = plan
+        .capacity
+        .saturating_mul(seeded.models.len() as u32)
+        .max(plan.capacity);
 
     // Only the demo path owns a local gateway whose capacity it can set.
     if gateway_observable {
-        let cap = admin.set_capacity(plan.capacity).await?;
+        let cap = admin.set_capacity(gateway_capacity).await?;
         println!(
-            "seeded {} models, {} tenants, capacity max_in_flight={cap}",
+            "seeded {} models x {} slots, {} tenants, {} keys, ceiling {cap}",
             seeded.models.len(),
-            seeded.tenants.len()
+            plan.capacity,
+            seeded.tenants.len(),
+            key_total,
         );
     } else {
         println!(
             "driving {} models across {} tenant keys on {proxy_base}",
             seeded.models.len(),
-            seeded.tenants.len()
+            key_total,
         );
     }
 
@@ -159,51 +192,89 @@ async fn build_setup(
     let plan_stream = plan.stream;
     let plan_out = plan.output_tokens;
 
-    // Per-key dispatch counters so the dashboard can show how load actually
-    // spread across tenants (the whole point of a fairshare benchmark).
-    let key_labels: Vec<String> = seeded
+    // Every (tenant, key) pair the run can drive, flattened so a worker can be
+    // pinned to one key rather than one tenant: per-key fairness is only
+    // measurable when each key offers its own independent load.
+    let key_slots: Vec<(usize, usize)> = seeded
         .tenants
         .iter()
         .enumerate()
-        .map(|(i, t)| {
-            if t.name.trim().is_empty() {
-                format!("tenant-{}", i + 1)
+        .flat_map(|(ti, t)| (0..t.keys.len()).map(move |ki| (ti, ki)))
+        .collect();
+    if key_slots.is_empty() {
+        anyhow::bail!("no API keys to drive load with — every seeded tenant came back keyless");
+    }
+
+    // Per-key dispatch counters so the dashboard can show how load actually
+    // spread across tenants and keys (the whole point of a fairshare benchmark).
+    let key_labels: Vec<String> = key_slots
+        .iter()
+        .map(|(ti, ki)| {
+            let t = &seeded.tenants[*ti];
+            let name = if t.name.trim().is_empty() {
+                format!("tenant-{}", ti + 1)
             } else {
                 t.name.clone()
-            }
+            };
+            format!("{name}/{}", t.keys[*ki].name)
         })
         .collect();
-    let key_counts: Arc<Vec<AtomicU64>> = Arc::new(
-        (0..seeded.tenants.len())
-            .map(|_| AtomicU64::new(0))
-            .collect(),
-    );
+    let key_counts: Arc<Vec<AtomicU64>> =
+        Arc::new((0..key_slots.len()).map(|_| AtomicU64::new(0)).collect());
+
+    // The fairshare profile sizes its own worker pool: two workers per key keeps
+    // every key backlogged so admission, not offered load, decides the split.
+    if plan.conc == 0 {
+        plan.conc = (key_slots.len() as u32).saturating_mul(2).max(1);
+    }
 
     let equal_tenant_load = cli.equal_tenant_load;
+    let pin_keys = equal_tenant_load || profile == Profile::Fairshare;
+    let key_slots = Arc::new(key_slots);
+    // Each fleet has its own traffic catalog: the fairshare fleet's covers all
+    // eight of its models, so no seeded pool sits idle.
+    let traffic: &'static [fleet::TrafficType] = match fleet_choice {
+        seed::FleetChoice::Standard => fleet::FIXTURE_TRAFFIC,
+        seed::FleetChoice::Fairshare => fleet::FAIRSHARE_TRAFFIC,
+    };
     let make_req = {
         let seeded_arc = seeded_arc.clone();
         let proxy_base = req_base.clone();
         let key_counts = key_counts.clone();
+        let key_slots = key_slots.clone();
         move |worker: usize| -> ProxyRequest {
             let mut rng = rand::thread_rng();
-            // Pick a tenant: pinned one-per-worker under equal load, otherwise
-            // sampled per request by the fixture's traffic shares.
-            let shares: Vec<u32> = seeded_arc.tenants.iter().map(|t| t.traffic_share).collect();
-            let ti = fleet::tenant_for_worker(worker, &shares, equal_tenant_load, rng.gen::<f64>());
+            // Pick a (tenant, key) slot: pinned one-per-worker when every key
+            // must offer its own load, otherwise the tenant is sampled per
+            // request by the fixture's traffic shares and the key follows the
+            // worker.
+            let si = if pin_keys {
+                worker % key_slots.len()
+            } else {
+                let shares: Vec<u32> = seeded_arc.tenants.iter().map(|t| t.traffic_share).collect();
+                let ti = fleet::tenant_for_worker(worker, &shares, false, rng.gen::<f64>());
+                let ki = worker % seeded_arc.tenants[ti].keys.len().max(1);
+                key_slots
+                    .iter()
+                    .position(|s| *s == (ti, ki))
+                    .unwrap_or(worker % key_slots.len())
+            };
+            let (ti, ki) = key_slots[si];
             let tenant = &seeded_arc.tenants[ti];
-            if let Some(c) = key_counts.get(ti) {
+            let key = tenant.keys[ki].secret.clone();
+            if let Some(c) = key_counts.get(si) {
                 c.fetch_add(1, Ordering::Relaxed);
             }
             // Pick a model + shape. Fixture uses the traffic catalog; live uses the seeded models.
             if seeded_arc.models.iter().all(|m| m.starts_with("obench-")) {
-                let cands: Vec<&fleet::TrafficType> = fleet::FIXTURE_TRAFFIC
+                let cands: Vec<&fleet::TrafficType> = traffic
                     .iter()
                     .filter(|t| seeded_arc.models.iter().any(|m| m == t.model))
                     .collect();
                 if cands.is_empty() {
                     return ProxyRequest::Chat(ChatRequest {
                         proxy_base: proxy_base.clone(),
-                        key: tenant.key.clone(),
+                        key: key.clone(),
                         model: seeded_arc.models[0].clone(),
                         input_tokens,
                         output_tokens: plan_out,
@@ -216,14 +287,14 @@ async fn build_setup(
                 if tt.kind == TrafficKind::Embed {
                     return ProxyRequest::Embed(EmbedRequest {
                         proxy_base: proxy_base.clone(),
-                        key: tenant.key.clone(),
+                        key: key.clone(),
                         model: tt.model.to_string(),
                         input_tokens,
                     });
                 }
                 ProxyRequest::Chat(ChatRequest {
                     proxy_base: proxy_base.clone(),
-                    key: tenant.key.clone(),
+                    key: key.clone(),
                     model: tt.model.to_string(),
                     input_tokens,
                     output_tokens: if tt.output_tokens > 0 {
@@ -237,7 +308,7 @@ async fn build_setup(
                 let mi = rng.gen_range(0..seeded_arc.models.len());
                 ProxyRequest::Chat(ChatRequest {
                     proxy_base: proxy_base.clone(),
-                    key: tenant.key.clone(),
+                    key: key.clone(),
                     model: seeded_arc.models[mi].clone(),
                     input_tokens,
                     output_tokens: plan_out,
@@ -257,6 +328,7 @@ async fn build_setup(
         proxy_base,
         ui_base,
         gateway_observable,
+        gateway_capacity,
         key_labels,
         key_counts,
     })
@@ -274,7 +346,16 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
 
     if profile == Profile::Auto {
         // Seed independently for the Auto path (it handles its own capacity).
-        let seeded = seed_and_guard(cli, tgt, &scope, &admin, None).await?;
+        let seeded = seed_and_guard(
+            cli,
+            tgt,
+            &scope,
+            &admin,
+            None,
+            seed::FleetChoice::Standard,
+            Some(plan.capacity),
+        )
+        .await?;
         let teardown = seeded.teardown.clone();
         // Demo drives the local gateway (admin sets capacity); live drives the
         // remote proxy as a black box with no admin access.
@@ -283,7 +364,14 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
             Target::Live => (resolve_live_config(cli, None)?.proxy_url, false),
         };
         if observable {
-            let _ = admin.set_capacity(plan.capacity).await?;
+            // `plan.capacity` is per-model, so the ceiling clears every pool.
+            let _ = admin
+                .set_capacity(
+                    plan.capacity
+                        .saturating_mul(seeded.models.len() as u32)
+                        .max(plan.capacity),
+                )
+                .await?;
         }
         let result = auto::run(cli, tgt, scope, &seeded, &proxy_base).await;
         // Clean up anything obench created (no-op for the black-box live path).
@@ -301,6 +389,7 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
         proxy_base: _proxy_base,
         ui_base,
         gateway_observable,
+        gateway_capacity: _gateway_capacity,
         key_labels: _key_labels,
         key_counts: _key_counts,
     } = setup;
@@ -329,11 +418,15 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
     let fs_acc = Arc::new(Mutex::new(
         crate::engine::fairshare::FairshareAccumulator::new(),
     ));
+    // One accumulator per model pool, keyed by model name.
+    let pool_accs: Arc<Mutex<std::collections::BTreeMap<String, PoolAccumulator>>> =
+        Arc::new(Mutex::new(std::collections::BTreeMap::new()));
     let fs_sampler = (fs_interval_ms > 0).then(|| {
         let admin_base = cli.admin_base.clone();
         let admin_token = cli.admin_token.clone();
         let stop = stop.clone();
         let acc = fs_acc.clone();
+        let pool_accs = pool_accs.clone();
         let pname = profile_name.clone();
         tokio::spawn(async move {
             let a = AdminClient::new(admin_base, admin_token);
@@ -370,6 +463,22 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
                 }
                 for group in live.group_samples().iter().filter(|g| g.is_participating()) {
                     let _ = report::append_fairshare_group_row(&pname, t_s, group);
+                }
+                let pools = live.pool_samples();
+                if let Ok(mut map) = pool_accs.lock() {
+                    for p in &pools {
+                        let acc = map
+                            .entry(p.model.clone())
+                            .or_insert_with(|| PoolAccumulator::new(&p.model, p.cap));
+                        acc.note_cap(p.cap);
+                        acc.observe(&p.tenants, &p.keys, dt_s);
+                    }
+                }
+                for p in &pools {
+                    let _ = report::append_pool_row(&pname, t_s, p);
+                    for k in &p.keys {
+                        let _ = report::append_key_row(&pname, t_s, &p.model, k);
+                    }
                 }
             }
         })
@@ -480,6 +589,20 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
             crate::engine::fairshare::apply_starvation_verdict(summary.verdict, &fs_summary);
     }
 
+    let pool_summaries: Vec<crate::engine::fairshare::PoolSummary> = pool_accs
+        .lock()
+        .map(|m| m.values().map(PoolAccumulator::summarize).collect())
+        .unwrap_or_else(|e| {
+            e.into_inner()
+                .values()
+                .map(PoolAccumulator::summarize)
+                .collect()
+        });
+    if !pool_summaries.is_empty() {
+        summary.verdict =
+            crate::engine::fairshare::apply_pool_verdicts(summary.verdict, &pool_summaries);
+    }
+
     println!("\n{}", report::render_summary(&summary, &ui_base));
     if fs_summary.samples > 0 {
         println!("\n{}", report::render_fairshare(&fs_summary));
@@ -487,6 +610,9 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
             Ok(p) => println!("  fairshare csv: {}", p.display()),
             Err(e) => eprintln!("  fairshare csv unavailable: {e}"),
         }
+    }
+    if !pool_summaries.is_empty() {
+        println!("\n{}", report::render_pools(&pool_summaries));
     }
     report::write_meta(
         &profile_name,
@@ -512,6 +638,20 @@ pub async fn run_headless(cli: &Cli, tgt: Target, profile: Profile, scope: Scope
                     "starved": t.starved,
                 })).collect::<Vec<_>>(),
             })),
+            "pools": pool_summaries.iter().map(|p| serde_json::json!({
+                "model": p.model, "cap": p.cap,
+                "jain_index": p.tenants.jain_index,
+                "key_jain_index": p.key_jain_index,
+                "idle_with_backlog_ticks": p.idle_with_backlog_ticks,
+                "cap_violations": p.cap_violations,
+                "starved": p.tenants.starved,
+                "keys": p.keys.iter().map(|k| serde_json::json!({
+                    "tenant": k.tenant, "key": k.name, "weight": k.weight,
+                    "slot_seconds": k.slot_seconds,
+                    "expected_share": k.expected_share, "realized_share": k.realized_share,
+                    "share_ratio": k.share_ratio,
+                })).collect::<Vec<_>>(),
+            })).collect::<Vec<_>>(),
         }),
     )?;
 
@@ -545,6 +685,7 @@ pub async fn start_run(
         proxy_base: _proxy_base,
         ui_base,
         gateway_observable,
+        gateway_capacity,
         key_labels,
         key_counts,
     } = setup;
@@ -581,6 +722,7 @@ pub async fn start_run(
         profile_name,
         teardown,
         gateway_observable,
+        gateway_capacity,
         key_labels,
         key_counts,
     })
