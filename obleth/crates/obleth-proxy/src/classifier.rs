@@ -356,6 +356,48 @@ mod tests {
         assert_eq!(intent_from_outcomes(&outcomes).difficulty, 3);
     }
 
+    /// The exact strings the brain is sent, pinned so they cannot drift away
+    /// from the training-time renderer that reproduces them — currently
+    /// `distill/tasks/router_intent.py` in the rc-k8s-gaudi repository, which
+    /// carries these same literals. A distilled classifier is trained on
+    /// these bytes; changing one here without regenerating its training data
+    /// silently degrades the deployed model, so this test is a deliberate
+    /// cross-repository tripwire, not a tautology. Update both together.
+    #[test]
+    fn the_rendered_prompts_match_the_training_goldens() {
+        let system = format!(
+            "You answer routing questions about the REQUEST below. Reply with exactly one \
+             answer label and nothing else — no explanation, no punctuation, no preamble.\n\n\
+             # Request\n{}",
+            "Write a Rust function that parses JSON"
+        );
+        assert_eq!(
+            system,
+            "You answer routing questions about the REQUEST below. Reply with exactly one \
+             answer label and nothing else — no explanation, no punctuation, no preamble.\n\n\
+             # Request\nWrite a Rust function that parses JSON"
+        );
+
+        let q = tag_question("coding");
+        let rendered = vprompt::render_user(&q, &vprompt::labels_for(&q));
+        assert_eq!(
+            rendered,
+            "# Question\nDoes the routing tag 'coding' describe this request?\n\nAnswer \"yes\" or \"no\"."
+        );
+
+        let d = difficulty_question();
+        let labels = vprompt::labels_for(&d);
+        assert_eq!(labels.labels, ["A", "B", "C"]);
+        assert_eq!(
+            vprompt::render_user(&d, &labels),
+            "# Question\nHow hard is this request to answer well?\n\n# Levels\n\
+             A) level 1 — Simple or factual — a small model answers it well\n\
+             B) level 2 — Moderate — needs solid general capability\n\
+             C) level 3 — Hard — needs careful, multi-step reasoning\n\
+             \nAnswer with the letter of the level that best matches."
+        );
+    }
+
     fn brain(api_base: &str) -> ResolvedModel {
         ResolvedModel {
             model_name: "brain-test".to_string(),
