@@ -4,6 +4,10 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## Unreleased
+
+- **Fairshare starts with waiting tenants.** The dashboard now puts capacity, queued work, and tenants waiting below share first, with selectable tenant details, group-to-tenant drill-downs, and a compact weight-editing workbench. Activity history is available below the overview, and refresh failures clearly label stale scheduler snapshots.
+
 ## v1.2.0
 
 The Responses API, boons that compose per request, and model names free of their serving format.

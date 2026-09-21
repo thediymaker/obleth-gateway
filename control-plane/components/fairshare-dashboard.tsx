@@ -31,9 +31,10 @@ import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { colorForGroup, OTHERS_COLOR, PALETTE } from "@/lib/chart-palette";
 import { isWaitingBelowShare } from "@/lib/fairshare";
-import { clamp, formatCompact, formatDecimal, formatDelta, formatPct, formatScore } from "@/lib/format";
+import { clamp, formatCompact, formatDecimal, formatPct, formatScore } from "@/lib/format";
 import type { ModelRoute } from "@/lib/obleth";
 import { cn, formatNumber } from "@/lib/utils";
 
@@ -89,9 +90,6 @@ const TENANT_PAGE = 120;
 const MAX_HISTORY_POINTS = 120;
 
 const QUEUED_COLOR = "hsl(38 75% 60%)";
-const STARVED_COLOR = "hsl(350 65% 60%)";
-const HEALTHY_COLOR = "hsl(210 8% 70%)";
-const UNDER_COLOR = "hsl(205 18% 58%)";
 
 type ThroughputMetric = "requests" | "tokens";
 type TenantSort = "pressure" | "queued" | "deficit" | "served" | "score" | "weight" | "share";
@@ -107,10 +105,16 @@ export function FairshareDashboard({
   tenantNames: Record<string, string>;
 }) {
   const queryClient = useQueryClient();
-  const { data: view, groupHistory, groupKeys, isFetching } = useFairshareLive();
+  const { data: view, groupHistory, groupKeys, isFetching, isError, dataUpdatedAt } = useFairshareLive();
   const { data: tenantSeries } = useThroughputSeries();
   const { data: modelRoutes } = useModelRoutes();
   const [throughputMetric, setThroughputMetric] = useState<ThroughputMetric>("requests");
+  const [section, setSection] = useState("overview");
+  const [tenantFilter, setTenantFilter] = useState({ group: "all", scope: "active" as TenantScope });
+  const inspectTenants = (group: string, scope: TenantScope) => {
+    setTenantFilter({ group, scope });
+    setSection("tenants");
+  };
 
   const summary = useMemo(() => summarizeFairshare(view), [view]);
   const throughput = useMemo(
@@ -129,49 +133,36 @@ export function FairshareDashboard({
         view={view}
         summary={summary}
         isFetching={isFetching}
+        isError={isError}
+        dataUpdatedAt={dataUpdatedAt}
         onRefresh={refresh}
       />
 
-      <FairshareSectionNav />
-
-      <section id="live" className="scroll-mt-20 space-y-4">
-        <SectionHeader
-          eyebrow="Live state"
-          title="Scheduler pressure"
-          description="Backlog, active work, and the next admission decision."
-        />
-        <PressureStrip view={view} summary={summary} />
-        <div className="grid gap-4 xl:grid-cols-[minmax(21rem,0.82fr)_minmax(0,1.55fr)]">
-          <SchedulerNow view={view} summary={summary} />
-          <CapacityTimeline history={groupHistory} groups={groupKeys} view={view} />
-        </div>
-      </section>
-
-      <section id="allocation" className="scroll-mt-20 space-y-4">
-        <SectionHeader
-          eyebrow="Allocation"
-          title="Group pools"
-          description="How groups and tenants are apportioned before an individual tenant is picked."
-        />
-        <GroupAllocation view={view} />
-        <ModelSlotPressure view={view} routes={modelRoutes ?? []} />
-      </section>
-
-      <section id="tenants" className="scroll-mt-20 space-y-4">
-        <SectionHeader
-          eyebrow="Tenants"
-          title="Contention ledger"
-          description="Search, filter, sort, and adjust tenant fairshare weight."
-        />
-        <FairshareBalance view={view} />
-        <TenantOperations view={view} />
-        <ThroughputPanel
-          data={throughput.data}
-          series={throughput.series}
-          metric={throughputMetric}
-          onMetricChange={setThroughputMetric}
-        />
-      </section>
+      <PressureStrip view={view} summary={summary} />
+      <Tabs value={section} onValueChange={setSection}>
+        <TabsList aria-label="Fairshare views" className="h-auto max-w-full flex-wrap justify-start">
+          <TabsTrigger value="overview"><Activity className="h-3.5 w-3.5" />Overview</TabsTrigger>
+          <TabsTrigger value="allocation"><Network className="h-3.5 w-3.5" />Allocation</TabsTrigger>
+          <TabsTrigger value="tenants"><Users className="h-3.5 w-3.5" />Tenants</TabsTrigger>
+        </TabsList>
+        <TabsContent value="overview" className="space-y-4">
+          <WaitingTenants view={view} onShowAll={() => inspectTenants("all", "waiting")} />
+          <details className="rounded-md border border-border bg-card">
+            <summary className="cursor-pointer px-4 py-3 text-sm font-medium">Activity history</summary>
+            <div className="grid gap-4 p-4 pt-0 xl:grid-cols-2">
+              <CapacityTimeline history={groupHistory} groups={groupKeys} view={view} />
+              <ThroughputPanel data={throughput.data} series={throughput.series} metric={throughputMetric} onMetricChange={setThroughputMetric} />
+            </div>
+          </details>
+        </TabsContent>
+        <TabsContent value="allocation" className="space-y-4">
+          <GroupAllocation view={view} onInspect={(group) => inspectTenants(group, "all")} />
+          <ModelSlotPressure view={view} routes={modelRoutes ?? []} />
+        </TabsContent>
+        <TabsContent value="tenants">
+          <TenantOperations key={`${tenantFilter.group}:${tenantFilter.scope}`} view={view} initialGroup={tenantFilter.group} initialScope={tenantFilter.scope} />
+        </TabsContent>
+      </Tabs>
     </div>
   );
 }
@@ -239,6 +230,7 @@ function useFairshareLive() {
     groupHistory,
     groupKeys,
     isFetching: query.isFetching,
+    isError: query.isError,
     dataUpdatedAt: query.dataUpdatedAt,
   };
 }
@@ -274,51 +266,27 @@ function useModelRoutes() {
 
 interface FairshareSummary {
   utilization: number;
-  activeTenants: number;
-  activeGroups: number;
   starvedTenants: number;
   waitingTenants: number;
-  totalServed: number;
-  totalTenantWeight: number;
-  totalGroupWeight: number;
-  nextTenant?: TenantFairshareView;
-  largestDeficit?: TenantFairshareView;
 }
 
 function summarizeFairshare(view?: FairshareLiveView): FairshareSummary {
   if (!view) {
     return {
       utilization: 0,
-      activeTenants: 0,
-      activeGroups: 0,
       starvedTenants: 0,
       waitingTenants: 0,
-      totalServed: 0,
-      totalTenantWeight: 0,
-      totalGroupWeight: 0,
     };
   }
 
-  const activeTenants = view.tenants.filter((t) => isTenantActive(t)).length;
-  const activeGroups = view.groups.filter((g) => g.in_flight + g.queued > 0).length;
   const waiting = view.tenants.filter((t) => t.queued > 0);
   const starved = waiting.filter(isWaitingBelowShare);
-  const nextTenant = [...waiting].sort((a, b) => tenantDebt(view, a) - tenantDebt(view, b))[0];
-  const largestDeficit = [...view.tenants]
-    .filter((t) => t.queued > 0 || fairnessGap(t) < 0)
-    .sort((a, b) => fairnessGap(a) - fairnessGap(b))[0];
+
 
   return {
     utilization: view.max_in_flight > 0 ? (view.global_in_flight / view.max_in_flight) * 100 : 0,
-    activeTenants,
-    activeGroups,
     starvedTenants: starved.length,
     waitingTenants: waiting.length,
-    totalServed: view.tenants.reduce((sum, t) => sum + (t.served_tokens ?? 0), 0),
-    totalTenantWeight: view.tenants.reduce((sum, t) => sum + (t.weight ?? 0), 0),
-    totalGroupWeight: view.groups.reduce((sum, g) => sum + (g.weight ?? 0), 0),
-    nextTenant,
-    largestDeficit,
   };
 }
 
@@ -390,16 +358,20 @@ function LiveConsoleHeader({
   view,
   summary,
   isFetching,
+  isError,
+  dataUpdatedAt,
   onRefresh,
 }: {
   view?: FairshareLiveView;
   summary: FairshareSummary;
   isFetching: boolean;
+  isError: boolean;
+  dataUpdatedAt: number;
   onRefresh: () => void;
 }) {
   const tone = pressureStatus(summary.utilization, view?.global_queued ?? 0);
   const label =
-    tone === "hot"
+    isError ? "Scheduler unavailable" : !view ? "Loading scheduler" : tone === "hot"
       ? "Admission hot"
       : tone === "warn"
         ? (view?.global_queued ?? 0) > 0
@@ -415,7 +387,7 @@ function LiveConsoleHeader({
       <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
         <div className="min-w-0">
           <h1 className="text-lg font-semibold tracking-tight">Fairshare</h1>
-          <p className="mt-0.5 text-sm text-muted-foreground">Live admission, allocation, and tenant contention in one scheduler workspace.</p>
+          <p className="mt-0.5 text-sm text-muted-foreground">Capacity, contention, and who is waiting.</p>
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <Badge
               className={cn(
@@ -433,7 +405,8 @@ function LiveConsoleHeader({
               poll {FAIRSHARE_POLL_MS / 1000}s
             </Badge>
           </div>
-          <p className="mt-2 truncate text-xs text-muted-foreground">{detail}</p>
+          <p className="mt-2 text-xs text-muted-foreground">{detail}</p>
+          {isError && <p role="alert" className="mt-2 text-xs text-amber-400">{view ? `Showing the last snapshot from ${new Date(dataUpdatedAt).toLocaleTimeString()}. Refresh failed; retrying automatically.` : "Could not load scheduler state. Retrying automatically."}</p>}
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button type="button" variant="outline" size="sm" asChild>
@@ -452,87 +425,35 @@ function LiveConsoleHeader({
   );
 }
 
-function FairshareSectionNav() {
-  const items = [
-    { href: "#live", label: "Live pressure", icon: Activity },
-    { href: "#allocation", label: "Allocation", icon: Network },
-    { href: "#tenants", label: "Tenants", icon: Users },
-  ];
 
-  return (
-    <div className="sticky top-2 z-20 overflow-x-auto rounded-md border border-border bg-card/95 p-2 backdrop-blur">
-      <nav className="flex min-w-max items-center gap-2" aria-label="Fairshare sections">
-        {items.map((item) => {
-          const Icon = item.icon;
-          return (
-            <a
-              key={item.href}
-              href={item.href}
-              className="inline-flex h-8 items-center gap-2 rounded-sm border border-border bg-background/35 px-3 text-xs font-medium text-muted-foreground transition-colors hover:bg-muted/20 hover:text-foreground"
-            >
-              <Icon className="h-3.5 w-3.5" />
-              {item.label}
-            </a>
-          );
-        })}
-      </nav>
-    </div>
-  );
-}
-
-function SectionHeader({
-  eyebrow,
-  title,
-  description,
-}: {
-  eyebrow: string;
-  title: string;
-  description: string;
-}) {
-  return (
-    <div className="flex flex-col gap-1">
-      <p className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">{eyebrow}</p>
-      <div className="flex flex-col gap-1 sm:flex-row sm:items-end sm:justify-between">
-        <h2 className="text-base font-semibold tracking-tight">{title}</h2>
-        <p className="max-w-2xl text-xs text-muted-foreground">{description}</p>
-      </div>
-    </div>
-  );
-}
 
 function PressureStrip({ view, summary }: { view?: FairshareLiveView; summary: FairshareSummary }) {
   const items = [
     {
-      label: "In flight",
-      value: view ? formatNumber(view.global_in_flight) : "--",
-      sub: view && view.global_in_flight > 0 ? "requests active now" : "no active requests",
+      label: "Active / capacity",
+      value: view ? `${formatNumber(view.global_in_flight)} / ${formatNumber(view.max_in_flight)}` : "--",
+      sub: view ? `${formatPct(summary.utilization)} of global slots occupied` : "Waiting for scheduler state",
       tone: "neutral",
     },
     {
-      label: "Queue",
+      label: "Queued requests",
       value: view ? formatNumber(view.global_queued) : "--",
       sub:
         view && view.global_queued > 0
           ? `${formatNumber(summary.waitingTenants)} tenants waiting`
-          : "no backlog",
+          : view ? "No backlog" : "Waiting for scheduler state",
       tone: view && view.global_queued > 0 ? "warn" : "ok",
     },
     {
-      label: "Tenants",
-      value: view ? `${formatNumber(summary.activeTenants)} / ${formatNumber(view.tenants.length)}` : "--",
-      sub: `${formatNumber(summary.starvedTenants)} below fair share`,
+      label: "Waiting below share",
+      value: view ? formatNumber(summary.starvedTenants) : "--",
+      sub: view ? `${formatDecimal(view.tenants.filter(isWaitingBelowShare).reduce((sum, t) => sum + t.expected_slots - t.in_flight, 0))} slots below expected` : "Waiting for scheduler state",
       tone: summary.starvedTenants > 0 ? "hot" : "ok",
-    },
-    {
-      label: "Groups",
-      value: view ? `${formatNumber(summary.activeGroups)} / ${formatNumber(view.groups.length)}` : "--",
-      sub: `${formatNumber(summary.totalGroupWeight)} total group weight`,
-      tone: "neutral",
     },
   ] satisfies MetricTile[];
 
   return (
-    <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+    <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
       {items.map((item) => (
         <MetricCard key={item.label} item={item} />
       ))}
@@ -569,9 +490,9 @@ function CapacityTimeline({
       </CardHeader>
       <CardContent>
         {history.length === 0 ? (
-          <EmptyState className="h-[28rem]">Waiting for live scheduler samples</EmptyState>
+          <EmptyState className="h-72">Waiting for live scheduler samples</EmptyState>
         ) : (
-          <ChartShell heightClass="h-[28rem]">
+          <ChartShell heightClass="h-72">
             <ResponsiveContainer width="100%" height="100%">
               <ComposedChart data={history} margin={{ top: 8, right: 12, left: 4, bottom: 4 }}>
                 <defs>
@@ -642,113 +563,87 @@ function CapacityTimeline({
   );
 }
 
-function SchedulerNow({ view, summary }: { view?: FairshareLiveView; summary: FairshareSummary }) {
-  const next = summary.nextTenant;
-  const deficit = summary.largestDeficit;
-
+function WaitingTenants({ view, onShowAll }: { view?: FairshareLiveView; onShowAll: () => void }) {
+  const [selectedId, setSelectedId] = useState<string>();
+  const waiting = [...(view?.tenants ?? [])].filter((t) => t.queued > 0).sort((a, b) =>
+    Number(isWaitingBelowShare(b)) - Number(isWaitingBelowShare(a)) || fairnessGap(a) - fairnessGap(b) || b.queued - a.queued || a.tenant_id.localeCompare(b.tenant_id),
+  );
+  const shown = waiting.slice(0, 8);
+  const selected = view?.tenants.find((t) => t.tenant_id === selectedId) ?? shown[0];
+  const scale = Math.max(1, ...shown.map((t) => Math.max(t.in_flight, t.expected_slots)));
   return (
-    <Card className="h-full rounded-md">
-      <CardHeader>
-        <CardTitle>Scheduler now</CardTitle>
-        <CardDescription>Admission pressure and current fair-share posture</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
-        <div className="grid grid-cols-2 gap-3">
-          <MiniStat label="In flight" value={view ? formatNumber(view.global_in_flight) : "--"} />
-          <MiniStat label="Queued" value={view ? formatNumber(view.global_queued) : "--"} tone={(view?.global_queued ?? 0) > 0 ? "warn" : "ok"} />
-          <MiniStat label="Waiting tenants" value={view ? formatNumber(summary.waitingTenants) : "--"} tone={summary.waitingTenants > 0 ? "warn" : "ok"} />
-          <MiniStat label="Below fair" value={view ? formatNumber(summary.starvedTenants) : "--"} tone={summary.starvedTenants > 0 ? "hot" : "ok"} />
-        </div>
+    <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1.7fr)_minmax(18rem,1fr)]">
+      <Card className="min-w-0 rounded-md">
+        <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
+          <div><CardTitle>Waiting tenants</CardTitle><CardDescription>Tenants waiting below their expected share appear first.</CardDescription></div>
+          <Button variant="outline" size="sm" onClick={onShowAll}>View all waiting ({formatNumber(waiting.length)})</Button>
+        </CardHeader>
+        <CardContent>
+          {!view ? <EmptyState className="h-32">Waiting for scheduler state</EmptyState> : shown.length === 0 ? <EmptyState className="h-32">No tenants are waiting for admission</EmptyState> : (
+            <ul className="divide-y divide-border">
+              {shown.map((tenant) => (
+                <li key={tenant.tenant_id}>
+                  <button type="button" aria-pressed={selected?.tenant_id === tenant.tenant_id} onClick={() => setSelectedId(tenant.tenant_id)} className={cn("grid w-full gap-3 rounded-sm px-2 py-4 text-left transition-colors hover:bg-muted/30 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.2fr)_4rem] sm:items-center", selected?.tenant_id === tenant.tenant_id && "bg-muted/30")}>
+                    <span className="min-w-0"><span className="block break-words text-sm font-medium">{tenant.name}</span><span className="block break-words text-xs text-muted-foreground">{tenant.fairshare_group}</span>{isWaitingBelowShare(tenant) && <span className="text-xs text-amber-400">Waiting below share</span>}</span>
+                    <SlotComparison tenant={tenant} scale={scale} />
+                    <span className="text-right text-sm tabular-nums">{formatNumber(tenant.queued)}<span className="block text-xs text-muted-foreground">queued</span></span>
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <p className="mt-4 text-xs text-muted-foreground">Bar: active slots. Marker: expected share, not a hard limit. {shown.length > 0 && `Shared scale: 0–${formatDecimal(scale)} slots.`}</p>
+          {waiting.length > shown.length && <p className="mt-2 text-xs text-muted-foreground">Showing {shown.length} of {formatNumber(waiting.length)} waiting tenants.</p>}
+        </CardContent>
+      </Card>
+      <TenantInspector key={selected?.tenant_id ?? "empty"} tenant={selected} view={view} />
+    </div>
+  );
+}
 
-        <PriorityReadout
-          title="Next waiting tenant"
-          tenant={next}
-          empty="No queued tenants"
-          valueLabel={next ? `debt ${formatScore(tenantDebt(view, next))}` : ""}
-        />
-        <PriorityReadout
-          title="Largest fair-share gap"
-          tenant={deficit}
-          empty="No active deficit"
-          valueLabel={deficit ? formatDelta(fairnessGap(deficit)) : ""}
-          highlight={deficit ? isWaitingBelowShare(deficit) : false}
-        />
+function SlotComparison({ tenant, scale }: { tenant: TenantFairshareView; scale: number }) {
+  return (
+    <span className="block min-w-0" aria-label={`${tenant.in_flight} active, ${formatDecimal(tenant.expected_slots)} expected slots`}>
+      <span className="mb-2 flex flex-wrap justify-between gap-x-2 text-xs tabular-nums text-muted-foreground"><span>{formatNumber(tenant.in_flight)} active</span><span>{formatDecimal(tenant.expected_slots)} expected</span></span>
+      <span className="relative block h-2 rounded-sm bg-muted/40">
+        <span className="block h-full rounded-sm bg-foreground/50" style={{ width: `${clamp(tenant.in_flight / scale * 100, 0, 100)}%` }} />
+        <span aria-hidden className="absolute -top-1 h-4 w-px -translate-x-full bg-foreground" style={{ left: `${clamp(tenant.expected_slots / scale * 100, 0, 100)}%` }} />
+      </span>
+    </span>
+  );
+}
+
+function TenantInspector({ tenant, view }: { tenant?: TenantFairshareView; view?: FairshareLiveView }) {
+  return (
+    <Card className="min-w-0 rounded-md" aria-label="Tenant details">
+      <CardHeader><CardTitle className="break-words">{tenant?.name ?? "Tenant details"}</CardTitle><CardDescription className="break-all">{tenant?.tenant_id ?? "Select a tenant to inspect its allocation."}</CardDescription></CardHeader>
+      <CardContent>
+        {tenant ? <>
+          <p className={cn("mb-4 rounded-sm bg-muted/30 px-3 py-2 text-xs", isWaitingBelowShare(tenant) && "text-amber-400")}>
+            {isWaitingBelowShare(tenant) ? `Waiting · ${formatDecimal(-fairnessGap(tenant))} slots below expected` : tenant.queued > 0 ? "Waiting for admission" : "No queued requests"}
+          </p>
+          <dl className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-x-3 gap-y-3 text-xs">
+            <dt className="text-muted-foreground">Group</dt><dd className="break-words text-right">{tenant.fairshare_group}</dd>
+            <dt className="text-muted-foreground">Active / expected</dt><dd className="text-right tabular-nums">{formatNumber(tenant.in_flight)} / {formatDecimal(tenant.expected_slots)}</dd>
+            <dt className="text-muted-foreground">Queued</dt><dd className="text-right tabular-nums">{formatNumber(tenant.queued)}</dd>
+            <dt className="text-muted-foreground">Weight share</dt><dd className="text-right tabular-nums">{formatPct(tenant.weight_share * 100)}</dd>
+            <dt className="text-muted-foreground">Scheduler debt</dt><dd className="text-right tabular-nums">{formatScore(tenantDebt(view, tenant))}</dd>
+            <dt className="text-muted-foreground">Served tokens</dt><dd className="text-right tabular-nums">{formatCompact(tenant.served_tokens)}</dd>
+            <dt className="text-muted-foreground">Tenant weight</dt><dd><WeightCell id={tenant.tenant_id} weight={tenant.weight} /></dd>
+          </dl>
+          <p className="mt-4 text-xs text-muted-foreground">Weights change relative priority; they do not reserve slots. Admission also depends on scheduler debt and model capacity.</p>
+        </> : <EmptyState className="h-32">No tenant selected</EmptyState>}
       </CardContent>
     </Card>
   );
 }
 
-function MiniStat({
-  label,
-  value,
-  tone = "neutral",
-}: {
-  label: string;
-  value: string;
-  tone?: MetricTone;
-}) {
-  const toneClass = {
-    ok: "text-[hsl(158_48%_56%)]",
-    warn: "text-[hsl(38_75%_62%)]",
-    hot: "text-[hsl(350_65%_64%)]",
-    neutral: "text-foreground",
-  }[tone];
-
-  return (
-    <div className="rounded-sm border border-border bg-background/35 px-3 py-2">
-      <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{label}</p>
-      <p className={cn("mt-0.5 text-lg font-semibold tabular-nums", toneClass)}>{value}</p>
-    </div>
-  );
-}
-
-function PriorityReadout({
-  title,
-  tenant,
-  empty,
-  valueLabel,
-  highlight,
-}: {
-  title: string;
-  tenant?: TenantFairshareView;
-  empty: string;
-  valueLabel: string;
-  highlight?: boolean;
-}) {
-  return (
-    <div className="rounded-sm border border-border bg-background/35 px-3 py-3">
-      <div className="flex items-center justify-between gap-3">
-        <p className="text-[10px] uppercase tracking-wider text-muted-foreground">{title}</p>
-        {tenant && (
-          <span
-            className={cn(
-              "shrink-0 rounded-sm px-1.5 py-0.5 text-[10px] font-medium tabular-nums",
-              highlight ? "bg-[hsl(350_65%_60%/0.16)] text-[hsl(350_65%_64%)]" : "bg-muted/45 text-muted-foreground",
-            )}
-          >
-            {valueLabel}
-          </span>
-        )}
-      </div>
-      {tenant ? (
-        <div className="mt-2 min-w-0">
-          <p className="truncate text-sm font-medium">{tenant.name}</p>
-          <p className="mt-0.5 truncate text-xs text-muted-foreground">
-            {tenant.fairshare_group} / {formatNumber(tenant.in_flight)} active / {formatNumber(tenant.queued)} queued
-          </p>
-        </div>
-      ) : (
-        <p className="mt-2 text-sm text-muted-foreground">{empty}</p>
-      )}
-    </div>
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Groups
 // ---------------------------------------------------------------------------
 
-function GroupAllocation({ view }: { view?: FairshareLiveView }) {
+function GroupAllocation({ view, onInspect }: { view?: FairshareLiveView; onInspect: (group: string) => void }) {
   const groups = useMemo(
     () =>
       [...(view?.groups ?? [])].sort((a, b) => {
@@ -763,7 +658,7 @@ function GroupAllocation({ view }: { view?: FairshareLiveView }) {
       <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <CardTitle>Group allocation</CardTitle>
-          <CardDescription>Caps, weights, entitlements, active slots, queued work, and served tokens</CardDescription>
+          <CardDescription>Groups can borrow idle capacity above their apportioned cap. Inspect a group to see its tenants.</CardDescription>
         </div>
         {view && (
           <Badge className="capitalize">
@@ -777,7 +672,7 @@ function GroupAllocation({ view }: { view?: FairshareLiveView }) {
         ) : (
           <div className="space-y-3">
             {groups.map((g, i) => (
-              <GroupAllocationRow key={g.name} group={g} index={i} maxInFlight={view?.max_in_flight ?? 0} />
+              <GroupAllocationRow key={g.name} group={g} index={i} onInspect={() => onInspect(g.name)} />
             ))}
           </div>
         )}
@@ -789,17 +684,15 @@ function GroupAllocation({ view }: { view?: FairshareLiveView }) {
 function GroupAllocationRow({
   group,
   index,
-  maxInFlight,
+  onInspect,
 }: {
   group: GroupFairshareView;
   index: number;
-  maxInFlight: number;
+  onInspect: () => void;
 }) {
   const color = colorForGroup(group.name, index);
   const cap = Math.max(group.slot_cap, group.expected_slots, group.in_flight, 1);
   const activePct = clamp((group.in_flight / cap) * 100, 0, 100);
-  const queuedPct = clamp((group.queued / Math.max(group.in_flight + group.queued, 1)) * 100, 0, 100);
-  const expectedPct = clamp((group.expected_slots / Math.max(maxInFlight, 1)) * 100, 0, 100);
 
   return (
     <div className="rounded-md border border-border bg-background/25 px-4 py-3">
@@ -807,7 +700,7 @@ function GroupAllocationRow({
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: color }} />
-            <p className="truncate text-sm font-semibold">{group.name}</p>
+            <button type="button" onClick={onInspect} className="break-words text-left text-sm font-semibold underline decoration-border underline-offset-4 hover:decoration-foreground" aria-label={`Inspect ${group.name} tenants`}>{group.name}</button>
           </div>
           <p className="mt-1 text-xs tabular-nums text-muted-foreground">
             w{formatNumber(group.weight)} / {formatPct(group.weight_share * 100)} share
@@ -817,25 +710,23 @@ function GroupAllocationRow({
         <div className="min-w-0">
           <div className="mb-1 flex items-center justify-between gap-2 text-[11px] tabular-nums text-muted-foreground">
             <span>{formatNumber(group.in_flight)} active</span>
-            <span>{formatDecimal(group.expected_slots)} expected / cap {formatNumber(group.slot_cap)}</span>
+            <span>{formatDecimal(group.expected_slots)} expected / apportioned cap {formatNumber(group.slot_cap)}</span>
           </div>
-          <div className="relative h-3 overflow-hidden rounded-sm bg-muted/35">
+          <div className="relative h-3 rounded-sm bg-muted/35">
             <div className="h-full rounded-sm" style={{ width: `${activePct}%`, background: color }} />
             <span
-              className="absolute top-[-2px] h-[calc(100%+4px)] w-px bg-foreground/70"
+              className="absolute top-[-2px] h-[calc(100%+4px)] w-px -translate-x-full bg-foreground/70"
               style={{ left: `${clamp((group.expected_slots / cap) * 100, 0, 100)}%` }}
             />
           </div>
-          <div className="mt-1.5 h-1.5 overflow-hidden rounded-sm bg-muted/25">
-            <div className="h-full rounded-sm bg-[hsl(38_65%_60%)]" style={{ width: `${queuedPct}%` }} />
-          </div>
+          <p className="mt-2 text-[11px] text-muted-foreground">Bar: active slots · marker: expected · scale: 0–{formatDecimal(cap)}</p>
         </div>
 
         <div className="grid grid-cols-4 gap-2 text-right">
           <GroupNumber label="Queued" value={formatNumber(group.queued)} tone={group.queued > 0 ? "warn" : "neutral"} />
           <GroupNumber label="Served" value={formatCompact(group.served_tokens)} />
           <GroupNumber label="Debt" value={formatScore(group.share_score)} />
-          <GroupNumber label="Global" value={formatPct(expectedPct)} />
+          <GroupNumber label="Borrowed" value={formatNumber(Math.max(0, group.in_flight - group.slot_cap))} />
         </div>
       </div>
     </div>
@@ -878,6 +769,7 @@ function ModelSlotPressure({ view, routes }: { view?: FairshareLiveView; routes:
         inFlight: inFlight[name] ?? 0,
         queued: queued[name] ?? 0,
         cap: capByName.get(name) ?? null,
+        capKnown: capByName.has(name),
       }))
       .filter((r) => r.inFlight > 0 || r.queued > 0)
       .sort((a, b) => b.queued - a.queued || b.inFlight - a.inFlight);
@@ -892,7 +784,7 @@ function ModelSlotPressure({ view, routes }: { view?: FairshareLiveView; routes:
         </div>
         <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground">
           <span className="inline-flex items-center gap-1.5"><i className="h-2 w-2 rounded-sm bg-[hsl(205_55%_52%)]" />in-flight</span>
-          <span className="inline-flex items-center gap-1.5"><i className="h-2 w-2 rounded-sm bg-[hsl(38_70%_52%)]" />queued</span>
+          <span>Queued requests are shown separately from occupied slots.</span>
         </div>
       </CardHeader>
       <CardContent>
@@ -901,19 +793,17 @@ function ModelSlotPressure({ view, routes }: { view?: FairshareLiveView; routes:
         ) : (
           <div className="space-y-2.5">
             {rows.map((r) => {
-              const cap = r.cap ?? Math.max(r.inFlight + r.queued, 1);
+              const cap = Math.max(r.cap ?? r.inFlight, 1);
               const inflightPct = clamp((r.inFlight / cap) * 100, 0, 100);
-              const queuedPct = clamp((r.queued / cap) * 100, 0, 100 - inflightPct);
               return (
-                <div key={r.name} className="flex items-center gap-3 text-xs">
-                  <span className="w-32 shrink-0 truncate font-medium" title={r.name}>{r.name}</span>
-                  <div className="flex h-4 flex-1 overflow-hidden rounded-sm bg-background/40">
-                    <div className="h-full bg-[hsl(205_55%_52%)] transition-all duration-500" style={{ width: `${inflightPct}%` }} />
-                    <div className="h-full bg-[hsl(38_70%_52%)] transition-all duration-500" style={{ width: `${queuedPct}%` }} />
+                <div key={r.name} className="grid gap-2 text-xs sm:grid-cols-[minmax(0,1fr)_minmax(0,2fr)_minmax(0,1fr)] sm:items-center">
+                  <span className="break-words font-medium">{r.name}</span>
+                  <div className="h-3 overflow-hidden rounded-sm bg-muted/35">
+                    {r.capKnown && r.cap !== null && <div className="h-full bg-[hsl(205_55%_52%)] transition-all duration-500" style={{ width: `${inflightPct}%` }} />}
                   </div>
-                  <span className="w-32 shrink-0 text-right font-mono text-[11px] tabular-nums text-muted-foreground">
-                    {formatNumber(r.inFlight)} / {r.cap == null ? "∞" : formatNumber(r.cap)}
-                    {r.queued > 0 ? ` · ${formatNumber(r.queued)} queued` : ""}
+                  <span className="tabular-nums text-muted-foreground sm:text-right">
+                    {formatNumber(r.inFlight)} active / {!r.capKnown ? "cap unavailable" : r.cap == null ? "no model cap" : `${formatNumber(r.cap)} cap`}
+                    <span className={cn("block", r.queued > 0 && "text-amber-400")}>{formatNumber(r.queued)} queued</span>
                   </span>
                 </div>
               );
@@ -929,67 +819,13 @@ function ModelSlotPressure({ view, routes }: { view?: FairshareLiveView; routes:
 // Tenants
 // ---------------------------------------------------------------------------
 
-function FairshareBalance({ view }: { view?: FairshareLiveView }) {
-  const rows = useMemo(() => {
-    const tenants = (view?.tenants ?? [])
-      .filter((t) => t.in_flight + t.queued > 0)
-      .map((t) => ({ t, gap: fairnessGap(t), starved: isWaitingBelowShare(t) }))
-      .sort((a, b) => a.gap - b.gap)
-      .slice(0, 12);
-    const maxAbs = tenants.reduce((m, r) => Math.max(m, Math.abs(r.gap), r.t.expected_slots), 1);
-    return { tenants, maxAbs };
-  }, [view]);
 
-  return (
-    <Card className="rounded-md">
-      <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
-        <div>
-          <CardTitle>Fair-share balance</CardTitle>
-          <CardDescription>Active slots vs. fair entitlement. Left of center is below fair share.</CardDescription>
-        </div>
-        <div className="flex flex-wrap gap-2 text-[11px] text-muted-foreground">
-          <span className="inline-flex items-center gap-1.5"><i className="h-2 w-2 rounded-sm" style={{ background: STARVED_COLOR }} />below fair</span>
-          <span className="inline-flex items-center gap-1.5"><i className="h-2 w-2 rounded-sm bg-[hsl(160_45%_48%)]" />above fair</span>
-        </div>
-      </CardHeader>
-      <CardContent>
-        {rows.tenants.length === 0 ? (
-          <EmptyState className="h-48">No active tenants contending right now</EmptyState>
-        ) : (
-          <div className="space-y-1.5">
-            {rows.tenants.map(({ t, gap, starved }) => {
-              const widthPct = clamp((Math.abs(gap) / rows.maxAbs) * 50, 0, 50);
-              const color = starved ? STARVED_COLOR : "hsl(160 45% 48%)";
-              return (
-                <div key={t.tenant_id} className="flex items-center gap-3 text-xs">
-                  <span className="w-32 shrink-0 truncate font-medium" title={t.name}>{t.name}</span>
-                  <span className="w-16 shrink-0 truncate text-[11px] text-muted-foreground">{t.fairshare_group}</span>
-                  <div className="relative h-4 flex-1 rounded-sm bg-background/40">
-                    <span className="absolute left-1/2 top-[-2px] bottom-[-2px] w-px bg-foreground/40" />
-                    <div
-                      className="absolute top-0.5 bottom-0.5 rounded-sm transition-all duration-500"
-                      style={gap >= 0
-                        ? { left: "50%", width: `${widthPct}%`, background: color }
-                        : { right: "50%", width: `${widthPct}%`, background: color }}
-                    />
-                  </div>
-                  <span className="w-28 shrink-0 text-right font-mono text-[11px] tabular-nums" style={{ color: starved ? STARVED_COLOR : "hsl(240 6% 64%)" }}>
-                    {formatDelta(gap)} / {formatDecimal(t.expected_slots)} exp
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        )}
-      </CardContent>
-    </Card>
-  );
-}
 
-function TenantOperations({ view }: { view?: FairshareLiveView }) {
+function TenantOperations({ view, initialGroup, initialScope }: { view?: FairshareLiveView; initialGroup: string; initialScope: TenantScope }) {
   const [query, setQuery] = useState("");
-  const [groupFilter, setGroupFilter] = useState("all");
-  const [scope, setScope] = useState<TenantScope>("active");
+  const [groupFilter, setGroupFilter] = useState(initialGroup);
+  const [scope, setScope] = useState<TenantScope>(initialScope);
+  const [selectedId, setSelectedId] = useState<string>();
   const [sort, setSort] = useState<TenantSort>("pressure");
 
   const groups = useMemo(() => {
@@ -1039,30 +875,32 @@ function TenantOperations({ view }: { view?: FairshareLiveView }) {
   }, [view, query, groupFilter, scope, sort]);
 
   const shown = rows.slice(0, TENANT_PAGE);
+  const selected = rows.find((t) => t.tenant_id === selectedId) ?? shown[0];
   const starved = useMemo(() => rows.filter(isWaitingBelowShare).length, [rows]);
   const totalActive = view?.tenants.filter(isTenantActive).length ?? 0;
   const totalWaiting = view?.tenants.filter((t) => t.queued > 0).length ?? 0;
   const totalStarved = view?.tenants.filter(isWaitingBelowShare).length ?? 0;
 
   return (
-    <Card className="rounded-md">
+    <div className="space-y-4">
+    <Card className="min-w-0 rounded-md">
       <CardHeader className="gap-3 lg:flex-row lg:items-start lg:justify-between">
         <div>
-          <CardTitle>Tenant contention</CardTitle>
+          <CardTitle>Tenant workbench</CardTitle>
           <CardDescription>
             {view ? `${formatNumber(rows.length)} tenant${rows.length === 1 ? "" : "s"}` : "Loading tenants"}
             {rows.length > TENANT_PAGE ? ` / showing ${formatNumber(TENANT_PAGE)}` : ""}
-            {starved > 0 ? ` / ${formatNumber(starved)} starved` : ""}
+            {starved > 0 ? ` / ${formatNumber(starved)} waiting below share` : ""}
           </CardDescription>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <div className="inline-flex rounded-sm border border-border bg-background/35 p-0.5">
+          <div className="inline-flex flex-wrap rounded-sm border border-border bg-background/35 p-0.5">
             <ScopeToggle active={scope === "active"} label={`Active ${formatNumber(totalActive)}`} onClick={() => setScope("active")} />
             <ScopeToggle active={scope === "waiting"} label={`Waiting ${formatNumber(totalWaiting)}`} onClick={() => setScope("waiting")} />
             <ScopeToggle active={scope === "starved"} label={`Below fair ${formatNumber(totalStarved)}`} onClick={() => setScope("starved")} />
             <ScopeToggle active={scope === "all"} label="All" onClick={() => setScope("all")} />
           </div>
-          <div className="relative">
+          <div className="relative w-full sm:w-auto">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <Input
               type="search"
@@ -1070,7 +908,7 @@ function TenantOperations({ view }: { view?: FairshareLiveView }) {
               onChange={(e) => setQuery(e.target.value)}
               placeholder="Search tenant, id, group"
               aria-label="Search tenants"
-              className="h-8 w-60 pl-8 text-xs"
+              className="h-8 w-full pl-8 text-xs sm:w-60"
             />
           </div>
           <Select
@@ -1099,28 +937,24 @@ function TenantOperations({ view }: { view?: FairshareLiveView }) {
         </div>
       </CardHeader>
       <CardContent className="p-0">
-        <div className="overflow-x-auto">
-          <table className="w-full min-w-[980px] text-sm">
+        <div className="grid items-start xl:grid-cols-[minmax(0,1.7fr)_minmax(18rem,1fr)]">
+        <div className="min-w-0 overflow-x-auto">
+          <table className="w-full min-w-[480px] text-sm">
             <thead>
               <tr className="border-b border-border text-left text-xs text-muted-foreground">
                 <th className="px-6 py-3 font-medium">Tenant</th>
-                <th className="px-3 py-3 font-medium">Group</th>
-                <th className="px-3 py-3 text-right font-medium">Active</th>
+                <th className="px-3 py-3 text-right font-medium">Active / expected</th>
                 <th className="px-3 py-3 text-right font-medium">Queued</th>
-                <th className="px-3 py-3 font-medium">Slots vs fair</th>
-                <th className="px-3 py-3 text-right font-medium">Share</th>
-                <th className="px-3 py-3 text-right font-medium">Debt</th>
-                <th className="px-3 py-3 text-right font-medium">Served</th>
                 <th className="px-6 py-3 text-right font-medium">Weight</th>
               </tr>
             </thead>
             <tbody>
               {shown.map((tenant) => (
-                <TenantRow key={tenant.tenant_id} tenant={tenant} view={view} />
+                <TenantRow key={tenant.tenant_id} tenant={tenant} selected={selected?.tenant_id === tenant.tenant_id} onSelect={() => setSelectedId(tenant.tenant_id)} />
               ))}
               {shown.length === 0 && (
                 <tr>
-                  <td colSpan={9} className="px-6 py-12 text-center text-muted-foreground">
+                  <td colSpan={4} className="px-6 py-12 text-center text-muted-foreground">
                     {view ? "No tenants match the current view" : "Waiting for tenant scheduler state"}
                   </td>
                 </tr>
@@ -1128,12 +962,15 @@ function TenantOperations({ view }: { view?: FairshareLiveView }) {
             </tbody>
           </table>
         </div>
+        <div className="p-4"><TenantInspector key={selected?.tenant_id ?? "empty"} tenant={selected} view={view} /></div>
+        </div>
       </CardContent>
     </Card>
+    </div>
   );
 }
 
-function TenantRow({ tenant, view }: { tenant: TenantFairshareView; view?: FairshareLiveView }) {
+function TenantRow({ tenant, selected, onSelect }: { tenant: TenantFairshareView; selected: boolean; onSelect: () => void }) {
   const starved = isWaitingBelowShare(tenant);
   const color = colorForGroup(tenant.fairshare_group);
 
@@ -1141,7 +978,7 @@ function TenantRow({ tenant, view }: { tenant: TenantFairshareView; view?: Fairs
     <tr
       className={cn(
         "border-b border-border/60 transition-colors hover:bg-muted/20",
-        starved && "bg-[hsl(350_65%_60%/0.07)]",
+        selected && "bg-muted/30",
       )}
     >
       <td className="px-6 py-3">
@@ -1149,87 +986,55 @@ function TenantRow({ tenant, view }: { tenant: TenantFairshareView; view?: Fairs
           <span className="h-2.5 w-2.5 shrink-0 rounded-full" style={{ background: color }} />
           <div className="min-w-0">
             <div className="flex items-center gap-2">
-              <p className="truncate font-medium">{tenant.name}</p>
+              <button type="button" onClick={onSelect} aria-pressed={selected} className="text-left font-medium hover:underline">{tenant.name}</button>
               {starved && (
                 <span className="rounded-sm bg-[hsl(350_65%_60%/0.16)] px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[hsl(350_65%_64%)]">
-                  starved
+                  Below share
                 </span>
               )}
             </div>
-            <p className="mt-0.5 font-mono text-[10px] text-muted-foreground">{tenant.tenant_id.slice(0, 8)}</p>
+            <p className="mt-0.5 text-xs text-muted-foreground">{tenant.fairshare_group}</p>
           </div>
         </div>
       </td>
-      <td className="px-3 py-3 text-muted-foreground">{tenant.fairshare_group}</td>
-      <td className="px-3 py-3 text-right tabular-nums">{formatNumber(tenant.in_flight)}</td>
+      <td className="px-3 py-3 text-right tabular-nums">{formatNumber(tenant.in_flight)} / {formatDecimal(tenant.expected_slots)}</td>
       <td className="px-3 py-3 text-right tabular-nums">
         <span className={tenant.queued > 0 ? "text-[hsl(38_75%_62%)]" : ""}>{formatNumber(tenant.queued)}</span>
       </td>
-      <td className="px-3 py-3">
-        <FairnessBar tenant={tenant} />
-      </td>
-      <td className="px-3 py-3 text-right tabular-nums text-muted-foreground">{formatPct(tenant.weight_share * 100)}</td>
-      <td className="px-3 py-3 text-right font-mono text-xs tabular-nums text-muted-foreground">
-        {formatScore(tenantDebt(view, tenant))}
-      </td>
-      <td className="px-3 py-3 text-right tabular-nums text-muted-foreground">{formatCompact(tenant.served_tokens)}</td>
-      <td className="px-6 py-3">
-        <WeightCell id={tenant.tenant_id} weight={tenant.weight} />
-      </td>
+      <td className="px-6 py-3 text-right tabular-nums">{formatNumber(tenant.weight)}</td>
     </tr>
   );
 }
 
-function FairnessBar({ tenant }: { tenant: TenantFairshareView }) {
-  const entitled = Math.max(tenant.expected_slots, 0);
-  const delta = fairnessGap(tenant);
-  const color = fairnessColor(tenant);
-  const scale = Math.max(entitled, tenant.in_flight, 1);
-  const frac = clamp(Math.abs(delta) / scale, 0, 1);
-  const widthPct = frac * 50;
 
-  return (
-    <div
-      className="flex items-center gap-2"
-      title={`${formatNumber(tenant.in_flight)} active vs ${formatDecimal(entitled)} expected slots`}
-    >
-      <div className="relative h-2.5 w-32 overflow-hidden rounded-sm bg-muted/40">
-        <span className="absolute left-1/2 top-[-1px] h-[calc(100%+2px)] w-px -translate-x-1/2 bg-foreground/45" />
-        <div
-          className="absolute top-0 h-full transition-all duration-500"
-          style={
-            delta >= 0
-              ? { left: "50%", width: `${widthPct}%`, background: color, borderRadius: "0 2px 2px 0" }
-              : { right: "50%", width: `${widthPct}%`, background: color, borderRadius: "2px 0 0 2px" }
-          }
-        />
-      </div>
-      <span
-        className="w-16 shrink-0 text-right font-mono text-[10px] tabular-nums"
-        style={{ color: isWaitingBelowShare(tenant) ? STARVED_COLOR : "hsl(240 6% 64%)" }}
-      >
-        {formatDelta(delta)} / {formatDecimal(entitled)}
-      </span>
-    </div>
-  );
-}
 
 function WeightCell({ id, weight }: { id: string; weight: number }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(weight);
   const [pending, start] = useTransition();
+  const [error, setError] = useState<string>();
   const queryClient = useQueryClient();
 
   const commit = () => {
-    const next = Math.max(1, Math.round(draft) || 1);
+    if (pending) return;
+    if (!Number.isSafeInteger(draft) || draft < 1) {
+      setError("Enter a positive whole number.");
+      return;
+    }
+    const next = draft;
+    setError(undefined);
     if (next === weight) {
       setEditing(false);
       return;
     }
     start(async () => {
-      await setWeightAction(id, next);
-      queryClient.invalidateQueries({ queryKey: ["fairshare-live"] });
-      setEditing(false);
+      try {
+        await setWeightAction(id, next);
+        await queryClient.invalidateQueries({ queryKey: ["fairshare-live"] });
+        setEditing(false);
+      } catch {
+        setError("Could not save weight. Try again.");
+      }
     });
   };
 
@@ -1239,19 +1044,21 @@ function WeightCell({ id, weight }: { id: string; weight: number }) {
         type="button"
         onClick={() => {
           setDraft(weight);
+          setError(undefined);
           setEditing(true);
         }}
         className="group ml-auto flex items-center justify-end gap-1.5 tabular-nums text-muted-foreground transition-colors hover:text-foreground"
-        title="Edit tenant weight"
+        aria-label="Edit tenant weight"
       >
         {formatNumber(weight)}
-        <Pencil className="h-3 w-3 opacity-0 transition-opacity group-hover:opacity-70" />
+        <Pencil className="h-3 w-3 opacity-70" />
       </button>
     );
   }
 
   return (
-    <div className="flex items-center justify-end gap-1">
+    <div>
+    <div className="flex flex-wrap items-center justify-end gap-1">
       <input
         type="number"
         min={1}
@@ -1261,7 +1068,7 @@ function WeightCell({ id, weight }: { id: string; weight: number }) {
         onChange={(e) => setDraft(Number(e.target.value))}
         onKeyDown={(e) => {
           if (e.key === "Enter") commit();
-          if (e.key === "Escape") setEditing(false);
+          if (e.key === "Escape" && !pending) setEditing(false);
         }}
         aria-label="Fairshare weight"
         className="h-7 w-16 rounded-md border border-border bg-background px-2 text-right text-xs tabular-nums outline-none focus:ring-1 focus:ring-foreground/40"
@@ -1284,6 +1091,8 @@ function WeightCell({ id, weight }: { id: string; weight: number }) {
       >
         <X className="h-3.5 w-3.5" />
       </button>
+    </div>
+    {error && <p role="alert" className="mt-2 text-xs text-destructive">{error}</p>}
     </div>
   );
 }
@@ -1438,10 +1247,7 @@ function fairnessGap(t: TenantFairshareView): number {
   return t.in_flight - t.expected_slots;
 }
 
-function fairnessColor(t: TenantFairshareView): string {
-  if (isWaitingBelowShare(t)) return STARVED_COLOR;
-  return fairnessGap(t) >= -0.5 ? HEALTHY_COLOR : UNDER_COLOR;
-}
+
 
 function tenantDebt(_view: FairshareLiveView | undefined, tenant: TenantFairshareView): number {
   return tenant.served_tokens / Math.max(tenant.weight, 1);
@@ -1452,4 +1258,3 @@ function pressureStatus(utilization: number, queued: number): MetricTone {
   if (queued > 0 || utilization >= 75) return "warn";
   return "ok";
 }
-
