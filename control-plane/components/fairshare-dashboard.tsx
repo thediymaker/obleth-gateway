@@ -714,14 +714,16 @@ function WaitingTenants({ view, onShowAll }: { view?: FairshareLiveView; onShowA
   const selected = view?.tenants.find((t) => t.tenant_id === selectedId) ?? shown[0];
   const scale = Math.max(1, ...shown.map((t) => Math.max(t.in_flight, t.expected_slots)));
   return (
-    <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1.7fr)_minmax(18rem,1fr)]">
-      <Card className="min-w-0 rounded-md">
+    // Both cards stretch to the row's height, so the list and the inspector
+    // stay level whether either one is empty or populated.
+    <div className="grid items-stretch gap-4 xl:grid-cols-[minmax(0,1.7fr)_minmax(18rem,1fr)]">
+      <Card className="flex min-w-0 flex-col rounded-md">
         <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div><CardTitle>Waiting tenants</CardTitle><CardDescription>Tenants waiting below their expected share appear first.</CardDescription></div>
           <Button variant="outline" size="sm" onClick={onShowAll}>View all waiting ({formatNumber(waiting.length)})</Button>
         </CardHeader>
-        <CardContent>
-          {!view ? <EmptyState className="h-32">Waiting for scheduler state</EmptyState> : shown.length === 0 ? <EmptyState className="h-32">No tenants are waiting for admission</EmptyState> : (
+        <CardContent className="flex flex-1 flex-col">
+          {!view ? <EmptyState className="flex-1">Waiting for scheduler state</EmptyState> : shown.length === 0 ? <EmptyState className="flex-1">No tenants are waiting for admission</EmptyState> : (
             <ul className="divide-y divide-border">
               {shown.map((tenant) => (
                 <li key={tenant.tenant_id}>
@@ -734,7 +736,7 @@ function WaitingTenants({ view, onShowAll }: { view?: FairshareLiveView; onShowA
               ))}
             </ul>
           )}
-          <p className="mt-4 text-xs text-muted-foreground">Bar: active slots. Marker: expected share, not a hard limit. {shown.length > 0 && `Shared scale: 0–${formatDecimal(scale)} slots.`}</p>
+          <p className="mt-auto pt-4 text-xs text-muted-foreground">Bar: active slots. Marker: expected share, not a hard limit. {shown.length > 0 && `Shared scale: 0–${formatDecimal(scale)} slots.`}</p>
           {waiting.length > shown.length && <p className="mt-2 text-xs text-muted-foreground">Showing {shown.length} of {formatNumber(waiting.length)} waiting tenants.</p>}
         </CardContent>
       </Card>
@@ -757,9 +759,12 @@ function SlotComparison({ tenant, scale }: { tenant: TenantFairshareView; scale:
 
 function TenantInspector({ tenant, view }: { tenant?: TenantFairshareView; view?: FairshareLiveView }) {
   return (
-    <Card className="min-w-0 rounded-md" aria-label="Tenant details">
+    <Card className="flex min-w-0 flex-col rounded-md" aria-label="Tenant details">
       <CardHeader><CardTitle className="break-words">{tenant?.name ?? "Tenant details"}</CardTitle><CardDescription className="break-all">{tenant?.tenant_id ?? "Select a tenant to inspect its allocation."}</CardDescription></CardHeader>
-      <CardContent>
+      {/* The same minimum height whether or not a tenant is selected, so the
+          card does not resize when the selection changes; a long key list
+          still grows it. */}
+      <CardContent className="flex min-h-[27rem] flex-1 flex-col">
         {tenant ? <>
           <p className={cn("mb-4 rounded-sm bg-muted/30 px-3 py-2 text-xs", isWaitingBelowShare(tenant) && "text-amber-400")}>
             {isWaitingBelowShare(tenant) ? `Waiting · ${formatDecimal(-fairnessGap(tenant))} slots below expected` : tenant.queued > 0 ? "Waiting for admission" : "No queued requests"}
@@ -800,7 +805,7 @@ function TenantInspector({ tenant, view }: { tenant?: TenantFairshareView; view?
             </div>
           )}
           <p className="mt-4 text-xs text-muted-foreground">Weights change relative priority; they do not reserve slots. Admission also depends on scheduler debt and model capacity.</p>
-        </> : <EmptyState className="h-32">No tenant selected</EmptyState>}
+        </> : <EmptyState className="flex-1">No tenant selected</EmptyState>}
       </CardContent>
     </Card>
   );
