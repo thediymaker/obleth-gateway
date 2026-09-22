@@ -120,6 +120,7 @@ services:
       OBLETH_JWT_ISSUERS: ${OBLETH_JWT_ISSUERS:-}
       OBLETH_GLOBAL_MAX_IN_FLIGHT: "1024"
       OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT: "32"
+      OBLETH_FAIRSHARE_HISTORY_SECS: "3600"
       OBLETH_FAIRSHARE_ALGORITHM: hierarchical
       OBLETH_FAIL_OPEN: "true"
       # Fail-open telemetry WAL. The default (./obleth-telemetry.wal) is relative

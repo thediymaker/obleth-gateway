@@ -2,10 +2,22 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { FairshareDashboard, type FairshareLiveView, type TenantFairshareView } from "./fairshare-dashboard";
+import {
+  appendHistoryTail,
+  buildHistoryChart,
+  FairshareDashboard,
+  fetchHistory,
+  thinHistory,
+  type FairshareLiveView,
+  type TenantFairshareView,
+} from "./fairshare-dashboard";
+import type { FairshareHistoryView } from "@/lib/obleth";
 
 const mocks = vi.hoisted(() => ({
   view: undefined as FairshareLiveView | undefined,
+  history: undefined as FairshareHistoryView | undefined,
+  tail: undefined as FairshareHistoryView | undefined,
+  queryKeys: [] as string[][],
   isError: false,
   save: vi.fn(),
   invalidate: vi.fn(),
@@ -13,12 +25,15 @@ const mocks = vi.hoisted(() => ({
 vi.mock("@/app/actions", () => ({ setWeightAction: mocks.save }));
 vi.mock("@tanstack/react-query", () => ({
   useQueryClient: () => ({ invalidateQueries: mocks.invalidate }),
-  useQuery: ({ queryKey }: { queryKey: string[] }) => ({
-    data: queryKey[0] === "fairshare-live" ? mocks.view : [],
-    isError: mocks.isError,
-    isFetching: false,
-    dataUpdatedAt: 1_700_000_000_000,
-  }),
+  useQuery: ({ queryKey }: { queryKey: string[] }) => {
+    mocks.queryKeys.push(queryKey);
+    const data =
+      queryKey[0] === "fairshare-live" ? mocks.view
+      : queryKey[0] === "fairshare-history" ? mocks.history
+      : queryKey[0] === "fairshare-history-tail" ? mocks.tail
+      : [];
+    return { data, isError: mocks.isError, isFetching: false, isSuccess: data !== undefined, dataUpdatedAt: 1_700_000_000_000 };
+  },
 }));
 vi.mock("recharts", async (original) => ({
   ...await original<typeof import("recharts")>(),
@@ -34,6 +49,9 @@ let host: HTMLDivElement;
 let root: Root;
 beforeEach(() => {
   mocks.isError = false;
+  mocks.history = undefined;
+  mocks.tail = undefined;
+  mocks.queryKeys = [];
   mocks.save.mockReset().mockResolvedValue(undefined);
   mocks.invalidate.mockReset().mockResolvedValue(undefined);
   mocks.view = {
@@ -163,5 +181,93 @@ describe("fairshare operations", () => {
     await render();
     expect(host.querySelector('select[aria-label="Model scope"]')).toBeNull();
     expect(inspector().textContent).toContain("below-share");
+  });
+
+  it("restores the activity chart from gateway history and says how far back it reaches", async () => {
+    mocks.history = {
+      interval_ms: 2000, retention_ms: 3_600_000, oldest_ts_ms: 1_700_000_000_000,
+      points: [
+        { ts_ms: 1_700_000_000_000, in_flight: 3, queued: 1, groups: { research: 3 } },
+        { ts_ms: 1_700_000_002_000, in_flight: 5, queued: 0, groups: { research: 4, teaching: 1 } },
+      ],
+    };
+    await render();
+    expect(host.textContent).toContain("History since");
+    expect(host.textContent).not.toContain("Waiting for live scheduler samples");
+  });
+
+  it("shows history is disabled instead of waiting forever", async () => {
+    mocks.history = { interval_ms: 2000, retention_ms: 0, oldest_ts_ms: null, points: [] };
+    await render();
+    expect(host.textContent).toContain("History disabled (OBLETH_FAIRSHARE_HISTORY_SECS=0)");
+  });
+
+  it("asks for history scoped to the selected model pool", async () => {
+    mocks.view = {
+      ...mocks.view!,
+      pools: [
+        { model: "llama", cap: 4, in_flight: 1, queued: 3, borrowed: 0, groups: mocks.view!.groups, tenants: mocks.view!.tenants, keys: [] },
+      ],
+    };
+    mocks.history = { interval_ms: 2000, retention_ms: 3_600_000, oldest_ts_ms: null, points: [] };
+    await render();
+    expect(host.textContent).toContain("No samples yet");
+    const select = host.querySelector<HTMLSelectElement>('select[aria-label="Model scope"]')!;
+    await act(async () => { select.value = "llama"; select.dispatchEvent(new Event("change", { bubbles: true })); });
+    expect(mocks.queryKeys).toContainEqual(["fairshare-history", "llama"]);
+    expect(mocks.queryKeys).toContainEqual(["fairshare-history-tail", "llama"]);
+  });
+
+  it("projects history points into stacked group series", () => {
+    const { history, groupKeys } = buildHistoryChart([
+      { ts_ms: 1_700_000_000_000, in_flight: 3, queued: 1, groups: { research: 3 } },
+      { ts_ms: 1_700_000_002_000, in_flight: 5, queued: 0, groups: { teaching: 1, research: 4 } },
+    ]);
+    expect(groupKeys.map((g) => g.name)).toEqual(["research", "teaching"]);
+    expect(history[1]).toMatchObject({ queued: 0, "group:research": 4, "group:teaching": 1 });
+    expect(history[0]["group:teaching"]).toBe(0);
+    expect(typeof history[0].time).toBe("string");
+  });
+
+  it("appends only newer tail points and trims to the retention window", () => {
+    const prev = [
+      { ts_ms: 1_000, in_flight: 1, queued: 0, groups: {} },
+      { ts_ms: 3_000, in_flight: 2, queued: 0, groups: {} },
+    ];
+    const next = appendHistoryTail(prev, [
+      { ts_ms: 3_000, in_flight: 2, queued: 0, groups: {} },
+      { ts_ms: 5_000, in_flight: 4, queued: 1, groups: {} },
+    ], 3_000);
+    expect(next.map((p) => p.ts_ms)).toEqual([3_000, 5_000]);
+    expect(appendHistoryTail(prev, [], 10_000)).toBe(prev);
+  });
+
+  it("thins a long history to a bounded row count, keeping the last row", () => {
+    const rows = Array.from({ length: 1_800 }, (_, i) => ({ i }));
+    const thinned = thinHistory(rows, 600);
+    expect(thinned.length).toBeLessThanOrEqual(600);
+    expect(thinned[thinned.length - 1]).toBe(rows[rows.length - 1]);
+  });
+
+  it("returns the same array reference when already within budget", () => {
+    const rows = Array.from({ length: 100 }, (_, i) => ({ i }));
+    expect(thinHistory(rows, 600)).toBe(rows);
+  });
+
+  it("requests the history endpoint the hook actually calls", async () => {
+    const originalFetch = globalThis.fetch;
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      json: async () => ({ interval_ms: 2000, retention_ms: 1, oldest_ts_ms: null, points: [] }),
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+    try {
+      await fetchHistory("llama", 1234);
+      expect(fetchMock).toHaveBeenCalledWith("/api/live/fairshare/history?model=llama&since_ms=1234");
+      await fetchHistory(undefined);
+      expect(fetchMock).toHaveBeenCalledWith("/api/live/fairshare/history");
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

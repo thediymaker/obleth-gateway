@@ -13,9 +13,14 @@
 
 mod algorithm;
 mod capacity;
+pub mod history;
 
 pub use algorithm::{group_slot_caps, weighted_caps};
 pub use capacity::{CapacityProvider, StaticCapacity};
+pub use history::{
+    FairshareHistory, FairshareSample, GroupSample, HistoryPoint, PoolSample,
+    FAIRSHARE_HISTORY_INTERVAL_MS,
+};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -236,6 +241,9 @@ enum Ctl {
     Snapshot {
         respond: oneshot::Sender<FairshareSnapshot>,
     },
+    Sample {
+        respond: oneshot::Sender<FairshareSample>,
+    },
 }
 
 /// Handle to the fairshare scheduler. Cheap to clone.
@@ -304,6 +312,16 @@ impl FairShare {
                 enqueued: Instant::now(),
             })
             .ok()?;
+        rx.await.ok()
+    }
+
+    /// A scheduler sample built directly from pool state, for the history
+    /// ring. Cheaper than [`FairShare::snapshot`]: it skips the tenant and
+    /// key views the dashboard's live console needs but the history sampler
+    /// does not.
+    pub async fn sample(&self) -> Option<FairshareSample> {
+        let (respond, rx) = oneshot::channel();
+        self.ctl.send(Ctl::Sample { respond }).ok()?;
         rx.await.ok()
     }
 }
@@ -919,6 +937,40 @@ impl Pool {
         self.virtual_time = 0.0;
     }
 
+    /// Per-group in-flight/queued totals, for the history sampler. Cheaper
+    /// than [`Pool::snapshot`]: one pass over `tenant_in_flight` and the
+    /// queues, no tenant/key views. Only groups with in-flight or queued
+    /// work are included.
+    fn group_totals(&self) -> Vec<GroupSample> {
+        let mut totals: HashMap<&str, (usize, usize)> = HashMap::new();
+        for (tenant, n) in &self.tenant_in_flight {
+            if *n == 0 {
+                continue;
+            }
+            if let Some(group) = self.tenant_group.get(tenant) {
+                totals.entry(group.as_str()).or_insert((0, 0)).0 += *n;
+            }
+        }
+        for (tenant, queue) in &self.queues {
+            if queue.len == 0 {
+                continue;
+            }
+            if let Some(group) = self.tenant_group.get(tenant) {
+                totals.entry(group.as_str()).or_insert((0, 0)).1 += queue.len;
+            }
+        }
+        let mut groups: Vec<GroupSample> = totals
+            .into_iter()
+            .map(|(name, (in_flight, queued))| GroupSample {
+                name: name.to_string(),
+                in_flight,
+                queued,
+            })
+            .collect();
+        groups.sort_by(|a, b| a.name.cmp(&b.name));
+        groups
+    }
+
     fn snapshot(&self) -> ModelPoolFairshare {
         let ids: HashSet<Uuid> = self
             .queues
@@ -1193,6 +1245,9 @@ impl Scheduler {
                 Ctl::Snapshot { respond } => {
                     let _ = respond.send(self.build_snapshot());
                 }
+                Ctl::Sample { respond } => {
+                    let _ = respond.send(self.build_sample());
+                }
             }
         }
     }
@@ -1270,6 +1325,34 @@ impl Scheduler {
         self.stats
             .queued
             .store(self.queued_total as i64, Ordering::Relaxed);
+    }
+
+    /// A [`FairshareSample`] built directly from pool state, without the
+    /// tenant/key views [`Scheduler::build_snapshot`] computes. Keeps the
+    /// history sampler from forcing that full walk every tick.
+    fn build_sample(&self) -> FairshareSample {
+        let ts_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+        let pools = self
+            .pool_order
+            .iter()
+            .filter_map(|name| self.pools.get(name))
+            .map(|pool| PoolSample {
+                model: pool.model.clone(),
+                cap: pool.cap,
+                in_flight: pool.in_flight,
+                queued: pool.queued_total,
+                groups: pool.group_totals(),
+            })
+            .collect();
+        FairshareSample {
+            ts_ms,
+            global_in_flight: self.in_flight,
+            global_queued: self.queued_total,
+            pools,
+        }
     }
 
     fn build_snapshot(&self) -> FairshareSnapshot {

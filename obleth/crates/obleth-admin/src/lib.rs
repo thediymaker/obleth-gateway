@@ -45,7 +45,7 @@ use obleth_config::{
     ToolLoopSettings, VisionBoonSettings, STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS,
     TOOL_LOOP_MAX_TURNS,
 };
-use obleth_fairshare::{FairShare, StaticCapacity, Stats};
+use obleth_fairshare::{FairShare, FairshareHistory, StaticCapacity, Stats};
 use obleth_redis::RedisStore;
 use obleth_store::{AuditEntry, Store};
 use obleth_tokenizer::Tokenizer;
@@ -83,6 +83,10 @@ pub struct AdminState {
     /// Per-model in-flight cap used for models that don't set their own
     /// `max_in_flight`, sourced from `cfg.default_model_max_in_flight`.
     pub default_model_max_in_flight: usize,
+    /// Sampled scheduler history for `/api/v1/fairshare/history`.
+    pub fairshare_history: Arc<FairshareHistory>,
+    /// Configured retention in seconds; `0` means the sampler is off.
+    pub fairshare_history_secs: u64,
     pub fairshare_stats: Arc<Stats>,
     pub clickhouse: clickhouse::Client,
     pub admin_token: String,
@@ -192,6 +196,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/stats", get(get_stats))
         .route("/api/v1/overview/summary", get(get_overview_summary))
         .route("/api/v1/fairshare/live", get(get_fairshare_live))
+        .route("/api/v1/fairshare/history", get(get_fairshare_history))
         .route(
             "/api/v1/fairshare/groups",
             post(create_fairshare_group).get(list_fairshare_groups),
@@ -4367,6 +4372,69 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
     }))
 }
 
+#[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
+pub struct FairshareHistoryQuery {
+    /// Return points at or after this Unix time in ms. Default: now minus retention.
+    pub since_ms: Option<i64>,
+    /// Scope to one model's pool. Absent or empty: aggregate across pools.
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct FairshareHistoryPointView {
+    pub ts_ms: i64,
+    pub in_flight: usize,
+    pub queued: usize,
+    /// Group name to in-flight slots.
+    pub groups: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct FairshareHistoryView {
+    pub interval_ms: u64,
+    pub retention_ms: u64,
+    /// Time of the oldest retained sample; null when nothing is retained yet.
+    pub oldest_ts_ms: Option<i64>,
+    pub points: Vec<FairshareHistoryPointView>,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/fairshare/history", tag = "fairshare",
+    params(FairshareHistoryQuery),
+    responses((status = 200, body = FairshareHistoryView))
+)]
+async fn get_fairshare_history(
+    State(state): State<AdminState>,
+    Query(q): Query<FairshareHistoryQuery>,
+) -> Json<FairshareHistoryView> {
+    let retention_ms = state.fairshare_history_secs.saturating_mul(1000);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let since_ms = q
+        .since_ms
+        .unwrap_or_else(|| now_ms.saturating_sub(retention_ms as i64));
+    let model = q.model.as_deref().filter(|m| !m.is_empty());
+    let points = state
+        .fairshare_history
+        .points(since_ms, model, Some(model_health::HEALTH_GROUP))
+        .into_iter()
+        .map(|p| FairshareHistoryPointView {
+            ts_ms: p.ts_ms,
+            in_flight: p.in_flight,
+            queued: p.queued,
+            groups: p.groups,
+        })
+        .collect();
+    Json(FairshareHistoryView {
+        interval_ms: obleth_fairshare::FAIRSHARE_HISTORY_INTERVAL_MS,
+        retention_ms,
+        oldest_ts_ms: state.fairshare_history.oldest_ts_ms(),
+        points,
+    })
+}
+
 #[utoipa::path(
     get, path = "/api/v1/fairshare/groups", tag = "fairshare",
     responses((status = 200, body = [FairshareGroup]))
@@ -5872,6 +5940,9 @@ mod tests {
             /// Same instance the router's `AdminState` holds, so admitting a
             /// request here is visible to a handler as real fleet load.
             pub(super) fairshare: FairShare,
+            /// Same ring the router's `AdminState` holds, so a test can seed
+            /// samples and read them back through the handler.
+            pub(super) fairshare_history: Arc<FairshareHistory>,
             /// Keeps this test's exclusive claim on the shared test database
             /// alive for the test's full duration (see `serial()`).
             _serial: tokio::sync::MutexGuard<'static, ()>,
@@ -5898,6 +5969,7 @@ mod tests {
                 obleth_config::FairshareAlgorithm::default(),
                 32,
             );
+            let fairshare_history = Arc::new(FairshareHistory::new(1800));
             let http = reqwest::Client::new();
             let alerts = AlertDispatcher::new(http.clone(), AlertSettings::default());
             let state = AdminState {
@@ -5907,6 +5979,8 @@ mod tests {
                 fairshare: fairshare.clone(),
                 fairshare_stats: fairshare.stats(),
                 default_model_max_in_flight: 32,
+                fairshare_history: fairshare_history.clone(),
+                fairshare_history_secs: 3600,
                 // Never dialled: no route under test reads ClickHouse.
                 clickhouse: clickhouse::Client::default(),
                 admin_token: TEST_ADMIN_TOKEN.to_string(),
@@ -5931,6 +6005,7 @@ mod tests {
                 app: router(state),
                 store,
                 fairshare,
+                fairshare_history,
                 _serial: guard,
             })
         }
@@ -6522,6 +6597,96 @@ mod tests {
             "the total ceiling is reported: {body}"
         );
         assert_eq!(body["default_model_max_in_flight"], serde_json::json!(32));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn fairshare_history_scopes_to_a_pool_or_the_aggregate() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        use obleth_fairshare::{FairshareSample, GroupSample, PoolSample};
+        let pool =
+            |model: &str, in_flight: usize, queued: usize, group_in_flight: usize| PoolSample {
+                model: model.into(),
+                cap: 8,
+                in_flight,
+                queued,
+                groups: vec![
+                    GroupSample {
+                        name: "research".into(),
+                        in_flight: group_in_flight,
+                        queued,
+                    },
+                    GroupSample {
+                        name: model_health::HEALTH_GROUP.into(),
+                        in_flight: 1,
+                        queued: 0,
+                    },
+                ],
+            };
+        t.fairshare_history.push(FairshareSample {
+            ts_ms: 1_000,
+            global_in_flight: 4,
+            global_queued: 2,
+            pools: vec![pool("m", 3, 1, 3), pool("n", 1, 1, 1)],
+        });
+        t.fairshare_history.push(FairshareSample {
+            ts_ms: 3_000,
+            global_in_flight: 6,
+            global_queued: 0,
+            pools: vec![pool("m", 6, 0, 6)],
+        });
+
+        let get = |path: &str| {
+            axum::http::Request::get(path)
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::empty())
+                .expect("build request")
+        };
+
+        let (status, body) = send(&t.app, get("/api/v1/fairshare/history?since_ms=0")).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["interval_ms"], 2000);
+        assert_eq!(body["retention_ms"], 3_600_000);
+        assert_eq!(body["oldest_ts_ms"], 1_000);
+        let points = body["points"].as_array().expect("points");
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0]["in_flight"], 2, "global 4 minus 2 prober: {body}");
+        assert_eq!(points[0]["groups"]["research"], 4);
+        assert!(
+            points[0]["groups"]
+                .get(model_health::HEALTH_GROUP)
+                .is_none(),
+            "prober group hidden: {body}"
+        );
+
+        let (status, body) = send(
+            &t.app,
+            get("/api/v1/fairshare/history?since_ms=2000&model=m"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let points = body["points"].as_array().expect("points");
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]["ts_ms"], 3_000);
+        assert_eq!(
+            points[0]["in_flight"], 5,
+            "model m: 6 minus 1 prober: {body}"
+        );
+        assert_eq!(points[0]["groups"]["research"], 6);
+
+        let (status, body) =
+            send(&t.app, get("/api/v1/fairshare/history?since_ms=0&model=n")).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let points = body["points"].as_array().expect("points");
+        assert_eq!(
+            points.len(),
+            2,
+            "a sample without the pool still yields a zero point"
+        );
+        assert_eq!(points[1]["in_flight"], 0);
+        assert!(points[1]["groups"].as_object().expect("groups").is_empty());
     }
 
     /// A handler can carry `#[utoipa::path]` and still be missing from the

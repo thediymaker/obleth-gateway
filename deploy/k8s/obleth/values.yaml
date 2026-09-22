@@ -19,6 +19,9 @@ obleth:
   replicas: 1
   globalMaxInFlight: 1024
   defaultModelMaxInFlight: 32
+  # Seconds of scheduler history each replica keeps in memory for the
+  # dashboard's activity chart (sampled every 2 s). 0 disables it.
+  fairshareHistorySecs: 3600
   failOpen: true
   # REQUIRED. No default is shipped — supply via `--set obleth.adminToken=...`,
   # a values override, or (preferred) an external Secret. `openssl rand -hex 32`.

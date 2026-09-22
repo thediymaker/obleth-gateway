@@ -87,7 +87,10 @@ hardened and made redundant):
 > the pool sizes you expect concurrently active, sizing both so that N × those
 > numbers stays within what your upstream can absorb — replicas cannot lend
 > each other idle capacity. The HPA is off by default for the same reason — an
-> autoscaled replica count moves the aggregate with no config change.
+> autoscaled replica count moves the aggregate with no config change. The
+> dashboard's fairshare history is per replica as well
+> (`obleth.fairshareHistorySecs`, in memory), so with several replicas the
+> chart shows whichever replica answered.
 
 > The bundled datastores are single plain Deployments with no replication or
 > backups — intentionally. Making them HA is the job of purpose-built operators

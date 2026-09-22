@@ -30,7 +30,9 @@ use axum::routing::get;
 use axum::Router;
 use moka::future::Cache;
 use obleth_config::Config;
-use obleth_fairshare::{FairShare, StaticCapacity};
+use obleth_fairshare::{
+    FairShare, FairshareHistory, StaticCapacity, FAIRSHARE_HISTORY_INTERVAL_MS,
+};
 use obleth_redis::RedisStore;
 use obleth_store::Store;
 use obleth_telemetry::{TelemetrySink, TelemetryStats};
@@ -88,6 +90,17 @@ async fn main() -> anyhow::Result<()> {
         cfg.fairshare_algorithm,
         cfg.default_model_max_in_flight,
     );
+    // ---- fairshare history (dashboard activity chart) ----
+    let history_len = if cfg.fairshare_history_secs == 0 {
+        0
+    } else {
+        (cfg.fairshare_history_secs.saturating_mul(1000) / FAIRSHARE_HISTORY_INTERVAL_MS).max(1)
+            as usize
+    };
+    let fairshare_history = Arc::new(FairshareHistory::new(history_len));
+    if history_len > 0 {
+        spawn_fairshare_history_sampler(fairshare.clone(), fairshare_history.clone());
+    }
     // The ceiling is a safety guard, not a fairness budget: set below the sum
     // of the pools it silently caps the fleet and hides the pool sizes the
     // operator configured.
@@ -432,6 +445,8 @@ async fn main() -> anyhow::Result<()> {
         fairshare: fairshare.clone(),
         fairshare_stats: fairshare.stats(),
         default_model_max_in_flight: cfg.default_model_max_in_flight,
+        fairshare_history: fairshare_history.clone(),
+        fairshare_history_secs: cfg.fairshare_history_secs,
         clickhouse: clickhouse_read,
         admin_token: cfg.admin_token.clone(),
         health: health_runtime,
@@ -572,6 +587,21 @@ fn spawn_model_registry_refresh(
                 Ok(Some(settings)) => energy.update(settings),
                 Ok(None) => {}
                 Err(e) => tracing::warn!(error = %e, "energy settings refresh failed"),
+            }
+        }
+    });
+}
+
+/// Sample the scheduler every `FAIRSHARE_HISTORY_INTERVAL_MS` into the
+/// in-memory history ring. A failed sample (scheduler gone) skips the tick.
+fn spawn_fairshare_history_sampler(fairshare: FairShare, history: Arc<FairshareHistory>) {
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(FAIRSHARE_HISTORY_INTERVAL_MS));
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tick.tick().await;
+            if let Some(sample) = fairshare.sample().await {
+                history.push(sample);
             }
         }
     });

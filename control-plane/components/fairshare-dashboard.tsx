@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState, useTransition } from "react";
+import { useEffect, useMemo, useRef, useState, useTransition } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Activity, Check, LayoutDashboard, Network, Pencil, RefreshCw, Search, Users, X } from "lucide-react";
 import {
@@ -36,6 +36,8 @@ import { colorForGroup, OTHERS_COLOR, PALETTE } from "@/lib/chart-palette";
 import { isWaitingBelowShare } from "@/lib/fairshare";
 import { clamp, formatCompact, formatDecimal, formatPct, formatScore } from "@/lib/format";
 import type {
+  FairshareHistoryPoint,
+  FairshareHistoryView,
   FairshareLiveView,
   GroupFairshareView,
   KeyFairshareView,
@@ -66,7 +68,6 @@ const ROUTES_POLL_MS = 30_000;
 
 const TOP_SERIES = 7;
 const TENANT_PAGE = 120;
-const MAX_HISTORY_POINTS = 120;
 
 const QUEUED_COLOR = "hsl(38 75% 60%)";
 
@@ -104,12 +105,13 @@ export function FairshareDashboard({
   tenantNames: Record<string, string>;
 }) {
   const queryClient = useQueryClient();
-  const { data: rawView, groupHistory, groupKeys, isFetching, isError, dataUpdatedAt } = useFairshareLive();
+  const { data: rawView, isFetching, isError, dataUpdatedAt } = useFairshareLive();
   const { data: tenantSeries } = useThroughputSeries();
   const { data: modelRoutes } = useModelRoutes();
   const [throughputMetric, setThroughputMetric] = useState<ThroughputMetric>("requests");
   const [section, setSection] = useState("overview");
   const [scope, setScope] = useState("all");
+  const { history, groupKeys, oldestTs, retentionMs } = useFairshareHistory(scope);
   const [tenantFilter, setTenantFilter] = useState({ group: "all", scope: "active" as TenantScope });
   const inspectTenants = (group: string, scope: TenantScope) => {
     setTenantFilter({ group, scope });
@@ -167,7 +169,7 @@ export function FairshareDashboard({
           <details className="rounded-md border border-border bg-card">
             <summary className="cursor-pointer px-4 py-3 text-sm font-medium">Activity history</summary>
             <div className="grid gap-4 p-4 pt-0 xl:grid-cols-2">
-              <CapacityTimeline history={groupHistory} groups={groupKeys} view={view} />
+              <CapacityTimeline history={history} groups={groupKeys} oldestTs={oldestTs} retentionMs={retentionMs} view={view} />
               <ThroughputPanel data={throughput.data} series={throughput.series} metric={throughputMetric} onMetricChange={setThroughputMetric} />
             </div>
           </details>
@@ -191,7 +193,6 @@ export function FairshareDashboard({
 interface GroupHistoryPoint {
   time: string;
   queued: number;
-  inFlight: number;
   [key: string]: number | string;
 }
 
@@ -201,10 +202,45 @@ interface GroupKey {
   color: string;
 }
 
-function useFairshareLive() {
-  const [groupHistory, setGroupHistory] = useState<GroupHistoryPoint[]>([]);
+/** Cache of formatted clock times keyed by `ts_ms`, so re-running
+ *  `buildHistoryChart` over an appended history only formats the new points
+ *  instead of the whole retained window every poll. Bounded so a long-lived
+ *  tab does not grow this without limit. */
+const TIME_LABEL_CACHE_MAX = 4096;
+const timeLabelCache = new Map<number, string>();
 
-  const query = useQuery({
+function formatPointTime(tsMs: number): string {
+  let label = timeLabelCache.get(tsMs);
+  if (label === undefined) {
+    if (timeLabelCache.size >= TIME_LABEL_CACHE_MAX) timeLabelCache.clear();
+    label = new Date(tsMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+    timeLabelCache.set(tsMs, label);
+  }
+  return label;
+}
+
+const MAX_CHART_ROWS = 600;
+
+/** Downsample `rows` to at most `max` entries, always keeping the last row so
+ *  the chart's right edge stays current. Returns `rows` itself, unchanged,
+ *  when it is already within budget. */
+export function thinHistory<T>(rows: T[], max: number): T[] {
+  if (rows.length <= max) return rows;
+  const step = Math.ceil(rows.length / max);
+  const thinned: T[] = [];
+  for (let i = 0; i < rows.length; i += step) thinned.push(rows[i]);
+  const last = rows[rows.length - 1];
+  if (thinned[thinned.length - 1] !== last) {
+    // Swap in the last row rather than appending when we are already at
+    // budget, so the result never exceeds `max`.
+    if (thinned.length >= max) thinned[thinned.length - 1] = last;
+    else thinned.push(last);
+  }
+  return thinned;
+}
+
+function useFairshareLive() {
+  return useQuery({
     queryKey: ["fairshare-live"],
     queryFn: async () => {
       const res = await fetch("/api/live/fairshare");
@@ -213,43 +249,120 @@ function useFairshareLive() {
     },
     refetchInterval: FAIRSHARE_POLL_MS,
   });
+}
+
+function historyQs(params: { model?: string; since_ms?: number }) {
+  const q = new URLSearchParams();
+  if (params.model) q.set("model", params.model);
+  if (params.since_ms !== undefined) q.set("since_ms", String(params.since_ms));
+  const s = q.toString();
+  return s ? `?${s}` : "";
+}
+
+export async function fetchHistory(model: string | undefined, sinceMs?: number) {
+  const res = await fetch(`/api/live/fairshare/history${historyQs({ model, since_ms: sinceMs })}`);
+  if (!res.ok) throw new Error("fairshare history unavailable");
+  return (await res.json()) as FairshareHistoryView;
+}
+
+/** Merge tail points onto `prev`: only strictly newer timestamps are added,
+ *  and points older than `retentionMs` before the newest are dropped. Returns
+ *  `prev` itself when nothing changes. */
+export function appendHistoryTail(
+  prev: FairshareHistoryPoint[],
+  fresh: FairshareHistoryPoint[],
+  retentionMs: number,
+): FairshareHistoryPoint[] {
+  const newest = prev.length ? prev[prev.length - 1].ts_ms : -Infinity;
+  const added = fresh.filter((p) => p.ts_ms > newest);
+  if (added.length === 0) return prev;
+  const merged = [...prev, ...added];
+  const cutoff = retentionMs > 0 ? merged[merged.length - 1].ts_ms - retentionMs : -Infinity;
+  return merged.filter((p) => p.ts_ms >= cutoff);
+}
+
+/** Project server points into the stacked chart's rows and the sorted group
+ *  series. Every row carries every group so the stack never has holes. */
+export function buildHistoryChart(points: FairshareHistoryPoint[]): {
+  history: GroupHistoryPoint[];
+  groupKeys: GroupKey[];
+} {
+  const names = new Set<string>();
+  for (const p of points) for (const g of Object.keys(p.groups)) names.add(g);
+  const groupKeys: GroupKey[] = [...names]
+    .sort((a, b) => a.localeCompare(b))
+    .map((name, i) => ({ name, key: groupDataKey(name), color: colorForGroup(name, i) }));
+  const history = points.map((p) => {
+    const row: GroupHistoryPoint = {
+      time: formatPointTime(p.ts_ms),
+      queued: p.queued,
+    };
+    for (const g of groupKeys) row[g.key] = p.groups[g.name] ?? 0;
+    return row;
+  });
+  return { history, groupKeys };
+}
+
+/** Retained scheduler history for one scope ("all" or a model name): the
+ *  full window on mount and scope change, then the tail every poll. */
+function useFairshareHistory(scope: string) {
+  const model = scope === "all" ? undefined : scope;
+  const [points, setPoints] = useState<FairshareHistoryPoint[]>([]);
+  const [oldestTs, setOldestTs] = useState<number | null>(null);
+  const [retentionMs, setRetentionMs] = useState<number | null>(null);
+  const newestRef = useRef<number | null>(null);
 
   useEffect(() => {
-    if (!query.data) return;
-    const time = new Date().toLocaleTimeString([], {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
+    setPoints([]);
+    setOldestTs(null);
+    newestRef.current = null;
+  }, [scope]);
+
+  const full = useQuery({
+    queryKey: ["fairshare-history", scope],
+    queryFn: () => fetchHistory(model),
+  });
+  useEffect(() => {
+    if (!full.data || !Array.isArray(full.data.points)) return;
+    setPoints(full.data.points);
+    setOldestTs(full.data.oldest_ts_ms);
+    setRetentionMs(full.data.retention_ms);
+    newestRef.current = full.data.points.length ? full.data.points[full.data.points.length - 1].ts_ms : null;
+  }, [full.data]);
+
+  const tail = useQuery({
+    queryKey: ["fairshare-history-tail", scope],
+    queryFn: () => fetchHistory(model, newestRef.current === null ? undefined : newestRef.current + 1),
+    refetchInterval: FAIRSHARE_POLL_MS,
+    // Not `full.isSuccess`: a failed initial fetch must not leave the tail
+    // disabled forever. With `newestRef.current` still null in that case, the
+    // tail requests the full window itself and rehydrates through
+    // `appendHistoryTail`.
+    enabled: !full.isPending,
+  });
+  useEffect(() => {
+    if (!tail.data || !Array.isArray(tail.data.points)) return;
+    setOldestTs(tail.data.oldest_ts_ms);
+    setRetentionMs(tail.data.retention_ms);
+    setPoints((prev) => {
+      const next = appendHistoryTail(prev, tail.data.points, tail.data.retention_ms);
+      if (next !== prev && next.length) newestRef.current = next[next.length - 1].ts_ms;
+      return next;
     });
-    const point: GroupHistoryPoint = {
-      time,
-      queued: query.data.global_queued,
-      inFlight: query.data.global_in_flight,
-    };
-    for (const g of query.data.groups) point[groupDataKey(g.name)] = g.in_flight;
-    setGroupHistory((prev) => [...prev, point].slice(-MAX_HISTORY_POINTS));
-  }, [query.data]);
+  }, [tail.data]);
 
-  const groupKeys = useMemo<GroupKey[]>(
-    () =>
-      [...(query.data?.groups ?? [])]
-        .sort((a, b) => a.name.localeCompare(b.name))
-        .map((g, i) => ({
-          name: g.name,
-          key: groupDataKey(g.name),
-          color: colorForGroup(g.name, i),
-        })),
-    [query.data],
-  );
+  // The header's "History since" must not claim a time earlier than the
+  // first plotted point, nor hide a point the ring already reports as
+  // retained: take whichever of the two is more recent, or fall back to
+  // whichever one exists.
+  const displayOldestTs = useMemo(() => {
+    const firstPointTs = points.length ? points[0].ts_ms : null;
+    if (oldestTs !== null && firstPointTs !== null) return Math.min(oldestTs, firstPointTs);
+    return oldestTs ?? firstPointTs;
+  }, [oldestTs, points]);
 
-  return {
-    data: query.data,
-    groupHistory,
-    groupKeys,
-    isFetching: query.isFetching,
-    isError: query.isError,
-    dataUpdatedAt: query.dataUpdatedAt,
-  };
+  const chart = useMemo(() => buildHistoryChart(points), [points]);
+  return { ...chart, oldestTs: displayOldestTs, retentionMs };
 }
 
 function useThroughputSeries() {
@@ -485,18 +598,30 @@ function PressureStrip({ view, summary }: { view?: FairshareLiveView; summary: F
 function CapacityTimeline({
   history,
   groups,
+  oldestTs,
+  retentionMs,
   view,
 }: {
   history: GroupHistoryPoint[];
   groups: GroupKey[];
+  oldestTs: number | null;
+  retentionMs: number | null;
   view?: FairshareLiveView;
 }) {
+  const rows = thinHistory(history, MAX_CHART_ROWS);
   return (
     <Card className="h-full rounded-md">
       <CardHeader className="gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div>
           <CardTitle>Live occupancy</CardTitle>
-          <CardDescription>Group activity over time; queued work uses the right axis</CardDescription>
+          <CardDescription>Group activity over the retained window; queued work uses the right axis</CardDescription>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {retentionMs === 0 && oldestTs === null
+              ? "History disabled (OBLETH_FAIRSHARE_HISTORY_SECS=0)"
+              : oldestTs === null
+                ? "No samples yet"
+                : `History since ${new Date(oldestTs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })}`}
+          </p>
         </div>
         {view && (
           <div className="flex flex-wrap justify-start gap-2 text-xs sm:justify-end">
@@ -506,12 +631,12 @@ function CapacityTimeline({
         )}
       </CardHeader>
       <CardContent>
-        {history.length === 0 ? (
+        {rows.length === 0 ? (
           <EmptyState className="h-72">Waiting for live scheduler samples</EmptyState>
         ) : (
           <ChartShell heightClass="h-72">
             <ResponsiveContainer width="100%" height="100%">
-              <ComposedChart data={history} margin={{ top: 8, right: 12, left: 4, bottom: 4 }}>
+              <ComposedChart data={rows} margin={{ top: 8, right: 12, left: 4, bottom: 4 }}>
                 <defs>
                   {groups.map((g, i) => (
                     <linearGradient key={g.key} id={`cap-${i}`} x1="0" y1="0" x2="0" y2="1">

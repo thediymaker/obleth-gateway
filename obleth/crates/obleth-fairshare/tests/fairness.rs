@@ -1179,3 +1179,71 @@ async fn ceiling_below_pool_cap_still_reserves_the_small_groups_slot() {
     drop(api_admitted.permit);
     drop(permits);
 }
+
+/// `FairShare::sample()` is the cheap path the history sampler uses instead of
+/// a full `snapshot()`. It must still agree with `snapshot()` on global and
+/// per-pool counts, and its per-group totals must sum in-flight and queued
+/// work by each tenant's fairshare group.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn sample_matches_snapshot_and_reports_group_totals() {
+    let cap = Arc::new(StaticCapacity::new(4));
+    let fs = FairShare::start(cap, FairshareAlgorithm::Hierarchical, 4);
+
+    let tenant_a1 = Uuid::new_v4();
+    let tenant_a2 = Uuid::new_v4();
+    let tenant_b1 = Uuid::new_v4();
+
+    let req = |tenant: Uuid, group: &'static str| {
+        AdmitRequest::new(tenant, "m", 10)
+            .weight(100)
+            .group(group, 100)
+            .model_cap(2)
+    };
+
+    let a1 = fs.admit(req(tenant_a1, "a")).await.expect("a1 admit");
+    assert_eq!(a1.admission, Admission::Fast);
+    let b1 = fs.admit(req(tenant_b1, "b")).await.expect("b1 admit");
+    assert_eq!(b1.admission, Admission::Fast);
+
+    // Pool "m" is now at its cap of 2, so this third request queues.
+    let fs_a2 = fs.clone();
+    let a2_waiter = tokio::spawn(async move { fs_a2.admit(req(tenant_a2, "a")).await });
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    let sample = fs.sample().await.expect("sample");
+    let snap = fs.snapshot().await.expect("snapshot");
+
+    assert_eq!(sample.global_in_flight, snap.global_in_flight);
+    assert_eq!(sample.global_queued, snap.global_queued);
+    assert_eq!(sample.pools.len(), snap.pools.len());
+    assert_eq!(sample.global_in_flight, 2);
+    assert_eq!(sample.global_queued, 1);
+
+    let pool = sample
+        .pools
+        .iter()
+        .find(|p| p.model == "m")
+        .expect("pool m in sample");
+    assert_eq!((pool.in_flight, pool.queued), (2, 1));
+    let group_a = pool
+        .groups
+        .iter()
+        .find(|g| g.name == "a")
+        .expect("group a in sample");
+    assert_eq!((group_a.in_flight, group_a.queued), (1, 1));
+    let group_b = pool
+        .groups
+        .iter()
+        .find(|g| g.name == "b")
+        .expect("group b in sample");
+    assert_eq!((group_b.in_flight, group_b.queued), (1, 0));
+
+    drop(a1.permit);
+    drop(b1.permit);
+    let a2 = tokio::time::timeout(Duration::from_secs(1), a2_waiter)
+        .await
+        .expect("queued a2 is dispatched once a slot frees")
+        .expect("join")
+        .expect("a2 admit");
+    drop(a2.permit);
+}

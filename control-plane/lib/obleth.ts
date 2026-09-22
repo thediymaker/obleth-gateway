@@ -670,6 +670,20 @@ export interface FairshareLiveView {
   pools?: ModelPoolView[];
 }
 
+export interface FairshareHistoryPoint {
+  ts_ms: number;
+  in_flight: number;
+  queued: number;
+  /** Group name to in-flight slots. */
+  groups: Record<string, number>;
+}
+export interface FairshareHistoryView {
+  interval_ms: number;
+  retention_ms: number;
+  oldest_ts_ms: number | null;
+  points: FairshareHistoryPoint[];
+}
+
 export interface TenantUsageTimePoint {
   tenant_id: string;
   bucket_ms: number;
@@ -1995,6 +2009,10 @@ export const obleth = {
   overviewSummary: (sinceMs?: number) =>
     api<OverviewSummaryView>(`/overview/summary${qs({ since_ms: sinceMs })}`),
   fairshareLive: () => api<FairshareLiveView>("/fairshare/live"),
+  fairshareHistory: (params: { since_ms?: number; model?: string } = {}) =>
+    api<FairshareHistoryView>(
+      `/fairshare/history${qs({ since_ms: params.since_ms, model: params.model })}`,
+    ),
   audit: (limit = 100) => api<AuditEntry[]>(`/audit?limit=${limit}`),
   getCapacity: () => api<{ max_in_flight: number }>("/capacity"),
   setCapacity: (max_in_flight: number, options?: AuditOptions) =>

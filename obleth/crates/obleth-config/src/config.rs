@@ -49,6 +49,9 @@ pub struct Config {
     pub global_max_in_flight: usize,
     /// Pool size for a model that has no explicit `max_in_flight`.
     pub default_model_max_in_flight: usize,
+    /// Seconds of scheduler history the gateway keeps in memory for the
+    /// dashboard's activity chart, sampled every 2 seconds. `0` disables it.
+    pub fairshare_history_secs: u64,
     /// Fairshare scheduling algorithm (`weighted` or `hierarchical`).
     pub fairshare_algorithm: FairshareAlgorithm,
 
@@ -128,6 +131,7 @@ impl Config {
             admin_token: require_secret("OBLETH_ADMIN_TOKEN"),
             global_max_in_flight: parse_or("OBLETH_GLOBAL_MAX_IN_FLIGHT", 1024),
             default_model_max_in_flight: parse_or("OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT", 32),
+            fairshare_history_secs: parse_or("OBLETH_FAIRSHARE_HISTORY_SECS", 3600),
             fairshare_algorithm: FairshareAlgorithm::parse(&env_or(
                 "OBLETH_FAIRSHARE_ALGORITHM",
                 "hierarchical",
