@@ -7,6 +7,28 @@ use obleth_config::{Admission, FairshareAlgorithm};
 use obleth_fairshare::{AdmitRequest, FairShare, StaticCapacity};
 use uuid::Uuid;
 
+/// Wait until the pool reports exactly `n` queued requests for `model`.
+///
+/// `tokio::spawn` guarantees nothing about when the spawned task actually
+/// reaches the queue, so a test that needs waiter A enqueued before waiter B
+/// cannot get that from spawn order, and a fixed sleep only hides the race on
+/// an idle machine -- on a contended runner B still wins sometimes. Poll the
+/// observable state instead.
+async fn wait_for_queued(fs: &FairShare, model: &str, n: usize) {
+    let deadline = Duration::from_secs(5);
+    tokio::time::timeout(deadline, async {
+        loop {
+            let snap = fs.snapshot().await.expect("snapshot");
+            if snap.model_queued.get(model).copied().unwrap_or(0) == n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {n} queued on model {model}"));
+}
+
 #[tokio::test]
 async fn fast_path_when_idle() {
     let cap = Arc::new(StaticCapacity::new(8));
@@ -1139,9 +1161,13 @@ async fn ceiling_below_pool_cap_still_reserves_the_small_groups_slot() {
     // higher than the big group's.
     let fs_warm = fs.clone();
     let warm = tokio::spawn(async move { fs_warm.admit(chat_req()).await });
+    // `warm` must be queued BEFORE `chat_waiter` is spawned -- the assertion
+    // below is that `warm` gets the freed slot. Spawning both and sleeping
+    // made that a coin flip under load.
+    wait_for_queued(&fs, "m", 1).await;
     let fs_chat = fs.clone();
     let chat_waiter = tokio::spawn(async move { fs_chat.admit(chat_req()).await });
-    tokio::time::sleep(Duration::from_millis(30)).await;
+    wait_for_queued(&fs, "m", 2).await;
     drop(permits.pop());
     let warm = tokio::time::timeout(Duration::from_secs(1), warm)
         .await
