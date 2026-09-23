@@ -99,12 +99,23 @@ services:
       context: ../..
       dockerfile: deploy/docker/obleth.Dockerfile
     restart: unless-stopped
+    # Room for OBLETH_SHUTDOWN_GRACE_SECS of draining plus the telemetry flush
+    # before Docker sends SIGKILL: 300 (grace) + 20 (telemetry drain) + 10
+    # (OTLP shutdown) + margin = 345.
+    stop_grace_period: 345s
     environment:
       OBLETH_PROXY_LISTEN: 0.0.0.0:8080
       OBLETH_ADMIN_LISTEN: 0.0.0.0:9180
       OBLETH_METRICS_LISTEN: 0.0.0.0:9091
       OBLETH_DATABASE_URL: postgres://${POSTGRES_USER:-obleth}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/docker/.env}@postgres:5432/${POSTGRES_DB:-obleth}
       OBLETH_REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/docker/.env}@redis:6379
+      OBLETH_REDIS_RESPONSE_TIMEOUT_MS: ${OBLETH_REDIS_RESPONSE_TIMEOUT_MS:-250}
+      OBLETH_REDIS_CONNECT_TIMEOUT_MS: ${OBLETH_REDIS_CONNECT_TIMEOUT_MS:-2000}
+      OBLETH_REDIS_REWARM_SECS: ${OBLETH_REDIS_REWARM_SECS:-300}
+      # Empty = the upstream request timeout (OBLETH_UPSTREAM_TIMEOUT_SECS).
+      OBLETH_UPSTREAM_READ_TIMEOUT_SECS: ${OBLETH_UPSTREAM_READ_TIMEOUT_SECS:-}
+      # Keep below stop_grace_period (below) minus the telemetry flush.
+      OBLETH_SHUTDOWN_GRACE_SECS: ${OBLETH_SHUTDOWN_GRACE_SECS:-300}
       OBLETH_CLICKHOUSE_URL: http://clickhouse:8123
       OBLETH_CLICKHOUSE_DB: ${CLICKHOUSE_DB:-obleth}
       OBLETH_CLICKHOUSE_USER: ${CLICKHOUSE_USER:-obleth}

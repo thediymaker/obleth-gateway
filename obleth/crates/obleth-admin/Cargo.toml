@@ -19,6 +19,7 @@ tracing.workspace = true
 thiserror.workspace = true
 utoipa.workspace = true
 tokio.workspace = true
+futures.workspace = true
 clickhouse.workspace = true
 rand.workspace = true
 subtle.workspace = true
@@ -39,3 +40,5 @@ obleth-tokenizer.workspace = true
 tower = { workspace = true, features = ["util"] }
 # Raw commands (ACL) to inject Redis failures in the eviction tests.
 redis.workspace = true
+# Raw deletes for fixture rows the store has no API to remove (fairshare groups).
+sqlx.workspace = true

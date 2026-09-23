@@ -22,8 +22,10 @@ spec:
         checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
       # Room for a 300s streaming response plus shutdown headroom before the
-      # pod is killed during a rollout or drain.
-      terminationGracePeriodSeconds: 330
+      # pod is killed during a rollout or drain: shutdownGraceSecs (300) + 20s
+      # telemetry drain + 10s OTLP shutdown + margin. See values.yaml's
+      # obleth.shutdownGraceSecs comment before changing either number.
+      terminationGracePeriodSeconds: 345
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- include "obleth.antiAffinity" . | nindent 6 }}
       {{- with .Values.nodeResolution.hostAliases }}
@@ -64,6 +66,12 @@ spec:
             - { name: OBLETH_USAGE_RETENTION_DAYS, value: {{ .Values.obleth.usageRetentionDays | quote }} }
             - { name: OBLETH_OTEL_ENDPOINT, value: {{ .Values.obleth.otelEndpoint | quote }} }
             - { name: OBLETH_SLACK_ALERT_MIN_INTERVAL_SECS, value: {{ .Values.obleth.slackAlertMinIntervalSecs | quote }} }
+            - { name: OBLETH_SHUTDOWN_GRACE_SECS, value: {{ .Values.obleth.shutdownGraceSecs | quote }} }
+            - { name: OBLETH_REDIS_REWARM_SECS, value: {{ .Values.obleth.redisRewarmSecs | quote }} }
+            - { name: OBLETH_UPSTREAM_READ_TIMEOUT_SECS, value: {{ .Values.obleth.upstreamReadTimeoutSecs | quote }} }
+            - { name: OBLETH_REDIS_RESPONSE_TIMEOUT_MS, value: {{ .Values.obleth.redisResponseTimeoutMs | quote }} }
+            - { name: OBLETH_REDIS_CONNECT_TIMEOUT_MS, value: {{ .Values.obleth.redisConnectTimeoutMs | quote }} }
+            - { name: OBLETH_ADMISSION_TIMEOUT_SECS, value: {{ .Values.obleth.admissionTimeoutSecs | quote }} }
             # Telemetry spill file used while ClickHouse is unreachable. Must be
             # writable by the non-root runtime user; backed by the wal volume.
             - { name: OBLETH_WAL_PATH, value: "/var/lib/obleth/telemetry.wal" }
@@ -76,6 +84,13 @@ spec:
                 name: {{ include "obleth.secretName" . }}
           volumeMounts:
             - { name: wal, mountPath: /var/lib/obleth }
+          # SIGTERM makes the gateway stop accepting at once, but endpoint
+          # removal reaches Services and ingresses a moment later; the delay
+          # keeps new connections from being refused during that window.
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "5"]
           # Boot runs migrations and warms Redis before /health answers; the
           # startup probe allows up to 150s before liveness takes over.
           startupProbe:

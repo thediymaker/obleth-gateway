@@ -1838,7 +1838,7 @@ mod tests {
             avg < 150.0,
             "EWMA must converge toward recent behavior, got {avg}"
         );
-        assert!(stats.snapshot().get("unseen").is_none());
+        assert!(!stats.snapshot().contains_key("unseen"));
     }
 
     #[test]

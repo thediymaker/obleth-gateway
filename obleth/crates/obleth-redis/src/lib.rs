@@ -10,8 +10,9 @@ pub mod scripts;
 use std::sync::OnceLock;
 
 use futures_util::StreamExt;
+pub use obleth_config::config::RedisTimeouts;
 use obleth_config::{CachedResponse, ResolvedKey, ResolvedMcpServer, ResolvedModel};
-use redis::aio::ConnectionManager;
+use redis::aio::{ConnectionManager, ConnectionManagerConfig};
 use redis::AsyncCommands;
 use uuid::Uuid;
 
@@ -31,12 +32,17 @@ cached_script!(reserve_with_term_script, scripts::RESERVE_WITH_TERM);
 cached_script!(reconcile_script, scripts::RECONCILE);
 cached_script!(term_usage_read_script, scripts::TERM_USAGE_READ);
 cached_script!(term_usage_add_script, scripts::TERM_USAGE_ADD);
+cached_script!(term_reconcile_script, scripts::TERM_RECONCILE);
 
 const KEY_PREFIX: &str = "obleth:key:";
 const MODEL_PREFIX: &str = "obleth:model:";
 const MCP_PREFIX: &str = "obleth:mcp:";
 const BUDGET_PREFIX: &str = "obleth:budget:";
 const TERM_USAGE_PREFIX: &str = "obleth:term_usage:";
+/// In-flight term-budget reservations, kept apart from committed usage so a
+/// never-settled request can only leak for the key's short TTL (see
+/// `scripts::RESERVE_WITH_TERM`).
+const TERM_RESERVED_PREFIX: &str = "obleth:term_reserved:";
 const CACHE_PREFIX: &str = "obleth:cache:";
 /// Namespace for compression-boon originals stashed for reversibility. Distinct
 /// from the response cache so the two never collide.
@@ -98,6 +104,12 @@ pub enum ReserveOutcome {
 
 /// Cloneable handle to Redis. Holds a multiplexed connection manager (auto
 /// reconnecting) plus the client for creating dedicated pub/sub connections.
+///
+/// The response timeout (default 250 ms) applies to every command on the
+/// shared connection, including admin-side batch work such as the Redis
+/// resync and stale-entry prune. That is intended: those run as many small
+/// commands, and a stalled Redis should fail them fast rather than hang.
+/// Pub/sub listeners use their own connection and are not bounded by it.
 #[derive(Clone)]
 pub struct RedisStore {
     conn: ConnectionManager,
@@ -105,9 +117,24 @@ pub struct RedisStore {
 }
 
 impl RedisStore {
+    /// Connect with the default timeouts (250 ms response / 2 s connect).
+    /// Deployments pass `Config.redis_timeouts` via [`Self::connect_with`].
     pub async fn connect(url: &str) -> Result<Self> {
+        Self::connect_with(url, RedisTimeouts::default()).await
+    }
+
+    pub async fn connect_with(url: &str, timeouts: RedisTimeouts) -> Result<Self> {
         let client = redis::Client::open(url)?;
-        let conn = ConnectionManager::new(client.clone()).await?;
+        // No internal retries: a request that lands while the manager is
+        // reconnecting awaits the whole retry chain, so with retries a dead
+        // Redis would stall each request for several connect timeouts instead
+        // of one. The next command re-triggers a reconnect on its own, and
+        // boot-time callers wrap `connect` in their own retry loop.
+        let config = ConnectionManagerConfig::new()
+            .set_response_timeout(timeouts.response)
+            .set_connection_timeout(timeouts.connect)
+            .set_number_of_retries(0);
+        let conn = ConnectionManager::new_with_config(client.clone(), config).await?;
         Ok(RedisStore { conn, client })
     }
 
@@ -119,6 +146,9 @@ impl RedisStore {
     }
     fn term_usage_key(tenant: &Uuid) -> String {
         format!("{TERM_USAGE_PREFIX}{tenant}")
+    }
+    fn term_reserved_key(scope: impl std::fmt::Display) -> String {
+        format!("{TERM_RESERVED_PREFIX}{scope}")
     }
 
     /// Record the provisioner heartbeat: the given epoch seconds, kept for
@@ -396,10 +426,10 @@ impl RedisStore {
         Ok((allowed == 1, remaining))
     }
 
-    /// Combined admission check in a single round trip: an optional cumulative
-    /// term-budget gate followed by the atomic token-bucket reserve. The term
-    /// gate runs first, so a term-exhausted request never reserves per-minute
-    /// tokens it has no completion path to refund.
+    /// Check-only variant of [`Self::reserve_with_term`]: gates on the term
+    /// budget but reserves nothing against it. Kept for callers that settle
+    /// with [`Self::term_usage_add`]; a reservation made here would never be
+    /// released.
     pub async fn reserve_budget_with_term(
         &self,
         tenant: &Uuid,
@@ -407,6 +437,56 @@ impl RedisStore {
         tokens_per_minute: i64,
         requested: u32,
         term: Option<TermGate<'_>>,
+    ) -> Result<ReserveOutcome> {
+        self.reserve_inner(tenant, capacity, tokens_per_minute, requested, term, None)
+            .await
+    }
+
+    /// Combined admission check in a single round trip: an optional cumulative
+    /// term-budget gate followed by the atomic token-bucket reserve. The term
+    /// gate runs first, so a term-exhausted request never reserves per-minute
+    /// tokens it has no completion path to refund.
+    ///
+    /// When admitted with a term gate, `requested` tokens and `est_cost` USD are
+    /// reserved for the scope in `obleth:term_reserved:<scope>` (`tokens` /
+    /// `cost`, 10-minute TTL set on creation, never refreshed) and count toward the cap until released by
+    /// [`Self::term_reconcile`] with the same estimates. `scope` is the tenant
+    /// or API-key id; the gate rejects when `committed + reserved >= cap`.
+    ///
+    /// Caller obligation: every `Reserved` outcome must eventually be settled
+    /// with [`Self::term_reconcile`], or the reservation blocks budget headroom
+    /// until the period rolls. In particular, after a successful key-scope
+    /// reservation, if the tenant step then rejects or errors, or the request
+    /// exits early for any reason before settling, release the key
+    /// reservation with `term_reconcile(key, period, est, est_cost, 0, 0.0)`.
+    pub async fn reserve_with_term(
+        &self,
+        scope: &Uuid,
+        capacity: i64,
+        tokens_per_minute: i64,
+        requested: u32,
+        term: Option<TermGate<'_>>,
+        est_cost: f64,
+    ) -> Result<ReserveOutcome> {
+        self.reserve_inner(
+            scope,
+            capacity,
+            tokens_per_minute,
+            requested,
+            term,
+            Some(est_cost),
+        )
+        .await
+    }
+
+    async fn reserve_inner(
+        &self,
+        tenant: &Uuid,
+        capacity: i64,
+        tokens_per_minute: i64,
+        requested: u32,
+        term: Option<TermGate<'_>>,
+        reserve_cost: Option<f64>,
     ) -> Result<ReserveOutcome> {
         let mut conn = self.conn.clone();
         let now_ms = now_ms();
@@ -428,6 +508,7 @@ impl RedisStore {
             reserve_with_term_script()
                 .key(Self::budget_key(tenant))
                 .key(Self::term_usage_key(tenant))
+                .key(Self::term_reserved_key(tenant))
                 .arg(capacity)
                 .arg(refill_per_ms)
                 .arg(now_ms)
@@ -436,6 +517,8 @@ impl RedisStore {
                 .arg(period_key)
                 .arg(cap_tokens)
                 .arg(cap_cost)
+                .arg(u8::from(reserve_cost.is_some()))
+                .arg(reserve_cost.unwrap_or(0.0))
                 .invoke_async(&mut conn)
                 .await?;
         Ok(match status {
@@ -462,9 +545,41 @@ impl RedisStore {
             .key(Self::budget_key(tenant))
             .arg(capacity)
             .arg(delta)
+            .arg(now_ms())
             .invoke_async(&mut conn)
             .await?;
         Ok(remaining)
+    }
+
+    /// Settle a request admitted by [`Self::reserve_with_term`]: release the
+    /// `est_*` reservation (floored at 0) and commit the `actual_*` usage to
+    /// the scope's term counters, atomically. `scope` is the tenant or API-key
+    /// id (as a string) that was passed to `reserve_with_term`, and `period`
+    /// is the period key used at admission.
+    ///
+    /// Returns the committed `(tokens, cost_usd)` after the reconcile (same
+    /// shape as [`Self::term_usage_add`]), for budget alerting.
+    pub async fn term_reconcile(
+        &self,
+        scope: &str,
+        period: &str,
+        est_tokens: i64,
+        est_cost: f64,
+        actual_tokens: i64,
+        actual_cost: f64,
+    ) -> Result<(i64, f64)> {
+        let mut conn = self.conn.clone();
+        let (tokens, cost): (i64, String) = term_reconcile_script()
+            .key(format!("{TERM_USAGE_PREFIX}{scope}"))
+            .key(Self::term_reserved_key(scope))
+            .arg(period)
+            .arg(est_tokens)
+            .arg(est_cost)
+            .arg(actual_tokens)
+            .arg(actual_cost)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok((tokens, cost.parse().unwrap_or(0.0)))
     }
 
     /// Read a tenant's cumulative term usage `(tokens, cost_usd)`, rolling the
@@ -499,23 +614,94 @@ impl RedisStore {
         Ok((tokens, cost.parse().unwrap_or(0.0)))
     }
 
-    /// Run `on_hash` for every invalidation message. Intended to drive a local
-    /// moka cache eviction; loops until the connection drops.
-    pub async fn run_invalidation_listener<F>(&self, mut on_hash: F) -> Result<()>
+    /// Run `on_hash` for every invalidation message, forever. Reconnects with
+    /// backoff when the connection drops, and calls `on_subscribed(reconnected)`
+    /// after every successful subscribe: `false` for the first, `true` for
+    /// each later one. Messages published while disconnected are lost, so a
+    /// caller should treat `true` as "local caches may be stale".
+    pub async fn run_invalidation_listener<F, S>(&self, mut on_hash: F, mut on_subscribed: S)
     where
         F: FnMut(String) + Send,
+        S: FnMut(bool) + Send,
     {
-        let mut pubsub = self.client.get_async_pubsub().await?;
-        pubsub.subscribe(INVALIDATE_CHANNEL).await?;
-        let mut stream = pubsub.on_message();
-        while let Some(msg) = stream.next().await {
-            if let Ok(hash) = msg.get_payload::<String>() {
-                on_hash(hash);
+        let mut subscribed_before = false;
+        let mut backoff = PUBSUB_BACKOFF_MIN;
+        loop {
+            let mut subscribed = false;
+            let result = self
+                .listen_once(&mut on_hash, &mut || {
+                    subscribed = true;
+                    on_subscribed(subscribed_before);
+                    subscribed_before = true;
+                })
+                .await;
+            // A session that got as far as subscribing was healthy, so the
+            // next retry starts from the short delay again.
+            if subscribed {
+                backoff = PUBSUB_BACKOFF_MIN;
+            }
+            match result {
+                Ok(()) => {
+                    tracing::warn!(retry_in = ?backoff, "invalidation listener connection closed")
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, retry_in = ?backoff, "invalidation listener stopped")
+                }
+            }
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(PUBSUB_BACKOFF_MAX);
+        }
+    }
+
+    /// One pub/sub session: `Ok` when the server closed the connection.
+    async fn listen_once<F, S>(&self, on_hash: &mut F, on_subscribed: &mut S) -> Result<()>
+    where
+        F: FnMut(String) + Send,
+        S: FnMut() + Send,
+    {
+        let timed_out = |what: &'static str| {
+            RedisError::Redis(redis::RedisError::from((redis::ErrorKind::IoError, what)))
+        };
+        let pubsub = tokio::time::timeout(PUBSUB_CONNECT_TIMEOUT, self.client.get_async_pubsub())
+            .await
+            .map_err(|_| timed_out("pub/sub connect timed out"))??;
+        let (mut sink, mut stream) = pubsub.split();
+        tokio::time::timeout(PUBSUB_REPLY_TIMEOUT, sink.subscribe(INVALIDATE_CHANNEL))
+            .await
+            .map_err(|_| timed_out("pub/sub subscribe timed out"))??;
+        on_subscribed();
+        let mut keepalive = tokio::time::interval_at(
+            tokio::time::Instant::now() + PUBSUB_KEEPALIVE,
+            PUBSUB_KEEPALIVE,
+        );
+        keepalive.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                msg = stream.next() => {
+                    let Some(msg) = msg else { return Ok(()) };
+                    if let Ok(hash) = msg.get_payload::<String>() {
+                        on_hash(hash);
+                    }
+                }
+                _ = keepalive.tick() => {
+                    // A half-open socket delivers nothing and reports no
+                    // error. Re-subscribing to a channel already joined still
+                    // gets a reply, so it serves as the PING that the
+                    // subscribed-mode sink doesn't expose.
+                    tokio::time::timeout(PUBSUB_REPLY_TIMEOUT, sink.subscribe(INVALIDATE_CHANNEL))
+                        .await
+                        .map_err(|_| timed_out("pub/sub keepalive timed out"))??;
+                }
             }
         }
-        Ok(())
     }
 }
+
+const PUBSUB_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(30);
+const PUBSUB_REPLY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const PUBSUB_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const PUBSUB_BACKOFF_MIN: std::time::Duration = std::time::Duration::from_secs(1);
+const PUBSUB_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -844,5 +1030,506 @@ mod tests {
         let _: () = conn.set(redis_key, vec![1u8, 2, 3]).await.unwrap();
 
         assert!(store.get_query_vector(&hash).await.is_none());
+    }
+
+    async fn test_store() -> Option<RedisStore> {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return None;
+        };
+        Some(RedisStore::connect(&url).await.expect("connect"))
+    }
+
+    async fn term_field(store: &RedisStore, scope: &Uuid, field: &str) -> Option<String> {
+        let mut conn = store.conn.clone();
+        conn.hget(RedisStore::term_usage_key(scope), field)
+            .await
+            .unwrap()
+    }
+
+    async fn reserved_field(store: &RedisStore, scope: &Uuid, field: &str) -> Option<String> {
+        let mut conn = store.conn.clone();
+        conn.hget(RedisStore::term_reserved_key(scope), field)
+            .await
+            .unwrap()
+    }
+
+    /// Stand-in for the 10-minute TTL running out on a never-settled request.
+    async fn expire_reservations_now(store: &RedisStore, scope: &Uuid) {
+        let mut conn = store.conn.clone();
+        let _: i64 = redis::cmd("PEXPIRE")
+            .arg(RedisStore::term_reserved_key(scope))
+            .arg(1)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn reservation_ttl_is_set_on_creation_and_never_refreshed() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let scope = Uuid::new_v4();
+        let rkey = RedisStore::term_reserved_key(scope);
+        store
+            .reserve_with_term(&scope, 0, 0, 10, Some(token_gate("l:0", 100)), 0.0)
+            .await
+            .unwrap();
+        let mut conn = store.conn.clone();
+        let ttl: i64 = conn.pttl(&rkey).await.unwrap();
+        assert!(ttl > 590_000 && ttl <= 600_000, "PTTL={ttl}");
+
+        // Stand-in for ~5 minutes passing (t0 + delta) without sleeping.
+        let _: i64 = redis::cmd("PEXPIRE")
+            .arg(&rkey)
+            .arg(300_000)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        // A later reserve in the same (busy) scope must not re-arm the TTL,
+        // or a leaked reservation would never expire.
+        store
+            .reserve_with_term(&scope, 0, 0, 10, Some(token_gate("l:0", 100)), 0.0)
+            .await
+            .unwrap();
+        let ttl: i64 = conn.pttl(&rkey).await.unwrap();
+        assert!(ttl > 0 && ttl <= 300_000, "PTTL={ttl}");
+        assert_eq!(
+            reserved_field(&store, &scope, "tokens").await.as_deref(),
+            Some("20")
+        );
+        // Committed usage keeps its long TTL, independent of reservations.
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(RedisStore::term_usage_key(&scope))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(ttl > 600_000, "PTTL={ttl}");
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn leaked_reservation_expires_and_stops_blocking_the_scope() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let scope = Uuid::new_v4();
+        store.term_usage_add(&scope, "l:0", 50, 0.0).await.unwrap();
+        // Reserve 50 and never settle (crash / SIGKILL): the scope is at cap.
+        store
+            .reserve_with_term(&scope, 0, 0, 50, Some(token_gate("l:0", 100)), 0.0)
+            .await
+            .unwrap();
+        let out = store
+            .reserve_with_term(&scope, 0, 0, 1, Some(token_gate("l:0", 100)), 0.0)
+            .await
+            .unwrap();
+        assert!(matches!(out, ReserveOutcome::TermExhausted { .. }));
+
+        expire_reservations_now(&store, &scope).await;
+
+        // Reserved reads as 0 again; only the committed 50 counts.
+        let out = store
+            .reserve_with_term(&scope, 0, 0, 10, Some(token_gate("l:0", 100)), 0.0)
+            .await
+            .unwrap();
+        assert!(matches!(out, ReserveOutcome::Reserved { .. }));
+        assert_eq!(
+            reserved_field(&store, &scope, "tokens").await.as_deref(),
+            Some("10")
+        );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn reconcile_after_reservation_expiry_still_commits_actual() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let scope = Uuid::new_v4();
+        store
+            .reserve_with_term(&scope, 0, 0, 40, Some(token_gate("l:0", 100)), 0.4)
+            .await
+            .unwrap();
+        expire_reservations_now(&store, &scope).await;
+
+        let committed = store
+            .term_reconcile(&scope.to_string(), "l:0", 40, 0.4, 25, 0.3)
+            .await
+            .unwrap();
+        assert_eq!(committed, (25, 0.3));
+        // The release did not resurrect the expired key.
+        assert_eq!(reserved_field(&store, &scope, "tokens").await, None);
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn reservation_from_a_previous_period_is_discarded() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let scope = Uuid::new_v4();
+        store
+            .reserve_with_term(&scope, 0, 0, 90, Some(token_gate("m:2026-08", 100)), 0.0)
+            .await
+            .unwrap();
+        let out = store
+            .reserve_with_term(&scope, 0, 0, 5, Some(token_gate("m:2026-09", 100)), 0.0)
+            .await
+            .unwrap();
+        assert!(matches!(out, ReserveOutcome::Reserved { .. }));
+        assert_eq!(
+            reserved_field(&store, &scope, "tokens").await.as_deref(),
+            Some("5")
+        );
+    }
+
+    fn token_gate(period_key: &str, cap: i64) -> TermGate<'_> {
+        TermGate {
+            period_key,
+            budget_tokens: Some(cap),
+            budget_cost_usd: None,
+        }
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set (the
+    /// target address needs no Redis, but the test needs a routable network).
+    #[tokio::test]
+    async fn connect_to_blackholed_address_errors_within_connect_timeout() {
+        if std::env::var("OBLETH_TEST_REDIS_URL").is_err() {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        }
+        let timeouts = RedisTimeouts {
+            response: std::time::Duration::from_millis(250),
+            connect: std::time::Duration::from_secs(2),
+        };
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            RedisStore::connect_with("redis://10.255.255.1:6379", timeouts),
+        )
+        .await
+        .expect("connect must not hang past the connect timeout");
+        let elapsed = started.elapsed();
+        assert!(res.is_err(), "blackholed connect must error");
+        assert!(
+            elapsed < std::time::Duration::from_millis(2500),
+            "took {elapsed:?}"
+        );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn response_timeout_is_applied_to_commands() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        // BLPOP on an empty list stalls the reply for 2 s, standing in for a
+        // server that stops answering after the connection is established.
+        let mut conn = store.conn.clone();
+        let started = std::time::Instant::now();
+        let res: redis::RedisResult<Option<(String, String)>> = redis::cmd("BLPOP")
+            .arg(format!("obleth:test:blpop:{}", Uuid::new_v4()))
+            .arg(2)
+            .query_async(&mut conn)
+            .await;
+        let elapsed = started.elapsed();
+        assert!(res.is_err(), "stalled command must time out, got {res:?}");
+        assert!(
+            elapsed < std::time::Duration::from_millis(1500),
+            "took {elapsed:?}"
+        );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn term_reservation_counts_toward_the_cap() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let scope = Uuid::new_v4();
+        store.term_usage_add(&scope, "l:0", 50, 0.0).await.unwrap();
+
+        // 50 committed + 0 reserved < 100: admitted, reserves 40.
+        let out = store
+            .reserve_with_term(&scope, 0, 0, 40, Some(token_gate("l:0", 100)), 0.4)
+            .await
+            .unwrap();
+        assert!(matches!(out, ReserveOutcome::Reserved { .. }));
+        assert_eq!(
+            reserved_field(&store, &scope, "tokens").await.as_deref(),
+            Some("40")
+        );
+        // 50 + 40 < 100: admitted, reserves 10 more.
+        let out = store
+            .reserve_with_term(&scope, 0, 0, 10, Some(token_gate("l:0", 100)), 0.1)
+            .await
+            .unwrap();
+        assert!(matches!(out, ReserveOutcome::Reserved { .. }));
+        // 50 + 50 >= 100: rejected although only 50 is committed.
+        let out = store
+            .reserve_with_term(&scope, 0, 0, 1, Some(token_gate("l:0", 100)), 0.0)
+            .await
+            .unwrap();
+        assert!(matches!(out, ReserveOutcome::TermExhausted { .. }));
+        let reserved_cost: f64 = reserved_field(&store, &scope, "cost")
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert!((reserved_cost - 0.5).abs() < 1e-9, "{reserved_cost}");
+
+        // Reserved cost counts toward a cost cap the same way.
+        let cost_scope = Uuid::new_v4();
+        let gate = || TermGate {
+            period_key: "l:0",
+            budget_tokens: None,
+            budget_cost_usd: Some(1.0),
+        };
+        for expect_ok in [true, true, false] {
+            let out = store
+                .reserve_with_term(&cost_scope, 0, 0, 1, Some(gate()), 0.75)
+                .await
+                .unwrap();
+            assert_eq!(
+                matches!(out, ReserveOutcome::Reserved { .. }),
+                expect_ok,
+                "{out:?}"
+            );
+        }
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn rate_limited_requests_reserve_no_term_budget() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let scope = Uuid::new_v4();
+        let out = store
+            .reserve_with_term(&scope, 10, 0, 5, Some(token_gate("l:0", 1000)), 0.0)
+            .await
+            .unwrap();
+        assert!(matches!(out, ReserveOutcome::Reserved { .. }));
+        // 8 does not fit the 5 left in the bucket.
+        let out = store
+            .reserve_with_term(&scope, 10, 0, 8, Some(token_gate("l:0", 1000)), 0.0)
+            .await
+            .unwrap();
+        assert!(matches!(out, ReserveOutcome::RateLimited { .. }));
+        assert_eq!(
+            reserved_field(&store, &scope, "tokens").await.as_deref(),
+            Some("5")
+        );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn legacy_check_only_reserve_leaves_no_reservation() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let scope = Uuid::new_v4();
+        let out = store
+            .reserve_budget_with_term(&scope, 0, 0, 40, Some(token_gate("l:0", 100)))
+            .await
+            .unwrap();
+        assert!(matches!(out, ReserveOutcome::Reserved { .. }));
+        assert_eq!(reserved_field(&store, &scope, "tokens").await, None);
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn term_reconcile_moves_reservation_to_committed() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let scope = Uuid::new_v4();
+        let s = scope.to_string();
+        store
+            .reserve_with_term(&scope, 0, 0, 40, Some(token_gate("l:0", 100)), 0.4)
+            .await
+            .unwrap();
+        let committed = store
+            .term_reconcile(&s, "l:0", 40, 0.4, 25, 0.3)
+            .await
+            .unwrap();
+        assert_eq!(committed, (25, 0.3));
+        assert_eq!(
+            store.term_usage_read(&scope, "l:0").await.unwrap(),
+            committed
+        );
+        assert_eq!(
+            reserved_field(&store, &scope, "tokens").await.as_deref(),
+            Some("0")
+        );
+        let reserved_cost: f64 = reserved_field(&store, &scope, "cost")
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(reserved_cost, 0.0);
+
+        // Releasing more than is reserved floors at zero instead of going
+        // negative (a negative reservation would inflate headroom).
+        let (tokens, cost) = store
+            .term_reconcile(&s, "l:0", 1_000, 5.0, 5, 0.05)
+            .await
+            .unwrap();
+        assert_eq!(tokens, 30);
+        assert!((cost - 0.35).abs() < 1e-9, "{cost}");
+        assert_eq!(
+            reserved_field(&store, &scope, "tokens").await.as_deref(),
+            Some("0")
+        );
+        let reserved_cost: f64 = reserved_field(&store, &scope, "cost")
+            .await
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(reserved_cost, 0.0);
+        let (tokens, cost) = store.term_usage_read(&scope, "l:0").await.unwrap();
+        assert_eq!(tokens, 30);
+        assert!((cost - 0.35).abs() < 1e-9, "{cost}");
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn term_reconcile_after_period_roll_keeps_the_new_period() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let scope = Uuid::new_v4();
+        store
+            .reserve_with_term(&scope, 0, 0, 40, Some(token_gate("m:2026-08", 100)), 0.0)
+            .await
+            .unwrap();
+        // Another request rolls the counters to the next period and reserves.
+        store
+            .reserve_with_term(&scope, 0, 0, 7, Some(token_gate("m:2026-09", 100)), 0.0)
+            .await
+            .unwrap();
+        // The straggler from the old period settles: its usage is counted,
+        // but it must neither wipe the new period nor release the new
+        // period's reservation.
+        let committed = store
+            .term_reconcile(&scope.to_string(), "m:2026-08", 40, 0.0, 30, 0.0)
+            .await
+            .unwrap();
+        assert_eq!(committed, (30, 0.0));
+        assert_eq!(
+            term_field(&store, &scope, "period").await.as_deref(),
+            Some("m:2026-09")
+        );
+        assert_eq!(
+            reserved_field(&store, &scope, "tokens").await.as_deref(),
+            Some("7")
+        );
+        assert_eq!(
+            term_field(&store, &scope, "tokens").await.as_deref(),
+            Some("30")
+        );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn concurrent_reservations_at_cap_minus_one_admit_only_one() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let scope = Uuid::new_v4();
+        store.term_usage_add(&scope, "l:0", 99, 0.0).await.unwrap();
+        let (ra, rb) = tokio::join!(
+            store.reserve_with_term(&scope, 0, 0, 10, Some(token_gate("l:0", 100)), 0.0),
+            store.reserve_with_term(&scope, 0, 0, 10, Some(token_gate("l:0", 100)), 0.0),
+        );
+        let outcomes = [ra.unwrap(), rb.unwrap()];
+        let admitted = outcomes
+            .iter()
+            .filter(|o| matches!(o, ReserveOutcome::Reserved { .. }))
+            .count();
+        let rejected = outcomes
+            .iter()
+            .filter(|o| matches!(o, ReserveOutcome::TermExhausted { .. }))
+            .count();
+        assert_eq!((admitted, rejected), (1, 1), "{outcomes:?}");
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn reconcile_that_recreates_the_bucket_sets_ttl_and_ts() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let tenant = Uuid::new_v4();
+        // Bucket expired between reserve and reconcile.
+        let remaining = store.reconcile_budget(&tenant, 100, 10, 30).await.unwrap();
+        assert_eq!(remaining, 80);
+        let mut conn = store.conn.clone();
+        let key = RedisStore::budget_key(&tenant);
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(ttl > 0, "recreated bucket must expire, PTTL={ttl}");
+        let ts: Option<i64> = conn.hget(&key, "ts").await.unwrap();
+        assert!(ts.is_some(), "recreated bucket must be re-seeded with ts");
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn estimate_larger_than_capacity_is_admitted_against_a_full_bucket() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let (capacity, tpm) = (100i64, 0i64);
+
+        let tenant = Uuid::new_v4();
+        let (ok, remaining) = store
+            .reserve_budget(&tenant, capacity, tpm, 150)
+            .await
+            .unwrap();
+        assert!(ok, "oversized request against a full bucket must pass");
+        assert_eq!(remaining, -50);
+        // Bucket now in debt: the next request waits for refill.
+        let (ok, _) = store
+            .reserve_budget(&tenant, capacity, tpm, 150)
+            .await
+            .unwrap();
+        assert!(!ok);
+
+        // The debt floor (-capacity) still holds.
+        let tenant = Uuid::new_v4();
+        let (ok, remaining) = store
+            .reserve_budget(&tenant, capacity, tpm, 10_000)
+            .await
+            .unwrap();
+        assert!(ok);
+        assert_eq!(remaining, -capacity);
+
+        // A partially drained bucket still rejects the oversized request.
+        let tenant = Uuid::new_v4();
+        store
+            .reserve_budget(&tenant, capacity, tpm, 1)
+            .await
+            .unwrap();
+        let (ok, _) = store
+            .reserve_budget(&tenant, capacity, tpm, 150)
+            .await
+            .unwrap();
+        assert!(!ok);
+
+        // Same rule through the combined term + bucket script.
+        let tenant = Uuid::new_v4();
+        let out = store
+            .reserve_with_term(&tenant, capacity, tpm, 150, None, 0.0)
+            .await
+            .unwrap();
+        assert_eq!(out, ReserveOutcome::Reserved { remaining: -50 });
     }
 }

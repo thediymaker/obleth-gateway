@@ -57,6 +57,11 @@ async fn main() -> anyhow::Result<()> {
     // Long-lived so its success cache survives across ticks: once a node name is
     // resolved (or aliased) the provisioner stops touching DNS for it.
     let resolver = resolve::HostResolver::new(Duration::from_secs(RESOLVE_TTL_SECS));
+    let (shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        wait_for_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
     loop {
         match run_once(&cfg, &obleth, &http, &resolver, &mut probe_failures).await {
             Ok(Tick::Ran) => {
@@ -80,7 +85,52 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(error = %e, "tick failed; holding (no destructive action)");
             }
         }
-        tokio::time::sleep(Duration::from_secs(cfg.interval_secs)).await;
+        // The tick above is never interrupted: stopping mid-tick could leave
+        // a submitted job unrecorded. A signal only cuts the idle wait short.
+        if !sleep_unless_shutdown(Duration::from_secs(cfg.interval_secs), &mut shutdown).await {
+            tracing::info!("shutdown signal received; exiting after the completed tick");
+            return Ok(());
+        }
+    }
+}
+
+/// Sleep for `period`; returns `false` as soon as shutdown is requested
+/// (including a request that arrived during the previous tick).
+async fn sleep_unless_shutdown(
+    period: Duration,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stop| *stop) => false,
+        _ = tokio::time::sleep(period) => true,
+    }
+}
+
+async fn wait_for_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "ctrl-c handler unavailable");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM handler unavailable");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
     }
 }
 
@@ -524,6 +574,35 @@ mod tests {
     use crate::obleth_client::MockObleth;
     use std::sync::atomic::Ordering;
     use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn idle_wait_continues_without_a_signal() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        assert!(sleep_unless_shutdown(Duration::from_millis(10), &mut rx).await);
+    }
+
+    #[tokio::test]
+    async fn signal_during_idle_wait_stops_the_loop() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = tx.send(true);
+        });
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(5),
+            sleep_unless_shutdown(Duration::from_secs(600), &mut rx),
+        )
+        .await
+        .expect("wait cut short");
+        assert!(!stopped);
+    }
+
+    #[tokio::test]
+    async fn signal_during_a_tick_stops_after_it() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send(true).unwrap();
+        assert!(!sleep_unless_shutdown(Duration::from_secs(600), &mut rx).await);
+    }
 
     /// Slurm fake that answers `get_job` from a fixed map (absent = `Ok(None)`)
     /// and records cancels/submits so a test can assert nothing destructive ran.

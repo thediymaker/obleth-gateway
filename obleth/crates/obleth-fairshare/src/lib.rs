@@ -10,6 +10,11 @@
 //! is served. A single scheduler task owns every pool; nothing is shared. The
 //! [`CapacityProvider`] is a total in-flight ceiling across all pools, not a
 //! fairness input; when it binds, pools are served round-robin.
+//!
+//! Requests with no resolved route share one [`PoolKey::Unrouted`] pool. A
+//! pool with no permits and no waiters for [`IDLE_POOL_TTL`] is dropped by the
+//! scheduler's housekeeping timer, which also drops queued waiters whose
+//! caller has gone.
 
 mod algorithm;
 mod capacity;
@@ -35,6 +40,37 @@ use uuid::Uuid;
 /// Pool size for a model that has no explicit `max_in_flight`.
 pub const DEFAULT_MODEL_MAX_IN_FLIGHT: usize = 32;
 
+/// Display name of the shared pool for requests with no resolved route.
+pub const UNROUTED_POOL: &str = "(unrouted)";
+
+/// How long a pool with no permits and no waiters is kept before housekeeping
+/// drops it.
+pub const IDLE_POOL_TTL: Duration = Duration::from_secs(600);
+
+/// Housekeeping period: a sixtieth of the idle TTL, kept between 1 and 10 s.
+fn housekeeping_interval(idle_pool_ttl: Duration) -> Duration {
+    (idle_pool_ttl / 60).clamp(Duration::from_secs(1), Duration::from_secs(10))
+}
+
+/// Which scheduling pool an admission lands in.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PoolKey {
+    /// The pool of a resolved model route.
+    Model(String),
+    /// One pool shared by every request that did not resolve to a route, so
+    /// arbitrary model strings cannot each mint a pool of their own.
+    Unrouted,
+}
+
+impl PoolKey {
+    fn display_name(&self) -> &str {
+        match self {
+            PoolKey::Model(name) => name,
+            PoolKey::Unrouted => UNROUTED_POOL,
+        }
+    }
+}
+
 /// Live counters for metrics/dashboards.
 #[derive(Debug, Default)]
 pub struct Stats {
@@ -53,6 +89,9 @@ pub struct GroupFairshare {
     /// Occupancy above this group's apportioned cap, i.e. slots borrowed from
     /// siblings that were leaving capacity idle.
     pub borrowed: usize,
+    /// Service actually received by the group's tenants, excluding the
+    /// virtual time each tenant was placed at; the scheduler ranks groups by
+    /// this over weight. Not the sum of the tenant rows' `served_tokens`.
     pub served_tokens: f64,
     pub share_score: f64,
     pub weight_share: f64,
@@ -205,7 +244,7 @@ pub struct Permit {
     release: Option<mpsc::UnboundedSender<Ctl>>,
     tenant: Uuid,
     key: Uuid,
-    model: String,
+    pool: PoolKey,
 }
 
 impl Drop for Permit {
@@ -214,7 +253,7 @@ impl Drop for Permit {
             let _ = tx.send(Ctl::Release {
                 tenant: self.tenant,
                 key: self.key,
-                model: self.model.clone(),
+                pool: std::mem::replace(&mut self.pool, PoolKey::Unrouted),
             });
         }
     }
@@ -229,6 +268,7 @@ pub struct Admitted {
 
 enum Ctl {
     Admit {
+        pool: PoolKey,
         req: AdmitRequest,
         respond: oneshot::Sender<Admitted>,
         enqueued: Instant,
@@ -236,7 +276,7 @@ enum Ctl {
     Release {
         tenant: Uuid,
         key: Uuid,
-        model: String,
+        pool: PoolKey,
     },
     Snapshot {
         respond: oneshot::Sender<FairshareSnapshot>,
@@ -260,6 +300,21 @@ impl FairShare {
         algorithm: FairshareAlgorithm,
         default_model_max_in_flight: usize,
     ) -> Self {
+        Self::start_with_idle_pool_ttl(
+            capacity,
+            algorithm,
+            default_model_max_in_flight,
+            IDLE_POOL_TTL,
+        )
+    }
+
+    /// [`FairShare::start`] with a custom [`IDLE_POOL_TTL`].
+    pub fn start_with_idle_pool_ttl(
+        capacity: Arc<dyn CapacityProvider>,
+        algorithm: FairshareAlgorithm,
+        default_model_max_in_flight: usize,
+        idle_pool_ttl: Duration,
+    ) -> Self {
         let (ctl, rx) = mpsc::unbounded_channel();
         let stats = Arc::new(Stats::default());
         let model_load = Arc::new(RwLock::new(HashMap::new()));
@@ -272,6 +327,7 @@ impl FairShare {
             cursor: 0,
             in_flight: 0,
             queued_total: 0,
+            idle_pool_ttl,
             ctl_tx: ctl.clone(),
             stats: stats.clone(),
             model_load: model_load.clone(),
@@ -303,10 +359,21 @@ impl FairShare {
         rx.await.ok()
     }
 
+    /// Admit into the pool named by `req.model`. Callers holding a request
+    /// that did not resolve to a route should use [`FairShare::admit_to`]
+    /// with [`PoolKey::Unrouted`] instead.
     pub async fn admit(&self, req: AdmitRequest) -> Option<Admitted> {
+        let pool = PoolKey::Model(req.model.clone());
+        self.admit_to(pool, req).await
+    }
+
+    /// Admit into an explicit pool. `req.model` is not consulted for pool
+    /// selection.
+    pub async fn admit_to(&self, pool: PoolKey, req: AdmitRequest) -> Option<Admitted> {
         let (respond, rx) = oneshot::channel();
         self.ctl
             .send(Ctl::Admit {
+                pool,
                 req,
                 respond,
                 enqueued: Instant::now(),
@@ -376,6 +443,7 @@ impl TenantQueue {
 /// `key_tenant`) are keyed by key id alone, not by (tenant, key): that relies on
 /// `api_keys.id` being globally unique, which it is.
 struct Pool {
+    key: PoolKey,
     model: String,
     algorithm: FairshareAlgorithm,
     cap: usize,
@@ -388,24 +456,32 @@ struct Pool {
     tenant_cap: HashMap<Uuid, usize>,
     queues: HashMap<Uuid, TenantQueue>,
     served: HashMap<Uuid, f64>,
+    /// The part of each tenant's `served` that is virtual time it was placed
+    /// at (on joining, or when snapped forward after going quiet) rather than
+    /// service it received. `served - served_base` is its actual service.
+    served_base: HashMap<Uuid, f64>,
     key_in_flight: HashMap<Uuid, usize>,
     key_served: HashMap<Uuid, f64>,
     key_weight: HashMap<Uuid, i64>,
     key_cap: HashMap<Uuid, usize>,
     key_tenant: HashMap<Uuid, Uuid>,
     virtual_time: f64,
+    /// When the pool last became idle (no permits, no waiters); `None` while
+    /// it is in use.
+    idle_since: Option<Instant>,
     ctl_tx: mpsc::UnboundedSender<Ctl>,
 }
 
 impl Pool {
     fn new(
-        model: String,
+        key: PoolKey,
         algorithm: FairshareAlgorithm,
         cap: usize,
         ctl_tx: mpsc::UnboundedSender<Ctl>,
     ) -> Self {
         Pool {
-            model,
+            model: key.display_name().to_string(),
+            key,
             algorithm,
             cap: cap.max(1),
             in_flight: 0,
@@ -417,12 +493,14 @@ impl Pool {
             tenant_cap: HashMap::new(),
             queues: HashMap::new(),
             served: HashMap::new(),
+            served_base: HashMap::new(),
             key_in_flight: HashMap::new(),
             key_served: HashMap::new(),
             key_weight: HashMap::new(),
             key_cap: HashMap::new(),
             key_tenant: HashMap::new(),
             virtual_time: 0.0,
+            idle_since: None,
             ctl_tx,
         }
     }
@@ -601,7 +679,11 @@ impl Pool {
         self.in_flight += 1;
         *self.tenant_in_flight.entry(tenant).or_insert(0) += 1;
         *self.key_in_flight.entry(key).or_insert(0) += 1;
-        *self.served.entry(tenant).or_insert(self.virtual_time) += cost as f64;
+        let vt = self.virtual_time;
+        *self.served.entry(tenant).or_insert_with(|| {
+            self.served_base.insert(tenant, vt);
+            vt
+        }) += cost as f64;
         *self.key_served.entry(key).or_insert(self.virtual_time) += cost as f64;
     }
 
@@ -617,7 +699,7 @@ impl Pool {
                 release: Some(self.ctl_tx.clone()),
                 tenant,
                 key,
-                model: self.model.clone(),
+                pool: self.key.clone(),
             },
             admission,
             waited,
@@ -661,9 +743,19 @@ impl Pool {
             .get(&req.tenant)
             .is_none_or(TenantQueue::is_empty);
         if tenant_queue_empty {
-            let entry = self.served.entry(req.tenant).or_insert(self.virtual_time);
-            if *entry < self.virtual_time {
-                *entry = self.virtual_time;
+            let vt = self.virtual_time;
+            match self.served.get_mut(&req.tenant) {
+                None => {
+                    self.served.insert(req.tenant, vt);
+                    self.served_base.insert(req.tenant, vt);
+                }
+                Some(served) if *served < vt => {
+                    // The snap forward is placement, not service: move the
+                    // base with it so group scores count only real service.
+                    *self.served_base.entry(req.tenant).or_insert(0.0) += vt - *served;
+                    *served = vt;
+                }
+                Some(_) => {}
             }
         }
         let key_queue_empty = self
@@ -694,33 +786,68 @@ impl Pool {
         self.queued_total += 1;
     }
 
-    /// Admit one queued waiter if the pool has a free slot. Returns whether a
-    /// grant happened so the scheduler can account the global ceiling.
-    fn dispatch_one(&mut self, effective: usize) -> bool {
-        if self.in_flight >= effective || self.queued_total == 0 {
-            return false;
-        }
-        let Some(tenant) = self.pick_tenant(effective) else {
-            return false;
-        };
-        let Some(key) = self.pick_key(&tenant) else {
-            return false;
-        };
-        let waiter = {
-            let queue = self.queues.get_mut(&tenant).expect("picked tenant exists");
-            let waiter = queue.pop(&key).expect("picked key non-empty");
-            if queue.is_empty() {
-                self.queues.remove(&tenant);
+    /// Admit one queued waiter if the pool has a free slot. Waiters whose
+    /// caller has gone are dropped on the way without being charged. Returns
+    /// whether a grant happened, so the scheduler can account the global
+    /// ceiling, and how many dead waiters were dropped.
+    fn dispatch_one(&mut self, effective: usize) -> (bool, usize) {
+        let mut dropped = 0;
+        loop {
+            if self.in_flight >= effective || self.queued_total == 0 {
+                return (false, dropped);
             }
-            waiter
-        };
-        self.queued_total -= 1;
-        self.track_waiter_meta(tenant, key, &waiter);
-        self.occupy(tenant, key, waiter.cost);
-        self.advance_virtual_time();
-        let waited = waiter.enqueued.elapsed();
-        self.send(tenant, key, waiter.respond, Admission::Queued, waited);
-        true
+            let Some(tenant) = self.pick_tenant(effective) else {
+                return (false, dropped);
+            };
+            let Some(key) = self.pick_key(&tenant) else {
+                return (false, dropped);
+            };
+            let waiter = {
+                let queue = self.queues.get_mut(&tenant).expect("picked tenant exists");
+                let waiter = queue.pop(&key).expect("picked key non-empty");
+                if queue.is_empty() {
+                    self.queues.remove(&tenant);
+                }
+                waiter
+            };
+            self.queued_total -= 1;
+            if waiter.respond.is_closed() {
+                dropped += 1;
+                self.forget_if_quiet(tenant, key);
+                continue;
+            }
+            self.track_waiter_meta(tenant, key, &waiter);
+            self.occupy(tenant, key, waiter.cost);
+            self.advance_virtual_time();
+            let waited = waiter.enqueued.elapsed();
+            self.send(tenant, key, waiter.respond, Admission::Queued, waited);
+            return (true, dropped);
+        }
+    }
+
+    /// Drop every queued waiter whose caller has gone. Returns how many.
+    fn prune_dead_waiters(&mut self) -> usize {
+        let mut dropped: Vec<(Uuid, Uuid)> = Vec::new();
+        for (tenant, queue) in &mut self.queues {
+            for (key, deque) in &mut queue.keys {
+                let before = deque.len();
+                deque.retain(|w| !w.respond.is_closed());
+                for _ in deque.len()..before {
+                    dropped.push((*tenant, *key));
+                }
+            }
+            queue.keys.retain(|_, d| !d.is_empty());
+            queue.len = queue.keys.values().map(VecDeque::len).sum();
+        }
+        if dropped.is_empty() {
+            return 0;
+        }
+        self.queues.retain(|_, q| !q.is_empty());
+        self.queued_total = self.queued_total.saturating_sub(dropped.len());
+        for (tenant, key) in &dropped {
+            self.forget_if_quiet(*tenant, *key);
+        }
+        dropped.len()
     }
 
     fn pick_tenant(&self, effective: usize) -> Option<Uuid> {
@@ -756,12 +883,7 @@ impl Pool {
                 }
             }
         }
-        let mut served_by_group: HashMap<&str, f64> = HashMap::new();
-        for (tenant, s) in &self.served {
-            if let Some(g) = self.tenant_group.get(tenant) {
-                *served_by_group.entry(g.as_str()).or_insert(0.0) += *s;
-            }
-        }
+        let served_by_group = self.group_service();
         let mut tenant_caps_by_group: HashMap<String, HashMap<Uuid, usize>> = HashMap::new();
         let mut eligible: Vec<(Uuid, f64)> = Vec::new();
         let mut borrowable: Vec<(Uuid, f64)> = Vec::new();
@@ -823,6 +945,21 @@ impl Pool {
         best.map(|(t, _)| t)
     }
 
+    /// Actual service per group: the sum over its tenants of `served` minus
+    /// the virtual time each was placed at. Summing raw `served` would count
+    /// that placement once per tenant, so a group with many tenants would
+    /// look over-served and lose every tie-break.
+    fn group_service(&self) -> HashMap<&str, f64> {
+        let mut by_group: HashMap<&str, f64> = HashMap::new();
+        for (tenant, s) in &self.served {
+            if let Some(g) = self.tenant_group.get(tenant) {
+                let base = self.served_base.get(tenant).copied().unwrap_or(0.0);
+                *by_group.entry(g.as_str()).or_insert(0.0) += (*s - base).max(0.0);
+            }
+        }
+        by_group
+    }
+
     /// Within the winning tenant, the key with the lowest weight-adjusted
     /// service debt goes first; ties break on the older head-of-line request.
     fn pick_key(&self, tenant: &Uuid) -> Option<Uuid> {
@@ -874,6 +1011,10 @@ impl Pool {
                 self.key_in_flight.remove(&key);
             }
         }
+        self.forget_if_quiet(tenant, key);
+    }
+
+    fn forget_if_quiet(&mut self, tenant: Uuid, key: Uuid) {
         // A key that is idle and at or below the pool's virtual time would be
         // snapped to virtual time on return anyway, so its entry carries no
         // information worth keeping.
@@ -909,6 +1050,7 @@ impl Pool {
     /// Only called for a tenant with no in-flight slot and an empty queue.
     fn forget_tenant(&mut self, tenant: &Uuid) {
         self.served.remove(tenant);
+        self.served_base.remove(tenant);
         self.tenant_weight.remove(tenant);
         self.tenant_group.remove(tenant);
         self.tenant_cap.remove(tenant);
@@ -917,6 +1059,17 @@ impl Pool {
 
     fn is_idle(&self) -> bool {
         self.in_flight == 0 && self.queued_total == 0
+    }
+
+    /// Record whether the pool is in use, resetting its share history the
+    /// first time it is found idle.
+    fn settle_idle(&mut self) {
+        if !self.is_idle() {
+            self.idle_since = None;
+        } else if self.idle_since.is_none() {
+            self.reset();
+            self.idle_since = Some(Instant::now());
+        }
     }
 
     /// With nobody holding or waiting for a slot, no tenant has relative debt,
@@ -929,6 +1082,7 @@ impl Pool {
         self.tenant_cap.clear();
         self.queues.clear();
         self.served.clear();
+        self.served_base.clear();
         self.key_in_flight.clear();
         self.key_served.clear();
         self.key_weight.clear();
@@ -971,7 +1125,9 @@ impl Pool {
         groups
     }
 
-    fn snapshot(&self) -> ModelPoolFairshare {
+    /// `headroom` is the global ceiling's free slots, so group caps and
+    /// borrowing are reported against the capacity actually enforced.
+    fn snapshot(&self, headroom: usize) -> ModelPoolFairshare {
         let ids: HashSet<Uuid> = self
             .queues
             .keys()
@@ -980,7 +1136,8 @@ impl Pool {
             .chain(self.served.keys().copied())
             .collect();
         let active = self.active_groups();
-        let group_caps = self.compute_group_caps(self.cap);
+        let group_caps = self.compute_group_caps(self.effective_cap(headroom));
+        let group_service = self.group_service();
         let total_group_weight: i64 = active.iter().map(|(_, w)| (*w).max(1)).sum();
 
         let mut names: HashSet<String> = active.iter().map(|(n, _)| n.clone()).collect();
@@ -990,27 +1147,25 @@ impl Pool {
             }
         }
 
-        // One pass over the tenants with state, bucketed by group: in-flight,
-        // queued and served per group, so the loop below does not re-scan every
+        // One pass over the tenants with state, bucketed by group: in-flight
+        // and queued per group, so the loop below does not re-scan every
         // tenant for every group.
-        let mut group_totals: HashMap<&str, (usize, usize, f64)> = HashMap::new();
+        let mut group_totals: HashMap<&str, (usize, usize)> = HashMap::new();
         for tenant in &ids {
             let Some(group) = self.tenant_group.get(tenant) else {
                 continue;
             };
-            let entry = group_totals.entry(group.as_str()).or_insert((0, 0, 0.0));
+            let entry = group_totals.entry(group.as_str()).or_insert((0, 0));
             entry.0 += self.tenant_in_flight.get(tenant).copied().unwrap_or(0);
             entry.1 += self.queues.get(tenant).map(|q| q.len).unwrap_or(0);
-            entry.2 += self.served.get(tenant).copied().unwrap_or(0.0);
         }
         let mut groups: Vec<GroupFairshare> = names
             .into_iter()
             .map(|name| {
                 let weight = self.group_weight.get(&name).copied().unwrap_or(100).max(1);
-                let (in_flight, queued, served_tokens) = group_totals
-                    .get(name.as_str())
-                    .copied()
-                    .unwrap_or((0, 0, 0.0));
+                let (in_flight, queued) =
+                    group_totals.get(name.as_str()).copied().unwrap_or((0, 0));
+                let served_tokens = group_service.get(name.as_str()).copied().unwrap_or(0.0);
                 let weight_share =
                     if total_group_weight > 0 && active.iter().any(|(n, _)| n == &name) {
                         weight as f64 / total_group_weight as f64
@@ -1188,12 +1343,13 @@ struct Scheduler {
     algorithm: FairshareAlgorithm,
     capacity: Arc<dyn CapacityProvider>,
     default_model_cap: usize,
-    pools: HashMap<String, Pool>,
+    pools: HashMap<PoolKey, Pool>,
     /// Insertion order of pools, for round-robin when the ceiling binds.
-    pool_order: Vec<String>,
+    pool_order: Vec<PoolKey>,
     cursor: usize,
     in_flight: usize,
     queued_total: usize,
+    idle_pool_ttl: Duration,
     ctl_tx: mpsc::UnboundedSender<Ctl>,
     stats: Arc<Stats>,
     model_load: Arc<RwLock<HashMap<String, usize>>>,
@@ -1201,71 +1357,132 @@ struct Scheduler {
 
 impl Scheduler {
     async fn run(mut self, mut rx: mpsc::UnboundedReceiver<Ctl>) {
-        while let Some(msg) = rx.recv().await {
-            match msg {
-                Ctl::Admit {
-                    req,
-                    respond,
-                    enqueued,
-                } => {
-                    let ceiling = self.capacity.max_in_flight();
-                    let headroom = ceiling.saturating_sub(self.in_flight);
-                    let default_cap = self.default_model_cap;
-                    let model = req.model.clone();
-                    let pool = self.pool_mut(&model);
-                    pool.cap = req
-                        .model_max_in_flight
-                        .filter(|c| *c > 0)
-                        .unwrap_or(default_cap);
-                    pool.track_meta(&req);
-                    let effective = pool.effective_cap(headroom);
-                    if headroom > 0 && pool.can_grant_immediately(&req, effective) {
-                        pool.grant_fast(req, respond);
-                        self.in_flight += 1;
-                    } else {
-                        pool.enqueue(req, respond, enqueued);
-                        self.queued_total += 1;
-                        self.dispatch_all();
-                    }
-                    self.publish_model_load(&model);
+        // Housekeeping runs on its own timer, not on `Ctl::Sample`: the
+        // history sampler is optional, and pruning must not depend on it.
+        let mut housekeeping = tokio::time::interval(housekeeping_interval(self.idle_pool_ttl));
+        housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some(msg) = msg else { break };
+                    self.handle(msg);
+                }
+                _ = housekeeping.tick() => {
+                    self.sweep();
                     self.publish_stats();
-                }
-                Ctl::Release { tenant, key, model } => {
-                    self.in_flight = self.in_flight.saturating_sub(1);
-                    if let Some(pool) = self.pools.get_mut(&model) {
-                        pool.release(tenant, key);
-                        if pool.is_idle() {
-                            pool.reset();
-                        }
-                    }
-                    self.publish_model_load(&model);
-                    self.dispatch_all();
-                    self.publish_stats();
-                }
-                Ctl::Snapshot { respond } => {
-                    let _ = respond.send(self.build_snapshot());
-                }
-                Ctl::Sample { respond } => {
-                    let _ = respond.send(self.build_sample());
                 }
             }
         }
     }
 
-    fn pool_mut(&mut self, model: &str) -> &mut Pool {
-        if !self.pools.contains_key(model) {
+    fn handle(&mut self, msg: Ctl) {
+        match msg {
+            Ctl::Admit {
+                pool: key,
+                req,
+                respond,
+                enqueued,
+            } => {
+                let ceiling = self.capacity.max_in_flight();
+                let headroom = ceiling.saturating_sub(self.in_flight);
+                let default_cap = self.default_model_cap;
+                let pool = self.pool_mut(&key);
+                pool.cap = match key {
+                    // No route means no configured cap to honour.
+                    PoolKey::Unrouted => default_cap,
+                    PoolKey::Model(_) => req
+                        .model_max_in_flight
+                        .filter(|c| *c > 0)
+                        .unwrap_or(default_cap),
+                };
+                pool.idle_since = None;
+                pool.track_meta(&req);
+                let effective = pool.effective_cap(headroom);
+                if headroom > 0 && pool.can_grant_immediately(&req, effective) {
+                    pool.grant_fast(req, respond);
+                    self.in_flight += 1;
+                } else {
+                    pool.enqueue(req, respond, enqueued);
+                    self.queued_total += 1;
+                    self.dispatch_all();
+                }
+                self.publish_model_load(&key);
+                self.publish_stats();
+            }
+            Ctl::Release {
+                tenant,
+                key,
+                pool: pool_key,
+            } => {
+                self.in_flight = self.in_flight.saturating_sub(1);
+                if let Some(pool) = self.pools.get_mut(&pool_key) {
+                    pool.release(tenant, key);
+                    pool.settle_idle();
+                }
+                self.publish_model_load(&pool_key);
+                self.dispatch_all();
+                self.publish_stats();
+            }
+            Ctl::Snapshot { respond } => {
+                let _ = respond.send(self.build_snapshot());
+            }
+            Ctl::Sample { respond } => {
+                let _ = respond.send(self.build_sample());
+            }
+        }
+    }
+
+    fn pool_mut(&mut self, key: &PoolKey) -> &mut Pool {
+        if !self.pools.contains_key(key) {
             self.pools.insert(
-                model.to_string(),
+                key.clone(),
                 Pool::new(
-                    model.to_string(),
+                    key.clone(),
                     self.algorithm,
                     self.default_model_cap,
                     self.ctl_tx.clone(),
                 ),
             );
-            self.pool_order.push(model.to_string());
+            self.pool_order.push(key.clone());
         }
-        self.pools.get_mut(model).expect("pool just inserted")
+        self.pools.get_mut(key).expect("pool just inserted")
+    }
+
+    /// Periodic housekeeping, run on its own timer: drop waiters whose
+    /// caller has gone, then drop pools that have been idle for the TTL.
+    fn sweep(&mut self) {
+        let mut dropped = 0;
+        for pool in self.pools.values_mut() {
+            dropped += pool.prune_dead_waiters();
+            pool.settle_idle();
+        }
+        self.queued_total = self.queued_total.saturating_sub(dropped);
+        if dropped > 0 {
+            self.dispatch_all();
+        }
+
+        let ttl = self.idle_pool_ttl;
+        // Only a pool with no permit and no waiter is removed: nothing can
+        // still send a `Release` for it or be waiting on a grant from it.
+        let expired: Vec<PoolKey> = self
+            .pools
+            .iter()
+            .filter(|(_, p)| p.is_idle() && p.idle_since.is_some_and(|t| t.elapsed() >= ttl))
+            .map(|(k, _)| k.clone())
+            .collect();
+        if expired.is_empty() {
+            return;
+        }
+        for key in &expired {
+            self.pools.remove(key);
+            self.publish_model_load(key);
+        }
+        self.pool_order.retain(|k| self.pools.contains_key(k));
+        self.cursor = if self.pool_order.is_empty() {
+            0
+        } else {
+            self.cursor % self.pool_order.len()
+        };
     }
 
     /// Serve queued waiters across pools. Each pass grants at most one slot per
@@ -1286,30 +1503,39 @@ impl Scheduler {
                 }
                 let idx = (self.cursor + i) % n;
                 let headroom = ceiling.saturating_sub(self.in_flight);
-                let granted = match self.pools.get_mut(self.pool_order[idx].as_str()) {
+                let (granted, dropped) = match self.pools.get_mut(&self.pool_order[idx]) {
                     Some(pool) if pool.queued_total > 0 => {
                         let effective = pool.effective_cap(headroom);
-                        pool.dispatch_one(effective)
+                        let outcome = pool.dispatch_one(effective);
+                        if outcome.1 > 0 {
+                            pool.settle_idle();
+                        }
+                        outcome
                     }
-                    _ => false,
+                    _ => (false, 0),
                 };
+                self.queued_total = self.queued_total.saturating_sub(dropped);
                 if granted {
                     self.in_flight += 1;
                     self.queued_total = self.queued_total.saturating_sub(1);
                     progressed = true;
-                    let name = self.pool_order[idx].clone();
-                    self.publish_model_load(&name);
+                    let key = self.pool_order[idx].clone();
+                    self.publish_model_load(&key);
                 }
             }
             self.cursor = (self.cursor + 1) % n;
         }
     }
 
-    fn publish_model_load(&self, model: &str) {
+    fn publish_model_load(&self, key: &PoolKey) {
+        // The unrouted pool is not a model the router could pick.
+        let PoolKey::Model(model) = key else {
+            return;
+        };
         if let Ok(mut shared) = self.model_load.write() {
-            match self.pools.get(model).map(|p| p.in_flight) {
+            match self.pools.get(key).map(|p| p.in_flight) {
                 Some(n) if n > 0 => {
-                    shared.insert(model.to_string(), n);
+                    shared.insert(model.clone(), n);
                 }
                 _ => {
                     shared.remove(model);
@@ -1329,7 +1555,8 @@ impl Scheduler {
 
     /// A [`FairshareSample`] built directly from pool state, without the
     /// tenant/key views [`Scheduler::build_snapshot`] computes. Keeps the
-    /// history sampler from forcing that full walk every tick.
+    /// history sampler from forcing that full walk every tick. Idle pools
+    /// carry nothing to chart and are left out.
     fn build_sample(&self) -> FairshareSample {
         let ts_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1338,7 +1565,8 @@ impl Scheduler {
         let pools = self
             .pool_order
             .iter()
-            .filter_map(|name| self.pools.get(name))
+            .filter_map(|key| self.pools.get(key))
+            .filter(|pool| !pool.is_idle())
             .map(|pool| PoolSample {
                 model: pool.model.clone(),
                 cap: pool.cap,
@@ -1356,7 +1584,9 @@ impl Scheduler {
     }
 
     fn build_snapshot(&self) -> FairshareSnapshot {
-        let mut pools: Vec<ModelPoolFairshare> = self.pools.values().map(Pool::snapshot).collect();
+        let headroom = self.capacity.max_in_flight().saturating_sub(self.in_flight);
+        let mut pools: Vec<ModelPoolFairshare> =
+            self.pools.values().map(|p| p.snapshot(headroom)).collect();
         pools.sort_by(|a, b| a.model.cmp(&b.model));
         let model_in_flight = pools
             .iter()
@@ -1379,5 +1609,50 @@ impl Scheduler {
             model_in_flight,
             model_queued,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Group standing is actual service, not tenant count: tenants that join
+    /// after virtual time has moved each start at that time, and summing raw
+    /// `served` would charge a many-tenant group for it once per tenant.
+    #[test]
+    fn many_tenant_group_ties_one_tenant_group_on_equal_service() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut pool = Pool::new(
+            PoolKey::Model("m".into()),
+            FairshareAlgorithm::Hierarchical,
+            8,
+            tx,
+        );
+        pool.virtual_time = 50.0;
+
+        for _ in 0..4 {
+            let t = Uuid::new_v4();
+            pool.track_meta(&AdmitRequest::new(t, "m", 10).group("many", 100));
+            pool.occupy(t, t, 10);
+        }
+        let solo = Uuid::new_v4();
+        pool.track_meta(&AdmitRequest::new(solo, "m", 10).group("one", 100));
+        for _ in 0..4 {
+            pool.occupy(solo, solo, 10);
+        }
+
+        let service = pool.group_service();
+        assert_eq!(service["many"], 40.0);
+        assert_eq!(service["one"], 40.0);
+
+        let snap = pool.snapshot(usize::MAX);
+        let score = |name: &str| {
+            snap.groups
+                .iter()
+                .find(|g| g.name == name)
+                .map(|g| g.share_score)
+                .unwrap()
+        };
+        assert_eq!(score("many"), score("one"));
     }
 }

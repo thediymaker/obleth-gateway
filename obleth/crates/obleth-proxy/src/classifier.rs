@@ -186,10 +186,13 @@ async fn call_brain(
         })
         .collect();
 
+    // Endpoint-aware like every other helper call: a brain provisioned on
+    // Slurm has a blank `api_base` and lives only in `endpoints`.
+    let target = crate::boons::helper_target(brain, "", None)?;
     let outcomes = fan_out(
         http,
-        &build_chat_url(&brain.api_base),
-        brain.api_key.as_deref(),
+        &build_chat_url(&target.base),
+        target.api_key.as_deref(),
         &brain.model_name,
         calls,
         timeout,
@@ -441,6 +444,67 @@ mod tests {
             verify_upstream_model: String::new(),
             endpoints: vec![],
         }
+    }
+
+    /// A brain provisioned on Slurm has a blank `api_base` and one healthy
+    /// endpoint; classification must reach it through the endpoint.
+    #[tokio::test]
+    async fn classify_reaches_an_endpoint_only_brain() {
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let hits_clone = hits.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move || {
+                let hits = hits_clone.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    axum::Json(serde_json::json!({
+                        "choices": [{
+                            "message": {"role": "assistant", "content": "x"},
+                            "logprobs": {"content": [{
+                                "token": " yes", "logprob": -0.05,
+                                "top_logprobs": [
+                                    {"token": " yes", "logprob": -0.05},
+                                    {"token": " no", "logprob": -3.5}
+                                ]
+                            }]},
+                            "finish_reason": "length"
+                        }],
+                        "usage": {"prompt_tokens": 50, "completion_tokens": 1}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut slurm_brain = brain("");
+        slurm_brain.endpoints = vec![obleth_config::ResolvedEndpoint {
+            id: "replica-1".into(),
+            api_base: format!("http://{addr}/v1"),
+            api_key: None,
+            priority: 0,
+            weight: 1,
+            enabled: true,
+            healthy: true,
+        }];
+        let settings: AutoRouterSettings = serde_json::from_value(serde_json::json!({})).unwrap();
+        let intent = Classifier::new(settings)
+            .classify(
+                &reqwest::Client::new(),
+                &slurm_brain,
+                "Write a Rust function",
+                &["coding".to_string()],
+            )
+            .await;
+        assert!(
+            hits.load(Ordering::SeqCst) >= 2,
+            "every question reaches the endpoint (a non-label answer is retried)"
+        );
+        assert_eq!(intent.tags, vec!["coding"]);
     }
 
     /// A canned brain: answers every single-token question by looking at

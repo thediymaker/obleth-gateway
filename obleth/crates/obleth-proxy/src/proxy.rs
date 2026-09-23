@@ -49,6 +49,37 @@ const NO_BUFFER_HEADER: (&str, &str) = ("x-accel-buffering", "no");
 /// upstream failure (a stale pooled keep-alive socket). Long enough to let a
 /// fresh connection replace the dead one, short enough to stay invisible in TTFT.
 const CONN_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+/// Default bound on a request's wait in the fairshare queue
+/// (`OBLETH_ADMISSION_TIMEOUT_SECS`). Without one, a saturated pool parks
+/// callers indefinitely.
+const DEFAULT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
+/// `Retry-After` sent with an admission timeout. `pub(crate)` so other
+/// admission call sites (e.g. `verdicts`) send the same value.
+pub(crate) const ADMISSION_RETRY_AFTER_SECS: &str = "5";
+/// How long the aggregated `GET /v1/models` listing is reused. Each miss fans
+/// out one request per upstream base, so polling clients must not drive that
+/// per call.
+const MODELS_LIST_TTL: Duration = Duration::from_secs(15);
+
+/// Parse `OBLETH_ADMISSION_TIMEOUT_SECS`; unset, unparseable, or zero falls
+/// back to the default.
+fn parse_admission_timeout(raw: Option<&str>) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_ADMISSION_TIMEOUT)
+}
+
+pub(crate) fn admission_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        parse_admission_timeout(
+            std::env::var("OBLETH_ADMISSION_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
 
 pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Response<Body> {
     let request_id = Uuid::new_v4();
@@ -223,7 +254,14 @@ fn translate_response_stream(
         // the split happens on bytes rather than decoded text.
         let mut buffer: Vec<u8> = Vec::new();
         while let Some(item) = upstream.next().await {
-            let Ok(chunk) = item else { break };
+            let Ok(chunk) = item else {
+                // The pipeline aborts its body when the upstream stream
+                // breaks; say so instead of closing with `completed`.
+                for frame in translator.fail("upstream stream ended before the response finished") {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                }
+                break;
+            };
             buffer.extend_from_slice(&chunk);
             for payload in crate::responses::drain_sse_data_lines(&mut buffer) {
                 if payload == "[DONE]" {
@@ -840,20 +878,65 @@ async fn proxy_handler_inner(
     let cache_status_label = if cache_enabled { "miss" } else { "off" };
 
     // ---- fairshare admission (per-model pool; group → tenant → key) ----
+    // Admission deliberately precedes the budget reservation below: a request
+    // parked in the queue holds no budget, so a waiter that times out (or
+    // whose client leaves) has nothing to refund, and budgets still fail shut
+    // because nothing is dispatched until the reservation has succeeded.
+    // Requests with no registered route share one pool, so arbitrary model
+    // strings cannot each mint scheduler state.
     let admission_start = crate::tracer::now_ms();
-    let admitted = match state
-        .fairshare
-        .admit(admit_request_for(
+    let pool = if route.is_some() {
+        obleth_fairshare::PoolKey::Model(model.clone())
+    } else {
+        obleth_fairshare::PoolKey::Unrouted
+    };
+    let admit_wait = admission_timeout();
+    let admit = state.fairshare.admit_to(
+        pool,
+        admit_request_for(
             &resolved,
             &model,
             route.as_deref(),
             effective_weight,
             est.total(),
-        ))
-        .await
-    {
-        Some(a) => a,
-        None => {
+        ),
+    );
+    let admitted = match timeout(admit_wait, admit).await {
+        Ok(Some(a)) => a,
+        Err(_) => {
+            if let Some(t) = tracer.take() {
+                t.finish("error");
+            }
+            let queued_ms = (crate::tracer::now_ms() - admission_start) as u32;
+            finalize(
+                &state,
+                request_id,
+                &resolved,
+                &req_meta,
+                &model,
+                Admission::Rejected,
+                est,
+                0,
+                0,
+                queued_ms,
+                0,
+                request_start.elapsed().as_millis() as u32,
+                503,
+                cache_status_label,
+                0.0,
+                crate::energy::EnergyFigures::default(),
+            );
+            let mut resp = error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "timed out waiting for model capacity",
+            );
+            resp.headers_mut().insert(
+                header::RETRY_AFTER,
+                header::HeaderValue::from_static(ADMISSION_RETRY_AFTER_SECS),
+            );
+            return resp;
+        }
+        Ok(None) => {
             if let Some(t) = tracer.take() {
                 t.finish("error");
             }
@@ -889,12 +972,17 @@ async fn proxy_handler_inner(
     let send_bytes = body_bytes;
 
     // ---- token budget reserve + cumulative term gate (atomic, cross-pod) ----
-    // One Redis round trip covers both checks. The term gate (Phase 3: caps on
-    // lifetime/monthly/term usage) runs first inside the script, so a
-    // term-exhausted request never reserves per-minute tokens it has no
-    // completion path to refund.
+    // One Redis round trip per scope covers both checks. The term gate
+    // (Phase 3: caps on lifetime/monthly/term usage) runs first inside the
+    // script, so a term-exhausted request never reserves per-minute tokens it
+    // has no completion path to refund. An admitted request also reserves its
+    // estimated tokens and cost against the term cap, so concurrent requests
+    // cannot all pass the gate on the same headroom; each such reservation is
+    // settled exactly once, through `term_reconcile` at settlement or
+    // `release_term_hold` on a rejection between the two scopes.
     let capacity = resolved.tokens_per_minute.max(0);
     let now = chrono::Utc::now();
+    let est_cost = estimated_cost(est, in_cost_rate, out_cost_rate, modality_cost);
     let term_period = term_period_key(&resolved, now);
     let term_gate = term_period
         .as_deref()
@@ -911,14 +999,28 @@ async fn proxy_handler_inner(
             budget_tokens: resolved.key_budget_tokens,
             budget_cost_usd: resolved.key_budget_cost_usd,
         });
+    // Whether each scope holds a term reservation that settlement must
+    // reconcile. False on the fail-open path: nothing was reserved, so the
+    // settle commits usage with a plain add instead.
+    let mut key_term_held = false;
+    // Releases the key reservation if the request ends (client drop included)
+    // before settlement takes ownership of it.
+    let mut key_hold: Option<PendingTermHold> = None;
+    let mut tenant_term_held = false;
     if let Some(gate) = key_term_gate {
         match state
             .redis
-            .reserve_budget_with_term(&resolved.key_id, 0, 0, est.total(), Some(gate))
+            .reserve_with_term(&resolved.key_id, 0, 0, est.total(), Some(gate), est_cost)
             .instrument(tracing::info_span!("reserve_key_budget"))
             .await
         {
-            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {}
+            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
+                key_term_held = true;
+                key_hold = key_term_period.clone().map(|period| {
+                    PendingTermHold::new(&state, resolved.key_id, period, est, est_cost)
+                });
+            }
+            // Capacity 0 has no per-minute bucket; nothing was reserved.
             Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {}
             Ok(obleth_redis::ReserveOutcome::TermExhausted {
                 used_tokens,
@@ -989,23 +1091,30 @@ async fn proxy_handler_inner(
             }
         }
     }
-    let should_check_budget = capacity > 0 || term_gate.is_some();
+    let tenant_gate_armed = term_gate.is_some();
+    let should_check_budget = capacity > 0 || tenant_gate_armed;
     if should_check_budget {
         match state
             .redis
-            .reserve_budget_with_term(
+            .reserve_with_term(
                 &resolved.tenant_id,
                 capacity,
                 resolved.tokens_per_minute,
                 est.total(),
                 term_gate,
+                est_cost,
             )
             .instrument(tracing::info_span!("reserve_budget"))
             .await
         {
-            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {}
+            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
+                tenant_term_held = tenant_gate_armed;
+            }
             Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {
                 drop(permit);
+                if let Some(hold) = key_hold.take() {
+                    hold.release().await;
+                }
                 finalize(
                     &state,
                     request_id,
@@ -1034,6 +1143,9 @@ async fn proxy_handler_inner(
                 used_cost,
             }) => {
                 drop(permit);
+                if let Some(hold) = key_hold.take() {
+                    hold.release().await;
+                }
                 state.alerts.issue(
                     format!("term_budget_exhausted:{}", resolved.tenant_id),
                     "Tenant term budget exhausted",
@@ -1070,6 +1182,9 @@ async fn proxy_handler_inner(
             Err(e) => {
                 if !state.fail_open {
                     drop(permit);
+                    if let Some(hold) = key_hold.take() {
+                        hold.release().await;
+                    }
                     state.alerts.issue(
                         "redis_budget_reserve_failed_closed",
                         "Redis budget reserve failed",
@@ -1095,6 +1210,42 @@ async fn proxy_handler_inner(
             }
         }
     }
+
+    if let Some(hold) = key_hold.take() {
+        hold.hand_off();
+    }
+
+    // From here on every exit settles through `settle_guard`, so the
+    // per-minute bucket and any term reservation are reconciled exactly once
+    // on every path — including a client that disconnects before upstream
+    // headers arrive, which settles as nothing generated (zero tokens, 499).
+    // Once an upstream answer starts, `arm_estimate` switches that fallback
+    // to the admission estimate.
+    let accounting = StreamAccounting {
+        state: state.clone(),
+        request_id,
+        resolved: resolved.clone(),
+        meta: req_meta.clone(),
+        model: model.clone(),
+        admission,
+        est,
+        queue_wait_ms,
+        request_start,
+        cache_status: cache_status_label.to_string(),
+        capacity,
+        term_period: term_period.clone(),
+        key_term_period: key_term_period.clone(),
+        in_cost_rate,
+        out_cost_rate,
+        modality_cost,
+        energy_slots,
+        holds: TermHolds {
+            tenant: tenant_term_held,
+            key: key_term_held,
+            est_cost,
+        },
+    };
+    let mut settle_guard = accounting.unbilled_guard();
 
     // ---- proxy upstream ----
     // Resolve the per-request timeout and retry policy. Both default to the
@@ -1148,28 +1299,15 @@ async fn proxy_handler_inner(
                     output_tokens,
                 } => {
                     drop(permit);
-                    let accounting = StreamAccounting {
-                        state: state.clone(),
-                        request_id,
-                        resolved: resolved.clone(),
-                        meta: req_meta.clone(),
-                        model: model.clone(),
-                        admission,
-                        est,
-                        queue_wait_ms,
-                        request_start,
-                        cache_status: cache_status_label.to_string(),
-                        capacity,
-                        term_period: term_period.clone(),
-                        key_term_period: key_term_period.clone(),
-                        in_cost_rate,
-                        out_cost_rate,
-                        modality_cost,
-                        energy_slots,
-                    };
                     let total_ms = request_start.elapsed().as_millis() as u32;
-                    accounting
-                        .settle((input_tokens, output_tokens), total_ms, total_ms, 200, None)
+                    let _ = settle_guard
+                        .complete(accounting.settle(
+                            (input_tokens, output_tokens),
+                            total_ms,
+                            total_ms,
+                            200,
+                            None,
+                        ))
                         .await;
                     if let Some(t) = tracer.take() {
                         t.finish("ok");
@@ -1190,26 +1328,7 @@ async fn proxy_handler_inner(
                         });
                 }
                 crate::boons::speculation::Outcome::Stream(driver) => {
-                    let accounting = StreamAccounting {
-                        state: state.clone(),
-                        request_id,
-                        resolved: resolved.clone(),
-                        meta: req_meta.clone(),
-                        model: model.clone(),
-                        admission,
-                        est,
-                        queue_wait_ms,
-                        request_start,
-                        cache_status: cache_status_label.to_string(),
-                        capacity,
-                        term_period: term_period.clone(),
-                        key_term_period: key_term_period.clone(),
-                        in_cost_rate,
-                        out_cost_rate,
-                        modality_cost,
-                        energy_slots,
-                    };
-                    let completion = accounting.cancellation_guard();
+                    accounting.arm_estimate(&mut settle_guard);
                     let body_stream = async_stream::stream! {
                         futures_util::pin_mut!(driver);
                         while let Some(item) = driver.next().await {
@@ -1226,7 +1345,7 @@ async fn proxy_handler_inner(
                             (s.ttft_ms, toks.0, toks.1)
                         };
                         let total_ms = request_start.elapsed().as_millis() as u32;
-                        let _ = completion.complete(accounting.settle(
+                        let _ = settle_guard.complete(accounting.settle(
                             (input_tokens, output_tokens), ttft_ms, total_ms, 200, None,
                         )).await;
                     };
@@ -1267,13 +1386,29 @@ async fn proxy_handler_inner(
     // Multipart bodies cannot be replayed, so they get a single attempt against
     // the first target only.
     let replayable = multipart_fields.is_none();
+    // Streaming chat/completions always ask the upstream for a final usage
+    // chunk, so billing never depends on whether the client happened to set
+    // `stream_options.include_usage`. A client that did not ask for it never
+    // sees it: the pass-through below strips it again.
+    let force_non_streaming = response_plan.is_some() && !stream_tap;
+    let client_include_usage = json
+        .pointer("/stream_options/include_usage")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let inject_usage = replayable
+        && !force_non_streaming
+        && route.is_some()
+        && json.is_object()
+        && json.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
+        && is_stream_usage_path(&path);
+    let strip_usage_chunk = inject_usage && !stream_tap && !client_include_usage;
     let prepared_body: Option<Bytes> = replayable.then(|| {
         prepare_upstream_body(
             route.as_deref(),
             &mut json,
             send_bytes,
-            response_plan.is_some() && !stream_tap,
-            stream_tap,
+            force_non_streaming,
+            stream_tap || inject_usage,
         )
     });
 
@@ -1336,6 +1471,10 @@ async fn proxy_handler_inner(
                 // exactly once; we still handle `None` gracefully instead of
                 // panicking should that invariant ever change.
                 let Some(fields) = multipart_fields.take() else {
+                    let total_ms = request_start.elapsed().as_millis() as u32;
+                    let _ = settle_guard
+                        .complete(accounting.settle_unbilled(0, total_ms, 500))
+                        .await;
                     return error_json(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "multipart request body was already consumed",
@@ -1475,24 +1614,12 @@ async fn proxy_handler_inner(
             } else {
                 (502u16, StatusCode::BAD_GATEWAY)
             };
-            finalize(
-                &state,
-                request_id,
-                &resolved,
-                &req_meta,
-                &model,
-                admission,
-                est,
-                0,
-                0,
-                queue_wait_ms,
-                0,
-                0,
-                code,
-                cache_status_label,
-                0.0,
-                crate::energy::EnergyFigures::default(),
-            );
+            // Nothing was generated: refund the per-minute reservation and
+            // release any term reservation rather than keeping the estimate.
+            let total_ms = request_start.elapsed().as_millis() as u32;
+            let _ = settle_guard
+                .complete(accounting.settle_unbilled(0, total_ms, code))
+                .await;
             let detail = if timed_out {
                 "upstream request timed out"
             } else {
@@ -1573,37 +1700,18 @@ async fn proxy_handler_inner(
             );
         }
 
-        // Mirror the streaming pass-through's accounting for a non-200: usage is
-        // whatever the (error) body reports, falling back to the admission
-        // estimate. Errors are never cached.
-        let (input_tokens, output_tokens) = extract_usage(&String::from_utf8_lossy(&buf))
-            .unwrap_or((est.input_tokens, est.estimated_output_tokens));
+        // A failed upstream call is billed only for the usage its body reports.
+        // With none reported it is billed nothing: the row keeps the status,
+        // the per-minute reservation is refunded, and any term reservation is
+        // released. Errors are never cached.
         let total_ms = request_start.elapsed().as_millis() as u32;
-        settle_request(
-            &state,
-            request_id,
-            &resolved,
-            &req_meta,
-            &model,
-            admission,
-            est,
-            input_tokens,
-            output_tokens,
-            queue_wait_ms,
-            ttft_ms,
-            total_ms,
-            status_code,
-            cache_status_label,
-            capacity,
-            term_period.as_deref(),
-            key_term_period.as_deref(),
-            in_cost_rate,
-            out_cost_rate,
-            modality_cost,
-            energy_slots,
-            None,
-        )
-        .await;
+        let (tokens, billed) = match extract_usage(&String::from_utf8_lossy(&buf)) {
+            Some(tokens) => (tokens, true),
+            None => ((0, 0), false),
+        };
+        let _ = settle_guard
+            .complete(accounting.settle_with(tokens, ttft_ms, total_ms, status_code, None, billed))
+            .await;
         if let Some(t) = tracer.take() {
             t.finish("error");
         }
@@ -1641,6 +1749,10 @@ async fn proxy_handler_inner(
             }),
         );
     }
+
+    // The upstream has answered and is generating: from here a client that
+    // disconnects is billed the estimate, as usage will never be delivered.
+    accounting.arm_estimate(&mut settle_guard);
 
     // Cache only successful responses.
     let store_in_cache = cache_key.clone();
@@ -1690,26 +1802,6 @@ async fn proxy_handler_inner(
                     stats.clone(),
                 );
 
-                let accounting = StreamAccounting {
-                    state: state.clone(),
-                    request_id,
-                    resolved: resolved.clone(),
-                    meta: req_meta.clone(),
-                    model: model.clone(),
-                    admission,
-                    est,
-                    queue_wait_ms,
-                    request_start,
-                    cache_status: cache_status_label.to_string(),
-                    capacity,
-                    term_period: term_period.clone(),
-                    key_term_period: key_term_period.clone(),
-                    in_cost_rate,
-                    out_cost_rate,
-                    modality_cost,
-                    energy_slots,
-                };
-                let completion = accounting.cancellation_guard();
                 let body_stream = async_stream::stream! {
                     futures_util::pin_mut!(driver);
                     while let Some(item) = driver.next().await {
@@ -1730,7 +1822,7 @@ async fn proxy_handler_inner(
                     };
                     let total_ms = request_start.elapsed().as_millis() as u32;
                     accounting.monitor(scan_policy.as_ref(), output_monitor);
-                    let _ = completion.complete(accounting.settle(
+                    let _ = settle_guard.complete(accounting.settle(
                         (input_tokens, output_tokens), ttft_ms, total_ms, status_code, None,
                     )).await;
                 };
@@ -1763,7 +1855,11 @@ async fn proxy_handler_inner(
     // stream. Fail-open: a body that can't be buffered or parsed passes
     // through verbatim. Non-200 responses skip transformation entirely and
     // fall through to the normal pass-through path below.
-    if let Some(plan) = response_plan.filter(|_| status_code == 200) {
+    if let Some(mut plan) = response_plan.filter(|_| status_code == 200) {
+        // Follow-up tool turns pin to the endpoint that served turn 0.
+        if let Some(tool_loop) = plan.tool_loop.as_mut() {
+            tool_loop.served_url = Some(upstream.url().to_string());
+        }
         // Buffer the upstream body, recording TTFT at the first byte for
         // metric continuity with the streaming path.
         let mut buf: Vec<u8> = Vec::new();
@@ -1794,6 +1890,9 @@ async fn proxy_handler_inner(
         // through unchanged (fail-open); only well-formed completions are
         // rewritten.
         let mut warning: Option<&'static str> = None;
+        // Usage the main row settles with when the buffered tool loop replaced
+        // the body (the follow-up turns are billed as helper rows).
+        let mut turn0_usage: Option<(u32, u32)> = None;
         let mut completion: Option<serde_json::Value> = (!truncated
             && buf.len() <= BOON_BUFFER_MAX)
             .then(|| serde_json::from_slice::<serde_json::Value>(&buf).ok())
@@ -1816,6 +1915,7 @@ async fn proxy_handler_inner(
                 )
                 .await;
                 warning = outcome.warning;
+                turn0_usage = outcome.turn0_usage;
                 // guardrails output scan (block/redact action)
                 if let Some(guard_plan) = &plan.guardrails {
                     match crate::boons::guardrails::apply_output(
@@ -1831,6 +1931,22 @@ async fn proxy_handler_inner(
                     {
                         crate::boons::guardrails::ApplyOutputResult::Block(block) => {
                             drop(permit);
+                            // The upstream did generate the blocked answer, so
+                            // the request settles with its real usage even
+                            // though the client only sees the block.
+                            let tokens = turn0_usage
+                                .or_else(|| completion_body_usage(body_json))
+                                .unwrap_or((est.input_tokens, est.estimated_output_tokens));
+                            let total_ms = request_start.elapsed().as_millis() as u32;
+                            let _ = settle_guard
+                                .complete(accounting.settle(
+                                    tokens,
+                                    ttft_ms,
+                                    total_ms,
+                                    block.status.as_u16(),
+                                    None,
+                                ))
+                                .await;
                             if let Some(t) = tracer.take() {
                                 t.finish("error");
                             }
@@ -1863,16 +1979,8 @@ async fn proxy_handler_inner(
         };
         drop(permit);
 
-        let (input_tokens, output_tokens) = completion
-            .as_ref()
-            .and_then(|c| {
-                let input = c.pointer("/usage/prompt_tokens")?.as_u64()? as u32;
-                let output = c
-                    .pointer("/usage/completion_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-                Some((input, output))
-            })
+        let (input_tokens, output_tokens) = turn0_usage
+            .or_else(|| completion.as_ref().and_then(completion_body_usage))
             .unwrap_or((est.input_tokens, est.estimated_output_tokens));
         let total_ms = request_start.elapsed().as_millis() as u32;
 
@@ -1884,35 +1992,19 @@ async fn proxy_handler_inner(
             .then(|| String::from_utf8_lossy(&final_body).into_owned());
         let cache_put = match (&store_in_cache, cache_body) {
             (Some(ck), Some(body)) => {
-                Some((ck.as_str(), cache_ttl, final_content_type.as_str(), body))
+                Some((ck.clone(), cache_ttl, final_content_type.clone(), body))
             }
             _ => None,
         };
-        settle_request(
-            &state,
-            request_id,
-            &resolved,
-            &req_meta,
-            &model,
-            admission,
-            est,
-            input_tokens,
-            output_tokens,
-            queue_wait_ms,
-            ttft_ms,
-            total_ms,
-            status_code,
-            cache_status_label,
-            capacity,
-            term_period.as_deref(),
-            key_term_period.as_deref(),
-            in_cost_rate,
-            out_cost_rate,
-            modality_cost,
-            energy_slots,
-            cache_put,
-        )
-        .await;
+        let _ = settle_guard
+            .complete(accounting.settle(
+                (input_tokens, output_tokens),
+                ttft_ms,
+                total_ms,
+                status_code,
+                cache_put,
+            ))
+            .await;
 
         let mut builder = Response::builder()
             .status(status_code)
@@ -1943,27 +2035,6 @@ async fn proxy_handler_inner(
     }
 
     // ---- stream back, inspecting for actual usage, then reconcile ----
-
-    let accounting = StreamAccounting {
-        state: state.clone(),
-        request_id,
-        resolved: resolved.clone(),
-        meta: req_meta.clone(),
-        model: model.clone(),
-        admission,
-        est,
-        queue_wait_ms,
-        request_start,
-        cache_status: cache_status_label.to_string(),
-        capacity,
-        term_period: term_period.clone(),
-        key_term_period: key_term_period.clone(),
-        in_cost_rate,
-        out_cost_rate,
-        modality_cost,
-        energy_slots,
-    };
-    let completion = accounting.cancellation_guard();
     let body_stream = async_stream::stream! {
         let mut byte_stream = upstream.bytes_stream();
         let mut first = true;
@@ -1971,6 +2042,11 @@ async fn proxy_handler_inner(
         let mut tail: Vec<u8> = Vec::with_capacity(TAIL_CAP.min(4 * 1024));
         let mut full: Vec<u8> = Vec::new();
         let mut cacheable = store_in_cache.is_some();
+        let mut usage_filter = strip_usage_chunk.then(UsageChunkFilter::default);
+        let mut upstream_error: Option<String> = None;
+        // Characters of generated text delivered so far, for billing a stream
+        // the upstream breaks off before reporting usage.
+        let mut streamed_chars: usize = 0;
 
         while let Some(item) = byte_stream.next().await {
             match item {
@@ -1979,7 +2055,17 @@ async fn proxy_handler_inner(
                         ttft_ms = upstream_start.elapsed().as_millis() as u32;
                         first = false;
                     }
+                    // Usage is read from the raw upstream bytes, before the
+                    // gateway-requested usage chunk is filtered out.
                     append_tail(&mut tail, &chunk);
+                    streamed_chars += delta_text_chars(&chunk);
+                    let chunk = match usage_filter.as_mut() {
+                        Some(filter) => filter.push(chunk),
+                        None => chunk,
+                    };
+                    if chunk.is_empty() {
+                        continue;
+                    }
                     if let Some(monitor) = output_monitor.as_mut() { monitor.push(&chunk); }
                     if cacheable {
                         if full.len() + chunk.len() <= CACHE_MAX_BYTES {
@@ -2002,7 +2088,25 @@ async fn proxy_handler_inner(
                         ),
                     );
                     cacheable = false;
+                    upstream_error = Some(e.to_string());
                     break;
+                }
+            }
+        }
+        if upstream_error.is_none() {
+            // A partial trailing event is passed through as received.
+            if let Some(rest) = usage_filter.take().map(UsageChunkFilter::finish) {
+                if !rest.is_empty() {
+                    if let Some(monitor) = output_monitor.as_mut() { monitor.push(&rest); }
+                    if cacheable {
+                        if full.len() + rest.len() <= CACHE_MAX_BYTES {
+                            full.extend_from_slice(&rest);
+                        } else {
+                            cacheable = false;
+                            full = Vec::new();
+                        }
+                    }
+                    yield Ok::<Bytes, std::io::Error>(rest);
                 }
             }
         }
@@ -2014,28 +2118,43 @@ async fn proxy_handler_inner(
         // shrink effective concurrency whenever Redis is slow.
         drop(permit);
 
-        let (input_tokens, output_tokens) = extract_usage(&String::from_utf8_lossy(&tail))
-            .unwrap_or((est.input_tokens, est.estimated_output_tokens));
+        let usage = extract_usage(&String::from_utf8_lossy(&tail));
         let total_ms = request_start.elapsed().as_millis() as u32;
-
-        // store the full response for identical future requests
-        let cache_put = if cacheable && status_code == 200 {
-            store_in_cache.as_deref().map(|ck| {
-                // Take ownership of the buffer instead of copying it; the
-                // lossy re-encode only runs for invalid UTF-8 (never for the
-                // JSON/SSE bodies this cache is meant for).
-                let body = String::from_utf8(std::mem::take(&mut full))
-                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-                (ck.to_string(), cache_ttl, content_type_str.clone(), body)
-            })
-        } else {
-            None
-        };
-
         accounting.monitor(scan_policy.as_ref(), output_monitor);
-        let _ = completion.complete(accounting.settle(
-            (input_tokens, output_tokens), ttft_ms, total_ms, status_code, cache_put,
-        )).await;
+
+        if let Some(err) = upstream_error {
+            // A stream the upstream broke off is a failed call (502), billed
+            // for what reached the client: reported usage, else the streamed
+            // text's estimated tokens; nothing only when nothing streamed.
+            // Settlement is handed off before the error is yielded: the error
+            // makes hyper drop this body, and the guard would otherwise settle
+            // it as a client disconnect.
+            let (tokens, billed) = truncated_stream_billing(usage, streamed_chars, est);
+            let _ = settle_guard.complete(accounting.settle_with(
+                tokens, ttft_ms, total_ms, 502, None, billed,
+            )).await;
+            // An error item aborts the response instead of ending it cleanly,
+            // so the client cannot mistake the truncated body for a whole one.
+            yield Err(std::io::Error::other(format!("upstream stream failed: {err}")));
+        } else {
+            let tokens = usage.unwrap_or((est.input_tokens, est.estimated_output_tokens));
+            // store the full response for identical future requests
+            let cache_put = if cacheable && status_code == 200 {
+                store_in_cache.as_deref().map(|ck| {
+                    // Take ownership of the buffer instead of copying it; the
+                    // lossy re-encode only runs for invalid UTF-8 (never for the
+                    // JSON/SSE bodies this cache is meant for).
+                    let body = String::from_utf8(std::mem::take(&mut full))
+                        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                    (ck.to_string(), cache_ttl, content_type_str.clone(), body)
+                })
+            } else {
+                None
+            };
+            let _ = settle_guard.complete(accounting.settle(
+                tokens, ttft_ms, total_ms, status_code, cache_put,
+            )).await;
+        }
     };
 
     let mut builder = Response::builder().status(status_code);
@@ -2054,27 +2173,362 @@ async fn proxy_handler_inner(
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
 }
 
+/// Above this much held, unterminated buffer, [`UsageChunkFilter`] gives up
+/// waiting for an SSE blank-line terminator and flushes what it has. An
+/// upstream that never emits one (non-compliant, or a non-SSE error body)
+/// would otherwise hold the whole stream indefinitely.
+const USAGE_FILTER_MAX_PENDING: usize = 64 * 1024;
+
+/// Drops the usage-only SSE event the gateway asked the upstream for on a
+/// client's behalf (see `prepare_upstream_body`), passing every other event
+/// through byte-for-byte. Complete events are released as soon as their
+/// terminating blank line arrives, so it adds no latency to a live stream.
+#[derive(Default)]
+struct UsageChunkFilter {
+    pending: Vec<u8>,
+    /// Set once the cap has been hit, so the fallback is logged only once
+    /// per stream rather than on every subsequent chunk.
+    overflowed: bool,
+}
+
+impl UsageChunkFilter {
+    fn push(&mut self, chunk: Bytes) -> Bytes {
+        // Common case: a chunk of whole events with no usage in it.
+        if self.pending.is_empty()
+            && (chunk.ends_with(b"\n\n") || chunk.ends_with(b"\r\n\r\n"))
+            && find_bytes(&chunk, b"prompt_tokens").is_none()
+        {
+            return chunk;
+        }
+        self.pending.extend_from_slice(&chunk);
+        let mut out = Vec::with_capacity(self.pending.len());
+        while let Some(end) = sse_event_end(&self.pending) {
+            let event: Vec<u8> = self.pending.drain(..end).collect();
+            if !is_usage_only_event(&event) {
+                out.extend_from_slice(&event);
+            }
+        }
+        // No event boundary showed up and the buffer has grown past the cap:
+        // stop holding it hostage. The client may then see the injected usage
+        // chunk verbatim, which is acceptable next to holding the stream.
+        if self.pending.len() > USAGE_FILTER_MAX_PENDING {
+            if !self.overflowed {
+                self.overflowed = true;
+                tracing::debug!(
+                    pending_bytes = self.pending.len(),
+                    "usage-chunk filter buffer exceeded cap; flushing unfiltered"
+                );
+            }
+            out.extend_from_slice(&self.pending);
+            self.pending.clear();
+        }
+        Bytes::from(out)
+    }
+
+    fn finish(self) -> Bytes {
+        Bytes::from(self.pending)
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Index just past the first SSE event terminator (a blank line).
+fn sse_event_end(buf: &[u8]) -> Option<usize> {
+    let lf = find_bytes(buf, b"\n\n").map(|i| i + 2);
+    let crlf = find_bytes(buf, b"\r\n\r\n").map(|i| i + 4);
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// An event carrying only usage: a `usage` object and no choices. Content
+/// chunks that also carry usage (continuous usage stats) are not dropped.
+fn is_usage_only_event(event: &[u8]) -> bool {
+    if find_bytes(event, b"prompt_tokens").is_none() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(event);
+    let payload = text
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("data:"))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+        return false;
+    };
+    let has_usage = value.get("usage").is_some_and(serde_json::Value::is_object);
+    let no_choices = match value.get("choices") {
+        None => true,
+        Some(c) => c.as_array().is_some_and(|a| a.is_empty()),
+    };
+    has_usage && no_choices
+}
+
+/// Which term reservations a request holds, and the cost estimate they were
+/// made with; settlement must release exactly these.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TermHolds {
+    pub(crate) tenant: bool,
+    pub(crate) key: bool,
+    pub(crate) est_cost: f64,
+}
+
+/// Admission-time cost estimate, priced the same way settlement prices
+/// actual usage, so a term reservation and its reconcile agree.
+pub(crate) fn estimated_cost(
+    est: CostEstimate,
+    in_rate: f64,
+    out_rate: f64,
+    modality_cost: f64,
+) -> f64 {
+    (est.input_tokens as f64) * in_rate
+        + (est.estimated_output_tokens as f64) * out_rate
+        + modality_cost
+}
+
+/// Frozen `(cost_usd, energy)` for a settled request. Energy is wall-time
+/// slot-share, so a request that held a slot is charged it even when it
+/// produced nothing billable; only the token-priced cost is waived then.
+fn settled_figures(
+    energy: &crate::energy::EnergyEngine,
+    billed: bool,
+    tokens: (u32, u32),
+    rates: (f64, f64, f64),
+    energy_slots: i64,
+    total_ms: u32,
+    queue_wait_ms: u32,
+) -> (f64, crate::energy::EnergyFigures) {
+    let (in_rate, out_rate, modality_cost) = rates;
+    let cost_usd = if billed {
+        (tokens.0 as f64) * in_rate + (tokens.1 as f64) * out_rate + modality_cost
+    } else {
+        0.0
+    };
+    (
+        cost_usd,
+        energy.compute(energy_slots, total_ms, queue_wait_ms),
+    )
+}
+
+/// A key-scope term reservation made before the tenant step, not yet owned by
+/// the settlement guard. If the request ends while it is armed (a tenant
+/// rejection that forgot it, or the client leaving mid-await), `Drop` releases
+/// it in the background so it cannot block headroom until the TTL lapses.
+pub(crate) struct PendingTermHold {
+    state: AppState,
+    scope: Uuid,
+    period: String,
+    est: CostEstimate,
+    est_cost: f64,
+    armed: bool,
+}
+
+impl PendingTermHold {
+    pub(crate) fn new(
+        state: &AppState,
+        scope: Uuid,
+        period: String,
+        est: CostEstimate,
+        est_cost: f64,
+    ) -> Self {
+        Self {
+            state: state.clone(),
+            scope,
+            period,
+            est,
+            est_cost,
+            armed: true,
+        }
+    }
+
+    /// Release now. The release runs as its own task, so cancelling this
+    /// await neither loses it nor lets `Drop` run it a second time.
+    pub(crate) async fn release(mut self) {
+        self.armed = false;
+        let _ = tokio::spawn(self.release_task()).await;
+    }
+
+    /// Settlement now owns the reservation.
+    pub(crate) fn hand_off(mut self) {
+        self.armed = false;
+    }
+
+    fn release_task(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let (state, scope, period, est, est_cost) = (
+            self.state.clone(),
+            self.scope,
+            self.period.clone(),
+            self.est,
+            self.est_cost,
+        );
+        async move { release_term_hold(&state, &scope, Some(&period), est, est_cost).await }
+    }
+}
+
+impl Drop for PendingTermHold {
+    fn drop(&mut self) {
+        if self.armed {
+            tokio::spawn(self.release_task());
+        }
+    }
+}
+
+/// Release a term reservation for a request that will never settle (it was
+/// rejected by a later admission step). Best effort: a failure only leaves
+/// the reservation to lapse with its key's TTL.
+async fn release_term_hold(
+    state: &AppState,
+    scope: &Uuid,
+    period: Option<&str>,
+    est: CostEstimate,
+    est_cost: f64,
+) {
+    let Some(period) = period else {
+        return;
+    };
+    if let Err(e) = state
+        .redis
+        .term_reconcile(
+            &scope.to_string(),
+            period,
+            est.total() as i64,
+            est_cost,
+            0,
+            0.0,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "term reservation release failed");
+    }
+}
+
+/// Tokens and billing for a stream the upstream broke off. Reported usage
+/// wins; otherwise the text already delivered is estimated the way the
+/// admission estimator counts text (`HeuristicTokenizer::count_text`,
+/// ~4 characters per token) on top of the prompt estimate. Nothing streamed
+/// means nothing generated, so it is unbilled.
+fn truncated_stream_billing(
+    usage: Option<(u32, u32)>,
+    streamed_chars: usize,
+    est: CostEstimate,
+) -> ((u32, u32), bool) {
+    if let Some(tokens) = usage {
+        return (tokens, true);
+    }
+    if streamed_chars == 0 {
+        return ((0, 0), false);
+    }
+    let output = u32::try_from(streamed_chars / 4).unwrap_or(u32::MAX).max(1);
+    ((est.input_tokens, output), true)
+}
+
+/// Characters of generated text in one raw response chunk: the string values
+/// of `content`, `reasoning_content`, `reasoning` and `text` fields. A byte
+/// scan rather than a JSON parse so it can run on every streamed chunk; a
+/// string split across two chunks is only partly counted, which errs low.
+///
+/// Some upstreams mirror the same reasoning text under both
+/// `reasoning_content` and `reasoning` in one delta; counting both would
+/// double the estimate, so `reasoning` is only counted when the chunk has no
+/// `reasoning_content` text of its own.
+fn delta_text_chars(chunk: &[u8]) -> usize {
+    let content = field_text_chars(chunk, b"\"content\"");
+    let reasoning_content = field_text_chars(chunk, b"\"reasoning_content\"");
+    let reasoning = if reasoning_content > 0 {
+        0
+    } else {
+        field_text_chars(chunk, b"\"reasoning\"")
+    };
+    let text = field_text_chars(chunk, b"\"text\"");
+    content + reasoning_content + reasoning + text
+}
+
+/// Characters in every string value that follows `key` in the chunk.
+fn field_text_chars(chunk: &[u8], key: &[u8]) -> usize {
+    let skip_spaces = |mut i: usize| {
+        while i < chunk.len() && chunk[i] == b' ' {
+            i += 1;
+        }
+        i
+    };
+    let mut total = 0;
+    let mut from = 0;
+    while let Some(at) = find_bytes(&chunk[from..], key) {
+        let mut i = skip_spaces(from + at + key.len());
+        if i >= chunk.len() || chunk[i] != b':' {
+            from = i;
+            continue;
+        }
+        i = skip_spaces(i + 1);
+        if i >= chunk.len() || chunk[i] != b'"' {
+            // `null` or a non-string value.
+            from = i;
+            continue;
+        }
+        i += 1;
+        while i < chunk.len() {
+            match chunk[i] {
+                b'"' => {
+                    i += 1;
+                    break;
+                }
+                b'\\' => {
+                    total += 1;
+                    i += if chunk.get(i + 1) == Some(&b'u') {
+                        6
+                    } else {
+                        2
+                    };
+                }
+                // UTF-8 continuation bytes belong to the character before.
+                b if b & 0xC0 == 0x80 => i += 1,
+                _ => {
+                    total += 1;
+                    i += 1;
+                }
+            }
+        }
+        from = i.min(chunk.len());
+    }
+    total
+}
+
+/// Usage a buffered chat completion reports, if any.
+fn completion_body_usage(body: &serde_json::Value) -> Option<(u32, u32)> {
+    let input = body.pointer("/usage/prompt_tokens")?.as_u64()? as u32;
+    let output = body
+        .pointer("/usage/completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    Some((input, output))
+}
+
 /// Owned admission snapshot: cancellation bookkeeping must not borrow the body
 /// that is being dropped. Prices and periods are the same as normal settlement.
 #[derive(Clone)]
-struct StreamAccounting {
-    state: AppState,
-    request_id: Uuid,
-    resolved: Arc<ResolvedKey>,
-    meta: RequestMeta,
-    model: String,
-    admission: Admission,
-    est: CostEstimate,
-    queue_wait_ms: u32,
-    request_start: Instant,
-    cache_status: String,
-    capacity: i64,
-    term_period: Option<String>,
-    key_term_period: Option<String>,
-    in_cost_rate: f64,
-    out_cost_rate: f64,
-    modality_cost: f64,
-    energy_slots: i64,
+pub(crate) struct StreamAccounting {
+    pub(crate) state: AppState,
+    pub(crate) request_id: Uuid,
+    pub(crate) resolved: Arc<ResolvedKey>,
+    pub(crate) meta: RequestMeta,
+    pub(crate) model: String,
+    pub(crate) admission: Admission,
+    pub(crate) est: CostEstimate,
+    pub(crate) queue_wait_ms: u32,
+    pub(crate) request_start: Instant,
+    pub(crate) cache_status: String,
+    pub(crate) capacity: i64,
+    pub(crate) term_period: Option<String>,
+    pub(crate) key_term_period: Option<String>,
+    pub(crate) in_cost_rate: f64,
+    pub(crate) out_cost_rate: f64,
+    pub(crate) modality_cost: f64,
+    pub(crate) energy_slots: i64,
+    pub(crate) holds: TermHolds,
 }
 
 impl StreamAccounting {
@@ -2101,22 +2555,34 @@ impl StreamAccounting {
         }
     }
 
-    fn cancellation_guard(&self) -> crate::completion::CompletionGuard {
+    /// Cancellation fallback settling as status 499. `tokens` is `None` before
+    /// the upstream has answered (nothing generated, billed nothing) and the
+    /// estimate afterwards. Runtime shutdown remains best-effort, just like
+    /// the asynchronous telemetry sink; a partial answer is never cached.
+    fn on_cancel(&self, tokens: Option<(u32, u32)>) -> impl FnOnce() + Send + 'static {
         let accounting = self.clone();
-        crate::completion::CompletionGuard::new(move || {
-            let tokens = (
-                accounting.est.input_tokens,
-                accounting.est.estimated_output_tokens,
-            );
+        move || {
             let elapsed = accounting.request_start.elapsed().as_millis() as u32;
-            // No final usage was delivered. Keep the estimate explicit through
-            // status 499; never cache a partial answer. Runtime shutdown remains
-            // best-effort, just like the existing asynchronous telemetry sink.
-            tokio::spawn(accounting.settle(tokens, 0, elapsed, 499, None));
-        })
+            let (tokens, billed) = match tokens {
+                Some(tokens) => (tokens, true),
+                None => ((0, 0), false),
+            };
+            tokio::spawn(accounting.settle_with(tokens, 0, elapsed, 499, None, billed));
+        }
     }
 
-    async fn settle(
+    pub(crate) fn unbilled_guard(&self) -> crate::completion::CompletionGuard {
+        crate::completion::CompletionGuard::new(self.on_cancel(None))
+    }
+
+    fn arm_estimate(&self, guard: &mut crate::completion::CompletionGuard) {
+        guard.rearm(self.on_cancel(Some((
+            self.est.input_tokens,
+            self.est.estimated_output_tokens,
+        ))));
+    }
+
+    pub(crate) async fn settle(
         self,
         tokens: (u32, u32),
         ttft_ms: u32,
@@ -2124,9 +2590,29 @@ impl StreamAccounting {
         status_code: u16,
         cache_put: Option<(String, i64, String, String)>,
     ) {
+        self.settle_with(tokens, ttft_ms, total_ms, status_code, cache_put, true)
+            .await;
+    }
+
+    /// Settle a request that produced nothing billable: zero tokens and
+    /// cost, full refund of every reservation (energy is still charged).
+    pub(crate) async fn settle_unbilled(self, ttft_ms: u32, total_ms: u32, status_code: u16) {
+        self.settle_with((0, 0), ttft_ms, total_ms, status_code, None, false)
+            .await;
+    }
+
+    async fn settle_with(
+        self,
+        tokens: (u32, u32),
+        ttft_ms: u32,
+        total_ms: u32,
+        status_code: u16,
+        cache_put: Option<(String, i64, String, String)>,
+        billed: bool,
+    ) {
         let cache_enabled = cache_put.is_some();
         let (key, ttl, content_type, body) = cache_put.unwrap_or_default();
-        settle_request(
+        settle_inner(
             &self.state,
             self.request_id,
             &self.resolved,
@@ -2149,6 +2635,8 @@ impl StreamAccounting {
             self.modality_cost,
             self.energy_slots,
             cache_enabled.then_some((key.as_str(), ttl, content_type.as_str(), body)),
+            self.holds,
+            billed,
         )
         .await;
     }
@@ -2161,8 +2649,14 @@ impl StreamAccounting {
 /// `cache_put` carries `(key, ttl, content_type, body)` when the response
 /// should be stored for identical future requests; callers gate it on a
 /// successful (200) response.
+///
+/// `holds` names the term reservations made at admission, which are
+/// reconciled (released, actual committed) rather than added to. `billed =
+/// false` settles a request that produced nothing billable: tokens and cost
+/// are frozen at zero (energy is still charged) and the reservations are
+/// fully refunded.
 #[allow(clippy::too_many_arguments)]
-pub(crate) async fn settle_request(
+async fn settle_inner(
     state: &AppState,
     request_id: Uuid,
     resolved: &ResolvedKey,
@@ -2185,6 +2679,8 @@ pub(crate) async fn settle_request(
     modality_cost: f64,
     energy_slots: i64,
     cache_put: Option<(&str, i64, &str, String)>,
+    holds: TermHolds,
+    billed: bool,
 ) {
     // Feed the router's per-request cost estimate: one EWMA sample of how
     // long this model's answers actually run. Successful requests only — an
@@ -2246,20 +2742,40 @@ pub(crate) async fn settle_request(
     // Frozen request cost: per-token rates (captured at admission) plus any
     // per-request modality surcharge. Computed once and used for both the
     // term-budget commit and the persisted usage ledger so they agree.
-    let cost_usd = (input_tokens as f64) * in_cost_rate
-        + (output_tokens as f64) * out_cost_rate
-        + modality_cost;
     // Frozen energy figures: slot-share of live cluster power over serving
     // time (queue wait excluded). Zeros when accounting is off. Frozen like
     // `cost_usd` so later settings edits never rewrite history.
-    let energy = state.energy.compute(energy_slots, total_ms, queue_wait_ms);
+    let (cost_usd, energy) = settled_figures(
+        &state.energy,
+        billed,
+        (input_tokens, output_tokens),
+        (in_cost_rate, out_cost_rate, modality_cost),
+        energy_slots,
+        total_ms,
+        queue_wait_ms,
+    );
+    let added = input_tokens.saturating_add(output_tokens) as i64;
+    let est_tokens = est.total() as i64;
     if let Some(period) = term_period {
-        let added = input_tokens.saturating_add(output_tokens) as i64;
-        match state
-            .redis
-            .term_usage_add(&resolved.tenant_id, period, added, cost_usd)
-            .await
-        {
+        let committed = if holds.tenant {
+            state
+                .redis
+                .term_reconcile(
+                    &resolved.tenant_id.to_string(),
+                    period,
+                    est_tokens,
+                    holds.est_cost,
+                    added,
+                    cost_usd,
+                )
+                .await
+        } else {
+            state
+                .redis
+                .term_usage_add(&resolved.tenant_id, period, added, cost_usd)
+                .await
+        };
+        match committed {
             Ok((total_tokens, total_cost)) => {
                 maybe_alert_budget(state, resolved, total_tokens, total_cost);
             }
@@ -2274,12 +2790,25 @@ pub(crate) async fn settle_request(
         }
     }
     if let Some(period) = key_term_period {
-        let added = input_tokens.saturating_add(output_tokens) as i64;
-        match state
-            .redis
-            .term_usage_add(&resolved.key_id, period, added, cost_usd)
-            .await
-        {
+        let committed = if holds.key {
+            state
+                .redis
+                .term_reconcile(
+                    &resolved.key_id.to_string(),
+                    period,
+                    est_tokens,
+                    holds.est_cost,
+                    added,
+                    cost_usd,
+                )
+                .await
+        } else {
+            state
+                .redis
+                .term_usage_add(&resolved.key_id, period, added, cost_usd)
+                .await
+        };
+        match committed {
             Ok((total_tokens, total_cost)) => {
                 maybe_alert_key_budget(state, resolved, total_tokens, total_cost);
             }
@@ -2319,13 +2848,10 @@ pub(crate) async fn settle_request(
 }
 
 /// Resolve a key via moka, falling back to Redis and caching the result.
+/// Distinguishes a Redis error from a miss so callers can fail closed on the
+/// former (503, backend unavailable) rather than reading it as an unknown
+/// credential (401) -- see `jwt_auth::authenticate_credential`.
 #[tracing::instrument(skip_all, name = "auth_resolve")]
-pub(crate) async fn resolve_key(state: &AppState, hash: &str) -> Option<Arc<ResolvedKey>> {
-    try_resolve_key(state, hash).await.unwrap_or(None)
-}
-
-/// Like [`resolve_key`], but distinguishes a Redis error from a miss so callers
-/// that would otherwise treat "unknown" as "first sight" can fail closed instead.
 pub(crate) async fn try_resolve_key(
     state: &AppState,
     hash: &str,
@@ -2756,6 +3282,35 @@ fn maybe_alert_key_budget(
 /// (litellm `openai`, vLLM `vllm`, llama.cpp `llamacpp`, Ollama `library`, …),
 /// so a wildcard passthrough is never dressed up as a registered route.
 async fn models_list_response(state: &AppState) -> Response<Body> {
+    // One entry per default base (one per process in practice). `get_with`
+    // also coalesces concurrent misses into a single upstream fan-out.
+    static LISTING: std::sync::OnceLock<moka::future::Cache<String, Bytes>> =
+        std::sync::OnceLock::new();
+    let cache = LISTING.get_or_init(|| {
+        moka::future::Cache::builder()
+            .max_capacity(16)
+            .time_to_live(MODELS_LIST_TTL)
+            .build()
+    });
+    // A listing missing an unreachable upstream is served but not cached, so
+    // the gap does not outlive the outage by a TTL.
+    let body = match cache
+        .try_get_with(state.upstream_base.clone(), build_models_list(state))
+        .await
+    {
+        Ok(body) => body,
+        Err(partial) => (*partial).clone(),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+}
+
+/// The merged, canonicalized model listing as serialized JSON. `Err` carries
+/// the listing when any upstream could not be read.
+async fn build_models_list(state: &AppState) -> Result<Bytes, Bytes> {
     let candidates = state.model_registry.load();
 
     // Each registered model's effective upstream target(s), paired with the key
@@ -2802,10 +3357,18 @@ async fn models_list_response(state: &AppState) -> Response<Body> {
             .map(|(base, key)| fetch_upstream_models(state, base, key.as_deref())),
     )
     .await;
+    let complete = results.iter().all(Option::is_some);
 
-    let mut merged = merge_upstream_models(results);
+    let mut merged = merge_upstream_models(results.into_iter().flatten());
     canonicalize_models(&mut merged, &model_facts_index(&candidates));
-    (StatusCode::OK, axum::Json(merged)).into_response()
+    let body = serde_json::to_vec(&merged)
+        .map(Bytes::from)
+        .unwrap_or_else(|_| Bytes::from_static(br#"{"object":"list","data":[]}"#));
+    if complete {
+        Ok(body)
+    } else {
+        Err(body)
+    }
 }
 
 /// What the gateway knows about one registered route, as the discovery
@@ -2980,7 +3543,7 @@ async fn fetch_upstream_models(
     state: &AppState,
     base: &str,
     api_key: Option<&str>,
-) -> Vec<serde_json::Value> {
+) -> Option<Vec<serde_json::Value>> {
     async fn fetch_one(
         state: &AppState,
         url: &str,
@@ -3006,10 +3569,10 @@ async fn fetch_upstream_models(
     let url = build_upstream_url(base, "/v1/models", "");
     for candidate in obleth_config::catalog_url_variants(&url) {
         if let Some(entries) = fetch_one(state, &candidate, api_key).await {
-            return entries;
+            return Some(entries);
         }
     }
-    Vec::new()
+    None
 }
 
 /// True for the model-listing collection itself, in either spelling. The
@@ -3290,10 +3853,11 @@ fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value
 /// client body — so streaming and non-streaming clients keep distinct cache
 /// entries holding the representation each actually receives (JSON vs SSE).
 ///
-/// `stream_with_usage` is set for the streaming tool loop's turn-0 dispatch:
-/// the upstream stays streaming but is asked to include a final usage chunk so
-/// turn-0 tokens are billed exactly instead of estimated. (`tool_stream`
-/// captures that usage but never forwards it to the client unless the client
+/// `stream_with_usage` is set for every streaming chat/completions dispatch
+/// (including the streaming tool loop's turn 0): the upstream stays streaming
+/// but is asked to include a final usage chunk so tokens are billed exactly
+/// instead of estimated. Other `stream_options` the client sent are kept.
+/// (`tool_stream` and the pass-through strip that chunk unless the client
 /// itself asked for usage.) The two flags are mutually exclusive.
 fn prepare_upstream_body(
     route: Option<&ResolvedModel>,
@@ -3317,10 +3881,13 @@ fn prepare_upstream_body(
         obj.remove("stream_options");
     } else if stream_with_usage {
         obj.insert("stream".into(), serde_json::Value::Bool(true));
-        obj.insert(
-            "stream_options".into(),
-            serde_json::json!({ "include_usage": true }),
-        );
+        let options = obj
+            .entry("stream_options")
+            .or_insert_with(|| serde_json::json!({}));
+        if !options.is_object() {
+            *options = serde_json::json!({});
+        }
+        options["include_usage"] = serde_json::Value::Bool(true);
     }
     serde_json::to_vec(&*json).map(Bytes::from).unwrap_or(body)
 }
@@ -3708,6 +4275,11 @@ fn is_chat_path(path: &str) -> bool {
     request_type_for_path(path) == "chat"
 }
 
+/// Endpoints whose streams honour `stream_options.include_usage`.
+fn is_stream_usage_path(path: &str) -> bool {
+    matches!(request_type_for_path(path), "chat" | "completion")
+}
+
 /// Provenance of a resolved conversation id.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SessionSource {
@@ -3935,6 +4507,10 @@ fn cached_response(cached: obleth_config::CachedResponse, request_id: Uuid) -> R
 /// endpoints (e.g. `/v1/verdicts`): key disabled, tenant lifecycle status,
 /// the activation/expiry/weekly schedule window, and the near-expiry operator
 /// alert. Internal probe keys bypass tenant lifecycle gating.
+// The error is the finished response every caller returns as-is
+// (`return resp`); boxing it would push a deref into each call site for a
+// rejection path that is cold anyway.
+#[allow(clippy::result_large_err)]
 pub(crate) fn gate_resolved_key(
     state: &AppState,
     resolved: &ResolvedKey,
@@ -3951,8 +4527,11 @@ pub(crate) fn gate_resolved_key(
         if let Err(reason) = tenant_active_now(resolved, now) {
             return Err(error_json(StatusCode::FORBIDDEN, reason));
         }
-        // Phase 5: warn operators when a tenant is within 72h of expiry.
-        if let Some(until) = resolved.active_until {
+        // Phase 5: warn operators when a tenant is within 72h of expiry. This
+        // runs on every request in that window, so the alert text is only
+        // formatted when a channel could deliver it; repeats are then
+        // deduplicated by the dispatcher's per-key cooldown.
+        if let Some(until) = resolved.active_until.filter(|_| state.alerts.enabled()) {
             let remaining = until - now;
             if remaining > chrono::Duration::zero() && remaining <= chrono::Duration::hours(72) {
                 state.alerts.issue(
@@ -4552,7 +5131,7 @@ mod tests {
         }
         // An unclaimed id still has no entry, so the request falls through to
         // the upstream passthrough rather than being answered with a guess.
-        assert!(index.get("wildcard-passthrough").is_none());
+        assert!(!index.contains_key("wildcard-passthrough"));
     }
 
     #[test]
@@ -4746,6 +5325,30 @@ mod tests {
         let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(sent["stream"], true);
         assert_eq!(sent["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn prepare_upstream_body_requests_usage_and_keeps_client_stream_options() {
+        // Every streaming chat call asks for usage, so billing never depends
+        // on the client's `include_usage`; the client's other options survive.
+        let model = model_with(Vec::new());
+        let mut json = serde_json::json!({
+            "model": "client-name",
+            "stream": true,
+            "stream_options": { "continuous_usage_stats": false },
+            "messages": []
+        });
+        let body = prepare_upstream_body(
+            Some(&model),
+            &mut json,
+            axum::body::Bytes::new(),
+            false,
+            true,
+        );
+        let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["stream_options"]["include_usage"], true);
+        assert_eq!(sent["stream_options"]["continuous_usage_stats"], false);
     }
 
     #[test]
@@ -5201,5 +5804,311 @@ mod tests {
         assert_eq!(req.tenant_max_in_flight, None);
         assert_eq!(req.key_max_in_flight, None);
         assert_eq!(req.model_max_in_flight, None);
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    /// Source with all whitespace removed, so pins survive reformatting.
+    fn squash(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// `proxy_handler_inner`'s source, for ordering pins (there is no
+    /// AppState harness in this crate: it needs live Redis and ClickHouse).
+    fn handler() -> &'static str {
+        let src = include_str!("proxy.rs");
+        let src = &src[..src.find("\nmod tests {").expect("the test module")];
+        let start = src
+            .find("async fn proxy_handler_inner(")
+            .expect("proxy_handler_inner");
+        let end = start
+            + src[start..]
+                .find("\n/// Drops the usage-only SSE event")
+                .expect("end of the handler");
+        &src[start..end]
+    }
+
+    #[test]
+    fn admission_precedes_the_budget_reservation() {
+        let h = handler();
+        let admit = h.find(".admit_to(").expect("admission");
+        let reserve = h.find(".reserve_with_term(").expect("reservation");
+        assert!(admit < reserve, "a queued request must hold no budget");
+        assert!(h[admit..reserve].contains("timeout(admit_wait"));
+    }
+
+    #[test]
+    fn every_exit_after_the_reservation_settles_through_the_guard() {
+        let h = handler();
+        let guard = h
+            .find("let mut settle_guard = accounting.unbilled_guard();")
+            .expect("guard");
+        let dispatch = h.find("// ---- proxy upstream ----").expect("dispatch");
+        assert!(guard < dispatch, "the guard must exist before dispatch");
+        let after = &h[guard..];
+        for bypass in ["finalize(", "settle_request(", "cancellation_guard("] {
+            assert!(
+                !after.contains(bypass),
+                "`{bypass}` after the reservation skips the guarded settlement"
+            );
+        }
+        // The fallback switches to the estimate only once the upstream answered
+        // successfully, i.e. after the error branch returned.
+        let flat = squash(after);
+        let error_branch = flat.find("ifstatus_code>=400{").expect("error branch");
+        let armed = flat.find("accounting.arm_estimate(&mutsettle_guard);//Cacheonly");
+        assert!(armed.is_some_and(|a| a > error_branch));
+    }
+
+    #[test]
+    fn a_rejection_between_the_two_scopes_releases_the_key_hold() {
+        let flat = squash(handler());
+        let key = flat
+            .find(".reserve_with_term(&resolved.key_id,")
+            .expect("key reserve");
+        let tenant = flat
+            .find(".reserve_with_term(&resolved.tenant_id,")
+            .expect("tenant reserve");
+        let proceed = flat
+            .find("letaccounting=StreamAccounting{")
+            .expect("accounting");
+        assert!(key < tenant);
+        let releases = flat[tenant..proceed]
+            .matches("hold.release().await")
+            .count();
+        // Rate limited, term exhausted, and fail-closed error.
+        assert_eq!(releases, 3);
+        // Success hands the hold to settlement before the guard exists.
+        assert!(flat[tenant..proceed].contains("hold.hand_off()"));
+    }
+
+    #[test]
+    fn a_dropped_pending_hold_is_released_but_a_handed_off_one_is_not() {
+        let full = include_str!("proxy.rs");
+        let src = squash(&full[..full.find("\nmod tests {").expect("the test module")]);
+        let drop_impl = src
+            .find("implDropforPendingTermHold{fndrop(&mutself){ifself.armed{tokio::spawn(self.release_task());")
+            .is_some();
+        assert!(drop_impl, "an armed hold must release itself on drop");
+        assert!(src.contains("fnhand_off(mutself){self.armed=false;}"));
+    }
+
+    #[test]
+    fn admission_timeout_defaults_and_parses() {
+        assert_eq!(parse_admission_timeout(None), DEFAULT_ADMISSION_TIMEOUT);
+        assert_eq!(
+            parse_admission_timeout(Some("abc")),
+            DEFAULT_ADMISSION_TIMEOUT
+        );
+        assert_eq!(
+            parse_admission_timeout(Some("0")),
+            DEFAULT_ADMISSION_TIMEOUT
+        );
+        assert_eq!(
+            parse_admission_timeout(Some(" 12 ")),
+            Duration::from_secs(12)
+        );
+    }
+
+    #[test]
+    fn estimated_cost_prices_the_estimate_like_settlement_prices_usage() {
+        let est = CostEstimate {
+            input_tokens: 100,
+            estimated_output_tokens: 50,
+        };
+        let cost = estimated_cost(est, 0.01, 0.02, 0.5);
+        assert!((cost - (1.0 + 1.0 + 0.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stream_usage_is_requested_only_where_upstreams_honour_it() {
+        assert!(is_stream_usage_path("/v1/chat/completions"));
+        assert!(is_stream_usage_path("/v1/completions"));
+        assert!(!is_stream_usage_path("/v1/embeddings"));
+        assert!(!is_stream_usage_path("/v1/audio/transcriptions"));
+    }
+
+    fn sse(v: serde_json::Value) -> String {
+        format!("data: {v}\n\n")
+    }
+
+    fn content_event(text: &str) -> String {
+        sse(serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "content": text } }],
+            "usage": null,
+        }))
+    }
+
+    fn usage_event() -> String {
+        sse(serde_json::json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10 },
+        }))
+    }
+
+    fn run_filter(chunks: &[&[u8]]) -> String {
+        let mut filter = UsageChunkFilter::default();
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend_from_slice(&filter.push(Bytes::copy_from_slice(c)));
+        }
+        out.extend_from_slice(&filter.finish());
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn the_injected_usage_chunk_is_stripped_and_content_passes_verbatim() {
+        let a = content_event("Hel");
+        let b = content_event("lo");
+        let u = usage_event();
+        let done = "data: [DONE]\n\n";
+        let out = run_filter(&[a.as_bytes(), b.as_bytes(), u.as_bytes(), done.as_bytes()]);
+        assert_eq!(out, format!("{a}{b}{done}"));
+    }
+
+    #[test]
+    fn usage_split_across_chunks_is_still_stripped() {
+        let a = content_event("hi");
+        let u = usage_event();
+        let done = "data: [DONE]\n\n";
+        let joined = format!("{a}{u}{done}");
+        let bytes = joined.as_bytes();
+        // Split inside the usage event and inside the blank-line terminator.
+        let cut1 = a.len() + 20;
+        let cut2 = a.len() + u.len() - 1;
+        let out = run_filter(&[&bytes[..cut1], &bytes[cut1..cut2], &bytes[cut2..]]);
+        assert_eq!(out, format!("{a}{done}"));
+        // CRLF-framed streams too.
+        let crlf = joined.replace("\n\n", "\r\n\r\n");
+        assert_eq!(
+            run_filter(&[crlf.as_bytes()]),
+            format!("{a}{done}").replace("\n\n", "\r\n\r\n")
+        );
+    }
+
+    #[test]
+    fn a_body_past_the_cap_with_no_event_boundary_is_flushed_unfiltered() {
+        // A non-SSE (or non-compliant) body that never sends a blank-line
+        // terminator must not be held for the life of the stream once it
+        // exceeds the cap.
+        let body = vec![b'x'; USAGE_FILTER_MAX_PENDING + 1];
+        let mut filter = UsageChunkFilter::default();
+        let out = filter.push(Bytes::copy_from_slice(&body));
+        assert_eq!(out.as_ref(), body.as_slice());
+        assert!(filter.pending.is_empty());
+        // The filter keeps working on whatever follows the flush (it does not
+        // latch into a permanently-disabled state); a later complete event
+        // is still filtered normally.
+        let done = "data: [DONE]\n\n";
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&filter.push(Bytes::from_static(done.as_bytes())));
+        tail.extend_from_slice(&filter.finish());
+        assert_eq!(tail, done.as_bytes());
+    }
+
+    #[test]
+    fn usage_riding_on_a_content_chunk_is_not_dropped() {
+        let e = sse(serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "content": "x" } }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1 },
+        }));
+        assert_eq!(run_filter(&[e.as_bytes()]), e);
+    }
+
+    #[test]
+    fn a_stream_cut_off_after_two_deltas_bills_the_delivered_text() {
+        let est = CostEstimate {
+            input_tokens: 30,
+            estimated_output_tokens: 500,
+        };
+        // Two content deltas reach the client, then the upstream errors with
+        // no usage chunk ever sent.
+        let chunks = [content_event("Hello, wor"), content_event("ld and more")];
+        let streamed: usize = chunks.iter().map(|c| delta_text_chars(c.as_bytes())).sum();
+        assert_eq!(streamed, "Hello, world and more".chars().count());
+        let usage = extract_usage(&chunks.concat());
+        assert_eq!(usage, None);
+        let (tokens, billed) = truncated_stream_billing(usage, streamed, est);
+        assert!(billed, "delivered text must be billed");
+        assert_eq!(tokens, (30, 5), "prompt estimate + ~4 chars per token");
+
+        // Reported usage wins; nothing streamed is nothing billed.
+        assert_eq!(
+            truncated_stream_billing(Some((7, 3)), streamed, est),
+            ((7, 3), true)
+        );
+        assert_eq!(truncated_stream_billing(None, 0, est), ((0, 0), false));
+    }
+
+    #[test]
+    fn delta_text_counting_handles_escapes_multibyte_and_null() {
+        let e = sse(serde_json::json!({
+            "choices": [{ "delta": { "content": "a\"b\né", "reasoning_content": "hm" } }],
+        }));
+        // a " b \n é = 5, plus "hm" = 2.
+        assert_eq!(delta_text_chars(e.as_bytes()), 7);
+        let null = content_event("");
+        assert_eq!(delta_text_chars(null.as_bytes()), 0);
+        assert_eq!(delta_text_chars(br#"{"content": null}"#), 0);
+    }
+
+    #[test]
+    fn delta_text_counting_does_not_double_count_mirrored_reasoning() {
+        // Some upstreams echo the same reasoning text under both
+        // `reasoning_content` and `reasoning` in one delta. Only
+        // `reasoning_content` should count.
+        let e = sse(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "content": "hi",
+                    "reasoning_content": "thinking",
+                    "reasoning": "thinking",
+                },
+            }],
+        }));
+        // "hi" = 2, plus "thinking" once = 8.
+        assert_eq!(delta_text_chars(e.as_bytes()), 10);
+
+        // Without `reasoning_content`, `reasoning` still counts on its own.
+        let fallback = sse(serde_json::json!({
+            "choices": [{ "delta": { "reasoning": "thinking" } }],
+        }));
+        assert_eq!(delta_text_chars(fallback.as_bytes()), 8);
+    }
+
+    #[test]
+    fn unbilled_settlement_still_charges_slot_energy() {
+        let energy = crate::energy::EnergyEngine::new(obleth_config::EnergySettings {
+            enabled: true,
+            prometheus_url: "http://prom".into(),
+            power_query: "watts".into(),
+            poll_interval_secs: 60,
+            energy_cost_per_kwh: 0.10,
+            carbon_g_per_kwh: 400.0,
+            pue: 1.0,
+        });
+        energy.store_reading(crate::energy::PowerReading {
+            cluster_watts: 409_000.0,
+            node_count: 178,
+            at_ms: 0,
+        });
+        // A 503 that produced nothing but held a slot for 2 s.
+        let (cost, figures) =
+            settled_figures(&energy, false, (0, 0), (0.01, 0.02, 0.5), 8, 2_000, 0);
+        assert_eq!(cost, 0.0, "no billable output, no cost");
+        assert!(figures.energy_wh > 0.0, "slot time is still energy");
+        let (billed_cost, _) =
+            settled_figures(&energy, true, (100, 50), (0.01, 0.02, 0.5), 8, 2_000, 0);
+        assert!((billed_cost - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn completion_body_usage_reads_openai_usage() {
+        let body = serde_json::json!({ "usage": { "prompt_tokens": 4, "completion_tokens": 9 } });
+        assert_eq!(completion_body_usage(&body), Some((4, 9)));
+        assert_eq!(completion_body_usage(&serde_json::json!({})), None);
     }
 }

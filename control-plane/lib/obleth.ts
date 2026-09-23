@@ -564,6 +564,16 @@ export interface CompactUsageResult {
   partitions_dropped: number;
 }
 
+/** Counts from `POST /api/v1/resync`: entries republished and evicted. */
+export interface ResyncReport {
+  keys: number;
+  keys_pruned: number;
+  models: number;
+  model_names_pruned: number;
+  mcp_servers: number;
+  mcp_servers_pruned: number;
+}
+
 export type UsageDailyGroupBy =
   | "day"
   | "tenant"
@@ -2013,6 +2023,11 @@ export const obleth = {
     }),
   compactUsage: (options?: AuditOptions) =>
     api<CompactUsageResult>("/usage/compact", {
+      method: "POST",
+      headers: auditActorHeaders(options),
+    }),
+  resync: (options?: AuditOptions) =>
+    api<ResyncReport>("/resync", {
       method: "POST",
       headers: auditActorHeaders(options),
     }),

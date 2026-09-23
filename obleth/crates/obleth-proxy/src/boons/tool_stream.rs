@@ -30,7 +30,6 @@ use futures_util::{Stream, StreamExt};
 use obleth_config::{ResolvedKey, ResolvedModel, ToolLoopSettings};
 use serde_json::{json, Value};
 
-use super::mcp_tools;
 use crate::state::AppState;
 
 /// Visible marker prefix shown inline before a gateway tool runs.
@@ -109,7 +108,12 @@ pub fn run(
         let upstream_model = route.upstream_model.clone();
         let created = super::now_ms() / 1000;
         let mut request = base_request;
-        let mut sessions: HashMap<String, mcp_tools::Session> = HashMap::new();
+        let mut sessions = super::tool_loop::Sessions::default();
+        let deadline = super::tool_loop::LoopDeadline::new(&settings);
+        // Follow-up turns go to the endpoint that served turn 0 (prefix-cache
+        // locality); resolved once so every turn agrees.
+        let target = super::helper_target(&route, &session_id, Some(first.url().as_str()));
+        let idle = stream_idle_timeout();
         let mut current: Option<reqwest::Response> = Some(first);
         let mut image_ctx = image_gen.as_ref().map(|cfg| super::image_gen::ImageCtx {
             cfg,
@@ -133,7 +137,7 @@ pub fn run(
                         );
                         obj.insert("model".into(), Value::String(upstream_model.clone()));
                     }
-                    match dispatch(&state, &route, &request, dispatch_timeout).await {
+                    match dispatch(&state, &target, &request, deadline.bound(dispatch_timeout)).await {
                         Ok(r) => r,
                         Err(e) => {
                             tracing::warn!(error = %e, "tool stream follow-up dispatch failed");
@@ -174,7 +178,7 @@ pub fn run(
             let mut finish_reason: Option<Value> = None;
             let mut turn_done = false;
 
-            'read: while let Some(item) = bytes.next().await {
+            'read: while let Some(item) = next_within(&mut bytes, idle).await {
                 let chunk = match item {
                     Ok(c) => c,
                     Err(e) => {
@@ -326,29 +330,33 @@ pub fn run(
                 &mut request,
                 assistant_message(&content_acc, &calls),
             );
-            for c in &calls {
+            for (index, c) in calls.iter().enumerate() {
                 // Emit the "searching…" marker on the reasoning channel, not as
                 // answer content: a coding/agentic client shows it as visible
                 // work (so a 15s search doesn't look like a hang) without it
                 // corrupting the content stream it parses as the real answer.
-                yield Ok(Bytes::from(reasoning_chunk(
-                    &id,
-                    &model_name,
-                    created,
-                    &marker_text(&c.name, &c.arguments),
-                )));
+                if index < obleth_config::TOOL_LOOP_MAX_CALLS_PER_TURN {
+                    yield Ok(Bytes::from(reasoning_chunk(
+                        &id,
+                        &model_name,
+                        created,
+                        &marker_text(&c.name, &c.arguments),
+                    )));
+                }
                 let pending = super::tool_loop::PendingCall {
                     id: c.id.clone(),
                     name: c.name.clone(),
                     arguments: serde_json::from_str(&c.arguments).unwrap_or_else(|_| json!({})),
                 };
-                let result = super::tool_loop::execute_call(
+                let result = super::tool_loop::run_one_call(
                     &state,
                     &key.tenant_id,
                     &tool_servers,
                     &mut sessions,
                     image_ctx.as_mut(),
                     &pending,
+                    index,
+                    &deadline,
                     tool_timeout,
                 )
                 .await;
@@ -385,7 +393,7 @@ pub fn run(
             }),
         );
 
-        let final_resp = match dispatch(&state, &route, &request, dispatch_timeout).await {
+        let final_resp = match dispatch(&state, &target, &request, deadline.bound(dispatch_timeout)).await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(error = %e, "tool stream finalization dispatch failed");
@@ -422,7 +430,7 @@ pub fn run(
         let mut finish_reason: Option<Value> = None;
         let mut turn_done = false;
 
-        'final_read: while let Some(item) = bytes.next().await {
+        'final_read: while let Some(item) = next_within(&mut bytes, idle).await {
             let chunk = match item {
                 Ok(c) => c,
                 Err(e) => {
@@ -494,16 +502,26 @@ pub fn run(
     }
 }
 
-/// Dispatch a follow-up streaming turn to the model.
+/// Dispatch a follow-up streaming turn to the loop's pinned target. `timeout`
+/// is `None` once the loop's time budget is spent.
 async fn dispatch(
     state: &AppState,
-    route: &ResolvedModel,
+    target: &anyhow::Result<crate::proxy::Target>,
     body: &Value,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> anyhow::Result<reqwest::Response> {
-    let url = super::build_chat_url(&route.api_base);
-    let mut req = state.http.post(url).json(body);
-    if let Some(api_key) = &route.api_key {
+    let Some(timeout) = timeout else {
+        anyhow::bail!("tool loop time limit reached");
+    };
+    let target = match target {
+        Ok(t) => t,
+        Err(e) => anyhow::bail!("{e}"),
+    };
+    let mut req = state
+        .http
+        .post(super::build_chat_url(&target.base))
+        .json(body);
+    if let Some(api_key) = &target.api_key {
         req = req.bearer_auth(api_key);
     }
     let resp = tokio::time::timeout(timeout, req.send())
@@ -513,6 +531,63 @@ async fn dispatch(
         anyhow::bail!("upstream returned {}", resp.status());
     }
     Ok(resp)
+}
+
+/// Longest silence tolerated between two chunks of a boon-driven upstream
+/// stream — the same effective read timeout the shared client applies to the
+/// main upstream path (`0` disables). Mirrors
+/// `obleth_config::Config::upstream_read_timeout_secs`'s own fallback: an
+/// explicit `OBLETH_UPSTREAM_READ_TIMEOUT_SECS` wins, otherwise the upstream
+/// request timeout floored at 120s. Computed from the env directly, rather
+/// than threaded through `AppState`, because `main.rs` builds `Config` before
+/// `AppState` exists. A zombie backend that stops sending mid-stream would
+/// otherwise hold the request, and its fairshare permit, until the client
+/// gives up.
+pub(crate) fn stream_idle_timeout() -> Option<Duration> {
+    static IDLE: std::sync::OnceLock<Option<Duration>> = std::sync::OnceLock::new();
+    *IDLE.get_or_init(|| {
+        let secs = idle_timeout_secs(
+            std::env::var("OBLETH_UPSTREAM_READ_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+            std::env::var("OBLETH_UPSTREAM_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+        );
+        (secs > 0).then(|| Duration::from_secs(secs))
+    })
+}
+
+/// Pure parse behind [`stream_idle_timeout`], split out so the fallback chain
+/// can be unit tested without racing the `OnceLock` across test threads.
+fn idle_timeout_secs(read_raw: Option<&str>, request_raw: Option<&str>) -> u64 {
+    read_raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            let request_timeout_secs = request_raw
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .unwrap_or(300);
+            request_timeout_secs.max(120)
+        })
+}
+
+/// The next item of `stream`, or an error once it has been silent for `idle`.
+pub(crate) async fn next_within<S, T, E>(
+    stream: &mut S,
+    idle: Option<Duration>,
+) -> Option<anyhow::Result<T>>
+where
+    S: Stream<Item = Result<T, E>> + Unpin,
+    E: Into<anyhow::Error>,
+{
+    let item = match idle {
+        Some(limit) => match tokio::time::timeout(limit, stream.next()).await {
+            Ok(item) => item,
+            Err(_) => return Some(Err(anyhow::anyhow!("upstream stream idle for {limit:?}"))),
+        },
+        None => stream.next().await,
+    };
+    item.map(|r| r.map_err(Into::into))
 }
 
 fn set_ttft(stats: &Arc<Mutex<StreamStats>>, ms: u32) {
@@ -534,12 +609,20 @@ fn finalize_stats(stats: &Arc<Mutex<StreamStats>>, usage: Option<(u32, u32)>) {
     }
 }
 
-/// Extract the next complete SSE event (up to and including the `\n\n`
-/// delimiter) from the buffer, draining it. Returns `None` while no full event
-/// is buffered yet.
+/// Extract the next complete SSE event (up to and including its blank-line
+/// delimiter, `\n\n` or `\r\n\r\n`) from the buffer, draining it. Returns
+/// `None` while no full event is buffered yet.
 pub(crate) fn split_event(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
-    let pos = buf.windows(2).position(|w| w == b"\n\n")?;
-    Some(buf.drain(..pos + 2).collect())
+    let lf = buf.windows(2).position(|w| w == b"\n\n").map(|pos| pos + 2);
+    let crlf = buf
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|pos| pos + 4);
+    let end = match (lf, crlf) {
+        (Some(a), Some(b)) => a.min(b),
+        (a, b) => a.or(b)?,
+    };
+    Some(buf.drain(..end).collect())
 }
 
 /// Pull the `data:` payloads out of one SSE event.
@@ -743,6 +826,48 @@ mod tests {
         // "data: c" has no terminator yet.
         assert!(split_event(&mut buf).is_none());
         assert_eq!(buf, b"data: c");
+    }
+
+    #[test]
+    fn split_event_accepts_crlf_delimiters() {
+        let mut buf = b"data: a\r\n\r\ndata: b\n\ndata: c\r\n".to_vec();
+        let e1 = split_event(&mut buf).unwrap();
+        assert_eq!(e1, b"data: a\r\n\r\n");
+        assert_eq!(parse_data_lines(&e1), vec!["a".to_string()]);
+        let e2 = split_event(&mut buf).unwrap();
+        assert_eq!(e2, b"data: b\n\n");
+        assert!(split_event(&mut buf).is_none());
+        assert_eq!(buf, b"data: c\r\n");
+    }
+
+    #[test]
+    fn idle_timeout_secs_matches_the_upstream_read_timeout_fallback() {
+        // Same fallback chain as `obleth_config::Config::upstream_read_timeout_secs`:
+        // an explicit read timeout wins; otherwise the request timeout,
+        // floored at 120s; with the same defaults when neither is set.
+        assert_eq!(idle_timeout_secs(None, None), 300);
+        assert_eq!(idle_timeout_secs(None, Some("30")), 120);
+        assert_eq!(idle_timeout_secs(Some("45"), None), 45);
+        assert_eq!(idle_timeout_secs(Some("0"), None), 0);
+        assert_eq!(idle_timeout_secs(Some("x"), Some("600")), 600);
+    }
+
+    #[tokio::test]
+    async fn next_within_gives_up_on_a_silent_stream() {
+        let mut silent = futures_util::stream::pending::<Result<Bytes, std::io::Error>>();
+        let item = next_within(&mut silent, Some(Duration::from_millis(20))).await;
+        assert!(
+            matches!(item, Some(Err(_))),
+            "a stalled upstream must end the read, not hang it"
+        );
+
+        let mut live =
+            futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(b"x"))]);
+        let first = next_within(&mut live, Some(Duration::from_secs(1))).await;
+        assert_eq!(first.unwrap().unwrap(), Bytes::from_static(b"x"));
+        assert!(next_within(&mut live, Some(Duration::from_secs(1)))
+            .await
+            .is_none());
     }
 
     #[test]

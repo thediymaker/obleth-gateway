@@ -197,6 +197,15 @@ pub(crate) fn to_chat_request(body: &Value) -> Value {
     if let Some(format) = body.pointer("/text/format") {
         out.insert("response_format".into(), format.clone());
     }
+    // A streamed Responses reply always ends with usage on
+    // `response.completed`, so the chat stream it is built from must carry it.
+    if body.get("stream").and_then(Value::as_bool) == Some(true) {
+        let options = out.entry("stream_options").or_insert_with(|| json!({}));
+        if !options.is_object() {
+            *options = json!({});
+        }
+        options["include_usage"] = json!(true);
+    }
     Value::Object(out)
 }
 
@@ -687,6 +696,24 @@ impl StreamTranslator {
         out.push(self.frame("response.completed", json!({ "response": envelope })));
         out
     }
+
+    /// Close a stream whose upstream broke off mid-answer. Ends with
+    /// `response.failed` rather than `response.completed`: a caller that
+    /// checks the terminal event alone must not take a truncated answer for
+    /// a whole one. Items already streamed are closed and echoed so the
+    /// partial text is not lost. Shares `finish`'s run-once flag.
+    pub(crate) fn fail(&mut self, message: &str) -> Vec<String> {
+        if self.completed {
+            return Vec::new();
+        }
+        self.completed = true;
+        let mut out = self.close_open();
+        out.extend(self.start());
+        let mut envelope = self.envelope("failed", Value::Array(self.done_items.clone()));
+        envelope["error"] = json!({ "code": "server_error", "message": message });
+        out.push(self.frame("response.failed", json!({ "response": envelope })));
+        out
+    }
 }
 
 #[cfg(test)]
@@ -944,6 +971,35 @@ mod tests {
                 "response.completed",
             ]
         );
+    }
+
+    #[test]
+    fn a_broken_upstream_stream_ends_failed_not_completed() {
+        let mut t = StreamTranslator::new("req1", "m");
+        let mut frames = t.on_chunk(&delta("partial"));
+        frames.extend(t.fail("upstream stream ended early"));
+        // A late `finish` (e.g. from a caller that always closes) adds nothing.
+        frames.extend(t.finish());
+        let parsed = parse(&frames);
+        let events: Vec<&str> = parsed.iter().map(|(e, _)| e.as_str()).collect();
+        assert!(!events.contains(&"response.completed"));
+        assert_eq!(events.last(), Some(&"response.failed"));
+        let (_, failed) = parsed.last().unwrap();
+        assert_eq!(failed["response"]["status"], "failed");
+        assert_eq!(failed["response"]["error"]["code"], "server_error");
+        // The text that did stream is closed and echoed, not dropped.
+        assert_eq!(
+            failed["response"]["output"][0]["content"][0]["text"],
+            "partial"
+        );
+    }
+
+    #[test]
+    fn a_streamed_request_asks_the_chat_upstream_for_usage() {
+        let chat = to_chat_request(&json!({ "model": "m", "input": "hi", "stream": true }));
+        assert_eq!(chat["stream_options"]["include_usage"], true);
+        let chat = to_chat_request(&json!({ "model": "m", "input": "hi" }));
+        assert!(chat.get("stream_options").is_none());
     }
 
     #[test]

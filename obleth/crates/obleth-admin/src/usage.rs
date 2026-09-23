@@ -234,17 +234,7 @@ pub async fn query_usage_logs(
         sql.push_str(" and startsWith(lower(toString(request_id)), lower(?))");
     }
     if q.traced_only == Some(true) {
-        let since = q.since_ms.unwrap_or(0);
-        let until = q.until_ms.unwrap_or(i64::MAX);
-        // Safety: `since` and `until` are `i64` — `Display` emits only ASCII
-        // digits (and an optional leading `-`), so there is no SQL-injection
-        // surface. The clickhouse crate (v0.13) scopes bind parameters to the
-        // top-level query string and does not propagate them into subqueries,
-        // making `format!` the correct approach for subquery literals.
-        sql.push_str(&format!(
-            " AND request_id IN (SELECT DISTINCT request_id FROM spans \
-              WHERE start_ms >= {since} AND start_ms <= {until})"
-        ));
+        sql.push_str(&traced_only_filter(since, q.until_ms));
     }
     // Keyset cursor: (ts_ms, request_id) tuple strictly less than the cursor.
     // Tuple comparison matches the `order by` below for stable paging.
@@ -292,6 +282,22 @@ pub async fn query_usage_logs(
     }
 
     query.fetch_all::<UsageLogRow>().await
+}
+
+/// `traced_only` subquery. It takes the outer query's resolved `since` so the
+/// span scan is bounded by the same window as the log read rather than the
+/// whole retained `spans` table.
+fn traced_only_filter(since: i64, until_ms: Option<i64>) -> String {
+    let until = until_ms.unwrap_or(i64::MAX);
+    // Safety: `since` and `until` are `i64` — `Display` emits only ASCII
+    // digits (and an optional leading `-`), so there is no SQL-injection
+    // surface. The clickhouse crate (v0.13) scopes bind parameters to the
+    // top-level query string and does not propagate them into subqueries,
+    // making `format!` the correct approach for subquery literals.
+    format!(
+        " AND request_id IN (SELECT DISTINCT request_id FROM spans \
+          WHERE start_ms >= {since} AND start_ms <= {until})"
+    )
 }
 
 /// One row of the daily rollup, shaped by the requested `group_by`. Identity
@@ -667,17 +673,40 @@ pub struct KeyUsageSummary {
 }
 
 /// Summary for one key. `last_used_ms` / `last_model` / `last_status_code` are
-/// computed over the full retained ledger for that key (cheap — one key is a
-/// narrow scan), while the request/token/cost columns are limited to the
-/// rolling window. Returns `None` when the key has never appeared in the ledger.
+/// computed over the full retained ledger for that key, while the
+/// request/token/cost columns are limited to the rolling window. Returns `None`
+/// when the key has never appeared in the ledger.
 pub async fn query_key_usage_summary(
     client: &clickhouse::Client,
+    tenant_id: Uuid,
     key_id: Uuid,
     since_ms: Option<i64>,
     include_internal: Option<bool>,
 ) -> Result<Option<KeyUsageSummary>, clickhouse::error::Error> {
     let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let sql = format!(
+    let sql = key_usage_summary_sql(include_internal);
+    let rows = client
+        .query(&sql)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(tenant_id.to_string())
+        .bind(key_id.to_string())
+        .fetch_all::<KeyUsageSummaryRow>()
+        .await?;
+    Ok(rows.into_iter().next().map(KeyUsageSummary::from))
+}
+
+/// The ledger's sort key is `(tenant_id, ts_ms)`, so the tenant predicate is
+/// what lets ClickHouse skip granules; `key_id` alone scans every retained row.
+/// The raw column is qualified so the `tenant_id` SELECT alias cannot shadow it.
+fn key_usage_summary_sql(include_internal: Option<bool>) -> String {
+    format!(
         "select \
          key_id, \
          any(tenant_id) as tenant_id, \
@@ -692,23 +721,10 @@ pub async fn query_key_usage_summary(
          sumIf(energy_wh, ts_ms >= ?) as e_wh, \
          sumIf(energy_cost_usd, ts_ms >= ?) as e_cost_usd, \
          sumIf(co2_g, ts_ms >= ?) as e_co2_g \
-         from usage where key_id = toUUID(?){} group by key_id",
+         from usage where usage.tenant_id = toUUID(?) and key_id = toUUID(?){} \
+         group by key_id",
         internal_filter(include_internal)
-    );
-    let rows = client
-        .query(&sql)
-        .bind(since)
-        .bind(since)
-        .bind(since)
-        .bind(since)
-        .bind(since)
-        .bind(since)
-        .bind(since)
-        .bind(since)
-        .bind(key_id.to_string())
-        .fetch_all::<KeyUsageSummaryRow>()
-        .await?;
-    Ok(rows.into_iter().next().map(KeyUsageSummary::from))
+    )
 }
 
 /// Bulk per-key summary for the dashboard. The window (`since_ms`) bounds the
@@ -794,7 +810,7 @@ pub async fn query_usage_series(
     q: UsageSeriesQuery,
 ) -> Result<Vec<UsageTimePoint>, clickhouse::error::Error> {
     let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let bucket = q.bucket_ms.unwrap_or(300_000).max(60_000);
+    let bucket = series_bucket_ms(since, q.bucket_ms, 60_000, now_ms());
     let mut sql = format!(
         "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
          count() as requests, \
@@ -820,7 +836,7 @@ pub async fn query_usage_series_by_tenant(
     q: UsageSeriesQuery,
 ) -> Result<Vec<TenantUsageTimePoint>, clickhouse::error::Error> {
     let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let bucket = q.bucket_ms.unwrap_or(300_000).max(10_000);
+    let bucket = series_bucket_ms(since, q.bucket_ms, 10_000, now_ms());
     let filter = internal_filter(q.include_internal);
     let sql = format!(
         "select tenant_id, intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
@@ -847,7 +863,7 @@ pub async fn query_usage_series_by_model(
     q: UsageSeriesQuery,
 ) -> Result<Vec<ModelUsageTimePoint>, clickhouse::error::Error> {
     let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let bucket = q.bucket_ms.unwrap_or(300_000).max(10_000);
+    let bucket = series_bucket_ms(since, q.bucket_ms, 10_000, now_ms());
     let filter = internal_filter(q.include_internal);
     // Per-stream engine rates, NOT volume-over-wall-clock. `gen_tps` is the
     // median decode rate (output tokens over the decode window = total - ttft,
@@ -1191,6 +1207,22 @@ fn usage_filter_bind_count(q: &UsageQuery) -> usize {
         + usize::from(q.model.is_some())
 }
 
+/// Most buckets a series read may return per series. A wide window with a fine
+/// bucket (or `since_ms=0`) would otherwise return millions of rows.
+pub const MAX_SERIES_BUCKETS: i64 = 5_000;
+
+/// Bucket width for a series read: the requested width (default 5 minutes),
+/// raised to `floor_ms`, then widened until `[since, now]` fits in
+/// [`MAX_SERIES_BUCKETS`].
+fn series_bucket_ms(since: i64, requested: Option<i64>, floor_ms: i64, now: i64) -> i64 {
+    let span = now.saturating_sub(since).max(0);
+    // Buckets are epoch-aligned (`intDiv(ts_ms, b) * b`), so a span covers up
+    // to `span / b + 1` of them; size `b` for `MAX - 1` whole widths.
+    let widths = MAX_SERIES_BUCKETS - 1;
+    let min_for_cap = span / widths + i64::from(span % widths != 0);
+    requested.unwrap_or(300_000).max(floor_ms).max(min_for_cap)
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1273,6 +1305,66 @@ mod internal_filter_tests {
     #[test]
     fn opt_in_disables_the_filter() {
         assert!(internal_filter(Some(true)).is_empty());
+    }
+
+    #[test]
+    fn key_usage_summary_filters_on_the_sort_key_prefix() {
+        let sql = key_usage_summary_sql(None);
+        assert!(
+            sql.contains("where usage.tenant_id = toUUID(?) and key_id = toUUID(?)"),
+            "{sql}"
+        );
+        // 8 window binds + tenant + key.
+        assert_eq!(sql.matches('?').count(), 10, "{sql}");
+    }
+
+    #[test]
+    fn traced_only_subquery_uses_the_outer_window() {
+        let sql = traced_only_filter(1_700_000_000_000, None);
+        assert!(sql.contains("start_ms >= 1700000000000"), "{sql}");
+        assert!(!sql.contains("start_ms >= 0 "), "{sql}");
+        let bounded = traced_only_filter(5, Some(9));
+        assert!(
+            bounded.contains("start_ms >= 5 AND start_ms <= 9"),
+            "{bounded}"
+        );
+    }
+
+    #[test]
+    fn series_bucket_honours_request_and_floor_in_short_windows() {
+        let now = 1_700_000_000_000;
+        let day = 86_400_000;
+        assert_eq!(series_bucket_ms(now - day, None, 60_000, now), 300_000);
+        assert_eq!(
+            series_bucket_ms(now - day, Some(1_000), 60_000, now),
+            60_000
+        );
+        assert_eq!(
+            series_bucket_ms(now - day, Some(3_600_000), 10_000, now),
+            3_600_000
+        );
+        // Future `since` is an empty window, not a negative width.
+        assert_eq!(series_bucket_ms(now + day, None, 10_000, now), 300_000);
+    }
+
+    #[test]
+    fn series_bucket_widens_so_wide_windows_stay_under_the_cap() {
+        let now = 1_700_000_000_123;
+        for (since, requested, floor) in [
+            (0, Some(10_000), 10_000),
+            (0, None, 60_000),
+            (now - 365 * 86_400_000, Some(10_000), 10_000),
+            (now - 30 * 86_400_000, Some(60_000), 60_000),
+        ] {
+            let b = series_bucket_ms(since, requested, floor, now);
+            let first = since.max(0) / b;
+            let last = now / b;
+            assert!(
+                last - first < MAX_SERIES_BUCKETS,
+                "since={since} bucket={b}: {} buckets",
+                last - first + 1
+            );
+        }
     }
 
     #[test]

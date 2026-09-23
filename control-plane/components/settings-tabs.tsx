@@ -21,6 +21,7 @@ import {
   CompressionSettingsForm,
   KnowledgeSettingsForm,
   SlurmSettingsForm,
+  ResolverCacheCard,
   UsageRetentionForm,
 } from "@/components/settings-form";
 import { EnergySettingsForm } from "@/components/energy-settings-form";
@@ -144,6 +145,7 @@ export function SettingsTabs({
         <div className="space-y-6">
           <UsageRetentionForm retention={retention} />
           <BackupRestore />
+          <ResolverCacheCard />
         </div>
       </TabsContent>
 

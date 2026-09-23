@@ -285,10 +285,12 @@ pub async fn embed_query(
         return Some(v);
     }
     let route = crate::proxy::resolve_model(state, embedding_model).await?;
-    let target = obleth_admin::knowledge::embed::EmbedTarget {
-        api_base: route.api_base.clone(),
-        api_key: route.api_key.clone(),
-        upstream_model: route.upstream_model.clone(),
+    let target = match embed_target(&route) {
+        Ok(target) => target,
+        Err(e) => {
+            tracing::debug!(error = %e, model = %embedding_model, "knowledge query embed skipped");
+            return None;
+        }
     };
     let inputs = [query.to_string()];
     let vector = obleth_admin::knowledge::embed::embed_batch(
@@ -306,6 +308,20 @@ pub async fn embed_query(
         .put_query_vector(&key, &vector, settings.query_cache_ttl_s)
         .await;
     Some(vector)
+}
+
+/// Where the query embedding goes: the embedding model's endpoint-aware target
+/// (healthy endpoints first, endpoint key over model key), so a Slurm-hosted
+/// embedding model with a blank `api_base` is reachable.
+fn embed_target(
+    route: &obleth_config::ResolvedModel,
+) -> anyhow::Result<obleth_admin::knowledge::embed::EmbedTarget> {
+    let target = crate::boons::helper_target(route, "", None)?;
+    Ok(obleth_admin::knowledge::embed::EmbedTarget {
+        api_base: target.base,
+        api_key: target.api_key,
+        upstream_model: route.upstream_model.clone(),
+    })
 }
 
 /// Apply one collection's rebuild outcome to the next snapshot: on success,
@@ -547,5 +563,51 @@ mod tests {
             !next.contains_key(&id),
             "a failed rebuild with no prior data must not fabricate a slab"
         );
+    }
+
+    /// A Slurm-hosted embedding model has a blank `api_base` and one healthy
+    /// endpoint; the query embedding must reach it with the endpoint's key.
+    #[tokio::test]
+    async fn query_embedding_reaches_an_endpoint_only_model() {
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let seen_clone = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/embeddings",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let seen = seen_clone.clone();
+                async move {
+                    *seen.lock().unwrap() = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    axum::Json(serde_json::json!({
+                        "data": [{ "index": 0, "embedding": [3.0, 4.0] }]
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let route = crate::boons::test_support::endpoint_only_route(&format!("http://{addr}/v1"));
+        let target = embed_target(&route).expect("endpoint target");
+        let vectors = obleth_admin::knowledge::embed::embed_batch(
+            &reqwest::Client::new(),
+            &target,
+            &["query".to_string()],
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("embedding through the endpoint");
+        assert_eq!(vectors.len(), 1);
+        assert_eq!(seen.lock().unwrap().as_str(), "Bearer endpoint-key");
+
+        let mut unreachable = route.clone();
+        unreachable.endpoints.clear();
+        assert!(embed_target(&unreachable).is_err());
     }
 }

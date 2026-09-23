@@ -368,3 +368,28 @@ use obleth_config::{
     )
 )]
 pub struct ApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::ApiDoc;
+    use utoipa::OpenApi;
+
+    #[test]
+    fn model_route_view_documents_its_fields() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize");
+        let props = &doc["components"]["schemas"]["ModelRouteView"]["properties"];
+        for field in [
+            "model_name",
+            "aliases",
+            "quantization",
+            "route_bias",
+            "auto_eligible",
+        ] {
+            let description = props[field]["description"].as_str().unwrap_or_default();
+            assert!(
+                !description.is_empty(),
+                "ModelRouteView.{field} has no description"
+            );
+        }
+    }
+}

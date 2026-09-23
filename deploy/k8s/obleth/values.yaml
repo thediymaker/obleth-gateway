@@ -68,6 +68,30 @@ obleth:
   modelHealthTimeoutSecs: 30
   modelHealthRetentionDays: 30
   usageRetentionDays: 180
+  # On shutdown the gateway stops accepting and waits this long for in-flight
+  # requests (including streams). Keep it below the pod's
+  # terminationGracePeriodSeconds (345) minus the 5s preStop delay, the 20s
+  # telemetry drain and the 10s OTLP shutdown flush: if you raise this value,
+  # raise terminationGracePeriodSeconds (templates/obleth.yaml) by the same
+  # amount, or the kubelet SIGKILLs mid-flush instead of a clean exit.
+  shutdownGraceSecs: 300
+  # Seconds between re-pushes of keys/models/MCP servers from Postgres into
+  # Redis (also runs after every Redis reconnect). 0 disables the timer.
+  redisRewarmSecs: 300
+  # Longest upstream silence (header wait or gap between body chunks) before
+  # the request fails. Empty = the upstream request timeout (floored at 120s);
+  # a lower value also cuts slow non-streaming requests. 0 disables.
+  upstreamReadTimeoutSecs: ""
+  # Redis client timeouts (milliseconds). A command that gets no reply within
+  # the response timeout errors instead of hanging the request, so an
+  # unreachable Redis is handled by the failOpen policy above. The connect
+  # timeout bounds each (re)connect attempt. 0 or invalid values fall back to
+  # these same defaults.
+  redisResponseTimeoutMs: 250
+  redisConnectTimeoutMs: 2000
+  # Longest a request waits in the fairshare queue before a 503 with
+  # Retry-After: 5. 0 or invalid falls back to this default.
+  admissionTimeoutSecs: 60
   resources:
     requests: { cpu: "250m", memory: "256Mi" }
     limits: { cpu: "2", memory: "1Gi" }

@@ -32,8 +32,19 @@ pub struct Config {
     /// TCP keep-alive probe interval for upstream connections. Keeps NAT/LB state
     /// warm and surfaces dead peers faster. `0` disables.
     pub upstream_tcp_keepalive_secs: u64,
+    /// Longest silence on an upstream connection (header wait or gap between
+    /// body chunks). reqwest applies it to the header wait too, so it defaults
+    /// to the upstream request timeout to never undercut it. `0` disables.
+    pub upstream_read_timeout_secs: u64,
+    /// How long shutdown waits for in-flight requests before exiting.
+    pub shutdown_grace: Duration,
+    /// Interval of the Postgres-to-Redis re-push of keys/models/MCP servers.
+    /// `0` disables the timer (the re-push after a Redis reconnect still runs).
+    pub redis_rewarm_secs: u64,
 
     pub redis_url: String,
+    /// Per-command and per-connect timeouts for the shared Redis connection.
+    pub redis_timeouts: RedisTimeouts,
     pub database_url: String,
     pub clickhouse_url: String,
     pub clickhouse_db: String,
@@ -109,6 +120,55 @@ impl fmt::Debug for SlackAlertConfig {
     }
 }
 
+/// Timeouts applied to the shared Redis connection manager.
+///
+/// Without them a blackholed Redis (packets dropped, no RST) hangs every
+/// request on the hot path instead of surfacing an error that the fail-open /
+/// fail-closed budget logic can act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RedisTimeouts {
+    /// Maximum wait for a reply to a single command
+    /// (`OBLETH_REDIS_RESPONSE_TIMEOUT_MS`, default 250).
+    pub response: Duration,
+    /// Maximum wait for one TCP connect + handshake attempt
+    /// (`OBLETH_REDIS_CONNECT_TIMEOUT_MS`, default 2000).
+    pub connect: Duration,
+}
+
+impl RedisTimeouts {
+    pub const DEFAULT_RESPONSE_MS: u64 = 250;
+    pub const DEFAULT_CONNECT_MS: u64 = 2000;
+
+    pub fn from_env() -> Self {
+        Self::from_values(
+            env::var("OBLETH_REDIS_RESPONSE_TIMEOUT_MS").ok().as_deref(),
+            env::var("OBLETH_REDIS_CONNECT_TIMEOUT_MS").ok().as_deref(),
+        )
+    }
+
+    /// Build from raw env values; missing, unparseable, or zero values fall
+    /// back to the defaults (a zero timeout would fail every command).
+    pub fn from_values(response_ms: Option<&str>, connect_ms: Option<&str>) -> Self {
+        let ms = |v: Option<&str>, default: u64| {
+            let n = v
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(default);
+            Duration::from_millis(n)
+        };
+        RedisTimeouts {
+            response: ms(response_ms, Self::DEFAULT_RESPONSE_MS),
+            connect: ms(connect_ms, Self::DEFAULT_CONNECT_MS),
+        }
+    }
+}
+
+impl Default for RedisTimeouts {
+    fn default() -> Self {
+        Self::from_values(None, None)
+    }
+}
+
 impl Config {
     pub fn from_env() -> Self {
         Config {
@@ -119,7 +179,16 @@ impl Config {
             upstream_timeout: Duration::from_secs(parse_or("OBLETH_UPSTREAM_TIMEOUT_SECS", 300)),
             upstream_pool_idle_secs: parse_or("OBLETH_UPSTREAM_POOL_IDLE_SECS", 15),
             upstream_tcp_keepalive_secs: parse_or("OBLETH_UPSTREAM_TCP_KEEPALIVE_SECS", 30),
+            upstream_read_timeout_secs: upstream_read_timeout_secs(
+                env::var("OBLETH_UPSTREAM_READ_TIMEOUT_SECS")
+                    .ok()
+                    .as_deref(),
+                parse_or("OBLETH_UPSTREAM_TIMEOUT_SECS", 300),
+            ),
+            shutdown_grace: Duration::from_secs(parse_or("OBLETH_SHUTDOWN_GRACE_SECS", 300)),
+            redis_rewarm_secs: parse_or("OBLETH_REDIS_REWARM_SECS", 300),
             redis_url: env_or("OBLETH_REDIS_URL", "redis://127.0.0.1:6379"),
+            redis_timeouts: RedisTimeouts::from_env(),
             database_url: env_or(
                 "OBLETH_DATABASE_URL",
                 "postgres://obleth:obleth@127.0.0.1:5432/obleth",
@@ -136,9 +205,9 @@ impl Config {
                 "OBLETH_FAIRSHARE_ALGORITHM",
                 "hierarchical",
             )),
-            fail_open: parse_or("OBLETH_FAIL_OPEN", true),
+            fail_open: require_bool("OBLETH_FAIL_OPEN", true),
             wal_path: env_or("OBLETH_WAL_PATH", "./obleth-telemetry.wal"),
-            model_health_enabled: parse_or("OBLETH_MODEL_HEALTH_ENABLED", true),
+            model_health_enabled: bool_or("OBLETH_MODEL_HEALTH_ENABLED", true),
             model_health_interval_secs: parse_or("OBLETH_MODEL_HEALTH_INTERVAL_SECS", 900),
             model_health_timeout_secs: parse_or("OBLETH_MODEL_HEALTH_TIMEOUT_SECS", 30),
             model_health_retention_days: parse_or("OBLETH_MODEL_HEALTH_RETENTION_DAYS", 30),
@@ -156,7 +225,7 @@ impl Config {
                     300,
                 )),
             },
-            auto_classifier_enabled: parse_or("OBLETH_AUTO_CLASSIFIER_ENABLED", false),
+            auto_classifier_enabled: bool_or("OBLETH_AUTO_CLASSIFIER_ENABLED", false),
             auto_classifier_model: env::var("OBLETH_AUTO_CLASSIFIER_MODEL")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
@@ -187,9 +256,125 @@ fn require_secret(key: &str) -> String {
     }
 }
 
+/// An explicit value wins; otherwise the upstream request timeout, floored at
+/// 120s. reqwest's read timeout also bounds the wait for response headers,
+/// so a default below the request timeout would cut slow non-streaming calls.
+fn upstream_read_timeout_secs(raw: Option<&str>, upstream_timeout_secs: u64) -> u64 {
+    raw.and_then(|v| v.trim().parse().ok())
+        .unwrap_or(upstream_timeout_secs.max(120))
+}
+
 fn parse_or<T: std::str::FromStr>(key: &str, default: T) -> T {
     env::var(key)
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(default)
+}
+
+/// Parse a boolean env value: `1/0`, `true/false`, `yes/no`, `on/off`,
+/// case-insensitive, surrounding whitespace ignored. `str::parse::<bool>`
+/// only accepts `true`/`false`, so `0` used to fall through to the default.
+pub fn parse_bool(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+/// Unset/blank → `default`; unparseable → `default`.
+fn lenient_bool(value: Option<&str>, default: bool) -> bool {
+    value.and_then(parse_bool).unwrap_or(default)
+}
+
+/// Unset/blank → `default`; unparseable → error naming the variable.
+fn strict_bool(key: &str, value: Option<&str>, default: bool) -> Result<bool, String> {
+    match value {
+        None => Ok(default),
+        Some(v) if v.trim().is_empty() => Ok(default),
+        Some(v) => parse_bool(v).ok_or_else(|| {
+            format!("{key}={v:?} is not a boolean; use one of 1/0, true/false, yes/no, on/off")
+        }),
+    }
+}
+
+fn bool_or(key: &str, default: bool) -> bool {
+    lenient_bool(env::var(key).ok().as_deref(), default)
+}
+
+/// Boolean flag whose misreading is unsafe (e.g. `OBLETH_FAIL_OPEN`: a typo
+/// must not silently turn budget enforcement fail-open). Aborts startup like
+/// [`require_secret`].
+fn require_bool(key: &str, default: bool) -> bool {
+    match strict_bool(key, env::var(key).ok().as_deref(), default) {
+        Ok(b) => b,
+        Err(msg) => panic!("{msg}. Refusing to start with an ambiguous setting."),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bool_flags_accept_common_spellings_case_insensitively() {
+        for v in ["1", "true", "TRUE", "yes", "Yes", "on", "ON", " true "] {
+            assert_eq!(parse_bool(v), Some(true), "{v:?}");
+        }
+        for v in ["0", "false", "False", "no", "NO", "off", "Off"] {
+            assert_eq!(parse_bool(v), Some(false), "{v:?}");
+        }
+        for v in ["", "2", "enabled", "nope", "tru"] {
+            assert_eq!(parse_bool(v), None, "{v:?}");
+        }
+    }
+
+    #[test]
+    fn fail_open_zero_means_fail_closed() {
+        // Regression: `"0".parse::<bool>()` fails, which used to silently fall
+        // back to the fail-open default.
+        assert_eq!(strict_bool("OBLETH_FAIL_OPEN", Some("0"), true), Ok(false));
+        assert_eq!(
+            strict_bool("OBLETH_FAIL_OPEN", Some("off"), true),
+            Ok(false)
+        );
+        assert_eq!(strict_bool("OBLETH_FAIL_OPEN", None, true), Ok(true));
+        assert_eq!(strict_bool("OBLETH_FAIL_OPEN", Some("  "), true), Ok(true));
+    }
+
+    #[test]
+    fn unparseable_strict_bool_is_an_error_not_a_default() {
+        let err = strict_bool("OBLETH_FAIL_OPEN", Some("maybe"), true).unwrap_err();
+        assert!(err.contains("OBLETH_FAIL_OPEN"), "{err}");
+        assert!(err.contains("maybe"), "{err}");
+    }
+
+    #[test]
+    fn lenient_bool_falls_back_on_garbage() {
+        assert!(!lenient_bool(Some("0"), true));
+        assert!(lenient_bool(Some("yes"), false));
+        assert!(lenient_bool(Some("garbage"), true));
+        assert!(!lenient_bool(None, false));
+    }
+
+    #[test]
+    fn redis_timeouts_default_and_parse() {
+        let d = RedisTimeouts::default();
+        assert_eq!(d.response, Duration::from_millis(250));
+        assert_eq!(d.connect, Duration::from_millis(2000));
+        let t = RedisTimeouts::from_values(Some("100"), Some("500"));
+        assert_eq!(t.response, Duration::from_millis(100));
+        assert_eq!(t.connect, Duration::from_millis(500));
+        let t = RedisTimeouts::from_values(Some("nope"), None);
+        assert_eq!(t, RedisTimeouts::default());
+    }
+
+    #[test]
+    fn upstream_read_timeout_never_undercuts_the_request_timeout() {
+        assert_eq!(upstream_read_timeout_secs(None, 300), 300);
+        assert_eq!(upstream_read_timeout_secs(None, 30), 120);
+        assert_eq!(upstream_read_timeout_secs(Some("45"), 300), 45);
+        assert_eq!(upstream_read_timeout_secs(Some("0"), 300), 0);
+        assert_eq!(upstream_read_timeout_secs(Some("x"), 600), 600);
+    }
 }

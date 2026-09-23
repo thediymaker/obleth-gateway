@@ -33,6 +33,12 @@ pub(super) const GENERATE_IMAGE_TOOL: &str = "generate_image";
 /// call by name before any server lookup.
 pub(super) const IMAGE_SYNTHETIC_SERVER: &str = "__image__";
 
+/// Largest image-generation response read into memory. Larger than the chat
+/// helper cap because a `b64_json` reply carries every image inline (several
+/// megabytes each), but still bounded so a misbehaving backend cannot stream
+/// without limit into gateway memory.
+const IMAGE_BODY_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 /// Longest prompt excerpt echoed back to the model in a receipt.
 const RECEIPT_PROMPT_MAX_CHARS: usize = 160;
 
@@ -63,7 +69,7 @@ pub(super) fn allowed_sizes(cfg: &ImageGenerationBoonSettings) -> Vec<String> {
     }
 }
 
-/// The effective per-call image cap: at least 1, never above the hard ceiling.
+/// The effective per-request image cap: at least 1, never above the hard ceiling.
 pub(super) fn max_images(cfg: &ImageGenerationBoonSettings) -> u32 {
     cfg.max_images_per_request
         .clamp(1, IMAGE_GENERATION_MAX_PER_REQUEST)
@@ -176,6 +182,25 @@ pub(super) fn inject(
 pub(super) fn clamp_n(cfg: &ImageGenerationBoonSettings, args: &Value) -> u32 {
     let requested = args.get("n").and_then(|v| v.as_u64()).unwrap_or(1);
     (requested.clamp(1, max_images(cfg) as u64)) as u32
+}
+
+/// Timeout for one generation call. Deliberately the boon's own timeout, not
+/// the tool loop's `tool_timeout_ms` (default 30s): image generation routinely
+/// takes longer than an MCP call. Still capped by the loop's remaining time
+/// budget, and `None` once that is spent, so a slow image backend cannot
+/// carry the loop past its deadline.
+pub(super) fn call_timeout(
+    cfg: &ImageGenerationBoonSettings,
+    deadline: &super::tool_loop::LoopDeadline,
+) -> Option<Duration> {
+    deadline.bound(Duration::from_millis(cfg.timeout_ms.max(1)))
+}
+
+/// Images this request may still generate. `max_images_per_request` bounds
+/// the whole request, not each call: without this a model calling the tool
+/// once per turn multiplies the cap (and the bill) by the turn count.
+pub(super) fn images_remaining(cfg: &ImageGenerationBoonSettings, generated: usize) -> u32 {
+    max_images(cfg).saturating_sub(u32::try_from(generated).unwrap_or(u32::MAX))
 }
 
 /// `size` from the model's arguments when it is on the allowed list, otherwise
@@ -504,7 +529,14 @@ pub(super) struct ImageCtx<'a> {
 ///
 /// Fail-open throughout: every failure returns a receipt describing the failure
 /// and leaves the accumulator untouched, so the model answers in prose.
-pub(super) async fn execute(state: &AppState, ctx: &mut ImageCtx<'_>, args: &Value) -> String {
+///
+/// `timeout` bounds the generation call; see [`call_timeout`].
+pub(super) async fn execute(
+    state: &AppState,
+    ctx: &mut ImageCtx<'_>,
+    args: &Value,
+    timeout: Duration,
+) -> String {
     let Some(prompt) = prompt_arg(args) else {
         return failure_receipt("no prompt was supplied");
     };
@@ -526,11 +558,12 @@ pub(super) async fn execute(state: &AppState, ctx: &mut ImageCtx<'_>, args: &Val
         return failure_receipt("the image model is not available");
     }
 
-    let n = clamp_n(ctx.cfg, args);
+    let remaining = images_remaining(ctx.cfg, ctx.images.len());
+    if remaining == 0 {
+        return failure_receipt("the image limit for this request was already reached");
+    }
+    let n = clamp_n(ctx.cfg, args).min(remaining);
     let size = clamp_size(ctx.cfg, args);
-    // Deliberately the boon's own timeout, not the tool loop's `tool_timeout_ms`
-    // (default 30s): image generation routinely takes longer than an MCP call.
-    let timeout = Duration::from_millis(ctx.cfg.timeout_ms.max(1));
     let body = json!({
         "model": image_model.upstream_model,
         "prompt": prompt,
@@ -540,7 +573,7 @@ pub(super) async fn execute(state: &AppState, ctx: &mut ImageCtx<'_>, args: &Val
     });
 
     let started = crate::tracer::now_ms();
-    let outcome = generate(state, &image_model, body, timeout).await;
+    let outcome = generate(&state.http, &image_model, body, timeout).await;
     let upstream_ms = (crate::tracer::now_ms() - started) as u32;
 
     match outcome {
@@ -560,6 +593,8 @@ pub(super) async fn execute(state: &AppState, ctx: &mut ImageCtx<'_>, args: &Val
                 });
                 return failure_receipt("the image model returned no image");
             }
+            // A backend that ignores `n` must not push the request past its cap.
+            let urls: Vec<String> = urls.into_iter().take(n as usize).collect();
             let count = urls.len();
             for url in urls {
                 ctx.images.push(GeneratedImage {
@@ -638,22 +673,23 @@ fn sanitize_generation_error(e: &anyhow::Error) -> String {
 
 /// POST one generation request to the image model, bounded by `timeout`.
 async fn generate(
-    state: &AppState,
+    http: &reqwest::Client,
     model: &ResolvedModel,
     body: Value,
     timeout: Duration,
 ) -> anyhow::Result<Value> {
     let fut = async {
-        let url = build_images_url(&model.api_base);
-        let mut req = state.http.post(url).json(&body);
-        if let Some(api_key) = &model.api_key {
+        let target = super::helper_target(model, "", None)?;
+        let mut req = http.post(build_images_url(&target.base)).json(&body);
+        if let Some(api_key) = &target.api_key {
             req = req.bearer_auth(api_key);
         }
         let resp = req.send().await?;
         if !resp.status().is_success() {
             anyhow::bail!("upstream returned {}", resp.status());
         }
-        Ok(resp.json::<Value>().await?)
+        let bytes = super::read_body_capped(resp, IMAGE_BODY_MAX_BYTES).await?;
+        Ok(serde_json::from_slice::<Value>(&bytes)?)
     };
     match tokio::time::timeout(timeout, fut).await {
         Ok(result) => result,
@@ -1176,6 +1212,82 @@ mod tests {
             !receipt.contains("127.0.0.1"),
             "receipt leaked the host: {receipt}"
         );
+    }
+
+    #[test]
+    fn the_image_cap_spans_the_whole_request() {
+        // cfg() allows 2 per request.
+        assert_eq!(images_remaining(&cfg(), 0), 2);
+        assert_eq!(images_remaining(&cfg(), 1), 1);
+        assert_eq!(images_remaining(&cfg(), 2), 0, "a second call gets nothing");
+        assert_eq!(images_remaining(&cfg(), 5), 0);
+    }
+
+    #[test]
+    fn image_calls_are_bounded_by_the_loop_deadline() {
+        let mut settings = cfg();
+        settings.timeout_ms = 60_000;
+        let short = super::super::tool_loop::LoopDeadline::after(Duration::from_millis(500));
+        let t = call_timeout(&settings, &short).expect("time left");
+        assert!(t <= Duration::from_millis(500), "{t:?}");
+        let spent = super::super::tool_loop::LoopDeadline::after(Duration::ZERO);
+        assert_eq!(
+            call_timeout(&settings, &spent),
+            None,
+            "no image call once the budget is spent"
+        );
+    }
+
+    #[tokio::test]
+    async fn generation_rejects_an_oversized_response() {
+        let big = "x".repeat(IMAGE_BODY_MAX_BYTES + 1);
+        let app = axum::Router::new().route(
+            "/v1/images/generations",
+            axum::routing::post(move || {
+                let big = big.clone();
+                async move { big }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let model = crate::boons::tests::endpoint_only_route(&format!("http://{addr}/v1"));
+        let err = generate(
+            &reqwest::Client::new(),
+            &model,
+            serde_json::json!({}),
+            Duration::from_secs(30),
+        )
+        .await
+        .expect_err("over the cap");
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn generation_reaches_an_endpoint_only_image_model() {
+        let app = axum::Router::new().route(
+            "/v1/images/generations",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({ "data": [{ "b64_json": "AAAA" }] }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let model = crate::boons::tests::endpoint_only_route(&format!("http://{addr}/v1"));
+        let response = generate(
+            &reqwest::Client::new(),
+            &model,
+            serde_json::json!({ "prompt": "a cat" }),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("a blank api_base must not stop generation through the endpoint");
+        assert_eq!(image_urls(&response).len(), 1);
     }
 
     // ---- M3: passthrough URL sanitization ----

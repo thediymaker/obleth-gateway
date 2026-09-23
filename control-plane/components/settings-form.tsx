@@ -32,6 +32,7 @@ import {
   testSlurmConnectionAction,
   setUsageRetentionAction,
   compactUsageAction,
+  resyncCacheAction,
 } from "@/app/actions";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -61,6 +62,7 @@ import type {
   UpdateKnowledgeSettings,
   UpdateSlurmSettings,
   UsageRetentionView,
+  ResyncReport,
 } from "@/lib/obleth";
 
 const RETENTION_PRESETS = [7, 30, 90, 180, 365] as const;
@@ -3369,6 +3371,68 @@ export function UsageRetentionForm({ retention }: { retention: UsageRetentionVie
           </>
         }
       />
+    </Card>
+  );
+}
+
+function plural(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`;
+}
+
+/** Operator-facing summary of a resolver-cache reconcile. */
+export function describeResync(report: ResyncReport): string {
+  const republished = `Republished ${plural(report.keys, "key")}, ${plural(report.models, "model")}, and ${plural(report.mcp_servers, "MCP server")}.`;
+  const evicted = report.keys_pruned + report.model_names_pruned + report.mcp_servers_pruned;
+  if (evicted === 0) return `${republished} No stale entries found.`;
+  return `${republished} Evicted ${plural(report.keys_pruned, "stale key")}, ${plural(report.model_names_pruned, "stale model name")}, and ${plural(report.mcp_servers_pruned, "stale MCP server")}.`;
+}
+
+export function ResolverCacheCard() {
+  const [pending, start] = useTransition();
+  const [status, setStatus] = useState<{ ok: boolean; message: string } | null>(null);
+
+  function onReconcile() {
+    setStatus(null);
+    start(async () => {
+      const result = await resyncCacheAction();
+      setStatus(
+        result.ok && result.report
+          ? { ok: true, message: describeResync(result.report) }
+          : { ok: false, message: result.ok ? "No report returned" : result.error },
+      );
+    });
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2">
+          <RefreshCw className="h-4 w-4" />
+          Resolver cache
+        </CardTitle>
+        <CardDescription>
+          Gateways resolve API keys, models, and MCP servers from a Redis cache kept in step with the
+          database. Reconciling republishes every entry from the database and evicts entries that no
+          longer have a backing record. Use it when a delete reports that the cache eviction failed.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <Button onClick={onReconcile} disabled={pending}>
+          <RefreshCw className={cn("h-4 w-4", pending && "animate-spin")} />
+          {pending ? "Reconciling..." : "Reconcile cache"}
+        </Button>
+        {status && (
+          <p
+            className={
+              status.ok
+                ? "rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-600 dark:text-emerald-400"
+                : "rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive"
+            }
+          >
+            {status.message}
+          </p>
+        )}
+      </CardContent>
     </Card>
   );
 }

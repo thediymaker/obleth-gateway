@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use obleth_config::{Admission, FairshareAlgorithm};
-use obleth_fairshare::{AdmitRequest, FairShare, StaticCapacity};
+use obleth_fairshare::{AdmitRequest, FairShare, PoolKey, StaticCapacity, UNROUTED_POOL};
 use uuid::Uuid;
 
 /// Wait until the pool reports exactly `n` queued requests for `model`.
@@ -1272,4 +1272,282 @@ async fn sample_matches_snapshot_and_reports_group_totals() {
         .expect("join")
         .expect("a2 admit");
     drop(a2.permit);
+}
+
+/// A queued caller that gives up must not be granted on its way out: its
+/// tenant is charged only for the service it really receives, and the freed
+/// slot goes to the next live waiter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn abandoned_waiter_is_skipped_and_not_charged() {
+    let fs = FairShare::start(
+        Arc::new(StaticCapacity::new(4)),
+        FairshareAlgorithm::Weighted,
+        1,
+    );
+    let (holder, tenant) = (Uuid::new_v4(), Uuid::new_v4());
+    let (quit_key, live_key) = (Uuid::new_v4(), Uuid::new_v4());
+
+    let held = fs
+        .admit(AdmitRequest::new(holder, "m", 10))
+        .await
+        .unwrap()
+        .permit;
+
+    // Both of `tenant`'s requests queue behind `holder`. The first is the
+    // older head, so it would be served first if it were still waiting.
+    let fs_q = fs.clone();
+    let quitting = tokio::spawn(async move {
+        fs_q.admit(AdmitRequest::new(tenant, "m", 10).key(quit_key, 100))
+            .await
+    });
+    wait_for_queued(&fs, "m", 1).await;
+    let fs_l = fs.clone();
+    let live = tokio::spawn(async move {
+        fs_l.admit(AdmitRequest::new(tenant, "m", 10).key(live_key, 100))
+            .await
+    });
+    wait_for_queued(&fs, "m", 2).await;
+
+    let served = |snap: &obleth_fairshare::FairshareSnapshot| {
+        snap.pools[0]
+            .tenants
+            .iter()
+            .find(|t| t.tenant_id == tenant)
+            .map(|t| t.served_tokens)
+            .expect("tenant has state")
+    };
+    let before = served(&fs.snapshot().await.unwrap());
+    quitting.abort();
+    let _ = quitting.await;
+
+    drop(held);
+    let live = tokio::time::timeout(Duration::from_secs(1), live)
+        .await
+        .expect("the live waiter gets the freed slot")
+        .expect("join")
+        .expect("admit");
+    assert_eq!(live.admission, Admission::Queued);
+
+    let snap = fs.snapshot().await.unwrap();
+    assert_eq!((snap.pools[0].in_flight, snap.pools[0].queued), (1, 0));
+    assert_eq!(snap.global_queued, 0);
+    assert_eq!(
+        served(&snap),
+        before + 10.0,
+        "only the live request is charged; the abandoned one is never granted"
+    );
+    drop(live.permit);
+}
+
+/// Requests with no resolved route all land in one shared pool, whatever
+/// model string they carry, and that pool is never offered to the router.
+#[tokio::test]
+async fn unrouted_requests_share_one_pool() {
+    let fs = FairShare::start(
+        Arc::new(StaticCapacity::new(8)),
+        FairshareAlgorithm::Weighted,
+        4,
+    );
+    let t = Uuid::new_v4();
+    let a = fs
+        .admit_to(PoolKey::Unrouted, AdmitRequest::new(t, "typo-one", 1))
+        .await
+        .unwrap();
+    let b = fs
+        .admit_to(PoolKey::Unrouted, AdmitRequest::new(t, "typo-two", 1))
+        .await
+        .unwrap();
+    let routed = fs
+        .admit_to(PoolKey::Model("m".into()), AdmitRequest::new(t, "m", 1))
+        .await
+        .unwrap();
+
+    let snap = fs.snapshot().await.unwrap();
+    assert_eq!(
+        snap.pools.len(),
+        2,
+        "{:?}",
+        snap.pools.iter().map(|p| &p.model).collect::<Vec<_>>()
+    );
+    let unrouted = snap
+        .pools
+        .iter()
+        .find(|p| p.model == UNROUTED_POOL)
+        .expect("shared unrouted pool");
+    assert_eq!(unrouted.in_flight, 2);
+    assert!(!snap.pools.iter().any(|p| p.model.starts_with("typo")));
+    let load = fs.model_load();
+    assert_eq!(load.get("m").copied(), Some(1));
+    assert!(!load.contains_key(UNROUTED_POOL));
+
+    drop((a.permit, b.permit, routed.permit));
+}
+
+/// Poll snapshots until `done` holds, without sending any `Sample`: the
+/// scheduler's own housekeeping timer must do the work.
+async fn wait_for_snapshot(
+    fs: &FairShare,
+    what: &str,
+    done: impl Fn(&obleth_fairshare::FairshareSnapshot) -> bool,
+) -> obleth_fairshare::FairshareSnapshot {
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let snap = fs.snapshot().await.expect("snapshot");
+            if done(&snap) {
+                return snap;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+}
+
+/// A pool nobody has used for the idle TTL is dropped by housekeeping, with no
+/// history sampler running; a pool holding a permit or a waiter never is.
+/// Idle pools are also left out of history samples.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn idle_pools_are_pruned_and_left_out_of_samples() {
+    let fs = FairShare::start_with_idle_pool_ttl(
+        Arc::new(StaticCapacity::new(8)),
+        FairshareAlgorithm::Weighted,
+        1,
+        Duration::from_secs(2),
+    );
+    let t = Uuid::new_v4();
+
+    let gone = fs.admit(AdmitRequest::new(t, "gone", 1)).await.unwrap();
+    let held = fs.admit(AdmitRequest::new(t, "held", 1)).await.unwrap();
+    let busy = fs.admit(AdmitRequest::new(t, "busy", 1)).await.unwrap();
+    let fs_w = fs.clone();
+    let waiter = tokio::spawn(async move { fs_w.admit(AdmitRequest::new(t, "busy", 1)).await });
+    wait_for_queued(&fs, "busy", 1).await;
+    drop(gone.permit);
+
+    let sample = fs.sample().await.unwrap();
+    let sampled: Vec<&str> = sample.pools.iter().map(|p| p.model.as_str()).collect();
+    assert!(
+        !sampled.contains(&"gone"),
+        "idle pool left out of samples: {sampled:?}"
+    );
+    assert!(sampled.contains(&"held") && sampled.contains(&"busy"));
+    assert!(
+        fs.snapshot()
+            .await
+            .unwrap()
+            .pools
+            .iter()
+            .any(|p| p.model == "gone"),
+        "an idle pool survives until the TTL passes"
+    );
+
+    let snap = wait_for_snapshot(&fs, "the idle pool to be pruned", |s| {
+        !s.pools.iter().any(|p| p.model == "gone")
+    })
+    .await;
+    let models: Vec<&str> = snap.pools.iter().map(|p| p.model.as_str()).collect();
+    assert!(models.contains(&"held"), "a pool with a permit is kept");
+    assert!(models.contains(&"busy"), "a pool with a waiter is kept");
+
+    // A pruned pool comes back on demand.
+    let again = fs.admit(AdmitRequest::new(t, "gone", 1)).await.unwrap();
+    assert_eq!(again.admission, Admission::Fast);
+
+    drop(busy.permit);
+    let queued = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("waiter dispatched")
+        .expect("join")
+        .expect("admit");
+    drop((again.permit, held.permit, queued.permit));
+}
+
+/// A caller that gives up while stuck behind another waiter is cleared by
+/// housekeeping, with no history sampler running, so `queued` stops counting
+/// it long before it would reach the head of the queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn housekeeping_clears_mid_queue_dead_waiters() {
+    let fs = FairShare::start_with_idle_pool_ttl(
+        Arc::new(StaticCapacity::new(8)),
+        FairshareAlgorithm::Weighted,
+        1,
+        Duration::from_secs(2),
+    );
+    let t = Uuid::new_v4();
+    let held = fs.admit(AdmitRequest::new(t, "m", 1)).await.unwrap();
+
+    let fs_a = fs.clone();
+    let head = tokio::spawn(async move { fs_a.admit(AdmitRequest::new(t, "m", 1)).await });
+    wait_for_queued(&fs, "m", 1).await;
+    let fs_b = fs.clone();
+    let behind = tokio::spawn(async move { fs_b.admit(AdmitRequest::new(t, "m", 1)).await });
+    wait_for_queued(&fs, "m", 2).await;
+    behind.abort();
+    let _ = behind.await;
+
+    let snap = wait_for_snapshot(&fs, "the dead waiter to be cleared", |s| {
+        s.global_queued == 1
+    })
+    .await;
+    assert_eq!(snap.model_queued.get("m").copied(), Some(1));
+    assert_eq!(
+        fs.stats().queued.load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+
+    drop(held.permit);
+    let head = tokio::time::timeout(Duration::from_secs(1), head)
+        .await
+        .expect("the live head is dispatched")
+        .expect("join")
+        .expect("admit");
+    drop(head.permit);
+}
+
+/// When the global ceiling binds below the pool cap, the snapshot reports the
+/// group caps the scheduler actually enforces, not a split of the nominal cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn snapshot_group_caps_follow_the_binding_ceiling() {
+    let fs = FairShare::start(
+        Arc::new(StaticCapacity::new(4)),
+        FairshareAlgorithm::Hierarchical,
+        8,
+    );
+    let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+    let mut permits = Vec::new();
+    for _ in 0..4 {
+        permits.push(
+            fs.admit(AdmitRequest::new(a, "m", 1).group("a", 100))
+                .await
+                .unwrap()
+                .permit,
+        );
+    }
+    let fs_b = fs.clone();
+    let waiter = tokio::spawn(async move {
+        fs_b.admit(AdmitRequest::new(b, "m", 1).group("b", 100))
+            .await
+    });
+    wait_for_queued(&fs, "m", 1).await;
+
+    let snap = fs.snapshot().await.unwrap();
+    let pool = &snap.pools[0];
+    assert_eq!(pool.cap, 8);
+    let group = |name: &str| pool.groups.iter().find(|g| g.name == name).unwrap();
+    assert_eq!(
+        group("a").slot_cap,
+        2,
+        "half of the 4 usable slots, not of 8"
+    );
+    assert_eq!(group("a").borrowed, 2);
+    assert_eq!(group("b").slot_cap, 2);
+    assert_eq!(pool.borrowed, 2);
+
+    permits.pop();
+    let b_admitted = tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("b dispatched")
+        .expect("join")
+        .expect("admit");
+    drop((permits, b_admitted.permit));
 }

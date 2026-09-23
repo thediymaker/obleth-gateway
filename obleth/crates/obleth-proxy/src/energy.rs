@@ -75,17 +75,28 @@ impl EnergyEngine {
         let Some(r) = self.reading() else {
             return EnergyFigures::default();
         };
-        if r.node_count == 0 || r.cluster_watts <= 0.0 {
+        // NaN passes `<= 0.0` (every comparison with it is false).
+        if r.node_count == 0 || !r.cluster_watts.is_finite() || r.cluster_watts <= 0.0 {
             return EnergyFigures::default();
         }
         let serving_ms = total_ms.saturating_sub(queue_wait_ms) as f64;
         let watts_per_slot =
             r.cluster_watts / r.node_count as f64 / energy_slots_per_node as f64 * s.pue;
         let energy_wh = watts_per_slot * serving_ms / 3_600_000.0;
-        EnergyFigures {
+        let figures = EnergyFigures {
             energy_wh,
             energy_cost_usd: energy_wh / 1000.0 * s.energy_cost_per_kwh,
             co2_g: energy_wh / 1000.0 * s.carbon_g_per_kwh,
+        };
+        // Figures are frozen into the ledger; a NaN there serialises as JSON
+        // null and sums to NaN in every rollup, so it is recorded as no reading.
+        if [figures.energy_wh, figures.energy_cost_usd, figures.co2_g]
+            .iter()
+            .all(|v| v.is_finite())
+        {
+            figures
+        } else {
+            EnergyFigures::default()
         }
     }
 }
@@ -223,6 +234,27 @@ mod tests {
             engine_with(Some(r), true).compute(8, 1000, 0).energy_wh,
             0.0
         );
+    }
+
+    #[test]
+    fn non_finite_inputs_yield_zero() {
+        for watts in [f64::NAN, f64::INFINITY] {
+            let r = PowerReading {
+                cluster_watts: watts,
+                node_count: 178,
+                at_ms: 0,
+            };
+            assert_eq!(
+                engine_with(Some(r), true).compute(8, 1000, 0),
+                EnergyFigures::default()
+            );
+        }
+        // A finite reading with a non-finite rate must not leak NaN either.
+        let mut s = engine_with(None, true).settings().as_ref().clone();
+        s.carbon_g_per_kwh = f64::NAN;
+        let e = EnergyEngine::new(s);
+        e.store_reading(reading_409kw_178n());
+        assert_eq!(e.compute(8, 1000, 0), EnergyFigures::default());
     }
 
     #[test]

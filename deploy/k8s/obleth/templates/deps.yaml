@@ -177,7 +177,12 @@ spec:
     type: Recreate
   selector: { matchLabels: { app: {{ .Release.Name }}-clickhouse } }
   template:
-    metadata: { labels: { app: {{ .Release.Name }}-clickhouse } }
+    metadata:
+      labels: { app: {{ .Release.Name }}-clickhouse }
+      annotations:
+        # Restart ClickHouse with the new CLICKHOUSE_PASSWORD when the
+        # chart-rendered Secret changes, in step with the gateway.
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
       containers:
         - name: clickhouse

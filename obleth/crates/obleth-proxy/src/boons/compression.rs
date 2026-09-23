@@ -316,19 +316,17 @@ pub(super) async fn apply_lossy(
         out
     };
 
+    // Largest segments first: the loop below stops after `max_lossy_segments`
+    // compactions, so this is the order in which segments can be used, and it
+    // spends that budget where the savings are.
+    let mut targets = targets;
+    targets.sort_by_cached_key(|(_, _, t)| std::cmp::Reverse(tk.count_text(t)));
+
     // Compute neural scores with a single batched call outside the loop.
     // Exactly one `score` call per request; fails open (None) on any error.
     let n_targets = targets.len();
     let neural_scores: Vec<Option<Vec<f32>>> = {
-        let prose_indices: Vec<usize> = targets
-            .iter()
-            .enumerate()
-            .filter_map(|(i, (_, _, t))| (classify(t) == ContentKind::Prose).then_some(i))
-            .collect();
-        let batches: Vec<Vec<String>> = prose_indices
-            .iter()
-            .map(|&i| super::compressor::split_sentences(&targets[i].2))
-            .collect();
+        let (prose_indices, batches) = scoring_batches(&targets, cfg.max_lossy_segments);
         // No references to `targets` are held past this point.
         let flat: Option<Vec<Vec<f32>>> = if let Some(kc) = state.compressor.as_ref() {
             if !prose_indices.is_empty() {
@@ -393,6 +391,44 @@ pub(super) async fn apply_lossy(
         }
     }
     stats
+}
+
+/// Hard ceiling on segments sent to the compressor sidecar in one `/score`
+/// call, whatever `max_lossy_segments` says.
+const SCORE_MAX_SEGMENTS: usize = 16;
+/// Hard ceiling on sentences sent in one `/score` call. A segment that would
+/// cross it is left unscored and compacts via the heuristic path instead.
+const SCORE_MAX_SENTENCES: usize = 2_048;
+
+/// The prose segments worth scoring and their sentence batches, as
+/// `(target indices, batches)`. `targets` is already in the order the lossy
+/// loop consumes it (largest first), so the first `max_segments` prose
+/// segments are the only ones the loop can use; scoring the whole history
+/// would ship every old turn to the sidecar on every request.
+fn scoring_batches(
+    targets: &[(usize, Option<usize>, String)],
+    max_segments: u32,
+) -> (Vec<usize>, Vec<Vec<String>>) {
+    let limit = (max_segments as usize).min(SCORE_MAX_SEGMENTS);
+    let mut indices = Vec::new();
+    let mut batches = Vec::new();
+    let mut sentences = 0usize;
+    for (i, (_, _, text)) in targets.iter().enumerate() {
+        if indices.len() >= limit {
+            break;
+        }
+        if text.contains("OBLETH_TABLE") || classify(text) != ContentKind::Prose {
+            continue;
+        }
+        let batch = super::compressor::split_sentences(text);
+        if sentences + batch.len() > SCORE_MAX_SENTENCES {
+            continue;
+        }
+        sentences += batch.len();
+        indices.push(i);
+        batches.push(batch);
+    }
+    (indices, batches)
 }
 
 /// Terms from the latest user message, used to bias prose extraction toward the
@@ -1343,5 +1379,53 @@ mod tests {
         let stats = apply(&cfg, false, &mut body);
         assert_eq!(stats.compressed, 0);
         assert_eq!(body["messages"][0]["content"].as_str().unwrap(), prose);
+    }
+}
+
+#[cfg(test)]
+mod scoring_tests {
+    use super::*;
+
+    fn prose(sentences: usize) -> String {
+        (0..sentences)
+            .map(|i| format!("Sentence number {i} says something plain."))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn scoring_sends_only_the_segments_the_loop_can_use() {
+        let targets: Vec<(usize, Option<usize>, String)> =
+            (0..10).map(|i| (i, None, prose(5))).collect();
+        let (indices, batches) = scoring_batches(&targets, 3);
+        assert_eq!(
+            indices,
+            vec![0, 1, 2],
+            "at most max_lossy_segments are scored"
+        );
+        assert_eq!(batches.len(), 3);
+        assert!(batches.iter().all(|b| b.len() == 5));
+    }
+
+    #[test]
+    fn scoring_skips_non_prose_and_respects_the_hard_caps() {
+        let mut targets: Vec<(usize, Option<usize>, String)> = vec![
+            (0, None, "{\"a\": [1, 2, 3]}".to_string()),
+            (1, None, format!("OBLETH_TABLE rows=3 {}", prose(5))),
+            (2, None, prose(SCORE_MAX_SENTENCES + 1)),
+            (3, None, prose(4)),
+        ];
+        let (indices, _) = scoring_batches(&targets, 50);
+        assert_eq!(
+            indices,
+            vec![3],
+            "JSON, already-compacted tables, and a segment over the sentence cap are not sent"
+        );
+
+        targets = (0..(SCORE_MAX_SEGMENTS + 8))
+            .map(|i| (i, None, prose(2)))
+            .collect();
+        let (indices, _) = scoring_batches(&targets, u32::MAX);
+        assert_eq!(indices.len(), SCORE_MAX_SEGMENTS);
     }
 }

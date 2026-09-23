@@ -12,6 +12,14 @@ impl CompletionGuard {
         }
     }
 
+    /// Replace the cancellation callback without running the old one, so the
+    /// fallback can track what is known as the request progresses (before
+    /// upstream headers nothing was generated; after them, the estimate
+    /// stands in for undelivered usage). Still runs at most once.
+    pub(crate) fn rearm(&mut self, on_cancel: impl FnOnce() + Send + 'static) {
+        self.on_cancel = Some(Box::new(on_cancel));
+    }
+
     pub(crate) fn complete(
         mut self,
         future: impl std::future::Future<Output = ()> + Send + 'static,
@@ -69,6 +77,42 @@ mod tests {
         assert_eq!(stream.next().await, Some(1));
         assert_eq!(count.load(Ordering::SeqCst), 0);
         drop(stream);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rearmed_guard_runs_only_the_new_callback_once() {
+        let first = Arc::new(AtomicUsize::new(0));
+        let second = Arc::new(AtomicUsize::new(0));
+        let (f, s) = (first.clone(), second.clone());
+        let mut guard = CompletionGuard::new(move || {
+            f.fetch_add(1, Ordering::SeqCst);
+        });
+        guard.rearm(move || {
+            s.fetch_add(1, Ordering::SeqCst);
+        });
+        drop(guard);
+        assert_eq!(first.load(Ordering::SeqCst), 0);
+        assert_eq!(second.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn completed_rearmed_guard_never_runs_a_callback() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let (a, b) = (count.clone(), count.clone());
+        let mut guard = CompletionGuard::new(move || {
+            a.fetch_add(100, Ordering::SeqCst);
+        });
+        guard.rearm(move || {
+            b.fetch_add(100, Ordering::SeqCst);
+        });
+        let counter = count.clone();
+        guard
+            .complete(async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 

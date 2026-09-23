@@ -799,6 +799,7 @@ impl BoonEngine {
                 settings: settings.tool_loop.clone(),
                 passthrough_unmapped: client_sent_tools,
                 image_gen: image_gen_cfg.clone(),
+                served_url: None,
             }
         });
 
@@ -863,6 +864,93 @@ pub(crate) struct ChatCallResult {
     pub output_tokens: u32,
 }
 
+/// Largest helper reply body read into memory. A helper reply is one chat
+/// completion (or one MCP JSON-RPC message); anything bigger is a misbehaving
+/// upstream, and reading it unbounded would let it exhaust gateway memory.
+pub(crate) const HELPER_BODY_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Where a helper call is sent: the same endpoint selection the proxy's own
+/// dispatch uses ([`crate::proxy::build_targets`]), so a model that lives only
+/// in `endpoints` (every Slurm-provisioned model has a blank `api_base`) is
+/// reachable, unhealthy endpoints are skipped, and a per-endpoint key wins
+/// over the model's.
+///
+/// `pinned` is a URL the model already answered on this request (the tool
+/// loop's turn 0); the target whose base prefixes it is chosen so follow-up
+/// turns land on the replica holding the conversation's prefix cache. Falls
+/// back to the first target when nothing matches.
+pub(crate) fn helper_target(
+    model: &ResolvedModel,
+    session_key: &str,
+    pinned: Option<&str>,
+) -> anyhow::Result<crate::proxy::Target> {
+    let mut targets =
+        crate::proxy::build_targets(Some(model), "", &model.endpoint_selection_mode, session_key);
+    let pick = pinned
+        .and_then(|url| {
+            targets.iter().position(|t| {
+                // Whole path segments only: `http://h:8000/v1` must not
+                // claim a URL served by `http://h:8000/v10`.
+                let base = t.base.trim_end_matches('/');
+                !base.is_empty()
+                    && url.strip_prefix(base).is_some_and(|rest| {
+                        rest.is_empty() || rest.starts_with('/') || rest.starts_with('?')
+                    })
+            })
+        })
+        .unwrap_or(0);
+    if pick >= targets.len() {
+        anyhow::bail!("model `{}` has no upstream target", model.model_name);
+    }
+    let target = targets.swap_remove(pick);
+    if target.base.trim().is_empty() {
+        anyhow::bail!(
+            "model `{}` has no usable upstream endpoint",
+            model.model_name
+        );
+    }
+    Ok(target)
+}
+
+/// Read a response body, refusing anything larger than `max` bytes. The
+/// declared `content-length` is checked first so an honest oversized reply is
+/// rejected without reading it; chunked bodies are cut off as they cross.
+pub(crate) async fn read_body_capped(
+    mut resp: reqwest::Response,
+    max: usize,
+) -> anyhow::Result<bytes::Bytes> {
+    if resp.content_length().is_some_and(|n| n > max as u64) {
+        anyhow::bail!("upstream body exceeds {max} bytes");
+    }
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if buf.len().saturating_add(chunk.len()) > max {
+            anyhow::bail!("upstream body exceeds {max} bytes");
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(bytes::Bytes::from(buf))
+}
+
+/// POST one non-streaming chat completion to `target` and return the parsed
+/// JSON body (size-capped). No timeout of its own; callers bound it.
+async fn post_chat_completion(
+    http: &reqwest::Client,
+    target: &crate::proxy::Target,
+    body: &Value,
+) -> anyhow::Result<Value> {
+    let mut req = http.post(build_chat_url(&target.base)).json(body);
+    if let Some(api_key) = &target.api_key {
+        req = req.bearer_auth(api_key);
+    }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        anyhow::bail!("upstream returned {}", resp.status());
+    }
+    let bytes = read_body_capped(resp, HELPER_BODY_MAX_BYTES).await?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 /// Send a chat-completions request to a helper model (describer, fixer) and
 /// return its reply text, bounded by `timeout`.
 pub(crate) async fn chat_call(
@@ -871,17 +959,18 @@ pub(crate) async fn chat_call(
     body: Value,
     timeout: Duration,
 ) -> anyhow::Result<ChatCallResult> {
+    chat_call_with(&state.http, helper, body, timeout).await
+}
+
+async fn chat_call_with(
+    http: &reqwest::Client,
+    helper: &ResolvedModel,
+    body: Value,
+    timeout: Duration,
+) -> anyhow::Result<ChatCallResult> {
     let fut = async {
-        let url = build_chat_url(&helper.api_base);
-        let mut req = state.http.post(url).json(&body);
-        if let Some(api_key) = &helper.api_key {
-            req = req.bearer_auth(api_key);
-        }
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("helper upstream returned {}", resp.status());
-        }
-        let body: Value = resp.json().await?;
+        let target = helper_target(helper, "", None)?;
+        let body = post_chat_completion(http, &target, &body).await?;
         let text = body
             .pointer("/choices/0/message/content")
             .and_then(|v| v.as_str())
@@ -919,19 +1008,19 @@ pub(crate) async fn chat_call_completion(
     body: Value,
     timeout: Duration,
 ) -> anyhow::Result<Value> {
-    let fut = async {
-        let url = build_chat_url(&model.api_base);
-        let mut req = state.http.post(url).json(&body);
-        if let Some(api_key) = &model.api_key {
-            req = req.bearer_auth(api_key);
-        }
-        let resp = req.send().await?;
-        if !resp.status().is_success() {
-            anyhow::bail!("upstream returned {}", resp.status());
-        }
-        Ok(resp.json::<Value>().await?)
-    };
-    match tokio::time::timeout(timeout, fut).await {
+    let target = helper_target(model, "", None)?;
+    chat_call_completion_on(&state.http, &target, body, timeout).await
+}
+
+/// [`chat_call_completion`] against an already-resolved target, for callers
+/// that must keep every call on one endpoint (the tool loop).
+pub(crate) async fn chat_call_completion_on(
+    http: &reqwest::Client,
+    target: &crate::proxy::Target,
+    body: Value,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    match tokio::time::timeout(timeout, post_chat_completion(http, target, &body)).await {
         Ok(result) => result,
         Err(_) => anyhow::bail!("chat call timed out after {timeout:?}"),
     }
@@ -975,6 +1064,7 @@ pub(crate) fn bill_helper_call(
     if key.internal {
         return;
     }
+    commit_helper_term_usage(state, key, total_tokens as i64, cost_usd);
     state.telemetry.record(UsageRecord {
         request_id: Uuid::new_v4(),
         tenant_id: key.tenant_id,
@@ -1025,6 +1115,7 @@ pub(crate) fn bill_image_generation(
     if key.internal {
         return;
     }
+    commit_helper_term_usage(state, key, 0, cost_usd);
     state.telemetry.record(UsageRecord {
         request_id: Uuid::new_v4(),
         tenant_id: key.tenant_id,
@@ -1055,6 +1146,60 @@ pub(crate) fn bill_image_generation(
     });
 }
 
+/// The term-budget counters one helper call must be added to: `(counter id,
+/// period key)` for the tenant and for the key, each present only when that
+/// scope has a cumulative cap. Period keys come from the same functions the
+/// proxy's settle path uses, so helper spend lands in the very counters
+/// admission checks.
+fn helper_term_commits(
+    key: &ResolvedKey,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<(Uuid, String)> {
+    let mut commits = Vec::with_capacity(2);
+    if let Some(period) = crate::proxy::term_period_key(key, now) {
+        commits.push((key.tenant_id, period));
+    }
+    if let Some(period) = crate::proxy::key_term_period_key(key, now) {
+        commits.push((key.key_id, period));
+    }
+    commits
+}
+
+/// Add helper spend to the tenant and key term-budget counters. Without this a
+/// tenant at its hard cap keeps spending through vision, repair, guardrails,
+/// tool-loop turns, and image generation, because only the main request was
+/// ever committed. Detached so the helper's caller never waits on Redis, and
+/// fail-open: a Redis error is logged and the spend stays in the ledger only.
+fn commit_helper_term_usage(state: &AppState, key: &ResolvedKey, tokens: i64, cost_usd: f64) {
+    if tokens <= 0 && cost_usd <= 0.0 {
+        return;
+    }
+    let commits = helper_term_commits(key, chrono::Utc::now());
+    if commits.is_empty() {
+        return;
+    }
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let redis = state.redis.clone();
+    runtime.spawn(async move {
+        apply_term_commits(&redis, &commits, tokens, cost_usd).await;
+    });
+}
+
+async fn apply_term_commits(
+    redis: &obleth_redis::RedisStore,
+    commits: &[(Uuid, String)],
+    tokens: i64,
+    cost_usd: f64,
+) {
+    for (id, period) in commits {
+        if let Err(e) = redis.term_usage_add(id, period, tokens, cost_usd).await {
+            tracing::warn!(error = %e, counter = %id, "helper term usage commit failed");
+        }
+    }
+}
+
 pub(crate) fn build_chat_url(api_base: &str) -> String {
     let base = api_base.trim_end_matches('/');
     format!("{base}/chat/completions")
@@ -1066,6 +1211,16 @@ pub(crate) fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// Test fixtures other modules of the crate reuse.
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// A Slurm-provisioned model: blank `api_base`, one healthy endpoint
+    /// carrying its own key (`endpoint-key`).
+    pub(crate) fn endpoint_only_route(base: &str) -> obleth_config::ResolvedModel {
+        super::tests::endpoint_only_route(base)
+    }
 }
 
 #[cfg(test)]
@@ -1168,6 +1323,7 @@ mod tests {
             settings: obleth_config::ToolLoopSettings::default(),
             passthrough_unmapped: false,
             image_gen: None,
+            served_url: None,
         }
     }
 
@@ -1452,6 +1608,219 @@ mod tests {
             build_chat_url("http://host:8080/v1"),
             "http://host:8080/v1/chat/completions"
         );
+    }
+
+    fn endpoint(id: &str, base: &str, key: Option<&str>, healthy: bool) -> ResolvedEndpoint {
+        ResolvedEndpoint {
+            id: id.to_string(),
+            api_base: base.to_string(),
+            api_key: key.map(str::to_string),
+            priority: 0,
+            weight: 1,
+            enabled: true,
+            healthy,
+        }
+    }
+
+    /// A Slurm-provisioned model: blank `api_base`, reachable only through its
+    /// endpoint list.
+    pub(super) fn endpoint_only_route(base: &str) -> ResolvedModel {
+        let mut route = test_route();
+        route.api_base = String::new();
+        route.api_key = Some("model-key".into());
+        route.endpoints = vec![endpoint("e1", base, Some("endpoint-key"), true)];
+        route
+    }
+
+    use obleth_config::ResolvedEndpoint;
+
+    #[test]
+    fn helper_target_uses_the_healthy_endpoint_of_an_endpoint_only_model() {
+        let route = endpoint_only_route("http://replica-1:8000/v1");
+        let target = helper_target(&route, "", None).expect("endpoint target");
+        assert_eq!(target.base, "http://replica-1:8000/v1");
+        assert_eq!(
+            target.api_key.as_deref(),
+            Some("endpoint-key"),
+            "the endpoint's own key wins over the model's"
+        );
+    }
+
+    #[test]
+    fn helper_target_refuses_a_model_with_nowhere_to_go() {
+        let mut route = endpoint_only_route("http://replica-1:8000/v1");
+        route.endpoints[0].healthy = false;
+        assert!(
+            helper_target(&route, "", None).is_err(),
+            "no healthy endpoint and a blank api_base must fail the helper, not POST to /chat/completions"
+        );
+        route.endpoints.clear();
+        assert!(helper_target(&route, "", None).is_err());
+    }
+
+    #[test]
+    fn helper_target_pins_the_endpoint_that_served_the_request() {
+        let mut route = endpoint_only_route("http://replica-1:8000/v1");
+        route
+            .endpoints
+            .push(endpoint("e2", "http://replica-2:8000/v1/", None, true));
+        route.endpoints[1].priority = 5;
+        // Failover order would pick replica-1 first.
+        let pinned = helper_target(
+            &route,
+            "",
+            Some("http://replica-2:8000/v1/chat/completions"),
+        )
+        .unwrap();
+        assert_eq!(pinned.base, "http://replica-2:8000/v1/");
+        assert_eq!(
+            pinned.api_key.as_deref(),
+            Some("model-key"),
+            "an endpoint without its own key falls back to the model's"
+        );
+        // A pin matches whole path segments only.
+        let mut prefixed = route.clone();
+        prefixed.endpoints[1].api_base = "http://replica-1:8000/v10".into();
+        prefixed.endpoints[1].priority = 0;
+        prefixed.endpoints[0].priority = 5;
+        let pin = helper_target(
+            &prefixed,
+            "",
+            Some("http://replica-1:8000/v10/chat/completions"),
+        )
+        .unwrap();
+        assert_eq!(pin.base, "http://replica-1:8000/v10");
+        prefixed.endpoints[0].priority = 0;
+        prefixed.endpoints[1].priority = 5;
+        let pin = helper_target(
+            &prefixed,
+            "",
+            Some("http://replica-1:8000/v10/chat/completions"),
+        )
+        .unwrap();
+        assert_eq!(
+            pin.base, "http://replica-1:8000/v10",
+            "`/v1` must not claim a URL served by `/v10`"
+        );
+        // A pin that matches nothing falls back to normal selection.
+        let fallback = helper_target(&route, "", Some("http://elsewhere/v1")).unwrap();
+        assert_eq!(fallback.base, "http://replica-1:8000/v1");
+    }
+
+    /// Serve `reply` on `/v1/chat/completions`, recording each request's
+    /// bearer token.
+    pub(super) async fn chat_server(reply: Value) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen_clone = seen.clone();
+        let app = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let seen = seen_clone.clone();
+                let reply = reply.clone();
+                async move {
+                    let auth = headers
+                        .get("authorization")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string();
+                    seen.lock().unwrap().push(auth);
+                    axum::Json(reply)
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}/v1"), seen)
+    }
+
+    #[tokio::test]
+    async fn chat_call_reaches_an_endpoint_only_model() {
+        let (base, seen) = chat_server(serde_json::json!({
+            "choices": [{ "message": { "role": "assistant", "content": "described" } }],
+            "usage": { "prompt_tokens": 7, "completion_tokens": 3 }
+        }))
+        .await;
+        let route = endpoint_only_route(&base);
+        let reply = chat_call_with(
+            &reqwest::Client::new(),
+            &route,
+            serde_json::json!({ "messages": [] }),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("helper call through the endpoint");
+        assert_eq!(reply.text, "described");
+        assert_eq!((reply.input_tokens, reply.output_tokens), (7, 3));
+        assert_eq!(seen.lock().unwrap().as_slice(), ["Bearer endpoint-key"]);
+    }
+
+    #[tokio::test]
+    async fn chat_call_completion_on_rejects_an_oversized_reply() {
+        let big = "x".repeat(HELPER_BODY_MAX_BYTES + 1);
+        let (base, _) = chat_server(serde_json::json!({ "pad": big })).await;
+        let target = helper_target(&endpoint_only_route(&base), "", None).unwrap();
+        let err = chat_call_completion_on(
+            &reqwest::Client::new(),
+            &target,
+            serde_json::json!({}),
+            Duration::from_secs(10),
+        )
+        .await
+        .expect_err("a reply over the cap is refused");
+        assert!(err.to_string().contains("exceeds"), "{err}");
+    }
+
+    #[test]
+    fn helper_spend_targets_both_capped_term_counters() {
+        let now = chrono::Utc::now();
+        let mut key = test_key_with_policy(None);
+        key.tenant_id = Uuid::from_u128(1);
+        key.key_id = Uuid::from_u128(2);
+        assert!(
+            helper_term_commits(&key, now).is_empty(),
+            "no cumulative cap anywhere, nothing to commit"
+        );
+
+        key.budget_cost_usd = Some(10.0);
+        key.key_budget_tokens = Some(1_000);
+        key.key_budget_period = Some("monthly".into());
+        let commits = helper_term_commits(&key, now);
+        assert_eq!(
+            commits,
+            vec![
+                (
+                    key.tenant_id,
+                    crate::proxy::term_period_key(&key, now).unwrap()
+                ),
+                (
+                    key.key_id,
+                    crate::proxy::key_term_period_key(&key, now).unwrap()
+                ),
+            ]
+        );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn helper_spend_lands_in_the_term_counters_admission_reads() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let redis = obleth_redis::RedisStore::connect(&url).await.unwrap();
+        let tenant = Uuid::new_v4();
+        let key_id = Uuid::new_v4();
+        let commits = vec![(tenant, "l:0".to_string()), (key_id, "l:0".to_string())];
+        apply_term_commits(&redis, &commits, 120, 0.5).await;
+        apply_term_commits(&redis, &commits, 30, 0.25).await;
+        for id in [tenant, key_id] {
+            let (tokens, cost) = redis.term_usage_read(&id, "l:0").await.unwrap();
+            assert_eq!(tokens, 150);
+            assert!((cost - 0.75).abs() < 1e-9, "cost {cost}");
+        }
     }
 
     /// The knowledge boon's two-phase split is an ordering property of

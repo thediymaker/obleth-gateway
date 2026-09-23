@@ -30,6 +30,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use obleth_config::{ResolvedKey, ResolvedModel, ToolLoopSettings};
+use obleth_tokenizer::Tokenizer;
 use serde_json::{json, Value};
 
 use super::mcp_tools::{self, McpTool};
@@ -119,6 +120,12 @@ pub struct ToolLoopPlan {
     /// the loop. `None` leaves `generate_image` unhandled, which is correct:
     /// the tool is only ever injected alongside this field.
     pub image_gen: Option<obleth_config::ImageGenerationBoonSettings>,
+    /// URL of the upstream that answered turn 0, when the dispatcher records
+    /// it. Follow-up turns go to the same endpoint so they reuse its prefix
+    /// cache. `None` falls back to the model's endpoint selection with this
+    /// request's session key, which picks the same first endpoint the proxy
+    /// tried in `failover` and `session_hash` modes.
+    pub served_url: Option<String>,
 }
 
 /// Inject the granted servers' tools into a chat request. Returns the
@@ -200,10 +207,34 @@ pub(super) async fn inject(
     Some(map)
 }
 
+/// How long a failed `tools/list` is remembered. Without it every request to
+/// a tool-granted model re-pays the full discovery timeout while the server is
+/// down; long enough to shed that load, short enough that a recovered server
+/// is picked up quickly.
+const MCP_DISCOVERY_NEGATIVE_TTL: Duration = Duration::from_secs(45);
+
+type ToolCache = moka::future::Cache<String, Arc<Vec<McpTool>>>;
+
+/// Failed discoveries, cached as an empty tool list. Separate from
+/// `AppState::tool_cache` because that cache's 10-minute TTL is right for a
+/// success and far too long for a failure.
+fn discovery_failures() -> &'static ToolCache {
+    static CACHE: std::sync::OnceLock<ToolCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| {
+        moka::future::Cache::builder()
+            .time_to_live(MCP_DISCOVERY_NEGATIVE_TTL)
+            .max_capacity(1_000)
+            .build()
+    })
+}
+
 /// Discovered tools for one server, via the short-TTL cache.
 async fn cached_tools(state: &AppState, server_name: &str) -> Option<Arc<Vec<McpTool>>> {
     if let Some(tools) = state.tool_cache.get(server_name).await {
         return Some(tools);
+    }
+    if let Some(empty) = discovery_failures().get(server_name).await {
+        return Some(empty);
     }
     let Some(server) = crate::mcp::resolve_mcp(state, server_name).await else {
         tracing::warn!(server = %server_name, "granted MCP server is not registered");
@@ -212,20 +243,157 @@ async fn cached_tools(state: &AppState, server_name: &str) -> Option<Arc<Vec<Mcp
     if !server.enabled {
         return None;
     }
-    match mcp_tools::list_tools(state, &server, Duration::from_secs(10)).await {
-        Ok(tools) => {
-            let tools = Arc::new(tools);
-            state
-                .tool_cache
-                .insert(server_name.to_string(), tools.clone())
-                .await;
-            Some(tools)
-        }
+    discover_coalesced(
+        &state.tool_cache,
+        discovery_failures(),
+        server_name,
+        mcp_tools::list_tools(state, &server, Duration::from_secs(10)),
+    )
+    .await
+}
+
+/// Run one discovery for `server_name`, shared by every concurrent miss
+/// (moka `try_get_with` runs a single init per key and hands its result to all
+/// waiters), so a burst of requests after expiry sends one `tools/list`, not
+/// one per request. A failure is recorded in `failures` as an empty list.
+async fn discover_coalesced<F>(
+    cache: &ToolCache,
+    failures: &ToolCache,
+    server_name: &str,
+    fetch: F,
+) -> Option<Arc<Vec<McpTool>>>
+where
+    F: std::future::Future<Output = anyhow::Result<Vec<McpTool>>>,
+{
+    match cache
+        .try_get_with(server_name.to_string(), async { fetch.await.map(Arc::new) })
+        .await
+    {
+        Ok(tools) => Some(tools),
         Err(e) => {
             tracing::warn!(error = %e, server = %server_name, "mcp tool discovery failed");
-            None
+            let empty = Arc::new(Vec::new());
+            failures
+                .insert(server_name.to_string(), empty.clone())
+                .await;
+            Some(empty)
         }
     }
+}
+
+/// Per-request MCP session state, shared by both loop variants. Generic only
+/// so tests can stand in for a real session.
+pub(super) struct Sessions<S = mcp_tools::Session> {
+    open: HashMap<String, S>,
+    /// Servers whose `initialize` already failed on this request, with the
+    /// error. Retrying a dead server on every call would cost a full tool
+    /// timeout per call.
+    failed: HashMap<String, String>,
+}
+
+impl<S> Default for Sessions<S> {
+    fn default() -> Self {
+        Sessions {
+            open: HashMap::new(),
+            failed: HashMap::new(),
+        }
+    }
+}
+
+impl<S> Sessions<S> {
+    /// The open session for `server`, opening it on first use. A server whose
+    /// open already failed on this request fails again immediately with the
+    /// original error.
+    async fn get_or_open<F, Fut>(&mut self, server: &str, open: F) -> Result<&S, String>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = anyhow::Result<S>>,
+    {
+        if let Some(err) = self.failed.get(server) {
+            return Err(err.clone());
+        }
+        if !self.open.contains_key(server) {
+            match open().await {
+                Ok(session) => {
+                    self.open.insert(server.to_string(), session);
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, server = %server, "mcp session open failed");
+                    let msg = e.to_string();
+                    self.failed.insert(server.to_string(), msg.clone());
+                    return Err(msg);
+                }
+            }
+        }
+        self.open
+            .get(server)
+            .ok_or_else(|| "session missing after open".to_string())
+    }
+}
+
+/// Wall-clock budget for one request's whole tool loop.
+pub(super) struct LoopDeadline {
+    at: std::time::Instant,
+}
+
+impl LoopDeadline {
+    pub(super) fn new(settings: &ToolLoopSettings) -> Self {
+        // `deadline_secs` is read back from settings JSON, which may hold a
+        // value written before the admin-side clamp existed; clamp again here
+        // so a stale over-limit value can't outrun `after`'s own fallback.
+        let secs = settings
+            .deadline_secs
+            .clamp(1, obleth_config::TOOL_LOOP_MAX_DEADLINE_SECS);
+        Self::after(Duration::from_secs(secs))
+    }
+
+    pub(super) fn after(budget: Duration) -> Self {
+        // A stored budget too large to add to `Instant::now()` must not panic
+        // the request path (boons fail open): fall back to the maximum an
+        // operator may configure.
+        let now = std::time::Instant::now();
+        let at = now.checked_add(budget).unwrap_or_else(|| {
+            now + Duration::from_secs(obleth_config::TOOL_LOOP_MAX_DEADLINE_SECS)
+        });
+        LoopDeadline { at }
+    }
+
+    /// `timeout` shortened to the time left, or `None` once the budget is
+    /// spent.
+    pub(super) fn bound(&self, timeout: Duration) -> Option<Duration> {
+        let left = self.at.saturating_duration_since(std::time::Instant::now());
+        (!left.is_zero()).then(|| left.min(timeout))
+    }
+}
+
+/// Warning reported when the loop stopped because its wall-clock budget ran
+/// out.
+pub(super) const DEADLINE_WARNING: &str = "tool_loop_deadline_exceeded";
+
+/// Tool result for a call past [`obleth_config::TOOL_LOOP_MAX_CALLS_PER_TURN`].
+pub(super) fn over_call_cap_result(name: &str) -> String {
+    format!(
+        "Error: tool `{name}` was not executed: at most {} tool calls run per turn.",
+        obleth_config::TOOL_LOOP_MAX_CALLS_PER_TURN
+    )
+}
+
+/// Tool result for a call reached after the loop's time budget ran out.
+pub(super) fn deadline_result(name: &str) -> String {
+    format!(
+        "Error: tool `{name}` was not executed: the tool time limit for this request was reached."
+    )
+}
+
+/// `(prompt_tokens, completion_tokens)` from a completion, read the way the
+/// proxy's settle path reads it (a missing `prompt_tokens` means "no usage").
+fn completion_usage(body: &Value) -> Option<(u32, u32)> {
+    let input = body.pointer("/usage/prompt_tokens")?.as_u64()? as u32;
+    let output = body
+        .pointer("/usage/completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    Some((input, output))
 }
 
 /// Attach generated images to the final completion and reconcile the warning.
@@ -274,6 +442,10 @@ fn finish_images(
 /// calls against their MCP servers, append the results, re-dispatch, and
 /// repeat until the model answers (or the turn limit is hit). Mutates `body`
 /// into the final client-facing completion.
+///
+/// Every follow-up turn is billed as a `tool_loop` helper row, so once `body`
+/// has been replaced the result carries turn 0's usage in
+/// [`TransformResult::turn0_usage`] for the main row.
 #[allow(clippy::too_many_arguments)]
 pub async fn run(
     state: &AppState,
@@ -290,8 +462,15 @@ pub async fn run(
             .await;
     };
     let Some(route) = route else {
-        return TransformResult { warning: None };
+        return TransformResult {
+            warning: None,
+            turn0_usage: None,
+        };
     };
+    // Captured before the loop can overwrite `body`: the main request row must
+    // settle with turn 0, not with whatever turn the loop ends on.
+    let turn0 = completion_usage(body);
+    let mut replaced = false;
     let mut request = loop_plan.request.clone();
     if let Some(obj) = request.as_object_mut() {
         obj.insert("model".into(), Value::String(route.upstream_model.clone()));
@@ -301,9 +480,12 @@ pub async fn run(
         .settings
         .max_turns
         .clamp(1, obleth_config::TOOL_LOOP_MAX_TURNS);
+    let deadline = LoopDeadline::new(&loop_plan.settings);
+    // Resolved once so every follow-up turn lands on the same endpoint.
+    let mut target = super::helper_target(route, session_id, loop_plan.served_url.as_deref());
     // One MCP session per server for the whole request: rate-limited servers
     // see a single initialization instead of one per tool call.
-    let mut sessions: HashMap<String, mcp_tools::Session> = HashMap::new();
+    let mut sessions = Sessions::default();
     let tool_loop_start = crate::tracer::now_ms();
     let mut image_ctx = loop_plan
         .image_gen
@@ -350,7 +532,10 @@ pub async fn run(
                 body,
                 None,
             );
-            return TransformResult { warning };
+            return TransformResult {
+                warning,
+                turn0_usage: replaced.then(|| turn0_or_estimate(state, loop_plan, turn0)),
+            };
         }
         if calls.is_empty() {
             // Final answer. Apply the structured-output transform when armed.
@@ -386,7 +571,10 @@ pub async fn run(
                     serde_json::json!({ "turns": completed_turns, "tools": all_tools_seen }),
                 );
             }
-            return TransformResult { warning };
+            return TransformResult {
+                warning,
+                turn0_usage: replaced.then(|| turn0_or_estimate(state, loop_plan, turn0)),
+            };
         }
 
         // Collect the tool names for this iteration and update the all-turns list.
@@ -403,14 +591,16 @@ pub async fn run(
             push_message(&mut request, message.clone());
         }
         let tool_exec_start = crate::tracer::now_ms();
-        for call in &calls {
-            let result_text = execute_call(
+        for (index, call) in calls.iter().enumerate() {
+            let result_text = run_one_call(
                 state,
                 &key.tenant_id,
                 &loop_plan.tool_servers,
                 &mut sessions,
                 image_ctx.as_mut(),
                 call,
+                index,
+                &deadline,
                 tool_timeout,
             )
             .await;
@@ -450,18 +640,21 @@ pub async fn run(
         let tool_exec_ms = (crate::tracer::now_ms() - tool_exec_start) as u32;
 
         let model_call_start = crate::tracer::now_ms();
-        match super::chat_call_completion(state, route, request.clone(), dispatch_timeout).await {
+        let (dispatched, failure_warning) = match deadline.bound(dispatch_timeout) {
+            None => (
+                Err(anyhow::anyhow!("tool loop time budget exhausted")),
+                DEADLINE_WARNING,
+            ),
+            Some(timeout) => (
+                dispatch_follow_up(&state.http, &mut target, request.clone(), timeout).await,
+                "tool_loop_dispatch_failed",
+            ),
+        };
+        match dispatched {
             Ok(completion) => {
                 let model_ms = (crate::tracer::now_ms() - model_call_start) as u32;
                 let iter_ms = (crate::tracer::now_ms() - iter_start) as u32;
-                let input_tokens = completion
-                    .pointer("/usage/prompt_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-                let output_tokens = completion
-                    .pointer("/usage/completion_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
+                let (input_tokens, output_tokens) = reported_tokens(&completion);
                 super::bill_helper_call(
                     state,
                     route,
@@ -472,6 +665,7 @@ pub async fn run(
                     output_tokens,
                 );
                 *body = completion;
+                replaced = true;
                 completed_turns += 1;
                 if let Some(t) = tracer.as_deref_mut() {
                     t.record(
@@ -524,9 +718,12 @@ pub async fn run(
                         .unwrap_or(&[]),
                     plan.structured.is_some(),
                     body,
-                    Some("tool_loop_dispatch_failed"),
+                    Some(failure_warning),
                 );
-                return TransformResult { warning };
+                return TransformResult {
+                    warning,
+                    turn0_usage: replaced.then(|| turn0_or_estimate(state, loop_plan, turn0)),
+                };
             }
         }
     }
@@ -551,16 +748,17 @@ pub async fn run(
                         already gathered above. Do not call any more tools.",
         }),
     );
-    match super::chat_call_completion(state, route, request, dispatch_timeout).await {
+    let mut limit_warning = "tool_loop_turn_limit";
+    let finalized = match deadline.bound(dispatch_timeout) {
+        Some(timeout) => dispatch_follow_up(&state.http, &mut target, request, timeout).await,
+        None => {
+            limit_warning = DEADLINE_WARNING;
+            Err(anyhow::anyhow!("tool loop time budget exhausted"))
+        }
+    };
+    match finalized {
         Ok(completion) => {
-            let input_tokens = completion
-                .pointer("/usage/prompt_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
-            let output_tokens = completion
-                .pointer("/usage/completion_tokens")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0) as u32;
+            let (input_tokens, output_tokens) = reported_tokens(&completion);
             super::bill_helper_call(
                 state,
                 route,
@@ -571,6 +769,7 @@ pub async fn run(
                 output_tokens,
             );
             *body = completion;
+            replaced = true;
         }
         Err(e) => {
             tracing::warn!(error = %e, "tool loop finalization dispatch failed");
@@ -592,9 +791,104 @@ pub async fn run(
             .unwrap_or(&[]),
         plan.structured.is_some(),
         body,
-        Some("tool_loop_turn_limit"),
+        Some(limit_warning),
     );
-    TransformResult { warning }
+    TransformResult {
+        warning,
+        turn0_usage: replaced.then(|| turn0_or_estimate(state, loop_plan, turn0)),
+    }
+}
+
+/// Helper-billing token counts: each field independently, zero when absent.
+fn reported_tokens(completion: &Value) -> (u32, u32) {
+    let read = |field: &str| {
+        completion
+            .pointer(&format!("/usage/{field}"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32
+    };
+    (read("prompt_tokens"), read("completion_tokens"))
+}
+
+/// Turn 0's reported usage, or an estimate of it when the upstream reported
+/// none. Only called once the body was replaced, so the tokenizer pass is paid
+/// only when it is actually needed.
+fn turn0_or_estimate(
+    state: &AppState,
+    loop_plan: &ToolLoopPlan,
+    reported: Option<(u32, u32)>,
+) -> (u32, u32) {
+    reported.unwrap_or_else(|| {
+        let est = state.tokenizer.estimate_request(&loop_plan.request);
+        (est.input_tokens, est.estimated_output_tokens)
+    })
+}
+
+/// One non-streaming follow-up turn against the loop's pinned target. A
+/// target that could not be resolved is reported once, with its cause chain.
+async fn dispatch_follow_up(
+    http: &reqwest::Client,
+    target: &mut anyhow::Result<crate::proxy::Target>,
+    request: Value,
+    timeout: Duration,
+) -> anyhow::Result<Value> {
+    let target = match target {
+        Ok(target) => target,
+        Err(e) => {
+            let cause = std::mem::replace(e, anyhow::anyhow!("follow-up target unavailable"));
+            return Err(cause.context("tool loop follow-up has no upstream target"));
+        }
+    };
+    super::chat_call_completion_on(http, target, request, timeout).await
+}
+
+/// Execute call number `index` of one turn, honoring the per-turn call cap and
+/// the loop's time budget. Both limits answer with a tool result the model can
+/// read instead of failing the loop.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn run_one_call(
+    state: &AppState,
+    tenant: &uuid::Uuid,
+    tool_servers: &HashMap<String, String>,
+    sessions: &mut Sessions,
+    image: Option<&mut super::image_gen::ImageCtx<'_>>,
+    call: &PendingCall,
+    index: usize,
+    deadline: &LoopDeadline,
+    tool_timeout: Duration,
+) -> String {
+    match call_timeout(&call.name, index, deadline, tool_timeout) {
+        Ok(timeout) => {
+            execute_call(
+                state,
+                tenant,
+                tool_servers,
+                sessions,
+                image,
+                call,
+                timeout,
+                deadline,
+            )
+            .await
+        }
+        Err(refusal) => refusal,
+    }
+}
+
+/// The timeout for call number `index` of a turn, or the tool result to
+/// return instead of running it.
+fn call_timeout(
+    name: &str,
+    index: usize,
+    deadline: &LoopDeadline,
+    tool_timeout: Duration,
+) -> Result<Duration, String> {
+    if index >= obleth_config::TOOL_LOOP_MAX_CALLS_PER_TURN {
+        return Err(over_call_cap_result(name));
+    }
+    deadline
+        .bound(tool_timeout)
+        .ok_or_else(|| deadline_result(name))
 }
 
 /// One tool call extracted from a completion.
@@ -641,14 +935,16 @@ fn extract_tool_calls(body: &Value) -> Vec<PendingCall> {
 /// Errors become a text result the model can read and recover from (fail-open
 /// inside the loop). `tenant` scopes `retrieve_original` to the caller's own
 /// stashed originals.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn execute_call(
     state: &AppState,
     tenant: &uuid::Uuid,
     tool_servers: &HashMap<String, String>,
-    sessions: &mut HashMap<String, mcp_tools::Session>,
+    sessions: &mut Sessions,
     image: Option<&mut super::image_gen::ImageCtx<'_>>,
     call: &PendingCall,
     timeout: Duration,
+    deadline: &LoopDeadline,
 ) -> String {
     // Gateway-executed compression tool: resolve from Redis, never an MCP server.
     if call.name == RETRIEVE_ORIGINAL_TOOL {
@@ -673,7 +969,10 @@ pub(super) async fn execute_call(
         let Some(ctx) = image else {
             return super::image_gen::failure_receipt("image generation is not configured");
         };
-        return super::image_gen::execute(state, ctx, &call.arguments).await;
+        let Some(image_timeout) = super::image_gen::call_timeout(ctx.cfg, deadline) else {
+            return deadline_result(&call.name);
+        };
+        return super::image_gen::execute(state, ctx, &call.arguments, image_timeout).await;
     }
 
     let Some(server_name) = tool_servers.get(&call.name) else {
@@ -682,20 +981,17 @@ pub(super) async fn execute_call(
     let Some(server) = crate::mcp::resolve_mcp(state, server_name).await else {
         return format!("Error: tool server `{server_name}` is unavailable.");
     };
-    if !sessions.contains_key(server_name) {
-        match mcp_tools::open_session(state, &server, timeout).await {
-            Ok(session) => {
-                sessions.insert(server_name.clone(), session);
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, server = %server_name, "mcp session open failed");
-                return format!("Error: could not reach tool server `{server_name}`: {e}");
-            }
+    let session = match sessions
+        .get_or_open(server_name, || {
+            mcp_tools::open_session(state, &server, timeout)
+        })
+        .await
+    {
+        Ok(session) => session,
+        Err(e) => {
+            return format!("Error: could not reach tool server `{server_name}`: {e}");
         }
-    }
-    let session = sessions
-        .get(server_name)
-        .expect("session inserted just above");
+    };
     match mcp_tools::call_tool_in(state, session, &call.name, call.arguments.clone(), timeout).await
     {
         Ok(text) => {
@@ -731,6 +1027,244 @@ pub(super) fn push_message(request: &mut Value, message: Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// In `load_balance` mode endpoint selection is random, so only the
+    /// recorded `served_url` keeps follow-up turns on the replica that served
+    /// turn 0 (and holds its prefix cache).
+    #[tokio::test]
+    async fn buffered_follow_ups_pin_to_the_endpoint_that_served_turn_0() {
+        let reply = json!({
+            "choices": [{ "message": { "role": "assistant", "content": "ok" } }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1 }
+        });
+        let (base_a, hits_a) = crate::boons::tests::chat_server(reply.clone()).await;
+        let (base_b, hits_b) = crate::boons::tests::chat_server(reply).await;
+        let mut route = crate::boons::tests::endpoint_only_route(&base_a);
+        route.endpoint_selection_mode = "load_balance".into();
+        route.endpoints.push(obleth_config::ResolvedEndpoint {
+            id: "e2".into(),
+            api_base: base_b.clone(),
+            api_key: None,
+            priority: 0,
+            weight: 1,
+            enabled: true,
+            healthy: true,
+        });
+        let plan = ToolLoopPlan {
+            tool_servers: HashMap::new(),
+            request: json!({}),
+            settings: ToolLoopSettings::default(),
+            passthrough_unmapped: false,
+            image_gen: None,
+            served_url: Some(format!("{base_b}/chat/completions")),
+        };
+        let http = reqwest::Client::new();
+        for _ in 0..20 {
+            let mut target =
+                crate::boons::helper_target(&route, "session", plan.served_url.as_deref());
+            dispatch_follow_up(&http, &mut target, json!({}), Duration::from_secs(5))
+                .await
+                .unwrap();
+        }
+        assert_eq!(hits_b.lock().unwrap().len(), 20);
+        assert!(hits_a.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_follow_up_target_keeps_its_cause() {
+        let mut route = crate::boons::tests::endpoint_only_route("http://unused/v1");
+        route.endpoints.clear();
+        let mut target = crate::boons::helper_target(&route, "", None);
+        let err = dispatch_follow_up(
+            &reqwest::Client::new(),
+            &mut target,
+            json!({}),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap_err();
+        let chain = format!("{err:#}");
+        assert!(chain.contains("no upstream target"), "{chain}");
+        assert!(chain.contains("no usable upstream endpoint"), "{chain}");
+    }
+
+    #[test]
+    fn calls_past_the_per_turn_cap_get_an_error_result() {
+        let deadline = LoopDeadline::after(Duration::from_secs(60));
+        let cap = obleth_config::TOOL_LOOP_MAX_CALLS_PER_TURN;
+        assert_eq!(cap, 16);
+        assert_eq!(
+            call_timeout("search", cap - 1, &deadline, Duration::from_secs(5)),
+            Ok(Duration::from_secs(5))
+        );
+        let refused = call_timeout("search", cap, &deadline, Duration::from_secs(5))
+            .expect_err("the 17th call is not executed");
+        assert!(refused.starts_with("Error:") && refused.contains("search"));
+    }
+
+    #[test]
+    fn the_loop_deadline_shortens_then_refuses_calls() {
+        let deadline = LoopDeadline::after(Duration::from_millis(200));
+        let bounded = deadline.bound(Duration::from_secs(30)).unwrap();
+        assert!(bounded <= Duration::from_millis(200), "{bounded:?}");
+
+        let spent = LoopDeadline::after(Duration::ZERO);
+        assert_eq!(spent.bound(Duration::from_secs(30)), None);
+        let refused = call_timeout("search", 0, &spent, Duration::from_secs(5)).unwrap_err();
+        assert!(refused.contains("time limit"));
+    }
+
+    #[test]
+    fn an_unrepresentable_deadline_does_not_panic() {
+        let deadline = LoopDeadline::after(Duration::from_secs(u64::MAX));
+        let bounded = deadline.bound(Duration::from_secs(u64::MAX)).unwrap();
+        assert!(
+            bounded <= Duration::from_secs(obleth_config::TOOL_LOOP_MAX_DEADLINE_SECS),
+            "{bounded:?}"
+        );
+        let settings = ToolLoopSettings {
+            deadline_secs: u64::MAX,
+            ..ToolLoopSettings::default()
+        };
+        assert!(LoopDeadline::new(&settings)
+            .bound(Duration::from_secs(1))
+            .is_some());
+    }
+
+    #[test]
+    fn new_clamps_a_persisted_over_limit_deadline() {
+        // Settings JSON written before the admin-side clamp existed may still
+        // hold something like 10^9; `new` must not hand that straight to
+        // `after` unclamped.
+        let settings = ToolLoopSettings {
+            deadline_secs: 1_000_000_000,
+            ..ToolLoopSettings::default()
+        };
+        let max = obleth_config::TOOL_LOOP_MAX_DEADLINE_SECS;
+        let bounded = LoopDeadline::new(&settings)
+            .bound(Duration::from_secs(max + 1_000_000_000))
+            .unwrap();
+        assert!(bounded <= Duration::from_secs(max), "{bounded:?}");
+
+        let zero = ToolLoopSettings {
+            deadline_secs: 0,
+            ..ToolLoopSettings::default()
+        };
+        assert!(LoopDeadline::new(&zero)
+            .bound(Duration::from_secs(1))
+            .is_some());
+    }
+
+    #[test]
+    fn the_deadline_setting_defaults_to_five_minutes() {
+        let settings: ToolLoopSettings = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(settings.deadline_secs, 300);
+    }
+
+    #[tokio::test]
+    async fn a_failed_session_open_is_not_retried_within_the_request() {
+        let opens = AtomicUsize::new(0);
+        let mut sessions: Sessions<()> = Sessions::default();
+        for _ in 0..3 {
+            let err = sessions
+                .get_or_open("dead", || async {
+                    opens.fetch_add(1, Ordering::SeqCst);
+                    anyhow::bail!("connection refused")
+                })
+                .await
+                .expect_err("dead server");
+            assert!(err.contains("connection refused"));
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+        // A healthy server opens once and is reused.
+        for _ in 0..3 {
+            sessions
+                .get_or_open("live", || async {
+                    opens.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
+    }
+
+    fn tool_cache(ttl: Duration) -> ToolCache {
+        moka::future::Cache::builder().time_to_live(ttl).build()
+    }
+
+    fn one_tool() -> Vec<McpTool> {
+        vec![McpTool {
+            name: "search".into(),
+            description: String::new(),
+            input_schema: json!({}),
+        }]
+    }
+
+    #[tokio::test]
+    async fn concurrent_discovery_misses_share_one_fetch() {
+        let cache = tool_cache(Duration::from_secs(600));
+        let failures = tool_cache(MCP_DISCOVERY_NEGATIVE_TTL);
+        let fetches = AtomicUsize::new(0);
+        let lookups = (0..8).map(|_| {
+            discover_coalesced(&cache, &failures, "srv", async {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                Ok(one_tool())
+            })
+        });
+        let results = futures_util::future::join_all(lookups).await;
+        assert!(results.iter().all(|r| r.as_ref().unwrap().len() == 1));
+        assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_discovery_is_cached_as_an_empty_list() {
+        let cache = tool_cache(Duration::from_secs(600));
+        let failures = tool_cache(MCP_DISCOVERY_NEGATIVE_TTL);
+        let fetches = AtomicUsize::new(0);
+        let lookups = (0..4).map(|_| {
+            discover_coalesced(&cache, &failures, "srv", async {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                anyhow::bail!("tools/list timed out")
+            })
+        });
+        let results = futures_util::future::join_all(lookups).await;
+        assert!(results.iter().all(|r| r.as_ref().unwrap().is_empty()));
+        assert_eq!(
+            fetches.load(Ordering::SeqCst),
+            1,
+            "misses coalesce on failure too"
+        );
+        assert!(
+            failures.get("srv").await.is_some_and(|t| t.is_empty()),
+            "the failure is remembered so the next request skips discovery"
+        );
+        assert!(
+            cache.get("srv").await.is_none(),
+            "a failure never enters the success cache"
+        );
+    }
+
+    #[test]
+    fn completion_usage_reads_like_the_settle_path() {
+        assert_eq!(
+            completion_usage(&json!({"usage": {"prompt_tokens": 9, "completion_tokens": 4}})),
+            Some((9, 4))
+        );
+        assert_eq!(
+            completion_usage(&json!({"usage": {"completion_tokens": 4}})),
+            None
+        );
+        assert_eq!(
+            reported_tokens(&json!({"usage": {"completion_tokens": 4}})),
+            (0, 4)
+        );
+    }
 
     #[test]
     fn extracts_native_tool_calls() {

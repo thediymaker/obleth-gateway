@@ -43,7 +43,7 @@ use obleth_config::{
 use obleth_config::{
     AlertSettings, AutoRouterSettings, BoonSettings, EmailSettings, StructuredOutputBoonSettings,
     ToolLoopSettings, VisionBoonSettings, STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS,
-    TOOL_LOOP_MAX_TURNS,
+    TOOL_LOOP_MAX_DEADLINE_SECS, TOOL_LOOP_MAX_TURNS,
 };
 use obleth_fairshare::{FairShare, FairshareHistory, StaticCapacity, Stats};
 use obleth_redis::RedisStore;
@@ -1491,46 +1491,120 @@ async fn patch_tenant_compression(
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ModelRouteView {
     pub id: Uuid,
+    /// Name clients pass in `model` (e.g. `qwen3-vl-32b-instruct`). Kept free
+    /// of deployment detail — the serving format belongs in `quantization`,
+    /// not in the name — so re-quantizing does not break every caller.
     pub model_name: String,
+    /// Additional client-facing names that resolve to this same route. Exists
+    /// so a name can be cleaned up without breaking pinned clients: register
+    /// the old `…-fp8` spelling as an alias and it keeps working, while only
+    /// `model_name` is advertised by the discovery endpoints.
     pub aliases: Vec<String>,
+    /// Human-facing summary for operators and dashboards.
     pub description: String,
+    /// Value sent to the upstream in the `model` field.
     pub upstream_model: String,
+    /// Base URL including `/v1` suffix when required.
     pub api_base: String,
     /// Whether an upstream API key is stored. The key itself is write-only.
     pub api_key_set: bool,
+    /// Modality from the fixed `MODEL_TYPES` vocabulary. Determines which
+    /// OpenAI endpoint this model serves (`chat`, `embedding`,
+    /// `audio_transcription`, `audio_speech`, `image`). Defaults to `chat`.
     pub model_type: String,
+    /// Weight/activation format this deployment serves, from the fixed
+    /// `QUANTIZATIONS` vocabulary. Descriptive only — it never affects
+    /// routing; it is reported so clients can tell a `fp8` deployment from a
+    /// `bf16` one without reading it out of the model's name.
     pub quantization: String,
     pub input_cost_per_token: f64,
     pub output_cost_per_token: f64,
+    /// Per-generated-image cost in USD (`image` models).
     pub cost_per_image: f64,
+    /// Per-second-of-audio cost in USD (`audio_transcription` models).
     pub cost_per_audio_second: f64,
+    /// Per-input-character cost in USD (`audio_speech` models).
     pub cost_per_character: f64,
     pub context_window: i64,
+    /// Multiplier applied to tenant weight at admission when this model is used.
     pub admission_weight: i64,
+    /// Optional per-model in-flight cap. `None` means only the global scheduler
+    /// cap and tenant/group fairshare limits apply.
     pub max_in_flight: Option<i64>,
+    /// How `max_in_flight` is decided. `static` (default) keeps the
+    /// operator-set value; `tuned` means it was found by the auto-tune ramp
+    /// probe against the upstream.
     pub capacity_mode: String,
+    /// When the tuned `max_in_flight` was last written by auto-tune. `None`
+    /// until the model has been tuned.
     pub capacity_tuned_at: Option<chrono::DateTime<chrono::Utc>>,
     pub supports_function_calling: bool,
     pub supports_system_messages: bool,
     pub supports_response_schema: bool,
     pub supports_tool_choice: bool,
+    /// Native image-input capability. When false, the gateway's vision boon can
+    /// relay images to a designated vision model and inject text descriptions
+    /// before forwarding the request to this model.
     pub supports_vision: bool,
     pub enabled: bool,
+    /// When true, identical requests to this model are served from the response
+    /// cache (exact-match on tenant + model + request body) instead of the
+    /// upstream. Entries are never shared across tenants.
     pub cache_enabled: bool,
+    /// Time-to-live for cached responses, in seconds. `0` disables caching:
+    /// nothing is stored (never "store without expiry").
     pub cache_ttl_secs: i64,
+    /// Routing tags from the fixed `MODEL_TAGS` vocabulary. The `auto` router
+    /// prefers models whose tags match the request's classified intent.
     pub tags: Vec<String>,
+    /// Gateway boons enabled for this model from the fixed `MODEL_BOONS`
+    /// vocabulary. Boons grant capabilities the model lacks natively (e.g. the
+    /// `vision` boon relays images to a describer). Empty by default.
     pub boons: Vec<String>,
+    /// Registered MCP servers whose tools this model may use. Distinct from
+    /// capabilities: a capability is what the model can do natively (e.g.
+    /// function calling); a tool server is something the gateway grants access
+    /// to. When non-empty, plain chat requests get the servers' tools injected
+    /// and the gateway runs the tool loop itself. Empty by default (off).
     pub tool_servers: Vec<String>,
+    /// Per-request upstream timeout in seconds. `None` falls back to the global
+    /// `OBLETH_UPSTREAM_TIMEOUT_SECS` default.
     pub request_timeout_secs: Option<i64>,
+    /// Extra attempts against the same endpoint on retryable failures (network
+    /// errors, timeouts, 408/429/5xx). `0` disables retries.
     pub max_retries: i64,
+    /// Base delay in milliseconds for exponential backoff between retries.
     pub retry_backoff_ms: i64,
+    /// How obleth chooses among this model's registered endpoints: `failover`
+    /// (priority order) or `load_balance` (weighted).
     pub endpoint_selection_mode: String,
+    /// When true, a terminal 502/504 against this model triggers read-only
+    /// upstream diagnostics (DNS resolve + TCP connect) recorded as a trace
+    /// span. Opt-in; off by default. Diagnose-only — never changes routing.
     pub debug_diagnostics: bool,
+    /// Declared saturation for energy accounting: how many concurrent
+    /// sequences of this model saturate one node (instances per node x
+    /// sequences per instance). Each request is charged
+    /// `node_watts / energy_slots_per_node` for its serving time.
+    /// `0` (default) disables energy accounting for this model.
     pub energy_slots_per_node: i64,
+    /// Per-model multiplier on the `auto` router's final score. `1.0` is
+    /// neutral; above 1.0 prefers the model, below 1.0 de-prioritizes it.
     pub route_bias: f64,
+    /// Whether the `auto` router may select this model. `false` removes it from
+    /// auto's candidate pool while leaving it addressable by name — the
+    /// distinction from `enabled = false`, which removes it everywhere.
     pub auto_eligible: bool,
+    /// Which small model writes this model's speculation drafts. Empty falls
+    /// back to the fleet default in the boon settings.
     pub draft_model: String,
+    /// Direct (non-gateway) URL of a deployment of THIS model whose backend
+    /// supports `prompt_logprobs`; it scores every draft token. Empty means
+    /// this model cannot speculate.
     pub verify_api_base: String,
+    /// The model name that scoring backend serves, when it differs from this
+    /// model's own `upstream_model` (a canary serving its own name). Empty =
+    /// same as `upstream_model`.
     pub verify_upstream_model: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub updated_at: chrono::DateTime<chrono::Utc>,
@@ -2425,6 +2499,8 @@ pub struct BoonSettingsView {
     pub tool_loop_enabled: bool,
     pub tool_loop_max_turns: u32,
     pub tool_loop_tool_timeout_ms: u64,
+    /// Wall-clock budget for one request's whole tool loop, in seconds.
+    pub tool_loop_deadline_secs: u64,
     pub tool_loop_nudge: String,
     pub compression_enabled: bool,
     pub compression_min_tokens: u32,
@@ -2481,6 +2557,7 @@ impl BoonSettingsView {
             tool_loop_enabled: s.tool_loop.enabled,
             tool_loop_max_turns: s.tool_loop.max_turns,
             tool_loop_tool_timeout_ms: s.tool_loop.tool_timeout_ms,
+            tool_loop_deadline_secs: s.tool_loop.deadline_secs,
             tool_loop_nudge: s.tool_loop.nudge.clone(),
             compression_enabled: s.compression.enabled,
             compression_min_tokens: s.compression.min_tokens,
@@ -2553,6 +2630,11 @@ pub struct UpdateBoonSettings {
     pub tool_loop_max_turns: Option<u32>,
     #[serde(default)]
     pub tool_loop_tool_timeout_ms: Option<u64>,
+    /// Wall-clock budget for one request's whole tool loop, in seconds.
+    /// Clamped to `1..=3600` (`TOOL_LOOP_MAX_DEADLINE_SECS`); omit (or send 0)
+    /// to leave unchanged.
+    #[serde(default)]
+    pub tool_loop_deadline_secs: Option<u64>,
     /// System nudge injected with granted tools. Empty string resets it to the
     /// built-in default; omit the field to leave it unchanged.
     #[serde(default)]
@@ -2708,6 +2790,16 @@ fn normalize_image_sizes(sizes: Vec<String>) -> Vec<String> {
 /// Images per call, bounded by the hard ceiling.
 fn clamp_image_count(n: u32) -> u32 {
     n.clamp(1, obleth_config::IMAGE_GENERATION_MAX_PER_REQUEST)
+}
+
+/// Apply a `tool_loop_deadline_secs` update: `None`/0 keeps `existing`, and any
+/// other value is clamped to `1..=TOOL_LOOP_MAX_DEADLINE_SECS`. Unbounded, a huge
+/// value overflows the loop's deadline arithmetic on the request path.
+fn merge_tool_loop_deadline(update: Option<u64>, existing: u64) -> u64 {
+    update
+        .filter(|s| *s > 0)
+        .map(|s| s.min(TOOL_LOOP_MAX_DEADLINE_SECS))
+        .unwrap_or(existing)
 }
 
 #[utoipa::path(
@@ -2910,6 +3002,10 @@ async fn put_boon_settings(
                 Some(n) => n.to_string(),
                 None => existing.tool_loop.nudge.clone(),
             },
+            deadline_secs: merge_tool_loop_deadline(
+                body.tool_loop_deadline_secs,
+                existing.tool_loop.deadline_secs,
+            ),
         },
         guardrails: existing.guardrails.clone(),
         compression: obleth_config::CompressionBoonSettings {
@@ -3061,6 +3157,7 @@ async fn put_boon_settings(
                 "tool_loop_enabled": settings.tool_loop.enabled,
                 "tool_loop_max_turns": settings.tool_loop.max_turns,
                 "tool_loop_tool_timeout_ms": settings.tool_loop.tool_timeout_ms,
+                "tool_loop_deadline_secs": settings.tool_loop.deadline_secs,
                 "tool_loop_nudge_len": settings.tool_loop.nudge.len(),
                 "image_generation_enabled": settings.image_generation.enabled,
                 "image_generation_model": settings.image_generation.image_model,
@@ -3918,24 +4015,29 @@ async fn get_key_usage(
         .next()
         .ok_or(AdminError::NotFound)?;
 
-    let summary =
-        usage::query_key_usage_summary(&state.clickhouse, id, q.since_ms, q.include_internal)
-            .await?
-            .unwrap_or(usage::KeyUsageSummary {
-                key_id: id,
-                tenant_id: key.tenant_id,
-                last_used_ms: 0,
-                last_model: String::new(),
-                last_status_code: 0,
-                requests: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                total_tokens: 0,
-                cost_usd: 0.0,
-                energy_wh: 0.0,
-                energy_cost_usd: 0.0,
-                co2_g: 0.0,
-            });
+    let summary = usage::query_key_usage_summary(
+        &state.clickhouse,
+        key.tenant_id,
+        id,
+        q.since_ms,
+        q.include_internal,
+    )
+    .await?
+    .unwrap_or(usage::KeyUsageSummary {
+        key_id: id,
+        tenant_id: key.tenant_id,
+        last_used_ms: 0,
+        last_model: String::new(),
+        last_status_code: 0,
+        requests: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        cost_usd: 0.0,
+        energy_wh: 0.0,
+        energy_cost_usd: 0.0,
+        co2_g: 0.0,
+    });
     Ok(Json(summary))
 }
 
@@ -4797,7 +4899,7 @@ async fn patch_fairshare_group_weight(
         .store
         .update_fairshare_group_weight(&name, body.weight)
         .await?;
-    resync_all_keys(&state).await?;
+    sync_group_keys(&state, &name).await?;
     state
         .store
         .record_audit(
@@ -4845,9 +4947,7 @@ async fn patch_tenant_group(
 /// row (e.g. a delete whose eviction failed). Returns (pushed, pruned).
 async fn resync_all_keys(state: &AdminState) -> Result<(usize, usize)> {
     let keys = state.store.all_resolved_keys().await?;
-    for (hash, resolved) in &keys {
-        push_key(state, hash, resolved).await?;
-    }
+    push_keys_bulk(state, &keys, BulkInvalidation::All).await?;
     let known: std::collections::HashSet<String> = keys.iter().map(|(h, _)| h.clone()).collect();
     let pruned: std::collections::HashSet<String> = state
         .redis
@@ -5804,12 +5904,37 @@ pub struct ProvisionErrorBody {
 async fn set_provision_error(
     State(state): State<AdminState>,
     Path(id): Path<uuid::Uuid>,
+    headers: HeaderMap,
     Json(body): Json<ProvisionErrorBody>,
 ) -> Result<Json<serde_json::Value>> {
+    // Only a clear is an operator-visible change worth auditing: the
+    // provisioner records an error on every failed submit and clears on every
+    // successful one, so the audit row is written only when a clear actually
+    // removed a recorded error.
+    let cleared = match body.error {
+        None => state
+            .store
+            .get_managed_model(id)
+            .await?
+            .and_then(|m| m.last_provision_error),
+        Some(_) => None,
+    };
     state
         .store
         .set_provision_error(id, body.error.as_deref())
         .await?;
+    if let Some(previous) = cleared {
+        state
+            .store
+            .record_audit(
+                &audit_actor(&headers),
+                "clear_provision_error",
+                "managed_model",
+                &id.to_string(),
+                serde_json::json!({ "cleared_error": previous }),
+            )
+            .await?;
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -6437,6 +6562,78 @@ async fn sync_mcp_server(state: &AdminState, server: &McpServer) -> Result<()> {
 async fn sync_tenant_keys(state: &AdminState, tenant_id: Uuid) -> Result<()> {
     for (hash, resolved) in state.store.resolved_keys_for_tenant(tenant_id).await? {
         push_key(state, &hash, &resolved).await?;
+    }
+    Ok(())
+}
+
+/// In-flight Redis writes for a bulk key push. The connection is multiplexed,
+/// so concurrent SETs pipeline instead of paying one round trip each.
+const BULK_PUSH_CONCURRENCY: usize = 32;
+
+/// How a bulk key push tells the gateways to drop their in-process copies.
+#[derive(Clone, Copy)]
+enum BulkInvalidation {
+    /// One message per pushed hash. Used for scoped pushes (a group weight
+    /// change) so gateways keep every unrelated key, model, and MCP entry.
+    PerKey,
+    /// A single `*`, which clears every gateway's key, model, and MCP caches.
+    /// Used only by the full reconcile, which rewrites all of them anyway.
+    All,
+}
+
+/// Re-push the keys of every tenant in a fairshare group after its weight
+/// changed. Keys outside the group carry a different `group_weight` and are
+/// untouched; no SCAN or prune runs here (that is `POST /api/v1/resync`).
+async fn sync_group_keys(state: &AdminState, group: &str) -> Result<usize> {
+    let keys = group_keys(state.store.all_resolved_keys().await?, group);
+    push_keys_bulk(state, &keys, BulkInvalidation::PerKey).await?;
+    Ok(keys.len())
+}
+
+fn group_keys(keys: Vec<(String, ResolvedKey)>, group: &str) -> Vec<(String, ResolvedKey)> {
+    keys.into_iter()
+        .filter(|(_, k)| k.fairshare_group == group)
+        .collect()
+}
+
+/// Write many resolved keys to Redis with bounded concurrency, then invalidate
+/// the gateways' in-process copies. Every SET completes before any invalidation
+/// is published, so a gateway that refetches on the message reads the new row.
+async fn push_keys_bulk(
+    state: &AdminState,
+    keys: &[(String, ResolvedKey)],
+    invalidation: BulkInvalidation,
+) -> Result<()> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    if keys.is_empty() {
+        return Ok(());
+    }
+    // Indexing (rather than mapping over `keys.iter()`) keeps the closure's
+    // argument free of a borrowed lifetime; otherwise the stream is not provably
+    // `Send` for every lifetime and the axum handlers calling this fail to build.
+    let redis = &state.redis;
+    stream::iter(0..keys.len())
+        .map(move |i| {
+            let (hash, resolved) = &keys[i];
+            redis.put_resolved_key(hash, resolved)
+        })
+        .buffer_unordered(BULK_PUSH_CONCURRENCY)
+        .try_for_each(|()| async { Ok(()) })
+        .await?;
+    match invalidation {
+        BulkInvalidation::All => state.redis.publish_invalidation("*").await?,
+        BulkInvalidation::PerKey => {
+            stream::iter(0..keys.len())
+                .map(move |i| redis.publish_invalidation(&keys[i].0))
+                .buffer_unordered(BULK_PUSH_CONCURRENCY)
+                .try_for_each(|()| async { Ok(()) })
+                .await?
+        }
+    }
+    if let Some(tx) = &state.local_cache_tx {
+        for (hash, _) in keys {
+            let _ = tx.send(hash.clone());
+        }
     }
     Ok(())
 }
@@ -7252,6 +7449,193 @@ mod tests {
         );
     }
 
+    /// Removes the group test's tenants and fairshare group on drop, including
+    /// on a failed assertion. The store has no group delete, so the group row
+    /// goes through the pool; tenants go first because they reference it.
+    struct GroupFixture {
+        store: Store,
+        group: String,
+        tenants: Vec<Uuid>,
+    }
+
+    impl Drop for GroupFixture {
+        fn drop(&mut self) {
+            let store = self.store.clone();
+            let group = std::mem::take(&mut self.group);
+            let tenants = std::mem::take(&mut self.tenants);
+            // block_in_place needs the multi-thread test flavor.
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    for id in tenants {
+                        let _ = store.delete_tenant(id).await;
+                    }
+                    let _ = sqlx::query("delete from fairshare_groups where name = $1")
+                        .bind(&group)
+                        .execute(store.pool())
+                        .await;
+                });
+            });
+        }
+    }
+
+    /// A group weight change republishes only that group's keys and never
+    /// prunes: a key in another group keeps its (sentinel) cache entry, and an
+    /// orphan entry with no backing row is left for `POST /resync`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn group_weight_patch_pushes_only_the_groups_keys() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").expect("checked above");
+        let redis = RedisStore::connect(&redis_url)
+            .await
+            .expect("connect redis");
+        let group = format!("g-{}", Uuid::new_v4().simple());
+        t.store
+            .create_fairshare_group(&group, 100)
+            .await
+            .expect("create group");
+        let mut fixture = GroupFixture {
+            store: t.store.clone(),
+            group: group.clone(),
+            tenants: Vec::new(),
+        };
+        let inside = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        fixture.tenants.push(inside.id);
+        t.store
+            .update_tenant_fairshare_group(inside.id, &group)
+            .await
+            .expect("move tenant");
+        let outside = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        fixture.tenants.push(outside.id);
+        let create_key = |tenant: Uuid| {
+            axum::http::Request::post(format!("/api/v1/tenants/{tenant}/keys"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "name": "k" }).to_string(),
+                ))
+                .expect("build request")
+        };
+        let (_, a) = send(&t.app, create_key(inside.id)).await;
+        let (_, b) = send(&t.app, create_key(outside.id)).await;
+        let hash_of = |v: &serde_json::Value| {
+            obleth_config::hash_api_key(v["secret"].as_str().unwrap_or_default())
+        };
+        let (hash_a, hash_b) = (hash_of(&a), hash_of(&b));
+
+        let mut sentinel = redis
+            .get_resolved_key(&hash_b)
+            .await
+            .expect("read b")
+            .expect("b cached on create");
+        sentinel.tenant_name = "sentinel".to_string();
+        redis
+            .put_resolved_key(&hash_b, &sentinel)
+            .await
+            .expect("write sentinel");
+        let orphan = format!("orphan-{}", Uuid::new_v4().simple());
+        redis
+            .put_resolved_key(&orphan, &sentinel)
+            .await
+            .expect("write orphan");
+
+        let patch = axum::http::Request::patch(format!("/api/v1/fairshare/groups/{group}/weight"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::from(
+                serde_json::json!({ "weight": 777 }).to_string(),
+            ))
+            .expect("build request");
+        let mut pubsub = ::redis::Client::open(redis_url.as_str())
+            .expect("redis client")
+            .get_async_pubsub()
+            .await
+            .expect("pubsub connect");
+        pubsub
+            .subscribe("obleth:invalidate")
+            .await
+            .expect("subscribe");
+        let (status, body) = send(&t.app, patch).await;
+        let mut published = Vec::new();
+        {
+            use futures::StreamExt;
+            let mut messages = pubsub.on_message();
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_millis(300), messages.next()).await
+            {
+                published.push(msg.get_payload::<String>().unwrap_or_default());
+            }
+        }
+        let cached_a = redis.get_resolved_key(&hash_a).await.expect("read a");
+        let cached_b = redis.get_resolved_key(&hash_b).await.expect("read b");
+        let cached_orphan = redis.get_resolved_key(&orphan).await.expect("read orphan");
+
+        let _ = redis.delete_resolved_key(&orphan).await;
+        for hash in [&hash_a, &hash_b] {
+            let _ = redis.delete_resolved_key(hash).await;
+        }
+        drop(fixture);
+        let group_left: Option<(String,)> =
+            sqlx::query_as("select name from fairshare_groups where name = $1")
+                .bind(&group)
+                .fetch_optional(t.store.pool())
+                .await
+                .expect("look up group");
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(cached_a.map(|k| k.group_weight), Some(777));
+        assert_eq!(
+            cached_b.map(|k| k.tenant_name),
+            Some("sentinel".to_string()),
+            "a key outside the group was re-pushed"
+        );
+        assert!(cached_orphan.is_some(), "a weight patch must not prune");
+        assert_eq!(
+            published,
+            vec![hash_a.clone()],
+            "a weight patch invalidates exactly the group's keys, never `*`"
+        );
+        assert!(group_left.is_none(), "fixture group was not cleaned up");
+    }
+
+    #[test]
+    fn group_keys_keeps_only_the_named_group() {
+        let key = |group: &str| {
+            let k: ResolvedKey = serde_json::from_value(serde_json::json!({
+                "key_id": Uuid::nil(),
+                "tenant_id": Uuid::nil(),
+                "tenant_name": "t",
+                "fairshare_group": group,
+                "group_weight": 1,
+                "weight": 1,
+                "tokens_per_minute": 1,
+                "disabled": false,
+            }))
+            .expect("resolved key");
+            k
+        };
+        let keys = vec![
+            ("a".to_string(), key("research")),
+            ("b".to_string(), key("default")),
+            ("c".to_string(), key("research")),
+        ];
+        let hashes: Vec<String> = group_keys(keys, "research")
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
+        assert_eq!(hashes, ["a", "c"]);
+    }
+
     /// Fairshare weight and per-model cap are set on a key at creation and
     /// edited afterwards, so both have to survive the round trip through the
     /// store and come back on the response the dashboard renders.
@@ -7728,6 +8112,42 @@ mod tests {
         };
         let view = BoonSettingsView::from_settings(&s);
         assert!(view.compression_code_compaction);
+    }
+
+    #[test]
+    fn boon_view_update_clamps_the_tool_loop_deadline() {
+        assert_eq!(merge_tool_loop_deadline(None, 300), 300);
+        assert_eq!(
+            merge_tool_loop_deadline(Some(0), 300),
+            300,
+            "0 means unchanged"
+        );
+        assert_eq!(merge_tool_loop_deadline(Some(120), 300), 120);
+        assert_eq!(
+            merge_tool_loop_deadline(Some(u64::MAX), 300),
+            TOOL_LOOP_MAX_DEADLINE_SECS
+        );
+        assert_eq!(
+            merge_tool_loop_deadline(Some(TOOL_LOOP_MAX_DEADLINE_SECS + 1), 300),
+            TOOL_LOOP_MAX_DEADLINE_SECS
+        );
+    }
+
+    #[test]
+    fn boon_view_exposes_the_tool_loop_deadline() {
+        let mut s = BoonSettings::default();
+        assert_eq!(
+            BoonSettingsView::from_settings(&s).tool_loop_deadline_secs,
+            300
+        );
+        s.tool_loop.deadline_secs = 90;
+        assert_eq!(
+            BoonSettingsView::from_settings(&s).tool_loop_deadline_secs,
+            90
+        );
+        let update: UpdateBoonSettings =
+            serde_json::from_value(serde_json::json!({ "tool_loop_deadline_secs": 120 })).unwrap();
+        assert_eq!(update.tool_loop_deadline_secs, Some(120));
     }
 
     #[test]

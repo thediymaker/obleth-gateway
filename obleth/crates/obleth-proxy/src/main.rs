@@ -44,7 +44,7 @@ use crate::state::AppState;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env();
-    let _otel_provider = init_telemetry(&cfg);
+    let otel_provider = init_telemetry(&cfg);
     tracing::info!(?cfg.proxy_listen, ?cfg.admin_listen, "starting obleth gateway");
 
     // ---- connect dependencies (with simple boot-time retries) ----
@@ -54,21 +54,32 @@ async fn main() -> anyhow::Result<()> {
     store.ensure_control_plane_identity().await?;
     tracing::info!("postgres connected + schema applied");
 
-    let redis = retry("redis", || RedisStore::connect(&cfg.redis_url)).await?;
-    tracing::info!("redis connected");
-
-    let telemetry = retry("clickhouse", || {
-        TelemetrySink::start(
-            &cfg.clickhouse_url,
-            &cfg.clickhouse_db,
-            &cfg.clickhouse_user,
-            &cfg.clickhouse_password,
-            &cfg.wal_path,
-            cfg.fail_open,
-        )
+    let redis = retry("redis", || {
+        RedisStore::connect_with(&cfg.redis_url, cfg.redis_timeouts)
     })
     .await?;
-    tracing::info!("clickhouse connected + schema applied");
+    tracing::info!("redis connected");
+
+    // Not wrapped in `retry`: `start` only errs on a config problem (an
+    // invalid database name) that retrying can't fix, and an unreachable
+    // ClickHouse is not an error here — the sink comes up in spill mode and
+    // the flusher retries schema setup on its own (see obleth-telemetry).
+    let telemetry = TelemetrySink::start(
+        &cfg.clickhouse_url,
+        &cfg.clickhouse_db,
+        &cfg.clickhouse_user,
+        &cfg.clickhouse_password,
+        &cfg.wal_path,
+        cfg.fail_open,
+    )
+    .await?;
+    if telemetry.schema_ready() {
+        tracing::info!("clickhouse connected + schema applied");
+    } else {
+        tracing::warn!(
+            "telemetry started in spill mode; ClickHouse schema deferred until reachable"
+        );
+    }
 
     // ---- warm the hot cache from the source of truth ----
     match store.all_resolved_keys().await {
@@ -178,6 +189,14 @@ async fn main() -> anyhow::Result<()> {
     if cfg.upstream_tcp_keepalive_secs > 0 {
         http_builder =
             http_builder.tcp_keepalive(Duration::from_secs(cfg.upstream_tcp_keepalive_secs));
+    }
+    // A backend that sends headers and then stalls would otherwise hold its
+    // fairshare permit forever. reqwest's read timeout also bounds the wait
+    // for response headers, so a non-streaming generation slower than this
+    // fails even when the model's request timeout is longer.
+    if cfg.upstream_read_timeout_secs > 0 {
+        http_builder =
+            http_builder.read_timeout(Duration::from_secs(cfg.upstream_read_timeout_secs));
     }
     let http = http_builder.build()?;
 
@@ -373,6 +392,7 @@ async fn main() -> anyhow::Result<()> {
         classifier.clone(),
         boons.clone(),
         energy.clone(),
+        cfg.upstream_read_timeout_secs,
     );
 
     energy::spawn_energy_poller(energy.clone(), http.clone(), alerts.clone());
@@ -418,12 +438,23 @@ async fn main() -> anyhow::Result<()> {
     // the hot path. Runs an immediate first pass at startup.
     spawn_tool_cache_prewarm(app_state.clone(), store.clone());
 
-    // ---- pub/sub cache invalidation listener ----
+    // ---- pub/sub cache invalidation listener + Redis re-warm ----
+    let redis_reconnected = Arc::new(tokio::sync::Notify::new());
     spawn_invalidation_listener(
         redis.clone(),
-        key_cache.clone(),
-        model_cache.clone(),
-        mcp_cache.clone(),
+        InvalidationCaches {
+            keys: key_cache.clone(),
+            models: model_cache.clone(),
+            mcp: mcp_cache.clone(),
+        },
+        redis_reconnected.clone(),
+    );
+    spawn_redis_rewarm(
+        store.clone(),
+        redis.clone(),
+        (cfg.redis_rewarm_secs > 0)
+            .then(|| Duration::from_secs(clamped_redis_rewarm_secs(cfg.redis_rewarm_secs))),
+        redis_reconnected,
     );
 
     // ---- admin (Management API) ----
@@ -505,12 +536,115 @@ async fn main() -> anyhow::Result<()> {
         cfg.metrics_listen
     );
 
-    tokio::try_join!(
-        async { axum::serve(proxy_listener, proxy_app).await },
-        async { axum::serve(admin_listener, admin_app).await },
-        async { axum::serve(metrics_listener, metrics_app).await },
-    )?;
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    spawn_signal_listener(shutdown_tx);
+    serve_until_shutdown(
+        vec![
+            (proxy_listener, proxy_app),
+            (admin_listener, admin_app),
+            (metrics_listener, metrics_app),
+        ],
+        shutdown_rx,
+        cfg.shutdown_grace,
+    )
+    .await?;
 
+    telemetry.shutdown().await;
+    if let Some(provider) = otel_provider {
+        // The exporter flush blocks; bound it so a dead collector can't hold exit.
+        let flush = tokio::task::spawn_blocking(move || provider.shutdown());
+        if tokio::time::timeout(Duration::from_secs(10), flush)
+            .await
+            .is_err()
+        {
+            // Dropping the runtime waits for blocking tasks, so a stuck flush
+            // would hang here; everything else is already drained.
+            tracing::warn!("trace export flush timed out; exiting");
+            std::process::exit(0);
+        }
+    }
+    tracing::info!("obleth gateway stopped");
+    Ok(())
+}
+
+async fn shutdown_requested(mut rx: tokio::sync::watch::Receiver<bool>) {
+    // A dropped sender also ends the wait, so a lost signal task can never
+    // leave the servers unstoppable.
+    let _ = rx.wait_for(|stop| *stop).await;
+}
+
+async fn wait_for_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "ctrl-c handler unavailable");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM handler unavailable");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
+}
+
+/// First SIGTERM/ctrl-c starts the drain; a second one exits immediately.
+fn spawn_signal_listener(tx: tokio::sync::watch::Sender<bool>) {
+    tokio::spawn(async move {
+        wait_for_signal().await;
+        tracing::info!("shutdown signal received; waiting for in-flight connections");
+        let _ = tx.send(true);
+        wait_for_signal().await;
+        tracing::warn!("second shutdown signal; exiting without draining");
+        std::process::exit(130);
+    });
+}
+
+/// Serve every listener until shutdown is requested, then stop accepting and
+/// give in-flight requests (including open streams) up to `grace` to finish.
+async fn serve_until_shutdown(
+    servers: Vec<(tokio::net::TcpListener, Router)>,
+    shutdown: tokio::sync::watch::Receiver<bool>,
+    grace: Duration,
+) -> anyhow::Result<()> {
+    let running = futures::future::try_join_all(servers.into_iter().map(|(listener, app)| {
+        let stop = shutdown_requested(shutdown.clone());
+        async move {
+            axum::serve(listener, app)
+                .with_graceful_shutdown(stop)
+                .await
+        }
+    }));
+    tokio::pin!(running);
+    tokio::select! {
+        res = &mut running => {
+            res?;
+            return Ok(());
+        }
+        _ = shutdown_requested(shutdown.clone()) => {}
+    }
+    match tokio::time::timeout(grace, &mut running).await {
+        Ok(res) => {
+            res?;
+            tracing::info!("in-flight requests drained");
+        }
+        Err(_) => tracing::warn!(
+            grace_secs = grace.as_secs(),
+            "shutdown grace elapsed; remaining connections end at process exit"
+        ),
+    }
     Ok(())
 }
 
@@ -551,6 +685,26 @@ fn install_candidates(
     }
 }
 
+/// Model names whose configured `request_timeout_secs` exceeds the upstream
+/// read timeout, with the configured value. Such a request is cut by the read
+/// timeout — a plain connection error — before the model's own timeout would
+/// ever fire, so the operator's per-model override is silently dead.
+fn overlong_request_timeouts(
+    candidates: &[router::Candidate],
+    upstream_read_timeout_secs: u64,
+) -> Vec<(String, i64)> {
+    let mut offenders: Vec<(String, i64)> = candidates
+        .iter()
+        .filter_map(|c| {
+            let configured = c.model.request_timeout_secs?;
+            (configured > upstream_read_timeout_secs as i64)
+                .then(|| (c.model.model_name.clone(), configured))
+        })
+        .collect();
+    offenders.sort();
+    offenders
+}
+
 /// Periodically rebuild the `auto`-router candidate list so enable/disable,
 /// metadata edits, and health/maintenance transitions take effect without a
 /// restart. Also refreshes the classifier settings (saved from the control
@@ -562,10 +716,15 @@ fn spawn_model_registry_refresh(
     classifier: classifier::Classifier,
     boons: boons::BoonEngine,
     energy: energy::EnergyEngine,
+    upstream_read_timeout_secs: u64,
 ) {
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(15));
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Names last warned about, so an unchanged offending set doesn't
+        // repeat the warning every 15s tick; only a change (new offender,
+        // one fixed) logs again.
+        let mut warned: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
             tick.tick().await;
             // Refresh auto-router settings (including `tier_source`) before
@@ -578,6 +737,21 @@ fn spawn_model_registry_refresh(
             }
             let tier_source = classifier.settings().tier_source;
             install_candidates(&registry, store.build_candidates(tier_source).await);
+            let offenders =
+                overlong_request_timeouts(registry.load().as_slice(), upstream_read_timeout_secs);
+            let current: std::collections::HashSet<String> =
+                offenders.iter().map(|(name, _)| name.clone()).collect();
+            if current != warned {
+                for (name, configured) in &offenders {
+                    tracing::warn!(
+                        model = %name,
+                        request_timeout_secs = configured,
+                        read_timeout_secs = upstream_read_timeout_secs,
+                        "requests to {name} will be cut at {upstream_read_timeout_secs}s by the read timeout"
+                    );
+                }
+                warned = current;
+            }
             match store.get_boon_settings().await {
                 Ok(Some(settings)) => boons.update(settings),
                 Ok(None) => {}
@@ -671,45 +845,433 @@ fn spawn_tool_cache_prewarm(state: AppState, store: Store) {
     });
 }
 
+#[derive(Clone)]
+struct InvalidationCaches {
+    keys: Cache<String, Arc<obleth_config::ResolvedKey>>,
+    models: Cache<String, Arc<obleth_config::ResolvedModel>>,
+    mcp: Cache<String, Arc<obleth_config::ResolvedMcpServer>>,
+}
+
+impl InvalidationCaches {
+    fn invalidate_all(&self) {
+        self.keys.invalidate_all();
+        self.models.invalidate_all();
+        self.mcp.invalidate_all();
+    }
+
+    async fn apply(&self, target: &str) {
+        if target == "*" {
+            self.invalidate_all();
+        } else if let Some(name) = target.strip_prefix("model:") {
+            self.models.invalidate(name).await;
+        } else if let Some(name) = target.strip_prefix("mcp:") {
+            self.mcp.invalidate(name).await;
+        } else {
+            self.keys.invalidate(target).await;
+        }
+    }
+}
+
 fn spawn_invalidation_listener(
     redis: RedisStore,
-    key_cache: Cache<String, Arc<obleth_config::ResolvedKey>>,
-    model_cache: Cache<String, Arc<obleth_config::ResolvedModel>>,
-    mcp_cache: Cache<String, Arc<obleth_config::ResolvedMcpServer>>,
+    caches: InvalidationCaches,
+    reconnected: Arc<tokio::sync::Notify>,
 ) {
     tokio::spawn(async move {
-        loop {
-            let key_cache = key_cache.clone();
-            let model_cache = model_cache.clone();
-            let mcp_cache = mcp_cache.clone();
-            let result = redis
-                .run_invalidation_listener(move |target| {
-                    let key_cache = key_cache.clone();
-                    let model_cache = model_cache.clone();
-                    let mcp_cache = mcp_cache.clone();
-                    tokio::spawn(async move {
-                        if target == "*" {
-                            key_cache.invalidate_all();
-                            model_cache.invalidate_all();
-                            mcp_cache.invalidate_all();
-                            return;
-                        }
-                        if let Some(name) = target.strip_prefix("model:") {
-                            model_cache.invalidate(name).await;
-                        } else if let Some(name) = target.strip_prefix("mcp:") {
-                            mcp_cache.invalidate(name).await;
-                        } else {
-                            key_cache.invalidate(&target).await;
-                        }
-                    });
-                })
-                .await;
-            if let Err(e) = result {
-                tracing::warn!(error = %e, "invalidation listener stopped; retrying in 2s");
+        let on_message = {
+            let caches = caches.clone();
+            move |target: String| {
+                let caches = caches.clone();
+                tokio::spawn(async move { caches.apply(&target).await });
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+        };
+        let on_subscribed = move |resubscribed: bool| {
+            // Anything published while disconnected was missed, and Redis
+            // itself may have lost data, so drop the in-process copies and
+            // re-push the source of truth.
+            if resubscribed {
+                caches.invalidate_all();
+                reconnected.notify_one();
+                tracing::info!("invalidation listener resubscribed");
+            }
+        };
+        redis
+            .run_invalidation_listener(on_message, on_subscribed)
+            .await;
+    });
+}
+
+/// `Instant::now() + period` panics on overflow, which would silently kill
+/// the re-warm task (and the reconnect re-warm with it, since both run in
+/// the same spawned task) for a misconfigured `OBLETH_REDIS_REWARM_SECS`. The
+/// re-warm is a self-heal safety net, not a latency-sensitive schedule, so a
+/// day between passes is still a safe ceiling.
+const MAX_REDIS_REWARM_SECS: u64 = 86_400;
+
+fn clamped_redis_rewarm_secs(configured: u64) -> u64 {
+    if configured > MAX_REDIS_REWARM_SECS {
+        tracing::warn!(
+            configured,
+            clamped = MAX_REDIS_REWARM_SECS,
+            "OBLETH_REDIS_REWARM_SECS exceeds the maximum; clamping"
+        );
+        MAX_REDIS_REWARM_SECS
+    } else {
+        configured
+    }
+}
+
+/// Re-push keys, models and MCP servers from Postgres into Redis on a timer
+/// and after every pub/sub reconnect, so a Redis restart or flush heals
+/// without restarting the gateway. Background only; the request path never
+/// waits on it.
+fn spawn_redis_rewarm(
+    store: Store,
+    redis: RedisStore,
+    every: Option<Duration>,
+    reconnected: Arc<tokio::sync::Notify>,
+) {
+    tokio::spawn(async move {
+        let mut tick = every.map(|period| {
+            let mut t = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+            t.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            t
+        });
+        loop {
+            let periodic = async {
+                match tick.as_mut() {
+                    Some(t) => {
+                        t.tick().await;
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::select! {
+                _ = periodic => {}
+                _ = reconnected.notified() => {}
+            }
+            rewarm_redis(&store, &redis).await;
         }
     });
+}
+
+async fn rewarm_redis(store: &Store, redis: &RedisStore) {
+    let keys = rewarm_keys(store, redis).await;
+    let models = rewarm_models(store, redis).await;
+    let mcp = rewarm_mcp_servers(store, redis).await;
+    tracing::debug!(?keys, ?models, ?mcp, "redis re-warm pass complete");
+}
+
+/// From a snapshot's `known` identifiers (hashes or names) and what the
+/// SCAN-based prune actually deleted (`pruned`), decide what a fresh
+/// post-prune reload should restore vs. evict. An identifier still present in
+/// `fresh` is restored — the prune deleted a live entry, most likely one
+/// created between the snapshot load and the SCAN (item N1). Anything still
+/// absent is evicted, which covers both a `pruned` identifier confirmed gone
+/// for good and a `known` identifier deleted mid-pass: the prune itself
+/// leaves the latter alone (it still matched `known` at SCAN time), so this
+/// is the only place that catches it. Pure and type-agnostic (keys, models
+/// and MCP servers all key their resolver cache by plain strings), so it's
+/// unit-tested directly instead of only through a live Redis.
+fn restore_and_evict(
+    known: &std::collections::HashSet<String>,
+    pruned: &std::collections::HashSet<String>,
+    fresh: &std::collections::HashSet<&str>,
+) -> (Vec<String>, Vec<String>) {
+    let restore = pruned
+        .iter()
+        .filter(|id| fresh.contains(id.as_str()))
+        .cloned()
+        .collect();
+    let evict = pruned
+        .iter()
+        .chain(known.iter())
+        .filter(|id| !fresh.contains(id.as_str()))
+        .cloned()
+        .collect();
+    (restore, evict)
+}
+
+/// Push a Postgres snapshot into Redis, then delete any `obleth:key:*` entry
+/// Redis holds that the snapshot doesn't list — the same SCAN-based prune
+/// `POST /api/v1/resync` uses (`obleth-redis/src/prune.rs`). A key revoked
+/// before this snapshot was taken has no entry here, so the prune removes it
+/// on this pass; a key revoked mid-pass survives until the next pass, which
+/// repeats the full push + prune and removes it then. Any failure (a push or
+/// the prune itself) ends the pass with a warn and nothing is written further
+/// — the next pass 300s later starts clean rather than patching over a
+/// partial one, so a revoked key is never left resurrected for good.
+///
+/// A key an admin *creates* between the snapshot load above and the SCAN is
+/// the opposite problem: it isn't in `snapshot`, so the prune deletes it as
+/// if it were stale and every replica 401s it until the next pass (up to
+/// 300s). When the prune actually removed something, re-read Postgres once
+/// more (same fix-up `POST /api/v1/resync`'s `resync_all_keys` applies) and
+/// restore anything that reload shows still exists; anything that's still
+/// gone — including a `known` entry deleted mid-pass, which the prune above
+/// left alone because it still matched `known` — is evicted so Redis matches
+/// the source of truth either way. A failure here is only logged: the pushed
+/// entries and the prune already landed, so the pass has already done useful
+/// work, and the next pass repeats this fix-up too.
+///
+/// `reload` is `Store::all_resolved_keys` in production; taking it as a
+/// closure (rather than `&Store` directly) keeps the restore/evict logic
+/// testable against Redis alone, with no Postgres in the loop.
+async fn push_and_prune_keys<F, Fut>(
+    redis: &RedisStore,
+    snapshot: &[(String, obleth_config::ResolvedKey)],
+    reload: F,
+) -> Option<usize>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+        Output = std::result::Result<
+            Vec<(String, obleth_config::ResolvedKey)>,
+            obleth_store::StoreError,
+        >,
+    >,
+{
+    for (hash, key) in snapshot {
+        if let Err(e) = redis.put_resolved_key(hash, key).await {
+            tracing::warn!(error = %e, "redis re-warm: key push failed; retrying next pass");
+            return None;
+        }
+    }
+    let known: std::collections::HashSet<String> =
+        snapshot.iter().map(|(hash, _)| hash.clone()).collect();
+    let pruned: std::collections::HashSet<String> =
+        match redis.prune_stale_resolved_keys(&known).await {
+            Ok(p) => p.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "redis re-warm: key prune failed; retrying next pass");
+                return None;
+            }
+        };
+    if pruned.is_empty() {
+        return Some(snapshot.len());
+    }
+    let fresh = match reload().await {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(error = %e, "redis re-warm: key re-read after prune failed; a wrongly pruned key may 401 until the next pass");
+            for hash in &pruned {
+                let _ = redis.publish_invalidation(hash).await;
+            }
+            return Some(snapshot.len());
+        }
+    };
+    let fresh_hashes: std::collections::HashSet<&str> =
+        fresh.iter().map(|(h, _)| h.as_str()).collect();
+    let fresh_by_hash: std::collections::HashMap<&str, &obleth_config::ResolvedKey> =
+        fresh.iter().map(|(h, k)| (h.as_str(), k)).collect();
+    let (restore, evict) = restore_and_evict(&known, &pruned, &fresh_hashes);
+    for hash in &restore {
+        let Some(key) = fresh_by_hash.get(hash.as_str()) else {
+            continue;
+        };
+        if let Err(e) = redis.put_resolved_key(hash, key).await {
+            tracing::warn!(error = %e, id = %hash, "redis re-warm: restoring a wrongly pruned key failed");
+            continue;
+        }
+        let _ = redis.publish_invalidation(hash).await;
+    }
+    for hash in &evict {
+        let _ = redis.delete_resolved_key(hash).await;
+        let _ = redis.publish_invalidation(hash).await;
+    }
+    Some(fresh.len())
+}
+
+async fn rewarm_keys(store: &Store, redis: &RedisStore) -> Option<usize> {
+    let snapshot = match store.all_resolved_keys().await {
+        Ok(k) => k,
+        Err(e) => {
+            tracing::warn!(error = %e, "redis re-warm: key load failed");
+            return None;
+        }
+    };
+    push_and_prune_keys(redis, &snapshot, || store.all_resolved_keys()).await
+}
+
+/// Resolved models keyed by every addressable name (canonical name + aliases).
+fn models_by_name(
+    models: Vec<(String, obleth_config::ResolvedModel)>,
+) -> Vec<(String, obleth_config::ResolvedModel)> {
+    models
+        .into_iter()
+        .flat_map(|(_, m)| {
+            m.addressable_names()
+                .map(|n| (n.to_string(), m.clone()))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Same push-then-prune contract as [`push_and_prune_keys`], for the
+/// `obleth:model:*` namespace, including the same post-prune restore/evict
+/// fix-up for a model created (or renamed to a new alias) between the
+/// snapshot load and the SCAN. `snapshot` is keyed by every addressable name
+/// ([`models_by_name`]), which is also what the prune treats as known. See
+/// [`push_and_prune_keys`] for why `reload` is a closure rather than `&Store`.
+async fn push_and_prune_models<F, Fut>(
+    redis: &RedisStore,
+    snapshot: &[(String, obleth_config::ResolvedModel)],
+    reload: F,
+) -> Option<usize>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+        Output = std::result::Result<
+            Vec<(String, obleth_config::ResolvedModel)>,
+            obleth_store::StoreError,
+        >,
+    >,
+{
+    for (name, model) in snapshot {
+        if let Err(e) = redis.put_resolved_model(name, model).await {
+            tracing::warn!(error = %e, "redis re-warm: model push failed; retrying next pass");
+            return None;
+        }
+    }
+    let known: std::collections::HashSet<String> =
+        snapshot.iter().map(|(name, _)| name.clone()).collect();
+    let pruned: std::collections::HashSet<String> =
+        match redis.prune_stale_resolved_models(&known).await {
+            Ok(p) => p.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "redis re-warm: model prune failed; retrying next pass");
+                return None;
+            }
+        };
+    if pruned.is_empty() {
+        return Some(snapshot.len());
+    }
+    let fresh = match reload().await {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::warn!(error = %e, "redis re-warm: model re-read after prune failed; a wrongly pruned model may 404 until the next pass");
+            for name in &pruned {
+                let _ = redis.publish_invalidation(&format!("model:{name}")).await;
+            }
+            return Some(snapshot.len());
+        }
+    };
+    let fresh_names: std::collections::HashSet<&str> =
+        fresh.iter().map(|(n, _)| n.as_str()).collect();
+    let fresh_by_name: std::collections::HashMap<&str, &obleth_config::ResolvedModel> =
+        fresh.iter().map(|(n, m)| (n.as_str(), m)).collect();
+    let (restore, evict) = restore_and_evict(&known, &pruned, &fresh_names);
+    for name in &restore {
+        let Some(model) = fresh_by_name.get(name.as_str()) else {
+            continue;
+        };
+        if let Err(e) = redis.put_resolved_model(name, model).await {
+            tracing::warn!(error = %e, id = %name, "redis re-warm: restoring a wrongly pruned model failed");
+            continue;
+        }
+        let _ = redis.publish_invalidation(&format!("model:{name}")).await;
+    }
+    for name in &evict {
+        let _ = redis.delete_resolved_model(name).await;
+        let _ = redis.publish_invalidation(&format!("model:{name}")).await;
+    }
+    Some(fresh.len())
+}
+
+async fn rewarm_models(store: &Store, redis: &RedisStore) -> Option<usize> {
+    let snapshot = match store.all_resolved_models().await {
+        Ok(m) => models_by_name(m),
+        Err(e) => {
+            tracing::warn!(error = %e, "redis re-warm: model load failed");
+            return None;
+        }
+    };
+    push_and_prune_models(redis, &snapshot, || async {
+        store.all_resolved_models().await.map(models_by_name)
+    })
+    .await
+}
+
+/// Same push-then-prune contract as [`push_and_prune_keys`], for the
+/// `obleth:mcp:*` namespace, including the same post-prune restore/evict
+/// fix-up for an MCP server registered between the snapshot load and the SCAN.
+/// See [`push_and_prune_keys`] for why `reload` is a closure rather than `&Store`.
+async fn push_and_prune_mcp_servers<F, Fut>(
+    redis: &RedisStore,
+    snapshot: &[(String, obleth_config::ResolvedMcpServer)],
+    reload: F,
+) -> Option<usize>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<
+        Output = std::result::Result<
+            Vec<(String, obleth_config::ResolvedMcpServer)>,
+            obleth_store::StoreError,
+        >,
+    >,
+{
+    for (name, server) in snapshot {
+        if let Err(e) = redis.put_resolved_mcp_server(name, server).await {
+            tracing::warn!(error = %e, "redis re-warm: mcp server push failed; retrying next pass");
+            return None;
+        }
+    }
+    let known: std::collections::HashSet<String> =
+        snapshot.iter().map(|(name, _)| name.clone()).collect();
+    let pruned: std::collections::HashSet<String> = match redis
+        .prune_stale_resolved_mcp_servers(&known)
+        .await
+    {
+        Ok(p) => p.into_iter().collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "redis re-warm: mcp server prune failed; retrying next pass");
+            return None;
+        }
+    };
+    if pruned.is_empty() {
+        return Some(snapshot.len());
+    }
+    let fresh = match reload().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "redis re-warm: mcp server re-read after prune failed; a wrongly pruned server may be unusable until the next pass");
+            for name in &pruned {
+                let _ = redis.publish_invalidation(&format!("mcp:{name}")).await;
+            }
+            return Some(snapshot.len());
+        }
+    };
+    let fresh_names: std::collections::HashSet<&str> =
+        fresh.iter().map(|(n, _)| n.as_str()).collect();
+    let fresh_by_name: std::collections::HashMap<&str, &obleth_config::ResolvedMcpServer> =
+        fresh.iter().map(|(n, s)| (n.as_str(), s)).collect();
+    let (restore, evict) = restore_and_evict(&known, &pruned, &fresh_names);
+    for name in &restore {
+        let Some(server) = fresh_by_name.get(name.as_str()) else {
+            continue;
+        };
+        if let Err(e) = redis.put_resolved_mcp_server(name, server).await {
+            tracing::warn!(error = %e, id = %name, "redis re-warm: restoring a wrongly pruned mcp server failed");
+            continue;
+        }
+        let _ = redis.publish_invalidation(&format!("mcp:{name}")).await;
+    }
+    for name in &evict {
+        let _ = redis.delete_resolved_mcp_server(name).await;
+        let _ = redis.publish_invalidation(&format!("mcp:{name}")).await;
+    }
+    Some(fresh.len())
+}
+
+async fn rewarm_mcp_servers(store: &Store, redis: &RedisStore) -> Option<usize> {
+    let snapshot = match store.all_resolved_mcp_servers().await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(error = %e, "redis re-warm: mcp server load failed");
+            return None;
+        }
+    };
+    push_and_prune_mcp_servers(redis, &snapshot, || store.all_resolved_mcp_servers()).await
 }
 
 /// Initialize logging + (optionally) OTLP trace export. Returns the tracer
@@ -820,5 +1382,340 @@ mod registry_refresh_tests {
         assert!(Arc::ptr_eq(&before, &registry.load()));
         install_candidates(&registry, Ok(Vec::new()));
         assert!(!Arc::ptr_eq(&before, &registry.load()));
+    }
+
+    fn model(name: &str, request_timeout_secs: Option<i64>) -> obleth_config::ResolvedModel {
+        obleth_config::ResolvedModel {
+            model_name: name.to_string(),
+            aliases: Vec::new(),
+            upstream_model: name.to_string(),
+            api_base: "http://upstream".to_string(),
+            api_key: None,
+            model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
+            quantization: obleth_config::DEFAULT_QUANTIZATION.to_string(),
+            admission_weight: 100,
+            max_in_flight: None,
+            enabled: true,
+            cache_enabled: false,
+            cache_ttl_secs: 0,
+            input_cost_per_token: 0.0,
+            output_cost_per_token: 0.0,
+            cost_per_image: 0.0,
+            cost_per_audio_second: 0.0,
+            cost_per_character: 0.0,
+            context_window: 128_000,
+            supports_function_calling: true,
+            supports_system_messages: true,
+            supports_response_schema: true,
+            supports_tool_choice: true,
+            supports_vision: false,
+            tags: Vec::new(),
+            declared_levels: Vec::new(),
+            boons: Vec::new(),
+            tool_servers: Vec::new(),
+            knowledge_collections: Vec::new(),
+            request_timeout_secs,
+            max_retries: 0,
+            retry_backoff_ms: obleth_config::DEFAULT_RETRY_BACKOFF_MS,
+            endpoint_selection_mode: obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
+            debug_diagnostics: false,
+            energy_slots_per_node: 0,
+            route_bias: 1.0,
+            auto_eligible: true,
+            draft_model: String::new(),
+            verify_api_base: String::new(),
+            verify_upstream_model: String::new(),
+            endpoints: Vec::new(),
+        }
+    }
+
+    fn candidate(name: &str, request_timeout_secs: Option<i64>) -> router::Candidate {
+        router::Candidate {
+            model: model(name, request_timeout_secs),
+            healthy: true,
+            levels: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn overlong_request_timeouts_flags_only_models_exceeding_the_read_timeout() {
+        let candidates = vec![
+            candidate("short", Some(60)),
+            candidate("no-override", None),
+            candidate("long", Some(600)),
+            candidate("exactly-at-limit", Some(300)),
+        ];
+        let offenders = overlong_request_timeouts(&candidates, 300);
+        assert_eq!(offenders, vec![("long".to_string(), 600)]);
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    async fn bind() -> (tokio::net::TcpListener, String) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        (listener, url)
+    }
+
+    /// `/slow` signals `started` once its handler runs, so a test can trigger
+    /// shutdown while the request is definitely in flight.
+    fn slow_app(delay: Duration, started: Arc<tokio::sync::Notify>) -> Router {
+        Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .route(
+                "/slow",
+                get(move || {
+                    let started = started.clone();
+                    async move {
+                        started.notify_one();
+                        tokio::time::sleep(delay).await;
+                        "done"
+                    }
+                }),
+            )
+    }
+
+    #[tokio::test]
+    async fn servers_exit_cleanly_when_shutdown_is_triggered() {
+        let (a, a_url) = bind().await;
+        let (b, b_url) = bind().await;
+        let (c, c_url) = bind().await;
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(serve_until_shutdown(
+            vec![
+                (a, slow_app(Duration::ZERO, Default::default())),
+                (b, slow_app(Duration::ZERO, Default::default())),
+                (c, slow_app(Duration::ZERO, Default::default())),
+            ],
+            rx,
+            Duration::from_secs(5),
+        ));
+        let http = reqwest::Client::new();
+        for url in [&a_url, &b_url, &c_url] {
+            let body = http.get(format!("{url}/health")).send().await.unwrap();
+            assert_eq!(body.text().await.unwrap(), "ok");
+        }
+        tx.send(true).unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("servers stop promptly")
+            .unwrap();
+        assert!(res.is_ok());
+        assert!(
+            http.get(format!("{a_url}/health")).send().await.is_err(),
+            "listener no longer accepts"
+        );
+    }
+
+    #[tokio::test]
+    async fn in_flight_request_finishes_before_exit() {
+        let (a, a_url) = bind().await;
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let server = tokio::spawn(serve_until_shutdown(
+            vec![(a, slow_app(Duration::from_millis(500), started.clone()))],
+            rx,
+            Duration::from_secs(5),
+        ));
+        let req =
+            tokio::spawn(async move { reqwest::get(format!("{a_url}/slow")).await?.text().await });
+        started.notified().await;
+        tx.send(true).unwrap();
+        assert_eq!(req.await.unwrap().unwrap(), "done");
+        assert!(server.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn grace_bounds_a_request_that_never_finishes() {
+        let (a, a_url) = bind().await;
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let server = tokio::spawn(serve_until_shutdown(
+            vec![(a, slow_app(Duration::from_secs(600), started.clone()))],
+            rx,
+            Duration::from_millis(200),
+        ));
+        let _req = tokio::spawn(reqwest::get(format!("{a_url}/slow")));
+        started.notified().await;
+        tx.send(true).unwrap();
+        let res = tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("grace elapsed")
+            .unwrap();
+        assert!(res.is_ok());
+    }
+
+    /// Pure, always-on coverage of the restore/evict decision itself — the
+    /// actual logic behind both I1 (a revoked key must not come back) and N1
+    /// (a key created mid-pass must not be wrongly evicted). This is the
+    /// primary proof: it needs no Redis and can't leave any shared state
+    /// behind, unlike the SCAN-based prune the integration test below drives
+    /// for real (see that test's doc comment for why it's careful about it).
+    #[test]
+    fn restore_and_evict_keeps_a_mid_pass_create_and_drops_a_genuine_revocation() {
+        use std::collections::HashSet;
+        let known: HashSet<String> = ["kept", "deleted-mid-pass"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        // `pruned` is what the SCAN removed: `created-mid-pass` (wrongly —
+        // it's not in `known` only because the snapshot predates it) and
+        // `revoked` (correctly — Postgres dropped it before the snapshot).
+        let pruned: HashSet<String> = ["created-mid-pass", "revoked"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        // The post-prune reload: `kept` still there, `created-mid-pass` now
+        // visible, `deleted-mid-pass` gone (an admin delete that landed after
+        // the snapshot but that the prune couldn't see, since it still
+        // matched `known`), `revoked` still gone.
+        let fresh: HashSet<&str> = ["kept", "created-mid-pass"].into_iter().collect();
+
+        let (mut restore, mut evict) = restore_and_evict(&known, &pruned, &fresh);
+        restore.sort();
+        evict.sort();
+        assert_eq!(restore, vec!["created-mid-pass".to_string()]);
+        assert_eq!(
+            evict,
+            vec!["deleted-mid-pass".to_string(), "revoked".to_string()]
+        );
+    }
+
+    #[test]
+    fn restore_and_evict_is_empty_when_the_prune_removed_nothing() {
+        use std::collections::HashSet;
+        let known: HashSet<String> = ["kept"].into_iter().map(String::from).collect();
+        let pruned: HashSet<String> = HashSet::new();
+        let fresh: HashSet<&str> = ["kept"].into_iter().collect();
+        assert_eq!(
+            restore_and_evict(&known, &pruned, &fresh),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    /// Integration smoke test for the real Redis plumbing behind both
+    /// scenarios `restore_and_evict_keeps_a_mid_pass_create_and_drops_a_genuine_revocation`
+    /// covers in isolation above.
+    ///
+    /// `push_and_prune_keys` calls `RedisStore::prune_stale_resolved_keys`,
+    /// which SCANs and deletes across the *entire* `obleth:key:*` namespace —
+    /// not just the hashes this test creates. Point `OBLETH_TEST_REDIS_URL`
+    /// at an isolated database (e.g. Redis db 15, the project's documented
+    /// test database — never db 0 / a shared or live instance): running this
+    /// against a real deployment's default database deletes its live
+    /// resolved-key cache. Both scenarios are folded into one `#[tokio::test]`
+    /// (rather than two, as originally written) because two such tests
+    /// running in parallel — the default for `cargo test` — race the same
+    /// SCAN and can prune each other's freshly-written keys.
+    #[tokio::test]
+    async fn push_and_prune_keys_integration() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let redis = obleth_redis::RedisStore::connect(&url)
+            .await
+            .expect("connect");
+
+        // Scenario 1 (I1): revoked before the snapshot was loaded, absent
+        // from both the snapshot and the post-prune reload — stays evicted.
+        let revoked_hash = format!("test-rewarm-{}", uuid::Uuid::new_v4());
+        redis
+            .put_resolved_key(&revoked_hash, &test_resolved_key())
+            .await
+            .unwrap();
+
+        // Scenario 2 (N1): created between the snapshot load and the SCAN —
+        // already in Redis (the admin create path pushes synchronously) but
+        // missing from the snapshot; the post-prune reload shows it, so it
+        // must be restored.
+        let created_hash = format!("test-rewarm-{}", uuid::Uuid::new_v4());
+        let created_key = test_resolved_key();
+        redis
+            .put_resolved_key(&created_hash, &created_key)
+            .await
+            .unwrap();
+
+        let kept_hash = format!("test-rewarm-{}", uuid::Uuid::new_v4());
+        let kept_key = test_resolved_key();
+        redis.put_resolved_key(&kept_hash, &kept_key).await.unwrap();
+
+        // The pass's own snapshot predates the create: only `kept` and
+        // (already-gone-from-Postgres) nothing for `revoked_hash`.
+        let snapshot = vec![(kept_hash.clone(), kept_key.clone())];
+        // The post-prune reload runs later: Postgres now also has `created`,
+        // and still doesn't have `revoked`.
+        let reread = vec![
+            (kept_hash.clone(), kept_key),
+            (created_hash.clone(), created_key),
+        ];
+
+        let pushed =
+            push_and_prune_keys(&redis, &snapshot, move || async move { Ok(reread) }).await;
+        assert_eq!(pushed, Some(2));
+        assert!(
+            redis
+                .get_resolved_key(&revoked_hash)
+                .await
+                .unwrap()
+                .is_none(),
+            "a key revoked before the snapshot must stay evicted"
+        );
+        assert!(
+            redis
+                .get_resolved_key(&created_hash)
+                .await
+                .unwrap()
+                .is_some(),
+            "a key created during the pass must survive it"
+        );
+        assert!(redis.get_resolved_key(&kept_hash).await.unwrap().is_some());
+
+        redis.delete_resolved_key(&created_hash).await.unwrap();
+        redis.delete_resolved_key(&kept_hash).await.unwrap();
+    }
+
+    fn test_resolved_key() -> obleth_config::ResolvedKey {
+        obleth_config::ResolvedKey {
+            key_id: uuid::Uuid::new_v4(),
+            tenant_id: uuid::Uuid::new_v4(),
+            tenant_name: "t".into(),
+            fairshare_group: "default".into(),
+            group_weight: 100,
+            weight: 7,
+            tokens_per_minute: 1000,
+            max_in_flight: None,
+            disabled: false,
+            status: "active".into(),
+            timezone: "UTC".into(),
+            active_from: None,
+            active_until: None,
+            weekly_windows: None,
+            budget_tokens: None,
+            budget_cost_usd: None,
+            budget_period: None,
+            budget_started_at: None,
+            key_budget_tokens: None,
+            key_budget_cost_usd: None,
+            key_budget_period: None,
+            key_budget_started_at: None,
+            key_weight: 100,
+            key_max_in_flight: None,
+            allowed_models: None,
+            internal: false,
+            tracing_enabled: false,
+            guardrails_policy: None,
+            compression_policy: None,
+            synthetic: false,
+        }
+    }
+
+    #[test]
+    fn redis_rewarm_secs_is_clamped_to_the_maximum() {
+        assert_eq!(clamped_redis_rewarm_secs(300), 300);
+        assert_eq!(clamped_redis_rewarm_secs(u64::MAX), MAX_REDIS_REWARM_SECS);
     }
 }

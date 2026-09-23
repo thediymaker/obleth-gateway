@@ -42,7 +42,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use futures_util::{Stream, StreamExt};
+use futures_util::Stream;
 use obleth_config::{ResolvedKey, ResolvedModel, SpeculationBoonSettings};
 use serde_json::{json, Value};
 
@@ -650,9 +650,12 @@ async fn dispatch_stream(
     body: &Value,
     timeout: Duration,
 ) -> anyhow::Result<reqwest::Response> {
-    let url = super::build_chat_url(&model.api_base);
-    let mut req = state.http.post(url).json(body);
-    if let Some(api_key) = &model.api_key {
+    let target = super::helper_target(model, "", None)?;
+    let mut req = state
+        .http
+        .post(super::build_chat_url(&target.base))
+        .json(body);
+    if let Some(api_key) = &target.api_key {
         req = req.bearer_auth(api_key);
     }
     let resp = tokio::time::timeout(timeout, req.send())
@@ -728,7 +731,12 @@ impl DraftReader {
                 }
                 return Ok(true);
             }
-            match self.bytes.next().await {
+            match super::tool_stream::next_within(
+                &mut self.bytes,
+                super::tool_stream::stream_idle_timeout(),
+            )
+            .await
+            {
                 Some(Ok(chunk)) => self.buf.extend_from_slice(&chunk),
                 Some(Err(e)) => anyhow::bail!("draft stream read failed: {e}"),
                 None => {
@@ -1433,7 +1441,7 @@ fn drive_stream(
                             }
                         }
                     }
-                    match bytes.next().await {
+                    match super::tool_stream::next_within(&mut bytes, super::tool_stream::stream_idle_timeout()).await {
                         Some(Ok(chunk)) => buf.extend_from_slice(&chunk),
                         Some(Err(e)) => {
                             tracing::warn!(error = %e, "speculation continuation stream failed");

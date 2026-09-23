@@ -2121,6 +2121,10 @@ fn default_tool_loop_timeout_ms() -> u64 {
     30_000
 }
 
+fn default_tool_loop_deadline_secs() -> u64 {
+    300
+}
+
 /// Default system nudge injected alongside granted tools so under-eager models
 /// reach for them. Names the capability explicitly ("you can call tools") and
 /// the situations that warrant a call, without forcing tool use on every turn.
@@ -2136,6 +2140,16 @@ your own knowledge directly for everything else."
 
 /// Maximum tool-loop turns an operator may configure (cost/latency guard).
 pub const TOOL_LOOP_MAX_TURNS: u32 = 8;
+
+/// Largest `ToolLoopSettings::deadline_secs` an operator may configure (one
+/// hour). Also the fallback budget when a stored value cannot be represented
+/// as a deadline.
+pub const TOOL_LOOP_MAX_DEADLINE_SECS: u64 = 3_600;
+
+/// Maximum gateway tool calls executed from one model turn. Each excess call
+/// gets an error tool result instead, so a single reply cannot fan out an
+/// unbounded number of MCP or image calls.
+pub const TOOL_LOOP_MAX_CALLS_PER_TURN: usize = 16;
 
 /// Configuration for the gateway tool loop: when a model is granted access to
 /// registered MCP servers (`ModelRoute::tool_servers`), the gateway injects
@@ -2162,6 +2176,12 @@ pub struct ToolLoopSettings {
     /// untouched). An empty string disables the nudge.
     #[serde(default = "default_tool_loop_nudge")]
     pub nudge: String,
+    /// Wall-clock budget for the whole loop of one request (every tool call
+    /// and follow-up turn), in seconds. Per-call timeouts alone stack up to
+    /// `max_turns` x calls x timeout of held upstream capacity; once this
+    /// elapses the loop dispatches nothing further.
+    #[serde(default = "default_tool_loop_deadline_secs")]
+    pub deadline_secs: u64,
 }
 
 impl Default for ToolLoopSettings {
@@ -2171,6 +2191,7 @@ impl Default for ToolLoopSettings {
             max_turns: default_tool_loop_max_turns(),
             tool_timeout_ms: default_tool_loop_timeout_ms(),
             nudge: default_tool_loop_nudge(),
+            deadline_secs: default_tool_loop_deadline_secs(),
         }
     }
 }

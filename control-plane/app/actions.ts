@@ -18,6 +18,7 @@ import type {
   ModelManifest,
   ModelRoute,
   RestoreReport,
+  ResyncReport,
   UpdateAlertSettings,
   UpdateAutoRouterSettings,
   UpdateBoonSettings,
@@ -1568,6 +1569,20 @@ export async function compactUsageAction(): Promise<
       partitionsDropped: res.partitions_dropped,
       retentionDays: res.retention_days,
     };
+  } catch (e) {
+    return actionError(e);
+  }
+}
+
+/**
+ * Rebuild the data plane's resolver cache (keys, models, MCP servers) from
+ * Postgres. This is the retry a failed delete-eviction error points operators at.
+ */
+export async function resyncCacheAction(): Promise<ActionResult & { report?: ResyncReport }> {
+  const session = await requireAdmin();
+  try {
+    const report = await obleth.resync({ auditActor: session.email });
+    return { ok: true, report };
   } catch (e) {
     return actionError(e);
   }

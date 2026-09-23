@@ -8,7 +8,7 @@
 //!
 //! The endpoint participates in the full pipeline: key auth, model resolution
 //! (aliases and `auto`), ONE fairshare permit covering the whole fan-out, the
-//! key- and tenant-level budget reserves, and a single `settle_request` with
+//! key- and tenant-level budget reserves, and a single guarded settlement with
 //! the summed real usage under `request_type: "verdict"`. Per-question
 //! visibility is in the trace (`verdict:q:<id>` spans), not extra ledger
 //! rows. The prompt-prefix / label mechanics live in [`prompt`], the
@@ -32,7 +32,7 @@ use uuid::Uuid;
 
 use crate::proxy::{
     self, build_targets, derive_intent, effective_admission_weight, error_json, finalize,
-    gate_resolved_key, key_term_period_key, resolve_conversation, resolve_model, settle_request,
+    gate_resolved_key, key_term_period_key, resolve_conversation, resolve_model,
     surfaced_request_type, term_period_key, union_candidate_tags, RequestMeta, BODY_LIMIT,
 };
 use crate::state::AppState;
@@ -587,21 +587,22 @@ async fn handler_inner(
     let energy_slots = route.energy_slots_per_node;
 
     // ---- fairshare admission: ONE permit covers the whole fan-out ----
+    // Bounded by the same `OBLETH_ADMISSION_TIMEOUT_SECS` wrapper the
+    // chat/completions and responses paths use, so a saturated pool cannot
+    // park a verdicts caller indefinitely.
     let effective_weight = effective_admission_weight(resolved.weight, Some(&route));
     let admission_start = crate::tracer::now_ms();
-    let admitted = match state
-        .fairshare
-        .admit(crate::proxy::admit_request_for(
-            &resolved,
-            &model,
-            Some(&route),
-            effective_weight,
-            est.total(),
-        ))
-        .await
-    {
-        Some(a) => a,
-        None => {
+    let admit_wait = proxy::admission_timeout();
+    let admit = state.fairshare.admit(crate::proxy::admit_request_for(
+        &resolved,
+        &model,
+        Some(&route),
+        effective_weight,
+        est.total(),
+    ));
+    let admitted = match tokio::time::timeout(admit_wait, admit).await {
+        Ok(Some(a)) => a,
+        Ok(None) => {
             if let Some(t) = tracer.take() {
                 t.finish("error");
             }
@@ -614,6 +615,39 @@ async fn handler_inner(
                 ),
             );
             return error_json(StatusCode::SERVICE_UNAVAILABLE, "scheduler unavailable");
+        }
+        Err(_) => {
+            if let Some(t) = tracer.take() {
+                t.finish("error");
+            }
+            let queued_ms = (crate::tracer::now_ms() - admission_start) as u32;
+            finalize(
+                &state,
+                request_id,
+                &resolved,
+                &req_meta,
+                &model,
+                Admission::Rejected,
+                est,
+                0,
+                0,
+                queued_ms,
+                0,
+                request_start.elapsed().as_millis() as u32,
+                503,
+                "off",
+                0.0,
+                crate::energy::EnergyFigures::default(),
+            );
+            let mut resp = error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "timed out waiting for model capacity",
+            );
+            resp.headers_mut().insert(
+                header::RETRY_AFTER,
+                header::HeaderValue::from_static(proxy::ADMISSION_RETRY_AFTER_SECS),
+            );
+            return resp;
         }
     };
     let admission = admitted.admission;
@@ -681,13 +715,24 @@ async fn handler_inner(
         }
         error_json(status, msg)
     };
+    // Reserve-then-reconcile, as in the passthrough pipeline: an admitted
+    // request holds its estimate against each term cap until settlement.
+    let est_cost = proxy::estimated_cost(est, in_cost_rate, out_cost_rate, 0.0);
+    let mut key_term_held = false;
+    let mut tenant_term_held = false;
+    let mut key_hold: Option<proxy::PendingTermHold> = None;
     if let Some(gate) = key_term_gate {
         match state
             .redis
-            .reserve_budget_with_term(&resolved.key_id, 0, 0, est.total(), Some(gate))
+            .reserve_with_term(&resolved.key_id, 0, 0, est.total(), Some(gate), est_cost)
             .await
         {
-            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {}
+            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
+                key_term_held = true;
+                key_hold = key_term_period.clone().map(|period| {
+                    proxy::PendingTermHold::new(&state, resolved.key_id, period, est, est_cost)
+                });
+            }
             Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {}
             Ok(obleth_redis::ReserveOutcome::TermExhausted {
                 used_tokens,
@@ -723,21 +768,28 @@ async fn handler_inner(
             }
         }
     }
-    if capacity > 0 || term_gate.is_some() {
+    let tenant_gate_armed = term_gate.is_some();
+    if capacity > 0 || tenant_gate_armed {
         match state
             .redis
-            .reserve_budget_with_term(
+            .reserve_with_term(
                 &resolved.tenant_id,
                 capacity,
                 resolved.tokens_per_minute,
                 est.total(),
                 term_gate,
+                est_cost,
             )
             .await
         {
-            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {}
+            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
+                tenant_term_held = tenant_gate_armed;
+            }
             Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {
                 drop(permit);
+                if let Some(hold) = key_hold.take() {
+                    hold.release().await;
+                }
                 return reject(
                     StatusCode::TOO_MANY_REQUESTS,
                     "token budget exceeded",
@@ -749,6 +801,9 @@ async fn handler_inner(
                 used_cost,
             }) => {
                 drop(permit);
+                if let Some(hold) = key_hold.take() {
+                    hold.release().await;
+                }
                 state.alerts.issue(
                     format!("term_budget_exhausted:{}", resolved.tenant_id),
                     "Tenant term budget exhausted",
@@ -768,6 +823,9 @@ async fn handler_inner(
             Err(e) => {
                 if !state.fail_open {
                     drop(permit);
+                    if let Some(hold) = key_hold.take() {
+                        hold.release().await;
+                    }
                     if let Some(t) = tracer.take() {
                         t.finish("error");
                     }
@@ -777,6 +835,37 @@ async fn handler_inner(
             }
         }
     }
+    if let Some(hold) = key_hold.take() {
+        hold.hand_off();
+    }
+
+    // Every exit from here settles through `settle_guard` exactly once; a
+    // client that leaves mid fan-out settles as unbilled 499 and refunds.
+    let accounting = proxy::StreamAccounting {
+        state: state.clone(),
+        request_id,
+        resolved: resolved.clone(),
+        meta: req_meta.clone(),
+        model: model.clone(),
+        admission,
+        est,
+        queue_wait_ms,
+        request_start,
+        cache_status: "off".to_string(),
+        capacity,
+        term_period: term_period.clone(),
+        key_term_period: key_term_period.clone(),
+        in_cost_rate,
+        out_cost_rate,
+        modality_cost: 0.0,
+        energy_slots,
+        holds: proxy::TermHolds {
+            tenant: tenant_term_held,
+            key: key_term_held,
+            est_cost,
+        },
+    };
+    let settle_guard = accounting.unbilled_guard();
 
     // ---- fan out against ONE pinned target (prefix-cache locality) ----
     let target = build_targets(
@@ -789,10 +878,16 @@ async fn handler_inner(
     .next();
     let Some(target) = target else {
         drop(permit);
-        return reject(
+        let total_ms = request_start.elapsed().as_millis() as u32;
+        let _ = settle_guard
+            .complete(accounting.settle_unbilled(0, total_ms, 502))
+            .await;
+        if let Some(t) = tracer.take() {
+            t.finish("error");
+        }
+        return error_json(
             StatusCode::BAD_GATEWAY,
             "model has no usable upstream endpoint",
-            tracer.take(),
         );
     };
     let url = format!("{}/chat/completions", target.base.trim_end_matches('/'));
@@ -902,31 +997,15 @@ async fn handler_inner(
     let total_ms = request_start.elapsed().as_millis() as u32;
     let status_code: u16 = if failure.is_some() { 502 } else { 200 };
 
-    settle_request(
-        &state,
-        request_id,
-        &resolved,
-        &req_meta,
-        &model,
-        admission,
-        est,
-        usage.prompt_tokens,
-        usage.completion_tokens,
-        queue_wait_ms,
-        ttft_ms,
-        total_ms,
-        status_code,
-        "off",
-        capacity,
-        term_period.as_deref(),
-        key_term_period.as_deref(),
-        in_cost_rate,
-        out_cost_rate,
-        0.0,
-        energy_slots,
-        None,
-    )
-    .await;
+    let _ = settle_guard
+        .complete(accounting.settle(
+            (usage.prompt_tokens, usage.completion_tokens),
+            ttft_ms,
+            total_ms,
+            status_code,
+            None,
+        ))
+        .await;
 
     if let Some(msg) = failure {
         if let Some(t) = tracer.take() {
@@ -1387,5 +1466,64 @@ mod tests {
         // Each question pays the state prefill again: 2 × (100 + 10 + 8).
         assert_eq!(est.input_tokens, 2 * (100 + 10 + 8));
         assert_eq!(est.estimated_output_tokens, 2);
+    }
+}
+
+#[cfg(test)]
+mod settlement_tests {
+    /// The handler's source with all whitespace removed. There is no AppState
+    /// harness here (it needs live Redis), so the reservation contract is
+    /// pinned at the source level, like the passthrough pipeline's.
+    fn handler() -> String {
+        let full = include_str!("mod.rs");
+        let src = &full[..full.find("\nmod tests {").expect("the test module")];
+        let start = src.find("async fn handler_inner(").unwrap_or(0);
+        src[start..]
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect()
+    }
+
+    #[test]
+    fn verdicts_reserve_term_budget_and_settle_through_the_guard() {
+        let h = handler();
+        assert!(!h.contains("reserve_budget_with_term("), "check-only gate");
+        assert!(!h.contains("settle_request("), "unguarded settlement");
+        assert!(
+            h.contains(".reserve_with_term(&resolved.key_id,0,0,est.total(),Some(gate),est_cost)")
+        );
+        let tenant = h
+            .find(".reserve_with_term(&resolved.tenant_id,")
+            .expect("tenant reserve");
+        let guard = h
+            .find("letsettle_guard=accounting.unbilled_guard();")
+            .expect("guard");
+        assert!(tenant < guard);
+        // Rate limited, term exhausted, and fail-closed error release the key hold.
+        assert_eq!(h[tenant..guard].matches("hold.release().await").count(), 3);
+        assert!(h[tenant..guard].contains("hold.hand_off()"));
+        // No legacy ledger-only rejection after the reservation owns budget.
+        assert!(!h[guard..].contains("returnreject("));
+        assert_eq!(h[guard..].matches("settle_guard.complete(").count(), 2);
+    }
+
+    #[test]
+    fn verdicts_admission_is_bounded_by_the_shared_admission_timeout() {
+        let h = handler();
+        // Same wrapper as the passthrough pipeline (proxy.rs): bounded by
+        // `OBLETH_ADMISSION_TIMEOUT_SECS`, and a timed-out wait answers 503
+        // with the shared `Retry-After` value rather than parking forever.
+        assert!(h.contains("letadmit_wait=proxy::admission_timeout();"));
+        assert!(h.contains("tokio::time::timeout(admit_wait,admit).await"));
+        let timeout_branch = h.find("Err(_)=>{").expect("the timeout branch");
+        let scope = &h[timeout_branch..];
+        let end = scope
+            .find("letadmission=admitted.admission;")
+            .expect("the match ends before the admission is unpacked");
+        let scope = &scope[..end];
+        assert!(scope.contains("StatusCode::SERVICE_UNAVAILABLE"));
+        assert!(scope.contains("\"timedoutwaitingformodelcapacity\""));
+        assert!(scope.contains("header::RETRY_AFTER"));
+        assert!(scope.contains("proxy::ADMISSION_RETRY_AFTER_SECS"));
     }
 }
