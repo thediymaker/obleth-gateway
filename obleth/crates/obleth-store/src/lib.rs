@@ -2052,9 +2052,12 @@ impl Store {
         }
     }
 
+    /// Update one endpoint of `model_id`. The model scope is part of the match:
+    /// an endpoint id belonging to another model is `NotFound`, never edited.
     #[allow(clippy::too_many_arguments)]
     pub async fn update_model_endpoint(
         &self,
+        model_id: Uuid,
         id: Uuid,
         name: &str,
         api_base: &str,
@@ -2072,7 +2075,7 @@ impl Store {
                 sqlx::query(
                     "update model_endpoints set name = $2, api_base = $3, api_key = $4,
                             priority = $5, weight = $6, enabled = $7, updated_at = now()
-                     where id = $1
+                     where id = $1 and model_id = $8
                      returning id, model_id, name, api_base, api_key, priority, weight, enabled,
                                health_status, consecutive_failures, alert_state,
                                last_checked_at, last_latency_ms, last_http_status, last_message,
@@ -2085,6 +2088,7 @@ impl Store {
                 .bind(priority.max(0))
                 .bind(weight.max(1))
                 .bind(enabled)
+                .bind(model_id)
                 .fetch_optional(&self.pool)
                 .await?
             }
@@ -2092,7 +2096,7 @@ impl Store {
                 sqlx::query(
                     "update model_endpoints set name = $2, api_base = $3,
                             priority = $4, weight = $5, enabled = $6, updated_at = now()
-                     where id = $1
+                     where id = $1 and model_id = $7
                      returning id, model_id, name, api_base, api_key, priority, weight, enabled,
                                health_status, consecutive_failures, alert_state,
                                last_checked_at, last_latency_ms, last_http_status, last_message,
@@ -2104,6 +2108,7 @@ impl Store {
                 .bind(priority.max(0))
                 .bind(weight.max(1))
                 .bind(enabled)
+                .bind(model_id)
                 .fetch_optional(&self.pool)
                 .await?
             }
@@ -2112,12 +2117,17 @@ impl Store {
         endpoint_from_row(&row)
     }
 
-    pub async fn delete_model_endpoint(&self, id: Uuid) -> Result<Uuid> {
-        let row = sqlx::query("delete from model_endpoints where id = $1 returning model_id")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?
-            .ok_or(StoreError::NotFound)?;
+    /// Delete one endpoint of `model_id`; an endpoint id belonging to another
+    /// model is `NotFound`, never deleted.
+    pub async fn delete_model_endpoint(&self, model_id: Uuid, id: Uuid) -> Result<Uuid> {
+        let row = sqlx::query(
+            "delete from model_endpoints where id = $1 and model_id = $2 returning model_id",
+        )
+        .bind(id)
+        .bind(model_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
         let model_id: Uuid = row.try_get("model_id")?;
         // Removing an endpoint changes the model's live pool; re-probe promptly so
         // the model-level aggregate doesn't lag a full interval behind.
@@ -4494,6 +4504,111 @@ mod tests {
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// An endpoint is only reachable through its own model: addressing model
+    /// B's endpoint via model A's id must neither edit nor delete it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn endpoint_writes_are_scoped_to_their_model() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let model = store
+                .create_model(
+                    &format!("m-{}", Uuid::new_v4()),
+                    "endpoint scoping test model",
+                    "upstream-model",
+                    "http://127.0.0.1:8081",
+                    None,
+                    "chat",
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    8192,
+                    100,
+                    None,
+                    false,
+                    true,
+                    false,
+                    false,
+                    false,
+                    &[],
+                    &[],
+                    &[],
+                    0,
+                    1.0,
+                    true,
+                    "",
+                    "",
+                    "",
+                    &[],
+                    "",
+                )
+                .await
+                .expect("create model");
+            fixtures.track_model(model.id);
+            ids.push(model.id);
+        }
+        let (model_a, model_b) = (ids[0], ids[1]);
+        let ep_b = store
+            .create_model_endpoint(model_b, "b", "http://127.0.0.1:8082", None, 0, 1, true)
+            .await
+            .expect("create endpoint");
+
+        let err = store
+            .update_model_endpoint(
+                model_a,
+                ep_b.id,
+                "hijacked",
+                "http://127.0.0.1:9999",
+                None,
+                0,
+                1,
+                true,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound), "{err:?}");
+        let err = store
+            .delete_model_endpoint(model_a, ep_b.id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StoreError::NotFound), "{err:?}");
+
+        let untouched = store.list_model_endpoints(model_b).await.expect("list");
+        assert_eq!(untouched.len(), 1);
+        assert_eq!(untouched[0].name, "b");
+        assert_eq!(untouched[0].api_base, "http://127.0.0.1:8082");
+
+        // Through its own model the endpoint is still writable.
+        store
+            .update_model_endpoint(
+                model_b,
+                ep_b.id,
+                "b2",
+                "http://127.0.0.1:8083",
+                None,
+                0,
+                1,
+                true,
+            )
+            .await
+            .expect("owner update");
+        store
+            .delete_model_endpoint(model_b, ep_b.id)
+            .await
+            .expect("owner delete");
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
     /// A `degraded` probe (reachable, model id unconfirmed) must lift a stale
     /// `unhealthy` so a recovered endpoint returns to rotation — but it must not
     /// downgrade a confirmed `healthy`. Regression for endpoints stuck unhealthy
@@ -5317,7 +5432,7 @@ mod tests {
             slurm_user: "obleth".into(),
             slurm_jwt: "header.payload.sig-secret".into(),
             node_aliases: vec![obleth_config::NodeAlias {
-                host: "scgh001".into(),
+                host: "node001".into(),
                 ip: "10.0.0.1".into(),
             }],
         };

@@ -18,8 +18,12 @@ LABEL org.opencontainers.image.source="https://github.com/thediymaker/obleth-gat
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 obleth \
-    && useradd --system --uid 10001 --gid obleth --no-create-home obleth
+    && useradd --system --uid 10001 --gid obleth --no-create-home obleth \
+    && mkdir -p /var/lib/obleth && chown 10001:10001 /var/lib/obleth
 COPY --from=builder /app/obleth/target/release/obleth /usr/local/bin/obleth
+# Writable working directory for the runtime user, so the default relative
+# OBLETH_WAL_PATH (./obleth-telemetry.wal) resolves to a path it can write.
+WORKDIR /var/lib/obleth
 USER 10001:10001
 EXPOSE 8080 9180 9091
 # Probe the proxy's /health endpoint (default OBLETH_PROXY_LISTEN :8080).

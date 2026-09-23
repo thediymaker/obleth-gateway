@@ -1,3 +1,4 @@
+import { requireAdmin } from "@/lib/auth/roles";
 import { OverviewDashboard } from "@/components/overview-dashboard";
 import { EMPTY_OVERVIEW_SUMMARY, fetchOverviewSummary } from "@/lib/overview-summary";
 import { obleth, type FairshareLiveView, type LiveStats, type ModelHealthSummary } from "@/lib/obleth";
@@ -9,6 +10,7 @@ const DAY_MS = 86_400_000;
 const HOUR_MS = 3_600_000;
 
 export default async function OverviewPage() {
+  await requireAdmin();
   const now = Date.now();
   const dayAgo = now - DAY_MS;
   const hourAgo = now - HOUR_MS;

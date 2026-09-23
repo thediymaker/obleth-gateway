@@ -240,6 +240,11 @@ pub(crate) fn effective_draft_model(route: &ResolvedModel, s: &SpeculationBoonSe
 /// The scoring address for one target: its own `verify_api_base`, else the
 /// fleet template with `{upstream}`/`{model}` substituted. Empty = cannot
 /// speculate.
+///
+/// The model's upstream key is sent to this address, so a model's fields must
+/// never be able to redirect it (see [`fill_template`]). A template the fill
+/// refuses yields no scoring endpoint: speculation is skipped, the request is
+/// served normally.
 pub(crate) fn scoring_base(route: &ResolvedModel, template: &str) -> String {
     let own = route.verify_api_base.trim();
     if !own.is_empty() {
@@ -249,9 +254,111 @@ pub(crate) fn scoring_base(route: &ResolvedModel, template: &str) -> String {
     if template.is_empty() {
         return String::new();
     }
-    template
-        .replace("{upstream}", &route.upstream_model)
-        .replace("{model}", &route.model_name)
+    match fill_template(template, route) {
+        Some(url) => url,
+        None => {
+            // Runs on every request to the model, so it cannot be a warn:
+            // one misconfigured model would flood the logs at load.
+            tracing::debug!(
+                model = %route.model_name,
+                "speculation verify_url_template cannot be filled safely for this model; \
+                 speculation skipped"
+            );
+            String::new()
+        }
+    }
+}
+
+/// Fill `{upstream}`/`{model}` per position:
+/// - in the host, the value must be plain DNS labels (no `@`, `:`, `/`, …) and
+///   the filled host must not be an IP literal, so a model field can name a
+///   per-model Service but never an address such as the metadata endpoint;
+/// - in the path/query, the value is percent-encoded into one opaque component.
+///
+/// Placeholders in the scheme or credentials are refused outright (saves
+/// reject them too). `None` = refuse.
+fn fill_template(template: &str, route: &ResolvedModel) -> Option<String> {
+    use obleth_admin::ssrf::{check_template_structure, VERIFY_TEMPLATE_PLACEHOLDERS};
+    check_template_structure(template, VERIFY_TEMPLATE_PLACEHOLDERS).ok()?;
+
+    // Byte range of the authority (`host[:port]`; userinfo is refused above).
+    let authority_start = template.find("://").map_or(0, |i| i + 3);
+    let authority_end = template[authority_start..]
+        .find(['/', '?', '#'])
+        .map_or(template.len(), |i| authority_start + i);
+
+    let mut out = String::with_capacity(template.len() + 32);
+    let mut host_filled = false;
+    let mut rest = template;
+    while !rest.is_empty() {
+        let pos = template.len() - rest.len();
+        let hit = [
+            ("{upstream}", route.upstream_model.as_str()),
+            ("{model}", route.model_name.as_str()),
+        ]
+        .into_iter()
+        .find(|(placeholder, _)| rest.starts_with(placeholder));
+        match hit {
+            Some((placeholder, value)) => {
+                if (authority_start..authority_end).contains(&pos) {
+                    if !is_dns_name(value) {
+                        return None;
+                    }
+                    out.push_str(value);
+                    host_filled = true;
+                } else {
+                    out.push_str(&encode_template_value(value));
+                }
+                rest = &rest[placeholder.len()..];
+            }
+            None => {
+                let ch = rest.chars().next()?;
+                out.push(ch);
+                rest = &rest[ch.len_utf8()..];
+            }
+        }
+    }
+
+    let url = reqwest::Url::parse(&out).ok()?;
+    let host = url.host_str()?;
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    // Covers labels that together form an address (`169.254.169.254`) and
+    // numeric forms the URL parser normalizes to one (`2852039166`). A fixed
+    // literal host in the template itself was policy-checked on save.
+    if host_filled && bare.parse::<std::net::IpAddr>().is_ok() {
+        return None;
+    }
+    Some(out)
+}
+
+/// One or more dot-separated DNS labels: alphanumerics and inner hyphens.
+fn is_dns_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.split('.').all(|label| {
+            !label.is_empty()
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+}
+
+/// Percent-encode everything outside RFC 3986's unreserved set, so a value is
+/// always a single opaque path/query component.
+fn encode_template_value(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// The verifier for one target, synthesized from the target itself with the
@@ -1397,6 +1504,70 @@ mod tests {
         );
         route.verify_api_base = "http://canary:8000/v1".into();
         assert_eq!(scoring_base(&route, tpl), "http://canary:8000/v1");
+    }
+
+    #[test]
+    fn host_placeholders_take_dns_labels_only() {
+        let mut route = target("glm-5-3");
+        route.upstream_model = "my-model".into();
+        let base = scoring_base(&route, "http://{upstream}.serving.svc/v1");
+        let url = reqwest::Url::parse(&base).expect("filled template parses");
+        assert_eq!(url.host_str(), Some("my-model.serving.svc"), "{base}");
+
+        // Values that would name an address or smuggle URL structure: no
+        // scoring route, so speculation is skipped rather than keyed there.
+        for upstream in [
+            "x@169.254.169.254",
+            "169.254.169.254",
+            "2852039166",
+            "a/b",
+            "a:1",
+            "-bad",
+            "",
+        ] {
+            route.upstream_model = upstream.into();
+            assert_eq!(
+                scoring_base(&route, "http://{upstream}/v1"),
+                "",
+                "{upstream}"
+            );
+            assert!(
+                scoring_route(&route, "http://{upstream}/v1").is_none(),
+                "{upstream}"
+            );
+        }
+    }
+
+    #[test]
+    fn template_values_cannot_move_the_scoring_host() {
+        let mut route = target("glm-5-3");
+        route.upstream_model = "x@169.254.169.254".into();
+        route.model_name = "a/b?c#d:e".into();
+        let base = scoring_base(&route, "http://10.0.0.5:8000/{upstream}/{model}/v1");
+        let url = reqwest::Url::parse(&base).expect("filled template parses");
+        assert_eq!(url.host_str(), Some("10.0.0.5"), "{base}");
+        assert_eq!(url.port(), Some(8000));
+        assert_eq!(url.username(), "");
+        assert_eq!(
+            url.path(),
+            "/x%40169.254.169.254/a%2Fb%3Fc%23d%3Ae/v1",
+            "{base}"
+        );
+        assert!(url.query().is_none() && url.fragment().is_none());
+    }
+
+    #[test]
+    fn scheme_userinfo_and_port_placeholders_yield_no_scoring_endpoint() {
+        let route = target("glm-5-3");
+        for tpl in [
+            "http://{model}@10.0.0.5/v1",
+            "http://user:{model}@10.0.0.5/v1",
+            "{upstream}://10.0.0.5/v1",
+            "http://10.0.0.5:{model}/v1",
+        ] {
+            assert_eq!(scoring_base(&route, tpl), "", "{tpl}");
+            assert!(scoring_route(&route, tpl).is_none(), "{tpl}");
+        }
     }
 
     #[test]

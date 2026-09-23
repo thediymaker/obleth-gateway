@@ -46,11 +46,48 @@ artifact carries the values published with that version. Keep per-deployment
 settings in your own `-f` values file so they apply regardless of source.
 `--wait` blocks until the rolled resources report Ready.
 
-> Values that render into the obleth Secret (`adminToken`, the database URL,
-> `clickhouse.password`, `encryptionKey`, `apiKeyPepper`) update the Secret but
-> do **not** restart running pods on their own. After changing one, force a
-> rollout: `kubectl rollout restart deployment/obleth -n obleth` (and
-> `deployment/obleth-control-plane` if its `DATABASE_URL` changed).
+> When a value that renders into the chart's obleth Secret changes
+> (`adminToken`, the database URL, the Redis URL, `postgres.password`,
+> `redis.password`, `clickhouse.password`, `encryptionKey`, `apiKeyPepper`),
+> the gateway and the bundled Redis roll automatically (`checksum/secret` pod
+> annotation). Other pods do not: after changing `adminToken`, restart
+> `deployment/obleth-control-plane` (and `deployment/obleth-provisioner` if
+> enabled), and restart the control-plane if its `DATABASE_URL` changed. With
+> `obleth.existingSecret`, the chart cannot see Secret changes, so restart the
+> affected deployments yourself, e.g. `kubectl rollout restart
+> deployment/obleth-obleth -n obleth` (the gateway is `<release>-obleth`).
+
+### Upgrading to a release with Redis authentication
+
+The bundled Redis now requires a password, and `redis.password` is a required
+value whenever `redis.enabled=true`. Generate it once and keep it with your
+other deployment secrets, then pass the same value on every upgrade:
+
+```bash
+REDIS_PASSWORD="$(openssl rand -hex 32)"   # store this; reuse it on later upgrades
+helm upgrade --install obleth deploy/k8s/obleth \
+  --namespace obleth \
+  -f my-values.yaml \
+  --set redis.password="$REDIS_PASSWORD" \
+  --wait
+```
+
+The gateway now reads `OBLETH_REDIS_URL` from the obleth Secret (rendered as
+`redis://:<password>@<release>-redis:6379`) instead of a plain environment
+value, and the bundled datastores read their passwords from the same Secret.
+With `obleth.existingSecret`, add these keys to the pre-created Secret before
+upgrading:
+
+- `OBLETH_REDIS_URL` — always; embed the password for the bundled Redis, or
+  use your external Redis URL.
+- `REDIS_PASSWORD` — when `redis.enabled=true`; must match the password in
+  `OBLETH_REDIS_URL`.
+- `POSTGRES_PASSWORD` — when `postgres.enabled=true`.
+- `OBLETH_CLICKHOUSE_PASSWORD` (already required) is also read by the bundled
+  ClickHouse when `clickhouse.enabled=true`.
+
+Use URL-safe characters for the Redis password (hex from `openssl rand -hex`),
+since it is embedded in the connection URL.
 
 ## Pick a storage scenario
 
@@ -103,6 +140,7 @@ helm install obleth deploy/k8s/obleth -n obleth --create-namespace \
   -f deploy/k8s/obleth/examples/values-persistent.yaml \
   --set obleth.adminToken="$(openssl rand -hex 32)" \
   --set postgres.password="$(openssl rand -hex 16)" \
+  --set redis.password="$(openssl rand -hex 32)" \
   --set clickhouse.password="$(openssl rand -hex 16)" \
   --set controlPlane.dashboardPassword="$(openssl rand -hex 16)" \
   --set controlPlane.dashboardSessionSecret="$(openssl rand -hex 32)"
@@ -151,7 +189,7 @@ postgres:
   external: { url: "postgres://obleth:pass@my-pg:5432/obleth" }
 redis:
   enabled: false
-  external: { url: "redis://my-redis:6379" }
+  external: { url: "redis://:pass@my-redis:6379" }
 clickhouse:
   enabled: false
   user: obleth
@@ -189,19 +227,27 @@ toggles in `values.yaml`, on by sensible defaults.
 - **Pre-created Secrets (`existingSecret`).** Point the chart at a Secret you
   created out-of-band so real credentials never enter values files or
   `--set`/CLI history. `obleth.existingSecret` must carry `OBLETH_ADMIN_TOKEN`,
-  `OBLETH_DATABASE_URL`, `OBLETH_CLICKHOUSE_PASSWORD`, `OBLETH_ENCRYPTION_KEY`,
-  `OBLETH_API_KEY_PEPPER`, `OBLETH_SLACK_WEBHOOK_URL`, and (optional — only if
-  you want the JWT bearer path) `OBLETH_JWT_ISSUERS`;
+  `OBLETH_DATABASE_URL`, `OBLETH_REDIS_URL`, `OBLETH_CLICKHOUSE_PASSWORD`,
+  `OBLETH_ENCRYPTION_KEY`, `OBLETH_API_KEY_PEPPER`, `OBLETH_SLACK_WEBHOOK_URL`,
+  (optional — only if you want the JWT bearer path) `OBLETH_JWT_ISSUERS`, and,
+  for each bundled datastore you keep enabled, `POSTGRES_PASSWORD` /
+  `REDIS_PASSWORD`;
   `controlPlane.existingSecret` must carry `DASHBOARD_PASSWORD`,
   `DASHBOARD_SESSION_SECRET`, `DATABASE_URL`, and (for the break-glass admin and
   SSO) `DASHBOARD_ADMIN_EMAIL`, `BETTER_AUTH_URL`, `OIDC_PROVIDERS`. See
   [`values-production.yaml`](obleth/examples/values-production.yaml).
 - **Spread + disruption protection.** `affinity.antiAffinity` (`soft`/`hard`)
   spreads obleth replicas across nodes; `podDisruptionBudget` keeps a minimum
-  available during drains/upgrades (rendered only when `replicas > 1`).
-- **NetworkPolicy (opt-in).** `networkPolicy.enabled: true` restricts the
-  bundled datastore ports to obleth pods. Requires a CNI that enforces
-  NetworkPolicy; inert otherwise, and a no-op for external datastores.
+  available during drains/upgrades (rendered only when the minimum replica
+  count is above 1: `hpa.minReplicas > 1` with the HPA enabled, otherwise
+  `replicas > 1`; a PDB over a single pod would block node drains).
+- **NetworkPolicy (opt-in).** `networkPolicy.enabled: true` restricts bundled
+  Postgres to the obleth and control-plane pods, bundled Redis and ClickHouse
+  to the obleth pods, and the Management API port (9180) to the control-plane
+  and provisioner. The data-plane port (8080) stays open to clients and ingress
+  controllers, and the metrics port (9091) stays open so a Prometheus in
+  another namespace can scrape it. Requires a CNI that enforces NetworkPolicy;
+  inert otherwise. The datastore policies are a no-op for external datastores.
 
 ## What the chart starts
 
@@ -333,11 +379,11 @@ better-auth writes onto a user.
 
 **Why you will probably want this.** Institutional IdPs routinely release an
 `email` that is not the identifier the institution keys accounts on. Globus is
-a clear case: for an Arizona State University identity it sends
+a clear case: for an Example University identity it sends
 
 ```
-email               Johnathan.Lee@asu.edu     <- a display alias
-preferred_username  jlee379@asu.edu           <- the canonical institutional id
+email               Jane.Doe@university.example   <- a display alias
+preferred_username  user@university.example       <- the canonical institutional id
 ```
 
 Without a mapping, obleth keys the account on the alias, so the same human
@@ -483,6 +529,7 @@ Do not commit production tokens or passwords. Prefer:
 helm install obleth deploy/k8s/obleth \
   --set obleth.adminToken="$(openssl rand -hex 32)" \
   --set postgres.password="$(openssl rand -hex 16)" \
+  --set redis.password="$(openssl rand -hex 32)" \
   ...
 ```
 

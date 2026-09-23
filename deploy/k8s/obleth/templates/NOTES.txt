@@ -6,6 +6,17 @@ Metrics                        : svc/{{ include "obleth.fullname" . }}:9091
 {{- if .Values.controlPlane.enabled }}
 Control-plane dashboard        : svc/{{ .Release.Name }}-control-plane:3000
 {{- end }}
+{{- if .Values.redis.enabled }}
+
+----------------------------------------------------------------------
+REDIS AUTHENTICATION
+----------------------------------------------------------------------
+The bundled Redis requires a password (redis.password, or REDIS_PASSWORD
+plus a matching OBLETH_REDIS_URL in obleth.existingSecret). Releases
+installed before this requirement must supply it on upgrade. The gateway
+now reads OBLETH_REDIS_URL from the obleth Secret instead of a plain
+environment value.
+{{- end }}
 
 ----------------------------------------------------------------------
 STORAGE / DURABILITY

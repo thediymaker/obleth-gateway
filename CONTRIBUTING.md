@@ -18,9 +18,12 @@ The main Rust workspace lives in `obleth/`.
 
 - Install stable Rust.
 - Start local Postgres and Redis if your change touches integration tests.
+  The dev compose stack (`deploy/docker`) runs Redis with AUTH, using
+  `REDIS_PASSWORD` from `deploy/docker/.env` (`dev-redis-password` in
+  `.env.example`).
 - Set:
   - `OBLETH_TEST_DATABASE_URL=postgres://obleth:obleth@localhost:5432/obleth_test`
-  - `OBLETH_TEST_REDIS_URL=redis://localhost:6379`
+  - `OBLETH_TEST_REDIS_URL=redis://:dev-redis-password@localhost:6379`
 
 Common commands:
 

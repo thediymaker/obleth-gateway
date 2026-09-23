@@ -48,7 +48,8 @@ postgres:
 redis:
   enabled: false
   external:
-    url: "redis://my-redis-host:6379"
+    # Include the password when your Redis requires AUTH.
+    url: "redis://:STRONGPASSWORD@my-redis-host:6379"
 
 clickhouse:
   enabled: false

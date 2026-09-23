@@ -1,9 +1,11 @@
+import { requireAdmin } from "@/lib/auth/roles";
 import { loadRecipeCards } from "@/lib/sbatch-recipes";
 import { RecipeList } from "@/components/recipes/recipe-list";
 
 export const dynamic = "force-dynamic";
 
 export default async function RecipesPage() {
+  await requireAdmin();
   const recipes = await loadRecipeCards();
 
   return (

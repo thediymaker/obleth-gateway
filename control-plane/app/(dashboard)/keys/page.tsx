@@ -1,3 +1,4 @@
+import { requireAdmin } from "@/lib/auth/roles";
 import { KeyManager } from "@/components/key-manager";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
@@ -10,6 +11,7 @@ export const dynamic = "force-dynamic";
 const KEY_USAGE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
 export default async function KeysPage() {
+  await requireAdmin();
   const [tenants, keys, keyUsage] = await Promise.all([
     safe(obleth.listTenants(), []),
     safe(obleth.listKeys(), []),

@@ -9,10 +9,10 @@ const TOKEN_AUTH_METHODS: readonly TokenAuthMethod[] = ["basic", "post"];
  *
  * Institutional IdPs routinely release an `email` that is not the identifier
  * the institution actually keys accounts on. Globus is a clear example: for an
- * ASU identity it sends `email: "Johnathan.Lee@asu.edu"` (a display alias)
- * while `preferred_username` carries the canonical `jlee379@asu.edu`. Without a
- * mapping, obleth keys the account on the alias, so the same human arrives as a
- * second, unrecognised user.
+ * Example University identity it sends `email: "Jane.Doe@university.example"`
+ * (a display alias) while `preferred_username` carries the canonical
+ * `user@university.example`. Without a mapping, obleth keys the account on the
+ * alias, so the same human arrives as a second, unrecognised user.
  *
  *     "claims": { "email": "preferred_username" }
  *

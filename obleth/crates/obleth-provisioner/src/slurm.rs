@@ -9,8 +9,10 @@ pub trait SlurmClient: Send + Sync {
     async fn cancel(&self, job_id: &str) -> anyhow::Result<()>;
     /// Current state of a single job by id. `Ok(None)` means the controller has
     /// no such job (finished and purged, or never existed) — the planner reads
-    /// that as "gone". A transport/HTTP error is returned as `Err` so the caller
-    /// can hold the tick rather than mistake an unreachable Slurm for dead jobs.
+    /// that as "gone" — so it is returned only for an explicit job-not-found
+    /// answer. A transport/HTTP error, an unrecognized 404, or an unparseable
+    /// body is returned as `Err` so the caller can hold the tick rather than
+    /// mistake an unreachable or mismatched Slurm for dead jobs.
     /// We look our jobs up by id (recorded on replica rows at submit) rather than
     /// listing the whole controller, which on a busy cluster is huge.
     async fn get_job(&self, job_id: &str) -> anyhow::Result<Option<JobInfo>>;
@@ -163,10 +165,74 @@ fn shell_quote(s: &str) -> String {
 /// serde *skip* every other field instead of allocating a dynamic tree for it,
 /// keeping memory proportional to "fields we use" rather than "every field of
 /// the record".
+///
+/// `jobs` is required: a 2xx body without it (an error envelope, a proxy page)
+/// is a failed read, not an empty answer.
 #[derive(serde::Deserialize)]
 struct JobsResponse {
-    #[serde(default)]
     jobs: Vec<JobRecord>,
+    #[serde(default)]
+    errors: Vec<SlurmError>,
+}
+
+/// One entry of slurmrestd's `errors` array.
+#[derive(serde::Deserialize)]
+struct SlurmError {
+    #[serde(default)]
+    error_number: Option<i64>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ErrorsOnly {
+    #[serde(default)]
+    errors: Vec<SlurmError>,
+}
+
+/// Slurm's `ESLURM_INVALID_JOB_ID` ("Invalid job id specified") — what
+/// slurmrestd reports for a job the controller has purged or never had.
+const ESLURM_INVALID_JOB_ID: i64 = 2017;
+
+impl SlurmError {
+    fn is_job_not_found(&self) -> bool {
+        self.error_number == Some(ESLURM_INVALID_JOB_ID)
+            || self
+                .error
+                .as_deref()
+                .is_some_and(|e| e.to_ascii_lowercase().contains("invalid job id"))
+    }
+}
+
+/// True only when the body is slurmrestd's error envelope naming the job as
+/// unknown. A bare 404 (wrong route, unsupported API version, a proxy in front)
+/// carries no such entry and must not be read as "the job is gone".
+fn is_job_not_found_body(body: &[u8]) -> bool {
+    serde_json::from_slice::<ErrorsOnly>(body)
+        .map(|b| b.errors.iter().any(SlurmError::is_job_not_found))
+        .unwrap_or(false)
+}
+
+/// Interpret a `GET /job/{id}` response. `Ok(None)` ("gone", which the planner
+/// turns into MarkLost) is returned only for an explicit job-not-found answer;
+/// every other failure is `Err` so the tick holds instead of acting on it.
+fn job_lookup_from_response(
+    status: reqwest::StatusCode,
+    body: &[u8],
+) -> anyhow::Result<Option<JobInfo>> {
+    if status == reqwest::StatusCode::NOT_FOUND {
+        if is_job_not_found_body(body) {
+            return Ok(None);
+        }
+        anyhow::bail!(
+            "slurmrestd 404 without a job-not-found error (wrong URL or API version?): {}",
+            String::from_utf8_lossy(&body[..body.len().min(200)])
+        );
+    }
+    if !status.is_success() {
+        anyhow::bail!("slurmrestd job lookup failed: {status}");
+    }
+    parse_job(body)
 }
 
 #[derive(serde::Deserialize)]
@@ -202,16 +268,27 @@ fn job_state_to_string(v: &serde_json::Value) -> String {
 
 /// Project a slurmrestd single-job response body into our `JobInfo`. The
 /// `GET /job/{id}` route returns `{ "jobs": [ {record} ] }`; we take the first
-/// record. `None` when the array is empty (some versions answer an unknown id
-/// with 200 + empty jobs rather than 404) or the body isn't the expected shape.
+/// record. `Ok(None)` when the array is empty (some versions answer an unknown
+/// id with 200 + empty jobs rather than 404) unless it carries an error other
+/// than job-not-found; a body that isn't the expected shape is `Err`.
 /// Pure (no HTTP) so the version-shape handling is unit-testable, and typed so
 /// the many fields we don't read are skipped rather than allocated.
-fn parse_job(body: &[u8]) -> Option<JobInfo> {
-    let parsed: JobsResponse = serde_json::from_slice(body).ok()?;
-    let j = parsed.jobs.into_iter().next()?;
+fn parse_job(body: &[u8]) -> anyhow::Result<Option<JobInfo>> {
+    let parsed: JobsResponse = serde_json::from_slice(body)
+        .map_err(|e| anyhow::anyhow!("unparseable slurmrestd job response: {e}"))?;
+    let Some(j) = parsed.jobs.into_iter().next() else {
+        if let Some(e) = parsed.errors.iter().find(|e| !e.is_job_not_found()) {
+            anyhow::bail!(
+                "slurmrestd returned no job with error {:?}: {}",
+                e.error_number,
+                e.error.as_deref().unwrap_or_default()
+            );
+        }
+        return Ok(None);
+    };
     let job_id = job_id_to_string(&j.job_id);
     if job_id.is_empty() {
-        return None;
+        anyhow::bail!("slurmrestd job record has no job_id");
     }
     let raw_state = job_state_to_string(&j.job_state);
     let reason = j
@@ -219,13 +296,13 @@ fn parse_job(body: &[u8]) -> Option<JobInfo> {
         .as_str()
         .map(str::to_string)
         .filter(|r| !r.trim().is_empty() && !r.eq_ignore_ascii_case("none"));
-    Some(JobInfo {
+    Ok(Some(JobInfo {
         job_id,
         state: map_job_state(&raw_state),
         nodes: expand_nodelist(&j.nodes),
         raw_state,
         reason,
-    })
+    }))
 }
 
 /// Map a Slurm job_state string (any version) onto our coarse JobState.
@@ -390,18 +467,14 @@ impl SlurmClient for Slurmrestd {
     async fn get_job(&self, job_id: &str) -> anyhow::Result<Option<JobInfo>> {
         let url = format!("{}/slurm/{}/job/{}", self.base, self.version, job_id);
         let resp = self.auth(self.http.get(&url)).send().await?;
-        // A finished+purged (or unknown) job is reported as 404 by some versions
-        // and as 200 with an empty `jobs` array by others — both mean "gone".
-        if resp.status() == reqwest::StatusCode::NOT_FOUND {
-            return Ok(None);
-        }
-        if !resp.status().is_success() {
-            anyhow::bail!("slurmrestd job {job_id} failed: {}", resp.status());
-        }
+        // A finished+purged (or unknown) job is reported as 404 + a job-not-found
+        // error by some versions and as 200 with an empty `jobs` array by others
+        // — both mean "gone". Anything else is an error, never "gone".
+        let status = resp.status();
         // Typed projection over the raw body (not `.json::<Value>()`): the
         // single-job response still carries a full record we mostly ignore.
         let body = resp.bytes().await?;
-        Ok(parse_job(&body))
+        job_lookup_from_response(status, &body).map_err(|e| e.context(format!("job {job_id}")))
     }
 
     async fn discover_resources(&self) -> anyhow::Result<ClusterResources> {
@@ -840,7 +913,7 @@ mod tests {
             { "job_id": 123, "job_state": ["PENDING"], "nodes": "", "state_reason": "Resources" },
         ] }))
         .unwrap();
-        let j = parse_job(&body).expect("job");
+        let j = parse_job(&body).unwrap().expect("job");
         assert_eq!(j.job_id, "123");
         assert_eq!(j.raw_state, "PENDING");
         assert_eq!(j.state, JobState::Pending);
@@ -854,20 +927,87 @@ mod tests {
             { "job_id": "456", "job_state": "PENDING", "nodes": "gpu03" },
         ] }))
         .unwrap();
-        let j = parse_job(&body).expect("job");
+        let j = parse_job(&body).unwrap().expect("job");
         assert_eq!(j.job_id, "456");
         assert_eq!(j.state, JobState::Pending);
     }
 
     #[test]
-    fn parse_job_returns_none_for_empty_or_unknown() {
+    fn parse_job_returns_none_only_for_empty_jobs() {
         // 200-with-empty-jobs is how some versions report an unknown id.
         let empty = serde_json::to_vec(&serde_json::json!({ "jobs": [] })).unwrap();
-        assert!(parse_job(&empty).is_none());
+        assert!(parse_job(&empty).unwrap().is_none());
+        // A record we can't identify is a malformed answer, not "gone".
         let no_id =
             serde_json::to_vec(&serde_json::json!({ "jobs": [ { "job_state": "RUNNING" } ] }))
                 .unwrap();
-        assert!(parse_job(&no_id).is_none());
+        assert!(parse_job(&no_id).is_err());
+    }
+
+    #[test]
+    fn parse_job_errors_on_unparseable_2xx_body() {
+        assert!(parse_job(b"<html>proxy error</html>").is_err());
+        // No `jobs` key at all (e.g. an error envelope) is not "gone".
+        assert!(parse_job(br#"{"error":"x"}"#).is_err());
+        // An empty jobs array carrying a non-not-found error is not "gone" either.
+        let auth = serde_json::to_vec(&serde_json::json!({
+            "jobs": [],
+            "errors": [ { "error_number": 1007, "error": "Protocol authentication error" } ],
+        }))
+        .unwrap();
+        assert!(parse_job(&auth).is_err());
+    }
+
+    #[test]
+    fn job_lookup_404_is_gone_only_for_job_not_found_body() {
+        let not_found = serde_json::to_vec(&serde_json::json!({
+            "jobs": [],
+            "errors": [ {
+                "description": "Unable to query JobId=123",
+                "error_number": 2017,
+                "error": "Invalid job id specified",
+                "source": "_handle_job_get",
+            } ],
+        }))
+        .unwrap();
+        assert!(
+            job_lookup_from_response(reqwest::StatusCode::NOT_FOUND, &not_found)
+                .unwrap()
+                .is_none()
+        );
+        // Matched by message too, for versions that omit error_number.
+        let by_text = br#"{"errors":[{"error":"Invalid job id specified"}]}"#;
+        assert!(
+            job_lookup_from_response(reqwest::StatusCode::NOT_FOUND, by_text)
+                .unwrap()
+                .is_none()
+        );
+        // A route/version-mismatch 404 must hold the tick, not read as "gone".
+        for body in [&b""[..], b"Not Found", br#"{"errors":[]}"#] {
+            assert!(
+                job_lookup_from_response(reqwest::StatusCode::NOT_FOUND, body).is_err(),
+                "404 body {:?} must be Err",
+                String::from_utf8_lossy(body)
+            );
+        }
+    }
+
+    #[test]
+    fn job_lookup_non_404_errors_and_2xx_parses() {
+        assert!(job_lookup_from_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            br#"{"errors":[{"error_number":2017}]}"#
+        )
+        .is_err());
+        let ok = serde_json::to_vec(&serde_json::json!({ "jobs": [
+            { "job_id": 7, "job_state": "RUNNING", "nodes": "node001" },
+        ] }))
+        .unwrap();
+        let j = job_lookup_from_response(reqwest::StatusCode::OK, &ok)
+            .unwrap()
+            .expect("job");
+        assert_eq!(j.job_id, "7");
+        assert!(job_lookup_from_response(reqwest::StatusCode::OK, b"not json").is_err());
     }
 
     #[test]
@@ -877,7 +1017,7 @@ mod tests {
             { "job_id": 1, "job_state": "PENDING", "state_reason": "None" },
         ] }))
         .unwrap();
-        let j = parse_job(&none_literal).expect("job");
+        let j = parse_job(&none_literal).unwrap().expect("job");
         assert_eq!(
             j.reason, None,
             "literal 'None' reason should collapse to None"
@@ -887,21 +1027,21 @@ mod tests {
             { "job_id": 2, "job_state": "PENDING", "state_reason": "nOnE" },
         ] }))
         .unwrap();
-        let j = parse_job(&none_mixed_case).expect("job");
+        let j = parse_job(&none_mixed_case).unwrap().expect("job");
         assert_eq!(j.reason, None, "case-insensitive 'None' should collapse");
 
         let whitespace_only = serde_json::to_vec(&serde_json::json!({ "jobs": [
             { "job_id": 3, "job_state": "PENDING", "state_reason": "   " },
         ] }))
         .unwrap();
-        let j = parse_job(&whitespace_only).expect("job");
+        let j = parse_job(&whitespace_only).unwrap().expect("job");
         assert_eq!(j.reason, None, "whitespace-only reason should collapse");
 
         let valid_reason = serde_json::to_vec(&serde_json::json!({ "jobs": [
             { "job_id": 4, "job_state": "PENDING", "state_reason": "Resources" },
         ] }))
         .unwrap();
-        let j = parse_job(&valid_reason).expect("job");
+        let j = parse_job(&valid_reason).unwrap().expect("job");
         assert_eq!(
             j.reason,
             Some("Resources".to_string()),

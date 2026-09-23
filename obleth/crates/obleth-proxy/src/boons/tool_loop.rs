@@ -406,6 +406,7 @@ pub async fn run(
         for call in &calls {
             let result_text = execute_call(
                 state,
+                &key.tenant_id,
                 &loop_plan.tool_servers,
                 &mut sessions,
                 image_ctx.as_mut(),
@@ -638,9 +639,11 @@ fn extract_tool_calls(body: &Value) -> Vec<PendingCall> {
 
 /// Execute one call against its MCP server, reusing the per-request session.
 /// Errors become a text result the model can read and recover from (fail-open
-/// inside the loop).
+/// inside the loop). `tenant` scopes `retrieve_original` to the caller's own
+/// stashed originals.
 pub(super) async fn execute_call(
     state: &AppState,
+    tenant: &uuid::Uuid,
     tool_servers: &HashMap<String, String>,
     sessions: &mut HashMap<String, mcp_tools::Session>,
     image: Option<&mut super::image_gen::ImageCtx<'_>>,
@@ -651,7 +654,7 @@ pub(super) async fn execute_call(
     if call.name == RETRIEVE_ORIGINAL_TOOL {
         let reference = call.arguments.get("ref").and_then(|v| v.as_str());
         let content = match reference {
-            Some(r) => match state.redis.compress_get(r).await {
+            Some(r) => match state.redis.compress_get(tenant, r).await {
                 Ok(found) => found,
                 Err(e) => {
                     tracing::warn!(error = %e, "compress_get failed for retrieve_original");

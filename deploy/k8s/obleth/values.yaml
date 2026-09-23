@@ -41,9 +41,14 @@ obleth:
   # build one from the values above (so real secrets never touch values files or
   # --set/CLI history). When set, the chart does NOT render its own Secret and
   # the named Secret MUST provide every key the chart would have: OBLETH_ADMIN_TOKEN,
-  # OBLETH_DATABASE_URL, OBLETH_CLICKHOUSE_PASSWORD, OBLETH_ENCRYPTION_KEY,
-  # OBLETH_API_KEY_PEPPER, OBLETH_SLACK_WEBHOOK_URL, and (optional — only if you
-  # want the JWT path) OBLETH_JWT_ISSUERS. See examples/values-production.yaml.
+  # OBLETH_DATABASE_URL, OBLETH_REDIS_URL, OBLETH_CLICKHOUSE_PASSWORD,
+  # OBLETH_ENCRYPTION_KEY, OBLETH_API_KEY_PEPPER, OBLETH_SLACK_WEBHOOK_URL, and
+  # (optional — only if you want the JWT path) OBLETH_JWT_ISSUERS. When a bundled
+  # datastore is enabled, the Secret must also carry the password its container
+  # reads: POSTGRES_PASSWORD (postgres.enabled), REDIS_PASSWORD (redis.enabled;
+  # OBLETH_REDIS_URL must embed the same value as
+  # redis://:<password>@<release>-redis:6379), and OBLETH_CLICKHOUSE_PASSWORD
+  # (clickhouse.enabled). See examples/values-production.yaml.
   existingSecret: ""
   # SSRF allowlist for admin-registered upstream URLs (comma-separated CIDRs).
   # Default SSRF policy permits private/LAN targets (RFC1918, loopback, etc.) so
@@ -89,11 +94,11 @@ hpa:
 nodeResolution:
   # Static /etc/hosts entries — a node->IP map. Example:
   #   - ip: "10.0.0.25"
-  #     hostnames: ["scgh001", "scgh001.example.edu"]
+  #     hostnames: ["node001", "node001.cluster.example.edu"]
   hostAliases: []
   # Custom resolver injected into the pods. Example:
   #   nameservers: ["10.0.0.10"]
-  #   searches: ["sol.rc.example.edu"]
+  #   searches: ["cluster.example.edu"]
   #   options: [{ name: ndots, value: "2" }]
   dnsConfig: {}
   # Override dnsPolicy (e.g. "None" when you fully specify nameservers above).
@@ -134,9 +139,17 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 1
 
-# Optional NetworkPolicy that restricts the bundled datastore ports to obleth
-# pods only. Off by default (requires a CNI that enforces NetworkPolicy). Has no
-# effect on external datastores.
+# Optional NetworkPolicies. Off by default (requires a CNI that enforces
+# NetworkPolicy). When enabled:
+#   - bundled Postgres admits the obleth data plane and the control-plane
+#     (dashboard auth tables); bundled Redis and ClickHouse admit the data
+#     plane only;
+#   - on the obleth pods, the Management API port (9180) admits only the
+#     control-plane and the provisioner; the data-plane port (8080) stays open
+#     to clients and ingress controllers;
+#   - the metrics port (9091) is left unrestricted so a Prometheus running in
+#     another namespace can scrape it. Add your own policy to narrow it.
+# The datastore policies have no effect on external datastores.
 networkPolicy:
   enabled: false
 
@@ -172,6 +185,10 @@ postgres:
   # REQUIRED when postgres.enabled=true. Supply via --set or an external Secret.
   password: ""
   db: obleth
+  # Container resources for the bundled Postgres. Override to size for load.
+  resources:
+    requests: { cpu: "250m", memory: "512Mi" }
+    limits: { cpu: "500m", memory: "1Gi" }
   # PVC-backed storage for the bundled Postgres. Disable for ephemeral test envs
   # (data is lost on restart). Postgres is the config source of truth — keep this
   # enabled for anything you care about.
@@ -189,6 +206,21 @@ postgres:
 redis:
   enabled: true
   image: redis:7
+  # REQUIRED when redis.enabled=true. The request path reads API keys from
+  # Redis, so the bundled instance always requires AUTH. Supply via --set or
+  # obleth.existingSecret (keys REDIS_PASSWORD and a matching OBLETH_REDIS_URL).
+  # The value is embedded in the connection URL, so use URL-safe characters
+  # (`openssl rand -hex 32`).
+  password: ""
+  # Container resources for the bundled Redis. Override to size for load.
+  resources:
+    requests: { cpu: "100m", memory: "128Mi" }
+    limits: { cpu: "200m", memory: "512Mi" }
+  # Redis's own memory ceiling (--maxmemory). Keep it at about 80% of
+  # resources.limits.memory so Redis evicts before the kernel OOM-kills it.
+  # Eviction is volatile-lru: only entries with a TTL (response cache,
+  # compression originals) are evicted; API keys and model routes never are.
+  maxmemory: 400mb
   # PVC-backed AOF persistence. Redis is a rebuildable hot cache, so this is
   # optional — disable for ephemeral test envs. obleth re-warms from Postgres if
   # Redis data is lost.
@@ -198,7 +230,8 @@ redis:
     storageClass: ""
     accessMode: ReadWriteOnce
   external:
-    # e.g. redis://my-redis-host:6379
+    # e.g. redis://:PASSWORD@my-redis-host:6379. Rendered into the obleth
+    # Secret, so it may carry credentials.
     url: ""
 
 clickhouse:
@@ -208,6 +241,10 @@ clickhouse:
   user: obleth
   # REQUIRED when clickhouse.enabled=true. Supply via --set or an external Secret.
   password: ""
+  # Container resources for the bundled ClickHouse. Override to size for load.
+  resources:
+    requests: { cpu: "500m", memory: "2Gi" }
+    limits: { cpu: "1", memory: "4Gi" }
   # PVC-backed storage for the usage ledger. Disable for ephemeral test envs
   # (usage history is lost on restart).
   persistence:

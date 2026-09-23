@@ -29,6 +29,7 @@ import type {
 import { requireAdmin } from "@/lib/auth/roles";
 import { resolveRecipeById, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
 import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
+import { blockedHostReason } from "@/lib/ssrf";
 import { tagsInclude } from "@/lib/utils";
 
 export type ActionResult =
@@ -41,6 +42,26 @@ function actionError(e: unknown): ActionResult {
     ok: false,
     error: e instanceof Error ? e.message : "Unexpected error",
   };
+}
+
+/**
+ * Run a delete and revalidate whether or not it succeeded: the Management API
+ * answers 502 when the row is gone from Postgres but the data-plane cache
+ * eviction failed, so the list must refresh and the operator must see that
+ * message (it names the reconcile endpoint).
+ */
+async function deleteAndRevalidate(
+  run: () => Promise<unknown>,
+  revalidate: () => void,
+): Promise<ActionResult> {
+  try {
+    await run();
+    return { ok: true };
+  } catch (e) {
+    return actionError(e);
+  } finally {
+    revalidate();
+  }
 }
 
 // ----------------------------------------------------------------------------
@@ -470,16 +491,20 @@ export async function setTenantCompressionAction(
   return { ok: true };
 }
 
-export async function deleteTenantAction(id: string) {
+export async function deleteTenantAction(id: string): Promise<ActionResult> {
   const session = await requireAdmin();
-  if (!id) return;
-  await obleth.deleteTenant(id, { auditActor: session.email });
-  updateTag(CACHE_TAGS.tenants);
-  updateTag(CACHE_TAGS.keys);
-  revalidatePath("/tenants");
-  revalidatePath("/keys");
-  revalidatePath("/fairshare");
-  revalidatePath("/");
+  if (!id) return { ok: false, error: "Missing tenant id" };
+  return deleteAndRevalidate(
+    () => obleth.deleteTenant(id, { auditActor: session.email }),
+    () => {
+      updateTag(CACHE_TAGS.tenants);
+      updateTag(CACHE_TAGS.keys);
+      revalidatePath("/tenants");
+      revalidatePath("/keys");
+      revalidatePath("/fairshare");
+      revalidatePath("/");
+    },
+  );
 }
 
 export async function setWeightAction(id: string, weight: number) {
@@ -616,12 +641,16 @@ export async function toggleTenantSyntheticAction(id: string, synthetic: boolean
   revalidatePath("/tenants");
 }
 
-export async function deleteKeyAction(id: string) {
+export async function deleteKeyAction(id: string): Promise<ActionResult> {
   const session = await requireAdmin();
-  await obleth.deleteKey(id, { auditActor: session.email });
-  updateTag(CACHE_TAGS.keys);
-  revalidatePath("/keys");
-  revalidatePath("/");
+  return deleteAndRevalidate(
+    () => obleth.deleteKey(id, { auditActor: session.email }),
+    () => {
+      updateTag(CACHE_TAGS.keys);
+      revalidatePath("/keys");
+      revalidatePath("/");
+    },
+  );
 }
 
 export async function deleteKeysAction(
@@ -857,11 +886,15 @@ export async function setModelWeightAction(
   revalidatePath("/fairshare");
 }
 
-export async function deleteModelAction(id: string) {
+export async function deleteModelAction(id: string): Promise<ActionResult> {
   const session = await requireAdmin();
-  await obleth.deleteModel(id, { auditActor: session.email });
-  updateTag(CACHE_TAGS.models);
-  revalidatePath("/models");
+  return deleteAndRevalidate(
+    () => obleth.deleteModel(id, { auditActor: session.email }),
+    () => {
+      updateTag(CACHE_TAGS.models);
+      revalidatePath("/models");
+    },
+  );
 }
 
 export async function setModelCacheAction(
@@ -1119,25 +1152,32 @@ export async function listUpstreamModelsAction(input: {
   const base = normalizeBase(input.apiBase ?? "");
   if (!base) return { ok: false, error: "Enter the provider API base URL." };
 
+  let parsed: URL;
   try {
-    const parsed = new URL(base);
-    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-      return { ok: false, error: "Provider URL must be http or https." };
-    }
+    parsed = new URL(base);
   } catch {
     return { ok: false, error: "Enter a valid http(s) URL." };
   }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return { ok: false, error: "Provider URL must be http or https." };
+  }
+  const blocked = await blockedHostReason(parsed.hostname);
+  if (blocked) return { ok: false, error: blocked };
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 15_000);
   try {
+    // Redirects are not followed: the target was vetted above, a redirect's
+    // destination (e.g. a metadata endpoint) would not be.
     const res = await fetch(`${base}/models`, {
       headers: {
         Accept: "application/json",
         ...(input.apiKey ? { Authorization: `Bearer ${input.apiKey}` } : {}),
       },
-      signal: controller.signal,
+      redirect: "manual",
+      signal: AbortSignal.timeout(5_000),
     });
+    if (res.status >= 300 && res.status < 400) {
+      return { ok: false, error: `Provider redirected (HTTP ${res.status}). Enter the final API base URL.` };
+    }
     if (res.status === 401 || res.status === 403) {
       return { ok: false, error: `Provider rejected the API key (HTTP ${res.status}).` };
     }
@@ -1162,12 +1202,10 @@ export async function listUpstreamModelsAction(input: {
     }
     return { ok: true, base, models };
   } catch (e) {
-    if (e instanceof Error && e.name === "AbortError") {
-      return { ok: false, error: "Provider did not respond within 15s." };
+    if (e instanceof Error && (e.name === "TimeoutError" || e.name === "AbortError")) {
+      return { ok: false, error: "Provider did not respond within 5s." };
     }
     return { ok: false, error: e instanceof Error ? e.message : "Could not reach the provider." };
-  } finally {
-    clearTimeout(timer);
   }
 }
 
@@ -1361,10 +1399,12 @@ export async function toggleMcpServerAction(
   revalidatePath("/mcp");
 }
 
-export async function deleteMcpServerAction(id: string) {
+export async function deleteMcpServerAction(id: string): Promise<ActionResult> {
   const session = await requireAdmin();
-  await obleth.deleteMcpServer(id, { auditActor: session.email });
-  revalidatePath("/mcp");
+  return deleteAndRevalidate(
+    () => obleth.deleteMcpServer(id, { auditActor: session.email }),
+    () => revalidatePath("/mcp"),
+  );
 }
 
 export async function setAlertSettingsAction(

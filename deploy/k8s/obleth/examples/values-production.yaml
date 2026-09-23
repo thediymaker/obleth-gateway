@@ -23,6 +23,7 @@
 #    kubectl create secret generic obleth-secrets -n obleth \
 #      --from-literal=OBLETH_ADMIN_TOKEN="$(openssl rand -hex 32)" \
 #      --from-literal=OBLETH_DATABASE_URL="postgres://obleth:PASS@pg-rw.db.svc:5432/obleth" \
+#      --from-literal=OBLETH_REDIS_URL="redis://:PASS@redis-master.db.svc:6379" \
 #      --from-literal=OBLETH_CLICKHOUSE_PASSWORD="CLICKHOUSE_PASS" \
 #      --from-literal=OBLETH_ENCRYPTION_KEY="$(openssl rand -base64 32)" \
 #      --from-literal=OBLETH_API_KEY_PEPPER="$(openssl rand -hex 32)" \
@@ -81,7 +82,9 @@ postgres:
 redis:
   enabled: false
   external:
-    url: "redis://redis-master.db.svc:6379"
+    # Used only to satisfy chart rendering; the live URL comes from the
+    # Secret's OBLETH_REDIS_URL above. Keep them consistent.
+    url: "redis://:PASS@redis-master.db.svc:6379"
 
 clickhouse:
   enabled: false

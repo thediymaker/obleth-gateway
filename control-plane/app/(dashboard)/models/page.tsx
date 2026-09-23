@@ -1,3 +1,4 @@
+import { requireAdmin } from "@/lib/auth/roles";
 import { ModelManager } from "@/components/model-manager";
 import {
   obleth,
@@ -14,6 +15,7 @@ import { loadRecipeCards } from "@/lib/sbatch-recipes";
 export const dynamic = "force-dynamic";
 
 export default async function ModelsPage() {
+  await requireAdmin();
   const [models, cacheStats, health, mcpServers, slurm, managedSpecs, boonSettings, knowledgeSettings] =
     await Promise.all([
       safe(obleth.listModels(), []),

@@ -59,11 +59,11 @@ pub trait OblethClient: Send + Sync {
 
 /// Map a JSON array of replica rows (`ModelReplica`) into `ReplicaView`s. Rows
 /// missing/with an invalid `id` are skipped (logged), since they can't be acted
-/// on. Shared by the per-model and all-models list calls.
-fn replica_views_from_json(rows: &serde_json::Value) -> Vec<ReplicaView> {
+/// on.
+fn replica_views_from_json(rows: &[serde_json::Value]) -> Vec<ReplicaView> {
     let now = chrono::Utc::now();
     let mut out = Vec::new();
-    for r in rows.as_array().map(|a| a.as_slice()).unwrap_or_default() {
+    for r in rows {
         let id: Uuid = match r
             .get("id")
             .and_then(|x| x.as_str())
@@ -221,6 +221,30 @@ impl HttpObleth {
         }
         req
     }
+
+    /// GET a list route strictly: a non-2xx status or a body that is not a JSON
+    /// array is an `Err`. The admin error envelope (`{"error":"..."}`) is valid
+    /// JSON, so reading it leniently turned a gateway 500 into an empty list —
+    /// and the tick plans destructive actions (drain, resubmit) from these lists.
+    async fn get_array(&self, path: &str) -> anyhow::Result<Vec<serde_json::Value>> {
+        let v: serde_json::Value = self
+            .req(reqwest::Method::GET, path)
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        match v {
+            serde_json::Value::Array(rows) => Ok(rows),
+            other => {
+                let body = other.to_string();
+                anyhow::bail!(
+                    "GET {path}: expected array, got {}",
+                    String::from_utf8_lossy(&body.as_bytes()[..body.len().min(200)])
+                )
+            }
+        }
+    }
 }
 
 #[async_trait]
@@ -229,22 +253,20 @@ impl OblethClient for HttpObleth {
         // /managed is per-model; the provisioner needs them all. List models,
         // then GET each /managed. (A bulk /managed route exists and is a fine
         // future optimization; v1 keeps the surface minimal.)
-        let models: serde_json::Value = self
-            .req(reqwest::Method::GET, "/models")
-            .send()
-            .await?
-            .json()
-            .await?;
+        let models = self.get_array("/models").await?;
         let mut out = Vec::new();
-        for m in models.as_array().cloned().unwrap_or_default() {
+        for m in models {
             let id = m.get("id").and_then(|x| x.as_str()).unwrap_or_default();
             if id.is_empty() {
                 continue;
             }
+            // An unmanaged model answers 200 `null`; an error status must not
+            // read as "unmanaged" (that would drain the model's replicas).
             let spec: Option<ManagedModelSpec> = self
                 .req(reqwest::Method::GET, &format!("/models/{id}/managed"))
                 .send()
                 .await?
+                .error_for_status()?
                 .json()
                 .await?;
             if let Some(s) = spec {
@@ -287,12 +309,7 @@ impl OblethClient for HttpObleth {
     }
 
     async fn list_all_replicas(&self) -> anyhow::Result<Vec<ReplicaView>> {
-        let rows: serde_json::Value = self
-            .req(reqwest::Method::GET, "/replicas")
-            .send()
-            .await?
-            .json()
-            .await?;
+        let rows = self.get_array("/replicas").await?;
         Ok(replica_views_from_json(&rows))
     }
 
@@ -389,18 +406,12 @@ impl OblethClient for HttpObleth {
         &self,
         model_id: Uuid,
     ) -> anyhow::Result<Vec<crate::domain::EndpointView>> {
-        let rows: serde_json::Value = self
-            .req(
-                reqwest::Method::GET,
-                &format!("/models/{model_id}/endpoints"),
-            )
-            .send()
-            .await?
-            .json()
+        let rows = self
+            .get_array(&format!("/models/{model_id}/endpoints"))
             .await?;
         let now = chrono::Utc::now();
         let mut out = Vec::new();
-        for e in rows.as_array().cloned().unwrap_or_default() {
+        for e in rows {
             let id = e
                 .get("id")
                 .and_then(|x| x.as_str())
@@ -511,6 +522,109 @@ mod tests {
         assert_eq!(header_safe("ok\u{7}\u{200b}→ done", 100), "ok done");
         assert_eq!(header_safe("", 100), "");
     }
+
+    /// A throwaway HTTP/1.1 server that answers every request with the same
+    /// status and JSON body (`Connection: close`, same shape as warmup.rs's).
+    async fn admin_stub(status: u16, body: &'static str) -> HttpObleth {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut sock, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = sock.read(&mut buf).await;
+                    let resp = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.flush().await;
+                });
+            }
+        });
+        let cfg = ProvisionerConfig {
+            admin_base_url: format!("http://{addr}"),
+            admin_token: "t".into(),
+            interval_secs: 15,
+            health_timeout_secs: 5,
+            warmup_timeout_secs: 0,
+            lost_retention_secs: 900,
+            restart_after_failures: 0,
+            port_span: 8,
+            job_name_prefix: "obleth-".into(),
+        };
+        HttpObleth::new(&cfg, reqwest::Client::new())
+    }
+
+    // The three reads the tick plans from must never turn an admin-API failure
+    // into an empty list: an empty managed set drains the whole fleet, and an
+    // empty replica list double-submits every model.
+
+    #[tokio::test]
+    async fn list_managed_models_errors_on_500_and_error_envelope() {
+        let c = admin_stub(500, r#"{"error":"db down"}"#).await;
+        assert!(c.list_managed_models().await.is_err(), "500 must be Err");
+        let c = admin_stub(500, "[]").await;
+        assert!(
+            c.list_managed_models().await.is_err(),
+            "500 with an array body must be Err"
+        );
+        let c = admin_stub(200, r#"{"error":"x"}"#).await;
+        assert!(
+            c.list_managed_models().await.is_err(),
+            "non-array must be Err"
+        );
+        let c = admin_stub(200, "[]").await;
+        assert!(c.list_managed_models().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_all_replicas_errors_on_500_and_error_envelope() {
+        let c = admin_stub(500, r#"{"error":"db down"}"#).await;
+        assert!(c.list_all_replicas().await.is_err(), "500 must be Err");
+        let c = admin_stub(500, "[]").await;
+        assert!(
+            c.list_all_replicas().await.is_err(),
+            "500 with an array body must be Err"
+        );
+        let c = admin_stub(200, r#"{"error":"x"}"#).await;
+        assert!(
+            c.list_all_replicas().await.is_err(),
+            "non-array must be Err"
+        );
+        let c = admin_stub(200, "[]").await;
+        assert!(c.list_all_replicas().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_endpoints_errors_on_500_and_error_envelope() {
+        let m = Uuid::new_v4();
+        let c = admin_stub(500, r#"{"error":"db down"}"#).await;
+        assert!(c.list_endpoints(m).await.is_err(), "500 must be Err");
+        let c = admin_stub(500, "[]").await;
+        assert!(
+            c.list_endpoints(m).await.is_err(),
+            "500 with an array body must be Err"
+        );
+        let c = admin_stub(200, r#"{"error":"x"}"#).await;
+        assert!(c.list_endpoints(m).await.is_err(), "non-array must be Err");
+        let c = admin_stub(200, "[]").await;
+        assert!(c.list_endpoints(m).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn non_array_error_body_is_truncated() {
+        let long = format!(r#"{{"error":"{}"}}"#, "x".repeat(5_000));
+        let c = admin_stub(200, Box::leak(long.into_boxed_str())).await;
+        let err = c.list_managed_models().await.unwrap_err().to_string();
+        assert!(err.contains("expected array"), "{err}");
+        assert!(
+            err.len() < 300,
+            "error body not truncated: {} bytes",
+            err.len()
+        );
+    }
 }
 
 /// In-memory fake for executor/loop tests — no network. Records every mutating
@@ -531,12 +645,21 @@ pub struct MockObleth {
     /// When set, `create_replica` returns an error — drives the compensating
     /// "cancel the orphan job" path in the Submit executor.
     pub fail_create_replica: std::sync::atomic::AtomicBool,
+    /// When set, the tick's planning reads fail — drives the hold-the-tick path.
+    pub fail_list_managed: std::sync::atomic::AtomicBool,
+    pub fail_list_replicas: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
 #[async_trait]
 impl OblethClient for MockObleth {
     async fn list_managed_models(&self) -> anyhow::Result<Vec<ManagedModelSpec>> {
+        if self
+            .fail_list_managed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated list_managed_models failure");
+        }
         Ok(self.managed.lock().unwrap().clone())
     }
     async fn get_slurm_settings(&self) -> anyhow::Result<Option<SlurmSettings>> {
@@ -546,6 +669,12 @@ impl OblethClient for MockObleth {
         Ok("test-model".to_string())
     }
     async fn list_all_replicas(&self) -> anyhow::Result<Vec<ReplicaView>> {
+        if self
+            .fail_list_replicas
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            anyhow::bail!("simulated list_all_replicas failure");
+        }
         Ok(self.replicas.lock().unwrap().clone())
     }
     async fn create_replica(

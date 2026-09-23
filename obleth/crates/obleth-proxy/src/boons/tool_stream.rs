@@ -344,6 +344,7 @@ pub fn run(
                 };
                 let result = super::tool_loop::execute_call(
                     &state,
+                    &key.tenant_id,
                     &tool_servers,
                     &mut sessions,
                     image_ctx.as_mut(),

@@ -147,8 +147,15 @@ pub(crate) async fn import_models(
         // until a replica is promoted); only a non-empty URL is validated.
         let api_base = resolved.config.api_base.trim();
         if !api_base.is_empty() {
-            if let Err(e) = state.ssrf.validate(api_base) {
+            if let Err(e) = state.ssrf.validate(api_base).await {
                 errors.push(format!("model '{name}': api_base {e}"));
+                continue;
+            }
+        }
+        let verify_api_base = resolved.config.verify_api_base.trim();
+        if !verify_api_base.is_empty() {
+            if let Err(e) = state.ssrf.validate(verify_api_base).await {
+                errors.push(format!("model '{name}': verify_api_base {e}"));
                 continue;
             }
         }
@@ -182,7 +189,7 @@ pub(crate) async fn import_models(
                     }
                     match resolve_endpoint(e, by_name.get(ep_name.as_str()).copied(), &name) {
                         Ok(r) => {
-                            if let Err(err) = state.ssrf.validate(&r.config.api_base) {
+                            if let Err(err) = state.ssrf.validate(&r.config.api_base).await {
                                 errors.push(format!(
                                     "model '{name}': endpoint '{ep_name}' api_base {err}"
                                 ));

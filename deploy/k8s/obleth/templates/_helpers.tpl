@@ -76,9 +76,17 @@ postgres://{{ .Values.postgres.user }}:{{ required "postgres.password is require
 {{- end -}}
 {{- end -}}
 
+{{/*
+The bundled Redis always requires AUTH, so its URL carries the password. This
+helper is only rendered into the obleth Secret, never a plain env value.
+*/}}
 {{- define "obleth.redisUrl" -}}
 {{- if .Values.redis.enabled -}}
-redis://{{ .Release.Name }}-redis:6379
+{{- $pw := required "redis.password is required when redis.enabled=true (set via --set or obleth.existingSecret)" .Values.redis.password -}}
+{{- if regexMatch "[@:/?#%[:space:]]" $pw -}}
+{{- fail "redis.password must not contain '@', ':', '/', '?', '#', '%' or whitespace: it is embedded unescaped in the Redis URL, which the gateway percent-decodes. Use a hex value, e.g. `openssl rand -hex 32`." -}}
+{{- end -}}
+redis://:{{ $pw }}@{{ .Release.Name }}-redis:6379
 {{- else -}}
 {{ required "redis.enabled=false requires redis.external.url" .Values.redis.external.url }}
 {{- end -}}

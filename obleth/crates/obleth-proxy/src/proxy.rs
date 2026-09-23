@@ -91,6 +91,20 @@ async fn responses_shim(
     request_id: Uuid,
 ) -> Response<Body> {
     let (mut parts, body) = req.into_parts();
+    // Authenticate before buffering: the body may be up to RESPONSES_BODY_MAX,
+    // and an unauthenticated caller must not get to make us hold that. The
+    // inner pipeline authenticates again (a moka hit) — this is only the door.
+    let Some(secret) = bearer(&parts.headers) else {
+        return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
+    };
+    match crate::jwt_auth::authenticate_credential(&state, &secret).await {
+        Ok(cred) => {
+            if let Err(resp) = gate_resolved_key(&state, &cred.resolved) {
+                return resp;
+            }
+        }
+        Err(resp) => return resp,
+    }
     let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
         return error_json(
             StatusCode::BAD_REQUEST,
@@ -722,10 +736,11 @@ async fn proxy_handler_inner(
     let tool_loop_armed = response_plan
         .as_ref()
         .is_some_and(|p| p.tool_loop.is_some());
-    // The response cache is keyed on (model, body) and shared across tenants. A
-    // tenant with an output guardrails policy (block/redact) must never serve —
-    // or populate — a shared cache entry, or it would bypass its own scanning by
-    // replaying another tenant's un-scanned response. Disable the cache for the
+    // The response cache is keyed on (tenant, model, body), so an entry is only
+    // ever replayed to the tenant that populated it. That alone does not make
+    // it safe under output guardrails: an entry stored before the tenant's
+    // block/redact policy was armed (or while it scanned nothing) would replay
+    // an un-scanned response and bypass the scan. Disable the cache for the
     // request whenever output guardrails are armed.
     let output_guardrails_armed = response_plan
         .as_ref()
@@ -734,7 +749,10 @@ async fn proxy_handler_inner(
         && !tool_loop_armed
         && !output_guardrails_armed;
     let cache_ttl = route.as_ref().map(|r| r.cache_ttl_secs).unwrap_or(0);
-    let cache_key = cache_enabled.then(|| obleth_config::cache_key(&model, &body_bytes));
+    // TTL <= 0 means "don't cache": nothing is ever written, so a lookup could
+    // never hit and would only cost a Redis round-trip.
+    let cache_key = (cache_enabled && cache_ttl > 0)
+        .then(|| obleth_config::cache_key(&resolved.tenant_id.to_string(), &model, &body_bytes));
     if let Some(ck) = &cache_key {
         let cache_start = crate::tracer::now_ms();
         let cache_result = state
@@ -4765,8 +4783,76 @@ mod tests {
         )
         .unwrap();
         assert_ne!(
-            obleth_config::cache_key("m", &streaming),
-            obleth_config::cache_key("m", &plain)
+            obleth_config::cache_key("t", "m", &streaming),
+            obleth_config::cache_key("t", "m", &plain)
+        );
+    }
+
+    /// Non-test source of this file, so pins below never match their own text.
+    fn handler_source() -> &'static str {
+        let src = include_str!("proxy.rs");
+        let end = src.find("\nmod tests {").expect("the test module");
+        &src[..end]
+    }
+
+    #[test]
+    fn responses_shim_authenticates_before_reading_the_body() {
+        // The shim buffers up to RESPONSES_BODY_MAX before the pipeline runs.
+        // An unauthenticated caller must be turned away before that buffer is
+        // filled, so the bearer check and key gate have to precede `to_bytes`.
+        // There is no AppState harness in this crate (it needs live Redis and
+        // ClickHouse), so the order is pinned at the source level.
+        let src = handler_source();
+        let start = src
+            .find("async fn responses_shim(")
+            .expect("responses_shim");
+        let end = start
+            + src[start..]
+                .find("async fn translate_response_body(")
+                .expect("end of responses_shim");
+        let shim = &src[start..end];
+        let read = shim.find("to_bytes(").expect("body read");
+        for step in [
+            "bearer(",
+            "UNAUTHORIZED",
+            "authenticate_credential(",
+            "gate_resolved_key(",
+        ] {
+            let at = shim
+                .find(step)
+                .unwrap_or_else(|| panic!("`{step}` missing from responses_shim"));
+            assert!(at < read, "`{step}` must run before the body is read");
+        }
+    }
+
+    #[test]
+    fn response_cache_key_includes_the_tenant() {
+        let src = handler_source();
+        let call = src
+            .find("obleth_config::cache_key(")
+            .expect("the cache_key call site");
+        assert_eq!(
+            src.matches("obleth_config::cache_key(").count(),
+            1,
+            "a single response-cache call site"
+        );
+        let args = &src[call..(call + 200).min(src.len())];
+        assert!(
+            args.contains("resolved.tenant_id"),
+            "the response cache key must be scoped to the caller's tenant"
+        );
+    }
+
+    #[test]
+    fn response_cache_lookup_is_skipped_when_ttl_disables_caching() {
+        let src = handler_source();
+        let call = src
+            .find("obleth_config::cache_key(")
+            .expect("the cache_key call site");
+        let gate = &src[call.saturating_sub(120)..call];
+        assert!(
+            gate.contains("cache_enabled && cache_ttl > 0"),
+            "no cache key (and so no cache_get) when TTL <= 0"
         );
     }
 

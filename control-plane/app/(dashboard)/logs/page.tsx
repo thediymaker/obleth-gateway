@@ -1,3 +1,4 @@
+import { requireAdmin } from "@/lib/auth/roles";
 import { RequestLogs } from "@/components/request-logs";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
@@ -5,6 +6,7 @@ import { safe } from "@/lib/safe";
 export const dynamic = "force-dynamic";
 
 export default async function LogsPage({ searchParams }: { searchParams: Promise<{ requestId?: string }> }) {
+  await requireAdmin();
   const { requestId } = await searchParams;
   // Filter option metadata is loaded server-side (tenants are bounded; models
   // are a small registry). The log rows themselves stream in client-side from

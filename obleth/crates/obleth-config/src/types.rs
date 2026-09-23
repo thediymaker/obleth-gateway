@@ -397,9 +397,11 @@ pub struct ModelRoute {
     pub supports_vision: bool,
     pub enabled: bool,
     /// When true, identical requests to this model are served from the response
-    /// cache (exact-match on model + request body) instead of the upstream.
+    /// cache (exact-match on tenant + model + request body) instead of the
+    /// upstream. Entries are never shared across tenants.
     pub cache_enabled: bool,
-    /// Time-to-live for cached responses, in seconds.
+    /// Time-to-live for cached responses, in seconds. `0` disables caching:
+    /// nothing is stored (never "store without expiry").
     pub cache_ttl_secs: i64,
     /// Routing tags from the fixed [`MODEL_TAGS`] vocabulary. The `auto` router
     /// prefers models whose tags match the request's classified intent.
@@ -986,7 +988,7 @@ pub struct SlurmSettings {
     #[serde(default)]
     pub slurm_jwt: String,
     /// Operator-supplied compute-node hostname → IP overrides. When the pods
-    /// running obleth resolve Slurm node names (`scgh001`, …) unreliably, these
+    /// running obleth resolve Slurm node names (`node001`, …) unreliably, these
     /// take DNS out of the loop: the provisioner registers replica endpoints by
     /// IP and probes by IP, so neither the health checker nor the data-plane
     /// proxy depends on per-request name resolution. Empty = pure DNS (the
@@ -998,7 +1000,7 @@ pub struct SlurmSettings {
 /// One compute-node hostname → IP override for `SlurmSettings::node_aliases`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub struct NodeAlias {
-    /// Slurm node hostname as it appears in job allocations (e.g. `scgh001`).
+    /// Slurm node hostname as it appears in job allocations (e.g. `node001`).
     pub host: String,
     /// The address to use instead — normally an IPv4/IPv6 literal.
     pub ip: String,
@@ -2912,7 +2914,7 @@ mod tests {
         let s = SlurmSettings {
             node_aliases: vec![
                 NodeAlias {
-                    host: " scgh001 ".into(),
+                    host: " node001 ".into(),
                     ip: " 10.0.0.1 ".into(),
                 }, // trimmed
                 NodeAlias {
@@ -2920,11 +2922,11 @@ mod tests {
                     ip: "10.0.0.9".into(),
                 }, // blank host → drop
                 NodeAlias {
-                    host: "scgh002".into(),
+                    host: "node002".into(),
                     ip: "".into(),
                 }, // blank ip → drop
                 NodeAlias {
-                    host: "scgh001".into(),
+                    host: "node001".into(),
                     ip: "10.0.0.2".into(),
                 }, // dupe → wins
             ],
@@ -2932,7 +2934,7 @@ mod tests {
         };
         let map = s.node_alias_map();
         assert_eq!(map.len(), 1);
-        assert_eq!(map.get("scgh001").map(String::as_str), Some("10.0.0.2"));
+        assert_eq!(map.get("node001").map(String::as_str), Some("10.0.0.2"));
     }
 
     #[test]

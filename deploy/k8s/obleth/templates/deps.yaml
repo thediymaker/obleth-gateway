@@ -34,12 +34,22 @@ spec:
           image: {{ .Values.postgres.image }}
           env:
             - { name: POSTGRES_USER, value: {{ .Values.postgres.user | quote }} }
-            - { name: POSTGRES_PASSWORD, value: {{ required "postgres.password is required (set via --set or an external Secret)" .Values.postgres.password | quote }} }
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "obleth.secretName" . }}
+                  key: POSTGRES_PASSWORD
             - { name: POSTGRES_DB, value: {{ .Values.postgres.db | quote }} }
             # Keep data in a subdirectory so a freshly provisioned volume's
             # lost+found entry does not block Postgres init.
             - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
           ports: [{ containerPort: 5432 }]
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\""]
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources: {{- toYaml .Values.postgres.resources | nindent 12 }}
           volumeMounts: [{ name: data, mountPath: /var/lib/postgresql/data }]
       volumes:
         - name: data
@@ -86,13 +96,41 @@ spec:
     type: Recreate
   selector: { matchLabels: { app: {{ .Release.Name }}-redis } }
   template:
-    metadata: { labels: { app: {{ .Release.Name }}-redis } }
+    metadata:
+      labels: { app: {{ .Release.Name }}-redis }
+      annotations:
+        # Restart Redis with the new --requirepass when the chart-rendered
+        # Secret changes, in step with the gateway.
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
       containers:
         - name: redis
           image: {{ .Values.redis.image }}
-          args: ["redis-server", "--appendonly", "yes"]
+          # $(REDIS_PASSWORD) is expanded by Kubernetes from the env below, so
+          # the password never appears in the pod spec.
+          args:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --requirepass
+            - $(REDIS_PASSWORD)
+            - --maxmemory
+            - {{ required "redis.maxmemory is required" .Values.redis.maxmemory | quote }}
+            - --maxmemory-policy
+            - volatile-lru
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "obleth.secretName" . }}
+                  key: REDIS_PASSWORD
           ports: [{ containerPort: 6379 }]
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "redis-cli -a \"$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources: {{- toYaml .Values.redis.resources | nindent 12 }}
           volumeMounts: [{ name: data, mountPath: /data }]
       volumes:
         - name: data
@@ -146,10 +184,19 @@ spec:
           image: {{ .Values.clickhouse.image }}
           env:
             - { name: CLICKHOUSE_USER, value: {{ .Values.clickhouse.user | quote }} }
-            - { name: CLICKHOUSE_PASSWORD, value: {{ required "clickhouse.password is required (set via --set or an external Secret)" .Values.clickhouse.password | quote }} }
+            - name: CLICKHOUSE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "obleth.secretName" . }}
+                  key: OBLETH_CLICKHOUSE_PASSWORD
             - { name: CLICKHOUSE_DB, value: {{ .Values.clickhouse.db | quote }} }
             - { name: CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT, value: "1" }
           ports: [{ containerPort: 8123 }, { containerPort: 9000 }]
+          readinessProbe:
+            httpGet: { path: /ping, port: 8123 }
+            periodSeconds: 5
+            timeoutSeconds: 3
+          resources: {{- toYaml .Values.clickhouse.resources | nindent 12 }}
           volumeMounts: [{ name: data, mountPath: /var/lib/clickhouse }]
       volumes:
         - name: data

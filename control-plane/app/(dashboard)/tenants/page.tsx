@@ -1,3 +1,4 @@
+import { requireAdmin } from "@/lib/auth/roles";
 import { TenantTable } from "@/components/tenant-table";
 import { obleth, type ModelRoute, type Tenant } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
@@ -5,6 +6,7 @@ import { safe } from "@/lib/safe";
 export const dynamic = "force-dynamic";
 
 export default async function TenantsPage() {
+  await requireAdmin();
   const [tenants, models] = await Promise.all([
     safe(obleth.listTenants(), [] as Tenant[]),
     safe(obleth.listModels(), [] as ModelRoute[]),

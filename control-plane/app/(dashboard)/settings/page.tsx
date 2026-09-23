@@ -1,3 +1,4 @@
+import { requireAdmin } from "@/lib/auth/roles";
 import { SettingsTabs } from "@/components/settings-tabs";
 import { VersionCard } from "@/components/version-card";
 import { obleth } from "@/lib/obleth";
@@ -6,6 +7,7 @@ import { safe } from "@/lib/safe";
 export const dynamic = "force-dynamic";
 
 export default async function SettingsPage() {
+  await requireAdmin();
   const [settings, autoRouter, boons, compressor, charo, energy, knowledge, models, retention, slurm, routerReadiness] =
     await Promise.all([
       safe(obleth.getAlertSettings(), null),

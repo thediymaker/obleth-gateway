@@ -3116,7 +3116,7 @@ export function SlurmSettingsForm({ settings }: { settings: SlurmSettingsView | 
                         prev.map((x, j) => (j === i ? { ...x, host: e.target.value } : x)),
                       )
                     }
-                    placeholder="scgh001"
+                    placeholder="node001"
                     className="font-mono"
                     autoComplete="off"
                   />

@@ -16,7 +16,7 @@ use obleth_config::{
 };
 use obleth_store::CryptoError;
 
-use crate::ssrf::SsrfPolicy;
+use crate::ssrf::{SsrfPolicy, VERIFY_TEMPLATE_PLACEHOLDERS};
 use crate::{
     audit_actor, resync_all_keys, sync_mcp_server, sync_model, AdminError, AdminState, Result,
 };
@@ -115,7 +115,7 @@ pub(crate) async fn restore_backup(
     // Restored rows are dispatched to by the data plane and boons without any
     // further check, so hold the whole document to the same destination policy
     // the individual forms enforce — before the first write.
-    validate_backup_destinations(&state.ssrf, &body.data)?;
+    validate_backup_destinations(&state.ssrf, &body.data).await?;
 
     let mut report = state.store.restore_backup_data(&body.data).await?;
 
@@ -190,38 +190,88 @@ fn contains_ciphertext(data: &BackupData) -> bool {
         || data.mcp_servers.iter().any(|s| enc(&s.auth_header))
 }
 
-/// Every outbound destination a restore would register, checked against the
-/// SSRF policy the create/update forms use. The first blocked entry fails the
-/// whole restore so nothing is written.
-fn validate_backup_destinations(policy: &SsrfPolicy, data: &BackupData) -> Result<()> {
-    let models = data
-        .models
-        .iter()
-        .map(|m| (format!("model '{}'", m.model_name), m.api_base.as_str()));
-    let endpoints = data
-        .model_endpoints
-        .iter()
-        .map(|e| (format!("endpoint '{}'", e.name), e.api_base.as_str()));
-    let mcp = data
-        .mcp_servers
-        .iter()
-        .map(|s| (format!("MCP server '{}'", s.name), s.upstream_url.as_str()));
-    validate_destinations(policy, models.chain(endpoints).chain(mcp))
+/// One outbound URL a restore would register.
+struct Destination {
+    label: String,
+    url: String,
+    /// A per-model URL template rather than a literal URL.
+    template: bool,
 }
 
-fn validate_destinations<'a>(
-    policy: &SsrfPolicy,
-    targets: impl Iterator<Item = (String, &'a str)>,
-) -> Result<()> {
-    for (label, url) in targets {
+/// Every outbound destination a restore would register — model, endpoint and
+/// MCP upstreams plus the URLs inside `app_settings` — checked against the
+/// SSRF policy the create/update forms use. The first blocked entry fails the
+/// whole restore so nothing is written.
+async fn validate_backup_destinations(policy: &SsrfPolicy, data: &BackupData) -> Result<()> {
+    validate_destinations(policy, backup_destinations(data)).await
+}
+
+fn backup_destinations(data: &BackupData) -> Vec<Destination> {
+    let literal = |label: String, url: &str| Destination {
+        label,
+        url: url.to_string(),
+        template: false,
+    };
+    let mut out = Vec::new();
+    for m in &data.models {
+        out.push(literal(
+            format!("model '{}' api_base", m.model_name),
+            &m.api_base,
+        ));
+        out.push(literal(
+            format!("model '{}' verify_api_base", m.model_name),
+            &m.verify_api_base,
+        ));
+    }
+    for e in &data.model_endpoints {
+        out.push(literal(format!("endpoint '{}'", e.name), &e.api_base));
+    }
+    for s in &data.mcp_servers {
+        out.push(literal(format!("MCP server '{}'", s.name), &s.upstream_url));
+    }
+    // Settings documents are opaque JSON here; pick out the fields the gateway
+    // sends credentials to (webhook path, Slurm JWT, model upstream keys).
+    for setting in &data.app_settings {
+        // Same rule as the Slurm settings form: a disabled configuration may
+        // carry a URL this host can't resolve; it is checked when enabled and
+        // before every test ping.
+        let slurm_enabled = setting.value.get("enabled").and_then(|v| v.as_bool()) == Some(true);
+        let fields: &[(&str, bool)] = match setting.key.as_str() {
+            "alerts" => &[("/slack_webhook_url", false)],
+            "energy" => &[("/prometheus_url", false)],
+            "slurm" if slurm_enabled => &[("/slurmrestd_url", false)],
+            "boons" => &[("/speculation/verify_url_template", true)],
+            _ => &[],
+        };
+        for (pointer, template) in fields {
+            if let Some(url) = setting.value.pointer(pointer).and_then(|v| v.as_str()) {
+                out.push(Destination {
+                    label: format!("setting '{}' {}", setting.key, &pointer[1..]),
+                    url: url.to_string(),
+                    template: *template,
+                });
+            }
+        }
+    }
+    out
+}
+
+async fn validate_destinations(policy: &SsrfPolicy, targets: Vec<Destination>) -> Result<()> {
+    for d in targets {
         // An empty URL is not a destination; older exports may carry one for
         // rows that were never dispatched to.
-        if url.trim().is_empty() {
+        let url = d.url.trim();
+        if url.is_empty() {
             continue;
         }
-        policy
-            .validate(url)
-            .map_err(|e| AdminError::BadRequest(format!("backup {label}: {e}")))?;
+        let checked = if d.template {
+            policy
+                .validate_template(url, VERIFY_TEMPLATE_PLACEHOLDERS)
+                .await
+        } else {
+            policy.validate(url).await
+        };
+        checked.map_err(|e| AdminError::BadRequest(format!("backup {}: {e}", d.label)))?;
     }
     Ok(())
 }
@@ -230,39 +280,141 @@ fn validate_destinations<'a>(
 mod tests {
     use super::*;
 
-    fn check(url: &str) -> Result<()> {
-        validate_destinations(
-            &SsrfPolicy::default(),
-            std::iter::once(("model 'm'".to_string(), url)),
-        )
+    fn dest(label: &str, url: &str) -> Destination {
+        Destination {
+            label: label.to_string(),
+            url: url.to_string(),
+            template: false,
+        }
     }
 
-    #[test]
-    fn metadata_destinations_fail_the_restore_with_the_entry_named() {
-        let err = check("http://169.254.169.254/latest/meta-data/").unwrap_err();
+    async fn check(url: &str) -> Result<()> {
+        validate_destinations(&SsrfPolicy::default(), vec![dest("model 'm'", url)]).await
+    }
+
+    #[tokio::test]
+    async fn metadata_destinations_fail_the_restore_with_the_entry_named() {
+        let err = check("http://169.254.169.254/latest/meta-data/")
+            .await
+            .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("model 'm'"), "{msg}");
         assert!(matches!(err, AdminError::BadRequest(_)));
     }
 
-    #[test]
-    fn local_upstreams_and_empty_urls_pass() {
-        assert!(check("http://127.0.0.1:8000/v1").is_ok());
-        assert!(check("http://10.1.2.3:8000/v1").is_ok());
-        assert!(check("").is_ok());
-        assert!(check("   ").is_ok());
+    #[tokio::test]
+    async fn local_upstreams_and_empty_urls_pass() {
+        assert!(check("http://127.0.0.1:8000/v1").await.is_ok());
+        assert!(check("http://10.1.2.3:8000/v1").await.is_ok());
+        assert!(check("").await.is_ok());
+        assert!(check("   ").await.is_ok());
     }
 
-    #[test]
-    fn stops_at_the_first_blocked_entry() {
+    #[tokio::test]
+    async fn stops_at_the_first_blocked_entry() {
         let targets = vec![
-            ("model 'ok'".to_string(), "http://127.0.0.1:8000"),
-            ("endpoint 'bad'".to_string(), "http://[fe80::1]/"),
-            ("MCP server 'later'".to_string(), "http://169.254.169.254/"),
+            dest("model 'ok'", "http://127.0.0.1:8000"),
+            dest("endpoint 'bad'", "http://[fe80::1]/"),
+            dest("MCP server 'later'", "http://169.254.169.254/"),
         ];
-        let msg = validate_destinations(&SsrfPolicy::default(), targets.into_iter())
+        let msg = validate_destinations(&SsrfPolicy::default(), targets)
+            .await
             .unwrap_err()
             .to_string();
         assert!(msg.contains("endpoint 'bad'"), "{msg}");
+    }
+
+    fn setting(key: &str, value: serde_json::Value) -> obleth_config::AppSettingBackup {
+        obleth_config::AppSettingBackup {
+            key: key.to_string(),
+            value,
+        }
+    }
+
+    #[tokio::test]
+    async fn settings_urls_are_validated_and_named() {
+        let cases = [
+            (
+                setting(
+                    "alerts",
+                    serde_json::json!({ "slack_webhook_url": "http://169.254.169.254/hook" }),
+                ),
+                "setting 'alerts' slack_webhook_url",
+            ),
+            (
+                setting(
+                    "energy",
+                    serde_json::json!({ "prometheus_url": "http://[fe80::1]:9090" }),
+                ),
+                "setting 'energy' prometheus_url",
+            ),
+            (
+                setting(
+                    "slurm",
+                    serde_json::json!({
+                        "enabled": true, "slurmrestd_url": "http://100.100.100.200:6820"
+                    }),
+                ),
+                "setting 'slurm' slurmrestd_url",
+            ),
+            (
+                setting(
+                    "boons",
+                    serde_json::json!({
+                        "speculation": { "verify_url_template": "http://169.254.169.254/{model}" }
+                    }),
+                ),
+                "setting 'boons' speculation/verify_url_template",
+            ),
+            (
+                setting(
+                    "boons",
+                    serde_json::json!({
+                        "speculation": { "verify_url_template": "http://{model}@10.0.0.5:8000/v1" }
+                    }),
+                ),
+                "setting 'boons' speculation/verify_url_template",
+            ),
+        ];
+        for (s, expected) in cases {
+            let data = BackupData {
+                app_settings: vec![s],
+                ..Default::default()
+            };
+            let msg = validate_backup_destinations(&SsrfPolicy::default(), &data)
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains(expected), "{msg}");
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_slurm_host_templates_and_unrelated_settings_pass() {
+        let data = BackupData {
+            app_settings: vec![
+                setting(
+                    "boons",
+                    serde_json::json!({
+                        "speculation": {
+                            "verify_url_template": "http://{upstream}.serving.svc.cluster.local:8000/{model}/v1"
+                        }
+                    }),
+                ),
+                setting("usage_retention", serde_json::json!({ "days": 30 })),
+                // Disabled: even a blocked or unresolvable URL is not a
+                // destination until the configuration is enabled.
+                setting(
+                    "slurm",
+                    serde_json::json!({
+                        "enabled": false, "slurmrestd_url": "http://169.254.169.254:6820"
+                    }),
+                ),
+            ],
+            ..Default::default()
+        };
+        assert!(validate_backup_destinations(&SsrfPolicy::default(), &data)
+            .await
+            .is_ok());
     }
 }

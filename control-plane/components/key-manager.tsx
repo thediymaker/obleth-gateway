@@ -97,6 +97,7 @@ export function KeyManager({
 
   const [createOpen, setCreateOpen] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [rowMessages, setRowMessages] = useState<Record<string, RowMessage>>({});
   const { confirm, confirmElement } = useConfirm();
   const [filterDeleteOpen, setFilterDeleteOpen] = useState(false);
@@ -219,7 +220,11 @@ export function KeyManager({
       description: `Delete API key "${key.name}"? Clients using it stop authenticating immediately. This cannot be undone.`,
     });
     if (!ok) return;
-    start(() => deleteKeyAction(key.id));
+    setDeleteError(null);
+    start(async () => {
+      const result = await deleteKeyAction(key.id);
+      if (!result.ok) setDeleteError(result.error);
+    });
   }
 
   function toggleKeySelection(id: string, checked: boolean) {
@@ -351,6 +356,15 @@ export function KeyManager({
         </div>
 
         <TopKeysPanel rows={rows} refreshing={refreshing} onRefresh={refreshData} />
+
+        {deleteError && (
+          <div className="flex items-start justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+            <span>Delete failed: {deleteError}</span>
+            <button type="button" onClick={() => setDeleteError(null)} className="shrink-0 text-xs underline opacity-80 hover:opacity-100">
+              Dismiss
+            </button>
+          </div>
+        )}
 
         <Card>
           <CardHeader className="gap-4">

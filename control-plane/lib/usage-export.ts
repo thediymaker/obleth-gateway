@@ -46,9 +46,13 @@ export interface ExportContext {
   keyPrefixes: Map<string, string>;
 }
 
+/// Numbers are emitted verbatim. Strings (tenant/key names are user-supplied)
+/// that a spreadsheet would evaluate as a formula get a leading `'` so the
+/// cell opens as text.
 export function csvField(value: string | number): string {
-  const s = String(value);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  if (typeof value === "number") return String(value);
+  const s = /^[=+\-@\t\r]/.test(value) ? `'${value}` : value;
+  return s !== value || /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
 /// Parse the client's `columns` allowlist. Output order always follows

@@ -1,6 +1,6 @@
 //! Node hostname → address resolution for the provisioner.
 //!
-//! Slurm allocations name compute nodes by short hostname (`scgh001`). When the
+//! Slurm allocations name compute nodes by short hostname (`node001`). When the
 //! pods running obleth resolve those names unreliably — a common cluster setup
 //! has the gateway/provisioner pods pointed at a corporate resolver behind a
 //! long DNS search list, so a fraction of short-name lookups time out — that
@@ -154,10 +154,10 @@ mod tests {
     async fn alias_overrides_dns_entirely() {
         let r = resolver();
         r.set_aliases(HashMap::from([(
-            "scgh001".to_string(),
+            "node001".to_string(),
             "10.0.0.7".to_string(),
         )]));
-        assert_eq!(r.resolve("scgh001").await.as_deref(), Some("10.0.0.7"));
+        assert_eq!(r.resolve("node001").await.as_deref(), Some("10.0.0.7"));
     }
 
     #[tokio::test]
@@ -170,11 +170,11 @@ mod tests {
     async fn resolve_url_host_swaps_hostname_for_alias_ip_keeping_port_and_path() {
         let r = resolver();
         r.set_aliases(HashMap::from([(
-            "scgh002".to_string(),
+            "node002".to_string(),
             "10.0.0.9".to_string(),
         )]));
         assert_eq!(
-            r.resolve_url_host("http://scgh002:8016/v1").await,
+            r.resolve_url_host("http://node002:8016/v1").await,
             "http://10.0.0.9:8016/v1"
         );
     }

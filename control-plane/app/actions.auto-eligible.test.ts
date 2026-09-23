@@ -26,7 +26,7 @@ const model = (over: Record<string, unknown> = {}) => ({
   description: "",
   upstream_model: "up",
   api_base: "http://a",
-  api_key: null,
+  api_key_set: false,
   model_type: "chat",
   input_cost_per_token: 0,
   output_cost_per_token: 0,

@@ -1,3 +1,4 @@
+import { requireAdmin } from "@/lib/auth/roles";
 import { AuditTable } from "@/components/audit-table";
 import { obleth, type AuditEntry, type Tenant } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
@@ -5,6 +6,7 @@ import { safe } from "@/lib/safe";
 export const dynamic = "force-dynamic";
 
 export default async function AuditPage() {
+  await requireAdmin();
   const [entries, tenants] = await Promise.all([
     safe(obleth.audit(1000), [] as AuditEntry[]),
     safe(obleth.listTenants(), [] as Tenant[]),

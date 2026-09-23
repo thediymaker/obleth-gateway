@@ -82,12 +82,12 @@ export function PortalKeys({
     });
   }
 
-  function handleToggle(key: ApiKey) {
+  function handleDisable(key: ApiKey) {
     setRowErrors((prev) => ({ ...prev, [key.id]: "" }));
     start(async () => {
       const fd = new FormData();
       fd.set("id", key.id);
-      fd.set("disabled", String(!key.disabled));
+      fd.set("disabled", "true");
       const result = await disablePortalKey(fd);
       if (!result.ok) {
         setRowErrors((prev) => ({ ...prev, [key.id]: result.error }));
@@ -225,7 +225,7 @@ export function PortalKeys({
                   usage={usageByKey.get(key.id)}
                   error={rowErrors[key.id]}
                   pending={pending}
-                  onToggle={() => handleToggle(key)}
+                  onDisable={() => handleDisable(key)}
                   onDelete={() => handleDelete(key)}
                 />
               ))}
@@ -242,14 +242,14 @@ function KeyRow({
   usage,
   error,
   pending,
-  onToggle,
+  onDisable,
   onDelete,
 }: {
   apiKey: ApiKey;
   usage?: KeyUsageSummary;
   error?: string;
   pending: boolean;
-  onToggle: () => void;
+  onDisable: () => void;
   onDelete: () => void;
 }) {
   const active = !apiKey.disabled;
@@ -303,10 +303,13 @@ function KeyRow({
         </div>
 
         <div className="flex flex-wrap items-center gap-2 lg:justify-end">
-          <Button variant="outline" size="sm" disabled={pending} onClick={onToggle}>
-            <Power className="h-3.5 w-3.5" aria-hidden />
-            {active ? "Disable" : "Enable"}
-          </Button>
+          {/* Disable-only: re-enabling a key is an administrator action. */}
+          {active && (
+            <Button variant="outline" size="sm" disabled={pending} onClick={onDisable}>
+              <Power className="h-3.5 w-3.5" aria-hidden />
+              Disable
+            </Button>
+          )}
           <Button
             variant="outline"
             size="sm"

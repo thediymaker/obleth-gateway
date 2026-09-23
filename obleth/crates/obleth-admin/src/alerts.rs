@@ -180,7 +180,8 @@ async fn post_slack(
         .json(&serde_json::json!({ "text": text }))
         .send()
         .await
-        .map_err(|e| e.to_string())?;
+        // The webhook URL is the Slack credential; keep it out of logs and test results.
+        .map_err(|e| e.without_url().to_string())?;
     if response.status().is_success() {
         Ok(())
     } else {
@@ -227,4 +228,19 @@ async fn send_email(email: &EmailSettings, subject: &str, body: &str) -> Result<
         .await
         .map_err(|e| format!("smtp send failed: {e}"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn slack_transport_error_omits_webhook_url() {
+        // Port 1 on loopback refuses immediately; the error must not echo the URL.
+        let url = "http://127.0.0.1:1/services/T000/B000/webhook-secret";
+        let err = post_slack(&Client::new(), url, "k", "t", "d")
+            .await
+            .unwrap_err();
+        assert!(!err.contains("webhook-secret"), "leaked webhook url: {err}");
+    }
 }

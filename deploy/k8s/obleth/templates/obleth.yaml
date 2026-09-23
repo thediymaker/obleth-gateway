@@ -1,27 +1,12 @@
-{{- if not .Values.obleth.existingSecret }}
-apiVersion: v1
-kind: Secret
-metadata:
-  name: {{ include "obleth.fullname" . }}-secret
-  labels: {{- include "obleth.labels" . | nindent 4 }}
-type: Opaque
-stringData:
-  OBLETH_ADMIN_TOKEN: {{ required "obleth.adminToken is required: set a strong token (via --set or an external Secret); do not commit a real value" .Values.obleth.adminToken | quote }}
-  OBLETH_DATABASE_URL: {{ include "obleth.databaseUrl" . | quote }}
-  OBLETH_CLICKHOUSE_PASSWORD: {{ .Values.clickhouse.password | quote }}
-  OBLETH_SLACK_WEBHOOK_URL: {{ .Values.obleth.slackWebhookUrl | quote }}
-  OBLETH_ENCRYPTION_KEY: {{ .Values.obleth.encryptionKey | quote }}
-  OBLETH_API_KEY_PEPPER: {{ .Values.obleth.apiKeyPepper | quote }}
-  OBLETH_JWT_ISSUERS: {{ .Values.obleth.jwtIssuers | quote }}
----
-{{- end }}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "obleth.fullname" . }}
   labels: {{- include "obleth.labels" . | nindent 4 }}
 spec:
+  {{- if not .Values.hpa.enabled }}
   replicas: {{ .Values.obleth.replicas }}
+  {{- end }}
   selector:
     matchLabels:
       app.kubernetes.io/name: obleth
@@ -31,7 +16,14 @@ spec:
       labels:
         app.kubernetes.io/name: obleth
         app.kubernetes.io/instance: {{ .Release.Name }}
+      annotations:
+        # Rolls the gateway when the chart-rendered Secret changes. Constant
+        # when obleth.existingSecret is set (restart manually in that mode).
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
     spec:
+      # Room for a 300s streaming response plus shutdown headroom before the
+      # pod is killed during a rollout or drain.
+      terminationGracePeriodSeconds: 330
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- include "obleth.antiAffinity" . | nindent 6 }}
       {{- with .Values.nodeResolution.hostAliases }}
@@ -56,7 +48,6 @@ spec:
             - { name: OBLETH_PROXY_LISTEN, value: "0.0.0.0:8080" }
             - { name: OBLETH_ADMIN_LISTEN, value: "0.0.0.0:9180" }
             - { name: OBLETH_METRICS_LISTEN, value: "0.0.0.0:9091" }
-            - { name: OBLETH_REDIS_URL, value: {{ include "obleth.redisUrl" . | quote }} }
             - { name: OBLETH_CLICKHOUSE_URL, value: {{ include "obleth.clickhouseUrl" . | quote }} }
             - { name: OBLETH_CLICKHOUSE_DB, value: {{ .Values.clickhouse.db | quote }} }
             - { name: OBLETH_CLICKHOUSE_USER, value: {{ .Values.clickhouse.user | quote }} }
@@ -73,6 +64,9 @@ spec:
             - { name: OBLETH_USAGE_RETENTION_DAYS, value: {{ .Values.obleth.usageRetentionDays | quote }} }
             - { name: OBLETH_OTEL_ENDPOINT, value: {{ .Values.obleth.otelEndpoint | quote }} }
             - { name: OBLETH_SLACK_ALERT_MIN_INTERVAL_SECS, value: {{ .Values.obleth.slackAlertMinIntervalSecs | quote }} }
+            # Telemetry spill file used while ClickHouse is unreachable. Must be
+            # writable by the non-root runtime user; backed by the wal volume.
+            - { name: OBLETH_WAL_PATH, value: "/var/lib/obleth/telemetry.wal" }
             {{- if .Values.compressor.enabled }}
             - { name: OBLETH_COMPRESSOR_URL, value: "http://{{ .Release.Name }}-compressor:8080" }
             {{- end }}
@@ -80,6 +74,14 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ include "obleth.secretName" . }}
+          volumeMounts:
+            - { name: wal, mountPath: /var/lib/obleth }
+          # Boot runs migrations and warms Redis before /health answers; the
+          # startup probe allows up to 150s before liveness takes over.
+          startupProbe:
+            httpGet: { path: /health, port: proxy }
+            periodSeconds: 5
+            failureThreshold: 30
           readinessProbe:
             httpGet: { path: /health, port: proxy }
             initialDelaySeconds: 5
@@ -89,6 +91,11 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 10
           resources: {{- toYaml .Values.obleth.resources | nindent 12 }}
+      volumes:
+        # Per-pod telemetry WAL. Spilled records survive container restarts but
+        # not pod deletion; replay runs once ClickHouse is reachable again.
+        - name: wal
+          emptyDir: {}
 ---
 apiVersion: v1
 kind: Service
@@ -103,7 +110,11 @@ spec:
     - { name: proxy, port: 8080, targetPort: proxy }
     - { name: admin, port: 9180, targetPort: admin }
     - { name: metrics, port: 9091, targetPort: metrics }
-{{- if and .Values.podDisruptionBudget.enabled (gt (int .Values.obleth.replicas) 1) }}
+{{- /* Only when the effective minimum replica count is > 1: a PDB over a single
+pod with minAvailable 1 would block node drains indefinitely. */}}
+{{- $minReplicas := int .Values.obleth.replicas }}
+{{- if .Values.hpa.enabled }}{{ $minReplicas = int .Values.hpa.minReplicas }}{{ end }}
+{{- if and .Values.podDisruptionBudget.enabled (gt $minReplicas 1) }}
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget

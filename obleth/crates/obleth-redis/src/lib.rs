@@ -4,6 +4,7 @@
 //! source of truth written by the Management API, then synced here). Budget
 //! checks run as atomic Lua so they are correct across many gateway pods.
 
+mod prune;
 pub mod scripts;
 
 use std::sync::OnceLock;
@@ -268,43 +269,53 @@ impl RedisStore {
         }
     }
 
-    /// Store a response in the cache with a TTL (seconds). A `ttl_secs` of 0
-    /// disables expiry; the entry then lives until evicted or invalidated.
+    /// Store a response in the cache, expiring after `ttl_secs`. A `ttl_secs`
+    /// of 0 (or less) means caching is disabled and nothing is written: a
+    /// never-expiring entry would be an unbounded memory path in the only
+    /// hot-path store.
     pub async fn cache_put(&self, key: &str, value: &CachedResponse, ttl_secs: i64) -> Result<()> {
+        if ttl_secs <= 0 {
+            return Ok(());
+        }
         let mut conn = self.conn.clone();
         let json = serde_json::to_string(value)?;
-        let redis_key = Self::response_cache_key(key);
-        if ttl_secs > 0 {
-            let _: () = conn.set_ex(redis_key, json, ttl_secs as u64).await?;
-        } else {
-            let _: () = conn.set(redis_key, json).await?;
-        }
+        let _: () = conn
+            .set_ex(Self::response_cache_key(key), json, ttl_secs as u64)
+            .await?;
         Ok(())
     }
 
-    fn compress_key(hash: &str) -> String {
-        format!("{COMPRESS_PREFIX}{hash}")
+    fn compress_key(tenant: &Uuid, hash: &str) -> String {
+        format!("{COMPRESS_PREFIX}{tenant}:{hash}")
     }
 
-    /// Stash an original content segment under its content hash for later
-    /// reversibility, expiring after `ttl_secs`. A `ttl_secs` of 0 stores it
-    /// without expiry (callers should always pass a positive session-scoped TTL).
-    pub async fn compress_put(&self, hash: &str, content: &str, ttl_secs: u64) -> Result<()> {
-        let mut conn = self.conn.clone();
-        let redis_key = Self::compress_key(hash);
-        if ttl_secs > 0 {
-            let _: () = conn.set_ex(redis_key, content, ttl_secs).await?;
-        } else {
-            let _: () = conn.set(redis_key, content).await?;
+    /// Stash an original content segment under the owning tenant and its
+    /// content hash for later reversibility, expiring after `ttl_secs`. The
+    /// tenant is part of the key so a hash alone never retrieves another
+    /// tenant's text. A `ttl_secs` of 0 skips the write (same reasoning as
+    /// `cache_put`).
+    pub async fn compress_put(
+        &self,
+        tenant: &Uuid,
+        hash: &str,
+        content: &str,
+        ttl_secs: u64,
+    ) -> Result<()> {
+        if ttl_secs == 0 {
+            return Ok(());
         }
+        let mut conn = self.conn.clone();
+        let _: () = conn
+            .set_ex(Self::compress_key(tenant, hash), content, ttl_secs)
+            .await?;
         Ok(())
     }
 
-    /// Fetch a stashed original by its content hash, or `None` when it has
-    /// expired or was never stored.
-    pub async fn compress_get(&self, hash: &str) -> Result<Option<String>> {
+    /// Fetch a tenant's stashed original by its content hash, or `None` when
+    /// it has expired, was never stored, or belongs to another tenant.
+    pub async fn compress_get(&self, tenant: &Uuid, hash: &str) -> Result<Option<String>> {
         let mut conn = self.conn.clone();
-        let v: Option<String> = conn.get(Self::compress_key(hash)).await?;
+        let v: Option<String> = conn.get(Self::compress_key(tenant, hash)).await?;
         Ok(v)
     }
 
@@ -336,13 +347,13 @@ impl RedisStore {
     /// Failures are ignored — the cache is an optimization, never a
     /// correctness requirement.
     ///
-    /// Unlike `compress_put`, `ttl_secs == 0` here means "caching disabled —
-    /// skip the write entirely" rather than "store with no expiry": this
-    /// key space is a digest of arbitrary user query text, so a never-expiring
-    /// entry would be an unbounded memory path in the only hot-path store,
-    /// which also serves key resolution and budget enforcement. A
-    /// storage-boundary method should not depend on a caller in another crate
-    /// validating this for it.
+    /// As with `cache_put` and `compress_put`, `ttl_secs == 0` here means
+    /// "caching disabled — skip the write entirely" rather than "store with no
+    /// expiry": this key space is a digest of arbitrary user query text, so a
+    /// never-expiring entry would be an unbounded memory path in the only
+    /// hot-path store, which also serves key resolution and budget enforcement.
+    /// A storage-boundary method should not depend on a caller in another
+    /// crate validating this for it.
     pub async fn put_query_vector(&self, hash: &str, vector: &[f32], ttl_secs: u64) {
         if ttl_secs == 0 {
             return;
@@ -721,20 +732,82 @@ mod tests {
             return;
         };
         let store = RedisStore::connect(&url).await.expect("connect");
+        let tenant = Uuid::new_v4();
         let hash = format!("h-{}", Uuid::new_v4());
 
         // Miss before write.
-        assert!(store.compress_get(&hash).await.unwrap().is_none());
+        assert!(store.compress_get(&tenant, &hash).await.unwrap().is_none());
 
         // Round-trip with a TTL.
         store
-            .compress_put(&hash, "the original content", 60)
+            .compress_put(&tenant, &hash, "the original content", 60)
             .await
             .unwrap();
         assert_eq!(
-            store.compress_get(&hash).await.unwrap().as_deref(),
+            store.compress_get(&tenant, &hash).await.unwrap().as_deref(),
             Some("the original content")
         );
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn compress_store_is_scoped_to_the_tenant() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let store = RedisStore::connect(&url).await.expect("connect");
+        let (owner, other) = (Uuid::new_v4(), Uuid::new_v4());
+        let hash = format!("h-{}", Uuid::new_v4());
+        store
+            .compress_put(&owner, &hash, "tenant secret", 60)
+            .await
+            .unwrap();
+        assert!(
+            store.compress_get(&other, &hash).await.unwrap().is_none(),
+            "another tenant must not retrieve an original by its hash"
+        );
+        let mut conn = store.conn.clone();
+        let exists: bool = conn
+            .exists(format!("{COMPRESS_PREFIX}{owner}:{hash}"))
+            .await
+            .unwrap();
+        assert!(exists, "stored under obleth:compress:<tenant>:<sha>");
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn zero_ttl_never_writes() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let store = RedisStore::connect(&url).await.expect("connect");
+        let tenant = Uuid::new_v4();
+        let hash = format!("h-{}", Uuid::new_v4());
+        store
+            .compress_put(&tenant, &hash, "content", 0)
+            .await
+            .unwrap();
+        assert!(store.compress_get(&tenant, &hash).await.unwrap().is_none());
+
+        let key = format!("k-{}", Uuid::new_v4());
+        let value = CachedResponse {
+            status: 200,
+            content_type: "application/json".into(),
+            body: "{}".into(),
+            input_tokens: 1,
+            output_tokens: 1,
+        };
+        store.cache_put(&key, &value, 0).await.unwrap();
+        assert!(store.cache_get(&key).await.unwrap().is_none());
+
+        // A positive TTL still stores, and the entry expires.
+        store.cache_put(&key, &value, 60).await.unwrap();
+        assert!(store.cache_get(&key).await.unwrap().is_some());
+        let mut conn = store.conn.clone();
+        let ttl: i64 = conn.ttl(format!("{CACHE_PREFIX}{key}")).await.unwrap();
+        assert!(ttl > 0 && ttl <= 60, "entry must expire, got ttl {ttl}");
     }
 
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.

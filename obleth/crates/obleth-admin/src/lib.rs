@@ -169,6 +169,7 @@ pub fn router(state: AdminState) -> Router {
             put(set_tenant_synthetic_handler),
         )
         .route("/api/v1/keys", get(list_keys))
+        .route("/api/v1/resync", post(resync_resolver_cache))
         .route("/api/v1/keys/:id", put(update_key).delete(delete_key))
         .route("/api/v1/keys/:id/disabled", put(set_key_disabled))
         .route("/api/v1/keys/:id/tracing", put(set_key_tracing_handler))
@@ -595,9 +596,9 @@ pub struct SetDisabled {
     pub disabled: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct SetKeyTracing {
-    tracing_enabled: bool,
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetKeyTracing {
+    pub tracing_enabled: bool,
 }
 
 fn normalize_budget_fields(
@@ -904,6 +905,8 @@ pub struct UpdateModel {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetModelCache {
     pub cache_enabled: bool,
+    /// Response-cache lifetime in seconds (default 300). 0 disables the cache:
+    /// responses are not written.
     pub cache_ttl_secs: Option<i64>,
 }
 
@@ -1474,6 +1477,274 @@ async fn patch_tenant_compression(
     Ok(Json(tenant))
 }
 
+// ---- secret-redacted response views ----
+//
+// The store decrypts upstream secrets on every read, so the config structs
+// carry plaintext keys. Every Management API response (and audit detail) for
+// models, endpoints, and MCP servers goes through these views instead: secrets
+// are write-only and only their presence is reported. The `From` impls
+// destructure exhaustively so a new config field fails to compile here rather
+// than silently going missing from the API.
+
+/// A registered model route as returned by the Management API. Identical to
+/// the stored route except the upstream `api_key` is never returned.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ModelRouteView {
+    pub id: Uuid,
+    pub model_name: String,
+    pub aliases: Vec<String>,
+    pub description: String,
+    pub upstream_model: String,
+    pub api_base: String,
+    /// Whether an upstream API key is stored. The key itself is write-only.
+    pub api_key_set: bool,
+    pub model_type: String,
+    pub quantization: String,
+    pub input_cost_per_token: f64,
+    pub output_cost_per_token: f64,
+    pub cost_per_image: f64,
+    pub cost_per_audio_second: f64,
+    pub cost_per_character: f64,
+    pub context_window: i64,
+    pub admission_weight: i64,
+    pub max_in_flight: Option<i64>,
+    pub capacity_mode: String,
+    pub capacity_tuned_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub supports_function_calling: bool,
+    pub supports_system_messages: bool,
+    pub supports_response_schema: bool,
+    pub supports_tool_choice: bool,
+    pub supports_vision: bool,
+    pub enabled: bool,
+    pub cache_enabled: bool,
+    pub cache_ttl_secs: i64,
+    pub tags: Vec<String>,
+    pub boons: Vec<String>,
+    pub tool_servers: Vec<String>,
+    pub request_timeout_secs: Option<i64>,
+    pub max_retries: i64,
+    pub retry_backoff_ms: i64,
+    pub endpoint_selection_mode: String,
+    pub debug_diagnostics: bool,
+    pub energy_slots_per_node: i64,
+    pub route_bias: f64,
+    pub auto_eligible: bool,
+    pub draft_model: String,
+    pub verify_api_base: String,
+    pub verify_upstream_model: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+fn secret_set(s: &Option<String>) -> bool {
+    s.as_ref().is_some_and(|v| !v.is_empty())
+}
+
+fn views<T, V: From<T>>(items: Vec<T>) -> Vec<V> {
+    items.into_iter().map(V::from).collect()
+}
+
+impl From<ModelRoute> for ModelRouteView {
+    fn from(m: ModelRoute) -> Self {
+        let ModelRoute {
+            id,
+            model_name,
+            aliases,
+            description,
+            upstream_model,
+            api_base,
+            api_key,
+            model_type,
+            quantization,
+            input_cost_per_token,
+            output_cost_per_token,
+            cost_per_image,
+            cost_per_audio_second,
+            cost_per_character,
+            context_window,
+            admission_weight,
+            max_in_flight,
+            capacity_mode,
+            capacity_tuned_at,
+            supports_function_calling,
+            supports_system_messages,
+            supports_response_schema,
+            supports_tool_choice,
+            supports_vision,
+            enabled,
+            cache_enabled,
+            cache_ttl_secs,
+            tags,
+            boons,
+            tool_servers,
+            request_timeout_secs,
+            max_retries,
+            retry_backoff_ms,
+            endpoint_selection_mode,
+            debug_diagnostics,
+            energy_slots_per_node,
+            route_bias,
+            auto_eligible,
+            draft_model,
+            verify_api_base,
+            verify_upstream_model,
+            created_at,
+            updated_at,
+        } = m;
+        ModelRouteView {
+            id,
+            model_name,
+            aliases,
+            description,
+            upstream_model,
+            api_base,
+            api_key_set: secret_set(&api_key),
+            model_type,
+            quantization,
+            input_cost_per_token,
+            output_cost_per_token,
+            cost_per_image,
+            cost_per_audio_second,
+            cost_per_character,
+            context_window,
+            admission_weight,
+            max_in_flight,
+            capacity_mode,
+            capacity_tuned_at,
+            supports_function_calling,
+            supports_system_messages,
+            supports_response_schema,
+            supports_tool_choice,
+            supports_vision,
+            enabled,
+            cache_enabled,
+            cache_ttl_secs,
+            tags,
+            boons,
+            tool_servers,
+            request_timeout_secs,
+            max_retries,
+            retry_backoff_ms,
+            endpoint_selection_mode,
+            debug_diagnostics,
+            energy_slots_per_node,
+            route_bias,
+            auto_eligible,
+            draft_model,
+            verify_api_base,
+            verify_upstream_model,
+            created_at,
+            updated_at,
+        }
+    }
+}
+
+/// A model's upstream endpoint as returned by the Management API. The
+/// endpoint `api_key` is never returned.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ModelEndpointView {
+    pub id: Uuid,
+    #[schema(value_type = String)]
+    pub model_id: Uuid,
+    pub name: String,
+    pub api_base: String,
+    /// Whether an endpoint API key is stored. The key itself is write-only.
+    pub api_key_set: bool,
+    pub priority: i64,
+    pub weight: i64,
+    pub enabled: bool,
+    pub health_status: String,
+    pub consecutive_failures: i64,
+    pub alert_state: String,
+    pub last_checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_latency_ms: Option<i64>,
+    pub last_http_status: Option<i64>,
+    pub last_message: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<ModelEndpoint> for ModelEndpointView {
+    fn from(e: ModelEndpoint) -> Self {
+        let ModelEndpoint {
+            id,
+            model_id,
+            name,
+            api_base,
+            api_key,
+            priority,
+            weight,
+            enabled,
+            health_status,
+            consecutive_failures,
+            alert_state,
+            last_checked_at,
+            last_latency_ms,
+            last_http_status,
+            last_message,
+            created_at,
+            updated_at,
+        } = e;
+        ModelEndpointView {
+            id,
+            model_id,
+            name,
+            api_base,
+            api_key_set: secret_set(&api_key),
+            priority,
+            weight,
+            enabled,
+            health_status,
+            consecutive_failures,
+            alert_state,
+            last_checked_at,
+            last_latency_ms,
+            last_http_status,
+            last_message,
+            created_at,
+            updated_at,
+        }
+    }
+}
+
+/// A registered MCP server as returned by the Management API. The upstream
+/// `auth_header` is never returned.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct McpServerView {
+    pub id: Uuid,
+    pub name: String,
+    pub upstream_url: String,
+    /// Whether an upstream Authorization header is stored. The value itself is
+    /// write-only.
+    pub auth_header_set: bool,
+    pub enabled: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<McpServer> for McpServerView {
+    fn from(s: McpServer) -> Self {
+        let McpServer {
+            id,
+            name,
+            upstream_url,
+            auth_header,
+            enabled,
+            created_at,
+            updated_at,
+        } = s;
+        McpServerView {
+            id,
+            name,
+            upstream_url,
+            auth_header_set: secret_set(&auth_header),
+            enabled,
+            created_at,
+            updated_at,
+        }
+    }
+}
+
 // ---- alert settings ----
 
 /// Read-only view of the saved alert settings. Secrets (webhook URL, SMTP
@@ -1583,7 +1854,7 @@ async fn put_alert_settings(
         Some(url) if !url.is_empty() => {
             // Alert dispatch POSTs to this URL from the gateway; hold it to the
             // same destination policy as registered upstreams.
-            state.ssrf.validate(url)?;
+            state.ssrf.validate(url).await?;
             Some(url.to_string())
         }
         _ if body.clear_slack_webhook => None,
@@ -2450,6 +2721,7 @@ async fn put_boon_settings(
     Json(body): Json<UpdateBoonSettings>,
 ) -> Result<Json<BoonSettingsView>> {
     let existing = state.store.get_boon_settings().await?.unwrap_or_default();
+    let verify_template_supplied = body.speculation_verify_url_template.is_some();
 
     let fallback_model = match body.vision_fallback_model.as_deref().map(str::trim) {
         Some("") => None,
@@ -2756,6 +3028,19 @@ async fn put_boon_settings(
         },
     };
 
+    // The speculation verifier sends each model's upstream key to this URL, so
+    // hold it to the upstream destination policy (placeholders are refused in
+    // the scheme/credentials; a filled host is re-checked by the proxy). Only
+    // a newly supplied value is checked, so an unrelated save isn't blocked by
+    // DNS for a stored one.
+    let template = settings.speculation.verify_url_template.as_str();
+    if verify_template_supplied && !template.is_empty() {
+        state
+            .ssrf
+            .validate_template(template, ssrf::VERIFY_TEMPLATE_PLACEHOLDERS)
+            .await
+            .map_err(|e| AdminError::BadRequest(format!("speculation_verify_url_template: {e}")))?;
+    }
     state.store.put_boon_settings(&settings).await?;
     state
         .store
@@ -2903,7 +3188,7 @@ async fn put_energy_settings(
     // policy the test route enforces so a save can't bypass it.
     if let Some(url) = body.prometheus_url.as_deref().map(str::trim) {
         if !url.is_empty() {
-            state.ssrf.validate(url)?;
+            state.ssrf.validate(url).await?;
         }
     }
     let settings = merge_energy_settings(&existing, &body);
@@ -2950,7 +3235,7 @@ async fn test_energy_query(
     State(state): State<AdminState>,
     Json(body): Json<TestEnergyQuery>,
 ) -> Result<Json<EnergyTestResult>> {
-    state.ssrf.validate(&body.prometheus_url)?;
+    state.ssrf.validate(&body.prometheus_url).await?;
     let q = body.power_query.trim();
     let base = body.prometheus_url.trim();
     let http = ssrf::upstream_client_builder()
@@ -3172,10 +3457,9 @@ async fn delete_tenant(
 ) -> Result<StatusCode> {
     let hashes = state.store.delete_tenant(id).await?;
     // Evict every cascaded key from the data-plane cache.
-    for hash in &hashes {
-        let _ = state.redis.delete_resolved_key(hash).await;
-        let _ = state.redis.publish_invalidation(hash).await;
-    }
+    let evicted = evict_keys(&state, &hashes, "the tenant and its keys").await;
+    // The Postgres delete stands either way, so it is audited before an
+    // eviction failure is reported.
     state
         .store
         .record_audit(
@@ -3183,9 +3467,10 @@ async fn delete_tenant(
             "delete_tenant",
             "tenant",
             &id.to_string(),
-            serde_json::json!({ "keys_removed": hashes.len() }),
+            serde_json::json!({ "keys_removed": hashes.len(), "cache_evicted": evicted.is_ok() }),
         )
         .await?;
+    evicted?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3439,8 +3724,8 @@ async fn delete_key(
     headers: HeaderMap,
 ) -> Result<StatusCode> {
     let hash = state.store.delete_key(id).await?;
-    let _ = state.redis.delete_resolved_key(&hash).await;
-    let _ = state.redis.publish_invalidation(&hash).await;
+    let evicted = evict_keys(&state, std::slice::from_ref(&hash), "the key").await;
+    // Audited before an eviction failure is reported: the row is gone.
     state
         .store
         .record_audit(
@@ -3448,9 +3733,10 @@ async fn delete_key(
             "delete_key",
             "api_key",
             &id.to_string(),
-            serde_json::json!({}),
+            serde_json::json!({ "cache_evicted": evicted.is_ok() }),
         )
         .await?;
+    evicted?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3485,6 +3771,12 @@ async fn set_key_disabled(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/keys/{id}/tracing", tag = "keys",
+    params(("id" = Uuid, Path, description = "API key id")),
+    request_body = SetKeyTracing,
+    responses((status = 204), (status = 404))
+)]
 async fn set_key_tracing_handler(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -3513,6 +3805,12 @@ async fn set_key_tracing_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/tenants/{id}/tracing", tag = "tenants",
+    params(("id" = Uuid, Path, description = "Tenant id")),
+    request_body = SetKeyTracing,
+    responses((status = 204), (status = 404))
+)]
 async fn set_tenant_tracing_handler(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -3827,6 +4125,11 @@ async fn get_usage_logs(
     Ok(Json(entries))
 }
 
+#[utoipa::path(
+    get, path = "/api/v1/usage/logs/{request_id}/spans", tag = "usage",
+    params(("request_id" = Uuid, Path, description = "Request id")),
+    responses((status = 200, body = [usage::SpanEntry]))
+)]
 async fn get_request_spans(
     State(state): State<AdminState>,
     Path(request_id): Path<Uuid>,
@@ -3975,6 +4278,12 @@ async fn put_usage_retention(
         return Err(AdminError::BadRequest(
             "retention days must be at least 1".into(),
         ));
+    }
+    if body.days > usage_retention::MAX_RETENTION_DAYS {
+        return Err(AdminError::BadRequest(format!(
+            "retention days must be at most {}",
+            usage_retention::MAX_RETENTION_DAYS
+        )));
     }
     let settings = obleth_config::UsageRetentionSettings { days: body.days };
     state.store.put_usage_retention_settings(&settings).await?;
@@ -4532,12 +4841,186 @@ async fn patch_tenant_group(
     Ok(Json(tenant))
 }
 
-async fn resync_all_keys(state: &AdminState) -> Result<()> {
+/// Republish every key from Postgres and evict Redis entries with no backing
+/// row (e.g. a delete whose eviction failed). Returns (pushed, pruned).
+async fn resync_all_keys(state: &AdminState) -> Result<(usize, usize)> {
     let keys = state.store.all_resolved_keys().await?;
-    for (hash, resolved) in keys {
-        push_key(state, &hash, &resolved).await?;
+    for (hash, resolved) in &keys {
+        push_key(state, hash, resolved).await?;
     }
-    Ok(())
+    let known: std::collections::HashSet<String> = keys.iter().map(|(h, _)| h.clone()).collect();
+    let pruned: std::collections::HashSet<String> = state
+        .redis
+        .prune_stale_resolved_keys(&known)
+        .await?
+        .into_iter()
+        .collect();
+    // Re-read after the prune: a key inserted after the snapshot but pushed
+    // before the SCAN was pruned wrongly and is restored here, and a key deleted
+    // after the snapshot (and so re-pushed above) is evicted again.
+    let fresh = state.store.all_resolved_keys().await?;
+    let fresh_hashes: std::collections::HashSet<&str> =
+        fresh.iter().map(|(h, _)| h.as_str()).collect();
+    for (hash, resolved) in fresh.iter().filter(|(h, _)| pruned.contains(h)) {
+        push_key(state, hash, resolved).await?;
+    }
+    let gone: Vec<String> = pruned
+        .iter()
+        .chain(known.iter())
+        .filter(|h| !fresh_hashes.contains(h.as_str()))
+        .cloned()
+        .collect();
+    for hash in &gone {
+        evict_key(state, hash).await?;
+    }
+    Ok((fresh.len(), gone.len()))
+}
+
+/// Republish every model and MCP server from Postgres and evict resolver
+/// entries no enabled row answers to. Returns (models, pruned names, mcp
+/// servers, pruned servers).
+async fn resync_models_and_mcp(state: &AdminState) -> Result<(usize, usize, usize, usize)> {
+    use std::collections::HashSet;
+    fn model_names(models: &[ModelRoute]) -> HashSet<String> {
+        models
+            .iter()
+            .filter(|m| m.enabled)
+            .flat_map(|m| std::iter::once(&m.model_name).chain(m.aliases.iter()))
+            .cloned()
+            .collect()
+    }
+    fn server_names(servers: &[McpServer]) -> HashSet<String> {
+        servers
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
+    let models = state.store.list_models().await?;
+    for model in &models {
+        sync_model(state, model).await?;
+    }
+    let pruned_models = state
+        .redis
+        .prune_stale_resolved_models(&model_names(&models))
+        .await?;
+    // Same re-read as `resync_all_keys`: restore anything created mid-prune.
+    let fresh_models = state.store.list_models().await?;
+    let fresh_names = model_names(&fresh_models);
+    for model in &fresh_models {
+        if model.enabled
+            && std::iter::once(&model.model_name)
+                .chain(model.aliases.iter())
+                .any(|n| pruned_models.contains(n))
+        {
+            sync_model(state, model).await?;
+        }
+    }
+    for name in pruned_models.iter().filter(|n| !fresh_names.contains(*n)) {
+        state
+            .redis
+            .publish_invalidation(&format!("model:{name}"))
+            .await?;
+    }
+
+    let servers = state.store.list_mcp_servers().await?;
+    for server in &servers {
+        sync_mcp_server(state, server).await?;
+    }
+    let pruned_servers = state
+        .redis
+        .prune_stale_resolved_mcp_servers(&server_names(&servers))
+        .await?;
+    let fresh_servers = state.store.list_mcp_servers().await?;
+    let fresh_server_names = server_names(&fresh_servers);
+    for server in fresh_servers
+        .iter()
+        .filter(|s| pruned_servers.contains(&s.name))
+    {
+        sync_mcp_server(state, server).await?;
+    }
+    for name in pruned_servers
+        .iter()
+        .filter(|n| !fresh_server_names.contains(*n))
+    {
+        state
+            .redis
+            .publish_invalidation(&format!("mcp:{name}"))
+            .await?;
+    }
+
+    Ok((
+        fresh_models.len(),
+        pruned_models.len(),
+        fresh_servers.len(),
+        pruned_servers.len(),
+    ))
+}
+
+/// Outcome of a resolver-cache reconcile.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ResyncReport {
+    /// Keys republished from Postgres.
+    pub keys: usize,
+    /// Key entries evicted because no key row backs them.
+    pub keys_pruned: usize,
+    /// Models republished from Postgres.
+    pub models: usize,
+    /// Model/alias entries evicted because no enabled model answers to them.
+    pub model_names_pruned: usize,
+    /// MCP servers republished from Postgres.
+    pub mcp_servers: usize,
+    /// MCP entries evicted because no enabled server backs them.
+    pub mcp_servers_pruned: usize,
+}
+
+/// Rebuild the data plane's resolver cache (keys, models, MCP servers) from
+/// Postgres. This is the retry for a delete that reported a failed eviction.
+#[utoipa::path(
+    post, path = "/api/v1/resync", tag = "meta",
+    responses((status = 200, body = ResyncReport), (status = 502))
+)]
+async fn resync_resolver_cache(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<ResyncReport>> {
+    let (keys, keys_pruned) = resync_all_keys(&state).await?;
+    let (models, model_names_pruned, mcp_servers, mcp_servers_pruned) =
+        resync_models_and_mcp(&state).await?;
+    let report = ResyncReport {
+        keys,
+        keys_pruned,
+        models,
+        model_names_pruned,
+        mcp_servers,
+        mcp_servers_pruned,
+    };
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "resync_resolver_cache",
+            "gateway",
+            "resolver_cache",
+            serde_json::to_value(&report).unwrap_or_default(),
+        )
+        .await?;
+    Ok(Json(report))
+}
+
+/// The speculation boon sends the model's upstream key to its scoring endpoint,
+/// so a non-empty `verify_api_base` gets the same destination policy as
+/// `api_base`.
+async fn validate_verify_api_base(state: &AdminState, raw: Option<&str>) -> Result<()> {
+    match raw.map(str::trim) {
+        Some(url) if !url.is_empty() => state
+            .ssrf
+            .validate(url)
+            .await
+            .map_err(|e| AdminError::BadRequest(format!("verify_api_base: {e}"))),
+        _ => Ok(()),
+    }
 }
 
 /// Validate a declared serving format against the fixed vocabulary.
@@ -4601,19 +5084,20 @@ async fn validate_aliases(
 #[utoipa::path(
     post, path = "/api/v1/models", tag = "models",
     request_body = CreateModel,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn create_model(
     State(state): State<AdminState>,
     headers: HeaderMap,
     Json(body): Json<CreateModel>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     // A blank api_base is allowed: Slurm-provisioned models have no static
     // upstream until a replica is promoted into the endpoint rotation. Only
     // validate a non-empty URL.
     if !body.api_base.trim().is_empty() {
-        state.ssrf.validate(&body.api_base)?;
+        state.ssrf.validate(&body.api_base).await?;
     }
+    validate_verify_api_base(&state, body.verify_api_base.as_deref()).await?;
     let quantization = validate_quantization(body.quantization.as_deref().unwrap_or_default())?;
     let aliases = validate_aliases(
         &state,
@@ -4681,48 +5165,49 @@ async fn create_model(
             "create_model",
             "model",
             &model.id.to_string(),
-            serde_json::to_value(&model).unwrap_or_default(),
+            serde_json::to_value(ModelRouteView::from(model.clone())).unwrap_or_default(),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 #[utoipa::path(
     get, path = "/api/v1/models", tag = "models",
-    responses((status = 200, body = [ModelRoute]))
+    responses((status = 200, body = [ModelRouteView]))
 )]
-async fn list_models(State(state): State<AdminState>) -> Result<Json<Vec<ModelRoute>>> {
-    Ok(Json(state.store.list_models().await?))
+async fn list_models(State(state): State<AdminState>) -> Result<Json<Vec<ModelRouteView>>> {
+    Ok(Json(views(state.store.list_models().await?)))
 }
 
 #[utoipa::path(
     get, path = "/api/v1/models/{id}", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
-    responses((status = 200, body = ModelRoute), (status = 404))
+    responses((status = 200, body = ModelRouteView), (status = 404))
 )]
 async fn get_model(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<ModelRoute>> {
-    Ok(Json(state.store.get_model(id).await?))
+) -> Result<Json<ModelRouteView>> {
+    Ok(Json(state.store.get_model(id).await?.into()))
 }
 
 #[utoipa::path(
     put, path = "/api/v1/models/{id}", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
     request_body = UpdateModel,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn update_model(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<UpdateModel>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     // Blank api_base allowed for provisioned-only (Slurm) models — see create_model.
     if !body.api_base.trim().is_empty() {
-        state.ssrf.validate(&body.api_base)?;
+        state.ssrf.validate(&body.api_base).await?;
     }
+    validate_verify_api_base(&state, body.verify_api_base.as_deref()).await?;
     let existing = state.store.get_model(id).await?;
     let api_key = body.api_key.as_deref().or(existing.api_key.as_deref());
     let quantization = match body.quantization.as_deref() {
@@ -4801,21 +5286,21 @@ async fn update_model(
             serde_json::json!({ "model_name": model.model_name }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 #[utoipa::path(
     put, path = "/api/v1/models/{id}/capacity", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
     request_body = SetModelCapacity,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn set_model_capacity(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetModelCapacity>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     let model = state
         .store
         .update_model_capacity(id, body.max_in_flight)
@@ -4831,7 +5316,7 @@ async fn set_model_capacity(
             serde_json::json!({ "max_in_flight": model.max_in_flight }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 #[utoipa::path(
@@ -4839,14 +5324,14 @@ async fn set_model_capacity(
     path = "/api/v1/models/{id}/capacity-mode",
     tag = "models",
     request_body = SetModelCapacityMode,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn set_model_capacity_mode(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetModelCapacityMode>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     if !obleth_config::is_valid_capacity_mode(body.capacity_mode.trim()) {
         return Err(AdminError::BadRequest(format!(
             "invalid capacity_mode `{}` (expected `static` or `tuned`)",
@@ -4868,7 +5353,7 @@ async fn set_model_capacity_mode(
             serde_json::json!({ "capacity_mode": model.capacity_mode }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 /// Run an auto-tune ramp probe against the model's upstream and return a
@@ -4919,14 +5404,14 @@ async fn autotune_model(
     path = "/api/v1/models/{id}/autotune/apply",
     tag = "models",
     request_body = ApplyAutotuneCapacity,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn apply_autotune_capacity(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<ApplyAutotuneCapacity>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     if body.max_in_flight < 1 {
         return Err(AdminError::BadRequest(
             "max_in_flight must be >= 1".to_string(),
@@ -4950,21 +5435,21 @@ async fn apply_autotune_capacity(
             }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 #[utoipa::path(
     put, path = "/api/v1/models/{id}/weight", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
     request_body = SetModelWeight,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn set_model_weight(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetModelWeight>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     let model = state
         .store
         .update_model_admission_weight(id, body.admission_weight)
@@ -4980,21 +5465,21 @@ async fn set_model_weight(
             serde_json::json!({ "admission_weight": model.admission_weight }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 #[utoipa::path(
     put, path = "/api/v1/models/{id}/cache", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
     request_body = SetModelCache,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn set_model_cache(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetModelCache>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     let model = state
         .store
         .update_model_cache(id, body.cache_enabled, body.cache_ttl_secs.unwrap_or(300))
@@ -5013,21 +5498,21 @@ async fn set_model_cache(
             }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 #[utoipa::path(
     put, path = "/api/v1/models/{id}/reliability", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
     request_body = SetModelReliability,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn set_model_reliability(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetModelReliability>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     let model = state
         .store
         .update_model_reliability(
@@ -5055,7 +5540,7 @@ async fn set_model_reliability(
             }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 // ---- model endpoints -----------------------------------------------------
@@ -5063,31 +5548,31 @@ async fn set_model_reliability(
 #[utoipa::path(
     get, path = "/api/v1/models/{id}/endpoints", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
-    responses((status = 200, body = [ModelEndpoint]))
+    responses((status = 200, body = [ModelEndpointView]))
 )]
 async fn list_model_endpoints(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<ModelEndpoint>>> {
+) -> Result<Json<Vec<ModelEndpointView>>> {
     // Confirm the model exists so callers get 404 (not an empty list) for a
     // bad id.
     state.store.get_model(id).await?;
-    Ok(Json(state.store.list_model_endpoints(id).await?))
+    Ok(Json(views(state.store.list_model_endpoints(id).await?)))
 }
 
 #[utoipa::path(
     post, path = "/api/v1/models/{id}/endpoints", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
     request_body = CreateModelEndpoint,
-    responses((status = 200, body = ModelEndpoint))
+    responses((status = 200, body = ModelEndpointView))
 )]
 async fn create_model_endpoint(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<CreateModelEndpoint>,
-) -> Result<Json<ModelEndpoint>> {
-    state.ssrf.validate(&body.api_base)?;
+) -> Result<Json<ModelEndpointView>> {
+    state.ssrf.validate(&body.api_base).await?;
     let model = state.store.get_model(id).await?;
     let endpoint = state
         .store
@@ -5116,7 +5601,7 @@ async fn create_model_endpoint(
             }),
         )
         .await?;
-    Ok(Json(endpoint))
+    Ok(Json(endpoint.into()))
 }
 
 #[utoipa::path(
@@ -5126,19 +5611,21 @@ async fn create_model_endpoint(
         ("endpoint_id" = Uuid, Path, description = "Endpoint id")
     ),
     request_body = UpdateModelEndpoint,
-    responses((status = 200, body = ModelEndpoint))
+    responses((status = 200, body = ModelEndpointView), (status = 404))
 )]
 async fn update_model_endpoint(
     State(state): State<AdminState>,
     Path((id, endpoint_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
     Json(body): Json<UpdateModelEndpoint>,
-) -> Result<Json<ModelEndpoint>> {
-    state.ssrf.validate(&body.api_base)?;
+) -> Result<Json<ModelEndpointView>> {
+    state.ssrf.validate(&body.api_base).await?;
     let model = state.store.get_model(id).await?;
     let endpoint = state
         .store
+        // Scoped to the path model: another model's endpoint id is a 404.
         .update_model_endpoint(
+            model.id,
             endpoint_id,
             &body.name,
             &body.api_base,
@@ -5164,7 +5651,7 @@ async fn update_model_endpoint(
             }),
         )
         .await?;
-    Ok(Json(endpoint))
+    Ok(Json(endpoint.into()))
 }
 
 #[utoipa::path(
@@ -5181,7 +5668,11 @@ async fn delete_model_endpoint(
     headers: HeaderMap,
 ) -> Result<StatusCode> {
     let model = state.store.get_model(id).await?;
-    state.store.delete_model_endpoint(endpoint_id).await?;
+    // Scoped to the path model: another model's endpoint id is a 404.
+    state
+        .store
+        .delete_model_endpoint(model.id, endpoint_id)
+        .await?;
     sync_model(&state, &model).await?;
     state
         .store
@@ -5301,13 +5792,14 @@ async fn delete_managed_model(
     Ok(Json(serde_json::json!({"deleted": true})))
 }
 
-#[derive(serde::Deserialize)]
-struct ProvisionErrorBody {
+#[derive(serde::Deserialize, ToSchema)]
+pub struct ProvisionErrorBody {
     #[serde(default)]
-    error: Option<String>,
+    pub error: Option<String>,
 }
 
 #[utoipa::path(patch, path = "/api/v1/models/{id}/managed/provision-error",
+    request_body = ProvisionErrorBody,
     responses((status = 200)))]
 async fn set_provision_error(
     State(state): State<AdminState>,
@@ -5464,8 +5956,19 @@ async fn delete_replica(
 pub async fn clear_lost_replicas(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
     let n = state.store.delete_lost_replicas(id).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "clear_lost_replicas",
+            "model",
+            &id.to_string(),
+            serde_json::json!({ "deleted": n }),
+        )
+        .await?;
     Ok(Json(serde_json::json!({ "deleted": n })))
 }
 
@@ -5483,15 +5986,23 @@ async fn delete_model(
     state.store.delete_model(id).await?;
     // Aliases are resolver keys of their own, so a delete has to clear all of
     // them or the model stays reachable under its old names.
+    let mut evict_err = None;
     for name in
         std::iter::once(model.model_name.as_str()).chain(model.aliases.iter().map(String::as_str))
     {
-        let _ = state.redis.delete_resolved_model(name).await;
-        let _ = state
-            .redis
-            .publish_invalidation(&format!("model:{name}"))
-            .await;
+        let evicted = async {
+            state.redis.delete_resolved_model(name).await?;
+            state
+                .redis
+                .publish_invalidation(&format!("model:{name}"))
+                .await
+        }
+        .await;
+        if let Err(e) = evicted {
+            evict_err.get_or_insert(e);
+        }
     }
+    // Audited before an eviction failure is reported: the row is gone.
     state
         .store
         .record_audit(
@@ -5499,9 +6010,15 @@ async fn delete_model(
             "delete_model",
             "model",
             &id.to_string(),
-            serde_json::json!({ "model_name": model.model_name }),
+            serde_json::json!({
+                "model_name": model.model_name,
+                "cache_evicted": evict_err.is_none(),
+            }),
         )
         .await?;
+    if let Some(e) = evict_err {
+        return Err(eviction_failed("the model", e));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -5510,14 +6027,14 @@ async fn delete_model(
 #[utoipa::path(
     post, path = "/api/v1/mcp-servers", tag = "mcp",
     request_body = CreateMcpServer,
-    responses((status = 200, body = McpServer))
+    responses((status = 200, body = McpServerView))
 )]
 async fn create_mcp_server(
     State(state): State<AdminState>,
     headers: HeaderMap,
     Json(body): Json<CreateMcpServer>,
-) -> Result<Json<McpServer>> {
-    state.ssrf.validate(&body.upstream_url)?;
+) -> Result<Json<McpServerView>> {
+    state.ssrf.validate(&body.upstream_url).await?;
     let server = state
         .store
         .create_mcp_server(&body.name, &body.upstream_url, body.auth_header.as_deref())
@@ -5533,42 +6050,42 @@ async fn create_mcp_server(
             serde_json::json!({ "name": server.name, "upstream_url": server.upstream_url }),
         )
         .await?;
-    Ok(Json(server))
+    Ok(Json(server.into()))
 }
 
 #[utoipa::path(
     get, path = "/api/v1/mcp-servers", tag = "mcp",
-    responses((status = 200, body = [McpServer]))
+    responses((status = 200, body = [McpServerView]))
 )]
-async fn list_mcp_servers(State(state): State<AdminState>) -> Result<Json<Vec<McpServer>>> {
-    Ok(Json(state.store.list_mcp_servers().await?))
+async fn list_mcp_servers(State(state): State<AdminState>) -> Result<Json<Vec<McpServerView>>> {
+    Ok(Json(views(state.store.list_mcp_servers().await?)))
 }
 
 #[utoipa::path(
     get, path = "/api/v1/mcp-servers/{id}", tag = "mcp",
     params(("id" = Uuid, Path, description = "MCP server id")),
-    responses((status = 200, body = McpServer), (status = 404))
+    responses((status = 200, body = McpServerView), (status = 404))
 )]
 async fn get_mcp_server(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<McpServer>> {
-    Ok(Json(state.store.get_mcp_server(id).await?))
+) -> Result<Json<McpServerView>> {
+    Ok(Json(state.store.get_mcp_server(id).await?.into()))
 }
 
 #[utoipa::path(
     put, path = "/api/v1/mcp-servers/{id}", tag = "mcp",
     params(("id" = Uuid, Path, description = "MCP server id")),
     request_body = UpdateMcpServer,
-    responses((status = 200, body = McpServer))
+    responses((status = 200, body = McpServerView))
 )]
 async fn update_mcp_server(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<UpdateMcpServer>,
-) -> Result<Json<McpServer>> {
-    state.ssrf.validate(&body.upstream_url)?;
+) -> Result<Json<McpServerView>> {
+    state.ssrf.validate(&body.upstream_url).await?;
     let existing = state.store.get_mcp_server(id).await?;
     let auth = body
         .auth_header
@@ -5594,7 +6111,7 @@ async fn update_mcp_server(
             serde_json::json!({ "name": server.name }),
         )
         .await?;
-    Ok(Json(server))
+    Ok(Json(server.into()))
 }
 
 #[utoipa::path(
@@ -5609,18 +6126,33 @@ async fn delete_mcp_server(
 ) -> Result<StatusCode> {
     let server = state.store.get_mcp_server(id).await?;
     state.store.delete_mcp_server(id).await?;
-    let _ = state.redis.delete_resolved_mcp_server(&server.name).await;
-    let _ = state
-        .redis
-        .publish_invalidation(&format!("mcp:{}", server.name))
-        .await;
+    let evicted = async {
+        state.redis.delete_resolved_mcp_server(&server.name).await?;
+        state
+            .redis
+            .publish_invalidation(&format!("mcp:{}", server.name))
+            .await
+    }
+    .await
+    .map_err(|e| eviction_failed("the MCP server", e));
     // Cascade: drop the deleted server from every model's tool grants. A stale
     // grant fails tool discovery on every request, and the dashboard can no
-    // longer display or clear it once the server's checkbox is gone.
+    // longer display or clear it once the server's checkbox is gone. The
+    // Postgres cascade runs even when the eviction above failed.
     let stripped = state.store.strip_tool_server_grants(&server.name).await?;
+    let mut synced = Ok(());
     for model in &stripped {
-        sync_model(&state, model).await?;
+        if let Err(e) = sync_model(&state, model).await {
+            if synced.is_ok() {
+                synced = Err(AdminError::CacheSync(format!(
+                    "the MCP server was deleted, but republishing model '{}' without its \
+                     grant failed ({e}); reconcile the data-plane cache with {RESYNC_ROUTE}",
+                    model.model_name
+                )));
+            }
+        }
     }
+    // Audited before a cache failure is reported: the rows are gone.
     state
         .store
         .record_audit(
@@ -5634,9 +6166,12 @@ async fn delete_mcp_server(
                     .iter()
                     .map(|m| m.model_name.as_str())
                     .collect::<Vec<_>>(),
+                "cache_evicted": evicted.is_ok() && synced.is_ok(),
             }),
         )
         .await?;
+    evicted?;
+    synced?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -5690,6 +6225,61 @@ async fn set_capacity(
 }
 
 // ---- sync helpers --------------------------------------------------------
+
+/// Route that rebuilds the resolver cache from Postgres; named in every
+/// eviction-failure error so the operator has a concrete retry.
+const RESYNC_ROUTE: &str = "POST /api/v1/resync";
+
+/// Resolver entries have no TTL, so a missed eviction would keep a deleted key,
+/// model or MCP server resolving indefinitely. Surface it as a 502 naming the
+/// reconcile route instead of reporting success.
+fn eviction_failed(what: &str, e: obleth_redis::RedisError) -> AdminError {
+    AdminError::CacheSync(format!(
+        "{what} was deleted, but evicting it from the data-plane cache failed ({e}); \
+         it may keep resolving until the cache is reconciled with {RESYNC_ROUTE}"
+    ))
+}
+
+/// Like [`eviction_failed`] for a saved change (disable, alias removal) whose
+/// stale resolver entry could not be removed.
+fn cache_removal_failed(what: &str, e: obleth_redis::RedisError) -> AdminError {
+    AdminError::CacheSync(format!(
+        "the change was saved, but removing {what} from the data-plane cache failed ({e}); \
+         it may keep resolving until the cache is reconciled with {RESYNC_ROUTE}"
+    ))
+}
+
+/// Evict a deleted key from Redis and every gateway's in-process cache.
+async fn evict_key(
+    state: &AdminState,
+    hash: &str,
+) -> std::result::Result<(), obleth_redis::RedisError> {
+    let result = async {
+        state.redis.delete_resolved_key(hash).await?;
+        state.redis.publish_invalidation(hash).await
+    }
+    .await;
+    // Always drop the local copy: even if the publish failed, this replica
+    // must not keep serving the key from moka for the TTL backstop.
+    if let Some(tx) = &state.local_cache_tx {
+        let _ = tx.send(hash.to_string());
+    }
+    result
+}
+
+/// Evict every hash, attempting all of them before reporting the first failure.
+async fn evict_keys(state: &AdminState, hashes: &[String], what: &str) -> Result<()> {
+    let mut first_err = None;
+    for hash in hashes {
+        if let Err(e) = evict_key(state, hash).await {
+            first_err.get_or_insert(e);
+        }
+    }
+    match first_err {
+        Some(e) => Err(eviction_failed(what, e)),
+        None => Ok(()),
+    }
+}
 
 async fn push_key(state: &AdminState, hash: &str, resolved: &ResolvedKey) -> Result<()> {
     state.redis.put_resolved_key(hash, resolved).await?;
@@ -5784,11 +6374,16 @@ async fn sync_model_from(
             .iter()
             .filter(|a| !model.aliases.contains(a))
         {
-            let _ = state.redis.delete_resolved_model(stale).await;
-            let _ = state
+            state
+                .redis
+                .delete_resolved_model(stale)
+                .await
+                .map_err(|e| cache_removal_failed("a removed alias", e))?;
+            state
                 .redis
                 .publish_invalidation(&format!("model:{stale}"))
-                .await;
+                .await
+                .map_err(|e| cache_removal_failed("a removed alias", e))?;
         }
     }
     // Every name the model answers to gets its own resolver key, so the data
@@ -5798,7 +6393,11 @@ async fn sync_model_from(
         if model.enabled {
             state.redis.put_resolved_model(name, &resolved).await?;
         } else {
-            let _ = state.redis.delete_resolved_model(name).await;
+            state
+                .redis
+                .delete_resolved_model(name)
+                .await
+                .map_err(|e| cache_removal_failed("the disabled model", e))?;
         }
         state
             .redis
@@ -5821,7 +6420,11 @@ async fn sync_mcp_server(state: &AdminState, server: &McpServer) -> Result<()> {
             .put_resolved_mcp_server(&server.name, &resolved)
             .await?;
     } else {
-        let _ = state.redis.delete_resolved_mcp_server(&server.name).await;
+        state
+            .redis
+            .delete_resolved_mcp_server(&server.name)
+            .await
+            .map_err(|e| cache_removal_failed("the disabled MCP server", e))?;
     }
     state
         .redis
@@ -5951,17 +6554,21 @@ mod tests {
         /// The real `/api/v1` router, wired to the integration datastores.
         /// Returns `None` (test skips) when either is unconfigured.
         pub(super) async fn test_admin_app() -> Option<TestApp> {
-            let db_url = test_db_url()?;
             let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
+            test_admin_app_on(&redis_url).await
+        }
+
+        /// [`test_admin_app`] against an explicit Redis URL (e.g. a
+        /// restricted ACL user, to inject cache failures).
+        pub(super) async fn test_admin_app_on(redis_url: &str) -> Option<TestApp> {
+            let db_url = test_db_url()?;
 
             // Taken before the first database touch (`migrate()` runs DDL) and
             // held until the test drops its `TestApp`.
             let guard = serial().lock().await;
             let store = Store::connect(&db_url).await.expect("connect postgres");
             store.migrate().await.expect("migrate");
-            let redis = RedisStore::connect(&redis_url)
-                .await
-                .expect("connect redis");
+            let redis = RedisStore::connect(redis_url).await.expect("connect redis");
 
             let capacity = Arc::new(StaticCapacity::new(64));
             let fairshare = FairShare::start(
@@ -6037,7 +6644,9 @@ mod tests {
         }
     }
 
-    use harness::{fixture_model, send, simulate_request, test_admin_app, TEST_ADMIN_TOKEN};
+    use harness::{
+        fixture_model, send, simulate_request, test_admin_app, test_admin_app_on, TEST_ADMIN_TOKEN,
+    };
 
     /// The simulator sits behind the same bearer gate as every other write-side
     /// route: it reads the whole model fleet and every tenant's allowlist.
@@ -6445,6 +7054,204 @@ mod tests {
         assert_eq!(body["vision_enabled"], serde_json::json!(true));
     }
 
+    /// The speculation verifier receives each model's upstream key, so its
+    /// URL template is policy-checked on save: per-model Service hosts are
+    /// fine, placeholders in the credentials and blocked literal hosts are not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn put_boon_settings_validates_the_verify_url_template() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let restore = t
+            .store
+            .get_boon_settings()
+            .await
+            .expect("read boon settings")
+            .unwrap_or_default();
+        let put = |template: &str| {
+            axum::http::Request::put("/api/v1/settings/boons")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "speculation_verify_url_template": template }).to_string(),
+                ))
+                .expect("build request")
+        };
+        let mut results = Vec::new();
+        for template in [
+            "http://{upstream}.serving.svc.cluster.local:8000/v1",
+            "http://{model}@10.0.0.5:8000/v1",
+            "http://169.254.169.254/{model}/v1",
+        ] {
+            results.push((template, send(&t.app, put(template)).await));
+        }
+
+        let _ = t.store.put_boon_settings(&restore).await;
+
+        let status = |i: usize| (results[i].1).0;
+        assert_eq!(status(0), StatusCode::OK, "{:?}", results[0]);
+        assert_eq!(status(1), StatusCode::BAD_REQUEST, "{:?}", results[1]);
+        assert_eq!(status(2), StatusCode::BAD_REQUEST, "{:?}", results[2]);
+    }
+
+    /// Slurm URL policy: a disabled draft may hold a URL that doesn't resolve
+    /// yet, enabling it (or testing it) holds the URL to the SSRF policy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn slurm_url_is_validated_when_enabled_and_on_test() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let original = t
+            .store
+            .get_slurm_settings()
+            .await
+            .expect("read slurm settings")
+            .unwrap_or_default();
+        let put = |body: serde_json::Value| {
+            axum::http::Request::put("/api/v1/settings/slurm")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("build request")
+        };
+        // `.invalid` is reserved and never resolves (RFC 6761).
+        let unresolvable = "http://slurm.obleth-test.invalid:6820";
+
+        let (disabled, disabled_body) = send(
+            &t.app,
+            put(serde_json::json!({
+                "enabled": false, "slurmrestd_url": unresolvable, "slurm_user": "obleth"
+            })),
+        )
+        .await;
+        let (enabled_unresolvable, _) = send(
+            &t.app,
+            put(serde_json::json!({
+                "enabled": true, "slurmrestd_url": unresolvable, "slurm_user": "obleth"
+            })),
+        )
+        .await;
+        let (enabled_blocked, _) = send(
+            &t.app,
+            put(serde_json::json!({
+                "enabled": true, "slurmrestd_url": "http://169.254.169.254:6820",
+                "slurm_user": "obleth"
+            })),
+        )
+        .await;
+        // A blocked URL stored directly (legacy row / restore) must not be pinged.
+        let mut blocked = original.clone();
+        blocked.slurmrestd_url = "http://169.254.169.254:6820".into();
+        t.store
+            .put_slurm_settings(&blocked)
+            .await
+            .expect("seed blocked url");
+        let test_req = axum::http::Request::post("/api/v1/settings/slurm/test")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (tested, _) = send(&t.app, test_req).await;
+
+        let _ = t.store.put_slurm_settings(&original).await;
+
+        assert_eq!(disabled, StatusCode::OK, "{disabled_body}");
+        assert_eq!(enabled_unresolvable, StatusCode::BAD_REQUEST);
+        assert_eq!(enabled_blocked, StatusCode::BAD_REQUEST);
+        assert_eq!(tested, StatusCode::BAD_REQUEST);
+    }
+
+    /// A key delete whose Redis eviction fails must not report success: the
+    /// resolver entry has no TTL, so a silent failure leaves the revoked key
+    /// working. Failure is injected with a Redis ACL user denied `DEL`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn delete_key_is_a_502_when_the_eviction_fails() {
+        let Ok(redis_url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        if redis_url.contains('@') || !redis_url.starts_with("redis://") {
+            eprintln!("skipping: needs a credential-free redis:// OBLETH_TEST_REDIS_URL");
+            return;
+        }
+        let user = format!("obleth-test-nodel-{}", Uuid::new_v4().simple());
+        let client = ::redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("redis connect");
+        let _: () = ::redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg(&user)
+            .arg("on")
+            .arg("nopass")
+            .arg("~*")
+            .arg("&*")
+            .arg("+@all")
+            .arg("-del")
+            .query_async(&mut conn)
+            .await
+            .expect("create restricted ACL user");
+        let restricted = redis_url.replacen("redis://", &format!("redis://{user}:x@"), 1);
+        let Some(t) = test_admin_app_on(&restricted).await else {
+            let _: ::redis::RedisResult<()> = ::redis::cmd("ACL")
+                .arg("DELUSER")
+                .arg(&user)
+                .query_async(&mut conn)
+                .await;
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+
+        let tenant = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        let create = axum::http::Request::post(format!("/api/v1/tenants/{}/keys", tenant.id))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::from(
+                serde_json::json!({ "name": "k" }).to_string(),
+            ))
+            .expect("build request");
+        let (created_status, created) = send(&t.app, create).await;
+        let key_id = created["key"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let delete = axum::http::Request::delete(format!("/api/v1/keys/{key_id}"))
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (deleted_status, deleted) = send(&t.app, delete).await;
+
+        let _ = t.store.delete_tenant(tenant.id).await;
+        // The failed eviction left the entry behind; remove it as the admin.
+        if let Some(secret) = created["secret"].as_str() {
+            let hash = obleth_config::hash_api_key(secret);
+            let _: ::redis::RedisResult<()> = ::redis::cmd("DEL")
+                .arg(format!("obleth:key:{hash}"))
+                .query_async(&mut conn)
+                .await;
+        }
+        let _: ::redis::RedisResult<()> = ::redis::cmd("ACL")
+            .arg("DELUSER")
+            .arg(&user)
+            .query_async(&mut conn)
+            .await;
+
+        assert_eq!(created_status, StatusCode::OK, "{created}");
+        assert_eq!(deleted_status, StatusCode::BAD_GATEWAY, "{deleted}");
+        assert!(
+            deleted["error"]
+                .as_str()
+                .is_some_and(|e| e.contains(RESYNC_ROUTE)),
+            "{deleted}"
+        );
+    }
+
     /// Fairshare weight and per-model cap are set on a key at creation and
     /// edited afterwards, so both have to survive the round trip through the
     /// store and come back on the response the dashboard renders.
@@ -6687,6 +7494,66 @@ mod tests {
         );
         assert_eq!(points[1]["in_flight"], 0);
         assert!(points[1]["groups"].as_object().expect("groups").is_empty());
+    }
+
+    #[test]
+    fn cache_sync_errors_are_single_line_and_name_the_resync_route() {
+        let redis_err =
+            || obleth_redis::RedisError::from(serde_json::from_str::<u8>("x").unwrap_err());
+        for err in [
+            eviction_failed("the key", redis_err()),
+            cache_removal_failed("the disabled model", redis_err()),
+        ] {
+            let AdminError::CacheSync(msg) = err else {
+                panic!("expected CacheSync");
+            };
+            assert!(!msg.contains('\n'), "{msg:?}");
+            assert!(!msg.contains("  "), "{msg:?}");
+            assert!(msg.contains(RESYNC_ROUTE), "{msg:?}");
+        }
+    }
+
+    /// Handlers that once carried `#[utoipa::path]` (or none) without being
+    /// listed in `paths(...)`, plus the schemas their annotations reference.
+    #[test]
+    fn openapi_doc_exposes_previously_unregistered_handlers() {
+        use utoipa::OpenApi;
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize the openapi doc");
+        for (path, method) in [
+            ("/api/v1/resync", "post"),
+            ("/api/v1/replicas/{id}/restart", "post"),
+            ("/api/v1/keys/{id}/tracing", "put"),
+            ("/api/v1/tenants/{id}/tracing", "put"),
+            ("/api/v1/usage/logs/{request_id}/spans", "get"),
+            ("/api/v1/models/{id}/managed/provision-error", "patch"),
+        ] {
+            assert!(
+                doc["paths"][path][method].is_object(),
+                "{method} {path} is missing from paths(...)"
+            );
+        }
+        let schemas = &doc["components"]["schemas"];
+        for name in [
+            "ResyncReport",
+            "SetKeyTracing",
+            "ProvisionErrorBody",
+            "SpanEntry",
+        ] {
+            assert!(
+                schemas.get(name).is_some(),
+                "{name} is not registered in components(...)"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_eviction_is_a_502_naming_the_resync_route() {
+        // Any RedisError will do; a serde one is constructible without a server.
+        let cause = serde_json::from_str::<i32>("x").unwrap_err();
+        let err = eviction_failed("the key", obleth_redis::RedisError::Serde(cause));
+        assert!(err.to_string().contains(RESYNC_ROUTE), "{err}");
+        let resp = axum::response::IntoResponse::into_response(err);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
     /// A handler can carry `#[utoipa::path]` and still be missing from the
@@ -7020,6 +7887,90 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn model_route_view_redacts_api_key() {
+        let mut route = fixture_model_route("m");
+        route.api_key = Some("sk-upstream-secret".into());
+        let v = serde_json::to_value(ModelRouteView::from(route.clone())).unwrap();
+        assert_eq!(v["api_key_set"], serde_json::json!(true));
+        assert!(v.get("api_key").is_none(), "view leaked api_key: {v}");
+        assert!(!v.to_string().contains("sk-upstream-secret"));
+        assert_eq!(v["model_name"], "m");
+
+        route.api_key = None;
+        let v = serde_json::to_value(ModelRouteView::from(route.clone())).unwrap();
+        assert_eq!(v["api_key_set"], serde_json::json!(false));
+        // An empty stored key is "no key" — the proxy sends no auth for it.
+        route.api_key = Some(String::new());
+        let v = serde_json::to_value(ModelRouteView::from(route)).unwrap();
+        assert_eq!(v["api_key_set"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn model_endpoint_view_redacts_api_key() {
+        let now = chrono::Utc::now();
+        let ep = ModelEndpoint {
+            id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            name: "primary".into(),
+            api_base: "http://upstream.invalid/v1".into(),
+            api_key: Some("sk-endpoint-secret".into()),
+            priority: 0,
+            weight: 100,
+            enabled: true,
+            health_status: "unknown".into(),
+            consecutive_failures: 0,
+            alert_state: "ok".into(),
+            last_checked_at: None,
+            last_latency_ms: None,
+            last_http_status: None,
+            last_message: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let v = serde_json::to_value(ModelEndpointView::from(ep.clone())).unwrap();
+        assert_eq!(v["api_key_set"], serde_json::json!(true));
+        assert!(v.get("api_key").is_none(), "view leaked api_key: {v}");
+        assert!(!v.to_string().contains("sk-endpoint-secret"));
+        assert_eq!(v["name"], "primary");
+
+        let v = serde_json::to_value(ModelEndpointView::from(ModelEndpoint {
+            api_key: None,
+            ..ep
+        }))
+        .unwrap();
+        assert_eq!(v["api_key_set"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn mcp_server_view_redacts_auth_header() {
+        let now = chrono::Utc::now();
+        let server = McpServer {
+            id: Uuid::new_v4(),
+            name: "files".into(),
+            upstream_url: "http://mcp.invalid/mcp".into(),
+            auth_header: Some("Bearer mcp-secret".into()),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let v = serde_json::to_value(McpServerView::from(server.clone())).unwrap();
+        assert_eq!(v["auth_header_set"], serde_json::json!(true));
+        assert!(
+            v.get("auth_header").is_none(),
+            "view leaked auth_header: {v}"
+        );
+        assert!(!v.to_string().contains("mcp-secret"));
+        assert_eq!(v["name"], "files");
+
+        let v = serde_json::to_value(McpServerView::from(McpServer {
+            auth_header: None,
+            ..server
+        }))
+        .unwrap();
+        assert_eq!(v["auth_header_set"], serde_json::json!(false));
     }
 
     fn pool(model: &str, cap: usize, tenants: Vec<TenantFairshareView>) -> ModelPoolView {

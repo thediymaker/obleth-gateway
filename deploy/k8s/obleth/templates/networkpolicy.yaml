@@ -1,9 +1,17 @@
 {{- if .Values.networkPolicy.enabled }}
 {{- /*
-Restrict the BUNDLED datastore pods so only the obleth data plane may reach
-their ports. Has no effect on external datastores (those run outside the
-cluster / namespace). Requires a CNI that enforces NetworkPolicy (Calico,
-Cilium, etc.); on CNIs without enforcement these objects are inert.
+Ingress restrictions for the bundled datastores and the obleth pods. Requires a
+CNI that enforces NetworkPolicy (Calico, Cilium, etc.); on CNIs without
+enforcement these objects are inert. The datastore policies have no effect on
+external datastores (those run outside the cluster / namespace).
+
+Who connects to what (from the env each workload is given):
+  postgres   <- obleth data plane (OBLETH_DATABASE_URL), control-plane (DATABASE_URL, auth tables)
+  redis      <- obleth data plane only (OBLETH_REDIS_URL)
+  clickhouse <- obleth data plane only (OBLETH_CLICKHOUSE_URL)
+  obleth:9180 (Management API) <- control-plane, provisioner
+  obleth:8080 (data plane)     <- any client / ingress controller
+  obleth:9091 (metrics)        <- left open for a Prometheus in any namespace
 */}}
 {{- if .Values.postgres.enabled }}
 apiVersion: networking.k8s.io/v1
@@ -21,6 +29,10 @@ spec:
             matchLabels:
               app.kubernetes.io/name: obleth
               app.kubernetes.io/instance: {{ .Release.Name }}
+        {{- if .Values.controlPlane.enabled }}
+        - podSelector:
+            matchLabels: { app: {{ .Release.Name }}-control-plane }
+        {{- end }}
       ports:
         - { protocol: TCP, port: 5432 }
 ---
@@ -64,5 +76,38 @@ spec:
       ports:
         - { protocol: TCP, port: 8123 }
         - { protocol: TCP, port: 9000 }
+---
 {{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "obleth.fullname" . }}
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: obleth
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  policyTypes: [Ingress]
+  ingress:
+    # Data plane: open to clients and ingress controllers.
+    - ports:
+        - { protocol: TCP, port: 8080 }
+    # Metrics: left open so a Prometheus in another namespace can scrape it.
+    - ports:
+        - { protocol: TCP, port: 9091 }
+    # Management API: only the dashboard and the provisioner hold the admin token.
+    {{- if or .Values.controlPlane.enabled .Values.provisioner.enabled }}
+    - from:
+        {{- if .Values.controlPlane.enabled }}
+        - podSelector:
+            matchLabels: { app: {{ .Release.Name }}-control-plane }
+        {{- end }}
+        {{- if .Values.provisioner.enabled }}
+        - podSelector:
+            matchLabels: { app: {{ .Release.Name }}-provisioner }
+        {{- end }}
+      ports:
+        - { protocol: TCP, port: 9180 }
+    {{- end }}
 {{- end }}

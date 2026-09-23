@@ -22,6 +22,7 @@ name: obleth
 services:
   postgres:
     image: postgres:16
+    restart: unless-stopped
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-obleth}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/docker/.env (copy from .env.example)}
@@ -36,17 +37,23 @@ services:
 
   redis:
     image: redis:7
-    command: ["redis-server", "--appendonly", "yes"]
+    restart: unless-stopped
+    # AUTH is always on: the request path reads API keys from Redis, so an
+    # unauthenticated instance would let anyone who reaches it mint keys.
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/docker/.env (copy from .env.example)}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/docker/.env}
     ports: ["127.0.0.1:6379:6379"]
     volumes: ["redisdata:/data"]
     healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" --no-auth-warning ping | grep -q PONG"]
       interval: 3s
       timeout: 3s
       retries: 20
 
   clickhouse:
     image: clickhouse/clickhouse-server:24.8
+    restart: unless-stopped
     environment:
       # the image restricts the built-in `default` user to localhost; provision a
       # network-accessible user instead.
@@ -91,12 +98,13 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/obleth.Dockerfile
+    restart: unless-stopped
     environment:
       OBLETH_PROXY_LISTEN: 0.0.0.0:8080
       OBLETH_ADMIN_LISTEN: 0.0.0.0:9180
       OBLETH_METRICS_LISTEN: 0.0.0.0:9091
       OBLETH_DATABASE_URL: postgres://${POSTGRES_USER:-obleth}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/docker/.env}@postgres:5432/${POSTGRES_DB:-obleth}
-      OBLETH_REDIS_URL: redis://redis:6379
+      OBLETH_REDIS_URL: redis://:${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/docker/.env}@redis:6379
       OBLETH_CLICKHOUSE_URL: http://clickhouse:8123
       OBLETH_CLICKHOUSE_DB: ${CLICKHOUSE_DB:-obleth}
       OBLETH_CLICKHOUSE_USER: ${CLICKHOUSE_USER:-obleth}
@@ -123,10 +131,10 @@ services:
       OBLETH_FAIRSHARE_HISTORY_SECS: "3600"
       OBLETH_FAIRSHARE_ALGORITHM: hierarchical
       OBLETH_FAIL_OPEN: "true"
-      # Fail-open telemetry WAL. The default (./obleth-telemetry.wal) is relative
-      # to the container CWD (/), which the non-root runtime user (uid 10001)
-      # cannot write — so a ClickHouse outage would drop records instead of
-      # spilling them. Point it at a writable path so WAL spill + replay work.
+      # Fail-open telemetry WAL: usage batches spill here while ClickHouse is
+      # unreachable and replay on recovery. Must be writable by the non-root
+      # runtime user (uid 10001); the image's working directory
+      # (/var/lib/obleth) and /tmp both are.
       OBLETH_WAL_PATH: ${OBLETH_WAL_PATH:-/tmp/obleth-telemetry.wal}
       OBLETH_MODEL_HEALTH_ENABLED: ${OBLETH_MODEL_HEALTH_ENABLED:-true}
       OBLETH_MODEL_HEALTH_INTERVAL_SECS: ${OBLETH_MODEL_HEALTH_INTERVAL_SECS:-900}
@@ -182,6 +190,7 @@ services:
         COMPRESSOR_SOURCE: ${COMPRESSOR_SOURCE:-onnx}
         MODEL_ID: ${COMPRESSOR_MODEL_ID:-chopratejas/kompress-v2-base}
         ONNX_FILE: ${COMPRESSOR_ONNX_FILE:-onnx/kompress-fp32.onnx}
+    restart: unless-stopped
     # The scorer is CPU-hungry: onnxruntime saturates every core it is allowed on
     # each inference, and throughput is core-bound. This compose stack is meant for
     # dev/testing, so cap it to a small, sane slice — a hard CPU quota AND the
@@ -217,6 +226,7 @@ services:
     build:
       context: ../..
       dockerfile: deploy/docker/obleth-provisioner.Dockerfile
+    restart: unless-stopped
     environment:
       OBLETH_ADMIN_BASE_URL: http://obleth:9180
       OBLETH_ADMIN_TOKEN: ${OBLETH_ADMIN_TOKEN:?set OBLETH_ADMIN_TOKEN in deploy/docker/.env}
@@ -235,6 +245,7 @@ services:
     build:
       context: ../../control-plane
       dockerfile: ../deploy/docker/control-plane.Dockerfile
+    restart: unless-stopped
     environment:
       # Next.js standalone (`node server.js`) binds to $HOSTNAME, which Docker
       # sets to the container ID -> it would listen only on the container's eth0
@@ -342,6 +353,7 @@ services:
     image: oliver006/redis_exporter:latest
     environment:
       REDIS_ADDR: redis://redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in deploy/docker/.env}
     # Scraped in-network by Prometheus on :9121; no host port needed.
     expose: ["9121"]
     depends_on:

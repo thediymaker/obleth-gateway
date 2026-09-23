@@ -116,7 +116,8 @@ export interface ModelRoute {
   description: string;
   upstream_model: string;
   api_base: string;
-  api_key: string | null;
+  /** Whether an upstream key is stored. The key itself is write-only and never returned. */
+  api_key_set: boolean;
   model_type: string;
   /**
    * Weight/activation format this deployment serves, from the gateway's fixed
@@ -171,12 +172,21 @@ export interface ModelRoute {
   updated_at: string;
 }
 
+/**
+ * Model fields accepted by create/update. `api_key` is write-only: omit it to
+ * keep the stored key; responses only report `api_key_set`.
+ */
+export type ModelWriteFields = Partial<Omit<ModelRoute, "api_key_set">> & {
+  api_key?: string | null;
+};
+
 export interface ModelEndpoint {
   id: string;
   model_id: string;
   name: string;
   api_base: string;
-  api_key: string | null;
+  /** Whether an endpoint key is stored. The key itself is write-only and never returned. */
+  api_key_set: boolean;
   priority: number;
   weight: number;
   enabled: boolean;
@@ -386,7 +396,8 @@ export interface McpServer {
   id: string;
   name: string;
   upstream_url: string;
-  auth_header: string | null;
+  /** Whether an upstream Authorization header is stored. The value itself is write-only and never returned. */
+  auth_header_set: boolean;
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -1622,7 +1633,7 @@ export const obleth = {
       next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.models] },
     }),
   createModel: (
-    body: Partial<ModelRoute> & {
+    body: ModelWriteFields & {
       model_name: string;
       upstream_model: string;
       api_base: string;
@@ -1636,7 +1647,7 @@ export const obleth = {
     }),
   updateModel: (
     id: string,
-    body: Partial<ModelRoute> & { upstream_model: string; api_base: string },
+    body: ModelWriteFields & { upstream_model: string; api_base: string },
     options?: AuditOptions,
   ) =>
     api<ModelRoute>(`/models/${id}`, {

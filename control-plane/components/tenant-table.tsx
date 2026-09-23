@@ -116,6 +116,7 @@ export function TenantTable({ tenants, models }: { tenants: Tenant[]; models: st
   const [expandedId, setExpandedId] = useState<string | null>(null);
   const [pending, start] = useTransition();
   const [createOpen, setCreateOpen] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const [saveFlash, setSaveFlash] = useState<{ id: string; n: number } | null>(null);
   const flashSaved = (id: string) =>
     setSaveFlash((prev) => ({ id, n: prev?.id === id ? prev.n + 1 : 1 }));
@@ -154,6 +155,16 @@ export function TenantTable({ tenants, models }: { tenants: Tenant[]; models: st
           </Button>
         </CardHeader>
         <CardContent className="p-0">
+          {deleteError && (
+            <div className="px-6 py-3">
+              <div className="flex items-start justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                <span>Delete failed: {deleteError}</span>
+                <button type="button" onClick={() => setDeleteError(null)} className="shrink-0 text-xs underline opacity-80 hover:opacity-100">
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
           <div className="text-sm">
             <div className="grid border-b border-border text-left text-xs text-muted-foreground md:grid-cols-[minmax(0,1.35fr)_minmax(10rem,0.45fr)_minmax(0,1fr)_auto]">
               <div className="px-6 py-3 font-medium">Tenant</div>
@@ -260,6 +271,7 @@ export function TenantTable({ tenants, models }: { tenants: Tenant[]; models: st
                             tenantCount={tenants.length}
                             pending={pending}
                             start={start}
+                            onDeleteError={setDeleteError}
                           />
                         </SaveFlashContext.Provider>
                       </div>
@@ -381,6 +393,7 @@ function TenantDetailPanel({
   tenantCount,
   pending,
   start,
+  onDeleteError,
 }: {
   tenant: Tenant;
   models: string[];
@@ -388,6 +401,7 @@ function TenantDetailPanel({
   tenantCount: number;
   pending: boolean;
   start: (cb: () => void) => void;
+  onDeleteError: (error: string | null) => void;
 }) {
   const flashSaved = useContext(SaveFlashContext);
   const { confirm, confirmElement } = useConfirm();
@@ -405,7 +419,11 @@ function TenantDetailPanel({
       description: `Permanently delete tenant "${tenant.name}"? This removes all of its API keys and cannot be undone. Usage history is retained.`,
     });
     if (!ok) return;
-    start(() => deleteTenantAction(tenant.id));
+    onDeleteError(null);
+    start(async () => {
+      const result = await deleteTenantAction(tenant.id);
+      if (!result.ok) onDeleteError(result.error);
+    });
   }
 
   return (

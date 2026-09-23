@@ -1,3 +1,4 @@
+import { requireAdmin } from "@/lib/auth/roles";
 import { FairshareDashboard } from "@/components/fairshare-dashboard";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
@@ -5,6 +6,7 @@ import { safe } from "@/lib/safe";
 export const dynamic = "force-dynamic";
 
 export default async function FairsharePage() {
+  await requireAdmin();
   // Only tenant metadata is loaded here (bounded - hundreds, not the full key
   // fleet). Key/usage data is fetched client-side via top-N limited endpoints
   // so the page stays fast even with 100k+ keys.

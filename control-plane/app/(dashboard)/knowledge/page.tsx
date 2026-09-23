@@ -1,3 +1,4 @@
+import { requireAdmin } from "@/lib/auth/roles";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 import { CollectionList } from "@/components/knowledge/collection-list";
@@ -5,6 +6,7 @@ import { CollectionList } from "@/components/knowledge/collection-list";
 export const dynamic = "force-dynamic";
 
 export default async function KnowledgePage() {
+  await requireAdmin();
   const [collections, models, settings] = await Promise.all([
     safe(obleth.listCollections(), []),
     safe(obleth.listModels(), []),

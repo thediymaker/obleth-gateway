@@ -276,7 +276,7 @@ pub(super) struct LossyStats {
 pub(super) async fn apply_lossy(
     state: &AppState,
     cfg: &CompressionBoonSettings,
-    _key: &ResolvedKey,
+    key: &ResolvedKey,
     _session_id: &str,
     json: &mut Value,
 ) -> LossyStats {
@@ -384,7 +384,7 @@ pub(super) async fn apply_lossy(
         // Best-effort stash for the retrieve_original bonus; never fail on Redis error.
         let _ = state
             .redis
-            .compress_put(&hash, &original, cfg.original_ttl_secs)
+            .compress_put(&key.tenant_id, &hash, &original, cfg.original_ttl_secs)
             .await;
         if set_segment_text(json, mi, pi, marker) {
             stats.refs_created += 1;
@@ -485,7 +485,7 @@ pub(super) struct DedupStats {
 pub(super) async fn apply_dedup(
     state: &AppState,
     cfg: &CompressionBoonSettings,
-    _key: &ResolvedKey,
+    key: &ResolvedKey,
     _session_id: &str,
     json: &mut Value,
 ) -> DedupStats {
@@ -495,7 +495,7 @@ pub(super) async fn apply_dedup(
     for (hash, original) in stash {
         let _ = state
             .redis
-            .compress_put(&hash, &original, cfg.original_ttl_secs)
+            .compress_put(&key.tenant_id, &hash, &original, cfg.original_ttl_secs)
             .await;
     }
     stats
@@ -594,7 +594,7 @@ pub(super) struct LogStats {
 pub(super) async fn apply_log_compaction(
     state: &AppState,
     cfg: &CompressionBoonSettings,
-    _key: &ResolvedKey,
+    key: &ResolvedKey,
     _session_id: &str,
     json: &mut Value,
 ) -> LogStats {
@@ -602,7 +602,7 @@ pub(super) async fn apply_log_compaction(
     for (hash, original) in stash {
         let _ = state
             .redis
-            .compress_put(&hash, &original, cfg.original_ttl_secs)
+            .compress_put(&key.tenant_id, &hash, &original, cfg.original_ttl_secs)
             .await;
     }
     stats

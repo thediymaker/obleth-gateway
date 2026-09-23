@@ -20,6 +20,10 @@ pub enum AdminError {
     Click(#[from] clickhouse::error::Error),
     #[error("{0}")]
     Internal(String),
+    /// Postgres was written but the Redis resolver cache could not be updated
+    /// (502: the durable change stands; the data plane has not seen it yet).
+    #[error("{0}")]
+    CacheSync(String),
 }
 
 impl From<crate::ssrf::SsrfError> for AdminError {
@@ -37,6 +41,7 @@ impl IntoResponse for AdminError {
             AdminError::Store(obleth_store::StoreError::Conflict(_)) => StatusCode::CONFLICT,
             AdminError::Store(obleth_store::StoreError::Protected(_)) => StatusCode::FORBIDDEN,
             AdminError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            AdminError::CacheSync(_) => StatusCode::BAD_GATEWAY,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         };
         let body = Json(serde_json::json!({ "error": self.to_string() }));

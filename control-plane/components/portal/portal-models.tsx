@@ -15,15 +15,18 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { CodeBlock, CopyButton } from "@/components/portal/copy-button";
-import type { ModelRoute, Tenant } from "@/lib/obleth";
+import type { PortalModelSummary } from "@/components/portal/portal-model-summary";
+import type { Tenant } from "@/lib/obleth";
 import { formatNumber, parseTagLevel, tagsInclude } from "@/lib/utils";
+
+export type { PortalModelSummary };
 
 export function PortalModels({
   models,
   tenant,
   gatewayBase,
 }: {
-  models: ModelRoute[];
+  models: PortalModelSummary[];
   tenant: Tenant | null;
   gatewayBase: string;
 }) {
@@ -89,10 +92,9 @@ export function PortalModels({
             </div>
           ) : (
             <div className="text-sm">
-              <div className="grid border-b border-border text-left text-xs text-muted-foreground md:grid-cols-[minmax(0,1.25fr)_minmax(0,1fr)_minmax(0,1fr)_auto]">
+              <div className="grid border-b border-border text-left text-xs text-muted-foreground md:grid-cols-[minmax(0,1.25fr)_minmax(0,1fr)_auto]">
                 <div className="px-6 py-3 font-medium">Model</div>
                 <div className="hidden px-3 py-3 font-medium md:block">Capabilities</div>
-                <div className="hidden px-3 py-3 font-medium md:block">Route</div>
                 <div className="hidden px-3 py-3 font-medium md:block" />
               </div>
               <div className="space-y-3 px-4 py-4">
@@ -108,11 +110,11 @@ export function PortalModels({
   );
 }
 
-function ModelRow({ model }: { model: ModelRoute }) {
+function ModelRow({ model }: { model: PortalModelSummary }) {
   const capabilities = capabilityList(model);
   return (
     <div className="group relative overflow-hidden rounded-lg border border-border/70 bg-card/35 shadow-sm transition-colors hover:border-border hover:bg-muted/15">
-      <div className="grid min-w-0 md:grid-cols-[minmax(0,1.25fr)_minmax(0,1fr)_minmax(0,1fr)_auto] md:items-center">
+      <div className="grid min-w-0 md:grid-cols-[minmax(0,1.25fr)_minmax(0,1fr)_auto] md:items-center">
         <div className="min-w-0 px-5 py-4 md:pr-5">
           <div className="flex min-w-0 items-start gap-3">
             <span className="mt-0.5 flex h-9 w-9 shrink-0 items-center justify-center rounded-md border border-border/70 bg-background/40 text-muted-foreground">
@@ -151,15 +153,6 @@ function ModelRow({ model }: { model: ModelRoute }) {
           </div>
         </div>
 
-        <div className="min-w-0 px-5 pb-4 md:px-3 md:py-4">
-          <p className="truncate font-mono text-xs text-muted-foreground" title={model.upstream_model}>
-            {model.upstream_model}
-          </p>
-          <p className="mt-0.5 truncate font-mono text-[11px] text-muted-foreground/70" title={model.api_base}>
-            {middleTruncate(model.api_base, 52)}
-          </p>
-        </div>
-
         <div className="flex items-center px-5 pb-4 md:justify-end md:px-4 md:py-4">
           <CopyButton value={model.model_name} label="Copy" variant="outline" />
         </div>
@@ -172,7 +165,7 @@ function ModelBadges({
   model,
   capabilities,
 }: {
-  model: ModelRoute;
+  model: PortalModelSummary;
   capabilities: string[];
 }) {
   return (
@@ -264,7 +257,7 @@ function buildSnippets(gatewayBase: string, modelName: string) {
   };
 }
 
-function capabilityList(model: ModelRoute): string[] {
+function capabilityList(model: PortalModelSummary): string[] {
   return [
     model.supports_function_calling && "functions",
     model.supports_system_messages && "system",
@@ -279,12 +272,4 @@ function formatContext(value: number) {
   if (value >= 1_000_000) return `${Math.round(value / 1_000_000)}M`;
   if (value >= 1_000) return `${Math.round(value / 1_000)}K`;
   return String(value);
-}
-
-function middleTruncate(value: string, maxLength = 48): string {
-  const trimmed = value.trim();
-  if (trimmed.length <= maxLength) return trimmed;
-  const head = Math.ceil((maxLength - 3) / 2);
-  const tail = Math.floor((maxLength - 3) / 2);
-  return `${trimmed.slice(0, head)}...${trimmed.slice(-tail)}`;
 }

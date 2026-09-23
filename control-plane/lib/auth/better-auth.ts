@@ -1,4 +1,4 @@
-import { betterAuth } from "better-auth";
+import { betterAuth, type BetterAuthOptions } from "better-auth";
 import { admin, genericOAuth } from "better-auth/plugins";
 import { getDb } from "@/lib/db";
 import { oidcProviders } from "@/lib/auth/providers";
@@ -45,14 +45,22 @@ function trustedOrigins(): string[] {
  *
  * A `pg.Pool` does not connect on construction, so `getDb()` here only risks its
  * explicit "DATABASE_URL unset" guard, not actual DB connectivity.
+ *
+ * Exported with injectable storage so tests can run the real configuration
+ * (hooks, plugins, sign-up policy) against an in-memory adapter.
  */
-function createAuth() {
+export function createAuth(
+  database: BetterAuthOptions["database"] = getDb(),
+  authSecret: string = secret(),
+) {
   return betterAuth({
-    database: getDb(),
-    secret: secret(),
+    database,
+    secret: authSecret,
     baseURL: process.env.BETTER_AUTH_URL ?? "http://localhost:3000",
     trustedOrigins: trustedOrigins(),
-    emailAndPassword: { enabled: true },
+    // Accounts come from OIDC or the seeded break-glass admin; an open
+    // email sign-up endpoint would let anyone mint a (pending) account.
+    emailAndPassword: { enabled: true, disableSignUp: true },
     hooks: { before: requireActiveAccountForAdminApi },
     user: {
       additionalFields: {

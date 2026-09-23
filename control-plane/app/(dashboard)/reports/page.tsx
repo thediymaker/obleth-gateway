@@ -1,3 +1,4 @@
+import { requireAdmin } from "@/lib/auth/roles";
 import { ReportsDashboard } from "@/components/reports-dashboard";
 import { obleth } from "@/lib/obleth";
 import type { ApiKey, Tenant } from "@/lib/obleth";
@@ -6,6 +7,7 @@ import { safe } from "@/lib/safe";
 export const dynamic = "force-dynamic";
 
 export default async function ReportsPage() {
+  await requireAdmin();
   const [tenants, keys] = await Promise.all([
     safe(obleth.listTenants(), [] as Tenant[]),
     safe(obleth.listKeys(), [] as ApiKey[]),

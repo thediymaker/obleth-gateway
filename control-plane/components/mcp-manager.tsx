@@ -20,6 +20,7 @@ import { McpStatusPill, McpTestRowDetails } from "@/components/charo/results/mcp
 export function McpManager({ servers }: { servers: McpServer[] }) {
   const [pending, start] = useTransition();
   const [createError, setCreateError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const createFormRef = useRef<HTMLFormElement>(null);
   const { confirm, confirmElement } = useConfirm();
 
@@ -54,7 +55,11 @@ export function McpManager({ servers }: { servers: McpServer[] }) {
       confirmLabel: "Remove",
     });
     if (!ok) return;
-    start(() => deleteMcpServerAction(server.id));
+    setDeleteError(null);
+    start(async () => {
+      const result = await deleteMcpServerAction(server.id);
+      if (!result.ok) setDeleteError(result.error);
+    });
   }
 
   function submitServer(formData: FormData) {
@@ -74,6 +79,14 @@ export function McpManager({ servers }: { servers: McpServer[] }) {
   return (
     <div className="space-y-6">
       {confirmElement}
+      {deleteError && (
+        <div className="flex items-start justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <span>Delete failed: {deleteError}</span>
+          <button type="button" onClick={() => setDeleteError(null)} className="shrink-0 text-xs underline opacity-80 hover:opacity-100">
+            Dismiss
+          </button>
+        </div>
+      )}
       <Card>
         <CardHeader>
           <CardTitle>Register MCP server</CardTitle>
@@ -150,7 +163,7 @@ export function McpManager({ servers }: { servers: McpServer[] }) {
                         {s.upstream_url}
                       </td>
                       <td className="px-3 py-3 text-xs text-muted-foreground">
-                        {s.auth_header ? "set" : "none"}
+                        {s.auth_header_set ? "set" : "none"}
                       </td>
                       <td className="px-3 py-3">
                         <button

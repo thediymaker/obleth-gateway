@@ -14,6 +14,7 @@
 #     --set obleth.adminToken="$(openssl rand -hex 32)" \
 #     --set obleth.encryptionKey="$(openssl rand -base64 32)" \
 #     --set postgres.password="$(openssl rand -hex 16)" \
+#     --set redis.password="$(openssl rand -hex 32)" \
 #     --set clickhouse.password="$(openssl rand -hex 16)" \
 #     --set controlPlane.dashboardPassword="$(openssl rand -hex 16)" \
 #     --set controlPlane.dashboardSessionSecret="$(openssl rand -hex 32)"

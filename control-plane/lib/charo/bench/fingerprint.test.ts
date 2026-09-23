@@ -4,7 +4,7 @@ import type { ModelRoute, ModelEndpoint } from "@/lib/obleth";
 
 const model = (over: Partial<ModelRoute> = {}): ModelRoute => ({
   id: "u", model_name: "m", description: "", upstream_model: "up", api_base: "http://a",
-  api_key: null, model_type: "chat", quantization: "unknown", aliases: [],
+  api_key_set: false, model_type: "chat", quantization: "unknown", aliases: [],
   input_cost_per_token: 0, output_cost_per_token: 0,
   cost_per_image: 0, cost_per_audio_second: 0, cost_per_character: 0, energy_slots_per_node: 1,
   route_bias: 1,
@@ -21,7 +21,7 @@ const model = (over: Partial<ModelRoute> = {}): ModelRoute => ({
   ...over,
 });
 const ep = (over: Partial<ModelEndpoint> = {}): ModelEndpoint => ({
-  id: "e", model_id: "u", name: "e1", api_base: "http://a", api_key: null, priority: 0, weight: 1,
+  id: "e", model_id: "u", name: "e1", api_base: "http://a", api_key_set: false, priority: 0, weight: 1,
   enabled: true, health_status: "healthy", consecutive_failures: 0, alert_state: "ok",
   last_checked_at: null, last_latency_ms: null, last_http_status: null, last_message: null,
   created_at: "", updated_at: "", ...over,

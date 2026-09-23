@@ -1,3 +1,4 @@
+import { requireAdmin } from "@/lib/auth/roles";
 import { McpManager } from "@/components/mcp-manager";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
@@ -5,6 +6,7 @@ import { safe } from "@/lib/safe";
 export const dynamic = "force-dynamic";
 
 export default async function McpPage() {
+  await requireAdmin();
   const servers = await safe(obleth.listMcpServers(), []);
 
   return (

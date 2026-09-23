@@ -57,9 +57,13 @@ export async function disablePortalKey(
   if (!(await assertOwnedKey(user.tenantId, id))) {
     return { ok: false, error: "Key not found" };
   }
-  const disabled = String(formData.get("disabled")) === "true";
+  // Disable-only: re-enabling would let a tenant undo an administrator's
+  // revocation, so that stays an admin decision.
+  if (String(formData.get("disabled")) !== "true") {
+    return { ok: false, error: "Contact an administrator to re-enable a key" };
+  }
   try {
-    await obleth.setKeyDisabled(id, disabled, { auditActor: user.email });
+    await obleth.setKeyDisabled(id, true, { auditActor: user.email });
     revalidatePath("/portal/keys");
     return { ok: true };
   } catch (e) {

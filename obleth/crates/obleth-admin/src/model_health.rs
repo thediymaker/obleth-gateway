@@ -315,7 +315,7 @@ pub async fn validate_model(
             warnings,
         }));
     }
-    state.ssrf.validate(&body.api_base)?;
+    state.ssrf.validate(&body.api_base).await?;
 
     match fetch_catalog_direct(&state, &body.api_base, body.api_key.as_deref()).await {
         Ok(catalog) => match catalog.as_ref() {

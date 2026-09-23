@@ -286,6 +286,7 @@ export function ModelManager({
   const [importPreview, setImportPreview] = useState<ModelImportReport | null>(null);
   const [importText, setImportText] = useState<string>("");
   const [importError, setImportError] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const healthByModel = useMemo(() => new Map(health.map((row) => [row.model_id, row])), [health]);
   const benchmarkRouteCount = models.filter(isBenchmarkRoute).length;
   const visibleModels = showBenchmarkRoutes ? models : models.filter((model) => !isBenchmarkRoute(model));
@@ -297,7 +298,11 @@ export function ModelManager({
       confirmLabel: "Remove",
     });
     if (!ok) return;
-    start(() => deleteModelAction(model.id));
+    setDeleteError(null);
+    start(async () => {
+      const result = await deleteModelAction(model.id);
+      if (!result.ok) setDeleteError(result.error);
+    });
   }
 
   // Exported by the gateway rather than assembled from the models already on
@@ -486,6 +491,16 @@ export function ModelManager({
           </div>
         </CardHeader>
         <CardContent className="p-0">
+          {deleteError && (
+            <div className="px-6 pt-4">
+              <div className="flex items-start justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                <span>Delete failed: {deleteError}</span>
+                <button type="button" onClick={() => setDeleteError(null)} className="shrink-0 text-xs underline opacity-80 hover:opacity-100">
+                  Dismiss
+                </button>
+              </div>
+            </div>
+          )}
           {importError && (
             <div className="px-6 pt-4">
               <div className="flex items-start justify-between gap-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
@@ -1499,7 +1514,12 @@ function ConnectionTab({
             <FormSection title="Upstream" columns={1}>
               <Field label="Upstream model" name="upstream_model" defaultValue={model.upstream_model} required />
               <Field label="API base URL" name="api_base" defaultValue={model.api_base} required />
-              <Field label="Upstream API key" name="api_key" placeholder="Leave blank to keep current" />
+              <Field
+                label="Upstream API key"
+                name="api_key"
+                placeholder="Leave blank to keep current"
+                hint={model.api_key_set ? "Key set" : "No key"}
+              />
               <SelectField
                 label="Model type"
                 name="model_type"

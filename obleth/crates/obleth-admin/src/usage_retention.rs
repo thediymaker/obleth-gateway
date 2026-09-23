@@ -17,6 +17,9 @@ use crate::{usage, AdminState};
 
 /// Floor so a misconfigured/zero value can never wipe the whole ledger.
 const MIN_RETENTION_DAYS: i64 = 1;
+/// Ceiling (100 years): far beyond any real window, and small enough that
+/// `now - days` can never overflow chrono and panic the worker.
+pub(crate) const MAX_RETENTION_DAYS: i64 = 36_500;
 /// How often the worker re-evaluates the retention window.
 const CLEANUP_INTERVAL_SECS: u64 = 3_600;
 
@@ -30,7 +33,9 @@ pub struct CompactResult {
 }
 
 /// Effective retention in days: the persisted setting if present, else the
-/// environment default carried on [`AdminState`]. Always clamped to the floor.
+/// environment default carried on [`AdminState`]. Always clamped to
+/// `MIN_RETENTION_DAYS..=MAX_RETENTION_DAYS`, so a bad stored value (older
+/// writes, a restored backup) cannot wipe the ledger or panic the worker.
 async fn effective_retention_days(state: &AdminState) -> i64 {
     let days = match state.store.get_usage_retention_settings().await {
         Ok(Some(settings)) => settings.days,
@@ -40,7 +45,11 @@ async fn effective_retention_days(state: &AdminState) -> i64 {
             state.usage_retention_default_days
         }
     };
-    days.max(MIN_RETENTION_DAYS)
+    clamp_retention_days(days)
+}
+
+fn clamp_retention_days(days: i64) -> i64 {
+    days.clamp(MIN_RETENTION_DAYS, MAX_RETENTION_DAYS)
 }
 
 /// Drop every `usage` day-partition older than the retention window. Safe to
@@ -93,4 +102,19 @@ pub fn spawn_worker(state: AdminState) {
             tokio::time::sleep(Duration::from_secs(CLEANUP_INTERVAL_SECS)).await;
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retention_is_clamped_to_a_cutoff_chrono_can_compute() {
+        assert_eq!(clamp_retention_days(0), MIN_RETENTION_DAYS);
+        assert_eq!(clamp_retention_days(-5), MIN_RETENTION_DAYS);
+        assert_eq!(clamp_retention_days(180), 180);
+        assert_eq!(clamp_retention_days(i64::MAX), MAX_RETENTION_DAYS);
+        // The ceiling itself must not panic when turned into a cutoff date.
+        let _ = (Utc::now() - ChronoDuration::days(clamp_retention_days(i64::MAX))).date_naive();
+    }
 }

@@ -267,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
                     "{}/.well-known/openid-configuration",
                     i.issuer.trim_end_matches('/')
                 );
-                if let Err(e) = ssrf.validate(&url) {
+                if let Err(e) = ssrf.validate(&url).await {
                     anyhow::bail!(
                         "OBLETH_JWT_ISSUERS: issuer {} rejected by destination policy: {e}",
                         i.issuer
@@ -291,7 +291,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
             let jwks_url = i.jwks_url.as_deref().expect("resolved above");
-            if let Err(e) = ssrf.validate(jwks_url) {
+            if let Err(e) = ssrf.validate(jwks_url).await {
                 anyhow::bail!(
                     "OBLETH_JWT_ISSUERS: jwks_url {jwks_url} rejected by destination policy: {e}"
                 );

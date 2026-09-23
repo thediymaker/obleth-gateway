@@ -535,15 +535,7 @@ pub async fn query_usage(
                  sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
                  from usage where ts_ms >= ?",
             );
-            if q.tenant_id.is_some() {
-                sql.push_str(" and tenant_id = toUUID(?)");
-            }
-            if q.key_id.is_some() {
-                sql.push_str(" and key_id = toUUID(?)");
-            }
-            if q.model.is_some() {
-                sql.push_str(" and model = ?");
-            }
+            sql.push_str(&usage_filter_sql(&q));
             sql.push_str(&internal_filter(q.include_internal));
             sql.push_str(" group by tenant_id");
             bind_usage_filters(client.query(&sql).bind(since), &q)
@@ -558,6 +550,12 @@ pub async fn query_usage_by_key(
     q: UsageQuery,
 ) -> Result<Vec<UsageKeyAgg>, clickhouse::error::Error> {
     let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    bind_usage_filters(client.query(&usage_by_key_sql(&q)).bind(since), &q)
+        .fetch_all::<UsageKeyAgg>()
+        .await
+}
+
+fn usage_by_key_sql(q: &UsageQuery) -> String {
     let mut sql = String::from(
         "select key_id, tenant_id, count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
@@ -565,20 +563,13 @@ pub async fn query_usage_by_key(
          sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
          from usage where ts_ms >= ?",
     );
-    if q.tenant_id.is_some() {
-        sql.push_str(" and tenant_id = toUUID(?)");
-    }
-    if q.key_id.is_some() {
-        sql.push_str(" and key_id = toUUID(?)");
-    }
+    sql.push_str(&usage_filter_sql(q));
     sql.push_str(&internal_filter(q.include_internal));
     sql.push_str(" group by key_id, tenant_id order by total_tok desc");
     if let Some(limit) = q.limit {
         sql.push_str(&format!(" limit {}", limit.min(10_000)));
     }
-    bind_usage_filters(client.query(&sql).bind(since), &q)
-        .fetch_all::<UsageKeyAgg>()
-        .await
+    sql
 }
 
 /// Filters for the per-key usage summary feeds (`/keys/{id}/usage` and
@@ -767,6 +758,12 @@ pub async fn query_usage_by_model(
     q: UsageQuery,
 ) -> Result<Vec<UsageModelAgg>, clickhouse::error::Error> {
     let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    bind_usage_filters(client.query(&usage_by_model_sql(&q)).bind(since), &q)
+        .fetch_all::<UsageModelAgg>()
+        .await
+}
+
+fn usage_by_model_sql(q: &UsageQuery) -> String {
     let mut sql = String::from(
         "select model, count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
@@ -786,17 +783,10 @@ pub async fn query_usage_by_model(
          sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
          from usage where ts_ms >= ?",
     );
-    if q.tenant_id.is_some() {
-        sql.push_str(" and tenant_id = toUUID(?)");
-    }
-    if q.model.is_some() {
-        sql.push_str(" and model = ?");
-    }
+    sql.push_str(&usage_filter_sql(q));
     sql.push_str(&internal_filter(q.include_internal));
     sql.push_str(" group by model order by total_tok desc");
-    bind_usage_filters(client.query(&sql).bind(since), &q)
-        .fetch_all::<UsageModelAgg>()
-        .await
+    sql
 }
 
 pub async fn query_usage_series(
@@ -1159,6 +1149,24 @@ fn today_day() -> String {
     chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
+/// The `where` fragment for the optional [`UsageQuery`] filters. Paired with
+/// [`bind_usage_filters`]: both walk tenant → key → model in the same order, so
+/// every query that uses one must use the other or the placeholder and bind
+/// counts diverge (ClickHouse rejects the query).
+fn usage_filter_sql(q: &UsageQuery) -> String {
+    let mut sql = String::new();
+    if q.tenant_id.is_some() {
+        sql.push_str(" and tenant_id = toUUID(?)");
+    }
+    if q.key_id.is_some() {
+        sql.push_str(" and key_id = toUUID(?)");
+    }
+    if q.model.is_some() {
+        sql.push_str(" and model = ?");
+    }
+    sql
+}
+
 fn bind_usage_filters(
     mut query: clickhouse::query::Query,
     q: &UsageQuery,
@@ -1175,6 +1183,14 @@ fn bind_usage_filters(
     query
 }
 
+/// How many values [`bind_usage_filters`] binds for `q`.
+#[cfg(test)]
+fn usage_filter_bind_count(q: &UsageQuery) -> usize {
+    usize::from(q.tenant_id.is_some())
+        + usize::from(q.key_id.is_some())
+        + usize::from(q.model.is_some())
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1184,7 +1200,7 @@ fn now_ms() -> i64 {
 }
 
 /// One row from the `spans` table, returned by the per-request trace endpoint.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, clickhouse::Row)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, clickhouse::Row, ToSchema)]
 pub struct SpanEntry {
     #[serde(with = "clickhouse::serde::uuid")]
     pub request_id: Uuid,
@@ -1257,5 +1273,34 @@ mod internal_filter_tests {
     #[test]
     fn opt_in_disables_the_filter() {
         assert!(internal_filter(Some(true)).is_empty());
+    }
+
+    #[test]
+    fn usage_by_key_and_model_placeholders_match_binds() {
+        let query = |tenant: bool, key: bool, model: bool| UsageQuery {
+            tenant_id: tenant.then(Uuid::new_v4),
+            key_id: key.then(Uuid::new_v4),
+            model: model.then(|| "m".to_string()),
+            since_ms: None,
+            group_by: None,
+            limit: Some(10),
+            include_internal: None,
+        };
+        for tenant in [false, true] {
+            for key in [false, true] {
+                for model in [false, true] {
+                    let q = query(tenant, key, model);
+                    // +1 for `since`, bound ahead of the filters.
+                    let binds = 1 + usage_filter_bind_count(&q);
+                    for sql in [usage_by_key_sql(&q), usage_by_model_sql(&q)] {
+                        assert_eq!(
+                            sql.matches('?').count(),
+                            binds,
+                            "tenant={tenant} key={key} model={model}: {sql}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
