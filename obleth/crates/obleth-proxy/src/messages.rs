@@ -75,8 +75,8 @@ pub(crate) fn to_chat_request(incoming: &Value) -> Result<Value, RequestError> {
     for (k, v) in obj {
         match k.as_str() {
             "messages" | "max_tokens" | "system" | "top_k" | "metadata" | "thinking"
-            | "service_tier" | "container" | "mcp_servers" | "stop_sequences" | "tools"
-            | "tool_choice" => {}
+            | "service_tier" | "cache_control" | "container" | "mcp_servers" | "stop_sequences"
+            | "tools" | "tool_choice" => {}
             _ => {
                 out.insert(k.clone(), v.clone());
             }
@@ -1090,7 +1090,7 @@ mod tests {
         let out = to_chat_request(&req(json!({
             "stop_sequences": ["END"], "temperature": 0.2, "top_p": 0.9, "top_k": 40,
             "metadata": {"user_id": "u1"}, "thinking": {"type": "enabled", "budget_tokens": 1024},
-            "service_tier": "auto", "container": "c", "mcp_servers": [], "custom_passthrough": 1
+            "service_tier": "auto", "cache_control": {"type": "ephemeral"}, "container": "c", "mcp_servers": [], "custom_passthrough": 1
         })))
         .unwrap();
         assert_eq!(out["stop"], json!(["END"]));
@@ -1103,6 +1103,7 @@ mod tests {
             "metadata",
             "thinking",
             "service_tier",
+            "cache_control",
             "container",
             "mcp_servers",
             "stop_sequences",
