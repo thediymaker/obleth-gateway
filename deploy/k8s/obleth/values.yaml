@@ -78,8 +78,8 @@ obleth:
   # Seconds between re-pushes of keys/models/MCP servers from Postgres into
   # Redis (also runs after every Redis reconnect). 0 disables the timer.
   redisRewarmSecs: 300
-  # Total time allowed for one upstream request, including a streamed
-  # response, before it fails.
+  # Longest wait for an upstream to return response headers before the
+  # attempt fails (the body is bounded by upstreamReadTimeoutSecs below).
   upstreamTimeoutSecs: 300
   # Longest upstream silence (header wait or gap between body chunks) before
   # the request fails. Empty = the upstream request timeout (floored at 120s);
@@ -245,8 +245,10 @@ redis:
     limits: { cpu: "200m", memory: "512Mi" }
   # Redis's own memory ceiling (--maxmemory). Keep it at about 80% of
   # resources.limits.memory so Redis evicts before the kernel OOM-kills it.
-  # Eviction is volatile-lru: only entries with a TTL (response cache,
-  # compression originals) are evicted; API keys and model routes never are.
+  # Eviction is volatile-lru: only entries with a TTL are evicted (response
+  # cache, compression originals, rate-limit windows, and term-budget usage
+  # counters); API keys and model routes never are. Size Redis so it does not
+  # reach this ceiling, or term-budget usage can be lost mid-period.
   maxmemory: 400mb
   # PVC-backed AOF persistence. Redis is a rebuildable hot cache, so this is
   # optional — disable for ephemeral test envs. obleth re-warms from Postgres if
