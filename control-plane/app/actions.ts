@@ -1432,6 +1432,7 @@ const autoRouterUpdateSchema = z.object({
   temperature: z.number().min(0).max(2).optional(),
   difficulty_enabled: z.boolean().optional(),
   tier_source: z.enum(["hybrid", "derived", "declared"]).optional(),
+  messages_default_model: z.string().optional(),
 });
 
 export async function setAutoRouterSettingsAction(

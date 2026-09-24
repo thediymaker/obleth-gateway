@@ -27,6 +27,7 @@ const settings: AutoRouterSettingsView = {
   temperature: 0.4,
   difficulty_enabled: false,
   tier_source: "derived",
+  messages_default_model: null,
 };
 
 function range(id: string) {
@@ -63,7 +64,7 @@ async function chooseOption(id: string, label: string) {
   });
 }
 
-async function render(view: AutoRouterSettingsView | null) {
+async function render(view: AutoRouterSettingsView | null, formModels: ModelRoute[] = models) {
   // useState initializers only run on mount, so a settings-prop change on an
   // already-mounted form (as the real page never does) wouldn't reset the
   // fields. Each render() call here gets a fresh root, matching how the page
@@ -73,7 +74,7 @@ async function render(view: AutoRouterSettingsView | null) {
   document.body.append(host);
   root = createRoot(host);
   await act(async () => {
-    root.render(<AutoRouterSettingsForm settings={view} models={models} />);
+    root.render(<AutoRouterSettingsForm settings={view} models={formModels} />);
   });
 }
 
@@ -206,4 +207,25 @@ it("recognizes preset values, applies a picked profile, and flips to custom on a
   });
   expect(profileCard("Best answer").getAttribute("aria-pressed")).toBe("false");
   expect(profileCard("Custom").getAttribute("aria-pressed")).toBe("true");
+});
+
+it("reflects the Anthropic default model, offers auto, and clears back to None on save", async () => {
+  // "auto" is deliberately absent from this models list: the select must
+  // still offer it, since the gateway's auto-router name is a valid target
+  // for Anthropic-default routing (unlike the classifier-model select,
+  // which filters "auto" out on purpose).
+  const anthropicModels = [{ id: "1", model_name: "local-llama" }] as unknown as ModelRoute[];
+  await render({ ...settings, messages_default_model: "local-llama" }, anthropicModels);
+
+  expect(selectTrigger("messages_default_model").textContent).toBe("local-llama");
+
+  await chooseOption("messages_default_model", "auto");
+  expect(selectTrigger("messages_default_model").textContent).toBe("auto");
+
+  await chooseOption("messages_default_model", "None");
+  await save();
+
+  expect(setAutoRouterSettingsAction).toHaveBeenCalledTimes(1);
+  const body = vi.mocked(setAutoRouterSettingsAction).mock.calls[0][0];
+  expect(body.messages_default_model).toBe("");
 });

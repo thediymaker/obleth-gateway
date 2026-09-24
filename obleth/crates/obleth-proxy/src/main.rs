@@ -9,6 +9,7 @@ mod energy;
 mod jwt_auth;
 mod knowledge;
 mod mcp;
+mod messages;
 mod metrics;
 mod output_monitor;
 mod proxy;

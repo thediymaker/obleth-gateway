@@ -1622,6 +1622,11 @@ pub struct AutoRouterSettings {
     pub difficulty_enabled: bool,
     #[serde(default)]
     pub tier_source: TierSource,
+    /// Model or alias served when a request on the Anthropic Messages surface
+    /// names a model the gateway does not know (Claude Code sends Anthropic
+    /// model ids). `None` means such requests get `not_found_error`.
+    #[serde(default)]
+    pub messages_default_model: Option<String>,
 }
 
 fn default_classifier_timeout_ms() -> u64 {
@@ -1653,6 +1658,7 @@ impl Default for AutoRouterSettings {
             temperature: 0.0,
             difficulty_enabled: false,
             tier_source: TierSource::default(),
+            messages_default_model: None,
         }
     }
 }
@@ -3471,5 +3477,12 @@ mod tests {
             model.addressable_names().collect::<Vec<_>>(),
             vec!["glm-5-3"]
         );
+    }
+
+    #[test]
+    fn auto_router_row_without_messages_default_model_still_parses() {
+        let v: AutoRouterSettings =
+            serde_json::from_str(r#"{"classifier_enabled":false}"#).unwrap();
+        assert_eq!(v.messages_default_model, None);
     }
 }

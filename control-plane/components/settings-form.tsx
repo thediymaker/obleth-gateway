@@ -512,6 +512,7 @@ export function AutoRouterSettingsForm({
   );
   const [profile, setProfile] = useState<string>(() => routerProfileFromSettings(settings));
   const [advanced, setAdvanced] = useState(false);
+  const [messagesDefault, setMessagesDefault] = useState(settings?.messages_default_model ?? "");
 
   function applyProfile(key: string) {
     setProfile(key);
@@ -552,6 +553,7 @@ export function AutoRouterSettingsForm({
       temperature,
       difficulty_enabled: difficultyEnabled,
       tier_source: tierSource,
+      messages_default_model: messagesDefault.trim() ? messagesDefault.trim() : "",
     };
     start(async () => {
       const result = await setAutoRouterSettingsAction(body);
@@ -630,6 +632,26 @@ export function AutoRouterSettingsForm({
                 </button>
               );
             })()}
+          </div>
+          <div className="space-y-1">
+            <Label htmlFor="messages_default_model">Default model for Anthropic clients</Label>
+            <Select
+              id="messages_default_model"
+              value={messagesDefault}
+              onValueChange={setMessagesDefault}
+              searchPlaceholder="Filter models"
+              options={[
+                { value: "", label: "None" },
+                ...(models.some((m) => m.model_name === "auto")
+                  ? []
+                  : [{ value: "auto", label: "auto" }]),
+                ...models.map((m) => ({ value: m.model_name, label: m.model_name })),
+              ]}
+            />
+            <p className="text-[11px] text-muted-foreground">
+              Served when a request on /v1/messages names a model the gateway does not know. None
+              returns not_found_error.
+            </p>
           </div>
           <div className="space-y-1">
             <Label htmlFor="classifier_timeout_ms">Timeout (ms)</Label>

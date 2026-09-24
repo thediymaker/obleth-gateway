@@ -2038,6 +2038,9 @@ pub struct AutoRouterSettingsView {
     pub difficulty_enabled: bool,
     /// `"hybrid" | "derived" | "declared"`.
     pub tier_source: String,
+    /// Model or alias served for unknown model names on `/v1/messages`;
+    /// `None` means such requests get `not_found_error`.
+    pub messages_default_model: Option<String>,
 }
 
 impl AutoRouterSettingsView {
@@ -2057,6 +2060,7 @@ impl AutoRouterSettingsView {
             temperature: s.temperature,
             difficulty_enabled: s.difficulty_enabled,
             tier_source: tier_source_as_str(s.tier_source).to_string(),
+            messages_default_model: s.messages_default_model.clone(),
         }
     }
 }
@@ -2086,6 +2090,10 @@ pub struct UpdateAutoRouterSettings {
     /// leave the persisted `tier_source` untouched.
     #[serde(default)]
     pub tier_source: Option<String>,
+    /// Model or alias served for unknown model names on `/v1/messages`.
+    /// Empty string clears it.
+    #[serde(default)]
+    pub messages_default_model: Option<String>,
 }
 
 /// Merge an update over the persisted settings, clamping out-of-range values.
@@ -2101,6 +2109,11 @@ fn merge_auto_router(
         Some("") => None,
         Some(m) => Some(m.to_string()),
         None => existing.classifier_model.clone(),
+    };
+    let messages_default_model = match body.messages_default_model.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.messages_default_model.clone(),
     };
     AutoRouterSettings {
         classifier_enabled: body
@@ -2130,6 +2143,7 @@ fn merge_auto_router(
             .as_deref()
             .and_then(parse_tier_source)
             .unwrap_or(existing.tier_source),
+        messages_default_model,
     }
 }
 
@@ -2185,6 +2199,7 @@ async fn put_auto_router_settings(
                 "temperature": settings.temperature,
                 "difficulty_enabled": settings.difficulty_enabled,
                 "tier_source": tier_source_as_str(settings.tier_source),
+                "messages_default_model": settings.messages_default_model,
             }),
         )
         .await?;
@@ -8056,6 +8071,30 @@ mod tests {
         assert_eq!(view.temperature, 0.5);
         assert!(view.difficulty_enabled);
         assert_eq!(view.tier_source, "declared");
+    }
+
+    #[test]
+    fn merge_auto_router_sets_and_clears_messages_default_model() {
+        use obleth_config::AutoRouterSettings;
+        let existing = AutoRouterSettings::default();
+        let set = merge_auto_router(
+            &existing,
+            &UpdateAutoRouterSettings {
+                messages_default_model: Some("local-llama".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(set.messages_default_model.as_deref(), Some("local-llama"));
+        let cleared = merge_auto_router(
+            &set,
+            &UpdateAutoRouterSettings {
+                messages_default_model: Some("".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cleared.messages_default_model, None);
+        let kept = merge_auto_router(&set, &UpdateAutoRouterSettings::default());
+        assert_eq!(kept.messages_default_model.as_deref(), Some("local-llama"));
     }
 
     #[test]
