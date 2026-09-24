@@ -346,7 +346,7 @@ pub fn render_summary(summary: &Summary, ui_base: &str) -> String {
          throughput: {:.0} tok/s{per_stream}\n\
          watch in the control plane:\n\
          \u{20}\u{20}fairshare   {ui_base}/fairshare\n\
-         \u{20}\u{20}accounting  {ui_base}/usage",
+         \u{20}\u{20}accounting  {ui_base}/reports",
         summary.completed,
         summary.attempts,
         summary.req_per_s,
@@ -385,7 +385,7 @@ mod tests {
         let out = render_summary(&sum, "http://localhost:3000");
         assert!(out.contains("PASS"));
         assert!(out.contains("http://localhost:3000/fairshare"));
-        assert!(out.contains("http://localhost:3000/usage"));
+        assert!(out.contains("http://localhost:3000/reports"));
     }
 
     #[test]
