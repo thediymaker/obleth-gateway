@@ -78,6 +78,9 @@ obleth:
   # Seconds between re-pushes of keys/models/MCP servers from Postgres into
   # Redis (also runs after every Redis reconnect). 0 disables the timer.
   redisRewarmSecs: 300
+  # Total time allowed for one upstream request, including a streamed
+  # response, before it fails.
+  upstreamTimeoutSecs: 300
   # Longest upstream silence (header wait or gap between body chunks) before
   # the request fails. Empty = the upstream request timeout (floored at 120s);
   # a lower value also cuts slow non-streaming requests. 0 disables.

@@ -68,6 +68,7 @@ spec:
             - { name: OBLETH_SLACK_ALERT_MIN_INTERVAL_SECS, value: {{ .Values.obleth.slackAlertMinIntervalSecs | quote }} }
             - { name: OBLETH_SHUTDOWN_GRACE_SECS, value: {{ .Values.obleth.shutdownGraceSecs | quote }} }
             - { name: OBLETH_REDIS_REWARM_SECS, value: {{ .Values.obleth.redisRewarmSecs | quote }} }
+            - { name: OBLETH_UPSTREAM_TIMEOUT_SECS, value: {{ .Values.obleth.upstreamTimeoutSecs | quote }} }
             - { name: OBLETH_UPSTREAM_READ_TIMEOUT_SECS, value: {{ .Values.obleth.upstreamReadTimeoutSecs | quote }} }
             - { name: OBLETH_REDIS_RESPONSE_TIMEOUT_MS, value: {{ .Values.obleth.redisResponseTimeoutMs | quote }} }
             - { name: OBLETH_REDIS_CONNECT_TIMEOUT_MS, value: {{ .Values.obleth.redisConnectTimeoutMs | quote }} }
