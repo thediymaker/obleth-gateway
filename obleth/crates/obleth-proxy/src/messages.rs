@@ -53,6 +53,22 @@ pub(crate) fn to_chat_request(incoming: &Value) -> Result<Value, RequestError> {
     for m in in_messages {
         convert_message(m, &mut messages)?;
     }
+    // Chat templates (vLLM's included) accept a system message only at the
+    // start, while Claude Code interleaves system-role reminders through the
+    // conversation. All system text is gathered, in order, into one leading
+    // system message so the upstream never sees one mid-conversation.
+    let (system_parts, rest): (Vec<Value>, Vec<Value>) = messages
+        .into_iter()
+        .partition(|m| m.get("role").and_then(Value::as_str) == Some("system"));
+    let mut messages = rest;
+    if !system_parts.is_empty() {
+        let text = system_parts
+            .iter()
+            .filter_map(|m| m.get("content").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        messages.insert(0, json!({"role": "system", "content": text}));
+    }
     out.insert("messages".into(), Value::Array(messages));
     out.insert("max_tokens".into(), json!(max_tokens));
 
@@ -127,12 +143,22 @@ fn convert_message(m: &Value, out: &mut Vec<Value>) -> Result<(), RequestError> 
         .get("role")
         .and_then(Value::as_str)
         .ok_or_else(|| invalid("each message needs a `role`"))?;
-    if role != "user" && role != "assistant" {
-        return Err(invalid(format!("unsupported message role `{role}`")));
-    }
     let content = m
         .get("content")
         .ok_or_else(|| invalid("each message needs `content`"))?;
+    // Claude Code puts system-role entries inside `messages` as well as the
+    // top-level `system`; chat completions accepts a system message anywhere,
+    // so it is forwarded as one rather than refused.
+    if role == "system" {
+        let text = system_text(content);
+        if !text.trim().is_empty() {
+            out.push(json!({"role": "system", "content": text}));
+        }
+        return Ok(());
+    }
+    if role != "user" && role != "assistant" {
+        return Err(invalid(format!("unsupported message role `{role}`")));
+    }
     if let Value::String(s) = content {
         out.push(json!({"role": role, "content": s}));
         return Ok(());
@@ -877,6 +903,48 @@ mod tests {
             }
         }
         base
+    }
+
+    #[test]
+    fn system_role_inside_messages_is_forwarded_as_a_system_message() {
+        let out = to_chat_request(&req(json!({"messages": [
+            {"role": "system", "content": [{"type": "text", "text": "be terse", "cache_control": {"type": "ephemeral"}}]},
+            {"role": "user", "content": "hi"}
+        ]})))
+        .unwrap();
+        assert_eq!(
+            out["messages"][0],
+            json!({"role": "system", "content": "be terse"})
+        );
+        assert_eq!(out["messages"][1]["role"], "user");
+        let other = to_chat_request(&req(
+            json!({"messages": [{"role": "tool", "content": "x"}]}),
+        ));
+        assert!(other.is_err());
+    }
+
+    #[test]
+    fn mid_conversation_system_entries_are_hoisted_into_one_leading_system_message() {
+        let out = to_chat_request(&req(json!({
+            "system": "top",
+            "messages": [
+                {"role": "user", "content": "one"},
+                {"role": "system", "content": "reminder"},
+                {"role": "assistant", "content": "two"},
+                {"role": "user", "content": "three"}
+            ]
+        })))
+        .unwrap();
+        let m = out["messages"].as_array().unwrap();
+        assert_eq!(m.len(), 4);
+        assert_eq!(
+            m[0],
+            json!({"role": "system", "content": "top\n\nreminder"})
+        );
+        assert_eq!(m[1]["content"], "one");
+        assert_eq!(m[2]["content"], "two");
+        assert_eq!(m[3]["content"], "three");
+        assert!(m[1..].iter().all(|x| x["role"] != "system"));
     }
 
     #[test]
