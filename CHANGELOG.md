@@ -16,7 +16,7 @@ workflow falls back to auto-generated notes.
 **Required action when upgrading**
 
 - **Redis now requires a password.** The Helm chart takes `redis.password` (required, URL-safe characters only — hex is simplest) and the compose stacks take `REDIS_PASSWORD`. Deployments using `existingSecret` must add `OBLETH_REDIS_URL` (now carried in the Secret, since it holds the password) and, for the bundled datastores, `REDIS_PASSWORD` and `POSTGRES_PASSWORD`. The chart's bundled Redis gets a 512Mi limit with `maxmemory 400mb` and `volatile-lru`; under that policy a full Redis refuses writes to keys without a TTL rather than evicting them.
-- **Upstream secrets are no longer returned by the Management API.** Model, endpoint, and MCP server responses carry `api_key_set` / `auth_header_set` booleans instead of the secret itself. Writes are unchanged: omit or blank the field to keep the stored value. Clients that read `api_key` or `auth_header` from a response must be updated.
+- **Upstream secrets are no longer returned by the Management API.** Model, endpoint, and MCP server responses carry `api_key_set` / `auth_header_set` booleans instead of the secret itself. Writes are unchanged: omit the field to keep the stored value, or send an empty string to clear it. Clients that read `api_key` or `auth_header` from a response must be updated.
 - **Response cache and compression store are scoped per tenant.** Existing entries are not reused after the upgrade (one miss per request until repopulated). A cache TTL of 0 now means "do not cache" rather than "never expire"; entries written with TTL 0 by earlier versions remain until flushed.
 
 **Security and safety fixes from a full audit**
