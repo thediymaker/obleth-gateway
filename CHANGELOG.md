@@ -6,18 +6,40 @@ workflow falls back to auto-generated notes.
 
 ## Unreleased
 
+> **⚠️ Breaking changes. Complete these steps before upgrading.**
+>
+> - **Helm with `obleth.existingSecret`: add the new keys to the Secret first.** The chart now reads the Redis URL from the Secret, because it carries the Redis password, instead of setting it in the pod environment. With `existingSecret` the chart does not render that Secret. If a key is missing, the new pods cannot start (the gateway has no Redis URL, and the bundled Redis and Postgres have no password) and the rollout stalls, with the old pods still serving. Before upgrading:
+>
+>   - **External Redis** (`redis.enabled: false`): copy the URL the running pods use into the Secret. It must include the password if your Redis requires one.
+>
+>     ```bash
+>     kubectl patch secret <existing-secret> -n <namespace> --type merge -p "{\"stringData\":{\"OBLETH_REDIS_URL\":\"$(kubectl get deploy <release>-obleth -n <namespace> -o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="OBLETH_REDIS_URL")].value}')\"}}"
+>     ```
+>
+>   - **Bundled Redis** (`redis.enabled: true`): the upgraded Redis requires a password, so the URL the running pods use (which has none) will not authenticate. Generate a password and add it together with a URL that carries it:
+>
+>     ```bash
+>     PW=$(openssl rand -hex 16)
+>     kubectl patch secret <existing-secret> -n <namespace> --type merge -p "{\"stringData\":{\"REDIS_PASSWORD\":\"$PW\",\"OBLETH_REDIS_URL\":\"redis://:$PW@<release>-redis:6379\"}}"
+>     ```
+>
+>   - **Bundled Postgres** (`postgres.enabled: true`): add `POSTGRES_PASSWORD`, set to the password the existing database already uses (the one in the gateway's database URL). Postgres reads it only when it initializes an empty volume, so an existing database keeps its password either way.
+>
+>   The full key list is in the upgrade guide.
+> - **Redis now requires a password.** The Helm chart takes `redis.password` (required, URL-safe characters only; hex is simplest) and the compose stacks take `REDIS_PASSWORD`. The chart's bundled Redis gets a 512Mi limit with `maxmemory 400mb` and `volatile-lru`; under that policy only entries with a TTL are evicted, and once none are left a full Redis rejects writes with an out-of-memory error.
+> - **Upstream secrets are no longer returned by the Management API.** Model, endpoint, and MCP server responses carry `api_key_set` / `auth_header_set` booleans instead of the secret itself. Writes are unchanged: omit the field to keep the stored value, or send an empty string to clear it. Clients that read `api_key` or `auth_header` from a response must be updated.
+> - **`POST /v1/messages` is translated, not forwarded.** The gateway now serves the Anthropic Messages API itself. A deployment that relied on it being passed through to the upstream unchanged must route those requests another way.
+> - **Guardrails policies refuse endpoints they cannot enforce.** For a tenant whose policy blocks or redacts, `POST /v1/completions`, audio transcription and translation, and unrecognized paths now return 400; use `/v1/chat/completions`, `/v1/responses`, or `/v1/messages`. Embedding, rerank, and moderation inputs are now scanned, so indexing a document that trips a scanner returns 400.
+> - **`OBLETH_GLOBAL_MAX_IN_FLIGHT` is a ceiling across per-model pools.** A deployment that pinned it (the shipped compose file used 64) should raise it above the sum of its models' pool sizes, or the ceiling binds before the pools do.
+> - **Response cache and compression store are scoped per tenant.** Existing entries are not reused after the upgrade (one miss per request until repopulated). A cache TTL of 0 now means "do not cache" rather than "never expire"; entries written with TTL 0 by earlier versions remain until flushed.
+> - **Dashboard email sign-up is closed.** The break-glass admin is seeded from `DASHBOARD_ADMIN_EMAIL` / `DASHBOARD_PASSWORD`.
+
 - **Fairshare is per model, and fair inside a tenant.** Every model now has its own scheduling pool (32 slots by default, or the model's max in flight), so a saturated model no longer delays a model with free capacity and usage on one model no longer costs a tenant priority on another. Inside a tenant, keys are served by weight: each key has a fairshare weight (default 100) and an optional per-model in-flight cap, so one user cannot starve their team. The per-tenant max in flight is now enforced, per model. The fairshare page gains a model selector and shows each tenant's keys; the live API reports per-pool detail alongside the aggregated view. `OBLETH_GLOBAL_MAX_IN_FLIGHT` is now a total ceiling across pools (default 1024) and `OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT` sets the default pool size. Upgrading: a deployment that pinned `OBLETH_GLOBAL_MAX_IN_FLIGHT` (the shipped compose file used 64) should raise it above the sum of its models' pool sizes — otherwise the ceiling binds before the pools do, and the gateway logs a warning at start-up.
 - **obench puts the in-flight ceiling back.** Demo runs raise the gateway's global in-flight ceiling to fit the fleet they seed; they now restore the previous value at teardown instead of leaving it behind. The scorecard also seeds its demo models with pools wide enough for its concurrency ramp, so the overhead and capacity sections measure the proxy rather than the default 32-slot pool.
 - **The fairshare activity chart keeps an hour of history.** The gateway samples the scheduler every 2 seconds into memory (`OBLETH_FAIRSHARE_HISTORY_SECS`, default 3600; 0 disables) and serves it at `GET /api/v1/fairshare/history`, scoped to one model or the aggregate. The Fairshare page loads that window on open and on every model-scope change, so a refresh no longer clears the chart. History is per gateway process and resets on restart.
 
 - **Fairshare starts with waiting tenants.** The dashboard now puts capacity, queued work, and tenants waiting below share first, with selectable tenant details, group-to-tenant drill-downs, and a compact weight-editing workbench. Activity history is available below the overview, and refresh failures clearly label stale scheduler snapshots.
 - **Anthropic Messages API.** The gateway serves `POST /v1/messages` and `POST /v1/messages/count_tokens`, so Claude Code and Anthropic SDKs work by pointing `ANTHROPIC_BASE_URL` at the gateway and using a gateway key as `ANTHROPIC_API_KEY` (`x-api-key` or `Authorization: Bearer`). Streaming, system prompts, images, and tool use translate onto the existing chat pipeline; admission, budgets, boons, and billing apply unchanged, and usage is recorded with request type `messages`. Requests naming a model the gateway does not know are served by the new "Default model for Anthropic clients" routing setting, or return `not_found_error` when it is unset. Not supported in this release: prompt caching, extended-thinking control, image results inside tool results, and server-side tools. Previously `POST /v1/messages` was forwarded to the upstream unchanged; it is now translated by the gateway, so a deployment that relied on that pass-through must route those requests a different way.
-
-**Required action when upgrading**
-
-- **Redis now requires a password.** The Helm chart takes `redis.password` (required, URL-safe characters only — hex is simplest) and the compose stacks take `REDIS_PASSWORD`. Deployments using `existingSecret` must add `OBLETH_REDIS_URL` (now carried in the Secret, since it holds the password) and, for the bundled datastores, `REDIS_PASSWORD` and `POSTGRES_PASSWORD`. The chart's bundled Redis gets a 512Mi limit with `maxmemory 400mb` and `volatile-lru`; under that policy only entries with a TTL are evicted, and once none are left a full Redis rejects writes with an out-of-memory error.
-- **Upstream secrets are no longer returned by the Management API.** Model, endpoint, and MCP server responses carry `api_key_set` / `auth_header_set` booleans instead of the secret itself. Writes are unchanged: omit the field to keep the stored value, or send an empty string to clear it. Clients that read `api_key` or `auth_header` from a response must be updated.
-- **Response cache and compression store are scoped per tenant.** Existing entries are not reused after the upgrade (one miss per request until repopulated). A cache TTL of 0 now means "do not cache" rather than "never expire"; entries written with TTL 0 by earlier versions remain until flushed.
 
 **Security and safety fixes from a full audit**
 
