@@ -246,9 +246,11 @@ redis:
   # Redis's own memory ceiling (--maxmemory). Keep it at about 80% of
   # resources.limits.memory so Redis evicts before the kernel OOM-kills it.
   # Eviction is volatile-lru: only entries with a TTL are evicted (response
-  # cache, compression originals, rate-limit windows, and term-budget usage
-  # counters); API keys and model routes never are. Size Redis so it does not
-  # reach this ceiling, or term-budget usage can be lost mid-period.
+  # cache, compression originals, rate-limit windows, in-flight budget
+  # reservations); API keys, model routes, and committed term-budget usage have
+  # no TTL and are never evicted. When the ceiling is reached with nothing left
+  # to evict, Redis rejects writes with an out-of-memory error until memory is
+  # freed, which the gateway handles as a Redis failure (see failOpen).
   maxmemory: 400mb
   # PVC-backed AOF persistence. Redis is a rebuildable hot cache, so this is
   # optional — disable for ephemeral test envs. obleth re-warms from Postgres if

@@ -95,22 +95,101 @@ const OUTPUT_TEXT_POINTERS: &[&str] = &[
     "/choices/0/message/provider_specific_fields/reasoning",
 ];
 
+/// Whether a message with this role is input the tenant's scanners must see:
+/// everything but the model's own turns and tool output, so `user`, `system`,
+/// `developer` (OpenAI SDKs, Codex), and a message with no role at all.
+pub(super) fn is_scanned_role(role: Option<&str>) -> bool {
+    !matches!(role, Some("assistant") | Some("tool") | Some("function"))
+}
+
+/// Top-level request fields that carry caller text on non-chat endpoints:
+/// `prompt` (legacy completions, image generation), `input` (embeddings,
+/// moderations, text-to-speech), `query` and `documents` (rerank).
+const TEXT_FIELDS: &[&str] = &["prompt", "input", "query", "documents"];
+
+/// The strings inside one top-level text field: a string, or an array of
+/// strings and `{"text": ...}` objects. Token-id arrays carry no scannable
+/// text and are skipped here (see [`has_token_id_prompt`]).
+fn field_texts(value: &Value) -> Vec<&str> {
+    match value {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s.as_str()),
+                Value::Object(o) => o.get("text").and_then(|t| t.as_str()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 pub(super) fn collect_input_text(json: &Value) -> String {
-    let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
-        return String::new();
+    let mut texts: Vec<String> = Vec::new();
+    if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
+        texts.extend(
+            messages
+                .iter()
+                .filter(|m| is_scanned_role(m.get("role").and_then(|r| r.as_str())))
+                .map(extract_message_text)
+                .filter(|s| !s.is_empty()),
+        );
+    }
+    // Without these, a non-chat endpoint would reach the model unscanned
+    // under a policy that covers chat.
+    for field in TEXT_FIELDS {
+        if let Some(value) = json.get(*field) {
+            texts.extend(
+                field_texts(value)
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
+    texts.join("\n")
+}
+
+/// A completion `prompt` given as token ids (an array of integers, or an
+/// array of such arrays). The scanners read text, so a pre-tokenized prompt
+/// would pass every input scanner unread; an enforcing policy refuses it.
+pub(super) fn has_token_id_prompt(json: &Value) -> bool {
+    json.get("prompt")
+        .and_then(|p| p.as_array())
+        .is_some_and(|items| items.iter().any(|v| v.is_number() || v.is_array()))
+}
+
+/// Redact the top-level text fields (see [`TEXT_FIELDS`]) in place.
+fn redact_fields_in_place(json: &mut Value, scanners: &[String], ban_keywords: &[String]) -> bool {
+    let mut changed = false;
+    let mut redact = |s: &mut String| {
+        let redacted = redact_text(s, scanners, ban_keywords);
+        if redacted != *s {
+            *s = redacted;
+            changed = true;
+        }
     };
-    messages
-        .iter()
-        .filter(|m| {
-            matches!(
-                m.get("role").and_then(|r| r.as_str()),
-                Some("user") | Some("system")
-            )
-        })
-        .map(extract_message_text)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    for field in TEXT_FIELDS {
+        match json.get_mut(*field) {
+            Some(Value::String(s)) => redact(s),
+            Some(Value::Array(items)) => {
+                for item in items.iter_mut() {
+                    match item {
+                        Value::String(s) => redact(s),
+                        Value::Object(o) => {
+                            if let Some(Value::String(s)) = o.get_mut("text") {
+                                redact(s);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    changed
 }
 
 /// Concatenate every text-bearing field of the assistant's reply (content plus
@@ -560,7 +639,32 @@ pub(super) async fn apply_input(
     tracer: Option<&mut crate::tracer::SpanRecorder>,
 ) -> GuardrailsInputOutcome {
     let start = crate::tracer::now_ms();
+    let enforcing = !matches!(policy.action, GuardrailsAction::LogOnly);
+    if enforcing && !policy.input_scanners.is_empty() && has_token_id_prompt(json) {
+        record_block(
+            tracer,
+            "boon:guardrails_input",
+            &policy.input_scanners,
+            start,
+            None,
+        );
+        return GuardrailsInputOutcome {
+            blocked: Some(GuardrailsBlock::policy(
+                "token-id prompts cannot be scanned by this tenant's guardrails; send text",
+            )),
+            sanitized: false,
+        };
+    }
     let text = collect_input_text(json);
+    // Nothing to scan (embeddings of token ids, audio uploads, an empty
+    // body): skip, so the harm scanner never spends a guard-model call on an
+    // empty string or fails such a request when the guard model is down.
+    if text.trim().is_empty() {
+        return GuardrailsInputOutcome {
+            blocked: None,
+            sanitized: false,
+        };
+    }
 
     // ---- log_only: observe and alert, never block or rewrite ----
     if matches!(policy.action, GuardrailsAction::LogOnly) {
@@ -666,8 +770,7 @@ pub(super) async fn apply_input(
     if matches!(policy.action, GuardrailsAction::Redact) {
         if let Some(messages) = json.get_mut("messages").and_then(|m| m.as_array_mut()) {
             for msg in messages.iter_mut() {
-                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                if role != "user" && role != "system" {
+                if !is_scanned_role(msg.get("role").and_then(|r| r.as_str())) {
                     continue;
                 }
                 if let Some(content) = msg.get_mut("content") {
@@ -680,6 +783,9 @@ pub(super) async fn apply_input(
                     }
                 }
             }
+        }
+        if redact_fields_in_place(json, &policy.input_scanners, &policy.ban_keywords) {
+            sanitized = true;
         }
     }
 
@@ -940,6 +1046,94 @@ mod tests {
         assert!(text.contains("first question"));
         assert!(text.contains("follow up"));
         assert!(!text.contains("answer"));
+    }
+
+    #[test]
+    fn collect_input_text_reads_a_top_level_prompt() {
+        let single = serde_json::json!({"prompt": "legacy completion text"});
+        assert_eq!(collect_input_text(&single), "legacy completion text");
+
+        let batch = serde_json::json!({"prompt": ["first", "", "second", 7]});
+        assert_eq!(collect_input_text(&batch), "first\nsecond");
+
+        let both = serde_json::json!({
+            "messages": [{"role": "user", "content": "chat turn"}],
+            "prompt": "image prompt"
+        });
+        let text = collect_input_text(&both);
+        assert!(text.contains("chat turn") && text.contains("image prompt"));
+    }
+
+    #[test]
+    fn developer_and_roleless_messages_are_scanned_model_turns_are_not() {
+        let json = serde_json::json!({
+            "messages": [
+                {"role": "developer", "content": "dev instructions"},
+                {"content": "no role given"},
+                {"role": "assistant", "content": "model answer"},
+                {"role": "tool", "content": "tool output"}
+            ]
+        });
+        let text = collect_input_text(&json);
+        assert!(text.contains("dev instructions"));
+        assert!(text.contains("no role given"));
+        assert!(!text.contains("model answer"));
+        assert!(!text.contains("tool output"));
+    }
+
+    #[test]
+    fn non_chat_text_fields_are_scanned() {
+        let embeddings = serde_json::json!({"input": ["doc one", "doc two"]});
+        assert_eq!(collect_input_text(&embeddings), "doc one\ndoc two");
+        let speech = serde_json::json!({"input": "read this aloud"});
+        assert_eq!(collect_input_text(&speech), "read this aloud");
+        let rerank = serde_json::json!({
+            "query": "which one",
+            "documents": ["plain", {"text": "object form"}]
+        });
+        let text = collect_input_text(&rerank);
+        assert!(text.contains("which one"));
+        assert!(text.contains("plain"));
+        assert!(text.contains("object form"));
+        // Token-id embedding input carries no text.
+        let tokens = serde_json::json!({"input": [101, 2023, 102]});
+        assert_eq!(collect_input_text(&tokens), "");
+    }
+
+    #[test]
+    fn token_id_prompts_are_detected() {
+        assert!(has_token_id_prompt(
+            &serde_json::json!({"prompt": [1, 2, 3]})
+        ));
+        assert!(has_token_id_prompt(
+            &serde_json::json!({"prompt": [[1, 2], [3]]})
+        ));
+        assert!(!has_token_id_prompt(&serde_json::json!({"prompt": "text"})));
+        assert!(!has_token_id_prompt(
+            &serde_json::json!({"prompt": ["a", "b"]})
+        ));
+        // Embedding token ids use `input`, which is not refused.
+        assert!(!has_token_id_prompt(&serde_json::json!({"input": [1, 2]})));
+    }
+
+    #[test]
+    fn redact_prompt_rewrites_string_and_array_prompts() {
+        let scanners = vec!["ban_keywords".to_string()];
+        let banned = vec!["secretword".to_string()];
+
+        let mut single = serde_json::json!({"prompt": "say secretword now"});
+        assert!(redact_fields_in_place(&mut single, &scanners, &banned));
+        assert!(!single["prompt"].as_str().unwrap().contains("secretword"));
+
+        let mut batch = serde_json::json!({"prompt": ["clean", "has secretword"]});
+        assert!(redact_fields_in_place(&mut batch, &scanners, &banned));
+        assert_eq!(batch["prompt"][0], "clean");
+        assert!(!batch["prompt"][1].as_str().unwrap().contains("secretword"));
+
+        let mut clean = serde_json::json!({"prompt": "nothing to see"});
+        assert!(!redact_fields_in_place(&mut clean, &scanners, &banned));
+        let mut none = serde_json::json!({"messages": []});
+        assert!(!redact_fields_in_place(&mut none, &scanners, &banned));
     }
 
     // --- prompt injection ---

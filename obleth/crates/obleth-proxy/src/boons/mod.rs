@@ -307,6 +307,73 @@ pub struct StructuredPlan {
     pub settings: StructuredOutputBoonSettings,
 }
 
+/// Tenant input guardrails for one request, recorded into `outcome`. Returns
+/// `true` when the request is blocked. Internal probe keys are exempt, and a
+/// tenant without a policy is a no-op.
+///
+/// Output scanning (block/redact actions) is armed only for chat: it reads
+/// chat-completion message content, the one response shape it understands.
+/// `log_only` output scanning is handled in proxy.rs after the stream drains.
+#[allow(clippy::too_many_arguments)]
+async fn guard_input(
+    state: &AppState,
+    settings: &BoonSettings,
+    key: &ResolvedKey,
+    session_id: &str,
+    is_chat: bool,
+    json: &mut Value,
+    tracer: Option<&mut crate::tracer::SpanRecorder>,
+    outcome: &mut EnrichOutcome,
+) -> bool {
+    if key.internal {
+        return false;
+    }
+    let Some(policy) = &key.guardrails_policy else {
+        return false;
+    };
+    let guard_outcome = guardrails::apply_input(
+        state,
+        &settings.guardrails,
+        policy,
+        key,
+        session_id,
+        json,
+        tracer,
+    )
+    .await;
+    if let Some(block) = guard_outcome.blocked {
+        outcome.blocked = Some(block);
+        return true;
+    }
+    if guard_outcome.sanitized {
+        outcome.rewritten = true;
+        outcome.applied.push("guardrails_input");
+    }
+    if is_chat
+        && !policy.output_scanners.is_empty()
+        && !matches!(policy.action, obleth_config::GuardrailsAction::LogOnly)
+    {
+        let plan = outcome.response_plan.get_or_insert_with(|| ResponsePlan {
+            structured: None,
+            tool_loop: None,
+            client_stream: json
+                .get("stream")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            include_usage: json
+                .pointer("/stream_options/include_usage")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            guardrails: None,
+        });
+        plan.guardrails = Some(GuardrailsOutputPlan {
+            policy: policy.clone(),
+            settings: settings.guardrails.clone(),
+        });
+    }
+    false
+}
+
 impl BoonEngine {
     pub fn new(initial: BoonSettings) -> Self {
         Self {
@@ -322,6 +389,38 @@ impl BoonEngine {
     /// Replace the settings (called by the periodic refresh task).
     pub fn update(&self, settings: BoonSettings) {
         self.settings.store(Arc::new(settings));
+    }
+
+    /// Scan a chat-shaped body with the tenant's input guardrails outside the
+    /// passthrough pipeline (the verdicts endpoint). `Err` carries the block
+    /// to return; `Ok(true)` means redaction rewrote `json` in place. Output
+    /// scanning is not armed: callers that use this read logprobs, not text.
+    pub async fn scan_input(
+        &self,
+        state: &AppState,
+        key: &ResolvedKey,
+        session_id: &str,
+        json: &mut Value,
+        tracer: Option<&mut crate::tracer::SpanRecorder>,
+    ) -> Result<bool, guardrails::GuardrailsBlock> {
+        let Some(policy) = key.guardrails_policy.as_ref().filter(|_| !key.internal) else {
+            return Ok(false);
+        };
+        let settings = self.settings();
+        let out = guardrails::apply_input(
+            state,
+            &settings.guardrails,
+            policy,
+            key,
+            session_id,
+            json,
+            tracer,
+        )
+        .await;
+        match out.blocked {
+            Some(block) => Err(block),
+            None => Ok(out.sanitized),
+        }
     }
 
     /// Apply every applicable boon to `json` in place before the request is
@@ -346,10 +445,25 @@ impl BoonEngine {
         mut tracer: Option<&mut crate::tracer::SpanRecorder>,
     ) -> EnrichOutcome {
         let mut outcome = EnrichOutcome::default();
+        let settings = self.settings();
+        // A tenant's guardrails policy is its administrator's control, not a
+        // boon the caller opted into: every early return below still scans the
+        // input first, so `x-obleth-boons: off`, an unrouted request, or a
+        // non-chat endpoint cannot skip it.
         if opt_out {
+            guard_input(
+                state,
+                &settings,
+                key,
+                session_id,
+                is_chat,
+                json,
+                tracer.as_deref_mut(),
+                &mut outcome,
+            )
+            .await;
             return outcome;
         }
-        let settings = self.settings();
 
         // ---- replayed image attachments ----
         // Independent of every boon switch and of `route`: the base64 in an
@@ -362,6 +476,17 @@ impl BoonEngine {
         }
 
         let Some(route) = route else {
+            guard_input(
+                state,
+                &settings,
+                key,
+                session_id,
+                is_chat,
+                json,
+                tracer.as_deref_mut(),
+                &mut outcome,
+            )
+            .await;
             return outcome;
         };
 
@@ -397,6 +522,17 @@ impl BoonEngine {
         // The tools/structured boons and the tool loop only make sense for
         // chat completions.
         if !is_chat {
+            guard_input(
+                state,
+                &settings,
+                key,
+                session_id,
+                is_chat,
+                json,
+                tracer.as_deref_mut(),
+                &mut outcome,
+            )
+            .await;
             return outcome;
         }
 
@@ -679,50 +815,19 @@ impl BoonEngine {
         // policy) trip a tenant's own PII/injection scanner and block a request
         // the boon must never fail. `tracer` is reborrowed here (not moved) so
         // it is still available for the knowledge span below.
-        if !key.internal {
-            if let Some(policy) = &key.guardrails_policy {
-                let guard_outcome = guardrails::apply_input(
-                    state,
-                    &settings.guardrails,
-                    policy,
-                    key,
-                    session_id,
-                    json,
-                    tracer.as_deref_mut(),
-                )
-                .await;
-                if let Some(reason) = guard_outcome.blocked {
-                    outcome.blocked = Some(reason);
-                    return outcome;
-                }
-                if guard_outcome.sanitized {
-                    outcome.rewritten = true;
-                    outcome.applied.push("guardrails_input");
-                }
-                // Arm output plan for block/redact actions.
-                // log_only output scanning is handled async in proxy.rs after the stream drains.
-                if !policy.output_scanners.is_empty()
-                    && !matches!(policy.action, obleth_config::GuardrailsAction::LogOnly)
-                {
-                    let plan = outcome.response_plan.get_or_insert_with(|| ResponsePlan {
-                        structured: None,
-                        tool_loop: None,
-                        client_stream: json
-                            .get("stream")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
-                        include_usage: json
-                            .pointer("/stream_options/include_usage")
-                            .and_then(|v| v.as_bool())
-                            .unwrap_or(false),
-                        guardrails: None,
-                    });
-                    plan.guardrails = Some(GuardrailsOutputPlan {
-                        policy: policy.clone(),
-                        settings: settings.guardrails.clone(),
-                    });
-                }
-            }
+        if guard_input(
+            state,
+            &settings,
+            key,
+            session_id,
+            is_chat,
+            json,
+            tracer.as_deref_mut(),
+            &mut outcome,
+        )
+        .await
+        {
+            return outcome;
         }
 
         // ---- knowledge boon, phase 2: retrieve and inject ----
@@ -1823,6 +1928,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_early_return_before_guardrails_still_scans_input() {
+        // A tenant's guardrails policy must not be skippable by
+        // `x-obleth-boons: off`, an unrouted request, or a non-chat path.
+        // Every `return outcome;` in `enrich_request` above the in-flow
+        // guardrails section must be preceded by its own `guard_input` call.
+        let full_src = include_str!("mod.rs");
+        let src = &full_src[..full_src
+            .find("\nmod tests {")
+            .expect("this file's own test module marker")];
+        let start = src
+            .find("pub async fn enrich_request(")
+            .expect("enrich_request");
+        let end = start
+            + src[start..]
+                .find("---- guardrails boon (input scanning) ----")
+                .expect("guardrails section marker");
+        let body = &src[start..end];
+        let segments: Vec<&str> = body.split("return outcome;").collect();
+        assert!(
+            segments.len() >= 4,
+            "expected the opt-out, no-route, and non-chat early returns"
+        );
+        for (i, seg) in segments[..segments.len() - 1].iter().enumerate() {
+            assert!(
+                seg.contains("guard_input("),
+                "early return #{} in enrich_request skips the input guardrails",
+                i + 1
+            );
+        }
+    }
+
     /// The knowledge boon's two-phase split is an ordering property of
     /// `enrich_request` itself — no test over the pure functions in
     /// `boons::knowledge` can express "phase 1 runs before compression" or
@@ -1856,9 +1993,15 @@ mod tests {
         let apply_lossy = src
             .find("compression::apply_lossy(")
             .expect("apply_lossy call");
-        let guardrails_apply = src
-            .find("guardrails::apply_input(")
-            .expect("guardrails::apply_input call");
+        // The in-flow call, not the `guard_input` helper defined above
+        // `enrich_request` (which would satisfy the ordering vacuously).
+        let guardrails_marker = src
+            .find("---- guardrails boon (input scanning) ----")
+            .expect("guardrails section marker");
+        let guardrails_apply = guardrails_marker
+            + src[guardrails_marker..]
+                .find("guard_input(")
+                .expect("in-flow guard_input call");
         let phase2 = src
             .find("knowledge boon, phase 2")
             .expect("phase 2 marker comment");

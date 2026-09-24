@@ -262,7 +262,13 @@ pub fn router(state: AdminState) -> Router {
         )
         .route(
             "/api/v1/knowledge/collections/:id/documents",
-            get(knowledge::list_documents).post(knowledge::upload_document),
+            // Documents arrive base64-encoded in JSON, well past axum's 2 MB
+            // default; size the limit for the largest permitted upload.
+            get(knowledge::list_documents)
+                .post(knowledge::upload_document)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    knowledge::UPLOAD_BODY_LIMIT_BYTES,
+                )),
         )
         .route(
             "/api/v1/knowledge/collections/:id/reindex",

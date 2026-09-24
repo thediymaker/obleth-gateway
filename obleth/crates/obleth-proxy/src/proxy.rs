@@ -81,6 +81,34 @@ pub(crate) fn admission_timeout() -> Duration {
     })
 }
 
+/// The canonical spelling of a POST path, when it differs from the request's.
+///
+/// Repeated and trailing slashes are removed, and the bare `/responses`, `/messages`,
+/// `/messages/count_tokens`, and `/verdicts` spellings map to their `/v1` forms. Without this,
+/// `/v1/responses/` or `/responses` skipped the translation shims and was
+/// forwarded to the upstream's own endpoint, so a tenant's guardrails never saw
+/// it, and `/v1/chat/completions/` lost its chat classification (and with it
+/// output guardrails and every chat-only boon).
+fn canonical_post_path(path: &str) -> Option<String> {
+    // Runs of `/` collapse to one, so `//v1/responses` cannot skip the shim
+    // (the upstream URL builder strips leading slashes and would forward it).
+    let mut collapsed = String::with_capacity(path.len());
+    for c in path.chars() {
+        if !(c == '/' && collapsed.ends_with('/')) {
+            collapsed.push(c);
+        }
+    }
+    let trimmed = collapsed.trim_end_matches('/');
+    let mapped = match trimmed {
+        "/responses" => crate::responses::RESPONSES_PATH,
+        "/messages" => crate::messages::MESSAGES_PATH,
+        "/messages/count_tokens" => crate::messages::COUNT_TOKENS_PATH,
+        "/verdicts" => crate::verdicts::VERDICTS_PATH,
+        other => other,
+    };
+    (!mapped.is_empty() && mapped != path).then(|| mapped.to_string())
+}
+
 pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Response<Body> {
     let request_id = Uuid::new_v4();
     // The surface marker is the gateway's own annotation (see
@@ -88,6 +116,22 @@ pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Re
     // caller cannot stamp a direct chat call as Responses traffic and pollute
     // the adoption metric. The shim re-inserts it after this strip.
     req.headers_mut().remove(crate::responses::SURFACE_HEADER);
+    if req.method() == Method::POST {
+        if let Some(canonical) = canonical_post_path(req.uri().path()) {
+            let pq = match req.uri().query() {
+                Some(q) => format!("{canonical}?{q}"),
+                None => canonical,
+            };
+            if let Ok(uri) = pq.parse() {
+                *req.uri_mut() = uri;
+            }
+        }
+    }
+    // The router serves the exact `/v1/verdicts` path; its other spellings
+    // arrive here and must reach the same handler, never the upstream.
+    if req.method() == Method::POST && req.uri().path() == crate::verdicts::VERDICTS_PATH {
+        return crate::verdicts::handler(state, req).await;
+    }
     // `/v1/responses` is served by translating to chat completions and back,
     // around the unchanged pipeline — see `crate::responses`.
     if req.method() == Method::POST && req.uri().path() == crate::responses::RESPONSES_PATH {
@@ -1097,6 +1141,10 @@ async fn proxy_handler_inner(
             &available_tags,
             &router_settings,
             effort_header,
+            // The classifier model reads the prompt, and on this path intent is
+            // derived before the tenant input guardrails run: under an input
+            // policy, route on the header and heuristics instead.
+            has_input_guardrails(&resolved),
         )
         .await;
         // Wall-clock around the whole of intent derivation (header parse,
@@ -1268,6 +1316,27 @@ async fn proxy_handler_inner(
             (opt_out, force_lossy)
         })
         .unwrap_or((false, false));
+    // Refused before the input scan so a request that cannot be served never
+    // spends a guard-model call first.
+    if method == Method::POST && output_guardrails_unenforceable(&resolved, &path) {
+        if let Some(t) = tracer.take() {
+            t.finish("error");
+        }
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "this tenant's output guardrails read chat responses only; \
+             use /v1/chat/completions, /v1/responses, or /v1/messages",
+        );
+    }
+    if method == Method::POST && input_guardrails_unscannable(&resolved, &path) {
+        if let Some(t) = tracer.take() {
+            t.finish("error");
+        }
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "this tenant's input guardrails cannot scan requests to this path; \n             use /v1/chat/completions, /v1/responses, or /v1/messages",
+        );
+    }
     let boon_outcome = state
         .boons
         .enrich_request(
@@ -3485,10 +3554,11 @@ pub(crate) async fn derive_intent(
     available_tags: &[String],
     settings: &obleth_config::AutoRouterSettings,
     effort_header: Option<&str>,
+    skip_classifier: bool,
 ) -> crate::router::Intent {
     let forced = crate::router::difficulty_from_header(effort_header);
 
-    if settings.classifier_active() && !available_tags.is_empty() {
+    if !skip_classifier && settings.classifier_active() && !available_tags.is_empty() {
         if let Some(name) = settings.classifier_model.as_deref() {
             if name != crate::router::AUTO_MODEL_NAME {
                 if let Some(brain) = resolve_model(state, name).await {
@@ -4851,6 +4921,50 @@ fn is_chat_path(path: &str) -> bool {
     request_type_for_path(path) == "chat"
 }
 
+/// A block/redact output policy scans chat-completion message content only
+/// (which `/v1/responses` and `/v1/messages` are translated into). Other
+/// endpoints that return model-generated text (legacy completions,
+/// transcription and translation, and unrecognized paths forwarded as-is)
+/// would reach the client unscanned, so under such a policy they are refused.
+/// Endpoints that return no text (embeddings, images, speech, rerank scores,
+/// moderation flags) are unaffected.
+fn output_guardrails_unenforceable(key: &ResolvedKey, path: &str) -> bool {
+    let text_output = match request_type_for_path(path) {
+        "completion" | "other" | "responses" => true,
+        "audio" => path.ends_with("/transcriptions") || path.ends_with("/translations"),
+        _ => false,
+    };
+    text_output
+        && !key.internal
+        && key.guardrails_policy.as_ref().is_some_and(|p| {
+            !p.output_scanners.is_empty()
+                && !matches!(p.action, obleth_config::GuardrailsAction::LogOnly)
+        })
+}
+
+/// Paths whose request bodies the input scanner cannot read: a Responses-shaped
+/// path that did not reach the translation shim (after canonicalization only
+/// an odd spelling or prefix can), and unrecognized paths forwarded as-is.
+/// Under an enforcing (block/redact) input policy these are refused rather
+/// than forwarded unscanned. `log_only` policies observe and never refuse.
+fn input_guardrails_unscannable(key: &ResolvedKey, path: &str) -> bool {
+    matches!(request_type_for_path(path), "responses" | "other")
+        && !key.internal
+        && key.guardrails_policy.as_ref().is_some_and(|p| {
+            !p.input_scanners.is_empty()
+                && !matches!(p.action, obleth_config::GuardrailsAction::LogOnly)
+        })
+}
+
+/// A non-internal key whose tenant has input scanners configured.
+fn has_input_guardrails(key: &ResolvedKey) -> bool {
+    !key.internal
+        && key
+            .guardrails_policy
+            .as_ref()
+            .is_some_and(|p| !p.input_scanners.is_empty())
+}
+
 /// Endpoints whose streams honour `stream_options.include_usage`.
 fn is_stream_usage_path(path: &str) -> bool {
     matches!(request_type_for_path(path), "chat" | "completion")
@@ -5143,12 +5257,14 @@ fn now_ms() -> i64 {
 mod tests {
     use super::{
         admit_request_for, anthropic_error, backfill_max_tokens_for_count_tokens, backoff_for,
-        build_targets, build_upstream_url, clamp_max_tokens, effective_request_type,
-        has_path_traversal, is_chat_path, is_models_collection, is_models_endpoint,
+        build_targets, build_upstream_url, canonical_post_path, clamp_max_tokens,
+        effective_request_type, has_input_guardrails, has_path_traversal,
+        input_guardrails_unscannable, is_chat_path, is_models_collection, is_models_endpoint,
         is_retryable_status, looks_like_context_length_error, messages_input_estimate,
-        prepare_upstream_body, redress_error, request_type_for_path, resolve_conversation,
-        session_hash_order, should_translate_as_stream, strip_beta_query, surface,
-        tenant_active_now, weighted_order, RequestMeta, TooLong,
+        output_guardrails_unenforceable, prepare_upstream_body, redress_error,
+        request_type_for_path, resolve_conversation, session_hash_order,
+        should_translate_as_stream, strip_beta_query, surface, tenant_active_now, weighted_order,
+        RequestMeta, TooLong,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::Body;
@@ -5216,6 +5332,176 @@ mod tests {
             compression_policy: None,
             synthetic: false,
         }
+    }
+
+    #[test]
+    fn legacy_completions_are_refused_only_under_an_enforcing_output_policy() {
+        let policy = |action, output: &[&str]| obleth_config::GuardrailsPolicy {
+            action,
+            input_scanners: vec![],
+            output_scanners: output.iter().map(|s| s.to_string()).collect(),
+            guard_model: None,
+            ban_keywords: vec![],
+            fail_open: true,
+        };
+        let mut key = key_with_schedule("UTC", None, None, None);
+        assert!(!output_guardrails_unenforceable(&key, "/v1/completions"));
+
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::Block, &["pii"]));
+        assert!(output_guardrails_unenforceable(&key, "/v1/completions"));
+        assert!(!output_guardrails_unenforceable(
+            &key,
+            "/v1/chat/completions"
+        ));
+
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::Redact, &["pii"]));
+        assert!(output_guardrails_unenforceable(&key, "/v1/completions"));
+
+        // log_only is observed after the stream, never enforced: not refused.
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::LogOnly, &["pii"]));
+        assert!(!output_guardrails_unenforceable(&key, "/v1/completions"));
+
+        // No output scanners: nothing to enforce on the response.
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::Block, &[]));
+        assert!(!output_guardrails_unenforceable(&key, "/v1/completions"));
+
+        // Other endpoints that return generated text are refused too; those
+        // that return no text are not.
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::Block, &["pii"]));
+        for path in [
+            "/v1/audio/transcriptions",
+            "/v1/audio/translations",
+            "/v1/some/unknown/path",
+        ] {
+            assert!(output_guardrails_unenforceable(&key, path), "{path}");
+        }
+        for path in [
+            "/v1/embeddings",
+            "/v1/audio/speech",
+            "/v1/images/generations",
+            "/v1/rerank",
+            "/v1/moderations",
+        ] {
+            assert!(!output_guardrails_unenforceable(&key, path), "{path}");
+        }
+
+        // Internal probe keys are exempt from guardrails.
+        key.internal = true;
+        assert!(!output_guardrails_unenforceable(&key, "/v1/completions"));
+    }
+
+    #[test]
+    fn output_guardrails_refusal_runs_before_the_input_scan() {
+        let src = include_str!("proxy.rs");
+        let refuse = src
+            .find("if method == Method::POST && output_guardrails_unenforceable(&resolved, &path)")
+            .expect("output guardrails refusal");
+        let enrich = src.find(".enrich_request(").expect("enrich_request call");
+        assert!(refuse < enrich);
+    }
+
+    #[test]
+    fn post_paths_are_canonicalized_before_surface_dispatch() {
+        assert_eq!(
+            canonical_post_path("/responses").as_deref(),
+            Some("/v1/responses")
+        );
+        assert_eq!(
+            canonical_post_path("/v1/responses/").as_deref(),
+            Some("/v1/responses")
+        );
+        assert_eq!(
+            canonical_post_path("/messages").as_deref(),
+            Some("/v1/messages")
+        );
+        assert_eq!(
+            canonical_post_path("/messages/count_tokens/").as_deref(),
+            Some("/v1/messages/count_tokens")
+        );
+        assert_eq!(
+            canonical_post_path("/verdicts").as_deref(),
+            Some("/v1/verdicts")
+        );
+        assert_eq!(
+            canonical_post_path("/v1/chat/completions//").as_deref(),
+            Some("/v1/chat/completions")
+        );
+        // Repeated slashes collapse, so a doubled prefix cannot skip a shim.
+        assert_eq!(
+            canonical_post_path("//v1/responses").as_deref(),
+            Some("/v1/responses")
+        );
+        assert_eq!(
+            canonical_post_path("/v1//messages").as_deref(),
+            Some("/v1/messages")
+        );
+        // Already canonical, or nothing to trim: untouched.
+        assert_eq!(canonical_post_path("/v1/chat/completions"), None);
+        assert_eq!(canonical_post_path("/"), None);
+        // Normalization runs before the shim dispatch in `proxy_handler`.
+        let src = include_str!("proxy.rs");
+        let handler = src
+            .find("pub async fn proxy_handler(")
+            .expect("proxy_handler");
+        let canon = handler
+            + src[handler..]
+                .find("canonical_post_path(req.uri().path())")
+                .expect("normalization");
+        let shim = handler
+            + src[handler..]
+                .find("return responses_shim(")
+                .expect("responses dispatch");
+        assert!(canon < shim);
+    }
+
+    #[test]
+    fn unscannable_paths_are_refused_only_under_an_enforcing_input_policy() {
+        let policy = |action| obleth_config::GuardrailsPolicy {
+            action,
+            input_scanners: vec!["pii".into()],
+            output_scanners: vec![],
+            guard_model: None,
+            ban_keywords: vec![],
+            fail_open: true,
+        };
+        let mut key = key_with_schedule("UTC", None, None, None);
+        assert!(!input_guardrails_unscannable(&key, "/v2/responses"));
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::Block));
+        for path in [
+            "/v2/responses",
+            "/openai/v1/responses",
+            "/v1/some/unknown/path",
+        ] {
+            assert!(input_guardrails_unscannable(&key, path), "{path}");
+        }
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"] {
+            assert!(!input_guardrails_unscannable(&key, path), "{path}");
+        }
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::LogOnly));
+        assert!(!input_guardrails_unscannable(&key, "/v2/responses"));
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::Redact));
+        key.internal = true;
+        assert!(!input_guardrails_unscannable(&key, "/v2/responses"));
+    }
+
+    #[test]
+    fn the_classifier_is_skipped_under_an_input_policy() {
+        let mut key = key_with_schedule("UTC", None, None, None);
+        assert!(!has_input_guardrails(&key));
+        key.guardrails_policy = Some(obleth_config::GuardrailsPolicy {
+            action: obleth_config::GuardrailsAction::LogOnly,
+            input_scanners: vec!["pii".into()],
+            output_scanners: vec![],
+            guard_model: None,
+            ban_keywords: vec![],
+            fail_open: true,
+        });
+        assert!(has_input_guardrails(&key));
+        key.internal = true;
+        assert!(!has_input_guardrails(&key));
+        let src = include_str!("proxy.rs");
+        assert!(src
+            .contains("            has_input_guardrails(&resolved),\n        )\n        .await;"));
     }
 
     #[test]

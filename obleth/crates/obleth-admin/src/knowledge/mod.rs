@@ -6,6 +6,7 @@ pub mod indexer;
 
 use std::collections::HashMap;
 
+use crate::{audit_actor, sync_model, AdminError, AdminState, Result};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -16,7 +17,15 @@ use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
-use crate::{audit_actor, sync_model, AdminError, AdminState, Result};
+/// Largest per-file upload the knowledge settings may allow (50 MiB).
+/// `max_upload_bytes` is clamped to it on update and at upload time.
+pub const MAX_UPLOAD_CEILING_BYTES: i64 = 50 * 1024 * 1024;
+
+/// Request-body limit for the document upload route: a base64-encoded file
+/// at [`MAX_UPLOAD_CEILING_BYTES`] (4 bytes per 3, padded) plus 1 MiB for the
+/// JSON envelope, title, and filename.
+pub const UPLOAD_BODY_LIMIT_BYTES: usize =
+    (MAX_UPLOAD_CEILING_BYTES as usize).div_ceil(3) * 4 + 1024 * 1024;
 
 /// Reject an upload before decoding, then require valid UTF-8. Binary formats
 /// are a later addition; today an undecodable file is a clear error rather
@@ -372,7 +381,13 @@ pub async fn upload_document(
     state.store.get_collection(id).await?;
 
     let settings = state.store.get_boon_settings().await?.unwrap_or_default();
-    let max_bytes = settings.knowledge.max_upload_bytes;
+    // Capped at the ceiling the route body limit is sized for: a stored
+    // value above it (restored from a backup, or set before the cap existed)
+    // would otherwise promise uploads the route rejects before this handler.
+    let max_bytes = settings
+        .knowledge
+        .max_upload_bytes
+        .min(MAX_UPLOAD_CEILING_BYTES);
 
     // Reject an oversized upload before decoding: base64 decodes to about
     // 3/4 of its encoded length, so this estimate lets a hostile upload fail
@@ -772,7 +787,9 @@ impl KnowledgeSettingsView {
             embed_timeout_ms: s.embed_timeout_ms,
             query_cache_ttl_s: s.query_cache_ttl_s,
             query_turns: s.query_turns,
-            max_upload_bytes: s.max_upload_bytes,
+            // The effective limit: a value stored above the ceiling is clamped at
+            // upload time, so report what uploads will actually get.
+            max_upload_bytes: s.max_upload_bytes.min(MAX_UPLOAD_CEILING_BYTES),
             max_chunks_per_collection: s.max_chunks_per_collection,
             index_batch_size: s.index_batch_size,
             index_timeout_ms: s.index_timeout_ms,
@@ -798,7 +815,8 @@ pub struct UpdateKnowledgeSettings {
     pub query_cache_ttl_s: Option<u64>,
     #[serde(default)]
     pub query_turns: Option<u32>,
-    /// Per-file upload cap in bytes. Omit/zero leaves it unchanged.
+    /// Per-file upload cap in bytes, at most [`MAX_UPLOAD_CEILING_BYTES`]
+    /// (larger values are clamped). Omit/zero leaves it unchanged.
     #[serde(default)]
     pub max_upload_bytes: Option<i64>,
     #[serde(default)]
@@ -865,6 +883,7 @@ pub async fn put_knowledge_settings(
         max_upload_bytes: body
             .max_upload_bytes
             .filter(|n| *n > 0)
+            .map(|n| n.min(MAX_UPLOAD_CEILING_BYTES))
             .unwrap_or(k.max_upload_bytes),
         max_chunks_per_collection: body
             .max_chunks_per_collection
@@ -906,6 +925,20 @@ pub async fn put_knowledge_settings(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_body_limit_fits_a_full_size_base64_upload() {
+        // The route limit must admit the largest permitted file once
+        // base64-encoded and wrapped in JSON, or uploads the settings allow
+        // fail before reaching the handler (axum's default is 2 MB).
+        let encoded = base64::engine::general_purpose::STANDARD
+            .encode(vec![0u8; MAX_UPLOAD_CEILING_BYTES as usize])
+            .len();
+        let envelope = r#"{"title":"","filename":"","content_base64":""}"#.len() + 2 * 255;
+        assert!(encoded + envelope <= UPLOAD_BODY_LIMIT_BYTES);
+        const { assert!(UPLOAD_BODY_LIMIT_BYTES > 2 * 1024 * 1024) };
+        assert!(KnowledgeBoonSettings::default().max_upload_bytes <= MAX_UPLOAD_CEILING_BYTES);
+    }
 
     #[test]
     fn upload_rejects_oversized_files_before_decoding() {

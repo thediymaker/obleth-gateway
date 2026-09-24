@@ -30,6 +30,10 @@ const nextConfig = {
       // action; large key fleets exceed the 1 MB default.
       bodySizeLimit: "64mb",
     },
+    // Request bodies passing through proxy.ts are buffered and cut off at
+    // 10 MB by default. Knowledge uploads send files base64-encoded in JSON
+    // (up to 50 MiB decoded, the gateway's ceiling), so allow the encoded size.
+    proxyClientMaxBodySize: "72mb",
   },
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];

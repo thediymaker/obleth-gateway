@@ -114,8 +114,9 @@ if check_term then
   if stored ~= period then
     redis.call('DEL', term)
     redis.call('HSET', term, 'period', period)
-    redis.call('PEXPIRE', term, 31536000000)
   end
+  -- clears a TTL left by an earlier version (committed usage never expires)
+  redis.call('PERSIST', term)
   local t = redis.call('HMGET', term, 'tokens', 'cost')
   term_tokens = tonumber(t[1]) or 0
   term_cost   = t[2] or '0'
@@ -231,6 +232,8 @@ if stored ~= period then
   redis.call('DEL', key)
   redis.call('HSET', key, 'period', period)
 end
+-- clears a TTL left by an earlier version (committed usage never expires)
+redis.call('PERSIST', key)
 local tokens = tonumber(redis.call('HGET', key, 'tokens')) or 0
 local cost   = redis.call('HGET', key, 'cost') or '0'
 return { tokens, cost }
@@ -255,8 +258,11 @@ if stored ~= period then
 end
 local tokens = redis.call('HINCRBY', key, 'tokens', tonumber(ARGV[2]))
 local cost   = redis.call('HINCRBYFLOAT', key, 'cost', tonumber(ARGV[3]))
--- safety expiry so abandoned tenants don't linger forever (refreshed on use)
-redis.call('PEXPIRE', key, 31536000000)
+-- no TTL: committed usage is budget state, not cache. Under a volatile-*
+-- eviction policy a TTL would make it evictable, silently resetting the
+-- scope's spend mid-period. PERSIST also clears the 1-year TTL that
+-- earlier versions set.
+redis.call('PERSIST', key)
 return { tokens, cost }
 "#;
 
@@ -299,6 +305,6 @@ end
 
 local tokens = redis.call('HINCRBY', key, 'tokens', tonumber(ARGV[4]))
 local cost   = redis.call('HINCRBYFLOAT', key, 'cost', tonumber(ARGV[5]))
-redis.call('PEXPIRE', key, 31536000000)
+redis.call('PERSIST', key)
 return { tokens, cost }
 "#;

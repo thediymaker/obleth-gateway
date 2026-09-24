@@ -430,7 +430,7 @@ async fn handler_inner(
     }
 
     // ---- prompt prep (shared prefix + per-question bodies) ----
-    let system = prompt::render_system(&request.state);
+    let mut system = prompt::render_system(&request.state);
     if system.len() > types::MAX_STATE_BYTES {
         return error_json(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -446,7 +446,7 @@ async fn handler_inner(
         .iter()
         .map(|(id, q)| (id, prompt::labels_for(q)))
         .collect();
-    let users: Vec<String> = request
+    let mut users: Vec<String> = request
         .questions
         .iter()
         .map(|(id, q)| prompt::render_user(q, &label_sets[id]))
@@ -467,6 +467,58 @@ async fn handler_inner(
     };
     if let Some(t) = tracer.as_mut() {
         t.set_conversation(&req_meta.session_id, req_meta.session_id_source);
+    }
+    // ---- tenant input guardrails ----
+    // The state and every question reach the model, so the tenant's input
+    // policy applies here exactly as on chat. Scanned as one chat-shaped body
+    // (system = rendered state, one user turn per question); a redaction is
+    // read back into the prompts before estimating and dispatching.
+    let mut scan_body = serde_json::json!({
+        "messages": std::iter::once(serde_json::json!({"role": "system", "content": system}))
+            .chain(users.iter().map(|u| serde_json::json!({"role": "user", "content": u})))
+            .collect::<Vec<_>>()
+    });
+    match state
+        .boons
+        .scan_input(
+            &state,
+            &resolved,
+            &req_meta.session_id,
+            &mut scan_body,
+            tracer.as_mut(),
+        )
+        .await
+    {
+        Err(block) => {
+            if let Some(t) = tracer.take() {
+                t.finish("error");
+            }
+            return error_json(block.status, block.reason);
+        }
+        Ok(true) => {
+            let texts: Vec<String> = scan_body["messages"]
+                .as_array()
+                .map(|m| {
+                    m.iter()
+                        .map(|msg| msg["content"].as_str().unwrap_or_default().to_string())
+                        .collect()
+                })
+                .unwrap_or_default();
+            // Fail closed: sending the unredacted prompts would bypass the
+            // policy the scan just applied.
+            if texts.len() != users.len() + 1 {
+                if let Some(t) = tracer.take() {
+                    t.finish("error");
+                }
+                return error_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "guardrails redaction could not be applied",
+                );
+            }
+            system = texts[0].clone();
+            users = texts[1..].to_vec();
+        }
+        Ok(false) => {}
     }
     let est = estimate(&*state.tokenizer, &system, &users);
 
@@ -503,6 +555,8 @@ async fn handler_inner(
             &available_tags,
             &router_settings,
             effort_header,
+            // Input guardrails already ran on this state and these questions.
+            false,
         )
         .await;
         let grants = crate::router::BoonGrants::from_settings(&state.boons.settings());
@@ -1505,6 +1559,22 @@ mod settlement_tests {
         // No legacy ledger-only rejection after the reservation owns budget.
         assert!(!h[guard..].contains("returnreject("));
         assert_eq!(h[guard..].matches("settle_guard.complete(").count(), 2);
+    }
+
+    #[test]
+    fn verdicts_scan_tenant_input_guardrails_before_estimate_and_admission() {
+        let h = handler();
+        let scan = h
+            .find(".scan_input(")
+            .expect("tenant input guardrails scan");
+        let estimate = h
+            .find("letest=estimate(&*state.tokenizer,&system,&users);")
+            .expect("cost estimate");
+        let admit = h.find("state.fairshare.admit(").expect("admission");
+        assert!(scan < estimate && estimate < admit);
+        // A block answers with the policy's status; a redaction is read back.
+        assert!(h[scan..estimate].contains("returnerror_json(block.status,block.reason);"));
+        assert!(h[scan..estimate].contains("system=texts[0].clone();"));
     }
 
     #[test]

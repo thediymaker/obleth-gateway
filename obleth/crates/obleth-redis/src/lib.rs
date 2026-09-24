@@ -1101,13 +1101,68 @@ mod tests {
             reserved_field(&store, &scope, "tokens").await.as_deref(),
             Some("20")
         );
-        // Committed usage keeps its long TTL, independent of reservations.
+        // Committed usage has no TTL at all, independent of reservations: it
+        // is budget state, and a TTL would make it evictable under
+        // volatile-lru.
         let ttl: i64 = redis::cmd("PTTL")
             .arg(RedisStore::term_usage_key(&scope))
             .query_async(&mut conn)
             .await
             .unwrap();
-        assert!(ttl > 600_000, "PTTL={ttl}");
+        assert_eq!(ttl, -1, "committed term usage must not expire");
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn committed_term_usage_never_expires_and_drops_a_legacy_ttl() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let scope = Uuid::new_v4();
+        let key = RedisStore::term_usage_key(&scope);
+        let mut conn = store.conn.clone();
+
+        store.term_usage_add(&scope, "l:0", 10, 0.5).await.unwrap();
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(ttl, -1, "add must leave committed usage without a TTL");
+
+        // A key written by an earlier version carries a 1-year TTL; the next
+        // write must clear it, not refresh it.
+        let _: i64 = redis::cmd("PEXPIRE")
+            .arg(&key)
+            .arg(31_536_000_000_i64)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        store.term_usage_add(&scope, "l:0", 5, 0.0).await.unwrap();
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(ttl, -1, "a legacy TTL must be cleared on the next add");
+        assert_eq!(store.term_usage_read(&scope, "l:0").await.unwrap().0, 15);
+
+        // A scope that is only ever read (no new usage) is cleared too.
+        let _: i64 = redis::cmd("PEXPIRE")
+            .arg(&key)
+            .arg(31_536_000_000_i64)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(store.term_usage_read(&scope, "l:0").await.unwrap().0, 15);
+        let ttl: i64 = redis::cmd("PTTL")
+            .arg(&key)
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(ttl, -1, "a legacy TTL must be cleared on read");
+
+        let _: () = conn.del(&key).await.unwrap();
     }
 
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
