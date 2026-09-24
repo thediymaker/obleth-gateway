@@ -3173,7 +3173,7 @@ function modelTypeHint(type: string): string {
     case "audio_speech":
       return "Serves /v1/audio/speech. Billed per input character.";
     case "image":
-      return "Serves /v1/images/generations. Billed per image.";
+      return "Serves /v1/images/generations, /v1/images/edits and /v1/images/variations (multipart image upload). Billed per image.";
     default:
       return "";
   }

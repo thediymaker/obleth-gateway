@@ -985,10 +985,12 @@ async fn proxy_handler_inner(
     };
     let mut json: serde_json::Value =
         serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
-    // Audio transcription/translation send the model as a `multipart/form-data`
-    // field alongside the uploaded file, not as JSON. Parse the fields once so
-    // we can resolve the model and later rebuild the upstream form with the
-    // model name swapped.
+    // File-upload endpoints (audio transcription/translation, image edits and
+    // variations) send the model as a `multipart/form-data` field alongside
+    // the uploaded file, not as JSON. Parse the fields once so we can resolve
+    // the model and later rebuild the upstream form with the model name
+    // swapped. The text fields stand in for the JSON body from here on, so
+    // the input guardrails scan the prompt and image cost reads `n`.
     let content_type_in = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -1006,6 +1008,9 @@ async fn proxy_handler_inner(
         } else {
             None
         };
+    if let Some(fields) = &multipart_fields {
+        json = multipart_text_view(fields);
+    }
 
     let mut model = if let Some(fields) = &multipart_fields {
         fields
@@ -1358,9 +1363,14 @@ async fn proxy_handler_inner(
         return error_json(block.status, block.reason);
     }
     if boon_outcome.rewritten {
-        match serde_json::to_vec(&json) {
-            Ok(bytes) => body_bytes = Bytes::from(bytes),
-            Err(e) => tracing::warn!(error = %e, "failed to re-serialize boon-rewritten body"),
+        if let Some(fields) = multipart_fields.as_mut() {
+            // The form is rebuilt from its fields at dispatch, not from the body.
+            apply_multipart_text_view(fields, &json);
+        } else {
+            match serde_json::to_vec(&json) {
+                Ok(bytes) => body_bytes = Bytes::from(bytes),
+                Err(e) => tracing::warn!(error = %e, "failed to re-serialize boon-rewritten body"),
+            }
         }
         // The body changed (e.g. images became text descriptions); the
         // admission estimate must reflect what is actually sent upstream.
@@ -4365,26 +4375,36 @@ fn is_model_info_endpoint(path: &str) -> bool {
     path == "/model/info" || path == "/v1/model/info"
 }
 
+/// OpenAI endpoints that must name a registered model.
+const REGISTERED_MODEL_PATHS: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/responses",
+    "/v1/audio/transcriptions",
+    "/v1/audio/translations",
+    "/v1/audio/speech",
+    "/v1/images/generations",
+    "/v1/images/edits",
+    "/v1/images/variations",
+];
+
 fn requires_registered_model(path: &str) -> bool {
+    REGISTERED_MODEL_PATHS.contains(&path)
+}
+
+/// True when the endpoint takes a file upload, so the OpenAI spec sends it as
+/// `multipart/form-data` with the model as a form field rather than JSON:
+/// audio transcription/translation, and the two image endpoints that take a
+/// source image (edits and variations).
+fn is_multipart_endpoint(path: &str) -> bool {
     matches!(
         path,
-        "/v1/chat/completions"
-            | "/v1/completions"
-            | "/v1/embeddings"
-            | "/v1/responses"
-            | "/v1/audio/transcriptions"
+        "/v1/audio/transcriptions"
             | "/v1/audio/translations"
-            | "/v1/audio/speech"
-            | "/v1/images/generations"
             | "/v1/images/edits"
             | "/v1/images/variations"
     )
-}
-
-/// True when the endpoint carries the model name in a multipart/form-data body
-/// (audio transcription/translation file uploads) rather than JSON.
-fn is_multipart_endpoint(path: &str) -> bool {
-    matches!(path, "/v1/audio/transcriptions" | "/v1/audio/translations")
 }
 
 /// A single parsed `multipart/form-data` field, held in memory so it can be
@@ -4420,6 +4440,47 @@ async fn parse_multipart(
         });
     }
     Ok(fields)
+}
+
+/// The form's text fields as a JSON object, so the stages that read the
+/// request body (the token estimate, the input guardrails, the per-image
+/// cost) see a multipart request the way they see a JSON one. File parts are
+/// left out. Values stay strings, as the form sent them; a name that repeats
+/// becomes an array, so every occurrence is scanned.
+fn multipart_text_view(fields: &[MultipartField]) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for f in fields.iter().filter(|f| f.file_name.is_none()) {
+        let text = serde_json::Value::String(String::from_utf8_lossy(&f.data).into_owned());
+        match obj.get_mut(&f.name) {
+            None => {
+                obj.insert(f.name.clone(), text);
+            }
+            Some(serde_json::Value::Array(items)) => items.push(text),
+            Some(first) => *first = serde_json::Value::Array(vec![first.take(), text]),
+        }
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Copy text fields rewritten in the JSON view (a redacting input policy)
+/// back into the form, so what is forwarded is what was scanned. The inverse
+/// of [`multipart_text_view`]: a repeated name maps onto its array by position.
+fn apply_multipart_text_view(fields: &mut [MultipartField], view: &serde_json::Value) {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for f in fields.iter_mut().filter(|f| f.file_name.is_none()) {
+        let index = seen.entry(f.name.clone()).or_insert(0);
+        let value = match view.get(&f.name) {
+            Some(serde_json::Value::Array(items)) => items.get(*index),
+            other if *index == 0 => other,
+            _ => None,
+        };
+        *index += 1;
+        if let Some(text) = value.and_then(|v| v.as_str()) {
+            if text.as_bytes() != f.data.as_ref() {
+                f.data = Bytes::from(text.to_string());
+            }
+        }
+    }
 }
 
 /// Rebuild a reqwest multipart form from parsed fields, replacing the client
@@ -4468,7 +4529,16 @@ fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value
     };
     match route.model_type.as_str() {
         "image" => {
-            let n = json.get("n").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
+            // `n` is a number in a JSON body and a string in a multipart form
+            // (edits and variations).
+            let n = json
+                .get("n")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                })
+                .unwrap_or(1)
+                .max(1);
             n as f64 * route.cost_per_image
         }
         "audio_speech" => {
@@ -5256,18 +5326,19 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_request_for, anthropic_error, backfill_max_tokens_for_count_tokens, backoff_for,
-        build_targets, build_upstream_url, canonical_post_path, clamp_max_tokens,
-        effective_request_type, has_input_guardrails, has_path_traversal,
-        input_guardrails_unscannable, is_chat_path, is_models_collection, is_models_endpoint,
-        is_retryable_status, looks_like_context_length_error, messages_input_estimate,
-        output_guardrails_unenforceable, prepare_upstream_body, redress_error,
-        request_type_for_path, resolve_conversation, session_hash_order,
+        admit_request_for, anthropic_error, apply_multipart_text_view,
+        backfill_max_tokens_for_count_tokens, backoff_for, build_targets, build_upstream_url,
+        canonical_post_path, clamp_max_tokens, compute_modality_cost, effective_request_type,
+        has_input_guardrails, has_path_traversal, input_guardrails_unscannable, is_chat_path,
+        is_models_collection, is_models_endpoint, is_multipart_endpoint, is_retryable_status,
+        looks_like_context_length_error, messages_input_estimate, multipart_text_view,
+        output_guardrails_unenforceable, parse_multipart, prepare_upstream_body, redress_error,
+        request_type_for_path, requires_registered_model, resolve_conversation, session_hash_order,
         should_translate_as_stream, strip_beta_query, surface, tenant_active_now, weighted_order,
-        RequestMeta, TooLong,
+        MultipartField, RequestMeta, TooLong, REGISTERED_MODEL_PATHS,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use axum::http::{header, HeaderMap, Response, StatusCode};
     use chrono::{DateTime, TimeZone, Utc};
     use obleth_config::{ResolvedEndpoint, ResolvedKey, ResolvedModel, WeeklyWindow};
@@ -7087,6 +7158,106 @@ mod tests {
         assert_eq!(req.key_max_in_flight, None);
         assert_eq!(req.model_max_in_flight, None);
     }
+    /// Endpoints whose OpenAI spec sends `multipart/form-data` (they take a
+    /// file upload).
+    const SPEC_MULTIPART_PATHS: &[&str] = &[
+        "/v1/audio/transcriptions",
+        "/v1/audio/translations",
+        "/v1/images/edits",
+        "/v1/images/variations",
+    ];
+
+    #[test]
+    fn every_registered_multipart_endpoint_parses_its_form() {
+        // The two lists drifted once: the image upload endpoints required a
+        // model but their form was never parsed, so the model field was never
+        // seen and every request failed "model is required".
+        for path in REGISTERED_MODEL_PATHS {
+            assert_eq!(
+                is_multipart_endpoint(path),
+                SPEC_MULTIPART_PATHS.contains(path),
+                "{path}"
+            );
+        }
+        for path in SPEC_MULTIPART_PATHS {
+            assert!(requires_registered_model(path), "{path}");
+        }
+    }
+
+    fn image_edit_form() -> (String, Bytes) {
+        let boundary = "XBOUNDARYX".to_string();
+        let body = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nflux\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nadd a hat\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"n\"\r\n\r\n3\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"cat.png\"\r\n\
+             Content-Type: image/png\r\n\r\nPNGDATA\r\n\
+             --{b}--\r\n",
+            b = boundary
+        );
+        (boundary, Bytes::from(body))
+    }
+
+    #[tokio::test]
+    async fn an_image_edit_form_reads_like_a_json_body() {
+        let (boundary, body) = image_edit_form();
+        let fields = parse_multipart(&body, &boundary)
+            .await
+            .expect("form parses");
+        let view = multipart_text_view(&fields);
+        // The file is not text the scanners or the estimate should read.
+        assert_eq!(
+            view,
+            serde_json::json!({"model": "flux", "prompt": "add a hat", "n": "3"})
+        );
+
+        // Priced per image from the form's `n`, like a JSON generation.
+        let mut route = minimal_model("flux");
+        route.model_type = "image".into();
+        route.cost_per_image = 0.04;
+        assert!((compute_modality_cost(Some(&route), &view) - 0.12).abs() < 1e-9);
+        let json_body = serde_json::json!({"prompt": "x", "n": 2});
+        assert!((compute_modality_cost(Some(&route), &json_body) - 0.08).abs() < 1e-9);
+        let unset = serde_json::json!({"prompt": "x"});
+        assert!((compute_modality_cost(Some(&route), &unset) - 0.04).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn a_redacted_prompt_is_what_the_form_forwards() {
+        let (boundary, body) = image_edit_form();
+        let mut fields = parse_multipart(&body, &boundary)
+            .await
+            .expect("form parses");
+        let mut view = multipart_text_view(&fields);
+        view["prompt"] = serde_json::json!("add a [REDACTED]");
+        apply_multipart_text_view(&mut fields, &view);
+
+        let prompt = fields.iter().find(|f| f.name == "prompt").unwrap();
+        assert_eq!(prompt.data.as_ref(), b"add a [REDACTED]");
+        // The file part and the untouched fields keep their bytes.
+        let image = fields.iter().find(|f| f.name == "image").unwrap();
+        assert_eq!(image.data.as_ref(), b"PNGDATA");
+        assert_eq!(image.file_name.as_deref(), Some("cat.png"));
+        let n = fields.iter().find(|f| f.name == "n").unwrap();
+        assert_eq!(n.data.as_ref(), b"3");
+    }
+
+    #[test]
+    fn a_repeated_text_field_is_scanned_and_redacted_in_every_occurrence() {
+        let text = |name: &str, data: &str| MultipartField {
+            name: name.into(),
+            file_name: None,
+            content_type: None,
+            data: Bytes::from(data.to_string()),
+        };
+        let mut fields = vec![text("prompt", "first"), text("prompt", "second")];
+        let mut view = multipart_text_view(&fields);
+        assert_eq!(view["prompt"], serde_json::json!(["first", "second"]));
+        view["prompt"][1] = serde_json::json!("[REDACTED]");
+        apply_multipart_text_view(&mut fields, &view);
+        assert_eq!(fields[0].data.as_ref(), b"first");
+        assert_eq!(fields[1].data.as_ref(), b"[REDACTED]");
+    }
 }
 
 #[cfg(test)]
@@ -7392,5 +7563,24 @@ mod lifecycle_tests {
         let body = serde_json::json!({ "usage": { "prompt_tokens": 4, "completion_tokens": 9 } });
         assert_eq!(completion_body_usage(&body), Some((4, 9)));
         assert_eq!(completion_body_usage(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn the_form_stands_in_for_the_body_before_guardrails_and_pricing() {
+        let src = squash(handler());
+        let view = src
+            .find("json=multipart_text_view(fields);")
+            .expect("the form's text fields replace the JSON body");
+        let scan = src
+            .find(".enrich_request(")
+            .expect("the boon/guardrail pass");
+        let price = src
+            .find("compute_modality_cost(route.as_deref(),&json)")
+            .expect("the modality price");
+        assert!(view < scan && view < price);
+        let write_back = src
+            .find("apply_multipart_text_view(fields,&json);")
+            .expect("a redaction reaches the forwarded form");
+        assert!(scan < write_back);
     }
 }

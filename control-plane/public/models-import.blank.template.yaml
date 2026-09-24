@@ -100,7 +100,9 @@ models:
   # ---- Example 4: image generation (/v1/images/generations) ----
   # Works with any OpenAI-compatible image endpoint, including a Stable
   # Diffusion server that exposes /v1/images/generations directly
-  # (pass-through, no adapter needed).
+  # (pass-through, no adapter needed). /v1/images/edits and
+  # /v1/images/variations take the source image as multipart/form-data, like
+  # audio uploads; cost_per_image is charged per image requested (`n`).
   - model_name: sd-xl
     description: Stable Diffusion XL image generation
     upstream_model: stable-diffusion-xl
