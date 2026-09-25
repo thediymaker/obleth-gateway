@@ -262,9 +262,13 @@ export interface ModelCapacityStatus {
   /** Kubernetes source: the Service whose ready endpoints are counted. */
   service: string | null;
   ready_replicas: number | null;
+  /** The value every ready replica shares; null when they differ. */
   per_replica_max_in_flight: number | null;
   /** `configured`, `endpoint`, or `endpoint and configured`. */
   per_replica_source: string | null;
+  /** The ready replicas' concurrency summed: ready × per replica, or each
+   *  endpoint's own value added up. */
+  replica_capacity?: number | null;
   headroom: number;
   /** Last value derived from the source: the cluster-wide pool size. */
   derived_max_in_flight: number | null;

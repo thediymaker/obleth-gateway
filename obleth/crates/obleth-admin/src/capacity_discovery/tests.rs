@@ -855,7 +855,9 @@ async fn the_endpoints_source_counts_enabled_healthy_endpoints() {
     assert_eq!(s.state, STATE_DISCOVERED);
     assert_eq!(s.ready_replicas, Some(2));
     assert_eq!(s.effective_max_in_flight, 24, "16 + 8");
-    assert_eq!(s.per_replica_max_in_flight, Some(12));
+    assert_eq!(s.per_replica_max_in_flight, None, "the endpoints differ");
+    assert_eq!(s.replica_capacity, Some(24));
+    assert_eq!(s.per_replica_source.as_deref(), Some(PER_REPLICA_BOTH));
     assert_eq!(pool_size(&fs, "e").await, 24);
 
     // Under failover only the endpoint in use takes traffic.
@@ -872,6 +874,73 @@ async fn the_endpoints_source_counts_enabled_healthy_endpoints() {
     let s = status(&handle, "e");
     assert_eq!(s.state, STATE_STALE);
     assert_eq!(s.effective_max_in_flight, 16);
+}
+
+/// Endpoints with their own values are summed, each unset one at the
+/// model's per-replica value: 8 + 2 + 4 = 14, not 3 x ceil(14 / 3) = 15.
+#[tokio::test]
+async fn mixed_endpoint_values_are_summed_not_averaged() {
+    let handle = settings(&[], "");
+    let fs = fairshare();
+    let mut d = Discoverer::new(None, fs.clone(), 32);
+    let mut t = endpoints_target(
+        "load_balance",
+        vec![
+            endpoint(0, true, true, Some(8)),
+            endpoint(1, true, true, Some(2)),
+            endpoint(2, true, true, None),
+        ],
+    );
+    t.per_replica_max_in_flight = Some(4);
+    d.pass(&handle, vec![t.clone()]).await;
+    let s = status(&handle, "e");
+    assert_eq!(s.state, STATE_DISCOVERED);
+    assert_eq!(s.ready_replicas, Some(3));
+    assert_eq!(s.replica_capacity, Some(14));
+    assert_eq!(s.effective_max_in_flight, 14);
+    assert_eq!(s.per_replica_max_in_flight, None);
+    assert_eq!(pool_size(&fs, "e").await, 14);
+
+    // Headroom scales the sum: ceil(14 x 1.1) = 16, where the average would
+    // give ceil(15 x 1.1) = 17.
+    t.headroom = 1.1;
+    d.pass(&handle, vec![t.clone()]).await;
+    assert_eq!(status(&handle, "e").effective_max_in_flight, 16);
+
+    // Only the endpoints' own values: summed the same way.
+    t.headroom = 1.0;
+    t.per_replica_max_in_flight = None;
+    t.endpoints[2].max_in_flight = Some(5);
+    d.pass(&handle, vec![t]).await;
+    let s = status(&handle, "e");
+    assert_eq!(s.effective_max_in_flight, 15, "8 + 2 + 5");
+    assert_eq!(s.per_replica_source.as_deref(), Some(PER_REPLICA_ENDPOINT));
+}
+
+/// No endpoint carries a value: every ready one counts at the model's.
+#[tokio::test]
+async fn endpoints_without_values_count_at_the_per_replica_value() {
+    let handle = settings(&[], "");
+    let mut d = Discoverer::new(None, fairshare(), 32);
+    let mut t = endpoints_target(
+        "load_balance",
+        vec![
+            endpoint(0, true, true, None),
+            endpoint(1, true, true, None),
+            endpoint(2, true, false, None),
+        ],
+    );
+    t.per_replica_max_in_flight = Some(6);
+    d.pass(&handle, vec![t]).await;
+    let s = status(&handle, "e");
+    assert_eq!(s.ready_replicas, Some(2));
+    assert_eq!(s.per_replica_max_in_flight, Some(6));
+    assert_eq!(s.replica_capacity, Some(12));
+    assert_eq!(s.effective_max_in_flight, 12);
+    assert_eq!(
+        s.per_replica_source.as_deref(),
+        Some(PER_REPLICA_CONFIGURED)
+    );
 }
 
 #[tokio::test]
@@ -924,10 +993,10 @@ async fn a_model_leaving_the_mode_leaves_the_view_and_the_overrides() {
 
 #[test]
 fn the_derivation_rounds_up_and_never_reaches_zero() {
-    assert_eq!(derive(2, 8, 1.0), 16);
-    assert_eq!(derive(3, 5, 1.1), 17, "16.5 rounds up");
-    assert_eq!(derive(1, 1, 0.1), 1, "never below 1");
-    assert_eq!(derive(usize::MAX, 2, 10.0), MAX_DERIVED);
+    assert_eq!(derive(16, 1.0), 16);
+    assert_eq!(derive(15, 1.1), 17, "16.5 rounds up");
+    assert_eq!(derive(1, 0.1), 1, "never below 1");
+    assert_eq!(derive(usize::MAX, 10.0), MAX_DERIVED);
 }
 
 #[test]

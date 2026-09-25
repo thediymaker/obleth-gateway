@@ -5091,6 +5091,7 @@ async fn get_capacity_discovery(
                     ready_replicas: None,
                     per_replica_max_in_flight: None,
                     per_replica_source: None,
+                    replica_capacity: None,
                     headroom: m.capacity_headroom,
                     derived_max_in_flight: None,
                     effective_max_in_flight: m

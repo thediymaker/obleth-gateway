@@ -6,8 +6,12 @@
 //! source, derives
 //!
 //! ```text
-//! configured pool size = max(1, ceil(ready serving replicas x per-replica concurrency x headroom))
+//! configured pool size = max(1, ceil(summed concurrency of the ready replicas x headroom))
 //! ```
+//!
+//! where the summed concurrency is ready replicas x the per-replica value, or,
+//! for endpoints that carry their own `max_in_flight`, each ready endpoint's
+//! value added up.
 //!
 //! and hands the result to fairshare as the model's configured, cluster-wide
 //! pool size ([`FairShare::set_model_caps`]), enforced across the gateway
@@ -17,8 +21,10 @@
 //! Sources:
 //! - `endpoints`: the model's enabled, healthy endpoints (all of them under
 //!   `load_balance` and `session_hash`, only the one in use under `failover`),
-//!   each counted at its own `max_in_flight` or the model's
-//!   `per_replica_max_in_flight`. A model with no endpoint rows counts its
+//!   each counted at its own `max_in_flight`, or the model's
+//!   `per_replica_max_in_flight` when it has none, and summed (8, 2 and an
+//!   unset one with a per-replica value of 4 make 14). A model with no
+//!   endpoint rows counts its
 //!   single `api_base` while the model is healthy. Needs nothing outside the
 //!   gateway.
 //! - `kubernetes`: the ready, serving, non-terminating endpoints of the
@@ -148,12 +154,18 @@ pub struct ModelCapacityStatus {
     pub service: Option<String>,
     /// Serving replicas the source reported on its last answer.
     pub ready_replicas: Option<usize>,
-    /// Requests one replica takes, as used in the last derivation.
+    /// Requests one replica takes, as used in the last derivation. `None`
+    /// when the ready replicas' values differ (endpoints with their own
+    /// `max_in_flight`); `replica_capacity` then has their sum.
     pub per_replica_max_in_flight: Option<usize>,
     /// Where that value came from: `configured` (the model's
     /// `per_replica_max_in_flight`), `endpoint` (each endpoint's own
     /// `max_in_flight`), or `endpoint and configured` when both were used.
     pub per_replica_source: Option<String>,
+    /// The ready replicas' concurrency summed, as used in the last
+    /// derivation: ready replicas x the per-replica value, or each
+    /// endpoint's own value added up.
+    pub replica_capacity: Option<usize>,
     pub headroom: f64,
     /// The last value derived from the source: the cluster-wide pool size.
     pub derived_max_in_flight: Option<usize>,
@@ -458,10 +470,13 @@ impl DiscoveryTarget {
 /// What one pass found for one model.
 #[derive(Debug, Clone, PartialEq)]
 enum Outcome {
-    /// Serving replicas and a per-replica value: a pool size.
+    /// Serving replicas and their summed concurrency: a pool size.
     Observed {
         ready: usize,
-        per_replica: usize,
+        /// The value every ready replica shares; `None` when they differ.
+        per_replica: Option<usize>,
+        /// The ready replicas' concurrency, summed.
+        capacity: usize,
         per_source: String,
     },
     /// The source answered, but nothing is serving.
@@ -645,6 +660,7 @@ impl Discoverer {
             ready_replicas: None,
             per_replica_max_in_flight: None,
             per_replica_source: None,
+            replica_capacity: None,
             headroom: t.headroom,
             derived_max_in_flight: None,
             effective_max_in_flight: static_cap,
@@ -657,13 +673,15 @@ impl Discoverer {
             Outcome::Observed {
                 ready,
                 per_replica,
+                capacity,
                 per_source,
             } => {
-                let derived = derive(ready, per_replica, t.headroom);
+                let derived = derive(capacity, t.headroom);
                 mem.derived = Some(derived);
                 mem.last_success = Some(now);
                 status.ready_replicas = Some(ready);
-                status.per_replica_max_in_flight = Some(per_replica);
+                status.per_replica_max_in_flight = per_replica;
+                status.replica_capacity = Some(capacity);
                 status.per_replica_source = Some(per_source);
                 status.effective_max_in_flight = derived;
                 status.state = STATE_DISCOVERED.into();
@@ -671,7 +689,7 @@ impl Discoverer {
                     tracing::info!(
                         model = %t.model_name,
                         ready_replicas = ready,
-                        per_replica,
+                        replica_capacity = capacity,
                         from = previous.unwrap_or_default(),
                         to = derived,
                         "discovered capacity changed; resizing the model's pool"
@@ -704,7 +722,7 @@ impl Discoverer {
                     model = %t.model_name,
                     source = %t.source,
                     ready_replicas = status.ready_replicas.unwrap_or_default(),
-                    per_replica = status.per_replica_max_in_flight.unwrap_or_default(),
+                    replica_capacity = status.replica_capacity.unwrap_or_default(),
                     per_replica_source = status.per_replica_source.as_deref().unwrap_or(""),
                     max_in_flight = status.effective_max_in_flight,
                     "capacity discovered"
@@ -788,9 +806,10 @@ async fn lookup_services<'a>(
     }
 }
 
-/// `max(1, ceil(ready x per_replica x headroom))`, bounded.
-fn derive(ready: usize, per_replica: usize, headroom: f64) -> usize {
-    let base = ready.saturating_mul(per_replica) as f64;
+/// `max(1, ceil(capacity x headroom))`, bounded, where `capacity` is the
+/// ready replicas' concurrency summed.
+fn derive(capacity: usize, headroom: f64) -> usize {
+    let base = capacity as f64;
     let scaled = (base * headroom).ceil();
     if !scaled.is_finite() || scaled >= MAX_DERIVED as f64 {
         MAX_DERIVED
@@ -862,8 +881,6 @@ fn endpoints_outcome(t: &DiscoveryTarget) -> Outcome {
             }
         }
     }
-    let total: usize = values.iter().sum();
-    let uniform = values.iter().all(|v| *v == values[0]);
     let per_source = match (from_endpoint, from_model) {
         (true, false) => PER_REPLICA_ENDPOINT,
         (false, true) => PER_REPLICA_CONFIGURED,
@@ -871,14 +888,10 @@ fn endpoints_outcome(t: &DiscoveryTarget) -> Outcome {
     };
     Outcome::Observed {
         ready,
-        // Endpoints that differ are summed; the per-replica figure shown is
-        // then the average, rounded up, so ready x per-replica still reads
-        // right.
-        per_replica: if uniform {
-            values[0]
-        } else {
-            total.div_ceil(ready)
-        },
+        per_replica: values.iter().all(|v| *v == values[0]).then_some(values[0]),
+        // Each ready endpoint at its own value, added up: an average would
+        // round a mix like 8, 2 and 4 up to 3 x 5.
+        capacity: values.iter().fold(0usize, |a, v| a.saturating_add(*v)),
         per_source: per_source.into(),
     }
 }
@@ -917,7 +930,8 @@ fn kubernetes_outcome(
                 } else {
                     Outcome::Observed {
                         ready: count.ready,
-                        per_replica,
+                        per_replica: Some(per_replica),
+                        capacity: count.ready.saturating_mul(per_replica),
                         per_source: PER_REPLICA_CONFIGURED.into(),
                     }
                 };

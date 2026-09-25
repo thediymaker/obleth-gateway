@@ -289,8 +289,12 @@ the `discovered` capacity mode instead takes its pool size from its live
 backend, so the gateway's limit follows whatever scales the backend:
 
 ```text
-pool size = max(1, ceil(ready serving replicas × per-replica concurrency × capacity_headroom))
+pool size = max(1, ceil(summed concurrency of the ready serving replicas × capacity_headroom))
 ```
+
+The summed concurrency is ready replicas × the per-replica concurrency, or,
+for endpoints that set their own `max_in_flight`, each ready endpoint's value
+added up.
 
 Every gateway replica re-reads the backend every
 `obleth.capacityDiscovery.intervalSecs` (default 15) and treats the result as
@@ -326,7 +330,10 @@ the model's `per_replica_max_in_flight` (the requests one replica serves at
 once, e.g. your server's max concurrent sequences, such as vLLM
 `--max-num-seqs`). It is required for the `kubernetes` source, and for
 `endpoints` unless every endpoint sets its own `max_in_flight`; a model write
-without it is refused with a message saying what to set.
+without it is refused with a message saying what to set. On the `endpoints`
+source an endpoint's own `max_in_flight` wins for that endpoint, and the
+model's value covers the rest: endpoints at 8 and 2 plus one unset with a
+per-replica value of 4 make a pool of 14.
 
 **Fallbacks:** when the source reports no serving replica or does not answer
 (scale to zero, a rollout, the Service not there, the API server briefly

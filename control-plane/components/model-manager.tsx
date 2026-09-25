@@ -1763,8 +1763,13 @@ export function CapacityModeToggle({ id, mode }: { id: string; mode: string }) {
 export function discoveryEquation(status?: CapacityDiscoveryView["models"][number]["status"]): string | null {
   if (!status) return null;
   const ready = status.ready_replicas ?? "—";
-  const per = status.per_replica_max_in_flight ?? "—";
   const headroom = status.headroom !== 1 ? ` × ${status.headroom}` : "";
+  if (status.per_replica_max_in_flight == null && status.replica_capacity != null) {
+    // Endpoints with values of their own: summed, not multiplied.
+    const sum = headroom ? `(${status.replica_capacity} summed)` : `${status.replica_capacity} summed`;
+    return `${ready} ready, ${sum}${headroom} = ${status.effective_max_in_flight}`;
+  }
+  const per = status.per_replica_max_in_flight ?? "—";
   return `${ready} ready × ${per} per replica${headroom} = ${status.effective_max_in_flight}`;
 }
 
@@ -2052,7 +2057,9 @@ export function CapacityDiscoveryStatus({
   const inFlight = capacityInFlight(entry, status.effective_max_in_flight, mode, replicas);
   const perReplica =
     status.per_replica_max_in_flight == null
-      ? "—"
+      ? status.replica_capacity != null
+        ? `varies, ${status.replica_capacity} summed${status.per_replica_source ? ` (${status.per_replica_source})` : ""}`
+        : "—"
       : `${status.per_replica_max_in_flight}${status.per_replica_source ? ` (${status.per_replica_source})` : ""}`;
   return (
     <div className="rounded-md border border-border/60 bg-background/30 p-3 text-xs" aria-label="Discovery status">

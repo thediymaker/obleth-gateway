@@ -7,6 +7,7 @@ import {
   CapacityDiscoveryPanel,
   CapacityDiscoveryStatus,
   capacityInFlight,
+  discoveryEquation,
   CapacityModeToggle,
   ChatCapabilityFields,
 } from "./model-manager";
@@ -198,6 +199,7 @@ describe("the discovered capacity mode", () => {
           ready_replicas: 2,
           per_replica_max_in_flight: 8,
           per_replica_source: "configured",
+          replica_capacity: 16,
           headroom: 1,
           derived_max_in_flight: 16,
           effective_max_in_flight: 16,
@@ -282,6 +284,22 @@ describe("the discovered capacity mode", () => {
       "11 of 16 (cluster-wide, 2 gateways)this gateway 4",
     );
     expect(text).not.toContain("replica's share");
+  });
+
+  it("shows summed endpoint values as a sum, not a product", () => {
+    const status = {
+      ...view().models[0].status,
+      source: "endpoints",
+      ready_replicas: 3,
+      per_replica_max_in_flight: null,
+      per_replica_source: "endpoint and configured",
+      replica_capacity: 14,
+      effective_max_in_flight: 14,
+    };
+    expect(discoveryEquation(status)).toBe("3 ready, 14 summed = 14");
+    expect(discoveryEquation({ ...status, headroom: 1.1, effective_max_in_flight: 16 })).toBe(
+      "3 ready, (14 summed) × 1.1 = 16",
+    );
   });
 
   it("labels the split and the fallback as this gateway's own limit", () => {

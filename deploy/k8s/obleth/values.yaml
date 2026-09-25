@@ -125,8 +125,9 @@ obleth:
     requests: { cpu: "250m", memory: "256Mi" }
     limits: { cpu: "2", memory: "1Gi" }
   # Pool sizes that follow the backend, for models in the `discovered`
-  # capacity mode: ready serving replicas x per-replica concurrency x the
-  # model's capacity_headroom, re-read by every gateway replica each interval
+  # capacity mode: the ready serving replicas' concurrency summed (ready x
+  # per-replica concurrency, or each endpoint's own max in flight added up)
+  # x the model's capacity_headroom, re-read by every gateway replica each interval
   # and enforced cluster-wide like any configured pool size.
   # Off by default; while off, a discovered model uses its static
   # max_in_flight. See the README's "Capacity discovery" section and
