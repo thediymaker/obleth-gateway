@@ -680,7 +680,10 @@ async fn generate(
 ) -> anyhow::Result<Value> {
     let fut = async {
         let target = super::helper_target(model, "", None)?;
-        let mut req = http.post(build_images_url(&target.base)).json(&body);
+        let mut req = http
+            .post(build_images_url(&target.base))
+            .headers(target.headers.clone())
+            .json(&body);
         if let Some(api_key) = &target.api_key {
             req = req.bearer_auth(api_key);
         }

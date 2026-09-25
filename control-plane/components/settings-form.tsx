@@ -3153,7 +3153,7 @@ export function SlurmSettingsForm({ settings }: { settings: SlurmSettingsView | 
                         prev.map((x, j) => (j === i ? { ...x, ip: e.target.value } : x)),
                       )
                     }
-                    placeholder="10.139.125.25"
+                    placeholder="10.0.0.25"
                     className="font-mono"
                     autoComplete="off"
                   />

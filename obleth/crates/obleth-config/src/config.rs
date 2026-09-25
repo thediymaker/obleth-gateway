@@ -19,7 +19,7 @@ pub struct Config {
     /// Prometheus metrics listener.
     pub metrics_listen: String,
 
-    /// Upstream base URL (Aibrix gateway, or the benchmark fixture backend in dev).
+    /// Upstream base URL (an inference server or gateway, or the benchmark fixture backend in dev).
     pub upstream_base_url: String,
     /// Upstream request timeout.
     pub upstream_timeout: Duration,
@@ -56,7 +56,8 @@ pub struct Config {
 
     /// Total in-flight ceiling across all model pools (memory and
     /// upstream-connection guard). Not a fairness input; set it above the sum
-    /// of the pool sizes you expect.
+    /// of the pool sizes you expect. Fleet-wide, like the pools, when
+    /// `fairshare_replica_aware` is on.
     pub global_max_in_flight: usize,
     /// Pool size for a model that has no explicit `max_in_flight`.
     pub default_model_max_in_flight: usize,
@@ -65,6 +66,18 @@ pub struct Config {
     pub fairshare_history_secs: u64,
     /// Fairshare scheduling algorithm (`weighted` or `hierarchical`).
     pub fairshare_algorithm: FairshareAlgorithm,
+    /// Divide the fairshare limits (pool sizes, the global ceiling, tenant and
+    /// key caps) across the live gateway replicas, counted from Redis
+    /// heartbeats, so the fleet enforces the configured numbers rather than
+    /// replicas times them. With one replica it changes nothing.
+    pub fairshare_replica_aware: bool,
+    /// How often each replica refreshes its Redis heartbeat.
+    pub fairshare_replica_heartbeat: Duration,
+    /// How long a heartbeat counts a replica as live. A crashed replica stops
+    /// being counted, and its share returns to the survivors, within this.
+    pub fairshare_replica_ttl: Duration,
+    /// Settings for models in the `discovered` capacity mode.
+    pub capacity_discovery: CapacityDiscoveryConfig,
 
     /// Fail-open: keep serving from cache + buffer telemetry to WAL when
     /// Redis/ClickHouse are unavailable. Fail-closed rejects instead.
@@ -98,6 +111,74 @@ pub struct Config {
     pub auto_classifier_enabled: bool,
     pub auto_classifier_model: Option<String>,
     pub auto_classifier_timeout_ms: u64,
+}
+
+/// Capacity discovery: how the gateway derives the pool size of models in the
+/// `discovered` capacity mode from their live backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityDiscoveryConfig {
+    /// Run the discovery loop (`OBLETH_CAPACITY_DISCOVERY_ENABLED`, default
+    /// off). Off, a `discovered` model keeps its static `max_in_flight`.
+    pub enabled: bool,
+    /// How often each replica re-reads the sources
+    /// (`OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS`, default 15, at least 1).
+    pub interval: Duration,
+    /// Namespaces the `kubernetes` source may read Service endpoints in
+    /// (`OBLETH_CAPACITY_DISCOVERY_NAMESPACES`, comma-separated). A model
+    /// that names no namespace is looked up in them in this order, and the
+    /// first one that has its Service wins. Empty leaves the `kubernetes`
+    /// source unavailable and no Kubernetes client is built.
+    pub namespaces: Vec<String>,
+    /// Service name template for `kubernetes`-source models that set no
+    /// `capacity_service` (`OBLETH_CAPACITY_DEFAULT_SERVICE`), with
+    /// `{upstream_model}` and `{model_name}` placeholders. Empty: such a model
+    /// is refused.
+    pub default_service: String,
+}
+
+impl CapacityDiscoveryConfig {
+    pub const DEFAULT_INTERVAL_SECS: u64 = 15;
+
+    pub fn from_env() -> Self {
+        Self::from_values(
+            env::var("OBLETH_CAPACITY_DISCOVERY_ENABLED")
+                .ok()
+                .as_deref(),
+            env::var("OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS")
+                .ok()
+                .as_deref(),
+            env::var("OBLETH_CAPACITY_DISCOVERY_NAMESPACES")
+                .ok()
+                .as_deref(),
+            env::var("OBLETH_CAPACITY_DEFAULT_SERVICE").ok().as_deref(),
+        )
+    }
+
+    /// Build from raw env values. An unparseable or zero interval falls back
+    /// to the default.
+    pub fn from_values(
+        enabled: Option<&str>,
+        interval_secs: Option<&str>,
+        namespaces: Option<&str>,
+        default_service: Option<&str>,
+    ) -> Self {
+        let secs = interval_secs
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(Self::DEFAULT_INTERVAL_SECS);
+        CapacityDiscoveryConfig {
+            enabled: lenient_bool(enabled, false),
+            interval: Duration::from_secs(secs),
+            namespaces: crate::capacity::parse_namespace_list(namespaces.unwrap_or_default()),
+            default_service: default_service.unwrap_or_default().trim().to_string(),
+        }
+    }
+}
+
+impl Default for CapacityDiscoveryConfig {
+    fn default() -> Self {
+        Self::from_values(None, None, None, None)
+    }
 }
 
 /// Slack alerting configuration. The webhook URL is intentionally redacted from
@@ -171,6 +252,10 @@ impl Default for RedisTimeouts {
 
 impl Config {
     pub fn from_env() -> Self {
+        let (fairshare_replica_heartbeat, fairshare_replica_ttl) = replica_heartbeat_timing(
+            parse_or("OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS", 5),
+            parse_or("OBLETH_FAIRSHARE_REPLICA_TTL_SECS", 15),
+        );
         Config {
             proxy_listen: env_or("OBLETH_PROXY_LISTEN", "0.0.0.0:8080"),
             admin_listen: env_or("OBLETH_ADMIN_LISTEN", "0.0.0.0:9180"),
@@ -198,13 +283,20 @@ impl Config {
             clickhouse_user: env_or("OBLETH_CLICKHOUSE_USER", "default"),
             clickhouse_password: env_or("OBLETH_CLICKHOUSE_PASSWORD", ""),
             admin_token: require_secret("OBLETH_ADMIN_TOKEN"),
-            global_max_in_flight: parse_or("OBLETH_GLOBAL_MAX_IN_FLIGHT", 1024),
+            global_max_in_flight: parse_or(
+                "OBLETH_GLOBAL_MAX_IN_FLIGHT",
+                DEFAULT_GLOBAL_MAX_IN_FLIGHT,
+            ),
             default_model_max_in_flight: parse_or("OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT", 32),
             fairshare_history_secs: parse_or("OBLETH_FAIRSHARE_HISTORY_SECS", 3600),
             fairshare_algorithm: FairshareAlgorithm::parse(&env_or(
                 "OBLETH_FAIRSHARE_ALGORITHM",
                 "hierarchical",
             )),
+            fairshare_replica_aware: bool_or("OBLETH_FAIRSHARE_REPLICA_AWARE", true),
+            fairshare_replica_heartbeat,
+            fairshare_replica_ttl,
+            capacity_discovery: CapacityDiscoveryConfig::from_env(),
             fail_open: require_bool("OBLETH_FAIL_OPEN", true),
             wal_path: env_or("OBLETH_WAL_PATH", "./obleth-telemetry.wal"),
             model_health_enabled: bool_or("OBLETH_MODEL_HEALTH_ENABLED", true),
@@ -238,6 +330,23 @@ impl Default for Config {
     fn default() -> Self {
         Self::from_env()
     }
+}
+
+/// Default `OBLETH_GLOBAL_MAX_IN_FLIGHT`. The per-model pools are what limit
+/// admission; this is a safety cap above them (divided across replicas like
+/// the pools when replica-aware sizing is on), so it sits well over the sum of
+/// a realistic fleet's pools (128 models at the default pool size of 32)
+/// rather than binding first.
+pub const DEFAULT_GLOBAL_MAX_IN_FLIGHT: usize = 4096;
+
+/// `(heartbeat interval, heartbeat TTL)` from their raw seconds. A zero
+/// interval falls back to 5 s, and the TTL is raised to at least twice the
+/// interval: a TTL at or under the interval would let one late heartbeat drop
+/// a live replica from the count and resize the whole fleet for nothing.
+fn replica_heartbeat_timing(interval_secs: u64, ttl_secs: u64) -> (Duration, Duration) {
+    let interval = if interval_secs == 0 { 5 } else { interval_secs };
+    let ttl = ttl_secs.max(interval.saturating_mul(2));
+    (Duration::from_secs(interval), Duration::from_secs(ttl))
 }
 
 fn env_or(key: &str, default: &str) -> String {
@@ -367,6 +476,40 @@ mod tests {
         assert_eq!(t.connect, Duration::from_millis(500));
         let t = RedisTimeouts::from_values(Some("nope"), None);
         assert_eq!(t, RedisTimeouts::default());
+    }
+
+    #[test]
+    fn capacity_discovery_is_off_by_default_and_parses_its_settings() {
+        let d = CapacityDiscoveryConfig::default();
+        assert!(!d.enabled);
+        assert_eq!(d.interval, Duration::from_secs(15));
+        assert!(d.namespaces.is_empty());
+        assert!(d.default_service.is_empty());
+
+        let c = CapacityDiscoveryConfig::from_values(
+            Some("true"),
+            Some("30"),
+            Some(" llm, image ,llm"),
+            Some(" {upstream_model} "),
+        );
+        assert!(c.enabled);
+        assert_eq!(c.interval, Duration::from_secs(30));
+        assert_eq!(c.namespaces, vec!["llm", "image"]);
+        assert_eq!(c.default_service, "{upstream_model}");
+
+        let c = CapacityDiscoveryConfig::from_values(Some("off"), Some("0"), None, None);
+        assert!(!c.enabled);
+        assert_eq!(c.interval, Duration::from_secs(15), "zero falls back");
+    }
+
+    #[test]
+    fn replica_heartbeat_ttl_stays_well_above_the_interval() {
+        let secs = |(i, t): (Duration, Duration)| (i.as_secs(), t.as_secs());
+        assert_eq!(secs(replica_heartbeat_timing(5, 15)), (5, 15));
+        assert_eq!(secs(replica_heartbeat_timing(5, 5)), (5, 10));
+        assert_eq!(secs(replica_heartbeat_timing(10, 3)), (10, 20));
+        assert_eq!(secs(replica_heartbeat_timing(0, 0)), (5, 10));
+        assert_eq!(secs(replica_heartbeat_timing(2, 60)), (2, 60));
     }
 
     #[test]

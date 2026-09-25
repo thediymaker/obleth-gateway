@@ -238,6 +238,7 @@ mod tests {
         ModelPoolFairshare {
             model: model.into(),
             cap,
+            configured_cap: cap,
             in_flight,
             queued,
             borrowed: 0,
@@ -251,6 +252,8 @@ mod tests {
         FairshareSnapshot {
             algorithm: "hierarchical".into(),
             max_in_flight: 64,
+            configured_max_in_flight: 64,
+            replicas: 1,
             default_model_max_in_flight: 32,
             global_in_flight: pools.iter().map(|p| p.in_flight).sum(),
             global_queued: pools.iter().map(|p| p.queued).sum(),

@@ -6,7 +6,7 @@ const model = (over: Partial<ModelRoute> = {}): ModelRoute => ({
   id: "u", model_name: "m", description: "", upstream_model: "up", api_base: "http://a",
   api_key_set: false, model_type: "chat", quantization: "unknown", aliases: [],
   input_cost_per_token: 0, output_cost_per_token: 0,
-  cost_per_image: 0, cost_per_audio_second: 0, cost_per_character: 0, energy_slots_per_node: 1,
+  cost_per_image: 0, cost_per_audio_second: 0, cost_per_character: 0, cost_per_video: 0, energy_slots_per_node: 1,
   route_bias: 1,
   auto_eligible: true,
   draft_model: "",

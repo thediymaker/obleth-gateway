@@ -28,6 +28,7 @@ import type {
   SlurmHealthView,
 } from "@/lib/obleth";
 import { requireAdmin } from "@/lib/auth/roles";
+import { parseUpstreamHeaders } from "@/lib/upstream-headers";
 import { resolveRecipeById, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
 import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
 import { blockedHostReason } from "@/lib/ssrf";
@@ -172,6 +173,7 @@ const modelFieldsSchema = {
   cost_per_image: nonNegNumber(0),
   cost_per_audio_second: nonNegNumber(0),
   cost_per_character: nonNegNumber(0),
+  cost_per_video: nonNegNumber(0),
   energy_slots_per_node: z.preprocess(blankToUndef, z.coerce.number().int().nonnegative().default(0)),
   route_bias: z.preprocess(blankToUndef, z.coerce.number().min(0.1).max(3).default(1)),
   auto_eligible: checkbox,
@@ -739,6 +741,7 @@ export async function createModelAction(
     cost_per_image: formData.get("cost_per_image"),
     cost_per_audio_second: formData.get("cost_per_audio_second"),
     cost_per_character: formData.get("cost_per_character"),
+    cost_per_video: formData.get("cost_per_video"),
     energy_slots_per_node: formData.get("energy_slots_per_node"),
     route_bias: formData.get("route_bias"),
     auto_eligible: formData.get("auto_eligible"),
@@ -780,6 +783,7 @@ export async function createModelAction(
       supports_vision: tagsInclude(tags, "vision"),
       tags,
       aliases: aliasesFromForm(formData),
+      ...upstreamHeadersFromForm(formData),
       boons: boonsFromForm(formData),
       tool_servers: toolServersFromForm(formData),
     }, { auditActor: session.email });
@@ -845,10 +849,102 @@ export async function setModelCapacityModeAction(
   capacityMode: string,
 ) {
   const session = await requireAdmin();
-  await obleth.setModelCapacityMode(id, capacityMode, { auditActor: session.email });
+  await obleth.setModelCapacityMode(id, capacityMode, undefined, { auditActor: session.email });
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
+}
+
+/** A Kubernetes Service name (RFC 1035 label), as the gateway checks it. */
+const SERVICE_NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
+
+const capacityDiscoveryFields = z.object({
+  capacity_source: z.enum(["endpoints", "kubernetes"], {
+    message: "Pick a capacity source",
+  }),
+  capacity_namespace: optionalText,
+  capacity_service: z.preprocess(
+    trimmed,
+    z
+      .string()
+      .refine(
+        (v) => v === "" || SERVICE_NAME.test(v),
+        "Service name must be lowercase letters, digits and '-', starting with a letter (at most 63 characters)",
+      ),
+  ),
+  per_replica_max_in_flight: z.preprocess(
+    blankToUndef,
+    z.coerce
+      .number()
+      .int("Per-replica concurrency must be a whole number")
+      .min(1, "Per-replica concurrency must be at least 1")
+      .max(100_000, "Per-replica concurrency must be at most 100000")
+      .optional(),
+  ),
+  capacity_headroom: z.preprocess(
+    blankToUndef,
+    z.coerce
+      .number()
+      .gt(0, "Headroom must be above 0")
+      .max(10, "Headroom must be at most 10")
+      .default(1),
+  ),
+});
+
+// The kubernetes source reads only replica counts, so the concurrency of one
+// replica has to come from here. The endpoints source can take it from each
+// endpoint instead; the gateway checks that against the endpoints.
+const capacityDiscoverySchema = capacityDiscoveryFields.refine(
+  (d) => d.capacity_source !== "kubernetes" || d.per_replica_max_in_flight != null,
+  {
+    message:
+      "Per-replica concurrency is required for the kubernetes source (e.g. your server's max concurrent sequences, such as vLLM --max-num-seqs)",
+    path: ["per_replica_max_in_flight"],
+  },
+);
+
+/**
+ * Put a model in the discovered capacity mode with its source settings. A
+ * blank field is sent as null, which clears it on the gateway (it then falls
+ * back to the gateway's default for that field). The gateway checks whether
+ * it can read a kubernetes source, and whether an endpoints-source model
+ * without a per-replica value has one on every endpoint, and refuses the save
+ * if not.
+ */
+export async function setModelCapacityDiscoveryAction(
+  id: string,
+  formData: FormData,
+): Promise<ActionResult> {
+  const session = await requireAdmin();
+  const parsed = capacityDiscoverySchema.safeParse({
+    capacity_source: formData.get("capacity_source"),
+    capacity_namespace: formData.get("capacity_namespace"),
+    capacity_service: formData.get("capacity_service"),
+    per_replica_max_in_flight: formData.get("per_replica_max_in_flight"),
+    capacity_headroom: formData.get("capacity_headroom"),
+  });
+  if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
+  const data = parsed.data;
+  try {
+    await obleth.setModelCapacityMode(
+      id,
+      "discovered",
+      {
+        capacity_source: data.capacity_source,
+        capacity_namespace: data.capacity_namespace || null,
+        capacity_service: data.capacity_service || null,
+        per_replica_max_in_flight: data.per_replica_max_in_flight ?? null,
+        capacity_headroom: data.capacity_headroom,
+      },
+      { auditActor: session.email },
+    );
+  } catch (e) {
+    return actionError(e);
+  }
+  updateTag(CACHE_TAGS.models);
+  revalidatePath("/models");
+  revalidatePath("/fairshare");
+  return { ok: true };
 }
 
 export async function autotuneModelAction(
@@ -937,6 +1033,7 @@ export async function createModelEndpointAction(
     priority: numOr(formData.get("priority"), 100),
     weight: numOr(formData.get("weight"), 100),
     enabled: formData.get("enabled") !== "off",
+    max_in_flight: numOrNull(formData.get("max_in_flight")),
   }, { auditActor: session.email });
   revalidatePath("/models");
 }
@@ -951,6 +1048,7 @@ export async function updateModelEndpointAction(
     priority?: number;
     weight?: number;
     enabled?: boolean;
+    max_in_flight?: number | null;
   },
 ) {
   const session = await requireAdmin();
@@ -1009,6 +1107,7 @@ function toModelUpdateBody(model: ModelRoute) {
     cost_per_image: model.cost_per_image,
     cost_per_audio_second: model.cost_per_audio_second,
     cost_per_character: model.cost_per_character,
+    cost_per_video: model.cost_per_video,
     energy_slots_per_node: model.energy_slots_per_node,
     route_bias: model.route_bias,
     auto_eligible: model.auto_eligible,
@@ -1065,11 +1164,13 @@ export async function updateModelConnectionAction(
       output_cost_per_token: numOr(formData.get("output_cost_per_token"), current.output_cost_per_token),
       cost_per_image: numOr(formData.get("cost_per_image"), current.cost_per_image),
       cost_per_character: numOr(formData.get("cost_per_character"), current.cost_per_character),
+      cost_per_video: numOr(formData.get("cost_per_video"), current.cost_per_video),
       cost_per_audio_second: numOr(formData.get("cost_per_audio_second"), current.cost_per_audio_second),
       energy_slots_per_node: numOr(formData.get("energy_slots_per_node"), current.energy_slots_per_node),
       route_bias: numOr(formData.get("route_bias"), current.route_bias),
       auto_eligible: formData.get("auto_eligible") === "on",
       ...(newKey ? { api_key: newKey } : {}),
+      ...upstreamHeadersFromForm(formData),
     }, { auditActor: session.email });
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Save failed." };
@@ -1658,6 +1759,16 @@ function aliasesFromForm(formData: FormData): string[] {
     .split(/[\n,]/)
     .map((a) => a.trim())
     .filter((a) => a.length > 0);
+}
+
+// The upstream-headers textarea as an update field, only when the form has
+// one: a form without it (every other model tab) must leave the stored
+// headers alone, which the gateway does when the field is omitted.
+function upstreamHeadersFromForm(
+  formData: FormData,
+): { upstream_headers?: Record<string, string | null> } {
+  if (!formData.has("upstream_headers")) return {};
+  return { upstream_headers: parseUpstreamHeaders(String(formData.get("upstream_headers") ?? "")) };
 }
 
 function clampTagLevel(raw: FormDataEntryValue | null): number {

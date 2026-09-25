@@ -17,7 +17,9 @@
 //!   plaintext `api_key` when you want to set one, and leaves the stored key
 //!   untouched when you don't. That means a manifest needs no encryption
 //!   envelope and moves between instances with different
-//!   `OBLETH_ENCRYPTION_KEY`s.
+//!   `OBLETH_ENCRYPTION_KEY`s. Per-model upstream headers follow the same
+//!   rule: export lists `upstream_header_names`, never the values, and import
+//!   takes `upstream_headers` when you want to set them.
 //!
 //! # Coverage boundary
 //!
@@ -34,11 +36,12 @@ use utoipa::ToSchema;
 
 use crate::types::{
     is_valid_capacity_mode, is_valid_endpoint_selection_mode, is_valid_model_type,
-    is_valid_quantization, normalize_aliases, normalize_boons, normalize_tool_servers,
-    parse_tag_level, ModelEndpoint, ModelRoute, CAPACITY_MODES, DEFAULT_CAPACITY_MODE,
-    DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE, DEFAULT_QUANTIZATION,
-    DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES, MAX_MODEL_ALIASES, MODEL_TYPES,
-    QUANTIZATIONS,
+    is_valid_quantization, merge_upstream_headers, normalize_aliases, normalize_boons,
+    normalize_tool_servers, parse_tag_level, upstream_header_names, ModelEndpoint, ModelRoute,
+    UpstreamHeaders, UpstreamHeadersWrite, CAPACITY_MODES, DEFAULT_CAPACITY_MODE,
+    DEFAULT_CAPACITY_SOURCE, DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE,
+    DEFAULT_QUANTIZATION, DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES, MAX_MODEL_ALIASES,
+    MODEL_TYPES, QUANTIZATIONS,
 };
 
 /// File-format discriminator for model manifests.
@@ -77,7 +80,8 @@ pub struct ModelManifest {
 /// is optional and absent means "leave unchanged" (or, for a model that does
 /// not exist yet, "use the default").
 ///
-/// Nullable columns (`max_in_flight`, `request_timeout_secs`) cannot be
+/// Nullable columns (`max_in_flight`, `request_timeout_secs`,
+/// `per_replica_max_in_flight`, an endpoint's `max_in_flight`) cannot be
 /// *cleared* from a manifest — a JSON `null` reads the same as an absent field.
 /// This matches the existing `PUT /api/v1/models/{id}` behaviour, where those
 /// fields also fall back to the stored value; clear them from the dashboard.
@@ -99,6 +103,16 @@ pub struct ManifestModel {
     /// exported manifest can be re-imported unchanged without wiping keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_api_key: Option<bool>,
+    /// Set the headers sent on every upstream request for this model. Never
+    /// written by export — see `upstream_header_names`. The whole set is
+    /// replaced when present: a `null` value keeps the stored value for that
+    /// name, and a stored name left out is removed. Absent leaves them alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_headers: Option<UpstreamHeadersWrite>,
+    /// Export-only: the names of the stored upstream headers. Ignored on
+    /// import, like `has_api_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_header_names: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_type: Option<String>,
     /// Extra client-facing names for this model. The whole list is replaced
@@ -123,6 +137,8 @@ pub struct ManifestModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_per_character: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_per_video: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_weight: Option<i64>,
@@ -130,6 +146,19 @@ pub struct ManifestModel {
     pub max_in_flight: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_mode: Option<String>,
+    /// `discovered` mode: `endpoints` or `kubernetes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_source: Option<String>,
+    /// `kubernetes` source namespace; an empty string clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_namespace: Option<String>,
+    /// `kubernetes` source Service name; an empty string clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_service: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_replica_max_in_flight: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_headroom: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_function_calling: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -212,6 +241,10 @@ pub struct ManifestEndpoint {
     pub weight: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Requests this endpoint takes at once, for a `discovered` model using
+    /// the `endpoints` source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_in_flight: Option<i64>,
 }
 
 // ---- the report -------------------------------------------------------------
@@ -262,6 +295,7 @@ pub struct ModelConfig {
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
+    pub upstream_headers: UpstreamHeaders,
     pub model_type: String,
     pub quantization: String,
     pub input_cost_per_token: f64,
@@ -269,10 +303,16 @@ pub struct ModelConfig {
     pub cost_per_image: f64,
     pub cost_per_audio_second: f64,
     pub cost_per_character: f64,
+    pub cost_per_video: f64,
     pub context_window: i64,
     pub admission_weight: i64,
     pub max_in_flight: Option<i64>,
     pub capacity_mode: String,
+    pub capacity_source: String,
+    pub capacity_namespace: Option<String>,
+    pub capacity_service: Option<String>,
+    pub per_replica_max_in_flight: Option<i64>,
+    pub capacity_headroom: f64,
     pub supports_function_calling: bool,
     pub supports_system_messages: bool,
     pub supports_response_schema: bool,
@@ -307,6 +347,7 @@ impl Default for ModelConfig {
             upstream_model: String::new(),
             api_base: String::new(),
             api_key: None,
+            upstream_headers: UpstreamHeaders::new(),
             model_type: DEFAULT_MODEL_TYPE.to_string(),
             quantization: DEFAULT_QUANTIZATION.to_string(),
             input_cost_per_token: 0.0,
@@ -314,10 +355,16 @@ impl Default for ModelConfig {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: DEFAULT_CONTEXT_WINDOW,
             admission_weight: DEFAULT_ADMISSION_WEIGHT,
             max_in_flight: None,
             capacity_mode: DEFAULT_CAPACITY_MODE.to_string(),
+            capacity_source: DEFAULT_CAPACITY_SOURCE.to_string(),
+            capacity_namespace: None,
+            capacity_service: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             supports_function_calling: false,
             // Matches `create_model`: system messages are assumed supported.
             supports_system_messages: true,
@@ -353,6 +400,7 @@ impl From<&ModelRoute> for ModelConfig {
             upstream_model: m.upstream_model.clone(),
             api_base: m.api_base.clone(),
             api_key: m.api_key.clone(),
+            upstream_headers: m.upstream_headers.clone(),
             model_type: m.model_type.clone(),
             quantization: m.quantization.clone(),
             input_cost_per_token: m.input_cost_per_token,
@@ -360,10 +408,16 @@ impl From<&ModelRoute> for ModelConfig {
             cost_per_image: m.cost_per_image,
             cost_per_audio_second: m.cost_per_audio_second,
             cost_per_character: m.cost_per_character,
+            cost_per_video: m.cost_per_video,
             context_window: m.context_window,
             admission_weight: m.admission_weight,
             max_in_flight: m.max_in_flight,
             capacity_mode: m.capacity_mode.clone(),
+            capacity_source: m.capacity_source.clone(),
+            capacity_namespace: m.capacity_namespace.clone(),
+            capacity_service: m.capacity_service.clone(),
+            per_replica_max_in_flight: m.per_replica_max_in_flight,
+            capacity_headroom: m.capacity_headroom,
             supports_function_calling: m.supports_function_calling,
             supports_system_messages: m.supports_system_messages,
             supports_response_schema: m.supports_response_schema,
@@ -413,6 +467,10 @@ impl ModelConfig {
         );
         note(self.api_base != other.api_base, "api_base");
         note(self.api_key != other.api_key, "api_key");
+        note(
+            self.upstream_headers != other.upstream_headers,
+            "upstream_headers",
+        );
         note(self.model_type != other.model_type, "model_type");
         note(self.quantization != other.quantization, "quantization");
         note(
@@ -436,6 +494,10 @@ impl ModelConfig {
             "cost_per_character",
         );
         note(
+            self.cost_per_video != other.cost_per_video,
+            "cost_per_video",
+        );
+        note(
             self.context_window != other.context_window,
             "context_window",
         );
@@ -445,6 +507,26 @@ impl ModelConfig {
         );
         note(self.max_in_flight != other.max_in_flight, "max_in_flight");
         note(self.capacity_mode != other.capacity_mode, "capacity_mode");
+        note(
+            self.capacity_source != other.capacity_source,
+            "capacity_source",
+        );
+        note(
+            self.capacity_namespace != other.capacity_namespace,
+            "capacity_namespace",
+        );
+        note(
+            self.capacity_service != other.capacity_service,
+            "capacity_service",
+        );
+        note(
+            self.per_replica_max_in_flight != other.per_replica_max_in_flight,
+            "per_replica_max_in_flight",
+        );
+        note(
+            self.capacity_headroom != other.capacity_headroom,
+            "capacity_headroom",
+        );
         note(
             self.supports_function_calling != other.supports_function_calling,
             "supports_function_calling",
@@ -601,6 +683,10 @@ pub fn resolve_model(
     if let Some(v) = &entry.api_key {
         next.api_key = if v.is_empty() { None } else { Some(v.clone()) };
     }
+    if let Some(write) = &entry.upstream_headers {
+        next.upstream_headers =
+            merge_upstream_headers(&current.upstream_headers, write).map_err(&reject)?;
+    }
     if let Some(v) = &entry.model_type {
         let t = v.trim().to_ascii_lowercase();
         if !is_valid_model_type(&t) {
@@ -631,6 +717,43 @@ pub fn resolve_model(
         }
         next.capacity_mode = m;
     }
+    if let Some(v) = &entry.capacity_source {
+        next.capacity_source = v.trim().to_ascii_lowercase();
+    }
+    if let Some(v) = &entry.capacity_namespace {
+        next.capacity_namespace = crate::capacity::normalize_optional_text(Some(v));
+    }
+    if let Some(v) = &entry.capacity_service {
+        next.capacity_service = crate::capacity::normalize_optional_text(Some(v));
+    }
+    if let Some(v) = entry.per_replica_max_in_flight {
+        next.per_replica_max_in_flight = Some(v);
+    }
+    if let Some(v) = entry.capacity_headroom {
+        next.capacity_headroom = v;
+    }
+    // Syntax only: whether this gateway can read a `kubernetes` source (its
+    // namespace allowlist, its default Service) and whether a per-replica
+    // value is there when the mode needs one (which depends on the model's
+    // endpoints) are the importer's checks.
+    crate::capacity::validate_discovery_fields(
+        name,
+        &next.upstream_model,
+        &crate::capacity::DiscoveryFields {
+            source: next.capacity_source.clone(),
+            namespace: next.capacity_namespace.clone(),
+            service: next.capacity_service.clone(),
+            per_replica_max_in_flight: next.per_replica_max_in_flight,
+            headroom: next.capacity_headroom,
+        },
+        false,
+        crate::capacity::DiscoveryPolicy {
+            namespaces: &[],
+            default_service: "",
+        },
+        &[],
+    )
+    .map_err(reject)?;
     if let Some(v) = &entry.endpoint_selection_mode {
         let m = v.trim().to_ascii_lowercase();
         if !is_valid_endpoint_selection_mode(&m) {
@@ -656,6 +779,9 @@ pub fn resolve_model(
     }
     if let Some(v) = entry.cost_per_character {
         next.cost_per_character = reject_negative(v, "cost_per_character").map_err(reject)?;
+    }
+    if let Some(v) = entry.cost_per_video {
+        next.cost_per_video = reject_negative(v, "cost_per_video").map_err(reject)?;
     }
     if let Some(v) = entry.route_bias {
         if !v.is_finite() || v < 0.0 {
@@ -806,6 +932,7 @@ pub struct EndpointConfig {
     pub priority: i64,
     pub weight: i64,
     pub enabled: bool,
+    pub max_in_flight: Option<i64>,
 }
 
 impl Default for EndpointConfig {
@@ -818,6 +945,7 @@ impl Default for EndpointConfig {
             priority: DEFAULT_ENDPOINT_PRIORITY,
             weight: DEFAULT_ENDPOINT_WEIGHT,
             enabled: true,
+            max_in_flight: None,
         }
     }
 }
@@ -831,6 +959,7 @@ impl From<&ModelEndpoint> for EndpointConfig {
             priority: e.priority,
             weight: e.weight,
             enabled: e.enabled,
+            max_in_flight: e.max_in_flight,
         }
     }
 }
@@ -881,6 +1010,18 @@ pub fn resolve_endpoint(
     if let Some(v) = entry.enabled {
         next.enabled = v;
     }
+    if let Some(v) = entry.max_in_flight {
+        crate::capacity::validate_per_replica_max_in_flight(Some(v)).map_err(|_| {
+            ManifestError {
+                model_name: model_name.to_string(),
+                message: format!(
+                    "endpoint '{name}': max_in_flight must be between 1 and {}",
+                    crate::capacity::MAX_PER_REPLICA_MAX_IN_FLIGHT
+                ),
+            }
+        })?;
+        next.max_in_flight = Some(v);
+    }
 
     // An endpoint is dispatched to, so it must have somewhere to dispatch. The
     // model row tolerates a blank `api_base` (Slurm-provisioned models get one
@@ -908,6 +1049,9 @@ pub fn resolve_endpoint(
     if current.enabled != next.enabled {
         changed_fields.push(format!("endpoints.{name}.enabled"));
     }
+    if current.max_in_flight != next.max_in_flight {
+        changed_fields.push(format!("endpoints.{name}.max_in_flight"));
+    }
 
     Ok(ResolvedManifestEndpoint {
         config: next,
@@ -927,6 +1071,7 @@ pub fn endpoint_to_manifest_entry(e: &ModelEndpoint) -> ManifestEndpoint {
         priority: Some(e.priority),
         weight: Some(e.weight),
         enabled: Some(e.enabled),
+        max_in_flight: e.max_in_flight,
     }
 }
 
@@ -939,7 +1084,8 @@ fn reject_negative(v: f64, field: &str) -> Result<f64, String> {
 }
 
 /// Render a model as a manifest entry: every field populated, secrets replaced
-/// by `has_api_key`, endpoints attached by the caller.
+/// by `has_api_key` and `upstream_header_names`, endpoints attached by the
+/// caller.
 pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
     ManifestModel {
         model_name: m.model_name.clone(),
@@ -949,6 +1095,8 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
         api_base: Some(m.api_base.clone()),
         api_key: None,
         has_api_key: Some(m.api_key.as_deref().is_some_and(|k| !k.is_empty())),
+        upstream_headers: None,
+        upstream_header_names: Some(upstream_header_names(&m.upstream_headers)),
         model_type: Some(m.model_type.clone()),
         quantization: Some(m.quantization.clone()),
         input_cost_per_token: Some(m.input_cost_per_token),
@@ -956,10 +1104,16 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
         cost_per_image: Some(m.cost_per_image),
         cost_per_audio_second: Some(m.cost_per_audio_second),
         cost_per_character: Some(m.cost_per_character),
+        cost_per_video: Some(m.cost_per_video),
         context_window: Some(m.context_window),
         admission_weight: Some(m.admission_weight),
         max_in_flight: m.max_in_flight,
         capacity_mode: Some(m.capacity_mode.clone()),
+        capacity_source: Some(m.capacity_source.clone()),
+        capacity_namespace: m.capacity_namespace.clone(),
+        capacity_service: m.capacity_service.clone(),
+        per_replica_max_in_flight: m.per_replica_max_in_flight,
+        capacity_headroom: Some(m.capacity_headroom),
         supports_function_calling: Some(m.supports_function_calling),
         supports_system_messages: Some(m.supports_system_messages),
         supports_response_schema: Some(m.supports_response_schema),
@@ -1000,6 +1154,7 @@ mod tests {
             upstream_model: "upstream/original".into(),
             api_base: "http://127.0.0.1:8000/v1".into(),
             api_key: Some("sk-original".into()),
+            upstream_headers: Default::default(),
             model_type: "chat".into(),
             quantization: "unknown".into(),
             input_cost_per_token: 1.0,
@@ -1007,11 +1162,17 @@ mod tests {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: 4096,
             admission_weight: 50,
             max_in_flight: Some(4),
             capacity_mode: "static".into(),
             capacity_tuned_at: None,
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_service: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             supports_function_calling: true,
             supports_system_messages: true,
             supports_response_schema: false,
@@ -1263,6 +1424,119 @@ mod tests {
     }
 
     #[test]
+    fn a_video_model_imports_with_its_flat_price() {
+        let mut e = entry("video-model");
+        e.model_type = Some("video".into());
+        e.cost_per_video = Some(0.5);
+
+        let r = resolve_model(&e, None, &[]).unwrap();
+
+        assert_eq!(r.config.model_type, "video");
+        assert_eq!(r.config.cost_per_video, 0.5);
+
+        let existing = route("video-model");
+        let r = resolve_model(&e, Some(&existing), &[]).unwrap();
+        assert!(r.changed_fields.contains(&"cost_per_video".to_string()));
+
+        let mut e = entry("video-model");
+        e.cost_per_video = Some(-0.5);
+        let err = resolve_model(&e, Some(&existing), &[]).unwrap_err();
+        assert!(err.message.contains("cost_per_video"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_discovered_model_carries_its_capacity_source() {
+        let mut e = entry("m");
+        e.capacity_mode = Some("discovered".into());
+        e.capacity_source = Some(" Kubernetes ".into());
+        e.capacity_namespace = Some(" inference ".into());
+        e.capacity_service = Some("m-serve".into());
+        e.per_replica_max_in_flight = Some(8);
+        e.capacity_headroom = Some(1.25);
+
+        let r = resolve_model(&e, None, &[]).unwrap();
+        assert_eq!(r.config.capacity_mode, "discovered");
+        assert_eq!(r.config.capacity_source, "kubernetes");
+        assert_eq!(r.config.capacity_namespace.as_deref(), Some("inference"));
+        assert_eq!(r.config.capacity_service.as_deref(), Some("m-serve"));
+        assert_eq!(r.config.per_replica_max_in_flight, Some(8));
+        assert_eq!(r.config.capacity_headroom, 1.25);
+
+        let existing = route("m");
+        let r = resolve_model(&e, Some(&existing), &[]).unwrap();
+        for field in [
+            "capacity_mode",
+            "capacity_source",
+            "capacity_namespace",
+            "capacity_service",
+            "per_replica_max_in_flight",
+            "capacity_headroom",
+        ] {
+            assert!(r.changed_fields.contains(&field.to_string()), "{field}");
+        }
+
+        // An empty string clears a text field.
+        let mut stored = route("m");
+        stored.capacity_namespace = Some("inference".into());
+        let mut clear = entry("m");
+        clear.capacity_namespace = Some(String::new());
+        let r = resolve_model(&clear, Some(&stored), &[]).unwrap();
+        assert_eq!(r.config.capacity_namespace, None);
+
+        // Export and re-import is a no-op.
+        let mut stored = route("m");
+        stored.capacity_mode = "discovered".into();
+        stored.capacity_source = "kubernetes".into();
+        stored.capacity_service = Some("m".into());
+        stored.per_replica_max_in_flight = Some(4);
+        stored.capacity_headroom = 1.5;
+        let exported = model_to_manifest_entry(&stored);
+        let r = resolve_model(&exported, Some(&stored), &[]).unwrap();
+        assert!(r.changed_fields.is_empty(), "{:?}", r.changed_fields);
+    }
+
+    #[test]
+    fn bad_capacity_fields_are_refused_with_the_field_named() {
+        for (field, apply) in [
+            (
+                "capacity_source",
+                (|e: &mut ManifestModel| e.capacity_source = Some("prometheus".into()))
+                    as fn(&mut ManifestModel),
+            ),
+            ("capacity_namespace", |e| {
+                e.capacity_namespace = Some("Not_A_Namespace".into())
+            }),
+            ("capacity_service", |e| {
+                e.capacity_service = Some("app=m".into())
+            }),
+            ("per_replica_max_in_flight", |e| {
+                e.per_replica_max_in_flight = Some(0)
+            }),
+            ("capacity_headroom", |e| e.capacity_headroom = Some(0.0)),
+        ] {
+            let mut e = entry("m");
+            apply(&mut e);
+            let err = resolve_model(&e, None, &[]).expect_err(field);
+            assert!(err.message.contains(field), "{field}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn an_endpoint_carries_its_own_concurrency() {
+        let mut e = ManifestEndpoint {
+            name: "a".into(),
+            api_base: Some("http://a/v1".into()),
+            max_in_flight: Some(16),
+            ..Default::default()
+        };
+        let r = resolve_endpoint(&e, None, "m").unwrap();
+        assert_eq!(r.config.max_in_flight, Some(16));
+        e.max_in_flight = Some(0);
+        let err = resolve_endpoint(&e, None, "m").unwrap_err();
+        assert!(err.message.contains("max_in_flight"), "{}", err.message);
+    }
+
+    #[test]
     fn an_empty_model_name_is_rejected() {
         let e = entry("   ");
         assert!(resolve_model(&e, None, &[]).is_err());
@@ -1290,6 +1564,46 @@ mod tests {
 
         assert_eq!(r.config.api_key.as_deref(), Some("sk-original"));
         assert!(r.changed_fields.is_empty());
+    }
+
+    #[test]
+    fn upstream_headers_export_as_names_and_import_as_a_write() {
+        let mut existing = route("m");
+        existing.upstream_headers = [
+            ("x-routing-hint".to_string(), "sticky".to_string()),
+            ("x-upstream-token".to_string(), "secret".to_string()),
+        ]
+        .into();
+
+        let exported = model_to_manifest_entry(&existing);
+        assert!(exported.upstream_headers.is_none(), "values never leave");
+        assert_eq!(
+            exported.upstream_header_names,
+            Some(vec!["x-routing-hint".into(), "x-upstream-token".into()])
+        );
+        // Re-importing the export changes nothing: the names are export-only.
+        let r = resolve_model(&exported, Some(&existing), &[]).unwrap();
+        assert!(!r.changed_fields.contains(&"upstream_headers".to_string()));
+        assert_eq!(r.config.upstream_headers, existing.upstream_headers);
+
+        // A write keeps a `null` value, sets a string, and drops what is left out.
+        let mut e = entry("m");
+        e.upstream_headers = Some(
+            [
+                ("X-Upstream-Token".to_string(), None),
+                ("x-routing-hint".to_string(), Some("least-busy".into())),
+            ]
+            .into(),
+        );
+        let r = resolve_model(&e, Some(&existing), &[]).unwrap();
+        assert_eq!(r.changed_fields, vec!["upstream_headers"]);
+        assert_eq!(r.config.upstream_headers["x-upstream-token"], "secret");
+        assert_eq!(r.config.upstream_headers["x-routing-hint"], "least-busy");
+
+        let mut e = entry("m");
+        e.upstream_headers = Some([("Authorization".to_string(), Some("Bearer x".into()))].into());
+        let err = resolve_model(&e, Some(&existing), &[]).unwrap_err();
+        assert!(err.message.contains("authorization"), "{}", err.message);
     }
 
     /// Every numeric field the `models` table constrains must be clamped into

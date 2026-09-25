@@ -11,6 +11,25 @@
 //! [`CapacityProvider`] is a total in-flight ceiling across all pools, not a
 //! fairness input; when it binds, pools are served round-robin.
 //!
+//! # Replicas
+//! Every configured limit that states cluster-wide intent (pool sizes, the
+//! global ceiling, per-tenant and per-key `max_in_flight`) is enforced as this
+//! process's share of it, [`replica_share`] of the live replica count set with
+//! [`FairShare::set_replicas`] (1 until told otherwise). Weights are ratios and
+//! are never divided. Fairness is still decided per replica, on its share, so
+//! the fleet matches the configured numbers only as well as the load balancer
+//! spreads requests. A resize never touches in-flight requests: shrinking just
+//! stops admitting until occupancy falls under the new size, growing
+//! dispatches waiters straight away.
+//!
+//! # Model caps set from outside
+//! A model's pool size normally arrives with each admission (the route's
+//! `max_in_flight`). [`FairShare::set_model_caps`] overrides it for named
+//! models with a configured (cluster-wide) value derived elsewhere, such as
+//! the live backend capacity a `discovered` model follows. An override is
+//! still a configured value: it is divided across the replicas like any other,
+//! and a change resizes the pool the same way a replica-count change does.
+//!
 //! Requests with no resolved route share one [`PoolKey::Unrouted`] pool. A
 //! pool with no permits and no waiters for [`IDLE_POOL_TTL`] is dropped by the
 //! scheduler's housekeeping timer, which also drops queued waiters whose
@@ -19,6 +38,7 @@
 mod algorithm;
 mod capacity;
 pub mod history;
+mod replicas;
 
 pub use algorithm::{group_slot_caps, weighted_caps};
 pub use capacity::{CapacityProvider, StaticCapacity};
@@ -26,6 +46,7 @@ pub use history::{
     FairshareHistory, FairshareSample, GroupSample, HistoryPoint, PoolSample,
     FAIRSHARE_HISTORY_INTERVAL_MS,
 };
+pub use replicas::{replica_share, ReplicaTracker};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
@@ -76,6 +97,8 @@ impl PoolKey {
 pub struct Stats {
     pub in_flight: AtomicUsize,
     pub queued: AtomicI64,
+    /// Live gateway replicas the configured limits are divided across.
+    pub replicas: AtomicUsize,
 }
 
 /// Per-group scheduler view for dashboards.
@@ -103,7 +126,8 @@ pub struct TenantFairshare {
     pub tenant_id: Uuid,
     pub fairshare_group: String,
     pub weight: i64,
-    /// Per-model in-flight ceiling for this tenant, when one is set.
+    /// Per-model in-flight ceiling for this tenant, when one is set: this
+    /// replica's share of the configured value.
     #[serde(default)]
     pub max_in_flight: Option<usize>,
     pub in_flight: usize,
@@ -119,6 +143,7 @@ pub struct KeyFairshare {
     pub key_id: Uuid,
     pub tenant_id: Uuid,
     pub weight: i64,
+    /// This replica's share of the key's configured per-model cap.
     #[serde(default)]
     pub max_in_flight: Option<usize>,
     pub in_flight: usize,
@@ -134,7 +159,12 @@ pub struct KeyFairshare {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPoolFairshare {
     pub model: String,
+    /// Slots this replica enforces: its share of `configured_cap`.
     pub cap: usize,
+    /// The pool size as configured (the model's `max_in_flight` or the
+    /// gateway default), before it is divided across replicas.
+    #[serde(default)]
+    pub configured_cap: usize,
     pub in_flight: usize,
     pub queued: usize,
     pub borrowed: usize,
@@ -147,8 +177,16 @@ pub struct ModelPoolFairshare {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FairshareSnapshot {
     pub algorithm: String,
-    /// Total in-flight ceiling across all pools.
+    /// Total in-flight ceiling across all pools, as this replica enforces it:
+    /// its share of `configured_max_in_flight`.
     pub max_in_flight: usize,
+    /// The ceiling as configured, before it is divided across replicas.
+    #[serde(default)]
+    pub configured_max_in_flight: usize,
+    /// Live gateway replicas the configured limits are divided across.
+    #[serde(default = "one")]
+    pub replicas: usize,
+    /// Configured default pool size, before it is divided across replicas.
     pub default_model_max_in_flight: usize,
     pub global_in_flight: usize,
     pub global_queued: usize,
@@ -160,6 +198,11 @@ pub struct FairshareSnapshot {
     pub model_in_flight: HashMap<String, usize>,
     #[serde(default)]
     pub model_queued: HashMap<String, usize>,
+}
+
+/// Serde default for [`FairshareSnapshot::replicas`].
+fn one() -> usize {
+    1
 }
 
 /// Context passed to the scheduler for a single admission attempt.
@@ -284,6 +327,8 @@ enum Ctl {
     Sample {
         respond: oneshot::Sender<FairshareSample>,
     },
+    SetReplicas(usize),
+    SetModelCaps(HashMap<String, usize>),
 }
 
 /// Handle to the fairshare scheduler. Cheap to clone.
@@ -317,11 +362,14 @@ impl FairShare {
     ) -> Self {
         let (ctl, rx) = mpsc::unbounded_channel();
         let stats = Arc::new(Stats::default());
+        stats.replicas.store(1, Ordering::Relaxed);
         let model_load = Arc::new(RwLock::new(HashMap::new()));
         let scheduler = Scheduler {
             algorithm,
             capacity,
             default_model_cap: default_model_max_in_flight.max(1),
+            replicas: 1,
+            model_caps: HashMap::new(),
             pools: HashMap::new(),
             pool_order: Vec::new(),
             cursor: 0,
@@ -351,6 +399,24 @@ impl FairShare {
             .read()
             .map(|m| m.clone())
             .unwrap_or_default()
+    }
+
+    /// Size every limit for `replicas` live gateway replicas (see the crate
+    /// docs). Takes effect for the next admission decision; in-flight
+    /// requests are never cut short. 0 is read as 1.
+    pub fn set_replicas(&self, replicas: usize) {
+        let _ = self.ctl.send(Ctl::SetReplicas(replicas.max(1)));
+    }
+
+    /// Replace the per-model pool-size overrides: each named model's pool is
+    /// sized by its value (a configured, cluster-wide number, so still divided
+    /// across replicas) instead of the cap its admissions carry. A model left
+    /// out goes back to its admissions' cap from its next admission on.
+    /// Resizes like [`FairShare::set_replicas`]: in-flight requests are never
+    /// cut short, and growth dispatches waiters at once. 0 is read as 1.
+    pub fn set_model_caps(&self, caps: HashMap<String, usize>) {
+        let caps = caps.into_iter().map(|(m, c)| (m, c.max(1))).collect();
+        let _ = self.ctl.send(Ctl::SetModelCaps(caps));
     }
 
     pub async fn snapshot(&self) -> Option<FairshareSnapshot> {
@@ -446,13 +512,18 @@ struct Pool {
     key: PoolKey,
     model: String,
     algorithm: FairshareAlgorithm,
+    /// Slots enforced here: `replica_share(configured_cap, replicas)`.
     cap: usize,
+    configured_cap: usize,
+    /// Live replica count the configured limits are divided by.
+    replicas: usize,
     in_flight: usize,
     queued_total: usize,
     tenant_in_flight: HashMap<Uuid, usize>,
     tenant_group: HashMap<Uuid, String>,
     group_weight: HashMap<String, i64>,
     tenant_weight: HashMap<Uuid, i64>,
+    /// Configured per-tenant caps; enforced as this replica's share.
     tenant_cap: HashMap<Uuid, usize>,
     queues: HashMap<Uuid, TenantQueue>,
     served: HashMap<Uuid, f64>,
@@ -463,6 +534,7 @@ struct Pool {
     key_in_flight: HashMap<Uuid, usize>,
     key_served: HashMap<Uuid, f64>,
     key_weight: HashMap<Uuid, i64>,
+    /// Configured per-key caps; enforced as this replica's share.
     key_cap: HashMap<Uuid, usize>,
     key_tenant: HashMap<Uuid, Uuid>,
     virtual_time: f64,
@@ -484,6 +556,8 @@ impl Pool {
             key,
             algorithm,
             cap: cap.max(1),
+            configured_cap: cap.max(1),
+            replicas: 1,
             in_flight: 0,
             queued_total: 0,
             tenant_in_flight: HashMap::new(),
@@ -503,6 +577,32 @@ impl Pool {
             idle_since: None,
             ctl_tx,
         }
+    }
+
+    /// Set the configured pool size; the enforced cap follows as this
+    /// replica's share of it.
+    fn set_configured_cap(&mut self, configured: usize) {
+        self.configured_cap = configured.max(1);
+        self.cap = replica_share(self.configured_cap, self.replicas);
+    }
+
+    fn set_replicas(&mut self, replicas: usize) {
+        self.replicas = replicas.max(1);
+        self.cap = replica_share(self.configured_cap, self.replicas);
+    }
+
+    /// The tenant's enforced cap in this pool, if it has one.
+    fn tenant_limit(&self, tenant: &Uuid) -> Option<usize> {
+        self.tenant_cap
+            .get(tenant)
+            .map(|cap| replica_share(*cap, self.replicas))
+    }
+
+    /// The key's enforced cap in this pool, if it has one.
+    fn key_limit(&self, key: &Uuid) -> Option<usize> {
+        self.key_cap
+            .get(key)
+            .map(|cap| replica_share(*cap, self.replicas))
     }
 
     fn track_meta(&mut self, req: &AdmitRequest) {
@@ -556,15 +656,15 @@ impl Pool {
     }
 
     fn tenant_has_slot(&self, tenant: &Uuid) -> bool {
-        match self.tenant_cap.get(tenant) {
-            Some(cap) => self.tenant_in_flight.get(tenant).copied().unwrap_or(0) < *cap,
+        match self.tenant_limit(tenant) {
+            Some(cap) => self.tenant_in_flight.get(tenant).copied().unwrap_or(0) < cap,
             None => true,
         }
     }
 
     fn key_has_slot(&self, key: &Uuid) -> bool {
-        match self.key_cap.get(key) {
-            Some(cap) => self.key_in_flight.get(key).copied().unwrap_or(0) < *cap,
+        match self.key_limit(key) {
+            Some(cap) => self.key_in_flight.get(key).copied().unwrap_or(0) < cap,
             None => true,
         }
     }
@@ -1247,7 +1347,7 @@ impl Pool {
                     tenant_id,
                     fairshare_group,
                     weight,
-                    max_in_flight: self.tenant_cap.get(&tenant_id).copied(),
+                    max_in_flight: self.tenant_limit(&tenant_id),
                     in_flight: self.tenant_in_flight.get(&tenant_id).copied().unwrap_or(0),
                     queued: self.queues.get(&tenant_id).map(|q| q.len).unwrap_or(0),
                     served_tokens,
@@ -1311,7 +1411,7 @@ impl Pool {
                     key_id,
                     tenant_id,
                     weight,
-                    max_in_flight: self.key_cap.get(&key_id).copied(),
+                    max_in_flight: self.key_limit(&key_id),
                     in_flight,
                     queued,
                     served_tokens,
@@ -1329,6 +1429,7 @@ impl Pool {
         ModelPoolFairshare {
             model: self.model.clone(),
             cap: self.cap,
+            configured_cap: self.configured_cap,
             in_flight: self.in_flight,
             queued: self.queued_total,
             borrowed: groups.iter().map(|g| g.borrowed).sum(),
@@ -1343,6 +1444,11 @@ struct Scheduler {
     algorithm: FairshareAlgorithm,
     capacity: Arc<dyn CapacityProvider>,
     default_model_cap: usize,
+    /// Live gateway replicas; every configured limit is divided by it.
+    replicas: usize,
+    /// Configured pool sizes set with [`FairShare::set_model_caps`], which win
+    /// over the cap an admission carries.
+    model_caps: HashMap<String, usize>,
     pools: HashMap<PoolKey, Pool>,
     /// Insertion order of pools, for round-robin when the ceiling binds.
     pool_order: Vec<PoolKey>,
@@ -1375,6 +1481,11 @@ impl Scheduler {
         }
     }
 
+    /// The global ceiling as this replica enforces it.
+    fn ceiling(&self) -> usize {
+        replica_share(self.capacity.max_in_flight(), self.replicas)
+    }
+
     fn handle(&mut self, msg: Ctl) {
         match msg {
             Ctl::Admit {
@@ -1383,18 +1494,23 @@ impl Scheduler {
                 respond,
                 enqueued,
             } => {
-                let ceiling = self.capacity.max_in_flight();
+                let ceiling = self.ceiling();
                 let headroom = ceiling.saturating_sub(self.in_flight);
                 let default_cap = self.default_model_cap;
+                let override_cap = match &key {
+                    PoolKey::Model(name) => self.model_caps.get(name).copied(),
+                    PoolKey::Unrouted => None,
+                };
                 let pool = self.pool_mut(&key);
-                pool.cap = match key {
+                pool.set_configured_cap(match key {
                     // No route means no configured cap to honour.
                     PoolKey::Unrouted => default_cap,
-                    PoolKey::Model(_) => req
-                        .model_max_in_flight
-                        .filter(|c| *c > 0)
-                        .unwrap_or(default_cap),
-                };
+                    PoolKey::Model(_) => override_cap.unwrap_or_else(|| {
+                        req.model_max_in_flight
+                            .filter(|c| *c > 0)
+                            .unwrap_or(default_cap)
+                    }),
+                });
                 pool.idle_since = None;
                 pool.track_meta(&req);
                 let effective = pool.effective_cap(headroom);
@@ -1429,20 +1545,51 @@ impl Scheduler {
             Ctl::Sample { respond } => {
                 let _ = respond.send(self.build_sample());
             }
+            Ctl::SetReplicas(replicas) => {
+                if replicas == self.replicas {
+                    return;
+                }
+                self.replicas = replicas;
+                for pool in self.pools.values_mut() {
+                    pool.set_replicas(replicas);
+                }
+                // Growing frees slots for whoever is queued; shrinking finds
+                // nothing to dispatch and leaves every held permit alone.
+                self.dispatch_all();
+                self.publish_stats();
+            }
+            Ctl::SetModelCaps(caps) => {
+                if caps == self.model_caps {
+                    return;
+                }
+                for (key, pool) in self.pools.iter_mut() {
+                    if let PoolKey::Model(name) = key {
+                        // A pool whose override was dropped keeps its size
+                        // until its next admission brings the route's cap.
+                        if let Some(cap) = caps.get(name) {
+                            pool.set_configured_cap(*cap);
+                        }
+                    }
+                }
+                self.model_caps = caps;
+                // Same as a replica-count change: growth dispatches waiters,
+                // a shrink leaves every held permit alone.
+                self.dispatch_all();
+                self.publish_stats();
+            }
         }
     }
 
     fn pool_mut(&mut self, key: &PoolKey) -> &mut Pool {
         if !self.pools.contains_key(key) {
-            self.pools.insert(
+            let mut pool = Pool::new(
                 key.clone(),
-                Pool::new(
-                    key.clone(),
-                    self.algorithm,
-                    self.default_model_cap,
-                    self.ctl_tx.clone(),
-                ),
+                self.algorithm,
+                self.default_model_cap,
+                self.ctl_tx.clone(),
             );
+            pool.set_replicas(self.replicas);
+            self.pools.insert(key.clone(), pool);
             self.pool_order.push(key.clone());
         }
         self.pools.get_mut(key).expect("pool just inserted")
@@ -1493,7 +1640,7 @@ impl Scheduler {
         if n == 0 {
             return;
         }
-        let ceiling = self.capacity.max_in_flight();
+        let ceiling = self.ceiling();
         let mut progressed = true;
         while progressed && self.in_flight < ceiling && self.queued_total > 0 {
             progressed = false;
@@ -1551,6 +1698,7 @@ impl Scheduler {
         self.stats
             .queued
             .store(self.queued_total as i64, Ordering::Relaxed);
+        self.stats.replicas.store(self.replicas, Ordering::Relaxed);
     }
 
     /// A [`FairshareSample`] built directly from pool state, without the
@@ -1584,7 +1732,8 @@ impl Scheduler {
     }
 
     fn build_snapshot(&self) -> FairshareSnapshot {
-        let headroom = self.capacity.max_in_flight().saturating_sub(self.in_flight);
+        let ceiling = self.ceiling();
+        let headroom = ceiling.saturating_sub(self.in_flight);
         let mut pools: Vec<ModelPoolFairshare> =
             self.pools.values().map(|p| p.snapshot(headroom)).collect();
         pools.sort_by(|a, b| a.model.cmp(&b.model));
@@ -1600,7 +1749,9 @@ impl Scheduler {
             .collect();
         FairshareSnapshot {
             algorithm: self.algorithm.as_str().into(),
-            max_in_flight: self.capacity.max_in_flight(),
+            max_in_flight: ceiling,
+            configured_max_in_flight: self.capacity.max_in_flight(),
+            replicas: self.replicas,
             default_model_max_in_flight: self.default_model_cap,
             global_in_flight: self.in_flight,
             global_queued: self.queued_total,

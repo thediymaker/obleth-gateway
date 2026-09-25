@@ -112,20 +112,39 @@ hardened and made redundant):
 | External | Yours | Whatever you operate | 3, ceiling above pool sum | `--set` | Self-host w/ managed DBs |
 | Production | Yours (operator/managed) | Backups + HA + PITR (your tooling) | 3, ceiling above pool sum + PDB + anti-affinity | **existingSecret** | Redundant production |
 
-> **Replica count is load-bearing.** Fairshare runs one scheduling pool per
-> model (default `obleth.defaultModelMaxInFlight` slots, or the model's own
+> **Replicas share the fairshare limits.** Fairshare runs one scheduling pool
+> per model (default `obleth.defaultModelMaxInFlight` slots, or the model's own
 > `max_in_flight`), and `obleth.globalMaxInFlight` is a total ceiling across
-> those pools — not a fairness input. Fairshare admission state lives in each
-> gateway process, so every replica enforces its own pools and ceiling
-> independently: N replicas admit up to N × the configured pool sizes and N ×
-> the configured ceiling. The chart therefore defaults to one replica so the
-> numbers you set are the numbers that reach your upstream. For redundancy,
-> raise `obleth.replicas` and keep `obleth.globalMaxInFlight` above the sum of
-> the pool sizes you expect concurrently active, sizing both so that N × those
-> numbers stays within what your upstream can absorb — replicas cannot lend
-> each other idle capacity. The HPA is off by default for the same reason — an
-> autoscaled replica count moves the aggregate with no config change. The
-> dashboard's fairshare history is per replica as well
+> those pools — not a fairness input. Admission runs in each gateway process,
+> but every replica heartbeats into Redis
+> (`obleth.fairshareReplicaHeartbeatSecs`, default 5 s) and enforces its share
+> of each limit: the configured value divided by the live replica count,
+> rounded up, never below 1. That covers pool sizes, the global ceiling, and
+> per-tenant and per-key max in flight; weights are ratios and are not
+> divided. So the numbers you set are fleet-wide whatever `obleth.replicas` is,
+> and the HPA can scale the gateway without moving the concurrency that
+> reaches your upstream. The limits of this:
+>
+> - Rounding up lets the fleet run up to one slot per replica over a limit (a
+>   pool of 8 over 3 replicas is 3 + 3 + 3). Every pool rounds up on its own,
+>   so keep `obleth.globalMaxInFlight` at least one slot per enabled model per
+>   replica above the pool sum; the gateway warns at start-up if it is not.
+> - Fairness is decided per replica, on its share. The fleet matches the
+>   configured numbers, and tenants get their weighted share, only as far as
+>   the Service spreads requests evenly; replicas cannot lend each other idle
+>   capacity, so one replica can queue while another has free slots.
+> - A new replica is counted within one heartbeat. A crashed one is counted
+>   until its heartbeat expires (`obleth.fairshareReplicaTtlSecs`, default
+>   15 s), so the survivors run below the configured total for up to that
+>   long; a replica that shuts down cleanly deregisters once it has drained.
+>   Resizing never interrupts in-flight requests.
+> - If Redis is unreachable, each replica keeps the last count it read (or 1,
+>   the per-replica behaviour, if it never read one) and logs the failure once.
+>
+> `obleth.fairshareReplicaAware: false` restores per-replica limits, where N
+> replicas admit N × every number. The dashboard's fairshare page shows the
+> answering replica's own counts and its share of each limit, with the live
+> replica count; its history is per replica as well
 > (`obleth.fairshareHistorySecs`, in memory), so with several replicas the
 > chart shows whichever replica answered.
 
@@ -249,6 +268,92 @@ toggles in `values.yaml`, on by sensible defaults.
   another namespace can scrape it. Requires a CNI that enforces NetworkPolicy;
   inert otherwise. The datastore policies are a no-op for external datastores.
 
+## Capacity discovery
+
+A model's fairshare pool is normally sized by its `max_in_flight`. A model in
+the `discovered` capacity mode instead takes its pool size from its live
+backend, so the gateway's limit follows whatever scales the backend:
+
+```text
+pool size = max(1, ceil(ready serving replicas × per-replica concurrency × capacity_headroom))
+```
+
+Every gateway replica re-reads the backend every
+`obleth.capacityDiscovery.intervalSecs` (default 15) and treats the result as
+the model's configured, fleet-wide pool size, so the replica-aware division
+above still applies: with three gateway replicas each enforces a third of it,
+rounded up. A change resizes the pool without cutting in-flight requests, and
+growth admits queued requests at once. Nothing is written to the database.
+
+**Where replicas are counted** (`capacity_source`, per model):
+
+- `endpoints` (the default): the model's enabled, healthy endpoints; under
+  `failover` only the endpoint in use counts, since the others are standbys. A
+  model with no endpoint rows counts its `api_base` while it is healthy. Needs
+  no Kubernetes access and works the same with backends anywhere.
+- `kubernetes`: the ready endpoints of a Service, read from its EndpointSlices.
+  The Service is `capacity_service`, or the
+  `obleth.capacityDiscovery.defaultService` template filled in for the model
+  (`{upstream_model}`, `{model_name}`; for example `"{upstream_model}"` when
+  each Service is named after the model it serves). The namespace is
+  `capacity_namespace`, or, when unset, each namespace in
+  `obleth.capacityDiscovery.namespaces` in order: the first one that has the
+  Service wins. An endpoint counts when it is ready, serving and not
+  terminating; endpoints listed in more than one slice count once. Only
+  replica counts are read: no pod, spec or environment.
+
+Which pods a Service counts is decided by the Service's own selector. For
+multi-node serving where only some pods take requests (for example a leader or
+head pod in front of workers), point the model at a Service whose selector
+matches just those pods.
+
+**Per-replica concurrency** is set by the operator, since it rarely changes:
+the model's `per_replica_max_in_flight` (the requests one replica serves at
+once, e.g. your server's max concurrent sequences, such as vLLM
+`--max-num-seqs`). It is required for the `kubernetes` source, and for
+`endpoints` unless every endpoint sets its own `max_in_flight`; a model write
+without it is refused with a message saying what to set.
+
+**Fallbacks:** when the source reports no serving replica or does not answer
+(scale to zero, a rollout, the Service not there, the API server briefly
+away), the last derived value holds, or the static `max_in_flight` (or
+`obleth.defaultModelMaxInFlight`) if nothing was derived yet. A namespace that
+fails to answer is not skipped in favour of a later one. A model that cannot
+be discovered as configured (no Service, a namespace outside the list) uses its
+static value. Each change of state is logged once.
+
+**Autoscalers:** capping the gateway at 100% of ready capacity still lets an
+autoscaler that scales on backend utilization or running requests (for example
+one targeting a fraction of the server's own concurrency limit) see saturation
+and add replicas; the new replicas raise the pool on the next pass. An
+autoscaler that scales on queue depth only sees a queue if requests can wait at
+the backend: give such models a `capacity_headroom` above 1 (1.25 admits a
+quarter more than the ready capacity).
+
+**RBAC (kubernetes source only):** with `obleth.capacityDiscovery.enabled` and
+at least one namespace listed, the chart creates a ServiceAccount for the
+gateway pods and, in each listed namespace, a Role granting only
+`get`/`list`/`watch` on `endpointslices` in the `discovery.k8s.io` API group,
+plus a RoleBinding to that account. Nothing on pods, Services or Secrets is
+granted, and there is no ClusterRole: the permission reveals only Service
+endpoint addresses (pod IPs and names) and readiness. The namespaces must exist
+and the account running `helm` must be allowed to create Roles in them. With no
+namespaces listed nothing is rendered and the gateway keeps its default
+account. A Service with a selector always has at least one EndpointSlice, kept
+by the EndpointSlice controller; a Service without a selector needs slices
+labelled `kubernetes.io/service-name` from whatever manages its endpoints.
+
+A kubernetes-source model with no per-replica value, whose namespace is outside
+the list, or that has no Service and no default template to fall back on (or a
+template that does not give a valid Service name for it), is refused when it is
+saved. The dashboard's model page and `GET /api/v1/capacity/discovery` show,
+per discovered model, the Service and the namespace it was found in, the ready
+replicas, the per-replica value, the derived pool size, this replica's share,
+the last refresh and the reason when discovery has no answer;
+`obleth_capacity_discovery_models{state}` counts models by state. See
+[`values-capacity-discovery.yaml`](obleth/examples/values-capacity-discovery.yaml)
+for settings and examples.
+
 ## What the chart starts
 
 A self-contained demo install brings up:
@@ -307,7 +412,7 @@ curl -s -X POST http://localhost:9180/api/v1/models \
   -d '{
     "model_name": "my-model",
     "upstream_model": "meta-llama/Llama-3-8b-instruct",
-    "api_base": "http://aibrix-gateway.aibrix.svc.cluster.local:8080/v1",
+    "api_base": "http://my-inference-gateway.inference.svc.cluster.local:8080/v1",
     "enabled": true
   }'
 ```
@@ -315,7 +420,7 @@ curl -s -X POST http://localhost:9180/api/v1/models \
 | Field | Rule |
 | --- | --- |
 | `api_base` | Provider **base** URL ending in `/v1`, not a full endpoint path |
-| `upstream_model` | Bare model id sent to the upstream (as vLLM/Aibrix expect it) |
+| `upstream_model` | Bare model id sent to the upstream (as the inference server expects it) |
 | `model_name` | Client-facing alias; what callers pass as `"model"` |
 
 You can also import models from the control-plane dashboard (Models → Import).

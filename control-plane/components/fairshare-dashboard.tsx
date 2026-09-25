@@ -536,6 +536,7 @@ function LiveConsoleHeader({
             </Badge>
           </div>
           <p className="mt-2 text-xs text-muted-foreground">{detail}</p>
+          {view && <p className="mt-1 text-xs text-muted-foreground">{replicaNote(view)}</p>}
           {isError && <p role="alert" className="mt-2 text-xs text-amber-400">{view ? `Showing the last snapshot from ${new Date(dataUpdatedAt).toLocaleTimeString()}. Refresh failed; retrying automatically.` : "Could not load scheduler state. Retrying automatically."}</p>}
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -930,23 +931,46 @@ function GroupNumber({
   );
 }
 
+/** This replica's share of a fleet-wide limit, as the gateway computes it. */
+export function replicaShare(configured: number, replicas: number): number {
+  return Math.max(Math.ceil(configured / Math.max(replicas, 1)), 1);
+}
+
+/** One line saying whether the numbers on the page are per-replica shares. */
+export function replicaNote(view: FairshareLiveView): string {
+  if (view.replica_aware === undefined) return "";
+  if (!view.replica_aware) {
+    return "Replica-aware sizing is off (OBLETH_FAIRSHARE_REPLICA_AWARE): every gateway replica enforces the full configured limits.";
+  }
+  const n = Math.max(view.replicas ?? 1, 1);
+  if (n === 1) return "1 live gateway replica: pools, caps and the ceiling are enforced at their configured size.";
+  const configured = view.configured_max_in_flight;
+  return `${formatNumber(n)} live gateway replicas: pool sizes, tenant and key caps and the ceiling shown here are this replica's share, ceil(configured / ${formatNumber(n)})${configured ? `, of ${formatNumber(configured)} configured pool slots` : ""}. Counts are this replica's own.`;
+}
+
 function ModelSlotPressure({ view, routes }: { view?: FairshareLiveView; routes: ModelRoute[] }) {
+  const replicas = Math.max(view?.replicas ?? 1, 1);
   const rows = useMemo(() => {
     const inFlight = view?.model_in_flight ?? {};
     const queued = view?.model_queued ?? {};
     const capByName = new Map(routes.map((r) => [r.model_name, r.max_in_flight ?? null]));
     const names = new Set<string>([...Object.keys(inFlight), ...Object.keys(queued)]);
     return [...names]
-      .map((name) => ({
-        name,
-        inFlight: inFlight[name] ?? 0,
-        queued: queued[name] ?? 0,
-        cap: capByName.get(name) ?? null,
-        capKnown: capByName.has(name),
-      }))
+      .map((name) => {
+        const configured = capByName.get(name) ?? null;
+        return {
+          name,
+          inFlight: inFlight[name] ?? 0,
+          queued: queued[name] ?? 0,
+          // In-flight counts are this replica's, so measure them against its share.
+          cap: configured === null ? null : replicaShare(configured, replicas),
+          configured,
+          capKnown: capByName.has(name),
+        };
+      })
       .filter((r) => r.inFlight > 0 || r.queued > 0)
       .sort((a, b) => b.queued - a.queued || b.inFlight - a.inFlight);
-  }, [view, routes]);
+  }, [view, routes, replicas]);
 
   return (
     <Card className="rounded-md">
@@ -976,6 +1000,7 @@ function ModelSlotPressure({ view, routes }: { view?: FairshareLiveView; routes:
                   </div>
                   <span className="tabular-nums text-muted-foreground sm:text-right">
                     {formatNumber(r.inFlight)} active / {!r.capKnown ? "cap unavailable" : r.cap == null ? "no model cap" : `${formatNumber(r.cap)} cap`}
+                    {replicas > 1 && r.configured !== null && <span className="block">of {formatNumber(r.configured)} configured</span>}
                     <span className={cn("block", r.queued > 0 && "text-amber-400")}>{formatNumber(r.queued)} queued</span>
                   </span>
                 </div>

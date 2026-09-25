@@ -109,3 +109,14 @@ http://{{ .Release.Name }}-benchmark-backend:8081
 {{ required "set obleth.upstreamBaseUrl when benchmarkBackend.enabled=false" .Values.obleth.upstreamBaseUrl }}
 {{- end -}}
 {{- end -}}
+
+{{/*
+Non-empty when the kubernetes capacity source is configured: discovery on and
+at least one namespace listed. Gates the gateway ServiceAccount, its per-
+namespace EndpointSlice-read Roles and RoleBindings, and the pod's use of that
+account.
+*/}}
+{{- define "obleth.capacityDiscoveryRbac" -}}
+{{- $cd := .Values.obleth.capacityDiscovery | default dict -}}
+{{- if and $cd.enabled $cd.namespaces -}}true{{- end -}}
+{{- end -}}

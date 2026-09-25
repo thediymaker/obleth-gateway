@@ -654,6 +654,7 @@ async fn dispatch_stream(
     let mut req = state
         .http
         .post(super::build_chat_url(&target.base))
+        .headers(target.headers.clone())
         .json(body);
     if let Some(api_key) = &target.api_key {
         req = req.bearer_auth(api_key);

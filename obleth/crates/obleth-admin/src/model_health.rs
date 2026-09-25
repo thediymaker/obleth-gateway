@@ -75,6 +75,7 @@ pub(crate) fn probe_config_changed(before: &ModelRoute, after: &ModelRoute) -> b
     before.api_base != after.api_base
         || before.upstream_model != after.upstream_model
         || before.model_type != after.model_type
+        || before.upstream_headers != after.upstream_headers
 }
 
 #[derive(Clone)]
@@ -317,7 +318,14 @@ pub async fn validate_model(
     }
     state.ssrf.validate(&body.api_base).await?;
 
-    match fetch_catalog_direct(&state, &body.api_base, body.api_key.as_deref()).await {
+    match fetch_catalog_direct(
+        &state,
+        &body.api_base,
+        body.api_key.as_deref(),
+        &Default::default(),
+    )
+    .await
+    {
         Ok(catalog) => match catalog.as_ref() {
             Catalog::Wildcard => {
                 warnings.push(
@@ -598,11 +606,12 @@ async fn fetch_upstream_catalog(
     state: &AdminState,
     api_base: &str,
     api_key: Option<&str>,
+    headers: &obleth_config::UpstreamHeaders,
 ) -> std::result::Result<Arc<Catalog>, CatalogError> {
     if let Some(catalog) = state.health.catalogs.get(api_base) {
         return Ok(catalog);
     }
-    let catalog = fetch_catalog_direct(state, api_base, api_key).await?;
+    let catalog = fetch_catalog_direct(state, api_base, api_key, headers).await?;
     state.health.catalogs.put(api_base, catalog.clone());
     Ok(catalog)
 }
@@ -614,10 +623,11 @@ async fn fetch_catalog_direct(
     state: &AdminState,
     api_base: &str,
     api_key: Option<&str>,
+    headers: &obleth_config::UpstreamHeaders,
 ) -> std::result::Result<Arc<Catalog>, CatalogError> {
     let mut first_error: Option<CatalogError> = None;
     for url in obleth_config::catalog_urls(api_base) {
-        match fetch_catalog_url(state, &url, api_key).await {
+        match fetch_catalog_url(state, &url, api_key, headers).await {
             Ok(catalog) => return Ok(catalog),
             Err(error) => {
                 // Only a 404 is worth a second path: unreachable, auth and 5xx
@@ -640,9 +650,15 @@ async fn fetch_catalog_url(
     state: &AdminState,
     url: &str,
     api_key: Option<&str>,
+    headers: &obleth_config::UpstreamHeaders,
 ) -> std::result::Result<Arc<Catalog>, CatalogError> {
     let timeout = Duration::from_secs(state.health.timeout_secs.max(1));
-    let mut request = state.health.http.get(url).timeout(timeout);
+    let mut request = state
+        .health
+        .http
+        .get(url)
+        .headers(crate::upstream_header_map(headers))
+        .timeout(timeout);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
@@ -690,17 +706,41 @@ async fn existence_probe(
     api_key: Option<&str>,
 ) -> ProbeResult {
     let started = Instant::now();
-    let catalog = fetch_upstream_catalog(state, api_base, api_key).await;
+    let catalog = fetch_upstream_catalog(state, api_base, api_key, &model.upstream_headers).await;
     let latency_ms: Option<i64> = started.elapsed().as_millis().try_into().ok();
     match catalog {
         Ok(catalog) => classify_existence(&catalog, &model.upstream_model, latency_ms),
-        Err(error) => ProbeResult {
-            status: classify_probe(error.http).to_string(),
-            latency_ms,
-            http_status: error.http.map(i64::from),
-            message: Some(normalize_excerpt(&error.message, 240)),
-            response_excerpt: None,
-        },
+        Err(error) => classify_catalog_failure(&error, latency_ms),
+    }
+}
+
+/// A catalog fetch that failed, for a model with no inference probe. The
+/// catalog is this model's only health signal, so a failure to read it is not
+/// evidence the model is down: a gateway that does not serve `/models`, or
+/// guards it differently from inference, answers 404 or 401 here while
+/// serving the model fine. Those answers are `unknown` (never counted toward
+/// the failure threshold, never alerted on). An upstream that does not answer
+/// at all is still `unhealthy`, since inference to it would fail the same
+/// way, and a 5xx stays `degraded`.
+fn classify_catalog_failure(error: &CatalogError, latency_ms: Option<i64>) -> ProbeResult {
+    let status = match error.http {
+        Some(code) if (400..500).contains(&code) => "unknown",
+        other => classify_probe(other),
+    };
+    let message = if status == "unknown" {
+        format!(
+            "{}; no inference probe for this model type, so health is unverified",
+            error.message
+        )
+    } else {
+        error.message.clone()
+    };
+    ProbeResult {
+        status: status.to_string(),
+        latency_ms,
+        http_status: error.http.map(i64::from),
+        message: Some(normalize_excerpt(&message, 240)),
+        response_excerpt: None,
     }
 }
 
@@ -744,7 +784,9 @@ async fn disambiguate_rejection(
     probe_url: &str,
     original: ProbeResult,
 ) -> ProbeResult {
-    let Ok(catalog) = fetch_upstream_catalog(state, api_base, api_key).await else {
+    let Ok(catalog) =
+        fetch_upstream_catalog(state, api_base, api_key, &model.upstream_headers).await
+    else {
         return original;
     };
     refine_rejection(&catalog, model, code, probe_url, original)
@@ -807,7 +849,9 @@ async fn inference_probe(
 
     loop {
         attempt += 1;
-        let mut request = req.build(client, timeout);
+        let mut request = req
+            .build(client, timeout)
+            .headers(crate::upstream_header_map(&model.upstream_headers));
         if let Some(key) = api_key {
             request = request.bearer_auth(key);
         }
@@ -1118,8 +1162,9 @@ fn probe_silence_wav() -> Vec<u8> {
 
 /// Build the minimal real inference request used to verify a model actually
 /// serves. `api_base` already includes the `/v1` suffix. Returns `None` for
-/// `image` (a "minimal" generation is still costly) and unrecognized types —
-/// those fall back to the catalog existence check.
+/// `image` (a "minimal" generation is still costly), `video` (a probe would be
+/// a multi-minute render holding a card) and unrecognized types — those fall
+/// back to the catalog existence check.
 fn build_probe_request(
     api_base: &str,
     model_type: &str,
@@ -1467,6 +1512,11 @@ mod tests {
             |m: &mut ModelRoute| m.api_base = "https://other/v1".into(),
             |m: &mut ModelRoute| m.upstream_model = "renamed".into(),
             |m: &mut ModelRoute| m.model_type = "embedding".into(),
+            // A routing header decides which backend the probe reaches.
+            |m: &mut ModelRoute| {
+                m.upstream_headers
+                    .insert("x-routing-hint".into(), "sticky".into());
+            },
         ] {
             let mut after = before.clone();
             mutate(&mut after);
@@ -1678,7 +1728,44 @@ mod tests {
     #[test]
     fn probe_request_costly_and_unknown_modes_are_none() {
         assert!(build_probe_request("https://up/v1", "image", "m").is_none());
+        assert!(build_probe_request("https://up/v1", "video", "m").is_none());
         assert!(build_probe_request("https://up/v1", "something-else", "m").is_none());
+    }
+
+    #[test]
+    fn a_catalog_that_cannot_be_read_leaves_an_unprobed_model_unverified() {
+        let failure = |http: Option<u16>| CatalogError {
+            http,
+            message: match http {
+                Some(code) => format!("catalog request failed (HTTP {code})"),
+                None => "catalog is unreachable: connection refused".into(),
+            },
+        };
+        // The upstream answered but would not list its models: no evidence
+        // either way about the model itself.
+        for code in [401, 403, 404, 405] {
+            let r = classify_catalog_failure(&failure(Some(code)), Some(12));
+            assert_eq!(r.status, "unknown", "HTTP {code}");
+            assert_eq!(r.http_status, Some(i64::from(code)));
+            assert!(r.message.unwrap().contains("unverified"));
+        }
+        // Overloaded: transient, as for every other probe.
+        assert_eq!(
+            classify_catalog_failure(&failure(Some(503)), None).status,
+            "degraded"
+        );
+        // Nothing answered at all: inference would fail too.
+        assert_eq!(
+            classify_catalog_failure(&failure(None), None).status,
+            "unhealthy"
+        );
+    }
+
+    #[test]
+    fn image_models_still_have_no_inference_probe() {
+        // A generation costs accelerator time per sweep; the catalog stays the
+        // default signal (see `classify_catalog_failure`).
+        assert!(build_probe_request("http://up/v1", "image", "image-model").is_none());
     }
 
     #[test]

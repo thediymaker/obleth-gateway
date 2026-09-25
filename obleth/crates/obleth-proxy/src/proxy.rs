@@ -56,10 +56,6 @@ const DEFAULT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
 /// `Retry-After` sent with an admission timeout. `pub(crate)` so other
 /// admission call sites (e.g. `verdicts`) send the same value.
 pub(crate) const ADMISSION_RETRY_AFTER_SECS: &str = "5";
-/// How long the aggregated `GET /v1/models` listing is reused. Each miss fans
-/// out one request per upstream base, so polling clients must not drive that
-/// per call.
-const MODELS_LIST_TTL: Duration = Duration::from_secs(15);
 
 /// Parse `OBLETH_ADMISSION_TIMEOUT_SECS`; unset, unparseable, or zero falls
 /// back to the default.
@@ -951,6 +947,22 @@ async fn proxy_handler_inner(
         return resp;
     }
 
+    // ---- Videos API follow-ups (poll, download, delete, list) ----
+    // They carry a job id, never a model, so they are served from the job
+    // record written at create time: routed to the model and endpoint that
+    // made the job, and "not found" for any other tenant. Reads of work the
+    // create already paid for, so no admission, budget, or ledger row (see
+    // `crate::videos`).
+    if let Some(call) = crate::videos::follow_up(&method, &path) {
+        let inbound = crate::videos::Inbound {
+            method: &method,
+            query: &query,
+            headers: &headers,
+        };
+        return crate::videos::handle_follow_up(&state, &resolved, call, inbound, request_id).await;
+    }
+    let video_create = crate::videos::is_create(&method, &path);
+
     // ---- request flight-recorder tracer ----
     let mut tracer: Option<crate::tracer::SpanRecorder> = if resolved.tracing_enabled {
         tracing::debug!(request_id = %request_id, "tracing enabled — recording spans");
@@ -985,10 +997,12 @@ async fn proxy_handler_inner(
     };
     let mut json: serde_json::Value =
         serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
-    // Audio transcription/translation send the model as a `multipart/form-data`
-    // field alongside the uploaded file, not as JSON. Parse the fields once so
-    // we can resolve the model and later rebuild the upstream form with the
-    // model name swapped.
+    // File-upload endpoints (audio transcription/translation, image edits and
+    // variations) send the model as a `multipart/form-data` field alongside
+    // the uploaded file, not as JSON. Parse the fields once so we can resolve
+    // the model and later rebuild the upstream form with the model name
+    // swapped. The text fields stand in for the JSON body from here on, so
+    // the input guardrails scan the prompt and image cost reads `n`.
     let content_type_in = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -1006,6 +1020,9 @@ async fn proxy_handler_inner(
         } else {
             None
         };
+    if let Some(fields) = &multipart_fields {
+        json = multipart_text_view(fields);
+    }
 
     let mut model = if let Some(fields) = &multipart_fields {
         fields
@@ -1045,7 +1062,7 @@ async fn proxy_handler_inner(
     // which still falls through for an unknown id so a wildcard passthrough
     // keeps working.
     if method == Method::GET && is_models_collection(&path) {
-        return models_list_response(&state).await;
+        return models_list_response(&state, &resolved);
     }
     // ---- model detail (`GET /v1/models/{id}`) ----
     // Answered from the registry for any name the gateway has a route for,
@@ -1056,8 +1073,15 @@ async fn proxy_handler_inner(
     // passthrough keeps working.
     if method == Method::GET && !is_models_collection(&path) && path.starts_with("/v1/models/") {
         let id = path.trim_start_matches("/v1/models/");
-        if let Some(entry) = registered_model_entry(&state, id) {
-            return (StatusCode::OK, axum::Json(entry)).into_response();
+        match registered_model_entry(&state, id, allowed_models_for(&resolved)) {
+            Some(Ok(entry)) => return (StatusCode::OK, axum::Json(entry)).into_response(),
+            // A registered model outside the tenant's allowlist answers like a
+            // name the gateway does not have. Falling through would forward the
+            // id to an upstream, which knows nothing of the allowlist.
+            Some(Err(())) => {
+                return error_json(StatusCode::NOT_FOUND, &format!("model '{id}' not found"));
+            }
+            None => {}
         }
     }
     // ---- model detail (`GET /model/info`) ----
@@ -1358,9 +1382,14 @@ async fn proxy_handler_inner(
         return error_json(block.status, block.reason);
     }
     if boon_outcome.rewritten {
-        match serde_json::to_vec(&json) {
-            Ok(bytes) => body_bytes = Bytes::from(bytes),
-            Err(e) => tracing::warn!(error = %e, "failed to re-serialize boon-rewritten body"),
+        if let Some(fields) = multipart_fields.as_mut() {
+            // The form is rebuilt from its fields at dispatch, not from the body.
+            apply_multipart_text_view(fields, &json);
+        } else {
+            match serde_json::to_vec(&json) {
+                Ok(bytes) => body_bytes = Bytes::from(bytes),
+                Err(e) => tracing::warn!(error = %e, "failed to re-serialize boon-rewritten body"),
+            }
         }
         // The body changed (e.g. images became text descriptions); the
         // admission estimate must reflect what is actually sent upstream.
@@ -1425,9 +1454,12 @@ async fn proxy_handler_inner(
     let output_guardrails_armed = response_plan
         .as_ref()
         .is_some_and(|p| p.guardrails.is_some());
+    // A video create is never replayed from cache either: an identical body
+    // must start a new job, not hand back an id some earlier call recorded.
     let cache_enabled = route.as_ref().map(|r| r.cache_enabled).unwrap_or(false)
         && !tool_loop_armed
-        && !output_guardrails_armed;
+        && !output_guardrails_armed
+        && !video_create;
     let cache_ttl = route.as_ref().map(|r| r.cache_ttl_secs).unwrap_or(0);
     // TTL <= 0 means "don't cache": nothing is ever written, so a lookup could
     // never hit and would only cost a Redis round-trip.
@@ -2065,6 +2097,8 @@ async fn proxy_handler_inner(
     let mut last_err: Option<String> = None;
     let mut timed_out = false;
     let total_targets = targets.len();
+    // Which target answered: a video job lives on the backend that accepted it.
+    let mut served_target = 0usize;
 
     'targets: for (ti, target) in targets.iter().enumerate() {
         let url = build_upstream_url(&target.base, &path, &query);
@@ -2087,6 +2121,9 @@ async fn proxy_handler_inner(
             let more_targets = replayable && ti + 1 < total_targets;
 
             let mut fwd_headers = forward_headers(&headers);
+            // The model's own upstream headers go on after the client's, so
+            // the operator's value wins a name both set.
+            fwd_headers.extend(target.headers.clone());
             if let Some(key) = &target.api_key {
                 if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {key}")) {
                     fwd_headers.insert(header::AUTHORIZATION, v);
@@ -2149,6 +2186,7 @@ async fn proxy_handler_inner(
                     }
                     state.metrics.record_upstream_attempt("success");
                     upstream_resp = Some(resp);
+                    served_target = ti;
                     break 'targets;
                 }
                 Ok(Err(e)) => {
@@ -2398,6 +2436,51 @@ async fn proxy_handler_inner(
 
     // Cache only successful responses.
     let store_in_cache = cache_key.clone();
+
+    // ---- video job create: record the job before its id leaves ----
+    // The response is a small JSON video object. It is read whole, its id is
+    // recorded against this tenant and the target that accepted it, and only
+    // then is it returned — an unrecorded id could never be followed up. The
+    // create is billed its flat `cost_per_video` (no tokens) once recorded,
+    // and nothing when it is not. The whole step runs as its own task so a
+    // client that leaves mid-way cannot strand a job it was charged for.
+    if video_create {
+        if let Some(t) = tracer.take() {
+            t.finish("ok");
+        }
+        let job = crate::videos::CreatedJob {
+            jobs: state.video_jobs.clone(),
+            http: state.http.clone(),
+            model: model.clone(),
+            tenant_id: resolved.tenant_id,
+            key_id: resolved.key_id,
+            target: Target {
+                base: targets[served_target].base.clone(),
+                api_key: targets[served_target].api_key.clone(),
+                headers: targets[served_target].headers.clone(),
+            },
+            started: upstream_start,
+        };
+        let recorded = tokio::spawn(async move {
+            let outcome = crate::videos::record_create(job, upstream).await;
+            drop(permit);
+            let total_ms = request_start.elapsed().as_millis() as u32;
+            let settle = accounting.settle_with(
+                (0, 0),
+                outcome.ttft_ms(),
+                total_ms,
+                outcome.status().as_u16(),
+                None,
+                outcome.billed(),
+            );
+            let _ = settle_guard.complete(settle).await;
+            outcome
+        });
+        return match recorded.await {
+            Ok(outcome) => outcome.into_response(request_id),
+            Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "video create failed"),
+        };
+    }
 
     // Extract guardrails policy for log_only output scanning (evaluated after stream drains).
     let scan_policy = resolved
@@ -3909,109 +3992,79 @@ fn maybe_alert_key_budget(
     }
 }
 
-/// Serve `GET /v1/models` by aggregating what the upstreams actually report.
+/// Serve `GET /v1/models` from the gateway's own registry: one entry per
+/// enabled route, under its client-facing `model_name`, carrying the same
+/// fields as the detail lookup.
 ///
-/// The single default upstream only lists its own models (e.g. the litellm or
-/// aibrix gateway), so Slurm-hosted models on their own endpoints never show up.
-/// We instead ask every distinct upstream that backs a registered model (the
-/// default base plus each model's endpoints) for its own `/v1/models` and union
-/// the entries. Lookups are best-effort and concurrent, so a slow or down
-/// upstream is simply skipped.
+/// The registry is the only honest source for this answer. The listing used to
+/// be the union of every upstream's own `/v1/models`, which listed nothing for
+/// a route whose backend does not serve a catalog (or was unreachable that
+/// second), and advertised whatever else a backend happened to serve, under
+/// its backend id, though a request naming a model the gateway has not
+/// registered is refused. Provisioned models are registry rows too, so nothing
+/// the union found is lost.
 ///
-/// An entry the gateway recognizes is then rewritten onto the gateway's own
-/// name and annotated — see [`canonicalize_models`], which is where the
-/// `glm-5-3-mxfp4` a backend calls itself becomes the registered `glm-5-3`.
-/// Everything else stays as its upstream reported it, `owned_by` included
-/// (litellm `openai`, vLLM `vllm`, llama.cpp `llamacpp`, Ollama `library`, …),
-/// so a wildcard passthrough is never dressed up as a registered route.
-async fn models_list_response(state: &AppState) -> Response<Body> {
-    // One entry per default base (one per process in practice). `get_with`
-    // also coalesces concurrent misses into a single upstream fan-out.
-    static LISTING: std::sync::OnceLock<moka::future::Cache<String, Bytes>> =
-        std::sync::OnceLock::new();
-    let cache = LISTING.get_or_init(|| {
-        moka::future::Cache::builder()
-            .max_capacity(16)
-            .time_to_live(MODELS_LIST_TTL)
-            .build()
-    });
-    // A listing missing an unreachable upstream is served but not cached, so
-    // the gap does not outlive the outage by a TTL.
-    let body = match cache
-        .try_get_with(state.upstream_base.clone(), build_models_list(state))
-        .await
-    {
-        Ok(body) => body,
-        Err(partial) => (*partial).clone(),
-    };
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body))
-        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+/// Tenants with a model allowlist see only the models they may call, as on
+/// `/model/info`: listing a model the caller would be refused advertises a 403.
+fn models_list_response(state: &AppState, resolved: &ResolvedKey) -> Response<Body> {
+    let candidates = state.model_registry.load();
+    (
+        StatusCode::OK,
+        axum::Json(registry_models_list(
+            &candidates,
+            allowed_models_for(resolved),
+        )),
+    )
+        .into_response()
 }
 
-/// The merged, canonicalized model listing as serialized JSON. `Err` carries
-/// the listing when any upstream could not be read.
-async fn build_models_list(state: &AppState) -> Result<Bytes, Bytes> {
-    let candidates = state.model_registry.load();
-
-    // Each registered model's effective upstream target(s), paired with the key
-    // needed to reach them. Most upstreams (litellm / aibrix / openai-compatible)
-    // require auth on `/v1/models`, so an unauthenticated probe 401s and the
-    // model silently drops out. Deduped by base; a base that carries a key wins
-    // over one that doesn't. Only models with neither endpoints nor an api_base
-    // fall back to the global default base.
-    let mut by_base: std::collections::HashMap<String, Option<String>> =
-        std::collections::HashMap::new();
-    for c in candidates.iter() {
-        let targets: Vec<(String, Option<String>)> = if !c.model.endpoints.is_empty() {
-            c.model
-                .endpoints
-                .iter()
-                .filter(|e| e.enabled)
-                .map(|e| {
-                    (
-                        e.api_base.clone(),
-                        e.api_key.clone().or_else(|| c.model.api_key.clone()),
-                    )
-                })
-                .collect()
-        } else if !c.model.api_base.is_empty() {
-            vec![(c.model.api_base.clone(), c.model.api_key.clone())]
-        } else {
-            vec![(state.upstream_base.clone(), None)]
-        };
-        for (base, key) in targets {
-            if base.is_empty() {
-                continue;
-            }
-            let slot = by_base.entry(base).or_insert(None);
-            if slot.is_none() {
-                *slot = key;
-            }
-        }
-    }
-
-    // Fan out concurrently (authenticating each probe), then union verbatim.
-    let results = futures_util::future::join_all(
-        by_base
-            .iter()
-            .map(|(base, key)| fetch_upstream_models(state, base, key.as_deref())),
-    )
-    .await;
-    let complete = results.iter().all(Option::is_some);
-
-    let mut merged = merge_upstream_models(results.into_iter().flatten());
-    canonicalize_models(&mut merged, &model_facts_index(&candidates));
-    let body = serde_json::to_vec(&merged)
-        .map(Bytes::from)
-        .unwrap_or_else(|_| Bytes::from_static(br#"{"object":"list","data":[]}"#));
-    if complete {
-        Ok(body)
+/// The model allowlist that bounds what a caller is shown, or `None` when it
+/// may see everything (internal callers, and tenants without an allowlist).
+/// Entries are canonical `model_name`s, which is also what the discovery
+/// endpoints advertise.
+fn allowed_models_for(resolved: &ResolvedKey) -> Option<&[String]> {
+    if resolved.internal {
+        None
     } else {
-        Err(body)
+        resolved.allowed_models.as_deref()
     }
+}
+
+/// True when `model_name` is visible under `allowed` (see [`allowed_models_for`]).
+fn model_visible(allowed: Option<&[String]>, model_name: &str) -> bool {
+    allowed.is_none_or(|list| list.iter().any(|m| m == model_name))
+}
+
+/// The OpenAI `{object:"list", data:[…]}` listing for a registry snapshot,
+/// sorted by id and limited to `allowed` when set. Pure, so the shape is
+/// unit-testable without a registry.
+fn registry_models_list(
+    candidates: &[obleth_config::routing::Candidate],
+    allowed: Option<&[String]>,
+) -> serde_json::Value {
+    let mut data: Vec<serde_json::Value> = candidates
+        .iter()
+        .filter(|c| c.model.enabled)
+        .filter(|c| model_visible(allowed, &c.model.model_name))
+        .map(|c| model_entry(&ModelFacts::of(&c.model)))
+        .collect();
+    data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    data.dedup_by(|a, b| a["id"] == b["id"]);
+    serde_json::json!({ "object": "list", "data": data })
+}
+
+/// One discovery entry (`/v1/models` and `/v1/models/{id}`).
+fn model_entry(facts: &ModelFacts) -> serde_json::Value {
+    serde_json::json!({
+        "id": facts.model_name,
+        "object": "model",
+        "owned_by": "obleth",
+        "model_type": facts.model_type,
+        "mode": mode_for_model_type(&facts.model_type),
+        "quantization": facts.quantization,
+        "tags": facts.tags,
+        "aliases": facts.aliases,
+    })
 }
 
 /// What the gateway knows about one registered route, as the discovery
@@ -4026,15 +4079,27 @@ struct ModelFacts {
     tags: Vec<String>,
 }
 
+impl ModelFacts {
+    fn of(model: &ResolvedModel) -> Self {
+        ModelFacts {
+            model_name: model.model_name.clone(),
+            model_type: model.model_type.clone(),
+            quantization: model.quantization.clone(),
+            aliases: model.aliases.clone(),
+            tags: model.tags.clone(),
+        }
+    }
+}
+
 /// Index every name a registered route can be recognized by — its
 /// `model_name`, its aliases, and the `upstream_model` its backend reports —
 /// onto the facts the gateway advertises for it.
 ///
-/// The `upstream_model` key is what lets a listing come back clean: a backend
-/// serving `glm-5-3-mxfp4` reports that id in its own catalog, and this index
-/// is how the aggregate recognizes it as the registered `glm-5-3`. Insertion
-/// order sets precedence deliberately — `model_name` is written last and wins,
-/// because it is the name request resolution matches on.
+/// The `upstream_model` key lets a detail lookup by a backend's own id (a
+/// client that learned `glm-5-3-mxfp4` from the backend) answer with the
+/// registered `glm-5-3`. Insertion order sets precedence deliberately —
+/// `model_name` is written last and wins, because it is the name request
+/// resolution matches on.
 fn model_facts_index(
     candidates: &[obleth_config::routing::Candidate],
 ) -> std::collections::HashMap<String, std::sync::Arc<ModelFacts>> {
@@ -4042,15 +4107,7 @@ fn model_facts_index(
         std::collections::HashMap::new();
     let facts: Vec<std::sync::Arc<ModelFacts>> = candidates
         .iter()
-        .map(|c| {
-            std::sync::Arc::new(ModelFacts {
-                model_name: c.model.model_name.clone(),
-                model_type: c.model.model_type.clone(),
-                quantization: c.model.quantization.clone(),
-                aliases: c.model.aliases.clone(),
-                tags: c.model.tags.clone(),
-            })
-        })
+        .map(|c| std::sync::Arc::new(ModelFacts::of(&c.model)))
         .collect();
     for (c, f) in candidates.iter().zip(facts.iter()) {
         if !c.model.upstream_model.is_empty() {
@@ -4070,152 +4127,16 @@ fn model_facts_index(
     by_name
 }
 
-/// Rewrite aggregated `/v1/models` entries onto the gateway's own names, and
-/// annotate them with what the gateway knows.
-///
-/// Two jobs, one pass:
-///
-/// * **Canonicalize.** An entry a registered route claims is re-`id`'d to that
-///   route's `model_name`. This is what keeps deployment detail out of the
-///   advertised catalog: a backend that serves `glm-5-3-mxfp4` (or a client
-///   pinned to that old spelling as an alias) is listed once, as `glm-5-3`.
-///   Two upstream ids collapsing onto one route therefore de-dupe here, after
-///   the rewrite, which [`merge_upstream_models`] could not have seen.
-/// * **Annotate.** Each matched entry gains `model_type` (obleth's
-///   [`MODEL_TYPES`](obleth_config::MODEL_TYPES) vocabulary), `mode` (the
-///   LiteLLM-convention alias many clients already read, where `image` is
-///   spelled `image_generation`), `quantization`, `tags`, and the `aliases`
-///   that still resolve to it — so a client that had pinned an old name can
-///   see where it went.
-///
-/// Entries no route claims — wildcard passthroughs — stay verbatim, with no
-/// guessed fields.
-fn canonicalize_models(
-    list: &mut serde_json::Value,
-    facts_by_name: &std::collections::HashMap<String, std::sync::Arc<ModelFacts>>,
-) {
-    let Some(data) = list.get_mut("data").and_then(|d| d.as_array_mut()) else {
-        return;
-    };
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut out: Vec<serde_json::Value> = Vec::with_capacity(data.len());
-    for mut entry in data.drain(..) {
-        let id = entry
-            .get("id")
-            .and_then(|i| i.as_str())
-            .unwrap_or_default()
-            .to_string();
-        match facts_by_name.get(&id) {
-            Some(f) => {
-                if !seen.insert(f.model_name.clone()) {
-                    continue;
-                }
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.insert("id".into(), f.model_name.clone().into());
-                    obj.insert("model_type".into(), f.model_type.clone().into());
-                    obj.insert("mode".into(), mode_for_model_type(&f.model_type).into());
-                    obj.insert("quantization".into(), f.quantization.clone().into());
-                    obj.insert("tags".into(), serde_json::json!(f.tags));
-                    obj.insert("aliases".into(), serde_json::json!(f.aliases));
-                }
-                out.push(entry);
-            }
-            None => {
-                if !seen.insert(id) {
-                    continue;
-                }
-                out.push(entry);
-            }
-        }
-    }
-    // Re-sorted because the rewrite above moves ids.
-    out.sort_by(|a, b| {
-        a.get("id")
-            .and_then(|i| i.as_str())
-            .cmp(&b.get("id").and_then(|i| i.as_str()))
-    });
-    *data = out;
-}
-
 /// The LiteLLM-convention spelling of a modality, which many OpenAI-compatible
 /// clients read instead of obleth's own `model_type`. Identical to the obleth
-/// vocabulary except that `image` is spelled `image_generation`.
+/// vocabulary except that `image` and `video` are spelled `image_generation`
+/// and `video_generation`.
 fn mode_for_model_type(model_type: &str) -> &str {
     match model_type {
         "image" => "image_generation",
+        "video" => "video_generation",
         other => other,
     }
-}
-
-/// Union upstream `/v1/models` entries into one OpenAI `{object:"list", data:[…]}`
-/// payload, keeping each entry exactly as its upstream reported it (real `id`,
-/// real `owned_by`) and de-duping by `id` — the first upstream to report an id
-/// wins. Sorted by id for stable output. Pure so it can be unit-tested without
-/// the network fan-out.
-fn merge_upstream_models(
-    lists: impl IntoIterator<Item = Vec<serde_json::Value>>,
-) -> serde_json::Value {
-    let mut seen = std::collections::HashSet::new();
-    let mut data: Vec<serde_json::Value> = Vec::new();
-    for entry in lists.into_iter().flatten() {
-        let Some(id) = entry.get("id").and_then(|i| i.as_str()) else {
-            continue;
-        };
-        if seen.insert(id.to_string()) {
-            data.push(entry);
-        }
-    }
-    data.sort_by(|a, b| {
-        a.get("id")
-            .and_then(|i| i.as_str())
-            .cmp(&b.get("id").and_then(|i| i.as_str()))
-    });
-    serde_json::json!({ "object": "list", "data": data })
-}
-
-/// Best-effort `GET {base}/v1/models`, returning the upstream's `data` entries
-/// verbatim. Any timeout/error/parse failure yields an empty list so one bad
-/// upstream never breaks or stalls the aggregate listing.
-///
-/// Both spellings of the path are tried, canonical first — see
-/// [`obleth_config::catalog_urls`]. Without the fallback an AIBrix gateway
-/// answers the canonical path with a 404 and every model behind it drops
-/// silently out of the listing: measured here as 6 of 45 routes advertised,
-/// with the 40 behind one such gateway all missing.
-async fn fetch_upstream_models(
-    state: &AppState,
-    base: &str,
-    api_key: Option<&str>,
-) -> Option<Vec<serde_json::Value>> {
-    async fn fetch_one(
-        state: &AppState,
-        url: &str,
-        api_key: Option<&str>,
-    ) -> Option<Vec<serde_json::Value>> {
-        let mut req = state.http.get(url);
-        if let Some(key) = api_key {
-            req = req.bearer_auth(key);
-        }
-        let resp = timeout(Duration::from_secs(4), req.send())
-            .await
-            .ok()?
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let v: serde_json::Value = resp.json().await.ok()?;
-        Some(v.get("data")?.as_array()?.clone())
-    }
-    // `build_upstream_url` first, so the base's own quirks (an api_base already
-    // ending in `/v1`, or one pasted as a full endpoint URL) are handled where
-    // every other upstream call handles them.
-    let url = build_upstream_url(base, "/v1/models", "");
-    for candidate in obleth_config::catalog_url_variants(&url) {
-        if let Some(entries) = fetch_one(state, &candidate, api_key).await {
-            return Some(entries);
-        }
-    }
-    None
 }
 
 /// True for the model-listing collection itself, in either spelling. The
@@ -4226,45 +4147,39 @@ fn is_models_collection(path: &str) -> bool {
 }
 
 /// One OpenAI model object for a name the gateway has a route for — canonical
-/// or alias — carrying the same annotations [`canonicalize_models`] adds to the
-/// listing. `None` for a name no route claims, which lets the caller fall
-/// through to the upstream passthrough.
+/// or alias — identical to that route's entry in the listing. `None` for a
+/// name no route claims, which lets the caller fall through to the upstream
+/// passthrough.
 ///
-/// `owned_by` is reported as `obleth` rather than guessed: unlike the
-/// aggregated listing, which repeats what an upstream said about itself, this
-/// answer is the gateway's own. `created` is omitted rather than fabricated —
-/// the hot-path view of a route does not carry a registration timestamp.
+/// `owned_by` is `obleth`: the answer is the gateway's own. `created` is
+/// omitted rather than fabricated — the hot-path view of a route does not
+/// carry a registration timestamp.
 ///
-/// Deliberately not filtered by the tenant's model allowlist, matching
-/// `GET /v1/models`: these are the OpenAI-compatible discovery endpoints, and a
-/// model name is not a secret — calling it is what the allowlist gates. The
-/// gateway-native `/model/info` does filter, because its semantics are ours to
-/// choose.
-fn registered_model_entry(state: &AppState, id: &str) -> Option<serde_json::Value> {
+/// `Some(Err(()))` when a route claims the name but it is outside `allowed`:
+/// the caller answers that like an unknown model, without forwarding the id,
+/// so the detail lookup reveals no more than the filtered listing does.
+fn registered_model_entry(
+    state: &AppState,
+    id: &str,
+    allowed: Option<&[String]>,
+) -> Option<Result<serde_json::Value, ()>> {
     if id.is_empty() {
         return None;
     }
     let candidates = state.model_registry.load();
     let facts = model_facts_index(&candidates).get(id)?.clone();
-    Some(serde_json::json!({
-        "id": facts.model_name,
-        "object": "model",
-        "owned_by": "obleth",
-        "model_type": facts.model_type,
-        "mode": mode_for_model_type(&facts.model_type),
-        "quantization": facts.quantization,
-        "tags": facts.tags,
-        "aliases": facts.aliases,
-    }))
+    if !model_visible(allowed, &facts.model_name) {
+        return Some(Err(()));
+    }
+    Some(Ok(model_entry(&facts)))
 }
 
 /// Serve `GET /model/info` from the gateway's own registry.
 ///
-/// Where `/v1/models` answers "what can I call right now" by asking the
-/// backends, this answers "what has this gateway been told about each model" —
-/// so it lists every registered, enabled route whether or not its backend is
-/// reachable this second, and reports the configured facts a client cannot
-/// infer from a name: the serving format, the routing tags, the context
+/// Where `/v1/models` answers "which names can I call" in the OpenAI shape,
+/// this answers "what has this gateway been told about each model" — every
+/// registered, enabled route with its health, and the configured facts a
+/// client cannot infer from a name: the serving format, the routing tags, the context
 /// window, the per-token prices, the capability flags, the aliases that still
 /// resolve here.
 ///
@@ -4287,18 +4202,11 @@ fn registered_model_entry(state: &AppState, id: &str) -> Option<serde_json::Valu
 /// model a caller would be refused would be advertising a 403.
 fn model_info_response(state: &AppState, resolved: &ResolvedKey) -> Response<Body> {
     let candidates = state.model_registry.load();
-    let allowed = if resolved.internal {
-        None
-    } else {
-        resolved.allowed_models.as_deref()
-    };
+    let allowed = allowed_models_for(resolved);
     let data: Vec<serde_json::Value> = candidates
         .iter()
         .filter(|c| c.model.enabled)
-        .filter(|c| match allowed {
-            Some(list) => list.iter().any(|m| m == &c.model.model_name),
-            None => true,
-        })
+        .filter(|c| model_visible(allowed, &c.model.model_name))
         .map(|c| model_info_entry(&c.model, c.healthy))
         .collect();
     (
@@ -4341,6 +4249,7 @@ fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
             "cost_per_image": model.cost_per_image,
             "cost_per_audio_second": model.cost_per_audio_second,
             "cost_per_character": model.cost_per_character,
+            "cost_per_video": model.cost_per_video,
             // Health as the gateway last observed it. False means the model is
             // registered and addressable but currently failing its probe or
             // held in a maintenance window.
@@ -4365,26 +4274,39 @@ fn is_model_info_endpoint(path: &str) -> bool {
     path == "/model/info" || path == "/v1/model/info"
 }
 
+/// OpenAI endpoints that must name a registered model.
+const REGISTERED_MODEL_PATHS: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/responses",
+    "/v1/audio/transcriptions",
+    "/v1/audio/translations",
+    "/v1/audio/speech",
+    "/v1/images/generations",
+    "/v1/images/edits",
+    "/v1/images/variations",
+    crate::videos::VIDEOS_PATH,
+];
+
 fn requires_registered_model(path: &str) -> bool {
-    matches!(
-        path,
-        "/v1/chat/completions"
-            | "/v1/completions"
-            | "/v1/embeddings"
-            | "/v1/responses"
-            | "/v1/audio/transcriptions"
-            | "/v1/audio/translations"
-            | "/v1/audio/speech"
-            | "/v1/images/generations"
-            | "/v1/images/edits"
-            | "/v1/images/variations"
-    )
+    REGISTERED_MODEL_PATHS.contains(&path)
 }
 
-/// True when the endpoint carries the model name in a multipart/form-data body
-/// (audio transcription/translation file uploads) rather than JSON.
+/// True when the endpoint takes a file upload, so the OpenAI spec sends it as
+/// `multipart/form-data` with the model as a form field rather than JSON:
+/// audio transcription/translation, the two image endpoints that take a
+/// source image (edits and variations), and the video create, whose optional
+/// reference frame is an upload (it accepts JSON too).
 fn is_multipart_endpoint(path: &str) -> bool {
-    matches!(path, "/v1/audio/transcriptions" | "/v1/audio/translations")
+    matches!(
+        path,
+        "/v1/audio/transcriptions"
+            | "/v1/audio/translations"
+            | "/v1/images/edits"
+            | "/v1/images/variations"
+            | crate::videos::VIDEOS_PATH
+    )
 }
 
 /// A single parsed `multipart/form-data` field, held in memory so it can be
@@ -4420,6 +4342,47 @@ async fn parse_multipart(
         });
     }
     Ok(fields)
+}
+
+/// The form's text fields as a JSON object, so the stages that read the
+/// request body (the token estimate, the input guardrails, the per-image
+/// cost) see a multipart request the way they see a JSON one. File parts are
+/// left out. Values stay strings, as the form sent them; a name that repeats
+/// becomes an array, so every occurrence is scanned.
+fn multipart_text_view(fields: &[MultipartField]) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for f in fields.iter().filter(|f| f.file_name.is_none()) {
+        let text = serde_json::Value::String(String::from_utf8_lossy(&f.data).into_owned());
+        match obj.get_mut(&f.name) {
+            None => {
+                obj.insert(f.name.clone(), text);
+            }
+            Some(serde_json::Value::Array(items)) => items.push(text),
+            Some(first) => *first = serde_json::Value::Array(vec![first.take(), text]),
+        }
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Copy text fields rewritten in the JSON view (a redacting input policy)
+/// back into the form, so what is forwarded is what was scanned. The inverse
+/// of [`multipart_text_view`]: a repeated name maps onto its array by position.
+fn apply_multipart_text_view(fields: &mut [MultipartField], view: &serde_json::Value) {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for f in fields.iter_mut().filter(|f| f.file_name.is_none()) {
+        let index = seen.entry(f.name.clone()).or_insert(0);
+        let value = match view.get(&f.name) {
+            Some(serde_json::Value::Array(items)) => items.get(*index),
+            other if *index == 0 => other,
+            _ => None,
+        };
+        *index += 1;
+        if let Some(text) = value.and_then(|v| v.as_str()) {
+            if text.as_bytes() != f.data.as_ref() {
+                f.data = Bytes::from(text.to_string());
+            }
+        }
+    }
 }
 
 /// Rebuild a reqwest multipart form from parsed fields, replacing the client
@@ -4460,15 +4423,25 @@ fn build_multipart_form(
 }
 
 /// Per-request surcharge for non-token-billed modalities: image generations are
-/// billed per image, text-to-speech per input character. Returns `0.0` for
-/// token-billed modalities (chat, embeddings) and audio transcription.
+/// billed per image, text-to-speech per input character, and a video job at a
+/// flat price per created job. Returns `0.0` for token-billed modalities
+/// (chat, embeddings) and audio transcription.
 fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value) -> f64 {
     let Some(route) = route else {
         return 0.0;
     };
     match route.model_type.as_str() {
         "image" => {
-            let n = json.get("n").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
+            // `n` is a number in a JSON body and a string in a multipart form
+            // (edits and variations).
+            let n = json
+                .get("n")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                })
+                .unwrap_or(1)
+                .max(1);
             n as f64 * route.cost_per_image
         }
         "audio_speech" => {
@@ -4479,6 +4452,9 @@ fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value
                 .unwrap_or(0);
             chars as f64 * route.cost_per_character
         }
+        // Frozen at the create, the only video call that reaches settlement:
+        // the polls and the download are served outside the pipeline.
+        "video" => route.cost_per_video,
         _ => 0.0,
     }
 }
@@ -4535,10 +4511,12 @@ fn prepare_upstream_body(
     serde_json::to_vec(&*json).map(Bytes::from).unwrap_or(body)
 }
 
-/// One resolved upstream target: a base URL plus an optional bearer key.
+/// One resolved upstream target: a base URL plus an optional bearer key, and
+/// the model's operator-configured upstream headers.
 pub(crate) struct Target {
     pub(crate) base: String,
     pub(crate) api_key: Option<String>,
+    pub(crate) headers: HeaderMap,
 }
 
 /// Build the ordered list of upstream targets for a request.
@@ -4558,6 +4536,9 @@ pub(crate) fn build_targets(
     session_key: &str,
 ) -> Vec<Target> {
     let mut targets: Vec<Target> = Vec::new();
+    let headers = route
+        .map(|r| obleth_admin::upstream_header_map(&r.upstream_headers))
+        .unwrap_or_default();
     if let Some(r) = route {
         let mut eligible: Vec<&ResolvedEndpoint> = r
             .endpoints
@@ -4574,6 +4555,7 @@ pub(crate) fn build_targets(
                 targets.push(Target {
                     base: e.api_base.clone(),
                     api_key: e.api_key.clone().or_else(|| r.api_key.clone()),
+                    headers: headers.clone(),
                 });
             }
             return targets;
@@ -4584,6 +4566,7 @@ pub(crate) fn build_targets(
             .map(|r| r.api_base.clone())
             .unwrap_or_else(|| default_base.to_string()),
         api_key: route.and_then(|r| r.api_key.clone()),
+        headers,
     });
     targets
 }
@@ -4723,7 +4706,7 @@ pub(crate) fn has_path_traversal(path: &str) -> bool {
     path.split(['/', '\\']).any(|seg| seg == "..")
 }
 
-fn build_upstream_url(base: &str, path: &str, query: &str) -> String {
+pub(crate) fn build_upstream_url(base: &str, path: &str, query: &str) -> String {
     let base = base.trim_end_matches('/');
     let rel_raw = path.trim_start_matches('/');
     // Defensive: operators sometimes paste the full endpoint URL as api_base
@@ -4858,6 +4841,8 @@ fn request_type_for_path(path: &str) -> &'static str {
         "audio"
     } else if path.contains("/images/") {
         "image"
+    } else if path.ends_with("/videos") {
+        "video"
     } else if path.ends_with("/rerank") || path.ends_with("/reranking") {
         "rerank"
     } else if path.ends_with("/moderations") {
@@ -5256,18 +5241,20 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        admit_request_for, anthropic_error, backfill_max_tokens_for_count_tokens, backoff_for,
-        build_targets, build_upstream_url, canonical_post_path, clamp_max_tokens,
-        effective_request_type, has_input_guardrails, has_path_traversal,
-        input_guardrails_unscannable, is_chat_path, is_models_collection, is_models_endpoint,
+        admit_request_for, anthropic_error, apply_multipart_text_view,
+        backfill_max_tokens_for_count_tokens, backoff_for, build_targets, build_upstream_url,
+        canonical_post_path, clamp_max_tokens, compute_modality_cost, effective_request_type,
+        forward_headers, has_input_guardrails, has_path_traversal, input_guardrails_unscannable,
+        is_chat_path, is_models_collection, is_models_endpoint, is_multipart_endpoint,
         is_retryable_status, looks_like_context_length_error, messages_input_estimate,
-        output_guardrails_unenforceable, prepare_upstream_body, redress_error,
-        request_type_for_path, resolve_conversation, session_hash_order,
-        should_translate_as_stream, strip_beta_query, surface, tenant_active_now, weighted_order,
-        RequestMeta, TooLong,
+        multipart_text_view, output_guardrails_unenforceable, parse_multipart,
+        prepare_upstream_body, redress_error, request_type_for_path, requires_registered_model,
+        resolve_conversation, session_hash_order, should_translate_as_stream, strip_beta_query,
+        surface, tenant_active_now, weighted_order, MultipartField, RequestMeta, TooLong,
+        REGISTERED_MODEL_PATHS,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
-    use axum::body::Body;
+    use axum::body::{Body, Bytes};
     use axum::http::{header, HeaderMap, Response, StatusCode};
     use chrono::{DateTime, TimeZone, Utc};
     use obleth_config::{ResolvedEndpoint, ResolvedKey, ResolvedModel, WeeklyWindow};
@@ -5291,6 +5278,7 @@ mod tests {
             weight,
             enabled,
             healthy,
+            max_in_flight: None,
         }
     }
 
@@ -5777,38 +5765,6 @@ mod tests {
         assert!(tenant_active_now(&key, now).is_ok());
     }
 
-    #[test]
-    fn merge_models_unions_upstreams_verbatim_and_dedups() {
-        use super::merge_upstream_models;
-        // litellm front (its models reported as "openai") and a Slurm/Ollama
-        // endpoint (reported as "library"); ids overlap on gemma.
-        let litellm = vec![
-            serde_json::json!({"id": "gemma4-31b-it", "object": "model", "owned_by": "openai"}),
-            serde_json::json!({"id": "minimax-m2-7-fast", "object": "model", "owned_by": "openai"}),
-        ];
-        let ollama = vec![
-            serde_json::json!({"id": "glm-5.2", "object": "model", "owned_by": "library"}),
-            // duplicate id already seen from litellm — first upstream wins.
-            serde_json::json!({"id": "gemma4-31b-it", "object": "model", "owned_by": "library"}),
-        ];
-
-        let payload = merge_upstream_models(vec![litellm, ollama]);
-        assert_eq!(payload["object"], "list");
-        let data = payload["data"].as_array().unwrap();
-        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
-        // Sorted union, deduped by id.
-        assert_eq!(ids, vec!["gemma4-31b-it", "glm-5.2", "minimax-m2-7-fast"]);
-        let owner_of = |id: &str| {
-            data.iter().find(|m| m["id"] == id).unwrap()["owned_by"]
-                .as_str()
-                .unwrap()
-        };
-        // Owners are verbatim from upstream; nothing synthesized.
-        assert_eq!(owner_of("gemma4-31b-it"), "openai"); // first upstream wins over the dup
-        assert_eq!(owner_of("glm-5.2"), "library");
-        assert_eq!(owner_of("minimax-m2-7-fast"), "openai");
-    }
-
     /// A registered route as the discovery endpoints see it, with only the
     /// fields those endpoints read set to anything interesting.
     fn candidate(
@@ -5834,90 +5790,125 @@ mod tests {
     }
 
     #[test]
-    fn models_listing_annotates_registered_modalities() {
-        use super::{canonicalize_models, model_facts_index};
-        let mut list = serde_json::json!({
-            "object": "list",
-            "data": [
-                {"id": "flux-2-dev", "object": "model", "owned_by": "vllm"},
-                {"id": "gemma4-31b-it", "object": "model", "owned_by": "openai"},
-                {"id": "wildcard-passthrough", "object": "model", "owned_by": "library"},
-            ]
-        });
+    fn models_listing_is_the_registry_under_client_facing_names() {
+        use super::registry_models_list;
+        let mut disabled = candidate("retired", "retired", "chat", "none", &[], &[]);
+        disabled.model.enabled = false;
         let candidates = vec![
+            // A backend that knows itself only by its quantized name, with an
+            // old spelling kept as an alias. Whether or not that backend
+            // serves a catalog, the route is listed once, as `glm-5-3`.
             candidate(
-                "flux-2-dev",
-                "flux-2-dev",
+                "glm-5-3",
+                "glm-5-3-mxfp4",
+                "chat",
+                "mxfp4",
+                &["glm-5-3-fp8"],
+                &["coding"],
+            ),
+            candidate(
+                "image-model",
+                "vendor/image-model",
                 "image",
                 "bf16",
                 &[],
                 &["creative"],
             ),
-            candidate("gemma4-31b-it", "gemma4-31b-it", "chat", "fp8", &[], &[]),
+            disabled,
         ];
-        canonicalize_models(&mut list, &model_facts_index(&candidates));
+        let list = registry_models_list(&candidates, None);
+        assert_eq!(list["object"], "list");
+        let data = list["data"].as_array().unwrap();
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        // Sorted, enabled routes only, and never a backend id.
+        assert_eq!(ids, vec!["glm-5-3", "image-model"]);
 
-        let field = |id: &str, key: &str| {
-            list["data"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|m| m["id"] == id)
-                .unwrap()[key]
-                .clone()
-        };
-        // Registered models gain both the obleth vocabulary and the
-        // LiteLLM-convention alias (`image` is spelled `image_generation`).
-        assert_eq!(field("flux-2-dev", "model_type"), "image");
-        assert_eq!(field("flux-2-dev", "mode"), "image_generation");
-        assert_eq!(field("gemma4-31b-it", "model_type"), "chat");
-        assert_eq!(field("gemma4-31b-it", "mode"), "chat");
-        // The serving format is reported as a field, which is the whole point
-        // of keeping it out of the name.
-        assert_eq!(field("flux-2-dev", "quantization"), "bf16");
-        assert_eq!(field("gemma4-31b-it", "quantization"), "fp8");
-        assert_eq!(field("flux-2-dev", "tags"), serde_json::json!(["creative"]));
-        // An id no route claims stays verbatim — no guessed fields.
-        assert!(field("wildcard-passthrough", "model_type").is_null());
-        assert!(field("wildcard-passthrough", "mode").is_null());
-        assert!(field("wildcard-passthrough", "quantization").is_null());
+        let glm = &data[0];
+        assert_eq!(glm["object"], "model");
+        assert_eq!(glm["owned_by"], "obleth");
+        assert_eq!(glm["quantization"], "mxfp4");
+        assert_eq!(glm["tags"], serde_json::json!(["coding"]));
+        // The old name is advertised as an alias, so a client that had pinned
+        // it can see where it went instead of finding it simply gone.
+        assert_eq!(glm["aliases"], serde_json::json!(["glm-5-3-fp8"]));
+        // Both the obleth vocabulary and the LiteLLM-convention alias.
+        assert_eq!(data[1]["model_type"], "image");
+        assert_eq!(data[1]["mode"], "image_generation");
+        assert_eq!(glm["mode"], "chat");
+        assert!(!list.to_string().contains("glm-5-3-mxfp4"));
     }
 
     #[test]
-    fn models_listing_reports_the_clean_name_not_the_upstream_spelling() {
-        use super::{canonicalize_models, merge_upstream_models, model_facts_index};
-        // The backend knows itself only by its quantized name, and a second
-        // upstream reports the same route under the old name a client pinned.
-        let payload = vec![
-            vec![serde_json::json!({
-                "id": "glm-5-3-mxfp4", "object": "model", "owned_by": "vllm"
-            })],
-            vec![serde_json::json!({
-                "id": "glm-5-3-fp8", "object": "model", "owned_by": "vllm"
-            })],
-        ];
-        let mut list = merge_upstream_models(payload);
+    fn a_listing_entry_and_the_detail_lookup_agree() {
+        use super::{model_entry, model_facts_index, registry_models_list};
         let candidates = vec![candidate(
             "glm-5-3",
             "glm-5-3-mxfp4",
             "chat",
             "mxfp4",
             &["glm-5-3-fp8"],
-            &["coding"],
+            &[],
         )];
-        canonicalize_models(&mut list, &model_facts_index(&candidates));
+        let listed = registry_models_list(&candidates, None)["data"][0].clone();
+        let detail = model_entry(&model_facts_index(&candidates)["glm-5-3-fp8"]);
+        assert_eq!(listed, detail);
+    }
 
-        let data = list["data"].as_array().unwrap();
-        // One entry, under the gateway's clean name — the two upstream
-        // spellings collapse onto the single route they both name.
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0]["id"], "glm-5-3");
-        assert_eq!(data[0]["quantization"], "mxfp4");
-        // The old name is advertised as an alias, so a client that had pinned
-        // it can see where it went instead of finding it simply gone.
-        assert_eq!(data[0]["aliases"], serde_json::json!(["glm-5-3-fp8"]));
-        // `owned_by` is still whatever the upstream said; only the id is ours.
-        assert_eq!(data[0]["owned_by"], "vllm");
+    #[test]
+    fn the_models_listing_shows_a_tenant_only_its_allowed_models() {
+        use super::{model_visible, registry_models_list};
+        let candidates = vec![
+            candidate(
+                "glm-5-3",
+                "glm-5-3-mxfp4",
+                "chat",
+                "mxfp4",
+                &["glm-5-3-fp8"],
+                &[],
+            ),
+            candidate(
+                "image-model",
+                "vendor/image-model",
+                "image",
+                "bf16",
+                &[],
+                &[],
+            ),
+        ];
+        let allowed = vec!["glm-5-3".to_string()];
+        let list = registry_models_list(&candidates, Some(&allowed));
+        let ids: Vec<&str> = list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["glm-5-3"]);
+        // No allowlist, or an internal caller, sees every enabled route.
+        assert_eq!(
+            registry_models_list(&candidates, None)["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        // Visibility is decided on the canonical name an alias resolves to.
+        assert!(model_visible(Some(&allowed), "glm-5-3"));
+        assert!(!model_visible(Some(&allowed), "image-model"));
+        assert!(!model_visible(Some(&[]), "glm-5-3"));
+    }
+
+    #[test]
+    fn the_models_listing_makes_no_upstream_calls() {
+        // Served from the registry snapshot: no per-upstream fan-out, so an
+        // upstream without a catalog (or one that is down) cannot shrink it.
+        let src = include_str!("proxy.rs");
+        let src = &src[..src.find("\nmod tests {").expect("the test module")];
+        let start = src.find("fn models_list_response(").unwrap();
+        let end = start + src[start..].find("\n}\n").unwrap();
+        let body = &src[start..end];
+        assert!(!body.contains("http"), "{body}");
+        assert!(!body.contains(".await"), "{body}");
     }
 
     #[test]
@@ -6021,9 +6012,16 @@ mod tests {
             upstream_model: "m".into(),
             api_base: "http://primary/v1".into(),
             api_key: Some("model-key".into()),
+            upstream_headers: Default::default(),
             model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
             admission_weight: 100,
             max_in_flight: None,
+            capacity_mode: "static".into(),
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_service: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             enabled: true,
             cache_enabled: false,
             cache_ttl_secs: 0,
@@ -6032,6 +6030,7 @@ mod tests {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: 128_000,
             supports_function_calling: true,
             supports_system_messages: true,
@@ -6146,6 +6145,43 @@ mod tests {
         let model = model_with(vec![ep]);
         let targets = build_targets(Some(&model), "http://global/v1", "failover", "");
         assert_eq!(targets[0].api_key.as_deref(), Some("model-key"));
+    }
+
+    #[test]
+    fn every_target_carries_the_models_upstream_headers_over_the_clients() {
+        let mut model = model_with(vec![
+            endpoint("a", "http://a", 10, 100, true, true),
+            endpoint("b", "http://b", 20, 100, true, true),
+        ]);
+        model.upstream_headers = [
+            ("x-routing-hint".to_string(), "sticky".to_string()),
+            ("x-team".to_string(), "ops".to_string()),
+        ]
+        .into();
+        let targets = build_targets(Some(&model), "http://global/v1", "failover", "");
+        assert_eq!(targets.len(), 2);
+        for t in &targets {
+            assert_eq!(t.headers["x-routing-hint"], "sticky");
+        }
+        // The legacy single-upstream fallback carries them too.
+        model.endpoints.clear();
+        let fallback = build_targets(Some(&model), "http://global/v1", "failover", "");
+        assert_eq!(fallback[0].headers["x-team"], "ops");
+        // An unrouted request has no model headers to add.
+        assert!(build_targets(None, "http://global/v1", "failover", "")[0]
+            .headers
+            .is_empty());
+
+        // Applied the way dispatch applies them: after the client's
+        // forwarded headers, so the operator's value wins a shared name.
+        let mut client = HeaderMap::new();
+        client.insert("x-team", "client".parse().unwrap());
+        client.insert("x-trace", "t1".parse().unwrap());
+        let mut fwd = forward_headers(&client);
+        fwd.extend(fallback[0].headers.clone());
+        assert_eq!(fwd["x-team"], "ops");
+        assert_eq!(fwd.get_all("x-team").iter().count(), 1);
+        assert_eq!(fwd["x-trace"], "t1");
     }
 
     #[test]
@@ -6978,9 +7014,16 @@ mod tests {
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
             api_key: None,
+            upstream_headers: Default::default(),
             model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
             admission_weight: 100,
             max_in_flight: None,
+            capacity_mode: "static".into(),
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_service: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             enabled: true,
             cache_enabled: false,
             cache_ttl_secs: 0,
@@ -6989,6 +7032,7 @@ mod tests {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: 128_000,
             supports_function_calling: true,
             supports_system_messages: true,
@@ -7086,6 +7130,146 @@ mod tests {
         assert_eq!(req.tenant_max_in_flight, None);
         assert_eq!(req.key_max_in_flight, None);
         assert_eq!(req.model_max_in_flight, None);
+    }
+    /// Endpoints whose OpenAI spec sends `multipart/form-data` (they take a
+    /// file upload). The video create's upload is its optional
+    /// `input_reference` frame; it also accepts JSON.
+    const SPEC_MULTIPART_PATHS: &[&str] = &[
+        "/v1/audio/transcriptions",
+        "/v1/audio/translations",
+        "/v1/images/edits",
+        "/v1/images/variations",
+        "/v1/videos",
+    ];
+
+    #[test]
+    fn every_registered_multipart_endpoint_parses_its_form() {
+        // The two lists drifted once: the image upload endpoints required a
+        // model but their form was never parsed, so the model field was never
+        // seen and every request failed "model is required".
+        for path in REGISTERED_MODEL_PATHS {
+            assert_eq!(
+                is_multipart_endpoint(path),
+                SPEC_MULTIPART_PATHS.contains(path),
+                "{path}"
+            );
+        }
+        for path in SPEC_MULTIPART_PATHS {
+            assert!(requires_registered_model(path), "{path}");
+        }
+    }
+
+    fn image_edit_form() -> (String, Bytes) {
+        let boundary = "XBOUNDARYX".to_string();
+        let body = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nimage-model\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nadd a hat\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"n\"\r\n\r\n3\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"cat.png\"\r\n\
+             Content-Type: image/png\r\n\r\nPNGDATA\r\n\
+             --{b}--\r\n",
+            b = boundary
+        );
+        (boundary, Bytes::from(body))
+    }
+
+    #[tokio::test]
+    async fn an_image_edit_form_reads_like_a_json_body() {
+        let (boundary, body) = image_edit_form();
+        let fields = parse_multipart(&body, &boundary)
+            .await
+            .expect("form parses");
+        let view = multipart_text_view(&fields);
+        // The file is not text the scanners or the estimate should read.
+        assert_eq!(
+            view,
+            serde_json::json!({"model": "image-model", "prompt": "add a hat", "n": "3"})
+        );
+
+        // Priced per image from the form's `n`, like a JSON generation.
+        let mut route = minimal_model("image-model");
+        route.model_type = "image".into();
+        route.cost_per_image = 0.04;
+        assert!((compute_modality_cost(Some(&route), &view) - 0.12).abs() < 1e-9);
+        let json_body = serde_json::json!({"prompt": "x", "n": 2});
+        assert!((compute_modality_cost(Some(&route), &json_body) - 0.08).abs() < 1e-9);
+        let unset = serde_json::json!({"prompt": "x"});
+        assert!((compute_modality_cost(Some(&route), &unset) - 0.04).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_video_model_is_its_own_modality() {
+        use super::{
+            input_guardrails_unscannable, mode_for_model_type, model_info_entry,
+            output_guardrails_unenforceable,
+        };
+        let mut route = minimal_model("video-model");
+        route.model_type = "video".into();
+        route.cost_per_video = 0.3;
+        // One flat price per created job, whatever the body asks for.
+        let body = serde_json::json!({"prompt": "a fox", "n": 4, "seconds": "5"});
+        assert!((compute_modality_cost(Some(&route), &body) - 0.3).abs() < 1e-9);
+        assert_eq!(mode_for_model_type("video"), "video_generation");
+        let info = model_info_entry(&route, true);
+        assert_eq!(info["model_info"]["mode"], "video_generation");
+        assert_eq!(info["model_info"]["cost_per_video"], 0.3);
+
+        // The create takes JSON or a form, must name a registered model, and
+        // is its own request class, which the input scanner reads and an
+        // output policy does not refuse (a video object is not model text).
+        assert!(is_multipart_endpoint("/v1/videos"));
+        assert!(requires_registered_model("/v1/videos"));
+        assert_eq!(request_type_for_path("/v1/videos"), "video");
+        let mut key = crate::boons::test_support::test_key();
+        key.guardrails_policy = Some(obleth_config::GuardrailsPolicy {
+            action: obleth_config::GuardrailsAction::Block,
+            input_scanners: vec!["pii".into()],
+            output_scanners: vec!["pii".into()],
+            guard_model: None,
+            ban_keywords: vec![],
+            fail_open: true,
+        });
+        assert!(!input_guardrails_unscannable(&key, "/v1/videos"));
+        assert!(!output_guardrails_unenforceable(&key, "/v1/videos"));
+        // Follow-ups never reach the pipeline; were one to, it is unmapped.
+        assert_eq!(request_type_for_path("/v1/videos/video_1/content"), "other");
+    }
+
+    #[tokio::test]
+    async fn a_redacted_prompt_is_what_the_form_forwards() {
+        let (boundary, body) = image_edit_form();
+        let mut fields = parse_multipart(&body, &boundary)
+            .await
+            .expect("form parses");
+        let mut view = multipart_text_view(&fields);
+        view["prompt"] = serde_json::json!("add a [REDACTED]");
+        apply_multipart_text_view(&mut fields, &view);
+
+        let prompt = fields.iter().find(|f| f.name == "prompt").unwrap();
+        assert_eq!(prompt.data.as_ref(), b"add a [REDACTED]");
+        // The file part and the untouched fields keep their bytes.
+        let image = fields.iter().find(|f| f.name == "image").unwrap();
+        assert_eq!(image.data.as_ref(), b"PNGDATA");
+        assert_eq!(image.file_name.as_deref(), Some("cat.png"));
+        let n = fields.iter().find(|f| f.name == "n").unwrap();
+        assert_eq!(n.data.as_ref(), b"3");
+    }
+
+    #[test]
+    fn a_repeated_text_field_is_scanned_and_redacted_in_every_occurrence() {
+        let text = |name: &str, data: &str| MultipartField {
+            name: name.into(),
+            file_name: None,
+            content_type: None,
+            data: Bytes::from(data.to_string()),
+        };
+        let mut fields = vec![text("prompt", "first"), text("prompt", "second")];
+        let mut view = multipart_text_view(&fields);
+        assert_eq!(view["prompt"], serde_json::json!(["first", "second"]));
+        view["prompt"][1] = serde_json::json!("[REDACTED]");
+        apply_multipart_text_view(&mut fields, &view);
+        assert_eq!(fields[0].data.as_ref(), b"first");
+        assert_eq!(fields[1].data.as_ref(), b"[REDACTED]");
     }
 }
 
@@ -7392,5 +7576,39 @@ mod lifecycle_tests {
         let body = serde_json::json!({ "usage": { "prompt_tokens": 4, "completion_tokens": 9 } });
         assert_eq!(completion_body_usage(&body), Some((4, 9)));
         assert_eq!(completion_body_usage(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn upstream_headers_go_on_after_the_forwarded_ones_and_before_auth() {
+        let src = squash(handler());
+        let fwd = src
+            .find("letmutfwd_headers=forward_headers(&headers);")
+            .unwrap();
+        let ext = src
+            .find("fwd_headers.extend(target.headers.clone());")
+            .unwrap();
+        let auth = src
+            .find("fwd_headers.insert(header::AUTHORIZATION,v);")
+            .unwrap();
+        assert!(fwd < ext && ext < auth);
+    }
+
+    #[test]
+    fn the_form_stands_in_for_the_body_before_guardrails_and_pricing() {
+        let src = squash(handler());
+        let view = src
+            .find("json=multipart_text_view(fields);")
+            .expect("the form's text fields replace the JSON body");
+        let scan = src
+            .find(".enrich_request(")
+            .expect("the boon/guardrail pass");
+        let price = src
+            .find("compute_modality_cost(route.as_deref(),&json)")
+            .expect("the modality price");
+        assert!(view < scan && view < price);
+        let write_back = src
+            .find("apply_multipart_text_view(fields,&json);")
+            .expect("a redaction reaches the forwarded form");
+        assert!(scan < write_back);
     }
 }

@@ -27,6 +27,12 @@ spec:
       # obleth.shutdownGraceSecs comment before changing either number.
       terminationGracePeriodSeconds: 345
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if include "obleth.capacityDiscoveryRbac" . }}
+      # The kubernetes capacity source reads Services' EndpointSlices with this
+      # account's token (see templates/capacity-discovery-rbac.yaml).
+      serviceAccountName: {{ include "obleth.fullname" . }}
+      automountServiceAccountToken: true
+      {{- end }}
       {{- include "obleth.antiAffinity" . | nindent 6 }}
       {{- with .Values.nodeResolution.hostAliases }}
       hostAliases: {{- toYaml . | nindent 8 }}
@@ -57,6 +63,13 @@ spec:
             - { name: OBLETH_GLOBAL_MAX_IN_FLIGHT, value: {{ .Values.obleth.globalMaxInFlight | quote }} }
             - { name: OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT, value: {{ .Values.obleth.defaultModelMaxInFlight | quote }} }
             - { name: OBLETH_FAIRSHARE_HISTORY_SECS, value: {{ .Values.obleth.fairshareHistorySecs | quote }} }
+            - { name: OBLETH_FAIRSHARE_REPLICA_AWARE, value: {{ .Values.obleth.fairshareReplicaAware | quote }} }
+            - { name: OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS, value: {{ .Values.obleth.fairshareReplicaHeartbeatSecs | quote }} }
+            - { name: OBLETH_FAIRSHARE_REPLICA_TTL_SECS, value: {{ .Values.obleth.fairshareReplicaTtlSecs | quote }} }
+            - { name: OBLETH_CAPACITY_DISCOVERY_ENABLED, value: {{ .Values.obleth.capacityDiscovery.enabled | quote }} }
+            - { name: OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS, value: {{ .Values.obleth.capacityDiscovery.intervalSecs | quote }} }
+            - { name: OBLETH_CAPACITY_DISCOVERY_NAMESPACES, value: {{ join "," (uniq .Values.obleth.capacityDiscovery.namespaces) | quote }} }
+            - { name: OBLETH_CAPACITY_DEFAULT_SERVICE, value: {{ .Values.obleth.capacityDiscovery.defaultService | quote }} }
             - { name: OBLETH_FAIL_OPEN, value: {{ .Values.obleth.failOpen | quote }} }
             - { name: OBLETH_ALLOWED_PRIVATE_CIDRS, value: {{ .Values.obleth.allowedPrivateCidrs | quote }} }
             - { name: OBLETH_MODEL_HEALTH_ENABLED, value: {{ .Values.obleth.modelHealthEnabled | quote }} }
@@ -73,6 +86,7 @@ spec:
             - { name: OBLETH_REDIS_RESPONSE_TIMEOUT_MS, value: {{ .Values.obleth.redisResponseTimeoutMs | quote }} }
             - { name: OBLETH_REDIS_CONNECT_TIMEOUT_MS, value: {{ .Values.obleth.redisConnectTimeoutMs | quote }} }
             - { name: OBLETH_ADMISSION_TIMEOUT_SECS, value: {{ .Values.obleth.admissionTimeoutSecs | quote }} }
+            - { name: OBLETH_VIDEO_JOB_RETENTION_HOURS, value: {{ .Values.obleth.videoJobRetentionHours | quote }} }
             # Telemetry spill file used while ClickHouse is unreachable. Must be
             # writable by the non-root runtime user; backed by the wal volume.
             - { name: OBLETH_WAL_PATH, value: "/var/lib/obleth/telemetry.wal" }

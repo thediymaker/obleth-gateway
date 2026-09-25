@@ -118,6 +118,12 @@ export interface ModelRoute {
   api_base: string;
   /** Whether an upstream key is stored. The key itself is write-only and never returned. */
   api_key_set: boolean;
+  /**
+   * Names of the headers the gateway adds to every upstream request for this
+   * model. Values are write-only and never returned. Absent from gateways
+   * older than the field.
+   */
+  upstream_header_names?: string[];
   model_type: string;
   /**
    * Weight/activation format this deployment serves, from the gateway's fixed
@@ -130,6 +136,8 @@ export interface ModelRoute {
   cost_per_image: number;
   cost_per_audio_second: number;
   cost_per_character: number;
+  /** Flat USD price of one created job (`video` models). */
+  cost_per_video: number;
   energy_slots_per_node: number;
   /** Multiplier on this model's auto-routing score. 1.0 is neutral. */
   route_bias: number;
@@ -150,8 +158,30 @@ export interface ModelRoute {
   context_window: number;
   admission_weight: number;
   max_in_flight: number | null;
+  /**
+   * `static`, `tuned` or `discovered`. In `discovered` mode the pool size
+   * follows the live backend and `max_in_flight` is only the fallback.
+   */
   capacity_mode: string;
   capacity_tuned_at: string | null;
+  /**
+   * Discovered mode: where serving replicas are counted, `endpoints` (the
+   * model's enabled, healthy endpoints) or `kubernetes` (the ready endpoints
+   * of a Service). The discovery fields are absent from gateways older than
+   * the mode.
+   */
+  capacity_source?: string;
+  /** Kubernetes source: namespace of the Service; null takes the first allowed namespace that has it. */
+  capacity_namespace?: string | null;
+  /** Kubernetes source: Service name; null uses the gateway's default Service template. */
+  capacity_service?: string | null;
+  /**
+   * Requests one replica serves at once. Required in discovered mode on the
+   * kubernetes source, and on endpoints unless every endpoint sets its own.
+   */
+  per_replica_max_in_flight?: number | null;
+  /** Multiplier on the derived pool size; 1 is exactly the ready capacity. */
+  capacity_headroom?: number;
   supports_function_calling: boolean;
   supports_system_messages: boolean;
   supports_response_schema: boolean;
@@ -174,10 +204,16 @@ export interface ModelRoute {
 
 /**
  * Model fields accepted by create/update. `api_key` is write-only: omit it to
- * keep the stored key; responses only report `api_key_set`.
+ * keep the stored key; responses only report `api_key_set`. `upstream_headers`
+ * replaces the model's headers when present (a `null` value keeps the stored
+ * value for that name); omit it to leave them unchanged. Responses only report
+ * `upstream_header_names`.
  */
-export type ModelWriteFields = Partial<Omit<ModelRoute, "api_key_set">> & {
+export type ModelWriteFields = Partial<
+  Omit<ModelRoute, "api_key_set" | "upstream_header_names">
+> & {
   api_key?: string | null;
+  upstream_headers?: Record<string, string | null>;
 };
 
 export interface ModelEndpoint {
@@ -190,6 +226,11 @@ export interface ModelEndpoint {
   priority: number;
   weight: number;
   enabled: boolean;
+  /**
+   * Requests this endpoint takes at once, counted by a discovered model on the
+   * `endpoints` source. Null uses the model's per-replica value.
+   */
+  max_in_flight?: number | null;
   health_status: string;
   consecutive_failures: number;
   alert_state: string;
@@ -199,6 +240,61 @@ export interface ModelEndpoint {
   last_message: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** The discovered-mode fields sent with a capacity-mode change. */
+export interface CapacityDiscoveryFields {
+  capacity_source: string;
+  capacity_namespace: string | null;
+  capacity_service: string | null;
+  per_replica_max_in_flight: number | null;
+  capacity_headroom: number;
+}
+
+/** What one gateway replica's discovery knows about a discovered model. */
+export interface ModelCapacityStatus {
+  model_name: string;
+  source: string;
+  /** Kubernetes source: the namespaces the Service is looked up in, in order. */
+  namespaces: string[];
+  /** Kubernetes source: the namespace the Service was found in. */
+  namespace: string | null;
+  /** Kubernetes source: the Service whose ready endpoints are counted. */
+  service: string | null;
+  ready_replicas: number | null;
+  per_replica_max_in_flight: number | null;
+  /** `configured`, `endpoint`, or `endpoint and configured`. */
+  per_replica_source: string | null;
+  headroom: number;
+  /** Last value derived from the source: the cluster-wide pool size. */
+  derived_max_in_flight: number | null;
+  /** The cluster-wide pool size in force (derived, last kept, or static). */
+  effective_max_in_flight: number;
+  /** `discovered`, `stale` or `fallback`. */
+  state: string;
+  last_refresh: string | null;
+  last_success: string | null;
+  reason: string | null;
+}
+
+export interface CapacityDiscoveryModelView {
+  model_id: string;
+  model_name: string;
+  enabled: boolean;
+  static_max_in_flight: number | null;
+  /** What the answering replica enforces: its share of the effective size. */
+  replica_share: number;
+  status: ModelCapacityStatus;
+}
+
+export interface CapacityDiscoveryView {
+  enabled: boolean;
+  interval_secs: number;
+  namespaces: string[];
+  /** Service name template for kubernetes models that name no Service. */
+  default_service: string;
+  replicas: number;
+  models: CapacityDiscoveryModelView[];
 }
 
 export interface ManagedModelSpec {
@@ -603,7 +699,10 @@ export interface CostAgg {
 export interface LiveStats {
   in_flight: number;
   queued: number;
+  /** This replica's share of the enabled models' pool sizes. */
   max_in_flight: number;
+  /** Live gateway replicas the configured limits are divided across. */
+  replicas?: number;
 }
 
 /** Wire shape of GET /overview/summary (config counts + windowed usage totals). */
@@ -661,7 +760,10 @@ export interface KeyFairshareView {
 
 export interface ModelPoolView {
   model: string;
+  /** Slots this replica enforces: its share of `configured_cap`. */
   cap: number;
+  /** Pool size as configured, before it is divided across replicas. */
+  configured_cap?: number;
   in_flight: number;
   queued: number;
   borrowed: number;
@@ -683,10 +785,21 @@ export interface FairshareLiveView {
   model_in_flight?: Record<string, number>;
   /** Live queued request count keyed by model name. */
   model_queued?: Record<string, number>;
-  /** Hard ceiling on global in-flight admission, independent of pool sums. */
+  /** Hard ceiling on global in-flight admission, independent of pool sums:
+   *  this replica's share of the configured ceiling. */
   hard_ceiling?: number;
+  /** OBLETH_GLOBAL_MAX_IN_FLIGHT as configured. */
+  configured_hard_ceiling?: number;
+  /** Enabled models' pool sizes as configured, summed; `max_in_flight` is
+   *  this replica's share of it. */
+  configured_max_in_flight?: number;
   /** Default per-model in-flight cap applied when a model has none configured. */
   default_model_max_in_flight?: number;
+  /** Live gateway replicas the configured limits are divided across. Every
+   *  count in the view is the answering replica's own. */
+  replicas?: number;
+  /** Whether limits are divided across replicas (OBLETH_FAIRSHARE_REPLICA_AWARE). */
+  replica_aware?: boolean;
   keys?: KeyFairshareView[];
   pools?: ModelPoolView[];
 }
@@ -1717,13 +1830,15 @@ export const obleth = {
   setModelCapacityMode: (
     id: string,
     capacity_mode: string,
+    fields?: CapacityDiscoveryFields,
     options?: AuditOptions,
   ) =>
     api<ModelRoute>(`/models/${id}/capacity-mode`, {
       method: "PUT",
       headers: auditActorHeaders(options),
-      body: JSON.stringify({ capacity_mode }),
+      body: JSON.stringify({ capacity_mode, ...(fields ?? {}) }),
     }),
+  capacityDiscovery: () => api<CapacityDiscoveryView>("/capacity/discovery"),
   autotuneModel: (
     id: string,
     opts?: {
@@ -1848,6 +1963,7 @@ export const obleth = {
       priority?: number;
       weight?: number;
       enabled?: boolean;
+      max_in_flight?: number | null;
     },
     options?: AuditOptions,
   ) =>
@@ -1866,6 +1982,7 @@ export const obleth = {
       priority?: number;
       weight?: number;
       enabled?: boolean;
+      max_in_flight?: number | null;
     },
     options?: AuditOptions,
   ) =>

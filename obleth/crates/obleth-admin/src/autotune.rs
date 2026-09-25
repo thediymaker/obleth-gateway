@@ -392,6 +392,7 @@ async fn run_step(
     base_prompt: Arc<str>,
     salt: u64,
     api_key: Option<String>,
+    headers: reqwest::header::HeaderMap,
     concurrency: usize,
     deadline: Instant,
     budget: Arc<AtomicUsize>,
@@ -406,6 +407,7 @@ async fn run_step(
         let upstream_model = upstream_model.clone();
         let base_prompt = base_prompt.clone();
         let api_key = api_key.clone();
+        let headers = headers.clone();
         let budget = budget.clone();
         set.spawn(async move {
             let mut latencies: Vec<u64> = Vec::new();
@@ -420,7 +422,7 @@ async fn run_step(
                 // response and make this level look faster than it is.
                 let prompt = unique_prompt(salt, &base_prompt);
                 let body = probe_body(&upstream_model, modality, reply_tokens, &prompt);
-                let mut req = http.post(&url).json(&body);
+                let mut req = http.post(&url).headers(headers.clone()).json(&body);
                 if let Some(key) = &api_key {
                     req = req.bearer_auth(key);
                 }
@@ -521,6 +523,7 @@ pub async fn run_probe(
             base_prompt.clone(),
             salt,
             model.api_key.clone(),
+            crate::upstream_header_map(&model.upstream_headers),
             concurrency,
             deadline,
             budget.clone(),

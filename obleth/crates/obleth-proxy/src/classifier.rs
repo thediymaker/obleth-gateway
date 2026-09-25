@@ -193,6 +193,7 @@ async fn call_brain(
         http,
         &build_chat_url(&target.base),
         target.api_key.as_deref(),
+        &target.headers,
         &brain.model_name,
         calls,
         timeout,
@@ -360,10 +361,8 @@ mod tests {
     }
 
     /// The exact strings the brain is sent, pinned so they cannot drift away
-    /// from the training-time renderer that reproduces them — currently
-    /// `distill/tasks/router_intent.py` in the rc-k8s-gaudi repository, which
-    /// carries these same literals. A distilled classifier is trained on
-    /// these bytes; changing one here without regenerating its training data
+    /// from the training-time renderer that reproduces them, which carries
+    /// these same literals. A distilled classifier is trained on these bytes; changing one here without regenerating its training data
     /// silently degrades the deployed model, so this test is a deliberate
     /// cross-repository tripwire, not a tautology. Update both together.
     #[test]
@@ -409,9 +408,16 @@ mod tests {
             upstream_model: "brain-upstream".to_string(),
             api_base: api_base.to_string(),
             api_key: None,
+            upstream_headers: Default::default(),
             model_type: "chat".to_string(),
             admission_weight: 1,
             max_in_flight: None,
+            capacity_mode: "static".into(),
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_service: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             enabled: true,
             cache_enabled: false,
             cache_ttl_secs: 0,
@@ -420,6 +426,7 @@ mod tests {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: 0,
             supports_function_calling: false,
             supports_system_messages: false,
@@ -490,6 +497,7 @@ mod tests {
             weight: 1,
             enabled: true,
             healthy: true,
+            max_in_flight: None,
         }];
         let settings: AutoRouterSettings = serde_json::from_value(serde_json::json!({})).unwrap();
         let intent = Classifier::new(settings)

@@ -1044,7 +1044,10 @@ async fn post_chat_completion(
     target: &crate::proxy::Target,
     body: &Value,
 ) -> anyhow::Result<Value> {
-    let mut req = http.post(build_chat_url(&target.base)).json(body);
+    let mut req = http
+        .post(build_chat_url(&target.base))
+        .headers(target.headers.clone())
+        .json(body);
     if let Some(api_key) = &target.api_key {
         req = req.bearer_auth(api_key);
     }
@@ -1326,6 +1329,16 @@ pub(crate) mod test_support {
     pub(crate) fn endpoint_only_route(base: &str) -> obleth_config::ResolvedModel {
         super::tests::endpoint_only_route(base)
     }
+
+    /// A plain enabled chat route named `test` at `http://localhost`.
+    pub(crate) fn test_route() -> obleth_config::ResolvedModel {
+        super::tests::test_route()
+    }
+
+    /// An active, non-internal key with no limits, budgets or policies.
+    pub(crate) fn test_key() -> obleth_config::ResolvedKey {
+        super::tests::test_key_with_policy(None)
+    }
 }
 
 #[cfg(test)]
@@ -1340,9 +1353,16 @@ mod tests {
             upstream_model: "test".to_string(),
             api_base: "http://localhost".to_string(),
             api_key: None,
+            upstream_headers: Default::default(),
             model_type: "chat".to_string(),
             admission_weight: 1,
             max_in_flight: None,
+            capacity_mode: "static".into(),
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_service: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             enabled: true,
             cache_enabled: false,
             cache_ttl_secs: 0,
@@ -1351,6 +1371,7 @@ mod tests {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: 0,
             supports_function_calling: false,
             supports_system_messages: false,
@@ -1724,6 +1745,7 @@ mod tests {
             weight: 1,
             enabled: true,
             healthy,
+            max_in_flight: None,
         }
     }
 

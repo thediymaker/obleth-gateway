@@ -1,9 +1,16 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { ChatCapabilityFields } from "./model-manager";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { setModelCapacityDiscoveryAction, setModelCapacityModeAction } from "@/app/actions";
+import {
+  CapacityDiscoveryPanel,
+  CapacityDiscoveryStatus,
+  CapacityModeToggle,
+  ChatCapabilityFields,
+} from "./model-manager";
 import { TooltipProvider } from "./ui/tooltip";
-import type { ModelRoute } from "@/lib/obleth";
+import type { CapacityDiscoveryView, ModelRoute } from "@/lib/obleth";
 
 // model-manager.tsx statically imports every model server action; stub them
 // so importing the module doesn't pull in "@/app/actions" (a "use server"
@@ -20,6 +27,7 @@ vi.mock("@/app/actions", () => ({
   setModelCacheAction: vi.fn(),
   setModelCapacityAction: vi.fn(),
   setModelCapacityModeAction: vi.fn(),
+  setModelCapacityDiscoveryAction: vi.fn(async () => ({ ok: true })),
   setModelHealthConfigAction: vi.fn(),
   restartReplicaAction: vi.fn(),
   setModelReliabilityAction: vi.fn(),
@@ -33,7 +41,7 @@ const model = (over: Partial<ModelRoute> = {}): ModelRoute => ({
   id: "u", model_name: "m", description: "", upstream_model: "up", api_base: "http://a",
   api_key_set: false, model_type: "chat", quantization: "unknown", aliases: [],
   input_cost_per_token: 0, output_cost_per_token: 0,
-  cost_per_image: 0, cost_per_audio_second: 0, cost_per_character: 0, energy_slots_per_node: 1,
+  cost_per_image: 0, cost_per_audio_second: 0, cost_per_character: 0, cost_per_video: 0, energy_slots_per_node: 1,
   route_bias: 1,
   auto_eligible: true,
   draft_model: "",
@@ -160,5 +168,146 @@ describe("boons that are not configured globally", () => {
     expect(host.querySelector<HTMLInputElement>('[name="boon_compression"]')!.disabled).toBe(false);
     expect(host.textContent).not.toContain("can’t be granted");
     expect(host.textContent).not.toContain("granted but inactive");
+  });
+});
+
+describe("the discovered capacity mode", () => {
+  const view = (over: Partial<CapacityDiscoveryView["models"][number]["status"]> = {}): CapacityDiscoveryView => ({
+    enabled: true,
+    interval_secs: 15,
+    namespaces: ["inference"],
+    default_service: "{upstream_model}",
+    replicas: 2,
+    models: [
+      {
+        model_id: "u",
+        model_name: "m",
+        enabled: true,
+        static_max_in_flight: 6,
+        replica_share: 8,
+        status: {
+          model_name: "m",
+          source: "kubernetes",
+          namespaces: ["inference", "batch"],
+          namespace: "inference",
+          service: "up",
+          ready_replicas: 2,
+          per_replica_max_in_flight: 8,
+          per_replica_source: "configured",
+          headroom: 1,
+          derived_max_in_flight: 16,
+          effective_max_in_flight: 16,
+          state: "discovered",
+          last_refresh: "2026-09-24T12:00:00Z",
+          last_success: "2026-09-24T12:00:00Z",
+          reason: null,
+          ...over,
+        },
+      },
+    ],
+  });
+
+  async function renderPanel(m: ModelRoute, v: CapacityDiscoveryView) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    client.setQueryData(["capacity-discovery"], v);
+    await act(async () => {
+      root.render(
+        <QueryClientProvider client={client}>
+          <TooltipProvider>
+            <CapacityDiscoveryPanel model={m} />
+          </TooltipProvider>
+        </QueryClientProvider>,
+      );
+    });
+  }
+
+  it("offers static, tuned and discovered, and switches mode on click", async () => {
+    await act(async () => {
+      root.render(<CapacityModeToggle id="u" mode="static" />);
+    });
+    const buttons = [...host.querySelectorAll<HTMLButtonElement>('[aria-label="Capacity mode"] button')];
+    expect(buttons.map((b) => b.textContent)).toEqual(["static", "tuned", "discovered"]);
+    await act(async () => buttons[2].click());
+    expect(setModelCapacityModeAction).toHaveBeenCalledWith("u", "discovered");
+  });
+
+  it("shows the kubernetes fields with the stored values, and the live derivation", async () => {
+    await renderPanel(
+      model({
+        capacity_mode: "discovered",
+        capacity_source: "kubernetes",
+        capacity_namespace: "inference",
+        capacity_service: "up-head",
+        per_replica_max_in_flight: 8,
+        capacity_headroom: 1.25,
+      }),
+      view(),
+    );
+    const input = (name: string) => host.querySelector<HTMLInputElement>(`input[name="${name}"]`);
+    expect(input("capacity_namespace")!.value).toBe("inference");
+    expect(input("capacity_service")!.value).toBe("up-head");
+    expect(input("capacity_service")!.placeholder).toBe("default: {upstream_model}");
+    expect(input("per_replica_max_in_flight")!.value).toBe("8");
+    expect(input("capacity_headroom")!.value).toBe("1.25");
+    expect(host.querySelector('input[name="capacity_selector"]')).toBeNull();
+    const text = host.textContent ?? "";
+    expect(text).toContain("Service name");
+    expect(text).toContain("discovered");
+    expect(text).toContain("Service up in inference");
+    expect(text).toContain("8 (configured)");
+    expect(text).toContain("16");
+    expect(text).toContain("of 2 gateways");
+  });
+
+  it("marks per-replica concurrency required for the kubernetes source, with a hint", async () => {
+    await renderPanel(model({ capacity_mode: "discovered", capacity_source: "kubernetes" }), view());
+    const perReplica = host.querySelector<HTMLInputElement>('input[name="per_replica_max_in_flight"]')!;
+    expect(perReplica.required).toBe(true);
+    const text = host.textContent ?? "";
+    expect(text).toContain("Per-replica concurrency (required)");
+    expect(text).toContain("vLLM --max-num-seqs");
+  });
+
+  it("hides the kubernetes fields for the endpoints source", async () => {
+    await renderPanel(model({ capacity_mode: "discovered", capacity_source: "endpoints" }), view());
+    expect(host.querySelector('input[name="capacity_service"]')).toBeNull();
+    expect(host.querySelector('input[name="capacity_namespace"]')).toBeNull();
+    const perReplica = host.querySelector<HTMLInputElement>('input[name="per_replica_max_in_flight"]');
+    expect(perReplica).not.toBeNull();
+    expect(perReplica!.required).toBe(false);
+  });
+
+  it("saves the form through the discovery action", async () => {
+    await renderPanel(model({ capacity_mode: "discovered", capacity_source: "endpoints" }), view());
+    const form = host.querySelector("form")!;
+    host.querySelector<HTMLInputElement>('input[name="per_replica_max_in_flight"]')!.value = "4";
+    await act(async () => {
+      form.requestSubmit();
+    });
+    expect(setModelCapacityDiscoveryAction).toHaveBeenCalled();
+    const [id, data] = vi.mocked(setModelCapacityDiscoveryAction).mock.calls[0];
+    expect(id).toBe("u");
+    expect((data as FormData).get("capacity_source")).toBe("endpoints");
+    expect((data as FormData).get("per_replica_max_in_flight")).toBe("4");
+  });
+
+  it("says why a model is not discovered", async () => {
+    await act(async () => {
+      root.render(
+        <CapacityDiscoveryStatus
+          status={{
+            ...view().models[0].status,
+            state: "stale",
+            ready_replicas: 0,
+            reason: "Service up in inference has no ready endpoint (1 listed); keeping the last discovered value",
+          }}
+          replicaShare={8}
+          replicas={1}
+        />,
+      );
+    });
+    expect(host.textContent).toContain("stale");
+    expect(host.textContent).toContain("keeping the last discovered value");
+    expect(host.textContent).not.toContain("gateways");
   });
 });

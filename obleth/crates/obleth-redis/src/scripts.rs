@@ -308,3 +308,30 @@ local cost   = redis.call('HINCRBYFLOAT', key, 'cost', tonumber(ARGV[5]))
 redis.call('PERSIST', key)
 return { tokens, cost }
 "#;
+
+/// Register one gateway replica's heartbeat and count the live replicas, in
+/// one round trip.
+///
+/// KEYS[1] = replica set (sorted set: member = instance id, score = expiry ms)
+/// ARGV[1] = instance id
+/// ARGV[2] = heartbeat TTL in ms
+///
+/// Expiry is scored on the Redis clock (`TIME`), not the caller's, so skew
+/// between pods cannot keep a dead replica counted or drop a live one. Expired
+/// members are pruned on every call, so a crashed replica stops being counted
+/// one TTL after its last heartbeat. The set itself carries no TTL: it is one
+/// member per live replica, and under the chart's volatile-lru policy a TTL
+/// would make it evictable, briefly collapsing every replica's count to 1.
+///
+/// Returns the live replica count, this one included.
+pub const REPLICA_HEARTBEAT: &str = r#"
+if redis.replicate_commands then redis.replicate_commands() end
+local key = KEYS[1]
+local ttl = tonumber(ARGV[2])
+local t   = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+
+redis.call('ZADD', key, now + ttl, ARGV[1])
+redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
+return redis.call('ZCARD', key)
+"#;

@@ -13,8 +13,8 @@
 #   * Secrets are sourced from PRE-CREATED Kubernetes Secrets (existingSecret),
 #     so real credentials never touch values files, git, or --set/CLI history.
 #   * The data plane runs 3 replicas, spread across nodes (anti-affinity) and
-#     protected by a PodDisruptionBudget, with the concurrency ceiling divided
-#     across them (fairshare admission is per-process — see obleth below).
+#     protected by a PodDisruptionBudget, with the fairshare limits divided
+#     across them through Redis heartbeats (see obleth below).
 #
 # -----------------------------------------------------------------------------
 # 1. Create the Secrets out-of-band (example — use your secrets manager / SOPS /
@@ -55,17 +55,18 @@ obleth:
   # Three replicas for redundancy. Fairshare runs one pool per model (default
   # 32 slots via defaultModelMaxInFlight, or the model's own max_in_flight);
   # globalMaxInFlight is a total ceiling across those pools, not a fairness
-  # input, and both are enforced per replica — the aggregate reaching the
-  # upstream is replicas x the configured numbers. 256 leaves headroom above
-  # the pool sum for several concurrently active models at the default pool
-  # size (an 85 ceiling would bind after only three); raise it further if you
-  # register more. Replicas cannot lend each other idle capacity.
+  # input. Both are fleet-wide: each replica enforces ceil(value / 3) of them
+  # (fairshareReplicaAware, the default). 256 covers seven concurrently active
+  # models at the default pool size (each replica holds 86 of the ceiling
+  # against 11 per pool); raise it if you register more. Replicas cannot lend
+  # each other idle capacity, so fairness is exact only when the Service
+  # spreads requests evenly.
   replicas: 3
   globalMaxInFlight: 256
   # All credentials come from the pre-created Secret above; no secret values are
   # set inline. The Secret MUST contain every key listed in step 1.
   existingSecret: obleth-secrets
-  upstreamBaseUrl: "https://my-vllm-or-aibrix-endpoint/v1"
+  upstreamBaseUrl: "https://my-inference-endpoint/v1"
   # If your external datastores sit on private/LAN addresses AND you enable
   # strict SSRF (OBLETH_BLOCK_PRIVATE_NETWORKS=1), allow those ranges here.
   allowedPrivateCidrs: ""
@@ -102,13 +103,12 @@ benchmarkBackend:
 
 # Stateless data plane: spread across nodes and protected against disruptions.
 #
-# Autoscaling is off because the replica count is load-bearing here:
-# globalMaxInFlight (and every model's pool) is enforced per replica, so a
-# replica count that moves on its own moves the aggregate concurrency limit
-# reaching the upstream. To autoscale anyway, size globalMaxInFlight (and the
-# pools you care about) so that replicas x those numbers stays within what the
-# upstream can absorb at maxReplicas, and accept that the upstream is
-# under-subscribed below full scale-out.
+# Autoscaling is safe to turn on: replicas divide the fairshare limits between
+# them, so scaling changes gateway CPU, not the concurrency reaching the
+# upstream. It stays off here so the example's capacity is predictable; when
+# enabling it, keep globalMaxInFlight at least one slot per enabled model per
+# replica (at maxReplicas) above the pool sum, since each pool's share rounds
+# up.
 hpa:
   enabled: false
   minReplicas: 3

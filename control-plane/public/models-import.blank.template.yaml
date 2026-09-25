@@ -17,6 +17,14 @@
 #   api_base                  (required) Upstream OpenAI-compatible base URL,
 #                                        usually ending in /v1.
 #   api_key                   (optional) Upstream key. Leave blank if none.
+#   upstream_headers          (optional) Map of extra headers sent on every
+#                                        upstream request, e.g.
+#                                          upstream_headers:
+#                                            x-routing-hint: sticky
+#                                        Replaces the stored set when present; a
+#                                        null value keeps that header's stored
+#                                        value. Export lists only the names
+#                                        (upstream_header_names), never values.
 #   description               (optional) Free-text label shown in the UI.
 #   model_type                (optional) Modality / endpoint this route serves.
 #                                        Default "chat". One of:
@@ -25,6 +33,8 @@
 #                                          audio_transcription -> /v1/audio/transcriptions, /v1/audio/translations
 #                                          audio_speech        -> /v1/audio/speech
 #                                          image               -> /v1/images/generations
+#                                          video               -> /v1/videos (create, poll,
+#                                                                 download, delete, list)
 #                                        Only `chat` models take part in `auto` routing.
 #   input_cost_per_token      (optional) USD per input token.  Default 0.
 #                                        Used by chat + embedding models.
@@ -36,9 +46,35 @@
 #                                        Used by audio_speech (TTS) models.
 #   cost_per_audio_second     (optional) USD per second of audio. Default 0.
 #                                        Reserved for audio_transcription (STT) models.
+#   cost_per_video            (optional) USD per created video job. Default 0.
+#                                        Used by video models, charged once when
+#                                        the create succeeds.
 #   context_window            (optional) Max tokens. Default 8192.
 #   admission_weight          (optional) Fair-share weight. Default 100.
 #   max_in_flight             (optional) Concurrency cap. Blank = no cap.
+#                                        The fallback in discovered mode.
+#   capacity_mode             (optional) static (default), tuned, or
+#                                        discovered: the pool size follows the
+#                                        live backend (ready replicas x
+#                                        per-replica concurrency x headroom).
+#   capacity_source           (optional) Discovered mode: endpoints (default,
+#                                        the model's healthy endpoints) or
+#                                        kubernetes (the ready endpoints of a
+#                                        Service).
+#   capacity_namespace        (optional) Kubernetes source: namespace of the
+#                                        Service. Blank = the first namespace
+#                                        the gateway allows that has it.
+#   capacity_service          (optional) Kubernetes source: Service name.
+#                                        Blank = the gateway's default Service
+#                                        template.
+#   per_replica_max_in_flight (optional) Requests one replica serves at once,
+#                                        e.g. your server's max concurrent
+#                                        sequences (vLLM --max-num-seqs).
+#                                        Required in discovered mode for
+#                                        kubernetes, and for endpoints unless
+#                                        every endpoint sets max_in_flight.
+#   capacity_headroom         (optional) Multiplier on the derived size.
+#                                        Default 1.
 #   supports_function_calling (optional) true/false. Default false.
 #   supports_system_messages  (optional) true/false. Default true.
 #   supports_response_schema  (optional) true/false. Default false.
@@ -100,7 +136,9 @@ models:
   # ---- Example 4: image generation (/v1/images/generations) ----
   # Works with any OpenAI-compatible image endpoint, including a Stable
   # Diffusion server that exposes /v1/images/generations directly
-  # (pass-through, no adapter needed).
+  # (pass-through, no adapter needed). /v1/images/edits and
+  # /v1/images/variations take the source image as multipart/form-data, like
+  # audio uploads; cost_per_image is charged per image requested (`n`).
   - model_name: sd-xl
     description: Stable Diffusion XL image generation
     upstream_model: stable-diffusion-xl
@@ -125,3 +163,19 @@ models:
     api_base: https://your-endpoint.example.com/v1
     model_type: audio_transcription
     cost_per_audio_second: 0.0001
+
+  # ---- Example 7: video generation (/v1/videos) ----
+  # The OpenAI Videos API is job-based: POST /v1/videos returns a job id,
+  # and clients poll GET /v1/videos/{id}, then fetch the video from
+  # GET /v1/videos/{id}/content; the upstream's status is passed through
+  # unchanged (for example a not-ready answer while it renders). The create
+  # takes JSON or multipart/form-data (a reference frame; OpenAI's field is
+  # `input_reference`), forwarded untouched.
+  # cost_per_video is charged once per created job; polls and downloads are
+  # free. No generation probe is sent: health is the catalog check only.
+  - model_name: my-video-model
+    description: Text- and image-to-video generation
+    upstream_model: my-video-model
+    api_base: http://video.internal:8000/v1
+    model_type: video
+    cost_per_video: 0.50

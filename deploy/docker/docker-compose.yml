@@ -114,6 +114,7 @@ services:
       OBLETH_REDIS_REWARM_SECS: ${OBLETH_REDIS_REWARM_SECS:-300}
       OBLETH_UPSTREAM_TIMEOUT_SECS: ${OBLETH_UPSTREAM_TIMEOUT_SECS:-300}
       OBLETH_ADMISSION_TIMEOUT_SECS: ${OBLETH_ADMISSION_TIMEOUT_SECS:-60}
+      OBLETH_VIDEO_JOB_RETENTION_HOURS: ${OBLETH_VIDEO_JOB_RETENTION_HOURS:-24}
       OBLETH_SESSION_ID_DERIVATION: ${OBLETH_SESSION_ID_DERIVATION:-true}
       # Boot-time seed only; the dashboard's routing settings win once saved.
       OBLETH_AUTO_CLASSIFIER_ENABLED: ${OBLETH_AUTO_CLASSIFIER_ENABLED:-false}
@@ -128,7 +129,7 @@ services:
       OBLETH_CLICKHOUSE_USER: ${CLICKHOUSE_USER:-obleth}
       OBLETH_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in deploy/docker/.env}
       # Upstream LLM endpoint. Defaults to the benchmark fixture backend for dev/demo
-      # stack; point this at a real vLLM/Aibrix endpoint in production (and run
+      # stack; point this at a real OpenAI-compatible endpoint in production (and run
       # without the `benchmark` profile).
       OBLETH_UPSTREAM_BASE_URL: ${OBLETH_UPSTREAM_BASE_URL:-http://benchmark-backend:8081}
       OBLETH_ADMIN_TOKEN: ${OBLETH_ADMIN_TOKEN:?set OBLETH_ADMIN_TOKEN in deploy/docker/.env (copy from .env.example)}
@@ -144,9 +145,22 @@ services:
       # Trusted JWT issuers for data-plane bearer auth (JSON array). Empty = off.
       # See the "Identity Tokens" guide.
       OBLETH_JWT_ISSUERS: ${OBLETH_JWT_ISSUERS:-}
-      OBLETH_GLOBAL_MAX_IN_FLIGHT: "1024"
+      OBLETH_GLOBAL_MAX_IN_FLIGHT: "4096"
       OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT: "32"
       OBLETH_FAIRSHARE_HISTORY_SECS: "3600"
+      # Divide fairshare limits across gateway replicas (Redis heartbeats).
+      # A no-op with the single gateway this file runs.
+      OBLETH_FAIRSHARE_REPLICA_AWARE: ${OBLETH_FAIRSHARE_REPLICA_AWARE:-true}
+      OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS: ${OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS:-5}
+      OBLETH_FAIRSHARE_REPLICA_TTL_SECS: ${OBLETH_FAIRSHARE_REPLICA_TTL_SECS:-15}
+      # Capacity discovery for models in the `discovered` capacity mode. Off by
+      # default. The `endpoints` source (a model's own endpoints) works here;
+      # the `kubernetes` source needs the gateway to run in a Kubernetes pod,
+      # so its namespace list stays empty in this file.
+      OBLETH_CAPACITY_DISCOVERY_ENABLED: ${OBLETH_CAPACITY_DISCOVERY_ENABLED:-false}
+      OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS: ${OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS:-15}
+      OBLETH_CAPACITY_DISCOVERY_NAMESPACES: ""
+      OBLETH_CAPACITY_DEFAULT_SERVICE: ""
       OBLETH_FAIRSHARE_ALGORITHM: hierarchical
       OBLETH_FAIL_OPEN: "true"
       # Fail-open telemetry WAL: usage batches spill here while ClickHouse is

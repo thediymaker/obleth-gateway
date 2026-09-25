@@ -7,6 +7,8 @@ import {
   buildHistoryChart,
   FairshareDashboard,
   fetchHistory,
+  replicaNote,
+  replicaShare,
   thinHistory,
   type FairshareLiveView,
   type TenantFairshareView,
@@ -18,6 +20,7 @@ const mocks = vi.hoisted(() => ({
   history: undefined as FairshareHistoryView | undefined,
   tail: undefined as FairshareHistoryView | undefined,
   queryKeys: [] as string[][],
+  routes: [] as Array<{ model_name: string; max_in_flight: number | null }>,
   isError: false,
   save: vi.fn(),
   invalidate: vi.fn(),
@@ -31,6 +34,7 @@ vi.mock("@tanstack/react-query", () => ({
       queryKey[0] === "fairshare-live" ? mocks.view
       : queryKey[0] === "fairshare-history" ? mocks.history
       : queryKey[0] === "fairshare-history-tail" ? mocks.tail
+      : queryKey[0] === "model-routes" ? mocks.routes
       : [];
     return { data, isError: mocks.isError, isFetching: false, isSuccess: data !== undefined, dataUpdatedAt: 1_700_000_000_000 };
   },
@@ -52,6 +56,7 @@ beforeEach(() => {
   mocks.history = undefined;
   mocks.tail = undefined;
   mocks.queryKeys = [];
+  mocks.routes = [];
   mocks.save.mockReset().mockResolvedValue(undefined);
   mocks.invalidate.mockReset().mockResolvedValue(undefined);
   mocks.view = {
@@ -130,6 +135,33 @@ describe("fairshare operations", () => {
     expect(host.textContent).toContain("4 queued");
     expect(host.textContent).toContain("Borrowed2");
     expect(host.textContent).not.toContain("hard limits");
+  });
+
+  it("says the numbers are this replica's share when several replicas are live", async () => {
+    mocks.view = { ...mocks.view!, replicas: 3, replica_aware: true, configured_max_in_flight: 48 };
+    mocks.view.model_in_flight = { llama: 2 };
+    mocks.routes = [{ model_name: "llama", max_in_flight: 8 }];
+    await render();
+    expect(host.textContent).toContain("3 live gateway replicas");
+    expect(host.textContent).toContain("ceil(configured / 3)");
+    expect(host.textContent).toContain("of 48 configured pool slots");
+    await tab("Allocation");
+    expect(host.textContent).toContain("2 active / 3 cap");
+    expect(host.textContent).toContain("of 8 configured");
+  });
+
+  it("says when replica-aware sizing is off or there is one replica", () => {
+    const base = mocks.view!;
+    expect(replicaNote({ ...base, replica_aware: false, replicas: 1 })).toContain("full configured limits");
+    expect(replicaNote({ ...base, replica_aware: true, replicas: 1 })).toContain("configured size");
+    expect(replicaNote(base)).toBe("");
+  });
+
+  it("computes a replica's share the way the gateway does", () => {
+    expect(replicaShare(8, 3)).toBe(3);
+    expect(replicaShare(1, 4)).toBe(1);
+    expect(replicaShare(32, 1)).toBe(32);
+    expect(replicaShare(10, 0)).toBe(10);
   });
 
   it("retains the weight draft after a failed save and refreshes after retry", async () => {

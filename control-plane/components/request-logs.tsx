@@ -67,6 +67,7 @@ const REQUEST_TYPES = [
   "embedding",
   "audio",
   "image",
+  "video",
   "rerank",
   "moderation",
   "other",
