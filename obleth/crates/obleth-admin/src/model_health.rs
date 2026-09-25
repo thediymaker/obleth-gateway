@@ -710,13 +710,37 @@ async fn existence_probe(
     let latency_ms: Option<i64> = started.elapsed().as_millis().try_into().ok();
     match catalog {
         Ok(catalog) => classify_existence(&catalog, &model.upstream_model, latency_ms),
-        Err(error) => ProbeResult {
-            status: classify_probe(error.http).to_string(),
-            latency_ms,
-            http_status: error.http.map(i64::from),
-            message: Some(normalize_excerpt(&error.message, 240)),
-            response_excerpt: None,
-        },
+        Err(error) => classify_catalog_failure(&error, latency_ms),
+    }
+}
+
+/// A catalog fetch that failed, for a model with no inference probe. The
+/// catalog is this model's only health signal, so a failure to read it is not
+/// evidence the model is down: a gateway that does not serve `/models`, or
+/// guards it differently from inference, answers 404 or 401 here while
+/// serving the model fine. Those answers are `unknown` (never counted toward
+/// the failure threshold, never alerted on). An upstream that does not answer
+/// at all is still `unhealthy`, since inference to it would fail the same
+/// way, and a 5xx stays `degraded`.
+fn classify_catalog_failure(error: &CatalogError, latency_ms: Option<i64>) -> ProbeResult {
+    let status = match error.http {
+        Some(code) if (400..500).contains(&code) => "unknown",
+        other => classify_probe(other),
+    };
+    let message = if status == "unknown" {
+        format!(
+            "{}; no inference probe for this model type, so health is unverified",
+            error.message
+        )
+    } else {
+        error.message.clone()
+    };
+    ProbeResult {
+        status: status.to_string(),
+        latency_ms,
+        http_status: error.http.map(i64::from),
+        message: Some(normalize_excerpt(&message, 240)),
+        response_excerpt: None,
     }
 }
 
@@ -1704,6 +1728,42 @@ mod tests {
     fn probe_request_costly_and_unknown_modes_are_none() {
         assert!(build_probe_request("https://up/v1", "image", "m").is_none());
         assert!(build_probe_request("https://up/v1", "something-else", "m").is_none());
+    }
+
+    #[test]
+    fn a_catalog_that_cannot_be_read_leaves_an_unprobed_model_unverified() {
+        let failure = |http: Option<u16>| CatalogError {
+            http,
+            message: match http {
+                Some(code) => format!("catalog request failed (HTTP {code})"),
+                None => "catalog is unreachable: connection refused".into(),
+            },
+        };
+        // The upstream answered but would not list its models: no evidence
+        // either way about the model itself.
+        for code in [401, 403, 404, 405] {
+            let r = classify_catalog_failure(&failure(Some(code)), Some(12));
+            assert_eq!(r.status, "unknown", "HTTP {code}");
+            assert_eq!(r.http_status, Some(i64::from(code)));
+            assert!(r.message.unwrap().contains("unverified"));
+        }
+        // Overloaded: transient, as for every other probe.
+        assert_eq!(
+            classify_catalog_failure(&failure(Some(503)), None).status,
+            "degraded"
+        );
+        // Nothing answered at all: inference would fail too.
+        assert_eq!(
+            classify_catalog_failure(&failure(None), None).status,
+            "unhealthy"
+        );
+    }
+
+    #[test]
+    fn image_models_still_have_no_inference_probe() {
+        // A generation costs accelerator time per sweep; the catalog stays the
+        // default signal (see `classify_catalog_failure`).
+        assert!(build_probe_request("http://up/v1", "image", "flux").is_none());
     }
 
     #[test]
