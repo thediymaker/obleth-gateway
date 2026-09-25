@@ -57,6 +57,9 @@ spec:
             - { name: OBLETH_GLOBAL_MAX_IN_FLIGHT, value: {{ .Values.obleth.globalMaxInFlight | quote }} }
             - { name: OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT, value: {{ .Values.obleth.defaultModelMaxInFlight | quote }} }
             - { name: OBLETH_FAIRSHARE_HISTORY_SECS, value: {{ .Values.obleth.fairshareHistorySecs | quote }} }
+            - { name: OBLETH_FAIRSHARE_REPLICA_AWARE, value: {{ .Values.obleth.fairshareReplicaAware | quote }} }
+            - { name: OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS, value: {{ .Values.obleth.fairshareReplicaHeartbeatSecs | quote }} }
+            - { name: OBLETH_FAIRSHARE_REPLICA_TTL_SECS, value: {{ .Values.obleth.fairshareReplicaTtlSecs | quote }} }
             - { name: OBLETH_FAIL_OPEN, value: {{ .Values.obleth.failOpen | quote }} }
             - { name: OBLETH_ALLOWED_PRIVATE_CIDRS, value: {{ .Values.obleth.allowedPrivateCidrs | quote }} }
             - { name: OBLETH_MODEL_HEALTH_ENABLED, value: {{ .Values.obleth.modelHealthEnabled | quote }} }

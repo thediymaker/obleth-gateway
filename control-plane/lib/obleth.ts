@@ -615,7 +615,10 @@ export interface CostAgg {
 export interface LiveStats {
   in_flight: number;
   queued: number;
+  /** This replica's share of the enabled models' pool sizes. */
   max_in_flight: number;
+  /** Live gateway replicas the configured limits are divided across. */
+  replicas?: number;
 }
 
 /** Wire shape of GET /overview/summary (config counts + windowed usage totals). */
@@ -673,7 +676,10 @@ export interface KeyFairshareView {
 
 export interface ModelPoolView {
   model: string;
+  /** Slots this replica enforces: its share of `configured_cap`. */
   cap: number;
+  /** Pool size as configured, before it is divided across replicas. */
+  configured_cap?: number;
   in_flight: number;
   queued: number;
   borrowed: number;
@@ -695,10 +701,21 @@ export interface FairshareLiveView {
   model_in_flight?: Record<string, number>;
   /** Live queued request count keyed by model name. */
   model_queued?: Record<string, number>;
-  /** Hard ceiling on global in-flight admission, independent of pool sums. */
+  /** Hard ceiling on global in-flight admission, independent of pool sums:
+   *  this replica's share of the configured ceiling. */
   hard_ceiling?: number;
+  /** OBLETH_GLOBAL_MAX_IN_FLIGHT as configured. */
+  configured_hard_ceiling?: number;
+  /** Enabled models' pool sizes as configured, summed; `max_in_flight` is
+   *  this replica's share of it. */
+  configured_max_in_flight?: number;
   /** Default per-model in-flight cap applied when a model has none configured. */
   default_model_max_in_flight?: number;
+  /** Live gateway replicas the configured limits are divided across. Every
+   *  count in the view is the answering replica's own. */
+  replicas?: number;
+  /** Whether limits are divided across replicas (OBLETH_FAIRSHARE_REPLICA_AWARE). */
+  replica_aware?: boolean;
   keys?: KeyFairshareView[];
   pools?: ModelPoolView[];
 }

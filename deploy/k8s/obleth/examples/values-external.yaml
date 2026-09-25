@@ -23,12 +23,11 @@
 obleth:
   # Fairshare runs one pool per model (default 32 slots via
   # defaultModelMaxInFlight, or the model's own max_in_flight); globalMaxInFlight
-  # is a total ceiling across those pools, not a fairness input. Admission is
-  # per-process: each replica enforces its own pools and ceiling independently,
-  # so the aggregate reaching the upstream is replicas x the configured
-  # numbers. 256 leaves headroom above the pool sum for several concurrently
-  # active models at the default pool size (an 85 ceiling would bind after
-  # only three); raise it further if you register more. Replicas cannot lend
+  # is a total ceiling across those pools, not a fairness input. Both are
+  # fleet-wide: each replica enforces ceil(value / live replicas) of them
+  # (fairshareReplicaAware, the default). 256 covers seven concurrently active
+  # models at the default pool size across 3 replicas (86 of the ceiling each,
+  # against 11 per pool); raise it if you register more. Replicas cannot lend
   # each other idle capacity.
   replicas: 3
   globalMaxInFlight: 256

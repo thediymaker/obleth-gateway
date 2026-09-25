@@ -112,20 +112,39 @@ hardened and made redundant):
 | External | Yours | Whatever you operate | 3, ceiling above pool sum | `--set` | Self-host w/ managed DBs |
 | Production | Yours (operator/managed) | Backups + HA + PITR (your tooling) | 3, ceiling above pool sum + PDB + anti-affinity | **existingSecret** | Redundant production |
 
-> **Replica count is load-bearing.** Fairshare runs one scheduling pool per
-> model (default `obleth.defaultModelMaxInFlight` slots, or the model's own
+> **Replicas share the fairshare limits.** Fairshare runs one scheduling pool
+> per model (default `obleth.defaultModelMaxInFlight` slots, or the model's own
 > `max_in_flight`), and `obleth.globalMaxInFlight` is a total ceiling across
-> those pools — not a fairness input. Fairshare admission state lives in each
-> gateway process, so every replica enforces its own pools and ceiling
-> independently: N replicas admit up to N × the configured pool sizes and N ×
-> the configured ceiling. The chart therefore defaults to one replica so the
-> numbers you set are the numbers that reach your upstream. For redundancy,
-> raise `obleth.replicas` and keep `obleth.globalMaxInFlight` above the sum of
-> the pool sizes you expect concurrently active, sizing both so that N × those
-> numbers stays within what your upstream can absorb — replicas cannot lend
-> each other idle capacity. The HPA is off by default for the same reason — an
-> autoscaled replica count moves the aggregate with no config change. The
-> dashboard's fairshare history is per replica as well
+> those pools — not a fairness input. Admission runs in each gateway process,
+> but every replica heartbeats into Redis
+> (`obleth.fairshareReplicaHeartbeatSecs`, default 5 s) and enforces its share
+> of each limit: the configured value divided by the live replica count,
+> rounded up, never below 1. That covers pool sizes, the global ceiling, and
+> per-tenant and per-key max in flight; weights are ratios and are not
+> divided. So the numbers you set are fleet-wide whatever `obleth.replicas` is,
+> and the HPA can scale the gateway without moving the concurrency that
+> reaches your upstream. The limits of this:
+>
+> - Rounding up lets the fleet run up to one slot per replica over a limit (a
+>   pool of 8 over 3 replicas is 3 + 3 + 3). Every pool rounds up on its own,
+>   so keep `obleth.globalMaxInFlight` at least one slot per enabled model per
+>   replica above the pool sum; the gateway warns at start-up if it is not.
+> - Fairness is decided per replica, on its share. The fleet matches the
+>   configured numbers, and tenants get their weighted share, only as far as
+>   the Service spreads requests evenly; replicas cannot lend each other idle
+>   capacity, so one replica can queue while another has free slots.
+> - A new replica is counted within one heartbeat. A crashed one is counted
+>   until its heartbeat expires (`obleth.fairshareReplicaTtlSecs`, default
+>   15 s), so the survivors run below the configured total for up to that
+>   long; a replica that shuts down cleanly deregisters once it has drained.
+>   Resizing never interrupts in-flight requests.
+> - If Redis is unreachable, each replica keeps the last count it read (or 1,
+>   the per-replica behaviour, if it never read one) and logs the failure once.
+>
+> `obleth.fairshareReplicaAware: false` restores per-replica limits, where N
+> replicas admit N × every number. The dashboard's fairshare page shows the
+> answering replica's own counts and its share of each limit, with the live
+> replica count; its history is per replica as well
 > (`obleth.fairshareHistorySecs`, in memory), so with several replicas the
 > chart shows whichever replica answered.
 

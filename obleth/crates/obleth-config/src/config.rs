@@ -56,7 +56,8 @@ pub struct Config {
 
     /// Total in-flight ceiling across all model pools (memory and
     /// upstream-connection guard). Not a fairness input; set it above the sum
-    /// of the pool sizes you expect.
+    /// of the pool sizes you expect. Fleet-wide, like the pools, when
+    /// `fairshare_replica_aware` is on.
     pub global_max_in_flight: usize,
     /// Pool size for a model that has no explicit `max_in_flight`.
     pub default_model_max_in_flight: usize,
@@ -65,6 +66,16 @@ pub struct Config {
     pub fairshare_history_secs: u64,
     /// Fairshare scheduling algorithm (`weighted` or `hierarchical`).
     pub fairshare_algorithm: FairshareAlgorithm,
+    /// Divide the fairshare limits (pool sizes, the global ceiling, tenant and
+    /// key caps) across the live gateway replicas, counted from Redis
+    /// heartbeats, so the fleet enforces the configured numbers rather than
+    /// replicas times them. With one replica it changes nothing.
+    pub fairshare_replica_aware: bool,
+    /// How often each replica refreshes its Redis heartbeat.
+    pub fairshare_replica_heartbeat: Duration,
+    /// How long a heartbeat counts a replica as live. A crashed replica stops
+    /// being counted, and its share returns to the survivors, within this.
+    pub fairshare_replica_ttl: Duration,
 
     /// Fail-open: keep serving from cache + buffer telemetry to WAL when
     /// Redis/ClickHouse are unavailable. Fail-closed rejects instead.
@@ -171,6 +182,10 @@ impl Default for RedisTimeouts {
 
 impl Config {
     pub fn from_env() -> Self {
+        let (fairshare_replica_heartbeat, fairshare_replica_ttl) = replica_heartbeat_timing(
+            parse_or("OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS", 5),
+            parse_or("OBLETH_FAIRSHARE_REPLICA_TTL_SECS", 15),
+        );
         Config {
             proxy_listen: env_or("OBLETH_PROXY_LISTEN", "0.0.0.0:8080"),
             admin_listen: env_or("OBLETH_ADMIN_LISTEN", "0.0.0.0:9180"),
@@ -208,6 +223,9 @@ impl Config {
                 "OBLETH_FAIRSHARE_ALGORITHM",
                 "hierarchical",
             )),
+            fairshare_replica_aware: bool_or("OBLETH_FAIRSHARE_REPLICA_AWARE", true),
+            fairshare_replica_heartbeat,
+            fairshare_replica_ttl,
             fail_open: require_bool("OBLETH_FAIL_OPEN", true),
             wal_path: env_or("OBLETH_WAL_PATH", "./obleth-telemetry.wal"),
             model_health_enabled: bool_or("OBLETH_MODEL_HEALTH_ENABLED", true),
@@ -244,10 +262,21 @@ impl Default for Config {
 }
 
 /// Default `OBLETH_GLOBAL_MAX_IN_FLIGHT`. The per-model pools are what limit
-/// admission; this is a per-replica safety cap above them, so it sits well over
-/// the sum of a realistic fleet's pools (128 models at the default pool size of
-/// 32) rather than binding first.
+/// admission; this is a safety cap above them (divided across replicas like
+/// the pools when replica-aware sizing is on), so it sits well over the sum of
+/// a realistic fleet's pools (128 models at the default pool size of 32)
+/// rather than binding first.
 pub const DEFAULT_GLOBAL_MAX_IN_FLIGHT: usize = 4096;
+
+/// `(heartbeat interval, heartbeat TTL)` from their raw seconds. A zero
+/// interval falls back to 5 s, and the TTL is raised to at least twice the
+/// interval: a TTL at or under the interval would let one late heartbeat drop
+/// a live replica from the count and resize the whole fleet for nothing.
+fn replica_heartbeat_timing(interval_secs: u64, ttl_secs: u64) -> (Duration, Duration) {
+    let interval = if interval_secs == 0 { 5 } else { interval_secs };
+    let ttl = ttl_secs.max(interval.saturating_mul(2));
+    (Duration::from_secs(interval), Duration::from_secs(ttl))
+}
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
@@ -376,6 +405,16 @@ mod tests {
         assert_eq!(t.connect, Duration::from_millis(500));
         let t = RedisTimeouts::from_values(Some("nope"), None);
         assert_eq!(t, RedisTimeouts::default());
+    }
+
+    #[test]
+    fn replica_heartbeat_ttl_stays_well_above_the_interval() {
+        let secs = |(i, t): (Duration, Duration)| (i.as_secs(), t.as_secs());
+        assert_eq!(secs(replica_heartbeat_timing(5, 15)), (5, 15));
+        assert_eq!(secs(replica_heartbeat_timing(5, 5)), (5, 10));
+        assert_eq!(secs(replica_heartbeat_timing(10, 3)), (10, 20));
+        assert_eq!(secs(replica_heartbeat_timing(0, 0)), (5, 10));
+        assert_eq!(secs(replica_heartbeat_timing(2, 60)), (2, 60));
     }
 
     #[test]

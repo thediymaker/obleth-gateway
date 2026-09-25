@@ -45,7 +45,7 @@ use obleth_config::{
     ToolLoopSettings, VisionBoonSettings, STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS,
     TOOL_LOOP_MAX_DEADLINE_SECS, TOOL_LOOP_MAX_TURNS,
 };
-use obleth_fairshare::{FairShare, FairshareHistory, StaticCapacity, Stats};
+use obleth_fairshare::{replica_share, FairShare, FairshareHistory, StaticCapacity, Stats};
 use obleth_redis::RedisStore;
 use obleth_store::{AuditEntry, Store};
 use obleth_tokenizer::Tokenizer;
@@ -87,6 +87,9 @@ pub struct AdminState {
     pub fairshare_history: Arc<FairshareHistory>,
     /// Configured retention in seconds; `0` means the sampler is off.
     pub fairshare_history_secs: u64,
+    /// Whether fairshare divides its limits across the live replicas
+    /// (`OBLETH_FAIRSHARE_REPLICA_AWARE`). Reported by the live view.
+    pub fairshare_replica_aware: bool,
     pub fairshare_stats: Arc<Stats>,
     pub clickhouse: clickhouse::Client,
     pub admin_token: String,
@@ -659,11 +662,15 @@ pub struct CapacityView {
     pub max_in_flight: usize,
 }
 
+/// This replica's live counters. `max_in_flight` is its share of the enabled
+/// models' pool sizes, the capacity `in_flight` is measured against.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LiveStats {
     pub in_flight: usize,
     pub queued: i64,
     pub max_in_flight: usize,
+    /// Live gateway replicas the configured limits are divided across.
+    pub replicas: usize,
 }
 
 /// At-a-glance dashboard summary: config counts from Postgres plus usage
@@ -735,7 +742,10 @@ pub struct KeyFairshareView {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ModelPoolView {
     pub model: String,
+    /// Slots this replica enforces: its share of `configured_cap`.
     pub cap: usize,
+    /// The pool size as configured, before it is divided across replicas.
+    pub configured_cap: usize,
     pub in_flight: usize,
     pub queued: usize,
     pub borrowed: usize,
@@ -747,16 +757,28 @@ pub struct ModelPoolView {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FairshareLiveView {
     pub algorithm: String,
-    /// Slots the gateway can run: the sum of the enabled models' pool sizes,
-    /// taken from the database rather than from the snapshot, so a model that
-    /// has had no traffic yet still counts. The aggregated `weight_share`
-    /// below is normalized against the sum of the caps of the pools that are
-    /// *present in the snapshot*, so the two can differ until every enabled
-    /// model has been used at least once.
+    /// Slots this replica can run: its share of each enabled model's pool
+    /// size, summed, taken from the database rather than from the snapshot,
+    /// so a model that has had no traffic yet still counts. The aggregated
+    /// `weight_share` below is normalized against the sum of the caps of the
+    /// pools that are *present in the snapshot*, so the two can differ until
+    /// every enabled model has been used at least once.
     pub max_in_flight: usize,
-    /// Total in-flight ceiling across all pools (`OBLETH_GLOBAL_MAX_IN_FLIGHT`).
+    /// The enabled models' pool sizes as configured, summed: the fleet-wide
+    /// intent that `max_in_flight` is this replica's share of.
+    pub configured_max_in_flight: usize,
+    /// Total in-flight ceiling across all pools as this replica enforces it:
+    /// its share of `OBLETH_GLOBAL_MAX_IN_FLIGHT`.
     pub hard_ceiling: usize,
+    /// `OBLETH_GLOBAL_MAX_IN_FLIGHT` as configured.
+    pub configured_hard_ceiling: usize,
     pub default_model_max_in_flight: usize,
+    /// Live gateway replicas the configured limits are divided across. Every
+    /// count in this view (in flight, queued, caps) is this replica's own.
+    pub replicas: usize,
+    /// Whether limits are divided across replicas at all
+    /// (`OBLETH_FAIRSHARE_REPLICA_AWARE`); when off, `replicas` is 1.
+    pub replica_aware: bool,
     pub global_in_flight: usize,
     pub global_queued: i64,
     /// Total occupancy above the apportioned group caps.
@@ -4535,16 +4557,71 @@ async fn get_overview_summary(
 /// Slots the gateway can actually run: the sum of the enabled models' pool
 /// sizes, each model's `max_in_flight` or the gateway default.
 pub fn enabled_pool_capacity(models: &[ModelRoute], default_cap: usize) -> usize {
+    enabled_pool_share(models, default_cap, 1)
+}
+
+/// Slots one of `replicas` live replicas can run: its share of each enabled
+/// model's pool size, summed. Each share rounds up on its own, so this can
+/// exceed `enabled_pool_capacity / replicas` by up to one slot per model.
+pub fn enabled_pool_share(models: &[ModelRoute], default_cap: usize, replicas: usize) -> usize {
     models
         .iter()
         .filter(|m| m.enabled)
         .map(|m| {
-            m.max_in_flight
+            let configured = m
+                .max_in_flight
                 .and_then(|c| usize::try_from(c).ok())
                 .filter(|c| *c > 0)
-                .unwrap_or(default_cap)
+                .unwrap_or(default_cap);
+            replica_share(configured, replicas)
         })
         .sum()
+}
+
+/// Why the global ceiling would bind before the pools do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CeilingWarning {
+    /// The ceiling compared, configured or per replica to match `pool_sum`.
+    pub ceiling: usize,
+    pub pool_sum: usize,
+    pub message: &'static str,
+}
+
+/// Start-up check that the global ceiling sits above the pools, comparing like
+/// with like. Configured ceiling against configured pool sum first: that is
+/// the operator's fleet-wide intent. Then this replica's share of each at the
+/// live count, since the shares round up per pool and many small pools can
+/// push their sum past the ceiling's share even when the configured numbers
+/// fit. With one replica the two checks are the same.
+pub fn ceiling_check(
+    models: &[ModelRoute],
+    default_cap: usize,
+    ceiling: usize,
+    replicas: usize,
+) -> Option<CeilingWarning> {
+    let pool_sum = enabled_pool_capacity(models, default_cap);
+    if ceiling < pool_sum {
+        return Some(CeilingWarning {
+            ceiling,
+            pool_sum,
+            message: "OBLETH_GLOBAL_MAX_IN_FLIGHT is below the sum of the enabled models' pool \
+                      sizes; the ceiling will bind first and pools will be served round-robin \
+                      — raise it above the pool sum",
+        });
+    }
+    let share_sum = enabled_pool_share(models, default_cap, replicas);
+    let ceiling_share = replica_share(ceiling, replicas);
+    if ceiling_share < share_sum {
+        return Some(CeilingWarning {
+            ceiling: ceiling_share,
+            pool_sum: share_sum,
+            message: "each replica's share of OBLETH_GLOBAL_MAX_IN_FLIGHT is below the sum of \
+                      its pool shares, which round up per model; the ceiling will bind first \
+                      on every replica — raise it by at least one slot per enabled model per \
+                      replica above the pool sum",
+        });
+    }
+    None
 }
 
 /// Fold per-pool views into one all-models view. Occupancy, backlog, served
@@ -4674,11 +4751,16 @@ async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
     use std::sync::atomic::Ordering;
     // The live counters are the point of this endpoint; a database hiccup
     // should degrade the capacity number, not fail the poll.
+    let replicas = state
+        .fairshare_stats
+        .replicas
+        .load(Ordering::Relaxed)
+        .max(1);
     let capacity = state
         .store
         .list_models()
         .await
-        .map(|m| enabled_pool_capacity(&m, state.default_model_max_in_flight))
+        .map(|m| enabled_pool_share(&m, state.default_model_max_in_flight, replicas))
         .unwrap_or(0);
     Json(LiveStats {
         in_flight: state.fairshare_stats.in_flight.load(Ordering::Relaxed),
@@ -4686,8 +4768,9 @@ async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
         max_in_flight: if capacity > 0 {
             capacity
         } else {
-            state.capacity.max_in_flight()
+            replica_share(state.capacity.max_in_flight(), replicas)
         },
+        replicas,
     })
 }
 
@@ -4719,7 +4802,8 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         .map(|k| (k.id, k.name))
         .collect();
     let models = state.store.list_models().await?;
-    let capacity = enabled_pool_capacity(&models, state.default_model_max_in_flight);
+    let configured_capacity = enabled_pool_capacity(&models, state.default_model_max_in_flight);
+    let capacity = enabled_pool_share(&models, state.default_model_max_in_flight, snap.replicas);
 
     // Pools outlive their model: a renamed, deleted or disabled model keeps an
     // empty pool in the scheduler until restart. Every pool with visible
@@ -4752,6 +4836,7 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
             ModelPoolView {
                 model: p.model.clone(),
                 cap,
+                configured_cap: p.configured_cap,
                 in_flight: p.in_flight.saturating_sub(h_in),
                 queued: p.queued.saturating_sub(h_q),
                 borrowed: p.borrowed,
@@ -4829,8 +4914,16 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         } else {
             snap.max_in_flight
         },
+        configured_max_in_flight: if configured_capacity > 0 {
+            configured_capacity
+        } else {
+            snap.configured_max_in_flight
+        },
         hard_ceiling: snap.max_in_flight,
+        configured_hard_ceiling: snap.configured_max_in_flight,
         default_model_max_in_flight: snap.default_model_max_in_flight,
+        replicas: snap.replicas,
+        replica_aware: state.fairshare_replica_aware,
         global_in_flight: snap.global_in_flight.saturating_sub(hidden_in_flight),
         global_queued: snap.global_queued.saturating_sub(hidden_queued) as i64,
         global_borrowed: snap.global_borrowed,
@@ -6859,6 +6952,7 @@ mod tests {
                 default_model_max_in_flight: 32,
                 fairshare_history: fairshare_history.clone(),
                 fairshare_history_secs: 3600,
+                fairshare_replica_aware: true,
                 // Never dialled: no route under test reads ClickHouse.
                 clickhouse: clickhouse::Client::default(),
                 admin_token: TEST_ADMIN_TOKEN.to_string(),
@@ -7864,6 +7958,52 @@ mod tests {
         assert_eq!(body["default_model_max_in_flight"], serde_json::json!(32));
     }
 
+    /// With several replicas live, the view reports this replica's share of
+    /// each limit next to the configured value, and the count it divides by.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn fairshare_live_reports_per_replica_shares() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        t.fairshare.set_replicas(2);
+        let admitted = t
+            .fairshare
+            .admit(obleth_fairshare::AdmitRequest::new(Uuid::new_v4(), "split", 1).model_cap(9))
+            .await
+            .expect("admitted");
+        let get = |path: &str| {
+            axum::http::Request::get(path)
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::empty())
+                .expect("build request")
+        };
+        let (status, body) = send(&t.app, get("/api/v1/fairshare/live")).await;
+        let (stats_status, stats) = send(&t.app, get("/api/v1/stats")).await;
+        drop(admitted);
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["replicas"], serde_json::json!(2));
+        assert_eq!(body["replica_aware"], serde_json::json!(true));
+        assert_eq!(body["hard_ceiling"], serde_json::json!(32), "ceil(64 / 2)");
+        assert_eq!(body["configured_hard_ceiling"], serde_json::json!(64));
+        assert!(
+            body["configured_max_in_flight"].as_u64() >= body["max_in_flight"].as_u64(),
+            "the share never exceeds the configured sum: {body}"
+        );
+        let pool = body["pools"]
+            .as_array()
+            .expect("pools")
+            .iter()
+            .find(|p| p["model"] == serde_json::json!("split"))
+            .cloned()
+            .expect("the split pool is reported");
+        assert_eq!(pool["cap"], serde_json::json!(5), "ceil(9 / 2)");
+        assert_eq!(pool["configured_cap"], serde_json::json!(9));
+        assert_eq!(stats_status, StatusCode::OK, "body: {stats}");
+        assert_eq!(stats["replicas"], serde_json::json!(2));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn fairshare_history_scopes_to_a_pool_or_the_aggregate() {
         let Some(t) = test_admin_app().await else {
@@ -8555,6 +8695,7 @@ mod tests {
         ModelPoolView {
             model: model.into(),
             cap,
+            configured_cap: cap,
             in_flight,
             queued: 0,
             borrowed: 0,
@@ -8623,5 +8764,45 @@ mod tests {
         c.enabled = false;
         c.max_in_flight = Some(100);
         assert_eq!(enabled_pool_capacity(&[a, b, c], 32), 36);
+    }
+
+    fn routes_with_caps(caps: &[Option<i64>]) -> Vec<ModelRoute> {
+        caps.iter()
+            .enumerate()
+            .map(|(i, cap)| {
+                let mut m = fixture_model_route(&format!("m{i}"));
+                m.max_in_flight = *cap;
+                m
+            })
+            .collect()
+    }
+
+    #[test]
+    fn enabled_pool_share_rounds_each_pool_up() {
+        let models = routes_with_caps(&[Some(4), None, Some(1)]);
+        assert_eq!(enabled_pool_share(&models, 32, 1), 37);
+        // ceil(4/3) + ceil(32/3) + ceil(1/3) = 2 + 11 + 1
+        assert_eq!(enabled_pool_share(&models, 32, 3), 14);
+    }
+
+    #[test]
+    fn ceiling_check_compares_like_with_like() {
+        let models = routes_with_caps(&[Some(8), Some(8)]);
+        // Configured ceiling under the configured pool sum.
+        let w = ceiling_check(&models, 32, 12, 1).expect("warns");
+        assert_eq!((w.ceiling, w.pool_sum), (12, 16));
+        assert!(w.message.contains("OBLETH_GLOBAL_MAX_IN_FLIGHT is below"));
+        // Covered, and still covered per replica: 3 replicas hold 3 + 3
+        // slots of pools against a 6-slot share of the ceiling.
+        assert_eq!(ceiling_check(&models, 32, 16, 3), None);
+        assert_eq!(ceiling_check(&models, 32, 64, 5), None);
+
+        // 64 one-slot pools under a 64 ceiling fit configured, but over 2
+        // replicas every pool rounds up to 1 while the ceiling halves.
+        let tiny = routes_with_caps(&[Some(1); 64]);
+        assert_eq!(ceiling_check(&tiny, 32, 64, 1), None);
+        let w = ceiling_check(&tiny, 32, 64, 2).expect("warns per replica");
+        assert_eq!((w.ceiling, w.pool_sum), (32, 64));
+        assert!(w.message.contains("round up per model"));
     }
 }

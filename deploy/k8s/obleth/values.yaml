@@ -11,14 +11,26 @@ image:
 obleth:
   # Fairshare runs one scheduling pool per model, sized by the model's
   # max_in_flight or defaultModelMaxInFlight. globalMaxInFlight is a total
-  # in-flight ceiling across all pools per replica, not a fairness input; keep
-  # it above the sum of the pool sizes you expect. Admission state is
-  # per-process: N replicas each enforce their own pools and ceiling, so the
-  # aggregate is N x the configured numbers. Keep hpa.enabled false when you
-  # run more than one replica (see below).
+  # in-flight ceiling across all pools, not a fairness input; keep it above
+  # the sum of the pool sizes you expect. With fairshareReplicaAware (the
+  # default) these are fleet-wide numbers: each replica enforces
+  # ceil(value / live replicas) of every pool, tenant and key cap, and the
+  # ceiling, so any replica count (or the HPA) admits about the configured
+  # concurrency. Rounding up puts the fleet at most one slot per replica over
+  # a limit, and because every pool rounds up on its own, keep the ceiling at
+  # least one slot per enabled model per replica above the pool sum.
   replicas: 1
   globalMaxInFlight: 4096
   defaultModelMaxInFlight: 32
+  # Divide the fairshare limits above across the live gateway replicas,
+  # counted from Redis heartbeats. false: every replica enforces the full
+  # numbers and N replicas admit N x them (the old behaviour).
+  fairshareReplicaAware: true
+  # How often each replica refreshes its heartbeat, and how long one counts it
+  # as live. A crashed replica's share returns to the survivors within about
+  # the TTL (raised to at least twice the interval).
+  fairshareReplicaHeartbeatSecs: 5
+  fairshareReplicaTtlSecs: 15
   # Seconds of scheduler history each replica keeps in memory for the
   # dashboard's activity chart (sampled every 2 s). 0 disables it.
   fairshareHistorySecs: 3600
@@ -99,13 +111,14 @@ obleth:
     requests: { cpu: "250m", memory: "256Mi" }
     limits: { cpu: "2", memory: "1Gi" }
 
-# Off by default. Each replica enforces its own model pools and its own
-# globalMaxInFlight ceiling, so an autoscaled replica count moves the aggregate
-# concurrency limit reaching your upstream with no config change: scaling
-# 2 -> 8 pods raises it fourfold. If you enable this, size globalMaxInFlight
-# (and the pools you care about) so that replicas x those numbers stays within
-# what the upstream can absorb at maxReplicas, and accept that the upstream is
-# under-subscribed below full scale-out.
+# Off by default. With obleth.fairshareReplicaAware on, replicas divide the
+# fairshare limits between them, so scaling moves CPU capacity, not the
+# concurrency reaching your upstream: pools resize within one heartbeat of a
+# pod joining, and within about the heartbeat TTL of one disappearing.
+# Fairness is decided per replica on its share, so it is exact only when the
+# Service spreads requests evenly. With fairshareReplicaAware off, each
+# replica enforces the full limits and scaling 2 -> 8 pods raises the
+# aggregate fourfold; size for maxReplicas in that case.
 hpa:
   enabled: false
   minReplicas: 1

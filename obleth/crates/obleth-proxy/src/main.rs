@@ -13,6 +13,7 @@ mod messages;
 mod metrics;
 mod output_monitor;
 mod proxy;
+mod replicas;
 mod responses;
 mod router;
 mod state;
@@ -102,6 +103,24 @@ async fn main() -> anyhow::Result<()> {
         cfg.fairshare_algorithm,
         cfg.default_model_max_in_flight,
     );
+    // Divide the configured limits across the live replicas, sized before the
+    // listeners open. Off, every replica enforces the whole of every limit.
+    let (replica_heartbeat, replicas) = if cfg.fairshare_replica_aware {
+        let (heartbeat, n) = replicas::ReplicaHeartbeat::start(
+            redis.clone(),
+            fairshare.clone(),
+            cfg.fairshare_replica_heartbeat,
+            cfg.fairshare_replica_ttl,
+        )
+        .await;
+        (Some(heartbeat), n)
+    } else {
+        tracing::info!(
+            "OBLETH_FAIRSHARE_REPLICA_AWARE is off; each replica enforces the full configured \
+             fairshare limits"
+        );
+        (None, 1)
+    };
     // ---- fairshare history (dashboard activity chart) ----
     let history_len = if cfg.fairshare_history_secs == 0 {
         0
@@ -118,15 +137,18 @@ async fn main() -> anyhow::Result<()> {
     // operator configured.
     match store.list_models().await {
         Ok(models) => {
-            let pool_sum =
-                obleth_admin::enabled_pool_capacity(&models, cfg.default_model_max_in_flight);
-            if cfg.global_max_in_flight < pool_sum {
+            if let Some(warning) = obleth_admin::ceiling_check(
+                &models,
+                cfg.default_model_max_in_flight,
+                cfg.global_max_in_flight,
+                replicas,
+            ) {
                 tracing::warn!(
-                    ceiling = cfg.global_max_in_flight,
-                    pool_sum,
-                    "OBLETH_GLOBAL_MAX_IN_FLIGHT is below the sum of the enabled models' pool \
-                     sizes; the ceiling will bind first and pools will be served round-robin \
-                     — raise it above the pool sum"
+                    ceiling = warning.ceiling,
+                    pool_sum = warning.pool_sum,
+                    replicas,
+                    "{}",
+                    warning.message
                 );
             }
         }
@@ -479,6 +501,7 @@ async fn main() -> anyhow::Result<()> {
         default_model_max_in_flight: cfg.default_model_max_in_flight,
         fairshare_history: fairshare_history.clone(),
         fairshare_history_secs: cfg.fairshare_history_secs,
+        fairshare_replica_aware: cfg.fairshare_replica_aware,
         clickhouse: clickhouse_read,
         admin_token: cfg.admin_token.clone(),
         health: health_runtime,
@@ -550,6 +573,10 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
+    // Only once drained: a draining replica still holds its in-flight share.
+    if let Some(heartbeat) = replica_heartbeat {
+        heartbeat.stop().await;
+    }
     telemetry.shutdown().await;
     if let Some(provider) = otel_provider {
         // The exporter flush blocks; bound it so a dead collector can't hold exit.
@@ -665,6 +692,9 @@ async fn metrics_handler(
         state.fs.queued.load(Ordering::Relaxed),
         state.tele.dropped.load(Ordering::Relaxed),
     );
+    state
+        .metrics
+        .set_fairshare_replicas(state.fs.replicas.load(Ordering::Relaxed) as i64);
     (
         [(
             axum::http::header::CONTENT_TYPE,
