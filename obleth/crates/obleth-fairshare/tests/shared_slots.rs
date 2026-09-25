@@ -347,7 +347,9 @@ async fn a_crashed_gateways_slots_are_reclaimed() {
     // B's process dies: its permits are never released, only reclaimed.
     std::mem::forget(on_b);
     cluster.kill("gw-1");
-    tokio::time::timeout(Duration::from_secs(2), a)
+    // Held until the count is read: dropping it releases the slot, and that
+    // release would race the assertion.
+    let _permit = tokio::time::timeout(Duration::from_secs(2), a)
         .await
         .expect("reclaimed slot admitted")
         .unwrap()
