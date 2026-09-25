@@ -495,6 +495,26 @@ async fn main() -> anyhow::Result<()> {
         telemetry: Some(telemetry.clone()),
         catalogs: Default::default(),
     };
+    // Discovered models: each replica derives their pool sizes from the live
+    // backend and hands them to fairshare as configured values. Reads the
+    // registry the refresher above keeps current, never Postgres.
+    let capacity_discovery =
+        obleth_admin::capacity_discovery::CapacityDiscovery::new(cfg.capacity_discovery.clone());
+    let _capacity_discovery_task =
+        capacity_discovery.spawn(fairshare.clone(), cfg.default_model_max_in_flight, {
+            let registry = model_registry.clone();
+            std::sync::Arc::new(move || {
+                registry
+                    .load()
+                    .iter()
+                    .filter_map(|c| {
+                        obleth_admin::capacity_discovery::DiscoveryTarget::from_resolved(
+                            &c.model, c.healthy,
+                        )
+                    })
+                    .collect()
+            })
+        });
     let admin_state = obleth_admin::AdminState {
         store: store.clone(),
         redis: redis.clone(),
@@ -523,9 +543,7 @@ async fn main() -> anyhow::Result<()> {
                     as std::pin::Pin<Box<dyn std::future::Future<Output = router::Intent> + Send>>
             }
         })),
-        capacity_discovery: obleth_admin::capacity_discovery::CapacityDiscovery::new(
-            cfg.capacity_discovery.clone(),
-        ),
+        capacity_discovery: capacity_discovery.clone(),
     };
     obleth_admin::model_health::spawn_worker(admin_state.clone());
     obleth_admin::usage_retention::spawn_worker(admin_state.clone());
@@ -550,6 +568,7 @@ async fn main() -> anyhow::Result<()> {
         metrics: metrics.clone(),
         fs: fairshare.stats(),
         tele: telemetry.stats(),
+        capacity_discovery,
     };
     let metrics_app = Router::new()
         .route("/metrics", get(metrics_handler))
@@ -687,6 +706,7 @@ struct MetricsState {
     metrics: Arc<Metrics>,
     fs: Arc<obleth_fairshare::Stats>,
     tele: Arc<TelemetryStats>,
+    capacity_discovery: obleth_admin::capacity_discovery::CapacityDiscovery,
 }
 
 async fn metrics_handler(
@@ -701,6 +721,11 @@ async fn metrics_handler(
     state
         .metrics
         .set_fairshare_replicas(state.fs.replicas.load(Ordering::Relaxed) as i64);
+    for (discovery_state, count) in state.capacity_discovery.state_counts() {
+        state
+            .metrics
+            .set_capacity_discovery_models(discovery_state, count as i64);
+    }
     (
         [(
             axum::http::header::CONTENT_TYPE,

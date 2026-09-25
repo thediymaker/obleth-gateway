@@ -215,6 +215,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/stats", get(get_stats))
         .route("/api/v1/overview/summary", get(get_overview_summary))
         .route("/api/v1/fairshare/live", get(get_fairshare_live))
+        .route("/api/v1/capacity/discovery", get(get_capacity_discovery))
         .route("/api/v1/fairshare/history", get(get_fairshare_history))
         .route(
             "/api/v1/fairshare/groups",
@@ -4691,15 +4692,27 @@ pub fn enabled_pool_capacity(models: &[ModelRoute], default_cap: usize) -> usize
 /// model's pool size, summed. Each share rounds up on its own, so this can
 /// exceed `enabled_pool_capacity / replicas` by up to one slot per model.
 pub fn enabled_pool_share(models: &[ModelRoute], default_cap: usize, replicas: usize) -> usize {
+    enabled_pool_share_with(models, default_cap, replicas, &Default::default())
+}
+
+/// [`enabled_pool_share`] with the pool sizes discovery set for some models
+/// (see [`capacity_discovery`]) in place of their `max_in_flight`.
+pub fn enabled_pool_share_with(
+    models: &[ModelRoute],
+    default_cap: usize,
+    replicas: usize,
+    discovered: &std::collections::HashMap<String, usize>,
+) -> usize {
     models
         .iter()
         .filter(|m| m.enabled)
         .map(|m| {
-            let configured = m
-                .max_in_flight
-                .and_then(|c| usize::try_from(c).ok())
-                .filter(|c| *c > 0)
-                .unwrap_or(default_cap);
+            let configured = discovered.get(&m.model_name).copied().unwrap_or_else(|| {
+                m.max_in_flight
+                    .and_then(|c| usize::try_from(c).ok())
+                    .filter(|c| *c > 0)
+                    .unwrap_or(default_cap)
+            });
             replica_share(configured, replicas)
         })
         .sum()
@@ -4883,11 +4896,14 @@ async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
         .replicas
         .load(Ordering::Relaxed)
         .max(1);
+    let discovered = state.capacity_discovery.effective_caps();
     let capacity = state
         .store
         .list_models()
         .await
-        .map(|m| enabled_pool_share(&m, state.default_model_max_in_flight, replicas))
+        .map(|m| {
+            enabled_pool_share_with(&m, state.default_model_max_in_flight, replicas, &discovered)
+        })
         .unwrap_or(0);
     Json(LiveStats {
         in_flight: state.fairshare_stats.in_flight.load(Ordering::Relaxed),
@@ -4899,6 +4915,117 @@ async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
         },
         replicas,
     })
+}
+
+/// This replica's capacity discovery: its settings and every `discovered`
+/// model's state.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CapacityDiscoveryView {
+    /// `OBLETH_CAPACITY_DISCOVERY_ENABLED` on this replica.
+    pub enabled: bool,
+    pub interval_secs: u64,
+    /// Namespaces the `kubernetes` source may read. Empty: that source is
+    /// unavailable.
+    pub namespaces: Vec<String>,
+    /// Selector template for `kubernetes` models that set none.
+    pub default_selector: String,
+    /// Live gateway replicas each pool size is divided across.
+    pub replicas: usize,
+    pub models: Vec<CapacityDiscoveryModelView>,
+}
+
+/// One `discovered` model.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CapacityDiscoveryModelView {
+    pub model_id: Uuid,
+    pub model_name: String,
+    pub enabled: bool,
+    /// The model's own `max_in_flight`: the fallback.
+    pub static_max_in_flight: Option<i64>,
+    /// What this replica enforces: its share of
+    /// `status.effective_max_in_flight`.
+    pub replica_share: usize,
+    pub status: capacity_discovery::ModelCapacityStatus,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/capacity/discovery", tag = "models",
+    responses((status = 200, body = CapacityDiscoveryView))
+)]
+async fn get_capacity_discovery(
+    State(state): State<AdminState>,
+) -> Result<Json<CapacityDiscoveryView>> {
+    use std::sync::atomic::Ordering;
+    let settings = state.capacity_discovery.settings().clone();
+    let replicas = state
+        .fairshare_stats
+        .replicas
+        .load(Ordering::Relaxed)
+        .max(1);
+    let statuses: std::collections::HashMap<String, capacity_discovery::ModelCapacityStatus> =
+        state
+            .capacity_discovery
+            .statuses()
+            .into_iter()
+            .map(|s| (s.model_name.clone(), s))
+            .collect();
+    let models = state
+        .store
+        .list_models()
+        .await?
+        .into_iter()
+        .filter(|m| m.capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE)
+        .map(|m| {
+            let status = statuses.get(&m.model_name).cloned().unwrap_or_else(|| {
+                // Not evaluated by this replica (yet): say why, with the value
+                // fairshare is using meanwhile.
+                let reason = if !settings.enabled {
+                    "capacity discovery is off on this gateway \
+                     (OBLETH_CAPACITY_DISCOVERY_ENABLED)"
+                } else if !m.enabled {
+                    "the model is disabled"
+                } else {
+                    "waiting for the next discovery pass"
+                };
+                capacity_discovery::ModelCapacityStatus {
+                    model_name: m.model_name.clone(),
+                    source: m.capacity_source.clone(),
+                    namespaces: Vec::new(),
+                    selector: m.capacity_selector.clone(),
+                    ready_replicas: None,
+                    per_replica_max_in_flight: None,
+                    per_replica_source: None,
+                    headroom: m.capacity_headroom,
+                    derived_max_in_flight: None,
+                    effective_max_in_flight: m
+                        .max_in_flight
+                        .and_then(|c| usize::try_from(c).ok())
+                        .filter(|c| *c > 0)
+                        .unwrap_or(state.default_model_max_in_flight),
+                    state: capacity_discovery::STATE_FALLBACK.into(),
+                    last_refresh: None,
+                    last_success: None,
+                    reason: Some(format!("{reason}; using the static max_in_flight")),
+                }
+            });
+            CapacityDiscoveryModelView {
+                model_id: m.id,
+                model_name: m.model_name,
+                enabled: m.enabled,
+                static_max_in_flight: m.max_in_flight,
+                replica_share: replica_share(status.effective_max_in_flight, replicas),
+                status,
+            }
+        })
+        .collect();
+    Ok(Json(CapacityDiscoveryView {
+        enabled: settings.enabled,
+        interval_secs: settings.interval.as_secs(),
+        namespaces: settings.namespaces,
+        default_selector: settings.default_selector,
+        replicas,
+        models,
+    }))
 }
 
 #[utoipa::path(
@@ -4929,8 +5056,15 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         .map(|k| (k.id, k.name))
         .collect();
     let models = state.store.list_models().await?;
-    let configured_capacity = enabled_pool_capacity(&models, state.default_model_max_in_flight);
-    let capacity = enabled_pool_share(&models, state.default_model_max_in_flight, snap.replicas);
+    let discovered = state.capacity_discovery.effective_caps();
+    let configured_capacity =
+        enabled_pool_share_with(&models, state.default_model_max_in_flight, 1, &discovered);
+    let capacity = enabled_pool_share_with(
+        &models,
+        state.default_model_max_in_flight,
+        snap.replicas,
+        &discovered,
+    );
 
     // Pools outlive their model: a renamed, deleted or disabled model keeps an
     // empty pool in the scheduler until restart. Every pool with visible
@@ -7532,6 +7666,29 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{ep}");
+
+        // The discovery view lists the model with the value in force: no loop
+        // runs in this test, so the static fallback, and says why.
+        let req = axum::http::Request::get("/api/v1/capacity/discovery")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (status, view) = send(&t.app, req).await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["enabled"], true);
+        assert_eq!(view["namespaces"], serde_json::json!(["inference"]));
+        let entry = view["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["model_id"] == serde_json::json!(id))
+            .expect("listed");
+        assert_eq!(entry["status"]["state"], "fallback");
+        assert_eq!(entry["status"]["effective_max_in_flight"], 32);
+        assert!(entry["status"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("waiting for the next discovery pass"));
 
         let _ = t.store.delete_model(Uuid::parse_str(&id).unwrap()).await;
     }
