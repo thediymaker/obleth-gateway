@@ -33,6 +33,7 @@ cached_script!(reconcile_script, scripts::RECONCILE);
 cached_script!(term_usage_read_script, scripts::TERM_USAGE_READ);
 cached_script!(term_usage_add_script, scripts::TERM_USAGE_ADD);
 cached_script!(term_reconcile_script, scripts::TERM_RECONCILE);
+cached_script!(replica_heartbeat_script, scripts::REPLICA_HEARTBEAT);
 
 const KEY_PREFIX: &str = "obleth:key:";
 const MODEL_PREFIX: &str = "obleth:model:";
@@ -67,6 +68,10 @@ const PROVISIONER_VERSION_KEY: &str = "obleth:provisioner:version";
 /// a provisioner can poll green for days while every tick fails against
 /// slurmrestd and holds all replica state frozen.
 const PROVISIONER_TICK_KEY: &str = "obleth:provisioner:tick";
+/// Live gateway replicas, as a sorted set of instance ids scored by heartbeat
+/// expiry (see `scripts::REPLICA_HEARTBEAT`). Fairshare divides its configured
+/// limits by the member count.
+const REPLICAS_KEY: &str = "obleth:gateway:replicas";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RedisError {
@@ -203,6 +208,45 @@ impl RedisStore {
         let mut conn = self.conn.clone();
         let v: Option<String> = conn.get(PROVISIONER_TICK_KEY).await?;
         Ok(v)
+    }
+
+    /// Refresh this replica's heartbeat for `ttl` and return how many
+    /// replicas are live (unexpired), this one included. One small script
+    /// call; run it on an interval well under `ttl`, never per request.
+    pub async fn replica_heartbeat(
+        &self,
+        instance: &str,
+        ttl: std::time::Duration,
+    ) -> Result<usize> {
+        self.replica_heartbeat_in(REPLICAS_KEY, instance, ttl).await
+    }
+
+    /// Drop this replica's heartbeat so the survivors grow at their next
+    /// heartbeat instead of one TTL later. Called on clean shutdown.
+    pub async fn replica_deregister(&self, instance: &str) -> Result<()> {
+        self.replica_deregister_in(REPLICAS_KEY, instance).await
+    }
+
+    async fn replica_heartbeat_in(
+        &self,
+        key: &str,
+        instance: &str,
+        ttl: std::time::Duration,
+    ) -> Result<usize> {
+        let mut conn = self.conn.clone();
+        let live: usize = replica_heartbeat_script()
+            .key(key)
+            .arg(instance)
+            .arg(ttl.as_millis().max(1) as u64)
+            .invoke_async(&mut conn)
+            .await?;
+        Ok(live)
+    }
+
+    async fn replica_deregister_in(&self, key: &str, instance: &str) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let _: i64 = conn.zrem(key, instance).await?;
+        Ok(())
     }
 
     /// Hot-path lookup of a resolved key by its hash.
@@ -1586,5 +1630,180 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(out, ReserveOutcome::Reserved { remaining: -50 });
+    }
+
+    fn replica_test_key() -> String {
+        format!("obleth:test:replicas:{}", Uuid::new_v4())
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn replica_heartbeats_count_live_instances_and_expire_the_silent() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let key = replica_test_key();
+        let ttl = std::time::Duration::from_millis(400);
+
+        assert_eq!(store.replica_heartbeat_in(&key, "a", ttl).await.unwrap(), 1);
+        assert_eq!(store.replica_heartbeat_in(&key, "b", ttl).await.unwrap(), 2);
+        // A refresh is not a second replica.
+        assert_eq!(store.replica_heartbeat_in(&key, "a", ttl).await.unwrap(), 2);
+
+        // b stops heartbeating (a crash): once its TTL passes it is no longer
+        // counted, while a, still refreshing, is.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(store.replica_heartbeat_in(&key, "a", ttl).await.unwrap(), 2);
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(
+            store.replica_heartbeat_in(&key, "a", ttl).await.unwrap(),
+            1,
+            "b expired"
+        );
+        let mut conn = store.conn.clone();
+        let members: Vec<String> = conn.zrange(&key, 0, -1).await.unwrap();
+        assert_eq!(members, vec!["a".to_string()], "expired members are pruned");
+
+        // The set itself never expires, so volatile-lru cannot evict it.
+        let pttl: i64 = conn.pttl(&key).await.unwrap();
+        assert_eq!(pttl, -1);
+
+        let _: () = conn.del(&key).await.unwrap();
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn replica_deregister_drops_the_instance_at_once() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let key = replica_test_key();
+        let ttl = std::time::Duration::from_secs(30);
+        store.replica_heartbeat_in(&key, "a", ttl).await.unwrap();
+        assert_eq!(store.replica_heartbeat_in(&key, "b", ttl).await.unwrap(), 2);
+        store.replica_deregister_in(&key, "a").await.unwrap();
+        assert_eq!(store.replica_heartbeat_in(&key, "b", ttl).await.unwrap(), 1);
+        // Deregistering an unknown instance is a no-op, not an error.
+        store.replica_deregister_in(&key, "gone").await.unwrap();
+        let mut conn = store.conn.clone();
+        let _: () = conn.del(&key).await.unwrap();
+    }
+
+    /// A TCP relay to the test Redis that can be taken down and brought back
+    /// on the same port, standing in for a Redis outage after boot.
+    struct Relay {
+        port: u16,
+        target: String,
+        tasks: std::sync::Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    }
+
+    impl Relay {
+        async fn start(target: String) -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let relay = Relay {
+                port,
+                target,
+                tasks: Default::default(),
+            };
+            relay.serve(listener);
+            relay
+        }
+
+        fn serve(&self, listener: tokio::net::TcpListener) {
+            let target = self.target.clone();
+            let tasks = self.tasks.clone();
+            let accept = tokio::spawn(async move {
+                while let Ok((mut inbound, _)) = listener.accept().await {
+                    let target = target.clone();
+                    let conn = tokio::spawn(async move {
+                        if let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await {
+                            let _ =
+                                tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                        }
+                    });
+                    tasks.lock().unwrap().push(conn);
+                }
+            });
+            self.tasks.lock().unwrap().push(accept);
+        }
+
+        /// Close the listener and every relayed connection.
+        fn down(&self) {
+            for task in self.tasks.lock().unwrap().drain(..) {
+                task.abort();
+            }
+        }
+
+        async fn up(&self) {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", self.port))
+                .await
+                .unwrap();
+            self.serve(listener);
+        }
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn replica_heartbeat_fails_fast_while_redis_is_down_and_recovers() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let info = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_connection_info()
+            .clone();
+        let redis::ConnectionAddr::Tcp(host, port) = info.addr.clone() else {
+            eprintln!("skipping: the relay needs a TCP Redis URL");
+            return;
+        };
+        let relay = Relay::start(format!("{host}:{port}")).await;
+        let mut relayed = info.clone();
+        relayed.addr = redis::ConnectionAddr::Tcp("127.0.0.1".into(), relay.port);
+        let client = redis::Client::open(relayed).unwrap();
+        let config = ConnectionManagerConfig::new()
+            .set_response_timeout(std::time::Duration::from_millis(250))
+            .set_connection_timeout(std::time::Duration::from_millis(500))
+            .set_number_of_retries(0);
+        let store = RedisStore {
+            conn: ConnectionManager::new_with_config(client.clone(), config)
+                .await
+                .unwrap(),
+            client,
+        };
+        let key = replica_test_key();
+        let ttl = std::time::Duration::from_secs(30);
+        assert_eq!(store.replica_heartbeat_in(&key, "a", ttl).await.unwrap(), 1);
+
+        relay.down();
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let res = store.replica_heartbeat_in(&key, "a", ttl).await;
+            assert!(res.is_err(), "heartbeat must fail while Redis is down");
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(2),
+                "a failed heartbeat must not hang: {:?}",
+                started.elapsed()
+            );
+        }
+
+        relay.up().await;
+        let recovered = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Ok(n) = store.replica_heartbeat_in(&key, "a", ttl).await {
+                    return n;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .expect("the heartbeat reconnects once Redis is back");
+        assert_eq!(recovered, 1);
+
+        let direct = test_store().await.unwrap();
+        let mut conn = direct.conn.clone();
+        let _: () = conn.del(&key).await.unwrap();
+        relay.down();
     }
 }
