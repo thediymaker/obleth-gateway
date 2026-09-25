@@ -294,9 +294,9 @@ pool size = max(1, ceil(ready serving replicas × per-replica concurrency × cap
 
 Every gateway replica re-reads the backend every
 `obleth.capacityDiscovery.intervalSecs` (default 15) and treats the result as
-the model's configured, fleet-wide pool size, so the replica-aware division
-above still applies: with three gateway replicas each enforces a third of it,
-rounded up. A change resizes the pool without cutting in-flight requests, and
+the model's configured, cluster-wide pool size, held across the gateway
+replicas like any other (shared slots, or the split when those are off or
+unavailable; see above). A change resizes the pool without cutting in-flight requests, and
 growth admits queued requests at once. Nothing is written to the database.
 
 **Where replicas are counted** (`capacity_source`, per model):
@@ -362,8 +362,8 @@ the list, or that has no Service and no default template to fall back on (or a
 template that does not give a valid Service name for it), is refused when it is
 saved. The dashboard's model page and `GET /api/v1/capacity/discovery` show,
 per discovered model, the Service and the namespace it was found in, the ready
-replicas, the per-replica value, the derived pool size, this replica's share,
-the last refresh and the reason when discovery has no answer;
+replicas, the per-replica value, the derived pool size, the model's
+cluster-wide and this gateway's in-flight counts, the last refresh and the reason when discovery has no answer;
 `obleth_capacity_discovery_models{state}` counts models by state. See
 [`values-capacity-discovery.yaml`](obleth/examples/values-capacity-discovery.yaml)
 for settings and examples.
