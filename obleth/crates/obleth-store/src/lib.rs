@@ -91,6 +91,7 @@ const SCHEMA_V24: &str =
 const SCHEMA_V25: &str = include_str!("../../../../schema/postgres/0025_api_key_fairshare.sql");
 const SCHEMA_V26: &str =
     include_str!("../../../../schema/postgres/0026_model_upstream_headers.sql");
+const SCHEMA_V27: &str = include_str!("../../../../schema/postgres/0027_model_cost_per_video.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -233,6 +234,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V24).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V25).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V26).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V27).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1323,6 +1325,7 @@ impl Store {
         aliases: &[String],
         quantization: &str,
         upstream_headers: &obleth_config::UpstreamHeaders,
+        cost_per_video: f64,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -1334,11 +1337,11 @@ impl Store {
                 supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
                 energy_slots_per_node, route_bias, auto_eligible,
                 draft_model, verify_api_base, verify_upstream_model, aliases, quantization,
-                upstream_headers
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
+                upstream_headers, cost_per_video
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)
              returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
@@ -1380,6 +1383,7 @@ impl Store {
         .bind(sqlx::types::Json(obleth_config::normalize_aliases(aliases)))
         .bind(obleth_config::normalize_quantization(quantization))
         .bind(encrypt_upstream_headers(upstream_headers))
+        .bind(cost_per_video.max(0.0))
         .fetch_one(&self.pool)
         .await?;
         model_from_row(&row)
@@ -1389,7 +1393,7 @@ impl Store {
         let rows = sqlx::query(
             "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                     input_cost_per_token, output_cost_per_token,
-                    cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                    cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
@@ -1408,7 +1412,7 @@ impl Store {
         let row = sqlx::query(
             "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                     input_cost_per_token, output_cost_per_token,
-                    cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                    cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
@@ -1429,7 +1433,7 @@ impl Store {
         let row = sqlx::query(
             "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                     input_cost_per_token, output_cost_per_token,
-                    cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                    cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
@@ -1508,6 +1512,7 @@ impl Store {
         aliases: &[String],
         quantization: &str,
         upstream_headers: &obleth_config::UpstreamHeaders,
+        cost_per_video: f64,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -1525,11 +1530,12 @@ impl Store {
                 auto_eligible = $26,
                 draft_model = $27, verify_api_base = $28, verify_upstream_model = $29,
                 aliases = $30, quantization = $31, upstream_headers = $32,
+                cost_per_video = $33,
                 updated_at = now()
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
@@ -1571,6 +1577,7 @@ impl Store {
         .bind(sqlx::types::Json(obleth_config::normalize_aliases(aliases)))
         .bind(obleth_config::normalize_quantization(quantization))
         .bind(encrypt_upstream_headers(upstream_headers))
+        .bind(cost_per_video.max(0.0))
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1598,7 +1605,7 @@ impl Store {
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
@@ -1627,7 +1634,7 @@ impl Store {
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
@@ -1657,7 +1664,7 @@ impl Store {
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
@@ -1683,7 +1690,7 @@ impl Store {
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
@@ -1703,7 +1710,7 @@ impl Store {
         let rows = sqlx::query(
             "select id, model_name, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization, admission_weight, max_in_flight, enabled,
                     cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token,
-                    cost_per_image, cost_per_audio_second, cost_per_character,
+                    cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video,
                     context_window, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
@@ -1782,6 +1789,7 @@ impl Store {
                     cost_per_image: row.try_get("cost_per_image")?,
                     cost_per_audio_second: row.try_get("cost_per_audio_second")?,
                     cost_per_character: row.try_get("cost_per_character")?,
+                    cost_per_video: row.try_get("cost_per_video").unwrap_or(0.0),
                     context_window: row.try_get("context_window")?,
                     supports_function_calling: row.try_get("supports_function_calling")?,
                     supports_system_messages: row.try_get("supports_system_messages")?,
@@ -1886,7 +1894,7 @@ impl Store {
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
@@ -1922,7 +1930,7 @@ impl Store {
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
@@ -2953,7 +2961,7 @@ impl Store {
               where tool_servers ? $1
              returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
-                       cost_per_image, cost_per_audio_second, cost_per_character, context_window,
+                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
@@ -3489,6 +3497,7 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         cost_per_image: row.try_get("cost_per_image").unwrap_or(0.0),
         cost_per_audio_second: row.try_get("cost_per_audio_second").unwrap_or(0.0),
         cost_per_character: row.try_get("cost_per_character").unwrap_or(0.0),
+        cost_per_video: row.try_get("cost_per_video").unwrap_or(0.0),
         context_window: row.try_get("context_window")?,
         admission_weight: row.try_get("admission_weight")?,
         max_in_flight: row.try_get("max_in_flight")?,
@@ -3947,6 +3956,7 @@ mod tests {
                 &[],
                 "unknown",
                 &headers,
+                0.0,
             )
             .await
             .expect("create model");
@@ -4025,6 +4035,7 @@ mod tests {
                 // A backend's own spelling, folded onto the vocabulary value.
                 "FP8-e4m3",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -4109,6 +4120,7 @@ mod tests {
                 &[],
                 "mxfp4",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("update model");
@@ -4214,6 +4226,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -4536,6 +4549,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -4674,6 +4688,7 @@ mod tests {
                     &[],
                     "",
                     &Default::default(),
+                    0.0,
                 )
                 .await
                 .expect("create model");
@@ -4781,6 +4796,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -4986,6 +5002,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -5060,6 +5077,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("update model");
@@ -5213,6 +5231,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -5319,6 +5338,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("model");
@@ -5426,6 +5446,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -5650,6 +5671,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -5748,6 +5770,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model with both grants");
@@ -5788,6 +5811,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model with kept grant");
@@ -5865,6 +5889,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -5943,6 +5968,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -6022,6 +6048,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -6117,6 +6144,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -6232,6 +6260,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -6333,6 +6362,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -6412,6 +6442,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -6512,6 +6543,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");
@@ -6582,6 +6614,7 @@ mod tests {
                 &[],
                 "",
                 &Default::default(),
+                0.0,
             )
             .await
             .expect("create model");

@@ -172,6 +172,7 @@ const MODEL_TYPE_OPTIONS = [
   { value: "audio_transcription", label: "Audio transcription (STT)" },
   { value: "audio_speech", label: "Text to speech (TTS)" },
   { value: "image", label: "Image generation" },
+  { value: "video", label: "Video generation" },
 ] as const;
 
 const MODEL_TYPE_LABELS: Record<string, string> = Object.fromEntries(
@@ -1085,6 +1086,9 @@ function CreateModelWizard({
                 {createType === "audio_speech" && (
                   <Field label="Cost / character" name="cost_per_character" placeholder="0.000015" />
                 )}
+                {createType === "video" && (
+                  <Field label="Cost / video" name="cost_per_video" placeholder="0.50" />
+                )}
                 {createType === "audio_transcription" && (
                   <Field label="Cost / audio second" name="cost_per_audio_second" placeholder="0.0001" />
                 )}
@@ -1566,6 +1570,9 @@ function ConnectionTab({
               )}
               {editType === "audio_speech" && (
                 <Field label="Cost / character" name="cost_per_character" defaultValue={toPlainDecimal(model.cost_per_character)} />
+              )}
+              {editType === "video" && (
+                <Field label="Cost / video" name="cost_per_video" defaultValue={toPlainDecimal(model.cost_per_video)} />
               )}
               {editType === "audio_transcription" && (
                 <Field label="Cost / audio second" name="cost_per_audio_second" defaultValue={toPlainDecimal(model.cost_per_audio_second)} />
@@ -3213,6 +3220,8 @@ function modelTypeHint(type: string): string {
       return "Serves /v1/audio/speech. Billed per input character.";
     case "image":
       return "Serves /v1/images/generations, /v1/images/edits and /v1/images/variations (multipart image upload). Billed per image.";
+    case "video":
+      return "Serves the /v1/videos job API: create (JSON or multipart reference image), poll, download, delete, list. Billed a flat price per created job; polls and downloads are free. Health is catalog-only.";
     default:
       return "";
   }

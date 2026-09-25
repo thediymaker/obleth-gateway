@@ -831,6 +831,9 @@ pub struct CreateModel {
     pub cost_per_audio_second: Option<f64>,
     #[serde(default)]
     pub cost_per_character: Option<f64>,
+    /// Flat USD price of one created job (`video` models).
+    #[serde(default)]
+    pub cost_per_video: Option<f64>,
     pub context_window: Option<i64>,
     pub admission_weight: Option<i64>,
     pub max_in_flight: Option<i64>,
@@ -903,6 +906,9 @@ pub struct UpdateModel {
     pub cost_per_audio_second: Option<f64>,
     #[serde(default)]
     pub cost_per_character: Option<f64>,
+    /// Flat USD price of one created job (`video` models).
+    #[serde(default)]
+    pub cost_per_video: Option<f64>,
     pub context_window: Option<i64>,
     pub admission_weight: Option<i64>,
     pub max_in_flight: Option<i64>,
@@ -1558,7 +1564,8 @@ pub struct ModelRouteView {
     pub upstream_header_names: Vec<String>,
     /// Modality from the fixed `MODEL_TYPES` vocabulary. Determines which
     /// OpenAI endpoint this model serves (`chat`, `embedding`,
-    /// `audio_transcription`, `audio_speech`, `image`). Defaults to `chat`.
+    /// `audio_transcription`, `audio_speech`, `image`, `video`). Defaults to
+    /// `chat`.
     pub model_type: String,
     /// Weight/activation format this deployment serves, from the fixed
     /// `QUANTIZATIONS` vocabulary. Descriptive only — it never affects
@@ -1573,6 +1580,9 @@ pub struct ModelRouteView {
     pub cost_per_audio_second: f64,
     /// Per-input-character cost in USD (`audio_speech` models).
     pub cost_per_character: f64,
+    /// Per-created-job cost in USD (`video` models), charged once when the
+    /// create call succeeds.
+    pub cost_per_video: f64,
     pub context_window: i64,
     /// Multiplier applied to tenant weight at admission when this model is used.
     pub admission_weight: i64,
@@ -1701,6 +1711,7 @@ impl From<ModelRoute> for ModelRouteView {
             cost_per_image,
             cost_per_audio_second,
             cost_per_character,
+            cost_per_video,
             context_window,
             admission_weight,
             max_in_flight,
@@ -1747,6 +1758,7 @@ impl From<ModelRoute> for ModelRouteView {
             cost_per_image,
             cost_per_audio_second,
             cost_per_character,
+            cost_per_video,
             context_window,
             admission_weight,
             max_in_flight,
@@ -5398,6 +5410,7 @@ async fn create_model(
             &aliases,
             &quantization,
             &upstream_headers,
+            body.cost_per_video.unwrap_or(0.0),
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -5533,6 +5546,7 @@ async fn update_model(
             &aliases,
             &quantization,
             &upstream_headers,
+            body.cost_per_video.unwrap_or(existing.cost_per_video),
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -6628,6 +6642,7 @@ async fn sync_model_from(
         cost_per_image: model.cost_per_image,
         cost_per_audio_second: model.cost_per_audio_second,
         cost_per_character: model.cost_per_character,
+        cost_per_video: model.cost_per_video,
         context_window: model.context_window,
         supports_function_calling: model.supports_function_calling,
         supports_system_messages: model.supports_system_messages,
@@ -6894,6 +6909,7 @@ mod tests {
                     &[],
                     "",
                     &Default::default(),
+                    0.0,
                 )
                 .await
                 .expect("create fixture model")
@@ -8516,6 +8532,7 @@ mod tests {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: 128_000,
             admission_weight: 100,
             max_in_flight: None,

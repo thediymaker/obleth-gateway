@@ -1162,8 +1162,9 @@ fn probe_silence_wav() -> Vec<u8> {
 
 /// Build the minimal real inference request used to verify a model actually
 /// serves. `api_base` already includes the `/v1` suffix. Returns `None` for
-/// `image` (a "minimal" generation is still costly) and unrecognized types —
-/// those fall back to the catalog existence check.
+/// `image` (a "minimal" generation is still costly), `video` (a probe would be
+/// a multi-minute render holding a card) and unrecognized types — those fall
+/// back to the catalog existence check.
 fn build_probe_request(
     api_base: &str,
     model_type: &str,
@@ -1727,6 +1728,7 @@ mod tests {
     #[test]
     fn probe_request_costly_and_unknown_modes_are_none() {
         assert!(build_probe_request("https://up/v1", "image", "m").is_none());
+        assert!(build_probe_request("https://up/v1", "video", "m").is_none());
         assert!(build_probe_request("https://up/v1", "something-else", "m").is_none());
     }
 

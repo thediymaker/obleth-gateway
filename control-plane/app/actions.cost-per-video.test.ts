@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 afterEach(() => vi.resetModules());
 
-// Mirrors the mocking approach in actions.model-tags.test.ts: actions.ts pulls
+// Mirrors the mocking approach in actions.upstream-headers.test.ts: actions.ts pulls
 // in "next/cache", "@/lib/obleth" and "@/lib/auth/roles", none of which can run
 // under vitest.
 function mockAdmin() {
@@ -89,36 +89,20 @@ function connectionForm(over: Record<string, string> = {}) {
   return fd;
 }
 
-describe("upstream headers round-trip through the model form", () => {
-  it("sends the textarea as a write, with a blank value meaning keep", async () => {
+describe("a video model's price round-trips through the model form", () => {
+  it("sends cost_per_video from the form", async () => {
     const updateModel = await connectionUpdate(
-      model({ upstream_header_names: ["x-upstream-token"] }),
-      connectionForm({
-        upstream_headers: "x-upstream-token:\nrouting-strategy: prefix-cache",
-      }),
+      model({ model_type: "video", cost_per_video: 0 }),
+      connectionForm({ cost_per_video: "0.5" }),
     );
-    expect(updateModel.mock.calls[0][1].upstream_headers).toEqual({
-      "x-upstream-token": null,
-      "routing-strategy": "prefix-cache",
-    });
+    expect(updateModel.mock.calls[0][1].cost_per_video).toBe(0.5);
   });
 
-  it("clears every header when the operator empties the field", async () => {
+  it("keeps the stored price when the form has no price field", async () => {
     const updateModel = await connectionUpdate(
-      model({ upstream_header_names: ["x-upstream-token"] }),
-      connectionForm({ upstream_headers: "" }),
-    );
-    expect(updateModel.mock.calls[0][1].upstream_headers).toEqual({});
-  });
-
-  it("leaves the headers alone when the form has no headers field", async () => {
-    // Omitted means keep: a save that never rendered the field must not
-    // send an empty set and wipe what is stored.
-    const updateModel = await connectionUpdate(
-      model({ upstream_header_names: ["x-upstream-token"] }),
+      model({ model_type: "video", cost_per_video: 0.75 }),
       connectionForm(),
     );
-    expect("upstream_headers" in updateModel.mock.calls[0][1]).toBe(false);
-    expect("upstream_header_names" in updateModel.mock.calls[0][1]).toBe(false);
+    expect(updateModel.mock.calls[0][1].cost_per_video).toBe(0.75);
   });
 });

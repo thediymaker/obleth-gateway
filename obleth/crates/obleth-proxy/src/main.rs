@@ -1435,6 +1435,7 @@ mod registry_refresh_tests {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: 128_000,
             supports_function_calling: true,
             supports_system_messages: true,

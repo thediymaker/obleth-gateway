@@ -141,6 +141,7 @@ export interface BatchDefaults {
   cost_per_image?: number;
   cost_per_audio_second?: number;
   cost_per_character?: number;
+  cost_per_video?: number;
   admission_weight?: number;
   tags?: string[];
   enabled: boolean;
@@ -202,6 +203,7 @@ export function buildImportPayload(
       if (merged.cost_per_image != null) entry.cost_per_image = merged.cost_per_image;
       if (merged.cost_per_audio_second != null) entry.cost_per_audio_second = merged.cost_per_audio_second;
       if (merged.cost_per_character != null) entry.cost_per_character = merged.cost_per_character;
+      if (merged.cost_per_video != null) entry.cost_per_video = merged.cost_per_video;
       if (merged.admission_weight != null) entry.admission_weight = merged.admission_weight;
       if (merged.tags && merged.tags.length > 0) entry.tags = merged.tags;
       return entry;

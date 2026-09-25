@@ -136,6 +136,8 @@ export interface ModelRoute {
   cost_per_image: number;
   cost_per_audio_second: number;
   cost_per_character: number;
+  /** Flat USD price of one created job (`video` models). */
+  cost_per_video: number;
   energy_slots_per_node: number;
   /** Multiplier on this model's auto-routing score. 1.0 is neutral. */
   route_bias: number;

@@ -422,6 +422,7 @@ mod tests {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: 0,
             supports_function_calling: false,
             supports_system_messages: false,

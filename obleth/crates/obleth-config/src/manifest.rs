@@ -136,6 +136,8 @@ pub struct ManifestModel {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_per_character: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_per_video: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub admission_weight: Option<i64>,
@@ -283,6 +285,7 @@ pub struct ModelConfig {
     pub cost_per_image: f64,
     pub cost_per_audio_second: f64,
     pub cost_per_character: f64,
+    pub cost_per_video: f64,
     pub context_window: i64,
     pub admission_weight: i64,
     pub max_in_flight: Option<i64>,
@@ -329,6 +332,7 @@ impl Default for ModelConfig {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: DEFAULT_CONTEXT_WINDOW,
             admission_weight: DEFAULT_ADMISSION_WEIGHT,
             max_in_flight: None,
@@ -376,6 +380,7 @@ impl From<&ModelRoute> for ModelConfig {
             cost_per_image: m.cost_per_image,
             cost_per_audio_second: m.cost_per_audio_second,
             cost_per_character: m.cost_per_character,
+            cost_per_video: m.cost_per_video,
             context_window: m.context_window,
             admission_weight: m.admission_weight,
             max_in_flight: m.max_in_flight,
@@ -454,6 +459,10 @@ impl ModelConfig {
         note(
             self.cost_per_character != other.cost_per_character,
             "cost_per_character",
+        );
+        note(
+            self.cost_per_video != other.cost_per_video,
+            "cost_per_video",
         );
         note(
             self.context_window != other.context_window,
@@ -680,6 +689,9 @@ pub fn resolve_model(
     }
     if let Some(v) = entry.cost_per_character {
         next.cost_per_character = reject_negative(v, "cost_per_character").map_err(reject)?;
+    }
+    if let Some(v) = entry.cost_per_video {
+        next.cost_per_video = reject_negative(v, "cost_per_video").map_err(reject)?;
     }
     if let Some(v) = entry.route_bias {
         if !v.is_finite() || v < 0.0 {
@@ -983,6 +995,7 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
         cost_per_image: Some(m.cost_per_image),
         cost_per_audio_second: Some(m.cost_per_audio_second),
         cost_per_character: Some(m.cost_per_character),
+        cost_per_video: Some(m.cost_per_video),
         context_window: Some(m.context_window),
         admission_weight: Some(m.admission_weight),
         max_in_flight: m.max_in_flight,
@@ -1035,6 +1048,7 @@ mod tests {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: 4096,
             admission_weight: 50,
             max_in_flight: Some(4),
@@ -1288,6 +1302,27 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    #[test]
+    fn a_video_model_imports_with_its_flat_price() {
+        let mut e = entry("wan-2-2");
+        e.model_type = Some("video".into());
+        e.cost_per_video = Some(0.5);
+
+        let r = resolve_model(&e, None, &[]).unwrap();
+
+        assert_eq!(r.config.model_type, "video");
+        assert_eq!(r.config.cost_per_video, 0.5);
+
+        let existing = route("wan-2-2");
+        let r = resolve_model(&e, Some(&existing), &[]).unwrap();
+        assert!(r.changed_fields.contains(&"cost_per_video".to_string()));
+
+        let mut e = entry("wan-2-2");
+        e.cost_per_video = Some(-0.5);
+        let err = resolve_model(&e, Some(&existing), &[]).unwrap_err();
+        assert!(err.message.contains("cost_per_video"), "{}", err.message);
     }
 
     #[test]

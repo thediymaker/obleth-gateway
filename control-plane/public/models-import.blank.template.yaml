@@ -33,6 +33,8 @@
 #                                          audio_transcription -> /v1/audio/transcriptions, /v1/audio/translations
 #                                          audio_speech        -> /v1/audio/speech
 #                                          image               -> /v1/images/generations
+#                                          video               -> /v1/videos (create, poll,
+#                                                                 download, delete, list)
 #                                        Only `chat` models take part in `auto` routing.
 #   input_cost_per_token      (optional) USD per input token.  Default 0.
 #                                        Used by chat + embedding models.
@@ -44,6 +46,9 @@
 #                                        Used by audio_speech (TTS) models.
 #   cost_per_audio_second     (optional) USD per second of audio. Default 0.
 #                                        Reserved for audio_transcription (STT) models.
+#   cost_per_video            (optional) USD per created video job. Default 0.
+#                                        Used by video models, charged once when
+#                                        the create succeeds.
 #   context_window            (optional) Max tokens. Default 8192.
 #   admission_weight          (optional) Fair-share weight. Default 100.
 #   max_in_flight             (optional) Concurrency cap. Blank = no cap.
@@ -135,3 +140,17 @@ models:
     api_base: https://your-endpoint.example.com/v1
     model_type: audio_transcription
     cost_per_audio_second: 0.0001
+
+  # ---- Example 7: video generation (/v1/videos) ----
+  # The OpenAI Videos API is job-based: POST /v1/videos returns a job id,
+  # and clients poll GET /v1/videos/{id}, then fetch the mp4 from
+  # GET /v1/videos/{id}/content (409 while it renders). The create takes JSON
+  # or multipart/form-data (a reference frame as `input_reference`).
+  # cost_per_video is charged once per created job; polls and downloads are
+  # free. No generation probe is sent: health is the catalog check only.
+  - model_name: wan-2-2
+    description: Text- and image-to-video generation
+    upstream_model: wan-2-2
+    api_base: http://video.internal:8000/v1
+    model_type: video
+    cost_per_video: 0.50

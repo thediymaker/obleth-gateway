@@ -356,7 +356,8 @@ pub struct ModelRoute {
     pub upstream_headers: UpstreamHeaders,
     /// Modality from the fixed [`MODEL_TYPES`] vocabulary. Determines which
     /// OpenAI endpoint this model serves (`chat`, `embedding`,
-    /// `audio_transcription`, `audio_speech`, `image`). Defaults to `chat`.
+    /// `audio_transcription`, `audio_speech`, `image`, `video`). Defaults to
+    /// `chat`.
     #[serde(default = "default_model_type")]
     pub model_type: String,
     /// Weight/activation format this deployment serves, from the fixed
@@ -376,6 +377,10 @@ pub struct ModelRoute {
     /// Per-input-character cost in USD (`audio_speech` models).
     #[serde(default)]
     pub cost_per_character: f64,
+    /// Per-created-job cost in USD (`video` models), charged once when the
+    /// create call succeeds.
+    #[serde(default)]
+    pub cost_per_video: f64,
     pub context_window: i64,
     /// Multiplier applied to tenant weight at admission when this model is used.
     pub admission_weight: i64,
@@ -571,6 +576,8 @@ pub struct ResolvedModel {
     pub cost_per_audio_second: f64,
     #[serde(default)]
     pub cost_per_character: f64,
+    #[serde(default)]
+    pub cost_per_video: f64,
     /// Maximum context window in tokens. Used by the `auto` router to filter
     /// out models that cannot fit the request. `#[serde(default)]` keeps older
     /// cached payloads (without this field) deserializable.
@@ -1268,6 +1275,7 @@ pub const MODEL_TYPES: &[&str] = &[
     "audio_transcription",
     "audio_speech",
     "image",
+    "video",
 ];
 
 /// The default modality assigned to a model when none is specified.
@@ -2823,6 +2831,9 @@ pub struct ModelBackup {
     pub cost_per_audio_second: f64,
     #[serde(default)]
     pub cost_per_character: f64,
+    /// Absent in backups taken before the column existed.
+    #[serde(default)]
+    pub cost_per_video: f64,
     pub context_window: i64,
     pub admission_weight: i64,
     pub max_in_flight: Option<i64>,
@@ -3626,6 +3637,7 @@ mod tests {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: 0,
             supports_function_calling: false,
             supports_system_messages: true,
