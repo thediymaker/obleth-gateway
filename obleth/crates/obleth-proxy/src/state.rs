@@ -68,8 +68,10 @@ pub struct AppState {
     /// can reach Postgres (single-flight identity provisioning, once per
     /// identity).
     pub jwt: Option<Arc<crate::jwt_auth::JwtAuth>>,
-    /// Video job records: which tenant owns each Videos API job and where it
-    /// lives. Written once per successful create and read by each follow-up;
+    /// Video job records: which tenant and key own each Videos API job and
+    /// where it lives, plus the `OBLETH_VIDEO_JOB_SCOPE` that decides whose
+    /// jobs a caller may follow up. Written once per successful create and
+    /// read by each follow-up;
     /// Postgres because a record must survive a render that takes minutes,
     /// which a TTL'd Redis key under `volatile-lru` does not promise.
     pub video_jobs: crate::videos::VideoJobStore,

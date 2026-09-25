@@ -121,6 +121,13 @@ obleth:
   # usually forgets finished jobs within an hour or two, so the default leaves
   # ample room. 0 or invalid falls back to this default.
   videoJobRetentionHours: 24
+  # Who may poll, download, delete and list a video job (/v1/videos).
+  # `key` (the default): only the API key that created it, so each user sees
+  # only their own videos (a JWT/SSO caller's identity key is one per user).
+  # `tenant`: any key of the tenant that created it, for tenants whose users
+  # share their renders. Another tenant's job is a 404 either way. Any other
+  # value falls back to `key` with a warning in the gateway log.
+  videoJobScope: key
   resources:
     requests: { cpu: "250m", memory: "256Mi" }
     limits: { cpu: "2", memory: "1Gi" }

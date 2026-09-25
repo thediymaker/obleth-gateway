@@ -15,19 +15,28 @@
 //! admission, budgets, the upstream model-name swap and headers. It is billed
 //! the model's flat `cost_per_video` when it succeeds. What is specific to
 //! video happens after the upstream answers: the job id is recorded against
-//! the model, the tenant, and the base URL that accepted it (see
+//! the model, the tenant, the key, and the base URL that accepted it (see
 //! [`record_create`]) before the id reaches the client.
 //!
 //! The follow-ups carry the job id and nothing else, so they cannot resolve a
 //! model the usual way. [`handle_follow_up`] reads the record instead: it
 //! routes the call back to the model and base that created the job, answers
-//! "not found" for an id this tenant does not own, and passes the upstream
+//! "not found" for an id the caller does not own, and passes the upstream
 //! answer through untouched (its status included, for example a not-ready
 //! answer while the video renders), streaming the file rather than buffering
 //! it.
-//! Follow-ups are authenticated and tenant-checked but take no fairshare slot,
-//! reserve no budget, and are not billed or written to the usage ledger: they
-//! are reads of work already paid for.
+//!
+//! Who owns a job is `OBLETH_VIDEO_JOB_SCOPE` (see [`owner_of`]): by default
+//! the API key that created it, so in a tenant of many users each one sees,
+//! polls, downloads and deletes only their own videos (a JWT caller's identity
+//! key is one per issuer and subject, so this holds for SSO users too).
+//! `tenant` shares every job with all of the tenant's keys. An unknown id,
+//! another tenant's job and another key's job are the same 404, answered
+//! without contacting the backend.
+//!
+//! Follow-ups are authenticated and ownership-checked but take no fairshare
+//! slot, reserve no budget, and are not billed or written to the usage ledger:
+//! they are reads of work already paid for.
 //!
 //! Not handled here yet: admission that counts outstanding renders rather than
 //! in-flight requests, billing on completion, and progress webhooks.
@@ -40,7 +49,8 @@ use axum::http::{header, HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use futures_util::StreamExt;
-use obleth_config::{ResolvedKey, ResolvedModel};
+use obleth_config::{ResolvedKey, ResolvedModel, VideoJobScope};
+use obleth_store::VideoJobOwner;
 use tokio::time::timeout;
 use uuid::Uuid;
 
@@ -87,13 +97,42 @@ const PASSTHROUGH_HEADERS: &[header::HeaderName] = &[
 ];
 
 /// The video job table, and only that: the data plane reads no other
-/// Postgres state on the request path.
+/// Postgres state on the request path. Carries the configured
+/// `OBLETH_VIDEO_JOB_SCOPE`, which decides whose jobs a caller may follow up.
 #[derive(Clone)]
-pub struct VideoJobStore(obleth_store::Store);
+pub struct VideoJobStore {
+    store: obleth_store::Store,
+    scope: VideoJobScope,
+}
 
 impl VideoJobStore {
-    pub fn new(store: obleth_store::Store) -> Self {
-        VideoJobStore(store)
+    pub fn new(store: obleth_store::Store, scope: VideoJobScope) -> Self {
+        VideoJobStore { store, scope }
+    }
+
+    /// The jobs `resolved` may follow up under the configured scope.
+    fn owner_of(&self, resolved: &ResolvedKey) -> VideoJobOwner {
+        owner_of(self.scope, resolved)
+    }
+}
+
+/// Whose jobs a caller may poll, download, delete and list.
+///
+/// Under [`VideoJobScope::Key`] (the default), only the jobs the caller's own
+/// key created, within its tenant. A disabled key is refused before this is
+/// reached, and a rotated key is a new key id, so neither reaches the old
+/// key's jobs; they expire with their records
+/// (`OBLETH_VIDEO_JOB_RETENTION_HOURS`). Under [`VideoJobScope::Tenant`], any
+/// job of the caller's tenant.
+///
+/// An internal key (a gateway-owned probe) is scoped exactly like any other:
+/// unlike the model allowlist, which it bypasses, ownership is never widened
+/// for it. Probes do not create video jobs, so under `key` scope one sees
+/// none.
+fn owner_of(scope: VideoJobScope, resolved: &ResolvedKey) -> VideoJobOwner {
+    match scope {
+        VideoJobScope::Key => VideoJobOwner::key(resolved.tenant_id, resolved.key_id),
+        VideoJobScope::Tenant => VideoJobOwner::tenant(resolved.tenant_id),
     }
 }
 
@@ -180,8 +219,8 @@ fn follow_up_path(call: FollowUp<'_>) -> String {
 }
 
 /// The not-found answer for an id that is unknown, malformed, or owned by
-/// another tenant. One message for all three, so a caller learns nothing
-/// about ids it does not hold.
+/// another tenant (or, under `key` scope, another key). One message for all,
+/// so a caller learns nothing about ids it does not hold.
 fn no_such_job() -> Response<Body> {
     error_json(StatusCode::NOT_FOUND, "no such video job")
 }
@@ -209,7 +248,7 @@ pub(crate) fn spawn_job_pruner(jobs: VideoJobStore) {
             let Ok(age) = chrono::Duration::from_std(retention) else {
                 return;
             };
-            match jobs.0.prune_video_jobs(chrono::Utc::now() - age).await {
+            match jobs.store.prune_video_jobs(chrono::Utc::now() - age).await {
                 Ok(0) => {}
                 Ok(n) => tracing::info!(pruned = n, "pruned expired video job records"),
                 Err(e) => tracing::warn!(error = %e, "video job prune failed"),
@@ -307,12 +346,8 @@ pub(crate) async fn handle_follow_up(
     if !valid_job_id(id) {
         return no_such_job();
     }
-    let job = match state
-        .video_jobs
-        .0
-        .get_video_job(id, resolved.tenant_id)
-        .await
-    {
+    let owner = state.video_jobs.owner_of(resolved);
+    let job = match state.video_jobs.store.get_video_job(id, owner).await {
         Ok(Some(job)) => job,
         Ok(None) => return no_such_job(),
         Err(e) => {
@@ -352,12 +387,7 @@ pub(crate) async fn handle_follow_up(
     if matches!(call, FollowUp::Delete(_))
         && (status.is_success() || status == StatusCode::NOT_FOUND)
     {
-        if let Err(e) = state
-            .video_jobs
-            .0
-            .delete_video_job(id, resolved.tenant_id)
-            .await
-        {
+        if let Err(e) = state.video_jobs.store.delete_video_job(id, owner).await {
             tracing::warn!(error = %e, job = id, "video job record delete failed");
         }
     }
@@ -387,21 +417,24 @@ fn passthrough(upstream: reqwest::Response, request_id: Uuid) -> Response<Body> 
 /// them.
 ///
 /// The backend lists every live job on its deployment, whoever made it, so its
-/// listing is filtered down to the ids this tenant owns. That keeps the rich
+/// listing is filtered down to the ids the caller owns: its own key's jobs
+/// under `key` scope, its tenant's under `tenant`. That keeps the rich
 /// objects (status, progress) and naturally leaves out jobs the backend has
 /// already expired. One upstream call per distinct model and endpoint the
-/// tenant has jobs on — in practice, one. The listing is never used to prune
-/// records: the backend answers an unreadable job store with an empty list.
+/// caller has jobs on — in practice, one; none when it has no jobs. The
+/// listing is never used to prune records: the backend answers an unreadable
+/// job store with an empty list.
 async fn list(
     state: &AppState,
     resolved: &ResolvedKey,
     headers: &HeaderMap,
     request_id: Uuid,
 ) -> Response<Body> {
+    let owner = state.video_jobs.owner_of(resolved);
     let jobs = match state
         .video_jobs
-        .0
-        .list_video_jobs(resolved.tenant_id, LIST_LIMIT)
+        .store
+        .list_video_jobs(owner, LIST_LIMIT)
         .await
     {
         Ok(jobs) => jobs,
@@ -611,7 +644,7 @@ pub(crate) async fn record_create(job: CreatedJob, upstream: reqwest::Response) 
 
     match job
         .jobs
-        .0
+        .store
         .insert_video_job(
             &job_id,
             &job.model,
@@ -814,6 +847,28 @@ mod tests {
         let own = affinity_target(&route, "http://model-base/v1").expect("model base");
         assert_eq!(own.base, "http://model-base/v1");
         assert!(affinity_target(&route, "http://gone/v1").is_none());
+    }
+
+    #[test]
+    fn ownership_is_the_callers_key_by_default_and_never_widened_for_internal_keys() {
+        let mut key = crate::boons::test_support::test_key();
+        key.key_id = Uuid::new_v4();
+        key.tenant_id = Uuid::new_v4();
+        assert_eq!(
+            owner_of(VideoJobScope::Key, &key),
+            VideoJobOwner::key(key.tenant_id, key.key_id)
+        );
+        assert_eq!(
+            owner_of(VideoJobScope::Tenant, &key),
+            VideoJobOwner::tenant(key.tenant_id)
+        );
+        key.internal = true;
+        assert_eq!(
+            owner_of(VideoJobScope::Key, &key),
+            VideoJobOwner::key(key.tenant_id, key.key_id),
+            "an internal key sees only its own jobs, like any other"
+        );
+        assert_eq!(VideoJobScope::default(), VideoJobScope::Key);
     }
 }
 
@@ -1058,8 +1113,14 @@ mod pipeline_tests {
         }
     }
 
-    /// A real `AppState` on the test datastores, or `None` (skip) without them.
+    /// A real `AppState` on the test datastores under the default `key`
+    /// scope, or `None` (skip) without them.
     async fn gateway() -> Option<Gateway> {
+        gateway_with(VideoJobScope::Key).await
+    }
+
+    /// [`gateway`] under the given `OBLETH_VIDEO_JOB_SCOPE`.
+    async fn gateway_with(scope: VideoJobScope) -> Option<Gateway> {
         let (Ok(db), Ok(redis_url)) = (
             std::env::var("OBLETH_TEST_DATABASE_URL"),
             std::env::var("OBLETH_TEST_REDIS_URL"),
@@ -1124,7 +1185,7 @@ mod pipeline_tests {
             energy: crate::energy::EnergyEngine::new(Default::default()),
             jwt: None,
             knowledge: Arc::new(crate::knowledge::KnowledgeIndex::new()),
-            video_jobs: VideoJobStore::new(store.clone()),
+            video_jobs: VideoJobStore::new(store.clone(), scope),
         };
         Some(Gateway {
             state,
@@ -1176,6 +1237,23 @@ mod pipeline_tests {
                 .insert(obleth_config::hash_api_key(&secret), Arc::new(key.clone()))
                 .await;
             (secret, key)
+        }
+
+        /// Another key of `of`'s tenant: a second user of the same tenant.
+        async fn second_key(&self, of: &ResolvedKey) -> (String, ResolvedKey) {
+            let mut key = of.clone();
+            key.key_id = Uuid::new_v4();
+            let secret = format!("sk-video-{}", Uuid::new_v4());
+            self.state
+                .key_cache
+                .insert(obleth_config::hash_api_key(&secret), Arc::new(key.clone()))
+                .await;
+            (secret, key)
+        }
+
+        async fn delete(&self, secret: &str, uri: &str) -> Response<Body> {
+            self.send(Method::DELETE, uri, secret, None, Body::empty())
+                .await
         }
 
         async fn spent(&self, key: &ResolvedKey) -> f64 {
@@ -1277,7 +1355,7 @@ mod pipeline_tests {
         // Recorded against the tenant, the key and the base that took it.
         let rec = gw
             .store
-            .get_video_job(&id, key.tenant_id)
+            .get_video_job(&id, VideoJobOwner::tenant(key.tenant_id))
             .await
             .unwrap()
             .expect("recorded");
@@ -1328,7 +1406,7 @@ mod pipeline_tests {
         );
         assert!(gw
             .store
-            .get_video_job(&id, key.tenant_id)
+            .get_video_job(&id, VideoJobOwner::tenant(key.tenant_id))
             .await
             .unwrap()
             .is_some());
@@ -1351,7 +1429,7 @@ mod pipeline_tests {
         );
         assert!(gw
             .store
-            .list_video_jobs(key.tenant_id, 10)
+            .list_video_jobs(VideoJobOwner::tenant(key.tenant_id), 10)
             .await
             .unwrap()
             .is_empty());
@@ -1423,7 +1501,10 @@ mod pipeline_tests {
         assert!(backend.calls.lock().unwrap().is_empty());
         assert!(gw
             .store
-            .get_video_job(&id, owner_key.tenant_id)
+            .get_video_job(
+                &id,
+                VideoJobOwner::key(owner_key.tenant_id, owner_key.key_id)
+            )
             .await
             .unwrap()
             .is_some());
@@ -1514,7 +1595,7 @@ mod pipeline_tests {
         assert!(!backend.jobs.lock().unwrap().contains_key(&id));
         assert!(gw
             .store
-            .get_video_job(&id, key.tenant_id)
+            .get_video_job(&id, VideoJobOwner::tenant(key.tenant_id))
             .await
             .unwrap()
             .is_none());
@@ -1643,5 +1724,146 @@ mod pipeline_tests {
         // A clean prompt goes through under the same policy.
         let resp = gw.create_json(&secret, "video-model", "a red fox").await;
         assert_eq!(resp.status(), StatusCode::CREATED);
+    }
+
+    /// The ids in a `GET /v1/videos` answer.
+    async fn listed_ids(gw: &Gateway, secret: &str) -> Vec<String> {
+        let resp = gw.get(secret, "/v1/videos").await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        json_of(resp).await["data"]
+            .as_array()
+            .expect("list data")
+            .iter()
+            .map(|v| v["id"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn another_key_of_the_same_tenant_cannot_see_the_job_under_key_scope() {
+        let Some(gw) = gateway().await else { return };
+        let (backend, base) = spawn_backend("k").await;
+        gw.register(video_route("video-model", &base)).await;
+        let (alice, alice_key) = gw.tenant(None).await;
+        let (bob, bob_key) = gw.second_key(&alice_key).await;
+        assert_eq!(alice_key.tenant_id, bob_key.tenant_id);
+
+        let id = json_of(gw.create_json(&alice, "video-model", "a fox").await).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let expected = json_of(gw.get(&bob, "/v1/videos/video_nope").await).await;
+
+        // Retrieve, download and delete of Alice's job are Bob's 404, the
+        // same answer as an unknown id.
+        for uri in [
+            format!("/v1/videos/{id}"),
+            format!("/v1/videos/{id}/content"),
+        ] {
+            let resp = gw.get(&bob, &uri).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(json_of(resp).await, expected, "{uri}");
+        }
+        let resp = gw.delete(&bob, &format!("/v1/videos/{id}")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_of(resp).await, expected);
+
+        // Bob's list leaves it out, and with no jobs of his own it asks the
+        // backend nothing.
+        assert!(listed_ids(&gw, &bob).await.is_empty());
+        assert!(
+            backend.calls.lock().unwrap().is_empty(),
+            "none of Bob's calls reached the backend"
+        );
+
+        // Alice's job and record are intact, and she still reaches both.
+        assert!(gw
+            .store
+            .get_video_job(
+                &id,
+                VideoJobOwner::key(alice_key.tenant_id, alice_key.key_id)
+            )
+            .await
+            .unwrap()
+            .is_some());
+        assert_eq!(
+            gw.get(&alice, &format!("/v1/videos/{id}")).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(listed_ids(&gw, &alice).await, vec![id.clone()]);
+
+        // Bob's own job is his alone: each lists only their own.
+        let his = json_of(gw.create_json(&bob, "video-model", "an owl").await).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(listed_ids(&gw, &bob).await, vec![his.clone()]);
+        assert_eq!(listed_ids(&gw, &alice).await, vec![id.clone()]);
+        assert_eq!(
+            gw.get(&alice, &format!("/v1/videos/{his}")).await.status(),
+            StatusCode::NOT_FOUND
+        );
+
+        // Only the owner's delete goes through.
+        let resp = gw.delete(&alice, &format!("/v1/videos/{id}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(!backend.jobs.lock().unwrap().contains_key(&id));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_tenant_scope_every_key_of_the_tenant_follows_the_job_and_no_other_tenant() {
+        let Some(gw) = gateway_with(VideoJobScope::Tenant).await else {
+            return;
+        };
+        let (backend, base) = spawn_backend("t").await;
+        gw.register(video_route("video-model", &base)).await;
+        let (alice, alice_key) = gw.tenant(None).await;
+        let (bob, _) = gw.second_key(&alice_key).await;
+        let (outsider, _) = gw.tenant(None).await;
+
+        let id = json_of(gw.create_json(&alice, "video-model", "a fox").await).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let expected = json_of(gw.get(&outsider, "/v1/videos/video_nope").await).await;
+
+        // Another tenant is still refused, without a backend call.
+        for uri in [
+            format!("/v1/videos/{id}"),
+            format!("/v1/videos/{id}/content"),
+        ] {
+            let resp = gw.get(&outsider, &uri).await;
+            assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{uri}");
+            assert_eq!(json_of(resp).await, expected, "{uri}");
+        }
+        let resp = gw.delete(&outsider, &format!("/v1/videos/{id}")).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(listed_ids(&gw, &outsider).await.is_empty());
+        assert!(backend.calls.lock().unwrap().is_empty());
+
+        // Bob, another key of Alice's tenant, polls, downloads, lists and
+        // deletes it.
+        let resp = gw.get(&bob, &format!("/v1/videos/{id}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(json_of(resp).await["id"], id.as_str());
+        assert_eq!(
+            gw.get(&bob, &format!("/v1/videos/{id}/content"))
+                .await
+                .status(),
+            StatusCode::CONFLICT,
+            "the backend's not-ready answer, so the call reached it"
+        );
+        assert_eq!(listed_ids(&gw, &bob).await, vec![id.clone()]);
+        let resp = gw.delete(&bob, &format!("/v1/videos/{id}")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(gw
+            .store
+            .get_video_job(&id, VideoJobOwner::tenant(alice_key.tenant_id))
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            gw.get(&alice, &format!("/v1/videos/{id}")).await.status(),
+            StatusCode::NOT_FOUND
+        );
     }
 }

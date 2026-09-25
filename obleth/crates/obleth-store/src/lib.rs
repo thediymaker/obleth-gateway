@@ -25,7 +25,7 @@ mod video_jobs;
 pub use backup::BACKUP_KEY_SENTINEL;
 pub use crypto::{Cipher, CryptoError};
 pub use models_io::{ModelImportOutcome, ModelImportWrite};
-pub use video_jobs::VideoJob;
+pub use video_jobs::{VideoJob, VideoJobOwner};
 
 /// Process-wide cipher for upstream secret columns, initialized once from the
 /// environment. Kept global so the row-mapping helpers can transparently
@@ -97,6 +97,7 @@ const SCHEMA_V27: &str = include_str!("../../../../schema/postgres/0027_model_co
 const SCHEMA_V28: &str = include_str!("../../../../schema/postgres/0028_video_jobs.sql");
 const SCHEMA_V29: &str =
     include_str!("../../../../schema/postgres/0029_model_capacity_discovery.sql");
+const SCHEMA_V30: &str = include_str!("../../../../schema/postgres/0030_video_jobs_key_index.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -242,6 +243,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V27).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V28).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V29).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V30).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
