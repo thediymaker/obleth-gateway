@@ -33,7 +33,7 @@ obleth:
   globalMaxInFlight: 256
   adminToken: ""        # REQUIRED
   encryptionKey: ""     # recommended — base64 of 32 bytes
-  upstreamBaseUrl: "https://my-vllm-or-aibrix-endpoint/v1"
+  upstreamBaseUrl: "https://my-inference-endpoint/v1"
   # If you run external datastores at private/LAN addresses AND enable strict
   # SSRF (OBLETH_BLOCK_PRIVATE_NETWORKS=1), allow your network here.
   allowedPrivateCidrs: ""

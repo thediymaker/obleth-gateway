@@ -361,10 +361,8 @@ mod tests {
     }
 
     /// The exact strings the brain is sent, pinned so they cannot drift away
-    /// from the training-time renderer that reproduces them — currently
-    /// `distill/tasks/router_intent.py` in the rc-k8s-gaudi repository, which
-    /// carries these same literals. A distilled classifier is trained on
-    /// these bytes; changing one here without regenerating its training data
+    /// from the training-time renderer that reproduces them, which carries
+    /// these same literals. A distilled classifier is trained on these bytes; changing one here without regenerating its training data
     /// silently degrades the deployed model, so this test is a deliberate
     /// cross-repository tripwire, not a tautology. Update both together.
     #[test]

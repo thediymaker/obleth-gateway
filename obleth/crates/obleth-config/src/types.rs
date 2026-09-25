@@ -327,7 +327,7 @@ impl Admission {
 }
 
 /// Registered model route. Client-facing `model_name` maps to an upstream
-/// OpenAI-compatible endpoint (Aibrix envoy, vLLM service, or external API).
+/// OpenAI-compatible endpoint (an inference gateway, a model server, or an external API).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelRoute {
     pub id: Uuid,
@@ -1446,13 +1446,12 @@ pub fn normalize_endpoint_selection_mode(mode: &str) -> String {
 /// Both spellings of an already-built model-catalog URL, canonical first:
 /// `…/models`, then `…/models/`.
 ///
-/// The canonical spelling has no trailing slash, but AIBrix's metadata service
-/// mounts its list at `/v1/models/` and builds FastAPI with `redirect_slashes`
-/// off, so the canonical path 404s there with no redirect to follow. A caller
-/// that stops at the first 404 silently loses every model behind such a
-/// gateway — which made obleth's own `/v1/models` advertise 6 of 45 routes,
-/// and separately made model health report an unreachable catalog. The rule
-/// lives here so a third caller cannot miss it.
+/// The canonical spelling has no trailing slash, but some gateways mount
+/// their list only at `/v1/models/` with trailing-slash redirects off, so the
+/// canonical path 404s there with no redirect to follow. A caller that stops
+/// at the first 404 silently loses every model behind such a gateway, and
+/// model health reports an unreachable catalog. The rule lives here so a
+/// third caller cannot miss it.
 pub fn catalog_url_variants(models_url: &str) -> [String; 2] {
     let trimmed = models_url.trim_end_matches('/');
     [trimmed.to_string(), format!("{trimmed}/")]
@@ -3456,7 +3455,7 @@ mod tests {
         let active = EnergySettings {
             enabled: true,
             prometheus_url: "http://prom:9090".into(),
-            power_query: "habana_device_power_watts".into(),
+            power_query: "node_power_watts".into(),
             ..Default::default()
         };
         assert!(active.active());

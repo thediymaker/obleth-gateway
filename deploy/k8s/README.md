@@ -400,7 +400,7 @@ curl -s -X POST http://localhost:9180/api/v1/models \
   -d '{
     "model_name": "my-model",
     "upstream_model": "meta-llama/Llama-3-8b-instruct",
-    "api_base": "http://aibrix-gateway.aibrix.svc.cluster.local:8080/v1",
+    "api_base": "http://my-inference-gateway.inference.svc.cluster.local:8080/v1",
     "enabled": true
   }'
 ```
@@ -408,7 +408,7 @@ curl -s -X POST http://localhost:9180/api/v1/models \
 | Field | Rule |
 | --- | --- |
 | `api_base` | Provider **base** URL ending in `/v1`, not a full endpoint path |
-| `upstream_model` | Bare model id sent to the upstream (as vLLM/Aibrix expect it) |
+| `upstream_model` | Bare model id sent to the upstream (as the inference server expects it) |
 | `model_name` | Client-facing alias; what callers pass as `"model"` |
 
 You can also import models from the control-plane dashboard (Models → Import).

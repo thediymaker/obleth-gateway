@@ -24,16 +24,15 @@ obleth:
     # serve requests. A generic example:
     defaultSelector: "app.kubernetes.io/name={upstream_model}"
 
-    # Examples for common stacks (use one, adjust to your labels):
+    # Examples (use one, adjust to your labels):
     #
-    # AIBrix labels every pod of a model deployment with the served model
-    # name:
-    #   defaultSelector: "model.aibrix.ai/name={upstream_model}"
+    # Pods labelled with the standard app name set to the served model:
+    #   defaultSelector: "app.kubernetes.io/name={upstream_model}"
     #
-    # KubeRay (multi-node serving): only head pods serve; worker pods hold
-    # GPUs but take no requests. `!=` also matches pods without the label, so
-    # this counts single-pod deployments and Ray heads alike:
-    #   defaultSelector: "model.aibrix.ai/name={upstream_model},ray.io/node-type!=worker"
+    # Multi-node serving on KubeRay: only head pods serve; worker pods hold
+    # accelerators but take no requests. `!=` also matches pods without the
+    # label, so this counts single-pod deployments and Ray heads alike:
+    #   defaultSelector: "app.kubernetes.io/name={upstream_model},ray.io/node-type!=worker"
     #
     # A plain Deployment per model, labelled by the gateway's model name:
     #   defaultSelector: "app={model_name}"

@@ -9146,7 +9146,7 @@ mod tests {
         let s = obleth_config::EnergySettings {
             enabled: true,
             prometheus_url: "http://prom:9090".into(),
-            power_query: "habana_device_power_watts".into(),
+            power_query: "node_power_watts".into(),
             poll_interval_secs: 30,
             energy_cost_per_kwh: 0.12,
             carbon_g_per_kwh: 400.0,

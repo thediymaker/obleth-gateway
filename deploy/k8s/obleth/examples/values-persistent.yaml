@@ -32,7 +32,7 @@ obleth:
   encryptionKey: ""     # recommended — base64 of 32 bytes
   # Point at your real inference upstream; leave benchmarkBackend enabled only
   # for demos.
-  upstreamBaseUrl: "http://aibrix-gateway.aibrix.svc.cluster.local:8080/v1"
+  upstreamBaseUrl: "http://my-inference-gateway.inference.svc.cluster.local:8080/v1"
 
 postgres:
   enabled: true

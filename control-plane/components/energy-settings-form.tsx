@@ -128,7 +128,7 @@ export function EnergySettingsForm({
             onChange={(e) => setPowerQuery(e.target.value)}
             rows={3}
             className="flex w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-            placeholder="habana_gaudi_module_power_watts"
+            placeholder="sum by (instance) (node_power_watts)"
           />
           <p className="text-xs text-muted-foreground">
             PromQL returning one power series (watts) per node — obleth uses

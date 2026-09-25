@@ -46,8 +46,8 @@ export default async function ModelsPage() {
       <div>
         <h1 className="text-lg font-semibold tracking-tight">Models</h1>
         <p className="text-sm text-muted-foreground">
-          Route client model names to upstream inference endpoints. Pod
-          selection remains with Aibrix.
+          Route client model names to upstream inference endpoints. Replica
+          selection stays with your inference backend.
         </p>
       </div>
       <ModelManager

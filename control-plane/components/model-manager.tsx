@@ -1064,7 +1064,7 @@ function CreateModelWizard({
 
               <section className={cn("grid gap-4 md:grid-cols-2", step !== 2 && "hidden")}>
                 <div className="md:col-span-2">
-                  <Field label="API base URL" name="api_base" placeholder="http://envoy-aibrix-system.../v1" />
+                  <Field label="API base URL" name="api_base" placeholder="http://my-inference-server:8000/v1" />
                 </div>
                 <Field label="Upstream API key (optional)" name="api_key" placeholder="sk_..." />
                 <div className="md:col-span-2">

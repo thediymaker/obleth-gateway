@@ -19,7 +19,7 @@ pub struct Config {
     /// Prometheus metrics listener.
     pub metrics_listen: String,
 
-    /// Upstream base URL (Aibrix gateway, or the benchmark fixture backend in dev).
+    /// Upstream base URL (an inference server or gateway, or the benchmark fixture backend in dev).
     pub upstream_base_url: String,
     /// Upstream request timeout.
     pub upstream_timeout: Duration,

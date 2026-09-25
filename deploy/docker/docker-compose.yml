@@ -129,7 +129,7 @@ services:
       OBLETH_CLICKHOUSE_USER: ${CLICKHOUSE_USER:-obleth}
       OBLETH_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?set CLICKHOUSE_PASSWORD in deploy/docker/.env}
       # Upstream LLM endpoint. Defaults to the benchmark fixture backend for dev/demo
-      # stack; point this at a real vLLM/Aibrix endpoint in production (and run
+      # stack; point this at a real OpenAI-compatible endpoint in production (and run
       # without the `benchmark` profile).
       OBLETH_UPSTREAM_BASE_URL: ${OBLETH_UPSTREAM_BASE_URL:-http://benchmark-backend:8081}
       OBLETH_ADMIN_TOKEN: ${OBLETH_ADMIN_TOKEN:?set OBLETH_ADMIN_TOKEN in deploy/docker/.env (copy from .env.example)}

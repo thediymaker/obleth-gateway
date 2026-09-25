@@ -66,7 +66,7 @@ obleth:
   # All credentials come from the pre-created Secret above; no secret values are
   # set inline. The Secret MUST contain every key listed in step 1.
   existingSecret: obleth-secrets
-  upstreamBaseUrl: "https://my-vllm-or-aibrix-endpoint/v1"
+  upstreamBaseUrl: "https://my-inference-endpoint/v1"
   # If your external datastores sit on private/LAN addresses AND you enable
   # strict SSRF (OBLETH_BLOCK_PRIVATE_NETWORKS=1), allow those ranges here.
   allowedPrivateCidrs: ""
