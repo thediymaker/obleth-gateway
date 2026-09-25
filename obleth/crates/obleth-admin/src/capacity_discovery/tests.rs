@@ -324,9 +324,10 @@ fn endpoints_are_deduplicated_and_judged_by_their_conditions() {
             // Serving false: not counted even if marked ready.
             {"addresses": ["10.0.0.2"], "conditions": {"ready": true, "serving": false},
              "targetRef": {"uid": "b"}},
-            // No conditions at all: not counted, but listed.
+            // No conditions at all: an unknown state, which the API says to
+            // read as ready.
             {"addresses": ["10.0.0.3"], "targetRef": {"uid": "c"}},
-            // Missing `ready`: not counted.
+            // Missing `ready`: read as ready.
             {"addresses": ["10.0.0.4"], "conditions": {"serving": true},
              "targetRef": {"uid": "d"}},
             // No targetRef: keyed by address.
@@ -348,7 +349,7 @@ fn endpoints_are_deduplicated_and_judged_by_their_conditions() {
     .expect("slices");
     assert_eq!(
         count_endpoints(&slices),
-        EndpointCount { total: 5, ready: 2 }
+        EndpointCount { total: 5, ready: 4 }
     );
     assert_eq!(count_endpoints(&[]), EndpointCount::default());
 }

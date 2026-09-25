@@ -262,15 +262,15 @@ where
 }
 
 impl Endpoint {
-    /// Counted as a serving replica: `ready` is explicitly true, `serving`
-    /// is not false (a missing `serving`, from an older or hand-written
-    /// slice, defers to `ready`), and `terminating` is not true (a draining
-    /// pod can stay serving through its grace period, but takes no new
-    /// requests). A missing `ready` is not counted: capacity is only
-    /// claimed for an endpoint the Service says is ready.
+    /// Counted as a serving replica: `ready` is not false, `serving` is not
+    /// false (a missing `serving`, from an older or hand-written slice,
+    /// defers to `ready`), and `terminating` is not true (a draining pod can
+    /// stay serving through its grace period, but takes no new requests). A
+    /// missing `ready` counts as ready, as the EndpointSlice API specifies
+    /// for an unknown state.
     pub fn is_serving(&self) -> bool {
         let c = &self.conditions;
-        c.ready == Some(true) && c.serving != Some(false) && c.terminating != Some(true)
+        c.ready != Some(false) && c.serving != Some(false) && c.terminating != Some(true)
     }
 
     /// What identifies the backend behind the endpoint across slices: the
