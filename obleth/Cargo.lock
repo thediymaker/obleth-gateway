@@ -1711,6 +1711,7 @@ name = "obleth-fairshare"
 version = "1.2.0"
 dependencies = [
  "obleth-config",
+ "rand 0.8.8",
  "serde",
  "tokio",
  "tracing",
@@ -1786,6 +1787,7 @@ version = "1.2.0"
 dependencies = [
  "futures-util",
  "obleth-config",
+ "obleth-fairshare",
  "redis",
  "serde",
  "serde_json",

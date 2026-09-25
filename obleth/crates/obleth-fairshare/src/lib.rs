@@ -11,24 +11,38 @@
 //! [`CapacityProvider`] is a total in-flight ceiling across all pools, not a
 //! fairness input; when it binds, pools are served round-robin.
 //!
-//! # Replicas
+//! # Replicas and shared slots
 //! Every configured limit that states cluster-wide intent (pool sizes, the
-//! global ceiling, per-tenant and per-key `max_in_flight`) is enforced as this
-//! process's share of it, [`replica_share`] of the live replica count set with
-//! [`FairShare::set_replicas`] (1 until told otherwise). Weights are ratios and
-//! are never divided. Fairness is still decided per replica, on its share, so
-//! the fleet matches the configured numbers only as well as the load balancer
-//! spreads requests. A resize never touches in-flight requests: shrinking just
-//! stops admitting until occupancy falls under the new size, growing
-//! dispatches waiters straight away.
+//! global ceiling, per-tenant and per-key `max_in_flight`) is meant for the
+//! whole fleet of gateway replicas. How a replica holds to that depends on
+//! its [`SlotMode`]:
+//!
+//! - **shared**: with a [`SharedSlots`] backend set by
+//!   [`FairShare::enable_shared_slots`] and more than one live replica, every
+//!   admission also takes a cluster-wide slot from the backend, checked
+//!   against the configured pool size, global ceiling and tenant and key caps
+//!   together (see [`shared`]). Any replica can use a model's whole pool; the
+//!   fleet never exceeds it. Local limits are the configured values.
+//! - **split** / **fallback**: each replica enforces [`replica_share`] of
+//!   every limit for the live replica count set with
+//!   [`FairShare::set_replicas`]: the behaviour with shared slots off, and
+//!   the fallback while the backend is unavailable.
+//! - **local**: one live replica (or no division configured) enforces the
+//!   configured values itself, with no backend call on the request path.
+//!
+//! Weights are ratios and are never divided, and fairness (which waiter goes
+//! next) is always decided per replica. A resize never touches in-flight
+//! requests: shrinking just stops admitting until occupancy falls under the
+//! new size, growing dispatches waiters straight away.
 //!
 //! # Model caps set from outside
 //! A model's pool size normally arrives with each admission (the route's
 //! `max_in_flight`). [`FairShare::set_model_caps`] overrides it for named
 //! models with a configured (cluster-wide) value derived elsewhere, such as
 //! the live backend capacity a `discovered` model follows. An override is
-//! still a configured value: it is divided across the replicas like any other,
-//! and a change resizes the pool the same way a replica-count change does.
+//! still a configured value: it is the cluster-wide pool size in shared mode
+//! and is divided across the replicas in split mode like any other, and a
+//! change resizes the pool the same way a replica-count change does.
 //!
 //! Requests with no resolved route share one [`PoolKey::Unrouted`] pool. A
 //! pool with no permits and no waiters for [`IDLE_POOL_TTL`] is dropped by the
@@ -39,6 +53,7 @@ mod algorithm;
 mod capacity;
 pub mod history;
 mod replicas;
+pub mod shared;
 
 pub use algorithm::{group_slot_caps, weighted_caps};
 pub use capacity::{CapacityProvider, StaticCapacity};
@@ -47,10 +62,15 @@ pub use history::{
     FAIRSHARE_HISTORY_INTERVAL_MS,
 };
 pub use replicas::{replica_share, ReplicaTracker};
+pub use shared::{
+    AcquireOutcome, ClusterCounts, InMemoryCluster, InMemorySlots, PoolHoldings, ReconcileOutcome,
+    SharedSlots, SharedSlotsConfig, SlotClaim, SlotDenial, SlotError, SlotFuture, SlotMode,
+    SlotRelease,
+};
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicI64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use obleth_config::{Admission, FairshareAlgorithm};
@@ -90,15 +110,44 @@ impl PoolKey {
             PoolKey::Unrouted => UNROUTED_POOL,
         }
     }
+
+    /// The pool's id in the shared slot backend, the same on every replica:
+    /// `m:` and the model name, or `u` for the unrouted pool.
+    pub fn slot_id(&self) -> String {
+        match self {
+            PoolKey::Model(name) => format!("m:{name}"),
+            PoolKey::Unrouted => "u".into(),
+        }
+    }
+
+    /// The inverse of [`PoolKey::slot_id`].
+    pub fn from_slot_id(id: &str) -> Option<Self> {
+        match id {
+            "u" => Some(PoolKey::Unrouted),
+            _ => id.strip_prefix("m:").map(|m| PoolKey::Model(m.to_string())),
+        }
+    }
 }
 
 /// Live counters for metrics/dashboards.
 #[derive(Debug, Default)]
 pub struct Stats {
+    /// This replica's in-flight requests.
     pub in_flight: AtomicUsize,
     pub queued: AtomicI64,
-    /// Live gateway replicas the configured limits are divided across.
+    /// Live gateway replicas.
     pub replicas: AtomicUsize,
+    mode: AtomicU8,
+    /// Cluster-wide in-flight requests as last reported by the shared slot
+    /// backend. Meaningful only in [`SlotMode::Shared`].
+    pub cluster_in_flight: AtomicUsize,
+}
+
+impl Stats {
+    /// How this replica is enforcing the configured limits.
+    pub fn mode(&self) -> SlotMode {
+        SlotMode::from_u8(self.mode.load(Ordering::Relaxed))
+    }
 }
 
 /// Per-group scheduler view for dashboards.
@@ -126,8 +175,9 @@ pub struct TenantFairshare {
     pub tenant_id: Uuid,
     pub fairshare_group: String,
     pub weight: i64,
-    /// Per-model in-flight ceiling for this tenant, when one is set: this
-    /// replica's share of the configured value.
+    /// Per-model in-flight ceiling for this tenant, when one is set, as this
+    /// replica enforces it: the configured value, cluster-wide, in shared and
+    /// local mode, its share of it in split mode.
     #[serde(default)]
     pub max_in_flight: Option<usize>,
     pub in_flight: usize,
@@ -143,7 +193,8 @@ pub struct KeyFairshare {
     pub key_id: Uuid,
     pub tenant_id: Uuid,
     pub weight: i64,
-    /// This replica's share of the key's configured per-model cap.
+    /// The key's per-model cap as this replica enforces it (see
+    /// [`TenantFairshare::max_in_flight`]).
     #[serde(default)]
     pub max_in_flight: Option<usize>,
     pub in_flight: usize,
@@ -159,13 +210,20 @@ pub struct KeyFairshare {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelPoolFairshare {
     pub model: String,
-    /// Slots this replica enforces: its share of `configured_cap`.
+    /// Slots this replica enforces: `configured_cap` in shared and local
+    /// mode, its share of it in split mode.
     pub cap: usize,
-    /// The pool size as configured (the model's `max_in_flight` or the
-    /// gateway default), before it is divided across replicas.
+    /// The pool size as configured (the model's `max_in_flight`, its
+    /// discovered size, or the gateway default): the cluster-wide size.
     #[serde(default)]
     pub configured_cap: usize,
+    /// This replica's in-flight requests in the pool.
     pub in_flight: usize,
+    /// Cluster-wide in-flight requests in the pool as last reported by the
+    /// shared slot backend; `None` outside shared mode or before this
+    /// replica has heard.
+    #[serde(default)]
+    pub cluster_in_flight: Option<usize>,
     pub queued: usize,
     pub borrowed: usize,
     pub groups: Vec<GroupFairshare>,
@@ -178,15 +236,28 @@ pub struct ModelPoolFairshare {
 pub struct FairshareSnapshot {
     pub algorithm: String,
     /// Total in-flight ceiling across all pools, as this replica enforces it:
-    /// its share of `configured_max_in_flight`.
+    /// `configured_max_in_flight` in shared and local mode, its share of it
+    /// in split mode.
     pub max_in_flight: usize,
-    /// The ceiling as configured, before it is divided across replicas.
+    /// The ceiling as configured: the cluster-wide value.
     #[serde(default)]
     pub configured_max_in_flight: usize,
-    /// Live gateway replicas the configured limits are divided across.
+    /// Live gateway replicas.
     #[serde(default = "one")]
     pub replicas: usize,
-    /// Configured default pool size, before it is divided across replicas.
+    /// How this replica is enforcing the configured limits: `local`,
+    /// `split`, `shared` or `fallback` (see [`SlotMode`]).
+    #[serde(default = "local_mode")]
+    pub mode: String,
+    /// Whether shared slots are configured on this replica, whatever the
+    /// current mode.
+    #[serde(default)]
+    pub shared_slots: bool,
+    /// Cluster-wide in-flight requests across every pool as last reported by
+    /// the shared slot backend; `None` outside shared mode.
+    #[serde(default)]
+    pub cluster_in_flight: Option<usize>,
+    /// Configured default pool size.
     pub default_model_max_in_flight: usize,
     pub global_in_flight: usize,
     pub global_queued: usize,
@@ -203,6 +274,11 @@ pub struct FairshareSnapshot {
 /// Serde default for [`FairshareSnapshot::replicas`].
 fn one() -> usize {
     1
+}
+
+/// Serde default for [`FairshareSnapshot::mode`].
+fn local_mode() -> String {
+    SlotMode::Local.as_str().into()
 }
 
 /// Context passed to the scheduler for a single admission attempt.
@@ -329,6 +405,24 @@ enum Ctl {
     },
     SetReplicas(usize),
     SetModelCaps(HashMap<String, usize>),
+    EnableShared {
+        backend: Arc<dyn SharedSlots>,
+        config: SharedSlotsConfig,
+    },
+    /// A slot may have been freed in this pool (`None`: anywhere).
+    Wake(Option<PoolKey>),
+    AcquireDone {
+        pool: PoolKey,
+        id: u64,
+        result: Result<(AcquireOutcome, ClusterCounts), SlotError>,
+    },
+    ReleaseDone {
+        pool: PoolKey,
+        result: Result<ClusterCounts, SlotError>,
+    },
+    ReconcileDone {
+        result: Result<ReconcileOutcome, SlotError>,
+    },
 }
 
 /// Handle to the fairshare scheduler. Cheap to clone.
@@ -337,6 +431,7 @@ pub struct FairShare {
     ctl: mpsc::UnboundedSender<Ctl>,
     stats: Arc<Stats>,
     model_load: Arc<RwLock<HashMap<String, usize>>>,
+    shared: Arc<OnceLock<Arc<dyn SharedSlots>>>,
 }
 
 impl FairShare {
@@ -369,6 +464,10 @@ impl FairShare {
             capacity,
             default_model_cap: default_model_max_in_flight.max(1),
             replicas: 1,
+            divisor: 1,
+            mode: SlotMode::Local,
+            shared: None,
+            next_op_id: 0,
             model_caps: HashMap::new(),
             pools: HashMap::new(),
             pool_order: Vec::new(),
@@ -385,6 +484,7 @@ impl FairShare {
             ctl,
             stats,
             model_load,
+            shared: Arc::new(OnceLock::new()),
         }
     }
 
@@ -401,17 +501,60 @@ impl FairShare {
             .unwrap_or_default()
     }
 
-    /// Size every limit for `replicas` live gateway replicas (see the crate
-    /// docs). Takes effect for the next admission decision; in-flight
-    /// requests are never cut short. 0 is read as 1.
+    /// Tell the scheduler how many gateway replicas are live (see the crate
+    /// docs): with shared slots on, more than one means admissions go
+    /// through the shared backend; otherwise, and in fallback, the limits
+    /// are divided by it. Takes effect for the next admission decision;
+    /// in-flight requests are never cut short. 0 is read as 1.
     pub fn set_replicas(&self, replicas: usize) {
         let _ = self.ctl.send(Ctl::SetReplicas(replicas.max(1)));
     }
 
+    /// Enforce the configured limits cluster-wide through `backend` whenever
+    /// more than one replica is live (see [`shared`]). Call once, before
+    /// traffic; later calls are ignored. The scheduler reconciles its
+    /// holdings with the backend before it first admits through it.
+    pub fn enable_shared_slots(&self, backend: Arc<dyn SharedSlots>, config: SharedSlotsConfig) {
+        if self.shared.set(backend.clone()).is_err() {
+            return;
+        }
+        let _ = self.ctl.send(Ctl::EnableShared { backend, config });
+    }
+
+    /// A slot may have been freed in the pool with this
+    /// [`PoolKey::slot_id`], on any replica: if this replica has waiters
+    /// refused a slot there, it retries once now. Unknown ids are ignored.
+    pub fn wake(&self, slot_id: &str) {
+        if let Some(pool) = PoolKey::from_slot_id(slot_id) {
+            let _ = self.ctl.send(Ctl::Wake(Some(pool)));
+        }
+    }
+
+    /// Like [`FairShare::wake`] for every pool, e.g. after wakeups may have
+    /// been missed.
+    pub fn wake_all(&self) {
+        let _ = self.ctl.send(Ctl::Wake(None));
+    }
+
+    /// Cluster-wide in-flight requests read from the shared backend: every
+    /// pool together, then each of `pools`. `None` unless this replica is in
+    /// shared mode and the backend answers.
+    pub async fn cluster_in_flight(&self, pools: &[PoolKey]) -> Option<(usize, Vec<usize>)> {
+        if self.stats.mode() != SlotMode::Shared {
+            return None;
+        }
+        let backend = self.shared.get()?;
+        let ids = pools.iter().map(PoolKey::slot_id).collect();
+        match tokio::time::timeout(Duration::from_secs(1), backend.totals(ids)).await {
+            Ok(Ok(totals)) => Some(totals),
+            _ => None,
+        }
+    }
+
     /// Replace the per-model pool-size overrides: each named model's pool is
-    /// sized by its value (a configured, cluster-wide number, so still divided
-    /// across replicas) instead of the cap its admissions carry. A model left
-    /// out goes back to its admissions' cap from its next admission on.
+    /// sized by its value (a configured, cluster-wide number) instead of the
+    /// cap its admissions carry. A model left out goes back to its
+    /// admissions' cap from its next admission on.
     /// Resizes like [`FairShare::set_replicas`]: in-flight requests are never
     /// cut short, and growth dispatches waiters at once. 0 is read as 1.
     pub fn set_model_caps(&self, caps: HashMap<String, usize>) {
@@ -468,7 +611,18 @@ struct Waiter {
     key_max_in_flight: Option<usize>,
     cost: u32,
     enqueued: Instant,
+    /// The local fast path would have admitted it on arrival; in shared mode
+    /// it is still reported as fast if its first claim succeeds.
+    fast: bool,
     respond: oneshot::Sender<Admitted>,
+}
+
+/// A waiter whose cluster-wide slot claim is outstanding. It already holds
+/// its local slot, so local limits count it.
+struct PendingClaim {
+    tenant: Uuid,
+    key: Uuid,
+    waiter: Waiter,
 }
 
 /// A tenant's backlog, split per key so the key level can pick fairly.
@@ -485,6 +639,17 @@ impl TenantQueue {
 
     fn push(&mut self, key: Uuid, waiter: Waiter) {
         self.keys.entry(key).or_default().push_back(waiter);
+        self.len += 1;
+    }
+
+    /// Put a waiter back in arrival order, e.g. after its claim was refused.
+    fn reinsert(&mut self, key: Uuid, waiter: Waiter) {
+        let queue = self.keys.entry(key).or_default();
+        let at = queue
+            .iter()
+            .position(|w| w.enqueued > waiter.enqueued)
+            .unwrap_or(queue.len());
+        queue.insert(at, waiter);
         self.len += 1;
     }
 
@@ -512,11 +677,12 @@ struct Pool {
     key: PoolKey,
     model: String,
     algorithm: FairshareAlgorithm,
-    /// Slots enforced here: `replica_share(configured_cap, replicas)`.
+    /// Slots enforced here: `replica_share(configured_cap, divisor)`.
     cap: usize,
     configured_cap: usize,
-    /// Live replica count the configured limits are divided by.
-    replicas: usize,
+    /// What the configured limits are divided by: the live replica count in
+    /// split mode, 1 otherwise.
+    divisor: usize,
     in_flight: usize,
     queued_total: usize,
     tenant_in_flight: HashMap<Uuid, usize>,
@@ -541,6 +707,18 @@ struct Pool {
     /// When the pool last became idle (no permits, no waiters); `None` while
     /// it is in use.
     idle_since: Option<Instant>,
+    /// Shared mode: claims outstanding with the backend, by id.
+    pending: HashMap<u64, PendingClaim>,
+    /// Shared mode: a claim was refused, so send one at a time until one
+    /// succeeds.
+    probing: bool,
+    /// Shared mode: the pool is full cluster-wide; wait for a wakeup.
+    blocked: bool,
+    /// Shared mode: tenants and keys at their cluster-wide cap here.
+    blocked_tenants: HashSet<Uuid>,
+    blocked_keys: HashSet<Uuid>,
+    /// Shared mode: the pool's cluster-wide occupancy as last reported.
+    cluster_in_flight: Option<usize>,
     ctl_tx: mpsc::UnboundedSender<Ctl>,
 }
 
@@ -557,7 +735,7 @@ impl Pool {
             algorithm,
             cap: cap.max(1),
             configured_cap: cap.max(1),
-            replicas: 1,
+            divisor: 1,
             in_flight: 0,
             queued_total: 0,
             tenant_in_flight: HashMap::new(),
@@ -575,34 +753,46 @@ impl Pool {
             key_tenant: HashMap::new(),
             virtual_time: 0.0,
             idle_since: None,
+            pending: HashMap::new(),
+            probing: false,
+            blocked: false,
+            blocked_tenants: HashSet::new(),
+            blocked_keys: HashSet::new(),
+            cluster_in_flight: None,
             ctl_tx,
         }
     }
 
-    /// Set the configured pool size; the enforced cap follows as this
-    /// replica's share of it.
+    /// Set the configured pool size; the enforced cap follows from it.
     fn set_configured_cap(&mut self, configured: usize) {
         self.configured_cap = configured.max(1);
-        self.cap = replica_share(self.configured_cap, self.replicas);
+        self.cap = replica_share(self.configured_cap, self.divisor);
     }
 
-    fn set_replicas(&mut self, replicas: usize) {
-        self.replicas = replicas.max(1);
-        self.cap = replica_share(self.configured_cap, self.replicas);
+    fn set_divisor(&mut self, divisor: usize) {
+        self.divisor = divisor.max(1);
+        self.cap = replica_share(self.configured_cap, self.divisor);
     }
 
     /// The tenant's enforced cap in this pool, if it has one.
     fn tenant_limit(&self, tenant: &Uuid) -> Option<usize> {
         self.tenant_cap
             .get(tenant)
-            .map(|cap| replica_share(*cap, self.replicas))
+            .map(|cap| replica_share(*cap, self.divisor))
     }
 
     /// The key's enforced cap in this pool, if it has one.
     fn key_limit(&self, key: &Uuid) -> Option<usize> {
         self.key_cap
             .get(key)
-            .map(|cap| replica_share(*cap, self.replicas))
+            .map(|cap| replica_share(*cap, self.divisor))
+    }
+
+    /// Forget every cluster-wide refusal: something may have been freed.
+    fn unblock(&mut self) {
+        self.blocked = false;
+        self.blocked_tenants.clear();
+        self.blocked_keys.clear();
     }
 
     fn track_meta(&mut self, req: &AdmitRequest) {
@@ -669,10 +859,16 @@ impl Pool {
         }
     }
 
-    /// A tenant can be picked only if it is under its own cap and at least one
-    /// of its queued keys is under its key cap.
+    /// A key can be picked if it is under its cap here and, in shared mode,
+    /// not at its cluster-wide cap.
+    fn key_open(&self, key: &Uuid) -> bool {
+        self.key_has_slot(key) && !self.blocked_keys.contains(key)
+    }
+
+    /// A tenant can be picked only if it is under its own cap (here and, in
+    /// shared mode, cluster-wide) and at least one of its queued keys is open.
     fn tenant_is_eligible(&self, tenant: &Uuid) -> bool {
-        if !self.tenant_has_slot(tenant) {
+        if !self.tenant_has_slot(tenant) || self.blocked_tenants.contains(tenant) {
             return false;
         }
         self.queues
@@ -680,7 +876,7 @@ impl Pool {
             .map(|q| {
                 q.keys
                     .iter()
-                    .any(|(k, d)| !d.is_empty() && self.key_has_slot(k))
+                    .any(|(k, d)| !d.is_empty() && self.key_open(k))
             })
             .unwrap_or(false)
     }
@@ -837,6 +1033,7 @@ impl Pool {
         req: AdmitRequest,
         respond: oneshot::Sender<Admitted>,
         enqueued: Instant,
+        fast: bool,
     ) {
         let tenant_queue_empty = self
             .queues
@@ -880,6 +1077,7 @@ impl Pool {
                 key_max_in_flight: req.key_max_in_flight,
                 cost: req.cost,
                 enqueued,
+                fast,
                 respond,
             },
         );
@@ -891,16 +1089,29 @@ impl Pool {
     /// whether a grant happened, so the scheduler can account the global
     /// ceiling, and how many dead waiters were dropped.
     fn dispatch_one(&mut self, effective: usize) -> (bool, usize) {
+        let (next, dropped) = self.take_next(effective);
+        let Some((tenant, key, waiter)) = next else {
+            return (false, dropped);
+        };
+        let waited = waiter.enqueued.elapsed();
+        self.send(tenant, key, waiter.respond, Admission::Queued, waited);
+        (true, dropped)
+    }
+
+    /// Pick the next waiter the local limits allow and give it its local
+    /// slot: dequeued, occupied and charged. Waiters whose caller has gone
+    /// are dropped on the way; the count comes back with the pick.
+    fn take_next(&mut self, effective: usize) -> (Option<(Uuid, Uuid, Waiter)>, usize) {
         let mut dropped = 0;
         loop {
             if self.in_flight >= effective || self.queued_total == 0 {
-                return (false, dropped);
+                return (None, dropped);
             }
             let Some(tenant) = self.pick_tenant(effective) else {
-                return (false, dropped);
+                return (None, dropped);
             };
             let Some(key) = self.pick_key(&tenant) else {
-                return (false, dropped);
+                return (None, dropped);
             };
             let waiter = {
                 let queue = self.queues.get_mut(&tenant).expect("picked tenant exists");
@@ -919,10 +1130,63 @@ impl Pool {
             self.track_waiter_meta(tenant, key, &waiter);
             self.occupy(tenant, key, waiter.cost);
             self.advance_virtual_time();
-            let waited = waiter.enqueued.elapsed();
-            self.send(tenant, key, waiter.respond, Admission::Queued, waited);
-            return (true, dropped);
+            return (Some((tenant, key, waiter)), dropped);
         }
+    }
+
+    /// Shared mode: undo [`Pool::take_next`] for a waiter whose claim was
+    /// refused or failed, putting it back in its place in the queue.
+    fn requeue(&mut self, claim: PendingClaim) {
+        let PendingClaim {
+            tenant,
+            key,
+            mut waiter,
+        } = claim;
+        self.in_flight = self.in_flight.saturating_sub(1);
+        for (map, id) in [
+            (&mut self.tenant_in_flight, tenant),
+            (&mut self.key_in_flight, key),
+        ] {
+            if let Some(n) = map.get_mut(&id) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    map.remove(&id);
+                }
+            }
+        }
+        if let Some(served) = self.served.get_mut(&tenant) {
+            *served -= waiter.cost as f64;
+        }
+        if let Some(served) = self.key_served.get_mut(&key) {
+            *served -= waiter.cost as f64;
+        }
+        waiter.fast = false;
+        self.queues.entry(tenant).or_default().reinsert(key, waiter);
+        self.queued_total += 1;
+    }
+
+    /// Shared mode: what this pool holds, for a reconcile. Only called with
+    /// no claim outstanding, so every local slot is a granted permit.
+    fn holdings(&self) -> Option<PoolHoldings> {
+        if self.in_flight == 0 {
+            return None;
+        }
+        Some(PoolHoldings {
+            pool: self.key.slot_id(),
+            in_flight: self.in_flight,
+            tenants: self
+                .tenant_in_flight
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(t, n)| (*t, *n))
+                .collect(),
+            keys: self
+                .key_in_flight
+                .iter()
+                .filter(|(_, n)| **n > 0)
+                .map(|(k, n)| (*k, *n))
+                .collect(),
+        })
     }
 
     /// Drop every queued waiter whose caller has gone. Returns how many.
@@ -1067,7 +1331,7 @@ impl Pool {
         let mut best: Option<(Uuid, f64, Instant)> = None;
         for (key, deque) in &queue.keys {
             let Some(head) = deque.front() else { continue };
-            if !self.key_has_slot(key) {
+            if !self.key_open(key) {
                 continue;
             }
             let weight = self.key_weight.get(key).copied().unwrap_or(1).max(1) as f64;
@@ -1431,6 +1695,7 @@ impl Pool {
             cap: self.cap,
             configured_cap: self.configured_cap,
             in_flight: self.in_flight,
+            cluster_in_flight: self.cluster_in_flight,
             queued: self.queued_total,
             borrowed: groups.iter().map(|g| g.borrowed).sum(),
             groups,
@@ -1440,12 +1705,53 @@ impl Pool {
     }
 }
 
+/// Shared-slot state of the scheduler (see [`shared`]).
+struct SharedCtl {
+    backend: Arc<dyn SharedSlots>,
+    config: SharedSlotsConfig,
+    /// A reconcile covering every local permit succeeded, and every grant
+    /// and release since went through the backend. Shared mode needs it.
+    synced: bool,
+    /// The last backend call failed; logged once until a reconcile works.
+    failing: bool,
+    /// Acquires and releases outstanding with the backend.
+    ops: usize,
+    /// A reconcile is due; in shared mode no claim is sent until it is done.
+    want_reconcile: bool,
+    reconciling: Option<Reconciling>,
+    /// Releases held back while a quiesced reconcile is outstanding: the
+    /// holdings it sent still count them.
+    deferred: Vec<SlotRelease>,
+    /// Bumped on every local grant or release the backend does not see, so
+    /// a reconcile that was not quiesced can tell whether its holdings were
+    /// still current when it landed.
+    unrecorded: u64,
+    /// The global ceiling is full cluster-wide; wait for a wakeup.
+    global_blocked: bool,
+    retry_at: Option<Instant>,
+    next_reconcile: Instant,
+    cluster_in_flight: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Reconciling {
+    /// Taken with no claim or release in flight and nothing admitted while
+    /// it runs, so its holdings are exact when it lands.
+    quiesced: bool,
+    unrecorded_at: u64,
+}
+
 struct Scheduler {
     algorithm: FairshareAlgorithm,
     capacity: Arc<dyn CapacityProvider>,
     default_model_cap: usize,
-    /// Live gateway replicas; every configured limit is divided by it.
+    /// Live gateway replicas.
     replicas: usize,
+    /// What configured limits are divided by in the current mode.
+    divisor: usize,
+    mode: SlotMode,
+    shared: Option<SharedCtl>,
+    next_op_id: u64,
     /// Configured pool sizes set with [`FairShare::set_model_caps`], which win
     /// over the cap an admission carries.
     model_caps: HashMap<String, usize>,
@@ -1468,6 +1774,7 @@ impl Scheduler {
         let mut housekeeping = tokio::time::interval(housekeeping_interval(self.idle_pool_ttl));
         housekeeping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            let deadline = self.shared_deadline();
             tokio::select! {
                 msg = rx.recv() => {
                     let Some(msg) = msg else { break };
@@ -1477,13 +1784,75 @@ impl Scheduler {
                     self.sweep();
                     self.publish_stats();
                 }
+                _ = tokio::time::sleep_until(deadline.unwrap_or_else(far_future).into()),
+                    if deadline.is_some() => {
+                    self.shared_timer();
+                }
             }
         }
     }
 
     /// The global ceiling as this replica enforces it.
     fn ceiling(&self) -> usize {
-        replica_share(self.capacity.max_in_flight(), self.replicas)
+        replica_share(self.capacity.max_in_flight(), self.divisor)
+    }
+
+    /// The mode the current state calls for (see [`SlotMode`]).
+    fn wanted_mode(&self) -> SlotMode {
+        match &self.shared {
+            None if self.replicas > 1 => SlotMode::Split,
+            None => SlotMode::Local,
+            Some(_) if self.replicas <= 1 => SlotMode::Local,
+            Some(s) if s.synced => SlotMode::Shared,
+            Some(_) => SlotMode::Fallback,
+        }
+    }
+
+    /// Move to the mode the state calls for, resizing pools when what the
+    /// limits are divided by changes. Held permits are never touched.
+    fn apply_mode(&mut self) {
+        let mode = self.wanted_mode();
+        let split = self
+            .shared
+            .as_ref()
+            .map(|s| s.config.split_on_fallback)
+            .unwrap_or(true);
+        let divisor = match mode {
+            SlotMode::Shared | SlotMode::Local => 1,
+            SlotMode::Split => self.replicas,
+            SlotMode::Fallback if split => self.replicas,
+            SlotMode::Fallback => 1,
+        };
+        if divisor != self.divisor {
+            self.divisor = divisor;
+            for pool in self.pools.values_mut() {
+                pool.set_divisor(divisor);
+            }
+        }
+        if mode != self.mode {
+            if self.mode == SlotMode::Shared {
+                // Refusals and cluster counts mean nothing outside shared mode.
+                for pool in self.pools.values_mut() {
+                    pool.unblock();
+                    pool.probing = false;
+                    pool.cluster_in_flight = None;
+                }
+                if let Some(s) = self.shared.as_mut() {
+                    s.global_blocked = false;
+                    s.retry_at = None;
+                    s.cluster_in_flight = None;
+                }
+            }
+            if self.shared.is_some() {
+                tracing::info!(
+                    from = self.mode.as_str(),
+                    to = mode.as_str(),
+                    replicas = self.replicas,
+                    "fairshare slot mode changed"
+                );
+            }
+            self.mode = mode;
+        }
     }
 
     fn handle(&mut self, msg: Ctl) {
@@ -1501,6 +1870,8 @@ impl Scheduler {
                     PoolKey::Model(name) => self.model_caps.get(name).copied(),
                     PoolKey::Unrouted => None,
                 };
+                let shared_mode = self.mode == SlotMode::Shared;
+                let quiescing = self.quiescing();
                 let pool = self.pool_mut(&key);
                 pool.set_configured_cap(match key {
                     // No route means no configured cap to honour.
@@ -1514,11 +1885,18 @@ impl Scheduler {
                 pool.idle_since = None;
                 pool.track_meta(&req);
                 let effective = pool.effective_cap(headroom);
-                if headroom > 0 && pool.can_grant_immediately(&req, effective) {
+                let fast = headroom > 0 && pool.can_grant_immediately(&req, effective);
+                if shared_mode {
+                    // Every admission takes a cluster-wide slot first.
+                    pool.enqueue(req, respond, enqueued, fast);
+                    self.queued_total += 1;
+                    self.dispatch_all();
+                } else if fast && !quiescing {
                     pool.grant_fast(req, respond);
                     self.in_flight += 1;
+                    self.note_unrecorded();
                 } else {
-                    pool.enqueue(req, respond, enqueued);
+                    pool.enqueue(req, respond, enqueued, false);
                     self.queued_total += 1;
                     self.dispatch_all();
                 }
@@ -1535,6 +1913,15 @@ impl Scheduler {
                     pool.release(tenant, key);
                     pool.settle_idle();
                 }
+                if self.mode == SlotMode::Shared || self.quiesced_reconcile_running() {
+                    self.release_shared(SlotRelease {
+                        pool: pool_key.slot_id(),
+                        tenant,
+                        key,
+                    });
+                } else {
+                    self.note_unrecorded();
+                }
                 self.publish_model_load(&pool_key);
                 self.dispatch_all();
                 self.publish_stats();
@@ -1549,10 +1936,21 @@ impl Scheduler {
                 if replicas == self.replicas {
                     return;
                 }
+                let was_multi = self.replicas > 1;
                 self.replicas = replicas;
-                for pool in self.pools.values_mut() {
-                    pool.set_replicas(replicas);
+                if let Some(s) = self.shared.as_mut() {
+                    if was_multi != (replicas > 1) {
+                        // Grants made alone were never recorded, and grants
+                        // from here on alone will not be: resync on the way
+                        // into shared mode.
+                        s.synced = false;
+                    }
+                    if replicas > 1 && !s.synced {
+                        s.want_reconcile = true;
+                    }
                 }
+                self.apply_mode();
+                self.maybe_start_reconcile();
                 // Growing frees slots for whoever is queued; shrinking finds
                 // nothing to dispatch and leaves every held permit alone.
                 self.dispatch_all();
@@ -1577,7 +1975,480 @@ impl Scheduler {
                 self.dispatch_all();
                 self.publish_stats();
             }
+            Ctl::EnableShared { backend, config } => {
+                if self.shared.is_some() {
+                    return;
+                }
+                self.shared = Some(SharedCtl {
+                    backend,
+                    config,
+                    synced: false,
+                    failing: false,
+                    ops: 0,
+                    want_reconcile: true,
+                    reconciling: None,
+                    deferred: Vec::new(),
+                    unrecorded: 0,
+                    global_blocked: false,
+                    retry_at: None,
+                    next_reconcile: Instant::now(),
+                    cluster_in_flight: None,
+                });
+                self.apply_mode();
+                self.maybe_start_reconcile();
+                self.dispatch_all();
+                self.publish_stats();
+            }
+            Ctl::Wake(pool) => {
+                if self.mode != SlotMode::Shared {
+                    return;
+                }
+                match pool {
+                    Some(key) => {
+                        if let Some(pool) = self.pools.get_mut(&key) {
+                            pool.unblock();
+                        }
+                    }
+                    None => self.unblock_all(),
+                }
+                if let Some(s) = self.shared.as_mut() {
+                    s.global_blocked = false;
+                }
+                self.dispatch_all();
+                self.publish_stats();
+            }
+            Ctl::AcquireDone { pool, id, result } => {
+                self.acquire_done(pool, id, result);
+                self.publish_stats();
+            }
+            Ctl::ReleaseDone { pool, result } => {
+                self.release_done(pool, result);
+                self.publish_stats();
+            }
+            Ctl::ReconcileDone { result } => {
+                self.reconcile_done(result);
+                self.publish_stats();
+            }
         }
+    }
+
+    // ---- shared slots -----------------------------------------------------
+
+    /// Whether admissions are held for a quiesced reconcile: one is due or
+    /// running with more than one replica live and the backend answering.
+    fn quiescing(&self) -> bool {
+        let multi = self.replicas > 1;
+        self.shared.as_ref().is_some_and(|s| {
+            (s.want_reconcile && multi && !s.failing) || s.reconciling.is_some_and(|r| r.quiesced)
+        })
+    }
+
+    fn quiesced_reconcile_running(&self) -> bool {
+        self.shared
+            .as_ref()
+            .is_some_and(|s| s.reconciling.is_some_and(|r| r.quiesced))
+    }
+
+    /// A local grant or release the backend does not see.
+    fn note_unrecorded(&mut self) {
+        if let Some(s) = self.shared.as_mut() {
+            s.unrecorded = s.unrecorded.wrapping_add(1);
+        }
+    }
+
+    fn unblock_all(&mut self) {
+        for pool in self.pools.values_mut() {
+            pool.unblock();
+        }
+        if let Some(s) = self.shared.as_mut() {
+            s.global_blocked = false;
+        }
+    }
+
+    /// When the shared-slot timer next needs to run: a refused pool's retry
+    /// or the next reconcile.
+    fn shared_deadline(&self) -> Option<Instant> {
+        let s = self.shared.as_ref()?;
+        let reconcile = (s.reconciling.is_none() && !s.want_reconcile).then_some(s.next_reconcile);
+        match (s.retry_at, reconcile) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
+    fn shared_timer(&mut self) {
+        let now = Instant::now();
+        let Some(s) = self.shared.as_mut() else {
+            return;
+        };
+        let mut retry = false;
+        if s.retry_at.is_some_and(|t| t <= now) {
+            s.retry_at = None;
+            retry = true;
+        }
+        if s.reconciling.is_none() && !s.want_reconcile && s.next_reconcile <= now {
+            s.want_reconcile = true;
+            s.next_reconcile = now + s.config.reconcile_interval;
+        }
+        if retry {
+            // Correctness never depends on a wakeup arriving: retry anyway.
+            self.unblock_all();
+        }
+        self.maybe_start_reconcile();
+        self.dispatch_all();
+        self.publish_stats();
+    }
+
+    /// Arm the jittered retry for refused pools, if it is not armed yet.
+    fn schedule_retry(&mut self) {
+        let Some(s) = self.shared.as_mut() else {
+            return;
+        };
+        if s.retry_at.is_some() {
+            return;
+        }
+        let (lo, hi) = (
+            s.config.retry_min,
+            s.config.retry_max.max(s.config.retry_min),
+        );
+        let span = (hi - lo).as_millis() as u64;
+        let jitter = if span == 0 {
+            0
+        } else {
+            rand::random::<u64>() % (span + 1)
+        };
+        s.retry_at = Some(Instant::now() + lo + Duration::from_millis(jitter));
+    }
+
+    /// Shared mode: send claims for the waiters the local order picks, round
+    /// robin across pools like [`Scheduler::dispatch_all`]. Each pool keeps at
+    /// most `max_pending_per_pool` claims outstanding, or one after a refusal.
+    fn dispatch_shared(&mut self) {
+        if self.quiescing() {
+            return;
+        }
+        let Some(s) = self.shared.as_ref() else {
+            return;
+        };
+        // Wait out a full ceiling.
+        if s.global_blocked {
+            return;
+        }
+        let max_pending = s.config.max_pending_per_pool.max(1);
+        let global_cap = self.capacity.max_in_flight();
+        let n = self.pool_order.len();
+        if n == 0 {
+            return;
+        }
+        let ceiling = self.ceiling();
+        let mut claims: Vec<(PoolKey, u64, SlotClaim)> = Vec::new();
+        let mut progressed = true;
+        while progressed && self.in_flight < ceiling && self.queued_total > 0 {
+            progressed = false;
+            for i in 0..n {
+                if self.in_flight >= ceiling {
+                    break;
+                }
+                let idx = (self.cursor + i) % n;
+                let headroom = ceiling.saturating_sub(self.in_flight);
+                let key = self.pool_order[idx].clone();
+                let Some(pool) = self.pools.get_mut(&key) else {
+                    continue;
+                };
+                let limit = if pool.probing { 1 } else { max_pending };
+                if pool.queued_total == 0 || pool.blocked || pool.pending.len() >= limit {
+                    continue;
+                }
+                let effective = pool.effective_cap(headroom);
+                let (next, dropped) = pool.take_next(effective);
+                if dropped > 0 {
+                    pool.settle_idle();
+                }
+                self.queued_total = self.queued_total.saturating_sub(dropped);
+                let Some((tenant, key_id, waiter)) = next else {
+                    continue;
+                };
+                let id = self.next_op_id;
+                self.next_op_id += 1;
+                let claim = SlotClaim {
+                    pool: key.slot_id(),
+                    tenant,
+                    key: key_id,
+                    pool_cap: pool.configured_cap,
+                    global_cap,
+                    tenant_cap: pool.tenant_cap.get(&tenant).copied(),
+                    key_cap: pool.key_cap.get(&key_id).copied(),
+                };
+                pool.pending.insert(
+                    id,
+                    PendingClaim {
+                        tenant,
+                        key: key_id,
+                        waiter,
+                    },
+                );
+                self.in_flight += 1;
+                self.queued_total = self.queued_total.saturating_sub(1);
+                claims.push((key, id, claim));
+                progressed = true;
+            }
+            self.cursor = (self.cursor + 1) % n;
+        }
+        for (pool, id, claim) in claims {
+            self.publish_model_load(&pool);
+            self.spawn_acquire(pool, id, claim);
+        }
+    }
+
+    fn spawn_acquire(&mut self, pool: PoolKey, id: u64, claim: SlotClaim) {
+        let Some(s) = self.shared.as_mut() else {
+            return;
+        };
+        s.ops += 1;
+        let fut = s.backend.acquire(claim);
+        let timeout = s.config.op_timeout;
+        let tx = self.ctl_tx.clone();
+        tokio::spawn(async move {
+            let result = bounded(timeout, fut).await;
+            let _ = tx.send(Ctl::AcquireDone { pool, id, result });
+        });
+    }
+
+    fn release_shared(&mut self, slot: SlotRelease) {
+        let Some(s) = self.shared.as_mut() else {
+            return;
+        };
+        if s.reconciling.is_some_and(|r| r.quiesced) {
+            s.deferred.push(slot);
+            return;
+        }
+        self.spawn_release(slot);
+    }
+
+    fn spawn_release(&mut self, slot: SlotRelease) {
+        let Some(s) = self.shared.as_mut() else {
+            return;
+        };
+        s.ops += 1;
+        let pool = PoolKey::from_slot_id(&slot.pool).unwrap_or(PoolKey::Unrouted);
+        let fut = s.backend.release(slot);
+        let timeout = s.config.op_timeout;
+        let tx = self.ctl_tx.clone();
+        tokio::spawn(async move {
+            let result = bounded(timeout, fut).await;
+            let _ = tx.send(Ctl::ReleaseDone { pool, result });
+        });
+    }
+
+    fn acquire_done(
+        &mut self,
+        key: PoolKey,
+        id: u64,
+        result: Result<(AcquireOutcome, ClusterCounts), SlotError>,
+    ) {
+        if let Some(s) = self.shared.as_mut() {
+            s.ops = s.ops.saturating_sub(1);
+        }
+        let Some(pool) = self.pools.get_mut(&key) else {
+            return;
+        };
+        let Some(claim) = pool.pending.remove(&id) else {
+            return;
+        };
+        match result {
+            Ok((AcquireOutcome::Granted, counts)) => {
+                pool.probing = false;
+                pool.cluster_in_flight = Some(counts.pool);
+                let PendingClaim {
+                    tenant,
+                    key: key_id,
+                    waiter,
+                } = claim;
+                let admission = if waiter.fast {
+                    Admission::Fast
+                } else {
+                    Admission::Queued
+                };
+                let waited = waiter.enqueued.elapsed();
+                pool.send(tenant, key_id, waiter.respond, admission, waited);
+                if let Some(s) = self.shared.as_mut() {
+                    s.cluster_in_flight = Some(counts.global);
+                }
+                if self.mode != SlotMode::Shared {
+                    // Granted by the backend after this replica left shared
+                    // mode: the next reconcile settles it.
+                    self.note_unrecorded();
+                }
+            }
+            Ok((AcquireOutcome::Denied(denial), counts)) => {
+                let (tenant, key_id) = (claim.tenant, claim.key);
+                pool.requeue(claim);
+                pool.probing = true;
+                pool.cluster_in_flight = Some(counts.pool);
+                match denial {
+                    SlotDenial::Pool => pool.blocked = true,
+                    SlotDenial::Tenant => {
+                        pool.blocked_tenants.insert(tenant);
+                    }
+                    SlotDenial::Key => {
+                        pool.blocked_keys.insert(key_id);
+                    }
+                    SlotDenial::Global => {}
+                }
+                self.in_flight = self.in_flight.saturating_sub(1);
+                self.queued_total += 1;
+                if let Some(s) = self.shared.as_mut() {
+                    s.cluster_in_flight = Some(counts.global);
+                    if denial == SlotDenial::Global {
+                        s.global_blocked = true;
+                    }
+                }
+                self.schedule_retry();
+            }
+            Ok((AcquireOutcome::NotRegistered, _)) => {
+                pool.requeue(claim);
+                self.in_flight = self.in_flight.saturating_sub(1);
+                self.queued_total += 1;
+                self.shared_failed("this gateway is not registered as live in the shared backend");
+            }
+            Err(e) => {
+                pool.requeue(claim);
+                self.in_flight = self.in_flight.saturating_sub(1);
+                self.queued_total += 1;
+                self.shared_failed(&e.to_string());
+            }
+        }
+        self.publish_model_load(&key);
+        self.maybe_start_reconcile();
+        self.dispatch_all();
+    }
+
+    fn release_done(&mut self, key: PoolKey, result: Result<ClusterCounts, SlotError>) {
+        if let Some(s) = self.shared.as_mut() {
+            s.ops = s.ops.saturating_sub(1);
+        }
+        match result {
+            Ok(counts) => {
+                if self.mode == SlotMode::Shared {
+                    if let Some(pool) = self.pools.get_mut(&key) {
+                        pool.cluster_in_flight = Some(counts.pool);
+                        // A claim sent before this release landed may have
+                        // been refused for the slot it frees.
+                        pool.unblock();
+                    }
+                    if let Some(s) = self.shared.as_mut() {
+                        s.cluster_in_flight = Some(counts.global);
+                        s.global_blocked = false;
+                    }
+                }
+            }
+            Err(e) => self.shared_failed(&e.to_string()),
+        }
+        self.maybe_start_reconcile();
+        self.dispatch_all();
+    }
+
+    /// A backend call failed: fall back to the split until a reconcile gets
+    /// through. Logged once per outage.
+    fn shared_failed(&mut self, error: &str) {
+        let replicas = self.replicas;
+        let Some(s) = self.shared.as_mut() else {
+            return;
+        };
+        if !s.failing {
+            s.failing = true;
+            tracing::warn!(
+                error,
+                replicas,
+                split = s.config.split_on_fallback,
+                "shared fairshare slots unavailable; enforcing each limit per replica until \
+                 the backend answers and holdings are reconciled"
+            );
+        }
+        s.synced = false;
+        for _ in s.deferred.drain(..) {
+            s.unrecorded = s.unrecorded.wrapping_add(1);
+        }
+        s.next_reconcile = Instant::now() + s.config.recovery_interval;
+        self.apply_mode();
+    }
+
+    /// Start a due reconcile once nothing else is in flight. In shared mode
+    /// (and on the way into it with the backend answering) it is quiesced:
+    /// no claim is sent until it lands and releases wait behind it, so the
+    /// holdings it records are exact. Alone or while failing, it runs
+    /// alongside local admissions and only counts as a resync if nothing
+    /// changed locally meanwhile.
+    fn maybe_start_reconcile(&mut self) {
+        let multi = self.replicas > 1;
+        let Some(s) = self.shared.as_ref() else {
+            return;
+        };
+        if !s.want_reconcile || s.reconciling.is_some() || s.ops > 0 {
+            return;
+        }
+        let holdings: Vec<PoolHoldings> = self.pools.values().filter_map(Pool::holdings).collect();
+        let Some(s) = self.shared.as_mut() else {
+            return;
+        };
+        s.want_reconcile = false;
+        s.reconciling = Some(Reconciling {
+            quiesced: multi && !s.failing,
+            unrecorded_at: s.unrecorded,
+        });
+        let fut = s.backend.reconcile(holdings);
+        let timeout = s.config.op_timeout;
+        let tx = self.ctl_tx.clone();
+        tokio::spawn(async move {
+            let result = bounded(timeout, fut).await;
+            let _ = tx.send(Ctl::ReconcileDone { result });
+        });
+    }
+
+    fn reconcile_done(&mut self, result: Result<ReconcileOutcome, SlotError>) {
+        let multi = self.replicas > 1;
+        let Some(s) = self.shared.as_mut() else {
+            return;
+        };
+        let Some(run) = s.reconciling.take() else {
+            return;
+        };
+        match result {
+            Ok(ReconcileOutcome::Synced) => {
+                if s.failing {
+                    s.failing = false;
+                    tracing::info!("shared fairshare slots reachable again; holdings reconciled");
+                }
+                if multi {
+                    if run.quiesced || run.unrecorded_at == s.unrecorded {
+                        s.synced = true;
+                    } else {
+                        // Local admissions moved on while it ran; now that
+                        // the backend answers, a quiesced one settles it.
+                        s.want_reconcile = true;
+                    }
+                }
+                s.next_reconcile = Instant::now() + s.config.reconcile_interval;
+                let deferred = std::mem::take(&mut s.deferred);
+                let send = s.synced && multi;
+                self.apply_mode();
+                for slot in deferred {
+                    if send {
+                        self.spawn_release(slot);
+                    } else {
+                        self.note_unrecorded();
+                    }
+                }
+                // The reconcile may have freed slots this replica was refused.
+                self.unblock_all();
+            }
+            Ok(ReconcileOutcome::NotRegistered) => {
+                self.shared_failed("this gateway is not registered as live in the shared backend");
+            }
+            Err(e) => self.shared_failed(&e.to_string()),
+        }
+        self.maybe_start_reconcile();
+        self.dispatch_all();
     }
 
     fn pool_mut(&mut self, key: &PoolKey) -> &mut Pool {
@@ -1588,7 +2459,7 @@ impl Scheduler {
                 self.default_model_cap,
                 self.ctl_tx.clone(),
             );
-            pool.set_replicas(self.replicas);
+            pool.set_divisor(self.divisor);
             self.pools.insert(key.clone(), pool);
             self.pool_order.push(key.clone());
         }
@@ -1636,6 +2507,13 @@ impl Scheduler {
     /// pool starting from a rotating cursor, so a binding ceiling is shared
     /// round-robin rather than by map order.
     fn dispatch_all(&mut self) {
+        if self.mode == SlotMode::Shared {
+            self.dispatch_shared();
+            return;
+        }
+        if self.quiescing() {
+            return;
+        }
         let n = self.pool_order.len();
         if n == 0 {
             return;
@@ -1665,6 +2543,7 @@ impl Scheduler {
                 if granted {
                     self.in_flight += 1;
                     self.queued_total = self.queued_total.saturating_sub(1);
+                    self.note_unrecorded();
                     progressed = true;
                     let key = self.pool_order[idx].clone();
                     self.publish_model_load(&key);
@@ -1699,6 +2578,16 @@ impl Scheduler {
             .queued
             .store(self.queued_total as i64, Ordering::Relaxed);
         self.stats.replicas.store(self.replicas, Ordering::Relaxed);
+        self.stats.mode.store(self.mode.to_u8(), Ordering::Relaxed);
+        let cluster = self
+            .shared
+            .as_ref()
+            .and_then(|s| s.cluster_in_flight)
+            .filter(|_| self.mode == SlotMode::Shared)
+            .unwrap_or(self.in_flight);
+        self.stats
+            .cluster_in_flight
+            .store(cluster, Ordering::Relaxed);
     }
 
     /// A [`FairshareSample`] built directly from pool state, without the
@@ -1752,6 +2641,13 @@ impl Scheduler {
             max_in_flight: ceiling,
             configured_max_in_flight: self.capacity.max_in_flight(),
             replicas: self.replicas,
+            mode: self.mode.as_str().into(),
+            shared_slots: self.shared.is_some(),
+            cluster_in_flight: self
+                .shared
+                .as_ref()
+                .and_then(|s| s.cluster_in_flight)
+                .filter(|_| self.mode == SlotMode::Shared),
             default_model_max_in_flight: self.default_model_cap,
             global_in_flight: self.in_flight,
             global_queued: self.queued_total,
@@ -1760,6 +2656,21 @@ impl Scheduler {
             model_in_flight,
             model_queued,
         }
+    }
+}
+
+/// Far enough ahead to stand for "never" in a `sleep_until`.
+fn far_future() -> Instant {
+    Instant::now() + Duration::from_secs(86_400)
+}
+
+/// A backend call bounded by `timeout`; running past it is a failure.
+async fn bounded<T>(timeout: Duration, fut: SlotFuture<T>) -> Result<T, SlotError> {
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(result) => result,
+        Err(_) => Err(SlotError(format!(
+            "shared slot backend did not answer within {timeout:?}"
+        ))),
     }
 }
 

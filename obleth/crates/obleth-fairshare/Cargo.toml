@@ -10,6 +10,7 @@ uuid.workspace = true
 obleth-config.workspace = true
 tracing.workspace = true
 serde.workspace = true
+rand.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true }
