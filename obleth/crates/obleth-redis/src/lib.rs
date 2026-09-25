@@ -6,6 +6,11 @@
 
 mod prune;
 pub mod scripts;
+mod slots;
+
+pub use slots::{
+    RedisSlots, SlotKeys, REPLICAS_KEY, SLOT_HELD_PREFIX, SLOT_RELEASE_CHANNEL, SLOT_TOTALS_KEY,
+};
 
 use std::sync::OnceLock;
 
@@ -34,6 +39,10 @@ cached_script!(term_usage_read_script, scripts::TERM_USAGE_READ);
 cached_script!(term_usage_add_script, scripts::TERM_USAGE_ADD);
 cached_script!(term_reconcile_script, scripts::TERM_RECONCILE);
 cached_script!(replica_heartbeat_script, scripts::REPLICA_HEARTBEAT);
+cached_script!(replica_deregister_script, scripts::REPLICA_DEREGISTER);
+cached_script!(slot_acquire_script, scripts::SLOT_ACQUIRE);
+cached_script!(slot_release_script, scripts::SLOT_RELEASE);
+cached_script!(slot_reconcile_script, scripts::SLOT_RECONCILE);
 
 const KEY_PREFIX: &str = "obleth:key:";
 const MODEL_PREFIX: &str = "obleth:model:";
@@ -68,10 +77,6 @@ const PROVISIONER_VERSION_KEY: &str = "obleth:provisioner:version";
 /// a provisioner can poll green for days while every tick fails against
 /// slurmrestd and holds all replica state frozen.
 const PROVISIONER_TICK_KEY: &str = "obleth:provisioner:tick";
-/// Live gateway replicas, as a sorted set of instance ids scored by heartbeat
-/// expiry (see `scripts::REPLICA_HEARTBEAT`). Fairshare divides its configured
-/// limits by the member count.
-const REPLICAS_KEY: &str = "obleth:gateway:replicas";
 
 #[derive(Debug, thiserror::Error)]
 pub enum RedisError {
@@ -210,7 +215,8 @@ impl RedisStore {
         Ok(v)
     }
 
-    /// Refresh this replica's heartbeat for `ttl` and return how many
+    /// Refresh this replica's heartbeat for `ttl`, reclaim the shared slots
+    /// of any replica whose heartbeat has expired, and return how many
     /// replicas are live (unexpired), this one included. One small script
     /// call; run it on an interval well under `ttl`, never per request.
     pub async fn replica_heartbeat(
@@ -218,34 +224,49 @@ impl RedisStore {
         instance: &str,
         ttl: std::time::Duration,
     ) -> Result<usize> {
-        self.replica_heartbeat_in(REPLICAS_KEY, instance, ttl).await
+        self.replica_heartbeat_in(&SlotKeys::default(), instance, ttl)
+            .await
     }
 
-    /// Drop this replica's heartbeat so the survivors grow at their next
-    /// heartbeat instead of one TTL later. Called on clean shutdown.
+    /// Drop this replica's heartbeat, and free any shared slot it still
+    /// holds, so the survivors grow at their next heartbeat instead of one
+    /// TTL later. Called on clean shutdown.
     pub async fn replica_deregister(&self, instance: &str) -> Result<()> {
-        self.replica_deregister_in(REPLICAS_KEY, instance).await
+        self.replica_deregister_in(&SlotKeys::default(), instance)
+            .await
     }
 
-    async fn replica_heartbeat_in(
+    /// [`RedisStore::replica_heartbeat`] with an explicit key layout.
+    pub async fn replica_heartbeat_in(
         &self,
-        key: &str,
+        keys: &SlotKeys,
         instance: &str,
         ttl: std::time::Duration,
     ) -> Result<usize> {
         let mut conn = self.conn.clone();
         let live: usize = replica_heartbeat_script()
-            .key(key)
+            .key(&keys.replicas)
+            .key(&keys.totals)
             .arg(instance)
             .arg(ttl.as_millis().max(1) as u64)
+            .arg(&keys.held_prefix)
+            .arg(&keys.channel)
             .invoke_async(&mut conn)
             .await?;
         Ok(live)
     }
 
-    async fn replica_deregister_in(&self, key: &str, instance: &str) -> Result<()> {
+    /// [`RedisStore::replica_deregister`] with an explicit key layout.
+    pub async fn replica_deregister_in(&self, keys: &SlotKeys, instance: &str) -> Result<()> {
         let mut conn = self.conn.clone();
-        let _: i64 = conn.zrem(key, instance).await?;
+        let _: i64 = replica_deregister_script()
+            .key(&keys.replicas)
+            .key(&keys.totals)
+            .key(keys.held(instance))
+            .arg(instance)
+            .arg(&keys.channel)
+            .invoke_async(&mut conn)
+            .await?;
         Ok(())
     }
 
@@ -663,8 +684,40 @@ impl RedisStore {
     /// after every successful subscribe: `false` for the first, `true` for
     /// each later one. Messages published while disconnected are lost, so a
     /// caller should treat `true` as "local caches may be stale".
-    pub async fn run_invalidation_listener<F, S>(&self, mut on_hash: F, mut on_subscribed: S)
+    pub async fn run_invalidation_listener<F, S>(&self, on_hash: F, on_subscribed: S)
     where
+        F: FnMut(String) + Send,
+        S: FnMut(bool) + Send,
+    {
+        self.run_channel_listener(INVALIDATE_CHANNEL, "invalidation", on_hash, on_subscribed)
+            .await
+    }
+
+    /// Run `on_pool` with the pool id of every shared-slot release wakeup on
+    /// `keys.channel`, forever, with the same reconnect behaviour as
+    /// [`RedisStore::run_invalidation_listener`]. Wakeups published while
+    /// disconnected are lost, so a caller should treat `on_subscribed(true)`
+    /// as "retry every pool".
+    pub async fn run_slot_release_listener<F, S>(
+        &self,
+        keys: &SlotKeys,
+        on_pool: F,
+        on_subscribed: S,
+    ) where
+        F: FnMut(String) + Send,
+        S: FnMut(bool) + Send,
+    {
+        self.run_channel_listener(&keys.channel, "slot release", on_pool, on_subscribed)
+            .await
+    }
+
+    async fn run_channel_listener<F, S>(
+        &self,
+        channel: &str,
+        what: &'static str,
+        mut on_message: F,
+        mut on_subscribed: S,
+    ) where
         F: FnMut(String) + Send,
         S: FnMut(bool) + Send,
     {
@@ -673,7 +726,7 @@ impl RedisStore {
         loop {
             let mut subscribed = false;
             let result = self
-                .listen_once(&mut on_hash, &mut || {
+                .listen_once(channel, &mut on_message, &mut || {
                     subscribed = true;
                     on_subscribed(subscribed_before);
                     subscribed_before = true;
@@ -686,10 +739,10 @@ impl RedisStore {
             }
             match result {
                 Ok(()) => {
-                    tracing::warn!(retry_in = ?backoff, "invalidation listener connection closed")
+                    tracing::warn!(listener = what, retry_in = ?backoff, "pub/sub listener connection closed")
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e, retry_in = ?backoff, "invalidation listener stopped")
+                    tracing::warn!(listener = what, error = %e, retry_in = ?backoff, "pub/sub listener stopped")
                 }
             }
             tokio::time::sleep(backoff).await;
@@ -698,7 +751,12 @@ impl RedisStore {
     }
 
     /// One pub/sub session: `Ok` when the server closed the connection.
-    async fn listen_once<F, S>(&self, on_hash: &mut F, on_subscribed: &mut S) -> Result<()>
+    async fn listen_once<F, S>(
+        &self,
+        channel: &str,
+        on_message: &mut F,
+        on_subscribed: &mut S,
+    ) -> Result<()>
     where
         F: FnMut(String) + Send,
         S: FnMut() + Send,
@@ -710,7 +768,7 @@ impl RedisStore {
             .await
             .map_err(|_| timed_out("pub/sub connect timed out"))??;
         let (mut sink, mut stream) = pubsub.split();
-        tokio::time::timeout(PUBSUB_REPLY_TIMEOUT, sink.subscribe(INVALIDATE_CHANNEL))
+        tokio::time::timeout(PUBSUB_REPLY_TIMEOUT, sink.subscribe(channel))
             .await
             .map_err(|_| timed_out("pub/sub subscribe timed out"))??;
         on_subscribed();
@@ -723,8 +781,8 @@ impl RedisStore {
             tokio::select! {
                 msg = stream.next() => {
                     let Some(msg) = msg else { return Ok(()) };
-                    if let Ok(hash) = msg.get_payload::<String>() {
-                        on_hash(hash);
+                    if let Ok(payload) = msg.get_payload::<String>() {
+                        on_message(payload);
                     }
                 }
                 _ = keepalive.tick() => {
@@ -732,7 +790,7 @@ impl RedisStore {
                     // error. Re-subscribing to a channel already joined still
                     // gets a reply, so it serves as the PING that the
                     // subscribed-mode sink doesn't expose.
-                    tokio::time::timeout(PUBSUB_REPLY_TIMEOUT, sink.subscribe(INVALIDATE_CHANNEL))
+                    tokio::time::timeout(PUBSUB_REPLY_TIMEOUT, sink.subscribe(channel))
                         .await
                         .map_err(|_| timed_out("pub/sub keepalive timed out"))??;
                 }
@@ -1632,8 +1690,15 @@ mod tests {
         assert_eq!(out, ReserveOutcome::Reserved { remaining: -50 });
     }
 
-    fn replica_test_key() -> String {
-        format!("obleth:test:replicas:{}", Uuid::new_v4())
+    fn replica_test_key() -> SlotKeys {
+        SlotKeys::with_prefix(&format!("obleth:test:{}", Uuid::new_v4()))
+    }
+
+    async fn drop_test_keys(store: &RedisStore, keys: &SlotKeys, instances: &[&str]) {
+        let mut conn = store.conn.clone();
+        let mut all = vec![keys.replicas.clone(), keys.totals.clone()];
+        all.extend(instances.iter().map(|i| keys.held(i)));
+        let _: () = conn.del(all).await.unwrap();
     }
 
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
@@ -1661,14 +1726,14 @@ mod tests {
             "b expired"
         );
         let mut conn = store.conn.clone();
-        let members: Vec<String> = conn.zrange(&key, 0, -1).await.unwrap();
+        let members: Vec<String> = conn.zrange(&key.replicas, 0, -1).await.unwrap();
         assert_eq!(members, vec!["a".to_string()], "expired members are pruned");
 
         // The set itself never expires, so volatile-lru cannot evict it.
-        let pttl: i64 = conn.pttl(&key).await.unwrap();
+        let pttl: i64 = conn.pttl(&key.replicas).await.unwrap();
         assert_eq!(pttl, -1);
 
-        let _: () = conn.del(&key).await.unwrap();
+        drop_test_keys(&store, &key, &[]).await;
     }
 
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
@@ -1685,8 +1750,7 @@ mod tests {
         assert_eq!(store.replica_heartbeat_in(&key, "b", ttl).await.unwrap(), 1);
         // Deregistering an unknown instance is a no-op, not an error.
         store.replica_deregister_in(&key, "gone").await.unwrap();
-        let mut conn = store.conn.clone();
-        let _: () = conn.del(&key).await.unwrap();
+        drop_test_keys(&store, &key, &[]).await;
     }
 
     /// A TCP relay to the test Redis that can be taken down and brought back
@@ -1743,6 +1807,40 @@ mod tests {
         }
     }
 
+    /// The first connection through a fresh relay, retried: with the whole
+    /// suite running in parallel the first round trip through a relay can
+    /// miss a sub-second timeout. What these tests check starts after it.
+    async fn relayed_connection(
+        client: &redis::Client,
+        config: ConnectionManagerConfig,
+    ) -> ConnectionManager {
+        for _ in 0..20 {
+            if let Ok(conn) =
+                ConnectionManager::new_with_config(client.clone(), config.clone()).await
+            {
+                return conn;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("could not connect through the relay");
+    }
+
+    /// The first heartbeat on a new connection, retried for the same reason.
+    async fn first_heartbeat(
+        store: &RedisStore,
+        keys: &SlotKeys,
+        instance: &str,
+        ttl: std::time::Duration,
+    ) -> usize {
+        for _ in 0..20 {
+            if let Ok(n) = store.replica_heartbeat_in(keys, instance, ttl).await {
+                return n;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("the first heartbeat never got through");
+    }
+
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
     #[tokio::test]
     async fn replica_heartbeat_fails_fast_while_redis_is_down_and_recovers() {
@@ -1767,14 +1865,12 @@ mod tests {
             .set_connection_timeout(std::time::Duration::from_millis(500))
             .set_number_of_retries(0);
         let store = RedisStore {
-            conn: ConnectionManager::new_with_config(client.clone(), config)
-                .await
-                .unwrap(),
+            conn: relayed_connection(&client, config).await,
             client,
         };
         let key = replica_test_key();
         let ttl = std::time::Duration::from_secs(30);
-        assert_eq!(store.replica_heartbeat_in(&key, "a", ttl).await.unwrap(), 1);
+        assert_eq!(first_heartbeat(&store, &key, "a", ttl).await, 1);
 
         relay.down();
         for _ in 0..3 {
@@ -1802,8 +1898,665 @@ mod tests {
         assert_eq!(recovered, 1);
 
         let direct = test_store().await.unwrap();
-        let mut conn = direct.conn.clone();
-        let _: () = conn.del(&key).await.unwrap();
+        drop_test_keys(&direct, &key, &[]).await;
         relay.down();
+    }
+
+    // ---- shared fairshare slots ------------------------------------------
+
+    use obleth_fairshare::{
+        AcquireOutcome, FairShare, PoolHoldings, ReconcileOutcome, SharedSlotsConfig, SlotClaim,
+        SlotDenial, SlotMode, SlotRelease, StaticCapacity,
+    };
+
+    fn claim(pool: &str, pool_cap: usize, global_cap: usize) -> SlotClaim {
+        SlotClaim {
+            pool: pool.into(),
+            tenant: Uuid::new_v4(),
+            key: Uuid::new_v4(),
+            pool_cap,
+            global_cap,
+            tenant_cap: None,
+            key_cap: None,
+        }
+    }
+
+    async fn live(store: &RedisStore, keys: &SlotKeys, instances: &[&str]) {
+        for i in instances {
+            store
+                .replica_heartbeat_in(keys, i, std::time::Duration::from_secs(60))
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn totals_field(store: &RedisStore, keys: &SlotKeys, field: &str) -> i64 {
+        let mut conn = store.conn.clone();
+        let v: Option<i64> = conn.hget(&keys.totals, field).await.unwrap();
+        v.unwrap_or(0)
+    }
+
+    async fn held_field(store: &RedisStore, keys: &SlotKeys, instance: &str, field: &str) -> i64 {
+        let mut conn = store.conn.clone();
+        let v: Option<i64> = conn.hget(keys.held(instance), field).await.unwrap();
+        v.unwrap_or(0)
+    }
+
+    /// Fire `claims` concurrently, spread over `instances`; return how many
+    /// were granted.
+    async fn race(
+        store: &RedisStore,
+        keys: &SlotKeys,
+        instances: &[&str],
+        claims: Vec<SlotClaim>,
+    ) -> Vec<SlotClaim> {
+        let tasks: Vec<_> = claims
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| {
+                let (store, keys) = (store.clone(), keys.clone());
+                let instance = instances[i % instances.len()].to_string();
+                tokio::spawn(async move {
+                    let (outcome, _) = store.slot_acquire(&keys, &instance, &c).await.unwrap();
+                    (outcome == AcquireOutcome::Granted).then_some(c)
+                })
+            })
+            .collect();
+        let mut granted = Vec::new();
+        for t in tasks {
+            if let Some(c) = t.await.unwrap() {
+                granted.push(c);
+            }
+        }
+        granted
+    }
+
+    /// The totals always equal the sum of the replicas' holdings.
+    async fn assert_books_balance(store: &RedisStore, keys: &SlotKeys, instances: &[&str]) {
+        let mut conn = store.conn.clone();
+        let totals: std::collections::HashMap<String, i64> =
+            conn.hgetall(&keys.totals).await.unwrap();
+        let mut summed: std::collections::HashMap<String, i64> = Default::default();
+        for i in instances {
+            let held: std::collections::HashMap<String, i64> =
+                conn.hgetall(keys.held(i)).await.unwrap();
+            for (f, n) in held {
+                *summed.entry(f).or_default() += n;
+            }
+        }
+        let counts: std::collections::HashMap<String, i64> = totals
+            .into_iter()
+            .filter(|(f, _)| !f.starts_with('w'))
+            .collect();
+        assert_eq!(counts, summed, "totals are the sum of the holdings");
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// Concurrent claims from several replicas never take a slot past any
+    /// limit, each limit binding on its own and all of them together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn slot_claims_are_atomic_across_every_limit() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        let gws = ["a", "b", "c", "d"];
+        live(&store, &keys, &gws).await;
+
+        // The pool binds.
+        let granted = race(
+            &store,
+            &keys,
+            &gws,
+            (0..50).map(|_| claim("m:p", 10, 1000)).collect(),
+        )
+        .await;
+        assert_eq!(granted.len(), 10);
+        assert_eq!(totals_field(&store, &keys, "p|m:p").await, 10);
+        assert_eq!(totals_field(&store, &keys, "g").await, 10);
+
+        // The tenant binds, in a pool with room.
+        let tenant = Uuid::new_v4();
+        let granted = race(
+            &store,
+            &keys,
+            &gws,
+            (0..30)
+                .map(|_| SlotClaim {
+                    tenant,
+                    tenant_cap: Some(3),
+                    ..claim("m:t", 100, 1000)
+                })
+                .collect(),
+        )
+        .await;
+        assert_eq!(granted.len(), 3);
+
+        // The key binds.
+        let key = Uuid::new_v4();
+        let granted = race(
+            &store,
+            &keys,
+            &gws,
+            (0..30)
+                .map(|_| SlotClaim {
+                    key,
+                    key_cap: Some(2),
+                    ..claim("m:k", 100, 1000)
+                })
+                .collect(),
+        )
+        .await;
+        assert_eq!(granted.len(), 2);
+
+        // The global count (15 so far) binds across pools.
+        let granted = race(
+            &store,
+            &keys,
+            &gws,
+            (0..30).map(|_| claim("m:g", 100, 19)).collect(),
+        )
+        .await;
+        assert_eq!(granted.len(), 4);
+        assert_eq!(totals_field(&store, &keys, "g").await, 19);
+
+        // All at once: a 6-slot pool, one tenant capped at 3 sending most of
+        // the load and one of its keys capped at 2.
+        let heavy = Uuid::new_v4();
+        let heavy_key = Uuid::new_v4();
+        let mixed: Vec<SlotClaim> = (0..60)
+            .map(|i| match i % 3 {
+                0 => SlotClaim {
+                    tenant: heavy,
+                    key: heavy_key,
+                    tenant_cap: Some(3),
+                    key_cap: Some(2),
+                    ..claim("m:x", 6, 1000)
+                },
+                1 => SlotClaim {
+                    tenant: heavy,
+                    tenant_cap: Some(3),
+                    ..claim("m:x", 6, 1000)
+                },
+                _ => claim("m:x", 6, 1000),
+            })
+            .collect();
+        let granted = race(&store, &keys, &gws, mixed).await;
+        assert_eq!(granted.len(), 6);
+        assert!(granted.iter().filter(|c| c.tenant == heavy).count() <= 3);
+        assert!(granted.iter().filter(|c| c.key == heavy_key).count() <= 2);
+        assert_eq!(totals_field(&store, &keys, "p|m:x").await, 6);
+        assert_books_balance(&store, &keys, &gws).await;
+        drop_test_keys(&store, &keys, &gws).await;
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn slot_releases_free_only_what_the_replica_holds() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        live(&store, &keys, &["a", "b"]).await;
+        let c = claim("m:p", 4, 100);
+        let (outcome, counts) = store.slot_acquire(&keys, "a", &c).await.unwrap();
+        assert_eq!(outcome, AcquireOutcome::Granted);
+        assert_eq!((counts.pool, counts.global), (1, 1));
+        let slot = SlotRelease {
+            pool: c.pool.clone(),
+            tenant: c.tenant,
+            key: c.key,
+        };
+        // b holds nothing, so its release frees nothing.
+        let (freed, counts) = store.slot_release(&keys, "b", &slot).await.unwrap();
+        assert!(!freed);
+        assert_eq!(counts.pool, 1);
+        let (freed, counts) = store.slot_release(&keys, "a", &slot).await.unwrap();
+        assert!(freed);
+        assert_eq!((counts.pool, counts.global), (0, 0));
+        // A second release of the same slot is a no-op, not a negative count.
+        let (freed, _) = store.slot_release(&keys, "a", &slot).await.unwrap();
+        assert!(!freed);
+        let mut conn = store.conn.clone();
+        let fields: std::collections::HashMap<String, i64> =
+            conn.hgetall(&keys.totals).await.unwrap();
+        assert!(fields.is_empty(), "counts at zero are deleted: {fields:?}");
+        drop_test_keys(&store, &keys, &["a", "b"]).await;
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// A replica's slots are reclaimed once its heartbeat expires, by the
+    /// next live replica's heartbeat, and not a moment before.
+    #[tokio::test]
+    async fn slot_holdings_are_reclaimed_when_the_heartbeat_expires_and_not_before() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        let ttl = std::time::Duration::from_millis(400);
+        store.replica_heartbeat_in(&keys, "a", ttl).await.unwrap();
+        store.replica_heartbeat_in(&keys, "b", ttl).await.unwrap();
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            let c = claim("m:p", 10, 100);
+            let (outcome, _) = store.slot_acquire(&keys, "b", &c).await.unwrap();
+            assert_eq!(outcome, AcquireOutcome::Granted);
+            held.push(c);
+        }
+        // Inside b's TTL: a's heartbeat leaves b's slots alone.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(
+            store.replica_heartbeat_in(&keys, "a", ttl).await.unwrap(),
+            2
+        );
+        assert_eq!(totals_field(&store, &keys, "p|m:p").await, 3);
+        assert_eq!(held_field(&store, &keys, "b", "p|m:p").await, 3);
+
+        // Past it: the next heartbeat reclaims them.
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert_eq!(
+            store.replica_heartbeat_in(&keys, "a", ttl).await.unwrap(),
+            1
+        );
+        assert_eq!(totals_field(&store, &keys, "p|m:p").await, 0);
+        assert_eq!(totals_field(&store, &keys, "g").await, 0);
+        assert_eq!(held_field(&store, &keys, "b", "p|m:p").await, 0);
+
+        // A late release from b frees nothing, and b takes nothing new until
+        // it heartbeats again.
+        let slot = SlotRelease {
+            pool: held[0].pool.clone(),
+            tenant: held[0].tenant,
+            key: held[0].key,
+        };
+        let (freed, _) = store.slot_release(&keys, "b", &slot).await.unwrap();
+        assert!(!freed);
+        let (outcome, _) = store
+            .slot_acquire(&keys, "b", &claim("m:p", 10, 100))
+            .await
+            .unwrap();
+        assert_eq!(outcome, AcquireOutcome::NotRegistered);
+        drop_test_keys(&store, &keys, &["a", "b"]).await;
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn slot_reconcile_replaces_the_holdings_and_repairs_drift() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        live(&store, &keys, &["a", "b"]).await;
+        let tenant = Uuid::new_v4();
+        let key = Uuid::new_v4();
+        for _ in 0..2 {
+            store
+                .slot_acquire(
+                    &keys,
+                    "a",
+                    &SlotClaim {
+                        tenant,
+                        key,
+                        ..claim("m:p", 10, 100)
+                    },
+                )
+                .await
+                .unwrap();
+        }
+        store
+            .slot_acquire(&keys, "b", &claim("m:p", 10, 100))
+            .await
+            .unwrap();
+        // Drift: three slots a no longer really holds (lost releases).
+        let mut conn = store.conn.clone();
+        for f in ["g", "p|m:p"] {
+            let _: i64 = conn.hincr(keys.held("a"), f, 3).await.unwrap();
+            let _: i64 = conn.hincr(&keys.totals, f, 3).await.unwrap();
+        }
+        assert_eq!(totals_field(&store, &keys, "p|m:p").await, 6);
+
+        let truth = vec![PoolHoldings {
+            pool: "m:p".into(),
+            in_flight: 1,
+            tenants: vec![(tenant, 1)],
+            keys: vec![(key, 1)],
+        }];
+        assert_eq!(
+            store.slot_reconcile(&keys, "a", &truth).await.unwrap(),
+            ReconcileOutcome::Synced
+        );
+        assert_eq!(
+            totals_field(&store, &keys, "p|m:p").await,
+            2,
+            "a's 1 + b's 1"
+        );
+        assert_eq!(totals_field(&store, &keys, "g").await, 2);
+        assert_eq!(
+            totals_field(&store, &keys, &format!("t|m:p|{tenant}")).await,
+            1
+        );
+        assert_eq!(held_field(&store, &keys, "a", "p|m:p").await, 1);
+        assert_books_balance(&store, &keys, &["a", "b"]).await;
+
+        // Reconciling to nothing clears a's books; b's are untouched.
+        store.slot_reconcile(&keys, "a", &[]).await.unwrap();
+        assert_eq!(totals_field(&store, &keys, "p|m:p").await, 1);
+
+        // A replica that is not live writes nothing.
+        assert_eq!(
+            store.slot_reconcile(&keys, "ghost", &truth).await.unwrap(),
+            ReconcileOutcome::NotRegistered
+        );
+        assert_eq!(totals_field(&store, &keys, "p|m:p").await, 1);
+        drop_test_keys(&store, &keys, &["a", "b", "ghost"]).await;
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// A release publishes the pool only while someone waits for it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn slot_releases_publish_only_while_someone_waits() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        live(&store, &keys, &["a", "b"]).await;
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        let (subscribed_tx, mut subscribed) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let listener = {
+            let (store, keys) = (store.clone(), keys.clone());
+            tokio::spawn(async move {
+                store
+                    .run_slot_release_listener(
+                        &keys,
+                        move |pool| {
+                            let _ = tx.send(pool);
+                        },
+                        move |_| {
+                            let _ = subscribed_tx.send(());
+                        },
+                    )
+                    .await
+            })
+        };
+        subscribed.recv().await.expect("subscribed");
+
+        let c = claim("m:p", 1, 100);
+        store.slot_acquire(&keys, "a", &c).await.unwrap();
+        let slot = SlotRelease {
+            pool: c.pool.clone(),
+            tenant: c.tenant,
+            key: c.key,
+        };
+        store.slot_release(&keys, "a", &slot).await.unwrap();
+        let quiet = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await;
+        assert!(quiet.is_err(), "nobody waited, so nothing was published");
+
+        store.slot_acquire(&keys, "a", &c).await.unwrap();
+        let (outcome, _) = store
+            .slot_acquire(&keys, "b", &claim("m:p", 1, 100))
+            .await
+            .unwrap();
+        assert_eq!(outcome, AcquireOutcome::Denied(SlotDenial::Pool));
+        store.slot_release(&keys, "a", &slot).await.unwrap();
+        let woken = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("published")
+            .unwrap();
+        assert_eq!(woken, "m:p");
+        listener.abort();
+        drop_test_keys(&store, &keys, &["a", "b"]).await;
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn replica_deregister_frees_what_the_replica_still_holds() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        live(&store, &keys, &["a"]).await;
+        store
+            .slot_acquire(&keys, "a", &claim("m:p", 10, 100))
+            .await
+            .unwrap();
+        store.replica_deregister_in(&keys, "a").await.unwrap();
+        assert_eq!(totals_field(&store, &keys, "p|m:p").await, 0);
+        assert_eq!(held_field(&store, &keys, "a", "p|m:p").await, 0);
+        drop_test_keys(&store, &keys, &["a"]).await;
+    }
+
+    fn slot_config() -> SharedSlotsConfig {
+        SharedSlotsConfig {
+            reconcile_interval: std::time::Duration::from_secs(60),
+            recovery_interval: std::time::Duration::from_millis(100),
+            // Far out, so a waiter admitted promptly proves the wakeup.
+            retry_min: std::time::Duration::from_secs(30),
+            retry_max: std::time::Duration::from_secs(30),
+            ..SharedSlotsConfig::default()
+        }
+    }
+
+    /// A gateway's scheduler on `store`, live under `instance` and listening
+    /// for release wakeups.
+    async fn slot_gateway(
+        store: &RedisStore,
+        keys: &SlotKeys,
+        instance: &str,
+        replicas: usize,
+        config: SharedSlotsConfig,
+    ) -> (FairShare, tokio::task::JoinHandle<()>) {
+        live(store, keys, &[instance]).await;
+        let fs = FairShare::start(
+            std::sync::Arc::new(StaticCapacity::new(4096)),
+            obleth_config::FairshareAlgorithm::Hierarchical,
+            32,
+        );
+        fs.enable_shared_slots(
+            std::sync::Arc::new(RedisSlots::with_keys(store.clone(), instance, keys.clone())),
+            config,
+        );
+        fs.set_replicas(replicas);
+        let (subscribed_tx, mut subscribed) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let listener = {
+            let (store, keys, fs) = (store.clone(), keys.clone(), fs.clone());
+            tokio::spawn(async move {
+                let woken = fs.clone();
+                store
+                    .run_slot_release_listener(
+                        &keys,
+                        move |pool| woken.wake(&pool),
+                        move |reconnected| {
+                            if reconnected {
+                                fs.wake_all();
+                            }
+                            let _ = subscribed_tx.send(());
+                        },
+                    )
+                    .await
+            })
+        };
+        subscribed.recv().await.expect("subscribed");
+        (fs, listener)
+    }
+
+    async fn wait_for_slot_mode(fs: &FairShare, mode: SlotMode) {
+        let stats = fs.stats();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while stats.mode() != mode {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {}", mode.as_str()));
+    }
+
+    fn model_req(cap: usize) -> obleth_fairshare::AdmitRequest {
+        obleth_fairshare::AdmitRequest::new(Uuid::new_v4(), "shared-model", 1).model_cap(cap)
+    }
+
+    async fn admit_in_time(fs: &FairShare, cap: usize) -> obleth_fairshare::Admitted {
+        tokio::time::timeout(std::time::Duration::from_secs(3), fs.admit(model_req(cap)))
+            .await
+            .expect("admitted in time")
+            .expect("scheduler alive")
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// Three gateways on one Redis: all 20 requests for a 20-slot model land
+    /// on one gateway and are all admitted; a waiter on another gateway gets
+    /// the next slot freed, through the release wakeup.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gateways_share_a_pool_through_redis() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let keys = replica_test_key();
+        let mut gws = Vec::new();
+        for name in ["a", "b", "c"] {
+            gws.push(slot_gateway(&store, &keys, name, 3, slot_config()).await);
+        }
+        for (fs, _) in &gws {
+            wait_for_slot_mode(fs, SlotMode::Shared).await;
+        }
+        let pool = obleth_fairshare::PoolKey::Model("shared-model".into());
+        let mut permits = Vec::new();
+        for _ in 0..20 {
+            permits.push(admit_in_time(&gws[0].0, 20).await);
+        }
+        assert_eq!(
+            totals_field(&store, &keys, &format!("p|{}", pool.slot_id())).await,
+            20
+        );
+        assert_eq!(
+            gws[1]
+                .0
+                .cluster_in_flight(std::slice::from_ref(&pool))
+                .await,
+            Some((20, vec![20]))
+        );
+
+        let b = gws[1].0.clone();
+        let waiter = tokio::spawn(async move { b.admit(model_req(20)).await });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!waiter.is_finished(), "the pool is full cluster-wide");
+        let freed = std::time::Instant::now();
+        permits.pop();
+        let admitted = tokio::time::timeout(std::time::Duration::from_secs(3), waiter)
+            .await
+            .expect("woken by the release")
+            .unwrap()
+            .expect("admitted");
+        assert!(
+            freed.elapsed() < std::time::Duration::from_secs(3),
+            "admitted by the wakeup, not the 30 s retry"
+        );
+        assert_eq!(
+            held_field(&store, &keys, "b", &format!("p|{}", pool.slot_id())).await,
+            1
+        );
+        drop(admitted);
+        drop(permits);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while totals_field(&store, &keys, "g").await != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("every slot released");
+        for (_, listener) in gws {
+            listener.abort();
+        }
+        drop_test_keys(&store, &keys, &["a", "b", "c"]).await;
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    /// Redis going away mid-traffic puts a gateway on the split; when it
+    /// comes back the gateway reconciles what it admitted meanwhile and goes
+    /// back to shared slots.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_redis_outage_falls_back_to_the_split_and_recovers() {
+        let Ok(url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let info = redis::Client::open(url.as_str())
+            .unwrap()
+            .get_connection_info()
+            .clone();
+        let redis::ConnectionAddr::Tcp(host, port) = info.addr.clone() else {
+            eprintln!("skipping: the relay needs a TCP Redis URL");
+            return;
+        };
+        let relay = Relay::start(format!("{host}:{port}")).await;
+        let mut relayed_info = info.clone();
+        relayed_info.addr = redis::ConnectionAddr::Tcp("127.0.0.1".into(), relay.port);
+        let client = redis::Client::open(relayed_info).unwrap();
+        let config = ConnectionManagerConfig::new()
+            .set_response_timeout(std::time::Duration::from_millis(250))
+            .set_connection_timeout(std::time::Duration::from_millis(500))
+            .set_number_of_retries(0);
+        let relayed = RedisStore {
+            conn: relayed_connection(&client, config).await,
+            client,
+        };
+        let direct = test_store().await.unwrap();
+        let keys = replica_test_key();
+        // b is another live gateway; a reaches Redis through the relay.
+        live(&direct, &keys, &["b"]).await;
+        let (fs, listener) = slot_gateway(&relayed, &keys, "a", 2, slot_config()).await;
+        wait_for_slot_mode(&fs, SlotMode::Shared).await;
+        let pool = format!(
+            "p|{}",
+            obleth_fairshare::PoolKey::Model("shared-model".into()).slot_id()
+        );
+        let mut permits = vec![admit_in_time(&fs, 10).await];
+        assert_eq!(held_field(&direct, &keys, "a", &pool).await, 1);
+
+        relay.down();
+        let started = std::time::Instant::now();
+        permits.push(admit_in_time(&fs, 10).await);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "a dead Redis cannot stall admission: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(fs.stats().mode(), SlotMode::Fallback);
+        let snap = fs.snapshot().await.unwrap();
+        assert_eq!(snap.mode, "fallback");
+        assert_eq!(snap.pools[0].cap, 5, "ceil(10 / 2)");
+        while permits.len() < 5 {
+            permits.push(admit_in_time(&fs, 10).await);
+        }
+        let blocked = {
+            let fs = fs.clone();
+            tokio::spawn(async move { fs.admit(model_req(10)).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(!blocked.is_finished(), "the split still bounds admission");
+
+        relay.up().await;
+        wait_for_slot_mode(&fs, SlotMode::Shared).await;
+        let admitted = tokio::time::timeout(std::time::Duration::from_secs(3), blocked)
+            .await
+            .expect("admitted once shared again")
+            .unwrap()
+            .expect("admitted");
+        assert_eq!(
+            held_field(&direct, &keys, "a", &pool).await,
+            6,
+            "what the split admitted is on the books"
+        );
+        drop(admitted);
+        drop(permits);
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while held_field(&direct, &keys, "a", &pool).await != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("releases recorded after recovery");
+        listener.abort();
+        relay.down();
+        drop_test_keys(&direct, &keys, &["a", "b"]).await;
     }
 }
