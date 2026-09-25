@@ -1348,7 +1348,7 @@ impl Store {
                 energy_slots_per_node, route_bias, auto_eligible,
                 draft_model, verify_api_base, verify_upstream_model, aliases, quantization,
                 upstream_headers, cost_per_video, capacity_mode, capacity_namespace,
-                capacity_selector, per_replica_max_in_flight, capacity_source, capacity_headroom
+                capacity_service, per_replica_max_in_flight, capacity_source, capacity_headroom
              ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)
              returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
@@ -1356,7 +1356,7 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
                        per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
@@ -1398,7 +1398,7 @@ impl Store {
         .bind(cost_per_video.max(0.0))
         .bind(obleth_config::normalize_capacity_mode(capacity_mode))
         .bind(&discovery.namespace)
-        .bind(&discovery.selector)
+        .bind(&discovery.service)
         .bind(discovery.per_replica_max_in_flight.map(|n| n.max(1)))
         .bind(&discovery.source)
         .bind(discovery.headroom)
@@ -1415,7 +1415,7 @@ impl Store {
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                    capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                    capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
                        per_replica_max_in_flight, capacity_headroom,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
                     debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
@@ -1435,7 +1435,7 @@ impl Store {
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                    capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                    capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
                        per_replica_max_in_flight, capacity_headroom,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
                     debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
@@ -1457,7 +1457,7 @@ impl Store {
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                    capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                    capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
                        per_replica_max_in_flight, capacity_headroom,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
                     debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
@@ -1555,7 +1555,7 @@ impl Store {
                 draft_model = $27, verify_api_base = $28, verify_upstream_model = $29,
                 aliases = $30, quantization = $31, upstream_headers = $32,
                 cost_per_video = $33, capacity_mode = $34, capacity_namespace = $35,
-                capacity_selector = $36, per_replica_max_in_flight = $37,
+                capacity_service = $36, per_replica_max_in_flight = $37,
                 capacity_source = $38, capacity_headroom = $39,
                 updated_at = now()
              where id = $1
@@ -1565,7 +1565,7 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
                        per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
@@ -1607,7 +1607,7 @@ impl Store {
         .bind(cost_per_video.max(0.0))
         .bind(obleth_config::normalize_capacity_mode(capacity_mode))
         .bind(&discovery.namespace)
-        .bind(&discovery.selector)
+        .bind(&discovery.service)
         .bind(discovery.per_replica_max_in_flight.map(|n| n.max(1)))
         .bind(&discovery.source)
         .bind(discovery.headroom)
@@ -1642,7 +1642,7 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
                        per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
@@ -1670,7 +1670,7 @@ impl Store {
         let row = sqlx::query(
             "update models set capacity_mode = $2,
                     capacity_namespace = case when $3 then $4 else capacity_namespace end,
-                    capacity_selector = case when $3 then $5 else capacity_selector end,
+                    capacity_service = case when $3 then $5 else capacity_service end,
                     per_replica_max_in_flight =
                         case when $3 then $6 else per_replica_max_in_flight end,
                     capacity_source = case when $3 then $7 else capacity_source end,
@@ -1683,7 +1683,7 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
                        per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
@@ -1692,7 +1692,7 @@ impl Store {
         .bind(obleth_config::normalize_capacity_mode(capacity_mode))
         .bind(discovery.is_some())
         .bind(discovery.as_ref().and_then(|d| d.namespace.clone()))
-        .bind(discovery.as_ref().and_then(|d| d.selector.clone()))
+        .bind(discovery.as_ref().and_then(|d| d.service.clone()))
         .bind(
             discovery
                 .as_ref()
@@ -1730,7 +1730,7 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
                        per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
@@ -1757,7 +1757,7 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
                        per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
@@ -1773,7 +1773,7 @@ impl Store {
     pub async fn all_resolved_models(&self) -> Result<Vec<(String, ResolvedModel)>> {
         let rows = sqlx::query(
             "select id, model_name, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization, admission_weight, max_in_flight, enabled,
-                    capacity_mode, capacity_source, capacity_namespace, capacity_selector,
+                    capacity_mode, capacity_source, capacity_namespace, capacity_service,
                     per_replica_max_in_flight, capacity_headroom,
                     cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video,
@@ -1855,7 +1855,7 @@ impl Store {
                         .try_get::<String, _>("capacity_source")
                         .unwrap_or_else(|_| obleth_config::DEFAULT_CAPACITY_SOURCE.to_string()),
                     capacity_namespace: row.try_get("capacity_namespace").unwrap_or(None),
-                    capacity_selector: row.try_get("capacity_selector").unwrap_or(None),
+                    capacity_service: row.try_get("capacity_service").unwrap_or(None),
                     per_replica_max_in_flight: row
                         .try_get::<Option<i64>, _>("per_replica_max_in_flight")
                         .unwrap_or(None)
@@ -1979,7 +1979,7 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
                        per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
@@ -2016,7 +2016,7 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
                        per_replica_max_in_flight, capacity_headroom,
                        request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
@@ -3057,7 +3057,7 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
                        per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
@@ -3604,7 +3604,7 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
             .try_get::<String, _>("capacity_source")
             .unwrap_or_else(|_| obleth_config::DEFAULT_CAPACITY_SOURCE.to_string()),
         capacity_namespace: row.try_get("capacity_namespace").unwrap_or(None),
-        capacity_selector: row.try_get("capacity_selector").unwrap_or(None),
+        capacity_service: row.try_get("capacity_service").unwrap_or(None),
         per_replica_max_in_flight: row.try_get("per_replica_max_in_flight").unwrap_or(None),
         capacity_headroom: row.try_get("capacity_headroom").unwrap_or(1.0),
         supports_function_calling: row.try_get("supports_function_calling")?,
@@ -4266,7 +4266,7 @@ mod tests {
         let discovery = obleth_config::capacity::DiscoveryFields {
             source: " Kubernetes ".into(),
             namespace: Some(" inference ".into()),
-            selector: Some("app=served,role!=worker".into()),
+            service: Some("served-serve".into()),
             per_replica_max_in_flight: Some(8),
             headroom: 1.25,
         };
@@ -4314,10 +4314,7 @@ mod tests {
             assert_eq!(m.capacity_mode, "discovered");
             assert_eq!(m.capacity_source, "kubernetes");
             assert_eq!(m.capacity_namespace.as_deref(), Some("inference"));
-            assert_eq!(
-                m.capacity_selector.as_deref(),
-                Some("app=served,role!=worker")
-            );
+            assert_eq!(m.capacity_service.as_deref(), Some("served-serve"));
             assert_eq!(m.per_replica_max_in_flight, Some(8));
             assert_eq!(m.capacity_headroom, 1.25);
         };
@@ -4371,10 +4368,7 @@ mod tests {
             .await
             .expect("mode only");
         assert_eq!(m.capacity_mode, "static");
-        assert_eq!(
-            m.capacity_selector.as_deref(),
-            Some("app=served,role!=worker")
-        );
+        assert_eq!(m.capacity_service.as_deref(), Some("served-serve"));
         // ...and with fields replaces them.
         let m = store
             .update_model_capacity_mode(
@@ -4389,7 +4383,7 @@ mod tests {
             .expect("mode and fields");
         assert_eq!(m.capacity_source, "endpoints");
         assert_eq!(m.capacity_namespace, None);
-        assert_eq!(m.capacity_selector, None);
+        assert_eq!(m.capacity_service, None);
         assert_eq!(m.per_replica_max_in_flight, Some(4));
         assert_eq!(m.capacity_headroom, 1.0);
 

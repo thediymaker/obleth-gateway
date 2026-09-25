@@ -123,15 +123,17 @@ pub struct CapacityDiscoveryConfig {
     /// How often each replica re-reads the sources
     /// (`OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS`, default 15, at least 1).
     pub interval: Duration,
-    /// Namespaces the `kubernetes` source may list pods in
-    /// (`OBLETH_CAPACITY_DISCOVERY_NAMESPACES`, comma-separated). Also the
-    /// namespaces searched for a model that names none. Empty leaves the
-    /// `kubernetes` source unavailable and no Kubernetes client is built.
+    /// Namespaces the `kubernetes` source may read Service endpoints in
+    /// (`OBLETH_CAPACITY_DISCOVERY_NAMESPACES`, comma-separated). A model
+    /// that names no namespace is looked up in them in this order, and the
+    /// first one that has its Service wins. Empty leaves the `kubernetes`
+    /// source unavailable and no Kubernetes client is built.
     pub namespaces: Vec<String>,
-    /// Selector template for `kubernetes`-source models that set no selector
-    /// (`OBLETH_CAPACITY_DEFAULT_SELECTOR`), with `{upstream_model}` and
-    /// `{model_name}` placeholders. Empty: such a model is refused.
-    pub default_selector: String,
+    /// Service name template for `kubernetes`-source models that set no
+    /// `capacity_service` (`OBLETH_CAPACITY_DEFAULT_SERVICE`), with
+    /// `{upstream_model}` and `{model_name}` placeholders. Empty: such a model
+    /// is refused.
+    pub default_service: String,
 }
 
 impl CapacityDiscoveryConfig {
@@ -148,7 +150,7 @@ impl CapacityDiscoveryConfig {
             env::var("OBLETH_CAPACITY_DISCOVERY_NAMESPACES")
                 .ok()
                 .as_deref(),
-            env::var("OBLETH_CAPACITY_DEFAULT_SELECTOR").ok().as_deref(),
+            env::var("OBLETH_CAPACITY_DEFAULT_SERVICE").ok().as_deref(),
         )
     }
 
@@ -158,7 +160,7 @@ impl CapacityDiscoveryConfig {
         enabled: Option<&str>,
         interval_secs: Option<&str>,
         namespaces: Option<&str>,
-        default_selector: Option<&str>,
+        default_service: Option<&str>,
     ) -> Self {
         let secs = interval_secs
             .and_then(|v| v.trim().parse::<u64>().ok())
@@ -168,7 +170,7 @@ impl CapacityDiscoveryConfig {
             enabled: lenient_bool(enabled, false),
             interval: Duration::from_secs(secs),
             namespaces: crate::capacity::parse_namespace_list(namespaces.unwrap_or_default()),
-            default_selector: default_selector.unwrap_or_default().trim().to_string(),
+            default_service: default_service.unwrap_or_default().trim().to_string(),
         }
     }
 }
@@ -482,18 +484,18 @@ mod tests {
         assert!(!d.enabled);
         assert_eq!(d.interval, Duration::from_secs(15));
         assert!(d.namespaces.is_empty());
-        assert!(d.default_selector.is_empty());
+        assert!(d.default_service.is_empty());
 
         let c = CapacityDiscoveryConfig::from_values(
             Some("true"),
             Some("30"),
             Some(" llm, image ,llm"),
-            Some(" app={upstream_model} "),
+            Some(" {upstream_model} "),
         );
         assert!(c.enabled);
         assert_eq!(c.interval, Duration::from_secs(30));
         assert_eq!(c.namespaces, vec!["llm", "image"]);
-        assert_eq!(c.default_selector, "app={upstream_model}");
+        assert_eq!(c.default_service, "{upstream_model}");
 
         let c = CapacityDiscoveryConfig::from_values(Some("off"), Some("0"), None, None);
         assert!(!c.enabled);

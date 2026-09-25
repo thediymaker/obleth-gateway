@@ -43,7 +43,7 @@ const MODEL_COLUMNS: &str = "id, model_name, aliases, description, upstream_mode
      upstream_headers, model_type, quantization, input_cost_per_token, output_cost_per_token, cost_per_image,
      cost_per_audio_second, cost_per_character, cost_per_video, context_window, admission_weight,
      max_in_flight, capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace,
-     capacity_selector, per_replica_max_in_flight, capacity_headroom, supports_function_calling,
+     capacity_service, per_replica_max_in_flight, capacity_headroom, supports_function_calling,
      supports_system_messages, supports_response_schema, supports_tool_choice,
      supports_vision, enabled, cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
      request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
@@ -80,7 +80,7 @@ impl Store {
                     endpoint_selection_mode, debug_diagnostics, energy_slots_per_node,
                     route_bias, auto_eligible,
                     draft_model, verify_api_base, verify_upstream_model, aliases, quantization,
-                    upstream_headers, cost_per_video, capacity_namespace, capacity_selector,
+                    upstream_headers, cost_per_video, capacity_namespace, capacity_service,
                     per_replica_max_in_flight, capacity_source, capacity_headroom
                  ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                     $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
@@ -127,7 +127,7 @@ impl Store {
                     upstream_headers = excluded.upstream_headers,
                     cost_per_video = excluded.cost_per_video,
                     capacity_namespace = excluded.capacity_namespace,
-                    capacity_selector = excluded.capacity_selector,
+                    capacity_service = excluded.capacity_service,
                     per_replica_max_in_flight = excluded.per_replica_max_in_flight,
                     capacity_source = excluded.capacity_source,
                     capacity_headroom = excluded.capacity_headroom,
@@ -186,7 +186,7 @@ impl Store {
                     c.capacity_namespace.as_deref(),
                 ))
                 .bind(obleth_config::capacity::normalize_optional_text(
-                    c.capacity_selector.as_deref(),
+                    c.capacity_service.as_deref(),
                 ))
                 .bind(c.per_replica_max_in_flight.map(|n| n.max(1)))
                 .bind(&c.capacity_source)

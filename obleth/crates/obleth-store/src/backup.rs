@@ -132,7 +132,7 @@ impl Store {
                     input_cost_per_token, output_cost_per_token, cost_per_image,
                     cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                     admission_weight, max_in_flight, capacity_mode, capacity_tuned_at,
-                    capacity_source, capacity_namespace, capacity_selector,
+                    capacity_source, capacity_namespace, capacity_service,
                     per_replica_max_in_flight, capacity_headroom, supports_function_calling,
                     supports_system_messages, supports_response_schema, supports_tool_choice,
                     supports_vision, enabled, cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
@@ -399,7 +399,7 @@ impl Store {
                         health_failure_threshold, health_maintenance_until,
                         health_maintenance_note, created_at,
                         debug_diagnostics, energy_slots_per_node, aliases, quantization,
-                        upstream_headers, cost_per_video, capacity_namespace, capacity_selector,
+                        upstream_headers, cost_per_video, capacity_namespace, capacity_service,
                         per_replica_max_in_flight, capacity_source, capacity_headroom)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
@@ -455,7 +455,7 @@ impl Store {
                         upstream_headers = excluded.upstream_headers,
                         cost_per_video = excluded.cost_per_video,
                         capacity_namespace = excluded.capacity_namespace,
-                        capacity_selector = excluded.capacity_selector,
+                        capacity_service = excluded.capacity_service,
                         per_replica_max_in_flight = excluded.per_replica_max_in_flight,
                         capacity_source = excluded.capacity_source,
                         capacity_headroom = excluded.capacity_headroom,
@@ -528,7 +528,7 @@ impl Store {
                 m.capacity_namespace.as_deref(),
             ))
             .bind(obleth_config::capacity::normalize_optional_text(
-                m.capacity_selector.as_deref(),
+                m.capacity_service.as_deref(),
             ))
             .bind(m.per_replica_max_in_flight.filter(|n| *n >= 1))
             .bind(
@@ -747,7 +747,7 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
             .try_get::<String, _>("capacity_source")
             .unwrap_or_else(|_| obleth_config::DEFAULT_CAPACITY_SOURCE.to_string()),
         capacity_namespace: row.try_get("capacity_namespace").unwrap_or(None),
-        capacity_selector: row.try_get("capacity_selector").unwrap_or(None),
+        capacity_service: row.try_get("capacity_service").unwrap_or(None),
         per_replica_max_in_flight: row.try_get("per_replica_max_in_flight").unwrap_or(None),
         capacity_headroom: row.try_get("capacity_headroom").unwrap_or(1.0),
         supports_function_calling: row.try_get("supports_function_calling")?,
@@ -908,7 +908,7 @@ mod tests {
                 &obleth_config::capacity::DiscoveryFields {
                     source: "kubernetes".into(),
                     namespace: Some("inference".into()),
-                    selector: Some("app=upstream-model".into()),
+                    service: Some("upstream-model".into()),
                     per_replica_max_in_flight: Some(8),
                     headroom: 1.5,
                 },
@@ -972,7 +972,7 @@ mod tests {
         // And its capacity discovery fields, and the endpoint's concurrency.
         sqlx::query(
             "update models set capacity_mode = 'static', capacity_source = 'endpoints',
-                    capacity_namespace = null, capacity_selector = null,
+                    capacity_namespace = null, capacity_service = null,
                     per_replica_max_in_flight = null, capacity_headroom = 1
              where id = $1",
         )
@@ -1004,8 +1004,8 @@ mod tests {
             Some("inference")
         );
         assert_eq!(
-            restored_model.capacity_selector.as_deref(),
-            Some("app=upstream-model")
+            restored_model.capacity_service.as_deref(),
+            Some("upstream-model")
         );
         assert_eq!(restored_model.per_replica_max_in_flight, Some(8));
         assert_eq!(restored_model.capacity_headroom, 1.5);

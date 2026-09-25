@@ -398,21 +398,23 @@ pub struct ModelRoute {
     pub capacity_tuned_at: Option<chrono::DateTime<chrono::Utc>>,
     /// `discovered` mode: where serving replicas are counted, from the fixed
     /// [`CAPACITY_SOURCES`] vocabulary. `endpoints` (default) counts the
-    /// model's own enabled, healthy endpoints; `kubernetes` counts Ready pods
-    /// matching `capacity_selector`.
+    /// model's own enabled, healthy endpoints; `kubernetes` counts the ready
+    /// endpoints of the Service `capacity_service`.
     #[serde(default = "default_capacity_source")]
     pub capacity_source: String,
-    /// `kubernetes` source: namespace of the backend pods. `None` searches
-    /// every namespace in `OBLETH_CAPACITY_DISCOVERY_NAMESPACES`.
+    /// `kubernetes` source: namespace of the Service. `None` looks it up in
+    /// `OBLETH_CAPACITY_DISCOVERY_NAMESPACES` in order; the first namespace
+    /// that has it wins.
     #[serde(default)]
     pub capacity_namespace: Option<String>,
-    /// `kubernetes` source: label selector for the serving pods. `None` uses
-    /// the gateway's `OBLETH_CAPACITY_DEFAULT_SELECTOR` template.
+    /// `kubernetes` source: name of the Service whose ready endpoints are the
+    /// serving replicas. `None` uses the gateway's
+    /// `OBLETH_CAPACITY_DEFAULT_SERVICE` template.
     #[serde(default)]
-    pub capacity_selector: Option<String>,
+    pub capacity_service: Option<String>,
     /// `discovered` mode: concurrent requests one serving replica takes.
-    /// `None` reads a known concurrency flag off the serving container
-    /// (`kubernetes`) or each endpoint's own `max_in_flight` (`endpoints`).
+    /// Required on the `kubernetes` source, and on `endpoints` unless every
+    /// endpoint sets its own `max_in_flight`.
     #[serde(default)]
     pub per_replica_max_in_flight: Option<i64>,
     /// `discovered` mode: multiplier on the derived pool size. `1.0` admits
@@ -597,7 +599,7 @@ pub struct ResolvedModel {
     #[serde(default)]
     pub capacity_namespace: Option<String>,
     #[serde(default)]
-    pub capacity_selector: Option<String>,
+    pub capacity_service: Option<String>,
     #[serde(default)]
     pub per_replica_max_in_flight: Option<usize>,
     #[serde(default = "default_capacity_headroom")]
@@ -1338,8 +1340,8 @@ fn default_model_type() -> String {
 
 /// Fixed vocabulary of capacity-tuning modes. `static` keeps the operator-set
 /// `max_in_flight`; `tuned` lets auto-tune set it from a ramp probe;
-/// `discovered` derives the pool size from the live backend on Kubernetes
-/// (ready serving replicas x per-replica concurrency), with `max_in_flight`
+/// `discovered` derives the pool size from the live backend (ready serving
+/// replicas x per-replica concurrency), with `max_in_flight`
 /// kept as the fallback when discovery has no answer.
 pub const CAPACITY_MODES: &[&str] = &["static", "tuned", "discovered"];
 
@@ -1348,8 +1350,8 @@ pub const DISCOVERED_CAPACITY_MODE: &str = "discovered";
 
 /// Fixed vocabulary of capacity sources for the `discovered` mode.
 /// `endpoints` counts the model's own enabled, healthy endpoints and needs
-/// nothing outside the gateway; `kubernetes` counts the Ready pods matching a
-/// label selector through the Kubernetes API.
+/// nothing outside the gateway; `kubernetes` counts the ready endpoints of a
+/// Service, read from its EndpointSlices through the Kubernetes API.
 pub const CAPACITY_SOURCES: &[&str] = &["endpoints", "kubernetes"];
 
 /// The capacity source assigned to a model when none is specified.
@@ -2926,7 +2928,7 @@ pub struct ModelBackup {
     #[serde(default)]
     pub capacity_namespace: Option<String>,
     #[serde(default)]
-    pub capacity_selector: Option<String>,
+    pub capacity_service: Option<String>,
     #[serde(default)]
     pub per_replica_max_in_flight: Option<i64>,
     #[serde(default = "default_capacity_headroom")]
@@ -3722,7 +3724,7 @@ mod tests {
             capacity_mode: "static".into(),
             capacity_source: "endpoints".into(),
             capacity_namespace: None,
-            capacity_selector: None,
+            capacity_service: None,
             per_replica_max_in_flight: None,
             capacity_headroom: 1.0,
             enabled: true,

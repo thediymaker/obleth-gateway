@@ -861,17 +861,19 @@ pub struct CreateModel {
     /// `discovered` mode: `endpoints` (default) or `kubernetes`.
     #[serde(default)]
     pub capacity_source: Option<String>,
-    /// `kubernetes` source: namespace of the backend pods. Omitted searches
-    /// the gateway's `OBLETH_CAPACITY_DISCOVERY_NAMESPACES`.
+    /// `kubernetes` source: namespace of the Service. Omitted looks it up in
+    /// the gateway's `OBLETH_CAPACITY_DISCOVERY_NAMESPACES`, in order; the
+    /// first namespace that has it wins.
     #[serde(default)]
     pub capacity_namespace: Option<String>,
-    /// `kubernetes` source: label selector for the serving pods. Omitted uses
-    /// the gateway's `OBLETH_CAPACITY_DEFAULT_SELECTOR`.
+    /// `kubernetes` source: name of the Service whose ready endpoints count
+    /// the serving replicas. Omitted uses the gateway's
+    /// `OBLETH_CAPACITY_DEFAULT_SERVICE` template.
     #[serde(default)]
-    pub capacity_selector: Option<String>,
-    /// Requests one serving replica takes. Omitted reads a known concurrency
-    /// flag off the serving container (`kubernetes`) or uses each endpoint's
-    /// `max_in_flight` (`endpoints`).
+    pub capacity_service: Option<String>,
+    /// Requests one serving replica takes (e.g. the server's max concurrent
+    /// sequences). Required in `discovered` mode on the `kubernetes` source,
+    /// and on `endpoints` unless every endpoint sets its own `max_in_flight`.
     #[serde(default)]
     pub per_replica_max_in_flight: Option<i64>,
     /// Multiplier on the derived pool size (default 1.0).
@@ -965,7 +967,7 @@ pub struct UpdateModel {
     /// Omitted leaves it unchanged; `null` or `""` clears it.
     #[serde(default, deserialize_with = "nullable")]
     #[schema(value_type = Option<String>)]
-    pub capacity_selector: Option<Option<String>>,
+    pub capacity_service: Option<Option<String>>,
     /// Omitted leaves it unchanged; `null` clears it.
     #[serde(default, deserialize_with = "nullable")]
     #[schema(value_type = Option<i64>)]
@@ -1178,7 +1180,7 @@ pub struct SetModelCapacityMode {
     pub capacity_namespace: Option<Option<String>>,
     #[serde(default, deserialize_with = "nullable")]
     #[schema(value_type = Option<String>)]
-    pub capacity_selector: Option<Option<String>>,
+    pub capacity_service: Option<Option<String>>,
     #[serde(default, deserialize_with = "nullable")]
     #[schema(value_type = Option<i64>)]
     pub per_replica_max_in_flight: Option<Option<i64>>,
@@ -1682,17 +1684,18 @@ pub struct ModelRouteView {
     /// until the model has been tuned.
     pub capacity_tuned_at: Option<chrono::DateTime<chrono::Utc>>,
     /// `discovered` mode: where serving replicas are counted, `endpoints`
-    /// (the model's enabled, healthy endpoints) or `kubernetes` (Ready pods).
+    /// (the model's enabled, healthy endpoints) or `kubernetes` (the ready
+    /// endpoints of a Service).
     pub capacity_source: String,
-    /// `kubernetes` source: namespace of the backend pods. `None` searches
-    /// the gateway's `OBLETH_CAPACITY_DISCOVERY_NAMESPACES`.
+    /// `kubernetes` source: namespace of the Service. `None` looks it up in
+    /// the gateway's `OBLETH_CAPACITY_DISCOVERY_NAMESPACES`, in order.
     pub capacity_namespace: Option<String>,
-    /// `kubernetes` source: label selector for the serving pods. `None` uses
-    /// the gateway's `OBLETH_CAPACITY_DEFAULT_SELECTOR`.
-    pub capacity_selector: Option<String>,
-    /// Requests one serving replica takes. `None` reads a known concurrency
-    /// flag off the serving container (`kubernetes`) or each endpoint's
-    /// `max_in_flight` (`endpoints`).
+    /// `kubernetes` source: name of the Service. `None` uses the gateway's
+    /// `OBLETH_CAPACITY_DEFAULT_SERVICE` template.
+    pub capacity_service: Option<String>,
+    /// Requests one serving replica takes. `None` only for the `endpoints`
+    /// source when every endpoint sets its own `max_in_flight`, or outside
+    /// the `discovered` mode.
     pub per_replica_max_in_flight: Option<i64>,
     /// Multiplier on the derived pool size; `1.0` is exactly the ready
     /// capacity.
@@ -1820,7 +1823,7 @@ impl From<ModelRoute> for ModelRouteView {
             capacity_tuned_at,
             capacity_source,
             capacity_namespace,
-            capacity_selector,
+            capacity_service,
             per_replica_max_in_flight,
             capacity_headroom,
             supports_function_calling,
@@ -1872,7 +1875,7 @@ impl From<ModelRoute> for ModelRouteView {
             capacity_tuned_at,
             capacity_source,
             capacity_namespace,
-            capacity_selector,
+            capacity_service,
             per_replica_max_in_flight,
             capacity_headroom,
             supports_function_calling,
@@ -4928,8 +4931,9 @@ pub struct CapacityDiscoveryView {
     /// Namespaces the `kubernetes` source may read. Empty: that source is
     /// unavailable.
     pub namespaces: Vec<String>,
-    /// Selector template for `kubernetes` models that set none.
-    pub default_selector: String,
+    /// Service name template for `kubernetes` models that set no
+    /// `capacity_service`.
+    pub default_service: String,
     /// Live gateway replicas each pool size is divided across.
     pub replicas: usize,
     pub models: Vec<CapacityDiscoveryModelView>,
@@ -4992,7 +4996,8 @@ async fn get_capacity_discovery(
                     model_name: m.model_name.clone(),
                     source: m.capacity_source.clone(),
                     namespaces: Vec::new(),
-                    selector: m.capacity_selector.clone(),
+                    namespace: m.capacity_namespace.clone(),
+                    service: m.capacity_service.clone(),
                     ready_replicas: None,
                     per_replica_max_in_flight: None,
                     per_replica_source: None,
@@ -5023,7 +5028,7 @@ async fn get_capacity_discovery(
         enabled: settings.enabled,
         interval_secs: settings.interval.as_secs(),
         namespaces: settings.namespaces,
-        default_selector: settings.default_selector,
+        default_service: settings.default_service,
         replicas,
         models,
     }))
@@ -5616,7 +5621,7 @@ fn patch_discovery_fields(
     existing: &ModelRoute,
     source: Option<&str>,
     namespace: Option<&Option<String>>,
-    selector: Option<&Option<String>>,
+    service: Option<&Option<String>>,
     per_replica_max_in_flight: Option<Option<i64>>,
     headroom: Option<f64>,
 ) -> obleth_config::capacity::DiscoveryFields {
@@ -5624,7 +5629,7 @@ fn patch_discovery_fields(
     obleth_config::capacity::DiscoveryFields {
         source: source.map(str::to_string).unwrap_or(current.source),
         namespace: namespace.cloned().unwrap_or(current.namespace),
-        selector: selector.cloned().unwrap_or(current.selector),
+        service: service.cloned().unwrap_or(current.service),
         per_replica_max_in_flight: per_replica_max_in_flight
             .unwrap_or(current.per_replica_max_in_flight),
         headroom: headroom.unwrap_or(current.headroom),
@@ -5635,12 +5640,17 @@ fn patch_discovery_fields(
 /// Check a model's capacity fields, and for a `discovered` model on the
 /// `kubernetes` source that this gateway can read it (see
 /// [`obleth_config::capacity::validate_discovery_fields`]).
+///
+/// `endpoint_max_in_flight` is each of the model's endpoints' own
+/// `max_in_flight` (see [`endpoint_concurrency`]), which decides whether an
+/// `endpoints`-source model needs its own per-replica value.
 fn validate_capacity_fields(
     state: &AdminState,
     capacity_mode: &str,
     model_name: &str,
     upstream_model: &str,
     fields: &obleth_config::capacity::DiscoveryFields,
+    endpoint_max_in_flight: &[Option<i64>],
 ) -> Result<()> {
     obleth_config::capacity::validate_discovery_fields(
         model_name,
@@ -5648,8 +5658,59 @@ fn validate_capacity_fields(
         fields,
         capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE,
         state.capacity_discovery.policy(),
+        endpoint_max_in_flight,
     )
     .map_err(AdminError::BadRequest)
+}
+
+/// The own `max_in_flight` of each of a model's endpoints.
+async fn endpoint_concurrency(state: &AdminState, model_id: Uuid) -> Result<Vec<Option<i64>>> {
+    Ok(state
+        .store
+        .list_model_endpoints(model_id)
+        .await?
+        .into_iter()
+        .map(|e| e.max_in_flight)
+        .collect())
+}
+
+/// Refuse an endpoint write that would leave a `discovered` model on the
+/// `endpoints` source with an endpoint it cannot count: one with no
+/// `max_in_flight` while the model has no `per_replica_max_in_flight`.
+/// `endpoint_id` is the endpoint being written (`None` for a new one) and
+/// `max_in_flight` its value after the write.
+async fn validate_endpoint_write(
+    state: &AdminState,
+    model: &ModelRoute,
+    endpoint_id: Option<Uuid>,
+    max_in_flight: Option<i64>,
+) -> Result<()> {
+    if model.capacity_mode != obleth_config::DISCOVERED_CAPACITY_MODE {
+        return Ok(());
+    }
+    let mut values: Vec<Option<i64>> = state
+        .store
+        .list_model_endpoints(model.id)
+        .await?
+        .into_iter()
+        .filter(|e| Some(e.id) != endpoint_id)
+        .map(|e| e.max_in_flight)
+        .collect();
+    values.push(max_in_flight);
+    validate_capacity_fields(
+        state,
+        &model.capacity_mode,
+        &model.model_name,
+        &model.upstream_model,
+        &obleth_config::capacity::DiscoveryFields::of(model),
+        &values,
+    )
+    .map_err(|e| match e {
+        AdminError::BadRequest(msg) => {
+            AdminError::BadRequest(format!("this endpoint needs its own max_in_flight: {msg}"))
+        }
+        other => other,
+    })
 }
 
 #[utoipa::path(
@@ -5693,17 +5754,19 @@ async fn create_model(
             .clone()
             .unwrap_or_else(|| obleth_config::DEFAULT_CAPACITY_SOURCE.to_string()),
         namespace: body.capacity_namespace.clone(),
-        selector: body.capacity_selector.clone(),
+        service: body.capacity_service.clone(),
         per_replica_max_in_flight: body.per_replica_max_in_flight,
         headroom: body.capacity_headroom.unwrap_or(1.0),
     }
     .normalized();
+    // A new model has no endpoint rows yet.
     validate_capacity_fields(
         &state,
         &capacity_mode,
         body.model_name.trim(),
         &body.upstream_model,
         &discovery,
+        &[],
     )?;
     let model = state
         .store
@@ -5834,7 +5897,7 @@ async fn update_model(
         &existing,
         body.capacity_source.as_deref(),
         body.capacity_namespace.as_ref(),
-        body.capacity_selector.as_ref(),
+        body.capacity_service.as_ref(),
         body.per_replica_max_in_flight,
         body.capacity_headroom,
     );
@@ -5844,6 +5907,7 @@ async fn update_model(
         &existing.model_name,
         &body.upstream_model,
         &discovery,
+        &endpoint_concurrency(&state, existing.id).await?,
     )?;
     let model = state
         .store
@@ -5969,7 +6033,7 @@ async fn set_model_capacity_mode(
         &existing,
         body.capacity_source.as_deref(),
         body.capacity_namespace.as_ref(),
-        body.capacity_selector.as_ref(),
+        body.capacity_service.as_ref(),
         body.per_replica_max_in_flight,
         body.capacity_headroom,
     );
@@ -5979,6 +6043,7 @@ async fn set_model_capacity_mode(
         &existing.model_name,
         &existing.upstream_model,
         &discovery,
+        &endpoint_concurrency(&state, existing.id).await?,
     )?;
     let model = state
         .store
@@ -5996,7 +6061,7 @@ async fn set_model_capacity_mode(
                 "capacity_mode": model.capacity_mode,
                 "capacity_source": model.capacity_source,
                 "capacity_namespace": model.capacity_namespace,
-                "capacity_selector": model.capacity_selector,
+                "capacity_service": model.capacity_service,
                 "per_replica_max_in_flight": model.per_replica_max_in_flight,
                 "capacity_headroom": model.capacity_headroom,
             }),
@@ -6235,6 +6300,7 @@ async fn create_model_endpoint(
     state.ssrf.validate(&body.api_base).await?;
     validate_endpoint_max_in_flight(body.max_in_flight)?;
     let model = state.store.get_model(id).await?;
+    validate_endpoint_write(&state, &model, None, body.max_in_flight).await?;
     let endpoint = state
         .store
         .create_model_endpoint(
@@ -6296,6 +6362,7 @@ async fn update_model_endpoint(
             .and_then(|e| e.max_in_flight),
     };
     validate_endpoint_max_in_flight(max_in_flight)?;
+    validate_endpoint_write(&state, &model, Some(endpoint_id), max_in_flight).await?;
     let endpoint = state
         .store
         // Scoped to the path model: another model's endpoint id is a 404.
@@ -7034,7 +7101,7 @@ async fn sync_model_from(
         capacity_mode: model.capacity_mode.clone(),
         capacity_source: model.capacity_source.clone(),
         capacity_namespace: model.capacity_namespace.clone(),
-        capacity_selector: model.capacity_selector.clone(),
+        capacity_service: model.capacity_service.clone(),
         per_replica_max_in_flight: model
             .per_replica_max_in_flight
             .and_then(|n| usize::try_from(n).ok())
@@ -7481,7 +7548,7 @@ mod tests {
             enabled: true,
             interval: std::time::Duration::from_secs(15),
             namespaces: vec!["inference".into()],
-            default_selector: "app.example.com/model={upstream_model}".into(),
+            default_service: "{upstream_model}".into(),
         })
         .await
         else {
@@ -7502,18 +7569,31 @@ mod tests {
             b
         };
 
-        // Refused: a namespace outside the allowlist, a bad selector, an
-        // unknown source or mode, a zero per-replica value.
+        // Refused: a namespace outside the allowlist, a bad Service name, no
+        // per-replica value where the mode needs one, an unknown source or
+        // mode, a zero per-replica value.
         for (bad, why) in [
             (
                 serde_json::json!({"capacity_mode": "discovered", "capacity_source": "kubernetes",
-                                   "capacity_namespace": "kube-system"}),
+                                   "capacity_namespace": "kube-system",
+                                   "per_replica_max_in_flight": 8}),
                 "OBLETH_CAPACITY_DISCOVERY_NAMESPACES",
             ),
             (
                 serde_json::json!({"capacity_mode": "discovered", "capacity_source": "kubernetes",
-                                   "capacity_selector": "app in (a"}),
-                "capacity_selector",
+                                   "capacity_service": "app=served-model",
+                                   "per_replica_max_in_flight": 8}),
+                "capacity_service",
+            ),
+            (
+                serde_json::json!({"capacity_mode": "discovered", "capacity_source": "kubernetes"}),
+                "per_replica_max_in_flight is required",
+            ),
+            (
+                // A new model has no endpoint rows: its api_base is counted
+                // at the model's value.
+                serde_json::json!({"capacity_mode": "discovered"}),
+                "per_replica_max_in_flight is required",
             ),
             (
                 serde_json::json!({"capacity_mode": "discovered", "capacity_source": "prometheus"}),
@@ -7538,7 +7618,7 @@ mod tests {
             assert!(body.to_string().contains(why), "{why}: {body}");
         }
 
-        // Accepted: the default selector template renders for this model.
+        // Accepted: the default Service template renders for this model.
         let (status, created) = send(
             &t.app,
             json_request(
@@ -7558,12 +7638,12 @@ mod tests {
         assert_eq!(created["capacity_mode"], "discovered");
         assert_eq!(created["capacity_source"], "kubernetes");
         assert_eq!(created["capacity_namespace"], "inference");
-        assert_eq!(created["capacity_selector"], serde_json::Value::Null);
+        assert_eq!(created["capacity_service"], serde_json::Value::Null);
         assert_eq!(created["per_replica_max_in_flight"], 8);
         assert_eq!(created["capacity_headroom"], 1.25);
         let id = created["id"].as_str().unwrap().to_string();
 
-        // Update: omitted fields are kept, null clears, "" clears text.
+        // Update: omitted fields are kept, "" clears text.
         let (status, updated) = send(
             &t.app,
             json_request(
@@ -7572,8 +7652,7 @@ mod tests {
                 serde_json::json!({
                     "upstream_model": "served-model",
                     "api_base": "http://127.0.0.1:9/v1",
-                    "capacity_selector": "app=served-model,role!=worker",
-                    "per_replica_max_in_flight": null,
+                    "capacity_service": "served-model-head",
                     "capacity_namespace": "",
                 }),
             ),
@@ -7582,17 +7661,31 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{updated}");
         assert_eq!(updated["capacity_mode"], "discovered", "kept");
         assert_eq!(updated["capacity_headroom"], 1.25, "kept");
-        assert_eq!(
-            updated["capacity_selector"],
-            "app=served-model,role!=worker"
-        );
-        assert_eq!(
-            updated["per_replica_max_in_flight"],
-            serde_json::Value::Null
-        );
+        assert_eq!(updated["per_replica_max_in_flight"], 8, "kept");
+        assert_eq!(updated["capacity_service"], "served-model-head");
         assert_eq!(updated["capacity_namespace"], serde_json::Value::Null);
 
-        // An upstream name the template cannot use needs its own selector.
+        // Clearing the per-replica value of a kubernetes model is refused.
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}"),
+                serde_json::json!({
+                    "upstream_model": "served-model",
+                    "api_base": "http://127.0.0.1:9/v1",
+                    "per_replica_max_in_flight": null,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.to_string().contains("--max-num-seqs"),
+            "the error says what to set: {body}"
+        );
+
+        // An upstream name the template cannot use needs its own Service.
         let (status, body) = send(
             &t.app,
             json_request(
@@ -7601,12 +7694,13 @@ mod tests {
                 serde_json::json!({
                     "upstream_model": "org/served-model",
                     "api_base": "http://127.0.0.1:9/v1",
-                    "capacity_selector": null,
+                    "capacity_service": null,
                 }),
             ),
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains("set capacity_service"), "{body}");
 
         // The capacity-mode endpoint switches mode and source together.
         let (status, switched) = send(
@@ -7626,7 +7720,7 @@ mod tests {
         assert_eq!(switched["capacity_source"], "endpoints");
         assert_eq!(switched["per_replica_max_in_flight"], 4);
         assert_eq!(
-            switched["capacity_selector"], "app=served-model,role!=worker",
+            switched["capacity_service"], "served-model-head",
             "omitted fields are kept"
         );
 
@@ -7668,6 +7762,52 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{ep}");
 
+        // Every endpoint has its own value, so the model's may be cleared...
+        let (status, switched) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}/capacity-mode"),
+                serde_json::json!({
+                    "capacity_mode": "discovered",
+                    "per_replica_max_in_flight": null,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{switched}");
+        assert_eq!(
+            switched["per_replica_max_in_flight"],
+            serde_json::Value::Null
+        );
+        // ...and then an endpoint without one, new or cleared, is refused.
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &format!("/api/v1/models/{id}/endpoints"),
+                serde_json::json!({"name": "b", "api_base": "http://127.0.0.1:9/v1"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.to_string()
+                .contains("this endpoint needs its own max_in_flight"),
+            "{body}"
+        );
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}/endpoints/{ep_id}"),
+                serde_json::json!({"name": "a", "api_base": "http://127.0.0.1:9/v1",
+                                   "max_in_flight": null}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
         // The discovery view lists the model with the value in force: no loop
         // runs in this test, so the static fallback, and says why.
         let req = axum::http::Request::get("/api/v1/capacity/discovery")
@@ -7678,6 +7818,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{view}");
         assert_eq!(view["enabled"], true);
         assert_eq!(view["namespaces"], serde_json::json!(["inference"]));
+        assert_eq!(view["default_service"], "{upstream_model}");
         let entry = view["models"]
             .as_array()
             .unwrap()
@@ -9205,7 +9346,7 @@ mod tests {
             capacity_tuned_at: None,
             capacity_source: "endpoints".into(),
             capacity_namespace: None,
-            capacity_selector: None,
+            capacity_service: None,
             per_replica_max_in_flight: None,
             capacity_headroom: 1.0,
             supports_function_calling: false,

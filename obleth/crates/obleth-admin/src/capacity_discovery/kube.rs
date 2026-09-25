@@ -1,14 +1,22 @@
-//! The one Kubernetes call capacity discovery makes: list the pods a label
-//! selector matches in a namespace.
+//! The one Kubernetes call capacity discovery makes: list the EndpointSlices
+//! of a named Service in a namespace, and count its ready endpoints.
 //!
 //! Plain `reqwest` against the API server rather than a Kubernetes client
 //! crate: one read-only endpoint does not justify the `kube`/`k8s-openapi`
 //! dependency tree and its compile time, and the gateway already ships
 //! `reqwest` with rustls. In a pod the client uses the mounted ServiceAccount
 //! (API server from `KUBERNETES_SERVICE_HOST`/`_PORT`, the cluster CA, and the
-//! token re-read on every call, since projected tokens rotate). Only the pod
-//! fields discovery needs are deserialized; nothing read here is logged.
+//! token re-read on every call, since projected tokens rotate).
+//!
+//! Least privilege by construction: the only path this client can build is
+//! `/apis/discovery.k8s.io/v1/namespaces/{ns}/endpointslices`, so the
+//! gateway needs nothing but `get`/`list`/`watch` on `endpointslices` in the
+//! `discovery.k8s.io` group. An EndpointSlice holds a Service's endpoint
+//! addresses, ports, readiness and the name of the pod behind each endpoint,
+//! never a pod spec, environment or Secret. Only the fields discovery counts
+//! are deserialized, and nothing read here is logged.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -19,8 +27,12 @@ const SERVICE_ACCOUNT_DIR: &str = "/var/run/secrets/kubernetes.io/serviceaccount
 /// Per-call timeout. Well under the default discovery interval.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Pods per page when the API server pages the list.
+/// Slices per page when the API server pages the list. A Service has one
+/// slice per 100 endpoints by default, so one page is the norm.
 const PAGE_LIMIT: u32 = 500;
+
+/// The label the EndpointSlice controller puts on every slice of a Service.
+pub const SERVICE_NAME_LABEL: &str = "kubernetes.io/service-name";
 
 /// A minimal read-only Kubernetes API client.
 #[derive(Clone)]
@@ -98,29 +110,50 @@ impl KubeClient {
         }
     }
 
-    /// Every pod in `namespace` that `selector` matches. The first page is
-    /// asked for at `resourceVersion=0`, which the API server may answer from
-    /// its watch cache instead of etcd.
-    pub async fn list_pods(&self, namespace: &str, selector: &str) -> Result<Vec<Pod>, String> {
+    /// The URL of one page of `service`'s EndpointSlices in `namespace`: the
+    /// only request this client makes. The first page is asked for at
+    /// `resourceVersion=0`, which the API server may answer from its watch
+    /// cache instead of etcd.
+    pub(crate) fn endpoint_slices_url(
+        &self,
+        namespace: &str,
+        service: &str,
+        cont: Option<&str>,
+    ) -> Result<reqwest::Url, String> {
+        let mut url = reqwest::Url::parse(&format!(
+            "{}/apis/discovery.k8s.io/v1/namespaces/{namespace}/endpointslices",
+            self.base
+        ))
+        .map_err(|e| format!("bad Kubernetes API URL: {e}"))?;
+        {
+            let mut q = url.query_pairs_mut();
+            q.append_pair("labelSelector", &format!("{SERVICE_NAME_LABEL}={service}"));
+            q.append_pair("limit", &PAGE_LIMIT.to_string());
+            match cont {
+                Some(token) => {
+                    q.append_pair("continue", token);
+                }
+                None => {
+                    q.append_pair("resourceVersion", "0");
+                }
+            }
+        }
+        Ok(url)
+    }
+
+    /// Every EndpointSlice of `service` in `namespace`. An empty list means
+    /// the namespace has no such Service (or one without a selector whose
+    /// slices nobody manages): the EndpointSlice controller keeps at least
+    /// one slice, possibly with no endpoints, for every Service it manages.
+    pub async fn list_endpoint_slices(
+        &self,
+        namespace: &str,
+        service: &str,
+    ) -> Result<Vec<EndpointSlice>, String> {
         let mut out = Vec::new();
         let mut cont: Option<String> = None;
         loop {
-            let mut url =
-                reqwest::Url::parse(&format!("{}/api/v1/namespaces/{namespace}/pods", self.base))
-                    .map_err(|e| format!("bad Kubernetes API URL: {e}"))?;
-            {
-                let mut q = url.query_pairs_mut();
-                q.append_pair("labelSelector", selector);
-                q.append_pair("limit", &PAGE_LIMIT.to_string());
-                match &cont {
-                    Some(token) => {
-                        q.append_pair("continue", token);
-                    }
-                    None => {
-                        q.append_pair("resourceVersion", "0");
-                    }
-                }
-            }
+            let url = self.endpoint_slices_url(namespace, service, cont.as_deref())?;
             let mut req = self.http.get(url).header("accept", "application/json");
             if let Some(token) = self.bearer()? {
                 req = req.bearer_auth(token);
@@ -137,12 +170,14 @@ impl KubeClient {
                     .and_then(|s| s.message)
                     .unwrap_or_default();
                 let hint = if status == reqwest::StatusCode::FORBIDDEN {
-                    " (the gateway's ServiceAccount needs get/list on pods in this namespace)"
+                    " (the gateway's ServiceAccount needs get/list/watch on endpointslices \
+                     (discovery.k8s.io) in this namespace)"
                 } else {
                     ""
                 };
                 return Err(format!(
-                    "listing pods in {namespace} failed: HTTP {}{}{hint}",
+                    "listing the EndpointSlices of Service {service} in {namespace} failed: \
+                     HTTP {}{}{hint}",
                     status.as_u16(),
                     if message.is_empty() {
                         String::new()
@@ -151,10 +186,9 @@ impl KubeClient {
                     },
                 ));
             }
-            let page: PodList = res
-                .json()
-                .await
-                .map_err(|e| format!("unreadable pod list from {namespace}: {e}"))?;
+            let page: EndpointSliceList = res.json().await.map_err(|e| {
+                format!("unreadable EndpointSlice list for Service {service} in {namespace}: {e}")
+            })?;
             out.extend(page.items);
             match page.metadata.cont.filter(|c| !c.is_empty()) {
                 Some(next) => cont = Some(next),
@@ -171,9 +205,9 @@ struct ApiStatus {
 }
 
 #[derive(Debug, Deserialize)]
-struct PodList {
+struct EndpointSliceList {
     #[serde(default)]
-    items: Vec<Pod>,
+    items: Vec<EndpointSlice>,
     #[serde(default)]
     metadata: ListMeta,
 }
@@ -184,80 +218,111 @@ struct ListMeta {
     cont: Option<String>,
 }
 
-/// The parts of a pod discovery reads.
+/// The parts of an EndpointSlice discovery reads.
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct Pod {
-    #[serde(default)]
-    pub metadata: PodMeta,
-    #[serde(default)]
-    pub spec: PodSpec,
-    #[serde(default)]
-    pub status: PodStatus,
+pub struct EndpointSlice {
+    /// `null` in JSON for a slice with no endpoints.
+    #[serde(default, deserialize_with = "null_as_empty")]
+    pub endpoints: Vec<Endpoint>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct PodMeta {
+pub struct Endpoint {
     #[serde(default)]
-    pub name: String,
+    pub addresses: Vec<String>,
     #[serde(default)]
-    pub namespace: String,
-    #[serde(rename = "deletionTimestamp", default)]
-    pub deletion_timestamp: Option<String>,
+    pub conditions: Conditions,
+    #[serde(rename = "targetRef", default)]
+    pub target_ref: Option<TargetRef>,
+}
+
+/// An endpoint's conditions. Each is optional in the API.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Conditions {
+    #[serde(default)]
+    pub ready: Option<bool>,
+    #[serde(default)]
+    pub serving: Option<bool>,
+    #[serde(default)]
+    pub terminating: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
-pub struct PodSpec {
+pub struct TargetRef {
     #[serde(default)]
-    pub containers: Vec<Container>,
+    pub uid: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct Container {
-    #[serde(default)]
-    pub name: String,
-    #[serde(default)]
-    pub command: Vec<String>,
-    #[serde(default)]
-    pub args: Vec<String>,
-    #[serde(default)]
-    pub env: Vec<EnvVar>,
+fn null_as_empty<'de, D, T>(d: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct EnvVar {
-    pub name: String,
-    /// Only a literal value; `valueFrom` is never read.
-    #[serde(default)]
-    pub value: Option<String>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct PodStatus {
-    #[serde(default)]
-    pub phase: String,
-    #[serde(default)]
-    pub conditions: Vec<PodCondition>,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct PodCondition {
-    #[serde(rename = "type", default)]
-    pub kind: String,
-    #[serde(default)]
-    pub status: String,
-}
-
-impl Pod {
-    /// Serving: Running, its Ready condition True, and not being deleted. A
-    /// terminating pod can stay Ready through its grace period while it
-    /// drains, so it no longer counts.
+impl Endpoint {
+    /// Counted as a serving replica: `ready` is explicitly true, `serving`
+    /// is not false (a missing `serving`, from an older or hand-written
+    /// slice, defers to `ready`), and `terminating` is not true (a draining
+    /// pod can stay serving through its grace period, but takes no new
+    /// requests). A missing `ready` is not counted: capacity is only
+    /// claimed for an endpoint the Service says is ready.
     pub fn is_serving(&self) -> bool {
-        self.metadata.deletion_timestamp.is_none()
-            && self.status.phase == "Running"
-            && self
-                .status
-                .conditions
-                .iter()
-                .any(|c| c.kind == "Ready" && c.status == "True")
+        let c = &self.conditions;
+        c.ready == Some(true) && c.serving != Some(false) && c.terminating != Some(true)
+    }
+
+    /// What identifies the backend behind the endpoint across slices: the
+    /// pod's uid, else its addresses.
+    fn key(&self) -> Option<String> {
+        if let Some(uid) = self
+            .target_ref
+            .as_ref()
+            .and_then(|t| t.uid.as_deref())
+            .filter(|u| !u.is_empty())
+        {
+            return Some(format!("uid:{uid}"));
+        }
+        let mut addresses: Vec<&str> = self
+            .addresses
+            .iter()
+            .map(String::as_str)
+            .filter(|a| !a.is_empty())
+            .collect();
+        if addresses.is_empty() {
+            return None;
+        }
+        addresses.sort_unstable();
+        Some(format!("addr:{}", addresses.join(",")))
+    }
+}
+
+/// What a Service's slices say: how many distinct endpoints they list, and
+/// how many of those serve.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EndpointCount {
+    pub total: usize,
+    pub ready: usize,
+}
+
+/// Count the distinct endpoints across a Service's slices. The same backend
+/// can appear in more than one slice (one per address family, or twice for a
+/// moment while the controller moves it between slices), so endpoints are
+/// de-duplicated by the pod's uid, else by address, and one counts as ready
+/// when any of its copies is. An endpoint with neither is skipped.
+pub fn count_endpoints(slices: &[EndpointSlice]) -> EndpointCount {
+    let mut all: HashSet<String> = HashSet::new();
+    let mut ready: HashSet<String> = HashSet::new();
+    for e in slices.iter().flat_map(|s| s.endpoints.iter()) {
+        let Some(key) = e.key() else { continue };
+        if e.is_serving() {
+            ready.insert(key.clone());
+        }
+        all.insert(key);
+    }
+    EndpointCount {
+        total: all.len(),
+        ready: ready.len(),
     }
 }

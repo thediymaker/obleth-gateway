@@ -20,22 +20,26 @@
 //!   `per_replica_max_in_flight`. A model with no endpoint rows counts its
 //!   single `api_base` while the model is healthy. Needs nothing outside the
 //!   gateway.
-//! - `kubernetes`: the Ready, non-terminating pods the model's label selector
-//!   matches in its namespace (or in every allowed namespace). Which pods
-//!   serve is the selector's business: a multi-node deployment whose worker
-//!   pods serve nothing excludes them there (for KubeRay,
-//!   `ray.io/node-type!=worker`). The per-replica value is the model's own,
-//!   else the lowest value a known concurrency flag gives on the serving pods
-//!   (see [`concurrency`]).
+//! - `kubernetes`: the ready, serving, non-terminating endpoints of the
+//!   model's Service, read from its EndpointSlices (see [`kube`]), each
+//!   counted at the model's `per_replica_max_in_flight`. Only replica counts
+//!   are read: no pod, no spec, no environment. Which pods a Service counts is
+//!   its own selector's business, so a multi-node deployment where only some
+//!   pods take requests is counted right by a Service that selects just
+//!   those. A model that names no namespace is looked up in the allowed
+//!   namespaces in order, and the first namespace that has the Service wins.
 //!
-//! Fallbacks: when a source answers with no serving replica, or does not
+//! The per-replica concurrency is always the operator's (it rarely changes,
+//! and reading it off a server's command line would mean reading pod specs).
+//!
+//! Fallbacks: when a source answers with no serving replica (the Service
+//! scaled to zero, every pod restarting, the Service not there), or does not
 //! answer, the last derived value stays (the backend may be restarting or the
 //! API server briefly away), or the static `max_in_flight`/default if there
 //! is none yet. When a model cannot be discovered as configured (no
-//! per-replica value anywhere, no selector, a namespace outside the
-//! allowlist), it uses its static value. Each state change is logged once.
+//! per-replica value, no Service, a namespace outside the allowlist), it uses
+//! its static value. Each state change is logged once.
 
-pub(crate) mod concurrency;
 pub mod kube;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -44,7 +48,9 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
-use obleth_config::capacity::{effective_capacity_selector, DiscoveryPolicy};
+use obleth_config::capacity::{
+    effective_capacity_service, validate_capacity_namespace, DiscoveryPolicy,
+};
 use obleth_config::{CapacityDiscoveryConfig, ResolvedEndpoint, ResolvedModel};
 use obleth_fairshare::FairShare;
 use serde::Serialize;
@@ -52,11 +58,11 @@ use utoipa::ToSchema;
 
 pub use kube::KubeClient;
 
-/// Pod lists fetched at once in one pass.
+/// EndpointSlice lists fetched at once in one pass.
 const LIST_CONCURRENCY: usize = 4;
 
-/// Upper bound on a derived pool size, so a runaway flag value or headroom
-/// cannot overflow anything downstream.
+/// Upper bound on a derived pool size, so a runaway per-replica value or
+/// headroom cannot overflow anything downstream.
 const MAX_DERIVED: usize = 10_000_000;
 
 /// State of a discovered model: `discovered` (derived this pass), `stale`
@@ -65,6 +71,12 @@ const MAX_DERIVED: usize = 10_000_000;
 pub const STATE_DISCOVERED: &str = "discovered";
 pub const STATE_STALE: &str = "stale";
 pub const STATE_FALLBACK: &str = "fallback";
+
+/// Where a per-replica value came from: the model's
+/// `per_replica_max_in_flight`, each endpoint's own `max_in_flight`, or both.
+pub const PER_REPLICA_CONFIGURED: &str = "configured";
+pub const PER_REPLICA_ENDPOINT: &str = "endpoint";
+pub const PER_REPLICA_BOTH: &str = "endpoint and configured";
 
 /// Handle to the gateway's capacity discovery. Cheap to clone.
 #[derive(Clone)]
@@ -83,17 +95,20 @@ pub struct ModelCapacityStatus {
     pub model_name: String,
     /// `endpoints` or `kubernetes`.
     pub source: String,
-    /// `kubernetes`: the namespaces searched.
+    /// `kubernetes`: the namespaces the Service is looked up in, in order.
     pub namespaces: Vec<String>,
-    /// `kubernetes`: the selector the pods were listed with.
-    pub selector: Option<String>,
+    /// `kubernetes`: the namespace the Service was found in on the last
+    /// answer.
+    pub namespace: Option<String>,
+    /// `kubernetes`: the Service whose ready endpoints are counted.
+    pub service: Option<String>,
     /// Serving replicas the source reported on its last answer.
     pub ready_replicas: Option<usize>,
     /// Requests one replica takes, as used in the last derivation.
     pub per_replica_max_in_flight: Option<usize>,
-    /// Where that value came from: `per_replica_max_in_flight`, `endpoint
-    /// max_in_flight`, or the rule that read it off a container (e.g.
-    /// `vLLM --max-num-seqs`).
+    /// Where that value came from: `configured` (the model's
+    /// `per_replica_max_in_flight`), `endpoint` (each endpoint's own
+    /// `max_in_flight`), or `endpoint and configured` when both were used.
     pub per_replica_source: Option<String>,
     pub headroom: f64,
     /// The last value derived from the source: the cluster-wide pool size,
@@ -122,7 +137,7 @@ impl CapacityDiscovery {
         }
     }
 
-    /// Discovery off, no namespaces, no default selector.
+    /// Discovery off, no namespaces, no default Service.
     pub fn disabled() -> Self {
         Self::new(CapacityDiscoveryConfig::default())
     }
@@ -135,7 +150,7 @@ impl CapacityDiscovery {
     pub fn policy(&self) -> DiscoveryPolicy<'_> {
         DiscoveryPolicy {
             namespaces: &self.inner.settings.namespaces,
-            default_selector: &self.inner.settings.default_selector,
+            default_service: &self.inner.settings.default_service,
         }
     }
 
@@ -241,7 +256,7 @@ pub struct DiscoveryTarget {
     pub static_max_in_flight: Option<usize>,
     pub source: String,
     pub namespace: Option<String>,
-    pub selector: Option<String>,
+    pub service: Option<String>,
     pub per_replica_max_in_flight: Option<usize>,
     pub headroom: f64,
     /// False while the model is reported down or in maintenance; decides
@@ -261,7 +276,7 @@ impl DiscoveryTarget {
             static_max_in_flight: m.max_in_flight.filter(|c| *c > 0),
             source: m.capacity_source.clone(),
             namespace: m.capacity_namespace.clone(),
-            selector: m.capacity_selector.clone(),
+            service: m.capacity_service.clone(),
             per_replica_max_in_flight: m.per_replica_max_in_flight.filter(|c| *c > 0),
             headroom: m.capacity_headroom,
             healthy,
@@ -337,65 +352,43 @@ impl Discoverer {
             .filter(|t| !t.model_name.is_empty())
             .collect();
 
-        // Plan the kubernetes reads: one list per distinct namespace and
-        // selector, however many models share them.
         let mut plans: HashMap<String, Result<KubePlan, String>> = HashMap::new();
-        let mut queries: BTreeSet<(String, String)> = BTreeSet::new();
         for t in targets.iter().filter(|t| t.source == "kubernetes") {
-            let plan = self.plan(t, settings);
-            if let Ok(p) = &plan {
-                for ns in &p.namespaces {
-                    queries.insert((ns.clone(), p.selector.clone()));
-                }
-            }
-            plans.insert(t.model_name.clone(), plan);
+            plans.insert(t.model_name.clone(), self.plan(t, settings));
         }
-        let lists = match &self.kube {
-            Some(Ok(client)) if !queries.is_empty() => {
-                stream::iter(queries.into_iter().map(|(ns, sel)| {
-                    let client = client.clone();
-                    async move {
-                        let res = client.list_pods(&ns, &sel).await;
-                        ((ns, sel), res)
-                    }
-                }))
-                .buffer_unordered(LIST_CONCURRENCY)
-                .collect::<HashMap<_, _>>()
-                .await
-            }
+        let lookups = match &self.kube {
+            Some(Ok(client)) => lookup_services(client, plans.values().flatten()).await,
             _ => HashMap::new(),
         };
 
         let mut statuses = BTreeMap::new();
         let mut caps = HashMap::new();
         for t in &targets {
-            let (outcome, namespaces, selector) = match t.source.as_str() {
-                "endpoints" => (endpoints_outcome(t), Vec::new(), None),
+            let mut seen = Seen::default();
+            let outcome = match t.source.as_str() {
+                "endpoints" => endpoints_outcome(t),
                 "kubernetes" => match plans.remove(&t.model_name) {
                     Some(Ok(plan)) => {
-                        let outcome = kubernetes_outcome(t, &plan, &lists);
-                        (outcome, plan.namespaces, Some(plan.selector))
+                        let (outcome, found) = kubernetes_outcome(t, &plan, &lookups);
+                        seen = Seen {
+                            namespaces: plan.namespaces,
+                            namespace: found,
+                            service: Some(plan.service),
+                        };
+                        outcome
                     }
-                    Some(Err(reason)) => (
-                        Outcome::Unusable {
-                            reason,
-                            ready: None,
-                        },
-                        Vec::new(),
-                        None,
-                    ),
-                    None => unreachable!("every kubernetes target was planned"),
-                },
-                other => (
-                    Outcome::Unusable {
-                        reason: format!("unknown capacity_source `{other}`"),
+                    Some(Err(reason)) => Outcome::Unusable {
+                        reason,
                         ready: None,
                     },
-                    Vec::new(),
-                    None,
-                ),
+                    None => unreachable!("every kubernetes target was planned"),
+                },
+                other => Outcome::Unusable {
+                    reason: format!("unknown capacity_source `{other}`"),
+                    ready: None,
+                },
             };
-            let status = self.settle(t, outcome, namespaces, selector, now);
+            let status = self.settle(t, outcome, seen, now);
             caps.insert(t.model_name.clone(), status.effective_max_in_flight);
             statuses.insert(t.model_name.clone(), status);
         }
@@ -408,7 +401,7 @@ impl Discoverer {
         }
     }
 
-    /// Where and how to list a kubernetes-source model's pods.
+    /// Where to look up a kubernetes-source model's Service, and which one.
     fn plan(
         &self,
         t: &DiscoveryTarget,
@@ -418,7 +411,7 @@ impl Discoverer {
             None => {
                 return Err(
                     "the kubernetes capacity source is not available on this gateway: \
-                            OBLETH_CAPACITY_DISCOVERY_NAMESPACES is empty"
+                     OBLETH_CAPACITY_DISCOVERY_NAMESPACES is empty"
                         .into(),
                 )
             }
@@ -428,6 +421,13 @@ impl Discoverer {
                 ))
             }
             Some(Ok(_)) => {}
+        }
+        if t.per_replica_max_in_flight.is_none() {
+            return Err(
+                "per_replica_max_in_flight is required on the kubernetes source (the requests \
+                 one backend replica serves at once)"
+                    .into(),
+            );
         }
         let namespaces = match &t.namespace {
             Some(ns) if settings.namespaces.iter().any(|a| a == ns) => vec![ns.clone()],
@@ -439,15 +439,19 @@ impl Discoverer {
             }
             None => settings.namespaces.clone(),
         };
-        let selector = effective_capacity_selector(
-            t.selector.as_deref(),
-            &settings.default_selector,
+        for ns in &namespaces {
+            validate_capacity_namespace(ns)
+                .map_err(|e| format!("OBLETH_CAPACITY_DISCOVERY_NAMESPACES: {e}"))?;
+        }
+        let service = effective_capacity_service(
+            t.service.as_deref(),
+            &settings.default_service,
             &t.upstream_model,
             &t.model_name,
         )?;
         Ok(KubePlan {
             namespaces,
-            selector,
+            service,
         })
     }
 
@@ -457,8 +461,7 @@ impl Discoverer {
         &mut self,
         t: &DiscoveryTarget,
         outcome: Outcome,
-        namespaces: Vec<String>,
-        selector: Option<String>,
+        seen: Seen,
         now: DateTime<Utc>,
     ) -> ModelCapacityStatus {
         let static_cap = t.static_max_in_flight.unwrap_or(self.default_cap);
@@ -468,8 +471,9 @@ impl Discoverer {
         let mut status = ModelCapacityStatus {
             model_name: t.model_name.clone(),
             source: t.source.clone(),
-            namespaces,
-            selector,
+            namespaces: seen.namespaces,
+            namespace: seen.namespace,
+            service: seen.service,
             ready_replicas: None,
             per_replica_max_in_flight: None,
             per_replica_source: None,
@@ -552,9 +556,68 @@ impl Discoverer {
     }
 }
 
+/// Where a kubernetes-source model's Service is looked up.
 struct KubePlan {
+    /// In order; the first that has the Service wins.
     namespaces: Vec<String>,
-    selector: String,
+    service: String,
+}
+
+/// What a kubernetes-source model's status shows about where it looked.
+#[derive(Default)]
+struct Seen {
+    namespaces: Vec<String>,
+    namespace: Option<String>,
+    service: Option<String>,
+}
+
+/// EndpointSlice lists by `(namespace, service)`.
+type Lookups = HashMap<(String, String), Result<Vec<kube::EndpointSlice>, String>>;
+
+/// The first namespace in `plan` that has not been read yet and is still
+/// needed: every namespace before it answered with no slice for the Service.
+/// `None` once the plan is decided (found, failed, or every namespace empty).
+fn next_lookup(plan: &KubePlan, lookups: &Lookups) -> Option<(String, String)> {
+    for ns in &plan.namespaces {
+        match lookups.get(&(ns.clone(), plan.service.clone())) {
+            None => return Some((ns.clone(), plan.service.clone())),
+            Some(Ok(slices)) if slices.is_empty() => continue,
+            Some(_) => return None,
+        }
+    }
+    None
+}
+
+/// Read the EndpointSlices every plan needs, one round per namespace depth:
+/// each round lists, concurrently and once per distinct namespace and
+/// Service, the next namespace of every plan whose Service has not been
+/// found yet. A plan pinned to one namespace takes one round, and a later
+/// namespace is only read when the earlier ones do not have the Service.
+async fn lookup_services<'a>(
+    client: &KubeClient,
+    plans: impl Iterator<Item = &'a KubePlan> + Clone,
+) -> Lookups {
+    let mut lookups = Lookups::new();
+    loop {
+        let wanted: BTreeSet<(String, String)> = plans
+            .clone()
+            .filter_map(|p| next_lookup(p, &lookups))
+            .collect();
+        if wanted.is_empty() {
+            return lookups;
+        }
+        let answers: Vec<_> = stream::iter(wanted.into_iter().map(|(ns, svc)| {
+            let client = client.clone();
+            async move {
+                let res = client.list_endpoint_slices(&ns, &svc).await;
+                ((ns, svc), res)
+            }
+        }))
+        .buffer_unordered(LIST_CONCURRENCY)
+        .collect()
+        .await;
+        lookups.extend(answers);
+    }
 }
 
 /// `max(1, ceil(ready x per_replica x headroom))`, bounded.
@@ -634,9 +697,9 @@ fn endpoints_outcome(t: &DiscoveryTarget) -> Outcome {
     let total: usize = values.iter().sum();
     let uniform = values.iter().all(|v| *v == values[0]);
     let per_source = match (from_endpoint, from_model) {
-        (true, false) => "endpoint max_in_flight",
-        (false, true) => "per_replica_max_in_flight",
-        _ => "endpoint max_in_flight, else per_replica_max_in_flight",
+        (true, false) => PER_REPLICA_ENDPOINT,
+        (false, true) => PER_REPLICA_CONFIGURED,
+        _ => PER_REPLICA_BOTH,
     };
     Outcome::Observed {
         ready,
@@ -652,68 +715,66 @@ fn endpoints_outcome(t: &DiscoveryTarget) -> Outcome {
     }
 }
 
-/// The `kubernetes` source, from the pod lists fetched this pass.
+/// The `kubernetes` source, from the EndpointSlices read this pass, and the
+/// namespace the Service was found in.
 fn kubernetes_outcome(
     t: &DiscoveryTarget,
     plan: &KubePlan,
-    lists: &HashMap<(String, String), Result<Vec<kube::Pod>, String>>,
-) -> Outcome {
-    let mut pods: Vec<&kube::Pod> = Vec::new();
+    lookups: &Lookups,
+) -> (Outcome, Option<String>) {
+    let service = &plan.service;
+    let Some(per_replica) = t.per_replica_max_in_flight else {
+        // Planning refuses this already; kept so a count never goes out
+        // without its per-replica value.
+        return (
+            Outcome::Unusable {
+                reason: "per_replica_max_in_flight is required on the kubernetes source".into(),
+                ready: None,
+            },
+            None,
+        );
+    };
     for ns in &plan.namespaces {
-        match lists.get(&(ns.clone(), plan.selector.clone())) {
-            Some(Ok(list)) => pods.extend(list.iter()),
-            Some(Err(e)) => return Outcome::Failed { reason: e.clone() },
+        match lookups.get(&(ns.clone(), service.clone())) {
+            Some(Ok(slices)) if slices.is_empty() => continue,
+            Some(Ok(slices)) => {
+                let count = kube::count_endpoints(slices);
+                let outcome = if count.ready == 0 {
+                    Outcome::NoReplicas {
+                        reason: format!(
+                            "Service {service} in {ns} has no ready endpoint ({} listed)",
+                            count.total
+                        ),
+                    }
+                } else {
+                    Outcome::Observed {
+                        ready: count.ready,
+                        per_replica,
+                        per_source: PER_REPLICA_CONFIGURED.into(),
+                    }
+                };
+                return (outcome, Some(ns.clone()));
+            }
+            Some(Err(e)) => return (Outcome::Failed { reason: e.clone() }, None),
             None => {
-                return Outcome::Failed {
-                    reason: "the Kubernetes API was not asked".into(),
-                }
+                return (
+                    Outcome::Failed {
+                        reason: "the Kubernetes API was not asked".into(),
+                    },
+                    None,
+                )
             }
         }
     }
-    let serving: Vec<&kube::Pod> = pods.iter().copied().filter(|p| p.is_serving()).collect();
-    if serving.is_empty() {
-        return Outcome::NoReplicas {
+    (
+        Outcome::NoReplicas {
             reason: format!(
-                "no Ready pod matches `{}` in {} ({} matched)",
-                plan.selector,
-                plan.namespaces.join(", "),
-                pods.len()
+                "no EndpointSlice for Service {service} in {}; does the Service exist there?",
+                plan.namespaces.join(", ")
             ),
-        };
-    }
-    let ready = serving.len();
-    if let Some(v) = t.per_replica_max_in_flight {
-        return Outcome::Observed {
-            ready,
-            per_replica: v,
-            per_source: "per_replica_max_in_flight".into(),
-        };
-    }
-    // The lowest value across the serving pods: during a rollout that changes
-    // it, the old pods still take only what they were started with.
-    let found = serving
-        .iter()
-        .filter_map(|p| concurrency::detect(&p.spec.containers))
-        .min_by_key(|d| d.value);
-    match found {
-        Some(d) => Outcome::Observed {
-            ready,
-            per_replica: d.value,
-            per_source: d.rule,
         },
-        None => Outcome::Unusable {
-            reason: format!(
-                "no known concurrency setting on the serving containers ({}); set \
-                 per_replica_max_in_flight",
-                concurrency::RULES
-                    .iter()
-                    .map(|r| r.server)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-            ready: Some(ready),
-        },
-    }
+        None,
+    )
 }
 
 #[cfg(test)]

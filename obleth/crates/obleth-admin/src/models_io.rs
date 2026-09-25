@@ -160,27 +160,6 @@ pub(crate) async fn import_models(
             }
         }
 
-        // The field syntax was checked by `resolve_model`; whether this gateway
-        // can read a `discovered` model's `kubernetes` source is checked here,
-        // like the create and update forms do.
-        let c = &resolved.config;
-        if let Err(e) = obleth_config::capacity::validate_discovery_fields(
-            &name,
-            &c.upstream_model,
-            &obleth_config::capacity::DiscoveryFields {
-                source: c.capacity_source.clone(),
-                namespace: c.capacity_namespace.clone(),
-                selector: c.capacity_selector.clone(),
-                per_replica_max_in_flight: c.per_replica_max_in_flight,
-                headroom: c.capacity_headroom,
-            },
-            c.capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE,
-            state.capacity_discovery.policy(),
-        ) {
-            errors.push(format!("model '{name}': {e}"));
-            continue;
-        }
-
         let mut changed_fields = resolved.changed_fields.clone();
         let warnings = resolved.warnings.clone();
 
@@ -236,6 +215,45 @@ pub(crate) async fn import_models(
                 Some(resolved_endpoints)
             }
         };
+
+        // The field syntax was checked by `resolve_model`; whether this gateway
+        // can read a `discovered` model's `kubernetes` source, and whether a
+        // per-replica value is there when the mode needs one, are checked
+        // here, like the create and update forms do. Endpoints are upserted
+        // by name, so the model's endpoints after the import are the stored
+        // ones with the listed ones laid over them.
+        let c = &resolved.config;
+        let mut endpoint_values: HashMap<String, Option<i64>> = match current {
+            Some(m) if c.capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE => state
+                .store
+                .list_model_endpoints(m.id)
+                .await?
+                .into_iter()
+                .map(|e| (e.name, e.max_in_flight))
+                .collect(),
+            _ => HashMap::new(),
+        };
+        for e in endpoints.iter().flatten() {
+            endpoint_values.insert(e.name.clone(), e.max_in_flight);
+        }
+        let endpoint_values: Vec<Option<i64>> = endpoint_values.into_values().collect();
+        if let Err(e) = obleth_config::capacity::validate_discovery_fields(
+            &name,
+            &c.upstream_model,
+            &obleth_config::capacity::DiscoveryFields {
+                source: c.capacity_source.clone(),
+                namespace: c.capacity_namespace.clone(),
+                service: c.capacity_service.clone(),
+                per_replica_max_in_flight: c.per_replica_max_in_flight,
+                headroom: c.capacity_headroom,
+            },
+            c.capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE,
+            state.capacity_discovery.policy(),
+            &endpoint_values,
+        ) {
+            errors.push(format!("model '{name}': {e}"));
+            continue;
+        }
 
         let action = if resolved.is_new {
             obleth_config::IMPORT_ACTION_CREATED

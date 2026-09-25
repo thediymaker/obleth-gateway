@@ -152,9 +152,9 @@ pub struct ManifestModel {
     /// `kubernetes` source namespace; an empty string clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_namespace: Option<String>,
-    /// `kubernetes` source label selector; an empty string clears it.
+    /// `kubernetes` source Service name; an empty string clears it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capacity_selector: Option<String>,
+    pub capacity_service: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub per_replica_max_in_flight: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -310,7 +310,7 @@ pub struct ModelConfig {
     pub capacity_mode: String,
     pub capacity_source: String,
     pub capacity_namespace: Option<String>,
-    pub capacity_selector: Option<String>,
+    pub capacity_service: Option<String>,
     pub per_replica_max_in_flight: Option<i64>,
     pub capacity_headroom: f64,
     pub supports_function_calling: bool,
@@ -362,7 +362,7 @@ impl Default for ModelConfig {
             capacity_mode: DEFAULT_CAPACITY_MODE.to_string(),
             capacity_source: DEFAULT_CAPACITY_SOURCE.to_string(),
             capacity_namespace: None,
-            capacity_selector: None,
+            capacity_service: None,
             per_replica_max_in_flight: None,
             capacity_headroom: 1.0,
             supports_function_calling: false,
@@ -415,7 +415,7 @@ impl From<&ModelRoute> for ModelConfig {
             capacity_mode: m.capacity_mode.clone(),
             capacity_source: m.capacity_source.clone(),
             capacity_namespace: m.capacity_namespace.clone(),
-            capacity_selector: m.capacity_selector.clone(),
+            capacity_service: m.capacity_service.clone(),
             per_replica_max_in_flight: m.per_replica_max_in_flight,
             capacity_headroom: m.capacity_headroom,
             supports_function_calling: m.supports_function_calling,
@@ -516,8 +516,8 @@ impl ModelConfig {
             "capacity_namespace",
         );
         note(
-            self.capacity_selector != other.capacity_selector,
-            "capacity_selector",
+            self.capacity_service != other.capacity_service,
+            "capacity_service",
         );
         note(
             self.per_replica_max_in_flight != other.per_replica_max_in_flight,
@@ -723,8 +723,8 @@ pub fn resolve_model(
     if let Some(v) = &entry.capacity_namespace {
         next.capacity_namespace = crate::capacity::normalize_optional_text(Some(v));
     }
-    if let Some(v) = &entry.capacity_selector {
-        next.capacity_selector = crate::capacity::normalize_optional_text(Some(v));
+    if let Some(v) = &entry.capacity_service {
+        next.capacity_service = crate::capacity::normalize_optional_text(Some(v));
     }
     if let Some(v) = entry.per_replica_max_in_flight {
         next.per_replica_max_in_flight = Some(v);
@@ -733,22 +733,25 @@ pub fn resolve_model(
         next.capacity_headroom = v;
     }
     // Syntax only: whether this gateway can read a `kubernetes` source (its
-    // namespace allowlist, its default selector) is the importer's check.
+    // namespace allowlist, its default Service) and whether a per-replica
+    // value is there when the mode needs one (which depends on the model's
+    // endpoints) are the importer's checks.
     crate::capacity::validate_discovery_fields(
         name,
         &next.upstream_model,
         &crate::capacity::DiscoveryFields {
             source: next.capacity_source.clone(),
             namespace: next.capacity_namespace.clone(),
-            selector: next.capacity_selector.clone(),
+            service: next.capacity_service.clone(),
             per_replica_max_in_flight: next.per_replica_max_in_flight,
             headroom: next.capacity_headroom,
         },
         false,
         crate::capacity::DiscoveryPolicy {
             namespaces: &[],
-            default_selector: "",
+            default_service: "",
         },
+        &[],
     )
     .map_err(reject)?;
     if let Some(v) = &entry.endpoint_selection_mode {
@@ -1108,7 +1111,7 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
         capacity_mode: Some(m.capacity_mode.clone()),
         capacity_source: Some(m.capacity_source.clone()),
         capacity_namespace: m.capacity_namespace.clone(),
-        capacity_selector: m.capacity_selector.clone(),
+        capacity_service: m.capacity_service.clone(),
         per_replica_max_in_flight: m.per_replica_max_in_flight,
         capacity_headroom: Some(m.capacity_headroom),
         supports_function_calling: Some(m.supports_function_calling),
@@ -1167,7 +1170,7 @@ mod tests {
             capacity_tuned_at: None,
             capacity_source: "endpoints".into(),
             capacity_namespace: None,
-            capacity_selector: None,
+            capacity_service: None,
             per_replica_max_in_flight: None,
             capacity_headroom: 1.0,
             supports_function_calling: true,
@@ -1447,7 +1450,7 @@ mod tests {
         e.capacity_mode = Some("discovered".into());
         e.capacity_source = Some(" Kubernetes ".into());
         e.capacity_namespace = Some(" inference ".into());
-        e.capacity_selector = Some("app=m,role!=worker".into());
+        e.capacity_service = Some("m-serve".into());
         e.per_replica_max_in_flight = Some(8);
         e.capacity_headroom = Some(1.25);
 
@@ -1455,10 +1458,7 @@ mod tests {
         assert_eq!(r.config.capacity_mode, "discovered");
         assert_eq!(r.config.capacity_source, "kubernetes");
         assert_eq!(r.config.capacity_namespace.as_deref(), Some("inference"));
-        assert_eq!(
-            r.config.capacity_selector.as_deref(),
-            Some("app=m,role!=worker")
-        );
+        assert_eq!(r.config.capacity_service.as_deref(), Some("m-serve"));
         assert_eq!(r.config.per_replica_max_in_flight, Some(8));
         assert_eq!(r.config.capacity_headroom, 1.25);
 
@@ -1468,7 +1468,7 @@ mod tests {
             "capacity_mode",
             "capacity_source",
             "capacity_namespace",
-            "capacity_selector",
+            "capacity_service",
             "per_replica_max_in_flight",
             "capacity_headroom",
         ] {
@@ -1487,7 +1487,7 @@ mod tests {
         let mut stored = route("m");
         stored.capacity_mode = "discovered".into();
         stored.capacity_source = "kubernetes".into();
-        stored.capacity_selector = Some("app=m".into());
+        stored.capacity_service = Some("m".into());
         stored.per_replica_max_in_flight = Some(4);
         stored.capacity_headroom = 1.5;
         let exported = model_to_manifest_entry(&stored);
@@ -1506,8 +1506,8 @@ mod tests {
             ("capacity_namespace", |e| {
                 e.capacity_namespace = Some("Not_A_Namespace".into())
             }),
-            ("capacity_selector", |e| {
-                e.capacity_selector = Some("app in (a".into())
+            ("capacity_service", |e| {
+                e.capacity_service = Some("app=m".into())
             }),
             ("per_replica_max_in_flight", |e| {
                 e.per_replica_max_in_flight = Some(0)

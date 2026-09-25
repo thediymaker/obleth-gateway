@@ -5,19 +5,23 @@
 -- fallback used until (or whenever) discovery has no answer.
 --   capacity_source            where replicas are counted: 'endpoints' (the
 --                              model's own enabled, healthy endpoints) or
---                              'kubernetes' (Ready pods matching a selector)
---   capacity_namespace         kubernetes: namespace of the backend pods; null
---                              searches OBLETH_CAPACITY_DISCOVERY_NAMESPACES
---   capacity_selector          kubernetes: label selector for them; null uses
---                              OBLETH_CAPACITY_DEFAULT_SELECTOR
---   per_replica_max_in_flight  requests one replica takes; null reads a known
---                              concurrency flag off the serving container
---                              (kubernetes) or each endpoint's max_in_flight
+--                              'kubernetes' (the ready endpoints of a Service)
+--   capacity_namespace         kubernetes: namespace of the Service; null looks
+--                              it up in OBLETH_CAPACITY_DISCOVERY_NAMESPACES in
+--                              order, the first namespace that has it wins
+--   capacity_service           kubernetes: name of the Service; null uses the
+--                              OBLETH_CAPACITY_DEFAULT_SERVICE template
+--   per_replica_max_in_flight  requests one replica takes. Required for a
+--                              discovered model on the kubernetes source, and
+--                              on the endpoints source unless every endpoint
+--                              sets its own max_in_flight (checked by the
+--                              Management API, not here: a static model may
+--                              leave it unset)
 --   capacity_headroom          multiplier on the derived value (1 = exactly
 --                              the ready capacity)
 alter table models add column if not exists capacity_source text not null default 'endpoints';
 alter table models add column if not exists capacity_namespace text;
-alter table models add column if not exists capacity_selector text;
+alter table models add column if not exists capacity_service text;
 alter table models add column if not exists per_replica_max_in_flight bigint;
 alter table models add column if not exists capacity_headroom double precision not null default 1;
 

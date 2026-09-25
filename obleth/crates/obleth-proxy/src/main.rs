@@ -1461,7 +1461,7 @@ mod registry_refresh_tests {
             capacity_mode: "static".into(),
             capacity_source: "endpoints".into(),
             capacity_namespace: None,
-            capacity_selector: None,
+            capacity_service: None,
             per_replica_max_in_flight: None,
             capacity_headroom: 1.0,
             enabled: true,

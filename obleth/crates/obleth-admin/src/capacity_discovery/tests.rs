@@ -1,13 +1,13 @@
 //! Discovery passes against a fake Kubernetes API (a local HTTP server that
-//! answers pod lists) and against a model's own endpoints, feeding a real
-//! fairshare scheduler.
+//! answers EndpointSlice lists, and records every path it is asked for) and
+//! against a model's own endpoints, feeding a real fairshare scheduler.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use axum::{Json, Router};
@@ -16,48 +16,103 @@ use obleth_fairshare::{AdmitRequest, FairShare, StaticCapacity};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
+use super::kube::{count_endpoints, EndpointCount, EndpointSlice};
 use super::*;
+
+/// The only path prefix and suffix the kubernetes source may ask for.
+const SLICES_PREFIX: &str = "/apis/discovery.k8s.io/v1/namespaces/";
+const SLICES_SUFFIX: &str = "/endpointslices";
+
+/// Pages of EndpointSlices, or an HTTP error status.
+type Answer = Result<Vec<Vec<Value>>, u16>;
 
 /// What the fake API server answers, and what it was asked.
 #[derive(Default)]
 struct FakeApi {
-    /// `(namespace, selector)` -> pod list JSON, or an HTTP error status.
-    answers: HashMap<(String, String), Result<Value, u16>>,
-    /// Every request: namespace, selector, bearer token.
-    seen: Vec<(String, String, Option<String>)>,
+    /// `(namespace, service)` -> what to answer.
+    answers: HashMap<(String, String), Answer>,
+    /// Every EndpointSlice request: namespace, service, bearer token, query.
+    seen: Vec<Seen>,
+    /// Every path asked for, whatever it was.
+    paths: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Seen {
+    namespace: String,
+    service: String,
+    token: Option<String>,
+    query: HashMap<String, String>,
 }
 
 type Shared = Arc<Mutex<FakeApi>>;
 
-async fn list_pods(
+async fn list_slices(
     State(api): State<Shared>,
     Path(ns): Path<String>,
     Query(q): Query<HashMap<String, String>>,
     headers: HeaderMap,
+    uri: Uri,
 ) -> axum::response::Response {
     let selector = q.get("labelSelector").cloned().unwrap_or_default();
+    let service = selector
+        .strip_prefix("kubernetes.io/service-name=")
+        .unwrap_or("")
+        .to_string();
     let token = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .map(str::to_string);
     let mut api = api.lock().unwrap();
-    api.seen.push((ns.clone(), selector.clone(), token));
-    match api.answers.get(&(ns, selector)) {
-        Some(Ok(list)) => Json(list.clone()).into_response(),
+    api.paths.push(uri.path().to_string());
+    api.seen.push(Seen {
+        namespace: ns.clone(),
+        service: service.clone(),
+        token,
+        query: q.clone(),
+    });
+    let page: usize = q
+        .get("continue")
+        .and_then(|c| c.strip_prefix('p'))
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0);
+    match api.answers.get(&(ns, service)) {
+        Some(Ok(pages)) => {
+            let items = pages.get(page).cloned().unwrap_or_default();
+            let meta = if page + 1 < pages.len() {
+                json!({"continue": format!("p{}", page + 1)})
+            } else {
+                json!({})
+            };
+            Json(json!({"kind": "EndpointSliceList", "metadata": meta, "items": items}))
+                .into_response()
+        }
         Some(Err(code)) => (
             StatusCode::from_u16(*code).unwrap(),
-            Json(json!({"kind": "Status", "message": "pods is forbidden: nope"})),
+            Json(json!({"kind": "Status", "message": "endpointslices is forbidden: nope"})),
         )
             .into_response(),
-        None => Json(json!({"kind": "PodList", "items": []})).into_response(),
+        None => {
+            Json(json!({"kind": "EndpointSliceList", "metadata": {}, "items": []})).into_response()
+        }
     }
+}
+
+/// Anything else the client asks for is recorded and refused.
+async fn anything_else(State(api): State<Shared>, uri: Uri) -> StatusCode {
+    api.lock().unwrap().paths.push(uri.path().to_string());
+    StatusCode::NOT_FOUND
 }
 
 async fn fake_api() -> (KubeClient, Shared) {
     let api: Shared = Arc::default();
     let app = Router::new()
-        .route("/api/v1/namespaces/:ns/pods", get(list_pods))
+        .route(
+            "/apis/discovery.k8s.io/v1/namespaces/:ns/endpointslices",
+            get(list_slices),
+        )
+        .fallback(anything_else)
         .with_state(api.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -68,53 +123,74 @@ async fn fake_api() -> (KubeClient, Shared) {
     )
 }
 
-fn answer(api: &Shared, ns: &str, selector: &str, pods: Vec<Value>) {
-    api.lock().unwrap().answers.insert(
-        (ns.into(), selector.into()),
-        Ok(json!({"kind": "PodList", "metadata": {}, "items": pods})),
-    );
+/// Every path the fake API server saw is an EndpointSlice list: no pod, no
+/// Service object, no Secret, nothing else.
+fn assert_only_endpoint_slices(api: &Shared) {
+    for path in &api.lock().unwrap().paths {
+        assert!(
+            path.starts_with(SLICES_PREFIX) && path.ends_with(SLICES_SUFFIX),
+            "the kubernetes source asked for {path}"
+        );
+        assert!(!path.contains("/pods"), "{path}");
+    }
 }
 
-fn fail(api: &Shared, ns: &str, selector: &str, code: u16) {
+fn answer(api: &Shared, ns: &str, service: &str, slices: Vec<Value>) {
+    answer_pages(api, ns, service, vec![slices]);
+}
+
+fn answer_pages(api: &Shared, ns: &str, service: &str, pages: Vec<Vec<Value>>) {
     api.lock()
         .unwrap()
         .answers
-        .insert((ns.into(), selector.into()), Err(code));
+        .insert((ns.into(), service.into()), Ok(pages));
 }
 
-/// A pod whose serving container runs with `args`.
-fn pod(name: &str, ready: bool, args: &[&str]) -> Value {
+fn fail(api: &Shared, ns: &str, service: &str, code: u16) {
+    api.lock()
+        .unwrap()
+        .answers
+        .insert((ns.into(), service.into()), Err(code));
+}
+
+fn asked(api: &Shared) -> Vec<(String, String)> {
+    api.lock()
+        .unwrap()
+        .seen
+        .iter()
+        .map(|s| (s.namespace.clone(), s.service.clone()))
+        .collect()
+}
+
+/// One endpoint: a pod `uid` at `ip`, with explicit conditions.
+fn ep(uid: &str, ip: &str, ready: bool, serving: bool, terminating: bool) -> Value {
     json!({
-        "metadata": {"name": name, "namespace": "inference"},
-        "spec": {"containers": [
-            {"name": "proxy", "image": "sidecar", "args": ["--port", "9000"]},
-            {"name": "server", "command": ["/bin/sh", "-c"],
-             "args": [format!("exec serve-model {}", args.join(" "))],
-             "env": [{"name": "SECRET", "valueFrom": {"secretKeyRef": {"name": "s", "key": "k"}}}]}
-        ]},
-        "status": {
-            "phase": "Running",
-            "conditions": [{"type": "Ready", "status": if ready { "True" } else { "False" }}]
-        }
+        "addresses": [ip],
+        "conditions": {"ready": ready, "serving": serving, "terminating": terminating},
+        "targetRef": {"kind": "Pod", "name": format!("pod-{uid}"), "namespace": "inference", "uid": uid},
+        "nodeName": "node-a"
     })
 }
 
-fn terminating(mut p: Value) -> Value {
-    p["metadata"]["deletionTimestamp"] = json!("2026-09-24T00:00:00Z");
-    p
+fn ready(uid: &str, ip: &str) -> Value {
+    ep(uid, ip, true, true, false)
 }
 
-fn pending(mut p: Value) -> Value {
-    p["status"]["phase"] = json!("Pending");
-    p
+fn slice(name: &str, endpoints: Vec<Value>) -> Value {
+    json!({
+        "metadata": {"name": name, "labels": {"kubernetes.io/service-name": "svc"}},
+        "addressType": "IPv4",
+        "endpoints": endpoints,
+        "ports": [{"name": "http", "port": 8000, "protocol": "TCP"}]
+    })
 }
 
-fn settings(namespaces: &[&str], default_selector: &str) -> CapacityDiscovery {
+fn settings(namespaces: &[&str], default_service: &str) -> CapacityDiscovery {
     CapacityDiscovery::new(CapacityDiscoveryConfig {
         enabled: true,
         interval: Duration::from_secs(15),
         namespaces: namespaces.iter().map(|s| s.to_string()).collect(),
-        default_selector: default_selector.into(),
+        default_service: default_service.into(),
     })
 }
 
@@ -125,8 +201,8 @@ fn kube_target(name: &str) -> DiscoveryTarget {
         static_max_in_flight: Some(6),
         source: "kubernetes".into(),
         namespace: Some("inference".into()),
-        selector: None,
-        per_replica_max_in_flight: None,
+        service: None,
+        per_replica_max_in_flight: Some(8),
         headroom: 1.0,
         healthy: true,
         api_base: "http://backend/v1".into(),
@@ -167,23 +243,37 @@ async fn pool_size(fs: &FairShare, model: &str) -> usize {
         .configured_cap
 }
 
-const TEMPLATE: &str = "app.example.com/model={upstream_model}";
+/// Services named after the served model.
+const TEMPLATE: &str = "{upstream_model}";
 
 #[tokio::test]
-async fn ready_pods_times_the_container_flag_sizes_the_pool() {
+async fn ready_endpoints_times_the_per_replica_value_size_the_pool() {
     let (client, api) = fake_api().await;
-    let selector = "app.example.com/model=m-served";
     answer(
         &api,
         "inference",
-        selector,
+        "m-served",
         vec![
-            pod("a", true, &["--max-num-seqs", "8"]),
-            pod("b", true, &["--max-num-seqs=8"]),
-            // Not Ready, terminating, or not Running: none of them serve.
-            pod("c", false, &["--max-num-seqs", "8"]),
-            terminating(pod("d", true, &["--max-num-seqs", "8"])),
-            pending(pod("e", true, &["--max-num-seqs", "8"])),
+            slice(
+                "m-served-abc",
+                vec![
+                    ready("a", "10.0.0.1"),
+                    ready("b", "10.0.0.2"),
+                    // Not ready, or draining: neither counts.
+                    ep("c", "10.0.0.3", false, false, false),
+                    ep("d", "10.0.0.4", false, true, true),
+                    ep("e", "10.0.0.5", true, true, true),
+                ],
+            ),
+            // A second slice lists `a` again (an IPv6 slice, or the
+            // controller moving it) and one more ready pod.
+            slice(
+                "m-served-def",
+                vec![
+                    ep("a", "fd00::1", true, true, false),
+                    ready("f", "10.0.0.6"),
+                ],
+            ),
         ],
     );
     let handle = settings(&["inference"], TEMPLATE);
@@ -194,58 +284,110 @@ async fn ready_pods_times_the_container_flag_sizes_the_pool() {
 
     let s = status(&handle, "m");
     assert_eq!(s.state, STATE_DISCOVERED, "{s:?}");
-    assert_eq!(s.ready_replicas, Some(2));
+    assert_eq!(s.ready_replicas, Some(3), "a, b and f");
     assert_eq!(s.per_replica_max_in_flight, Some(8));
-    assert_eq!(s.per_replica_source.as_deref(), Some("vLLM --max-num-seqs"));
-    assert_eq!(s.derived_max_in_flight, Some(16));
-    assert_eq!(s.effective_max_in_flight, 16);
-    assert_eq!(s.selector.as_deref(), Some(selector));
+    assert_eq!(
+        s.per_replica_source.as_deref(),
+        Some(PER_REPLICA_CONFIGURED)
+    );
+    assert_eq!(s.derived_max_in_flight, Some(24));
+    assert_eq!(s.effective_max_in_flight, 24);
+    assert_eq!(s.service.as_deref(), Some("m-served"));
     assert_eq!(s.namespaces, vec!["inference"]);
+    assert_eq!(s.namespace.as_deref(), Some("inference"));
     assert!(s.reason.is_none());
-    assert_eq!(pool_size(&fs, "m").await, 16);
-    assert_eq!(handle.effective_caps().get("m"), Some(&16));
+    assert_eq!(pool_size(&fs, "m").await, 24);
+    assert_eq!(handle.effective_caps().get("m"), Some(&24));
 
     let seen = api.lock().unwrap().seen.clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].namespace, "inference");
+    assert_eq!(seen[0].token.as_deref(), Some("sa-token"));
     assert_eq!(
-        seen,
-        vec![(
-            "inference".to_string(),
-            selector.to_string(),
-            Some("sa-token".to_string())
-        )]
+        seen[0].query.get("labelSelector").map(String::as_str),
+        Some("kubernetes.io/service-name=m-served")
     );
+    assert_eq!(
+        seen[0].query.get("resourceVersion").map(String::as_str),
+        Some("0")
+    );
+    assert_only_endpoint_slices(&api);
+}
+
+#[test]
+fn endpoints_are_deduplicated_and_judged_by_their_conditions() {
+    let slices: Vec<EndpointSlice> = serde_json::from_value(json!([
+        {"endpoints": [
+            // Missing `serving` defers to `ready`.
+            {"addresses": ["10.0.0.1"], "conditions": {"ready": true},
+             "targetRef": {"uid": "a"}},
+            // Serving false: not counted even if marked ready.
+            {"addresses": ["10.0.0.2"], "conditions": {"ready": true, "serving": false},
+             "targetRef": {"uid": "b"}},
+            // No conditions at all: not counted, but listed.
+            {"addresses": ["10.0.0.3"], "targetRef": {"uid": "c"}},
+            // Missing `ready`: not counted.
+            {"addresses": ["10.0.0.4"], "conditions": {"serving": true},
+             "targetRef": {"uid": "d"}},
+            // No targetRef: keyed by address.
+            {"addresses": ["10.0.0.5"], "conditions": {"ready": true}},
+            // Neither uid nor address: skipped.
+            {"addresses": [], "conditions": {"ready": true}}
+        ]},
+        {"endpoints": [
+            // `a` again, not ready in this copy: still counted once.
+            {"addresses": ["10.0.0.1"], "conditions": {"ready": false},
+             "targetRef": {"uid": "a"}},
+            // The address-keyed endpoint again.
+            {"addresses": ["10.0.0.5"], "conditions": {"ready": true, "terminating": false}}
+        ]},
+        // A slice of a Service with no endpoints.
+        {"endpoints": null},
+        {}
+    ]))
+    .expect("slices");
+    assert_eq!(
+        count_endpoints(&slices),
+        EndpointCount { total: 5, ready: 2 }
+    );
+    assert_eq!(count_endpoints(&[]), EndpointCount::default());
 }
 
 #[tokio::test]
-async fn set_based_and_inequality_selectors_reach_the_api_server_intact() {
+async fn a_paged_list_is_read_to_the_end() {
     let (client, api) = fake_api().await;
-    // Heads only, the way a multi-node deployment excludes worker pods.
-    let selector = "app=m,ray.io/node-type!=worker,tier in (gpu, accel)";
-    answer(
+    answer_pages(
         &api,
         "inference",
-        selector,
-        vec![pod("head", true, &["--max-num-seqs", "4"])],
+        "m-served",
+        vec![
+            vec![slice("s1", vec![ready("a", "10.0.0.1")])],
+            vec![slice("s2", vec![ready("b", "10.0.0.2")])],
+        ],
     );
-    let handle = settings(&["inference"], "");
+    let handle = settings(&["inference"], TEMPLATE);
     let mut d = Discoverer::new(Some(Ok(client)), fairshare(), 32);
-    let mut t = kube_target("m");
-    t.selector = Some(selector.into());
 
-    d.pass(&handle, vec![t]).await;
+    d.pass(&handle, vec![kube_target("m")]).await;
 
-    assert_eq!(status(&handle, "m").effective_max_in_flight, 4);
-    assert_eq!(api.lock().unwrap().seen[0].1, selector);
+    assert_eq!(status(&handle, "m").ready_replicas, Some(2));
+    let seen = api.lock().unwrap().seen.clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        seen[1].query.get("continue").map(String::as_str),
+        Some("p1")
+    );
+    assert!(!seen[1].query.contains_key("resourceVersion"));
 }
 
 #[tokio::test]
-async fn models_sharing_a_selector_share_one_list_call() {
+async fn models_sharing_a_service_share_one_list_call() {
     let (client, api) = fake_api().await;
     answer(
         &api,
         "inference",
-        "app=shared",
-        vec![pod("a", true, &["--max-num-seqs", "2"])],
+        "shared",
+        vec![slice("s", vec![ready("a", "10.0.0.1")])],
     );
     let handle = settings(&["inference"], "");
     let mut d = Discoverer::new(Some(Ok(client)), fairshare(), 32);
@@ -253,37 +395,83 @@ async fn models_sharing_a_selector_share_one_list_call() {
         .into_iter()
         .map(|n| {
             let mut t = kube_target(n);
-            t.selector = Some("app=shared".into());
+            t.service = Some("shared".into());
+            t.per_replica_max_in_flight = Some(2);
             t
         })
         .collect();
 
     d.pass(&handle, targets).await;
 
-    assert_eq!(
-        api.lock().unwrap().seen.len(),
-        1,
-        "one list for three models"
-    );
+    assert_eq!(asked(&api).len(), 1, "one list for three models");
     for n in ["one", "two", "three"] {
         assert_eq!(status(&handle, n).effective_max_in_flight, 2);
     }
 }
 
 #[tokio::test]
-async fn no_namespace_searches_every_allowed_one() {
+async fn no_namespace_takes_the_first_allowed_one_that_has_the_service() {
     let (client, api) = fake_api().await;
-    answer(
-        &api,
-        "llm",
-        "app.example.com/model=m-served",
-        vec![pod("a", true, &["--max-num-seqs", "3"])],
-    );
+    // Not in `llm`; in both `batch` and `extra`: `batch` comes first.
     answer(
         &api,
         "batch",
-        "app.example.com/model=m-served",
-        vec![pod("b", true, &["--max-num-seqs", "3"])],
+        "m-served",
+        vec![slice("s", vec![ready("a", "10.0.0.1")])],
+    );
+    answer(
+        &api,
+        "extra",
+        "m-served",
+        vec![slice(
+            "s",
+            vec![ready("b", "10.0.1.1"), ready("c", "10.0.1.2")],
+        )],
+    );
+    let handle = settings(&["llm", "batch", "extra"], TEMPLATE);
+    let mut d = Discoverer::new(Some(Ok(client)), fairshare(), 32);
+    let mut t = kube_target("m");
+    t.namespace = None;
+    t.per_replica_max_in_flight = Some(3);
+
+    d.pass(&handle, vec![t.clone()]).await;
+
+    let s = status(&handle, "m");
+    assert_eq!(s.state, STATE_DISCOVERED, "{s:?}");
+    assert_eq!(s.ready_replicas, Some(1));
+    assert_eq!(s.effective_max_in_flight, 3);
+    assert_eq!(s.namespaces, vec!["llm", "batch", "extra"]);
+    assert_eq!(s.namespace.as_deref(), Some("batch"));
+    // `extra` is never read once `batch` has the Service.
+    assert_eq!(
+        asked(&api),
+        vec![
+            ("llm".to_string(), "m-served".to_string()),
+            ("batch".to_string(), "m-served".to_string()),
+        ]
+    );
+
+    // A Service with no endpoints still exists: its namespace wins, and the
+    // model has no ready replica rather than moving on to `extra`.
+    answer(&api, "batch", "m-served", vec![slice("s", vec![])]);
+    d.pass(&handle, vec![t]).await;
+    let s = status(&handle, "m");
+    assert_eq!(s.state, STATE_STALE);
+    assert_eq!(s.namespace.as_deref(), Some("batch"));
+    assert!(s.reason.unwrap().contains("no ready endpoint"));
+    assert!(!asked(&api).iter().any(|(ns, _)| ns == "extra"));
+    assert_only_endpoint_slices(&api);
+}
+
+#[tokio::test]
+async fn a_namespace_that_does_not_answer_is_not_skipped() {
+    let (client, api) = fake_api().await;
+    fail(&api, "llm", "m-served", 403);
+    answer(
+        &api,
+        "batch",
+        "m-served",
+        vec![slice("s", vec![ready("a", "10.0.0.1")])],
     );
     let handle = settings(&["llm", "batch"], TEMPLATE);
     let mut d = Discoverer::new(Some(Ok(client)), fairshare(), 32);
@@ -292,74 +480,95 @@ async fn no_namespace_searches_every_allowed_one() {
 
     d.pass(&handle, vec![t]).await;
 
+    // Whether `llm` has the Service is unknown, so `batch` cannot be trusted
+    // to be the right one.
     let s = status(&handle, "m");
-    assert_eq!(s.ready_replicas, Some(2));
-    assert_eq!(s.effective_max_in_flight, 6);
-    assert_eq!(s.namespaces, vec!["llm", "batch"]);
+    assert_eq!(s.state, STATE_FALLBACK);
+    let reason = s.reason.unwrap();
+    assert!(reason.contains("HTTP 403"), "{reason}");
+    assert_eq!(asked(&api).len(), 1);
 }
 
 #[tokio::test]
-async fn the_models_own_value_wins_and_headroom_scales_it() {
+async fn a_missing_service_falls_back_then_keeps_the_last_value() {
+    let (client, api) = fake_api().await;
+    let handle = settings(&["llm", "batch"], TEMPLATE);
+    let fs = fairshare();
+    let mut d = Discoverer::new(Some(Ok(client)), fs.clone(), 32);
+    let mut t = kube_target("m");
+    t.namespace = None;
+
+    // Nowhere yet: the static value, and why.
+    d.pass(&handle, vec![t.clone()]).await;
+    let s = status(&handle, "m");
+    assert_eq!(s.state, STATE_FALLBACK);
+    assert_eq!(s.effective_max_in_flight, 6);
+    assert_eq!(s.namespace, None);
+    let reason = s.reason.unwrap();
+    assert!(
+        reason.contains("no EndpointSlice for Service m-served"),
+        "{reason}"
+    );
+    assert!(reason.contains("llm, batch"), "{reason}");
+
+    // It appears with two ready replicas.
+    answer(
+        &api,
+        "batch",
+        "m-served",
+        vec![slice(
+            "s",
+            vec![ready("a", "10.0.0.1"), ready("b", "10.0.0.2")],
+        )],
+    );
+    d.pass(&handle, vec![t.clone()]).await;
+    assert_eq!(status(&handle, "m").effective_max_in_flight, 16);
+    assert_eq!(pool_size(&fs, "m").await, 16);
+
+    // Deleted, or the API briefly answers nothing: the last value holds.
+    api.lock().unwrap().answers.clear();
+    d.pass(&handle, vec![t]).await;
+    let s = status(&handle, "m");
+    assert_eq!(s.state, STATE_STALE);
+    assert_eq!(s.ready_replicas, Some(0));
+    assert_eq!(s.effective_max_in_flight, 16);
+    assert_eq!(pool_size(&fs, "m").await, 16);
+}
+
+#[tokio::test]
+async fn headroom_scales_the_derived_value() {
     let (client, api) = fake_api().await;
     answer(
         &api,
         "inference",
-        "app.example.com/model=m-served",
-        vec![
-            pod("a", true, &["--max-num-seqs", "64"]),
-            pod("b", true, &["--max-num-seqs", "64"]),
-        ],
+        "m-served",
+        vec![slice(
+            "s",
+            vec![ready("a", "10.0.0.1"), ready("b", "10.0.0.2")],
+        )],
     );
     let handle = settings(&["inference"], TEMPLATE);
     let mut d = Discoverer::new(Some(Ok(client)), fairshare(), 32);
     let mut t = kube_target("m");
-    t.per_replica_max_in_flight = Some(8);
     t.headroom = 1.25;
 
     d.pass(&handle, vec![t]).await;
 
-    let s = status(&handle, "m");
-    assert_eq!(s.per_replica_max_in_flight, Some(8));
     assert_eq!(
-        s.per_replica_source.as_deref(),
-        Some("per_replica_max_in_flight")
+        status(&handle, "m").effective_max_in_flight,
+        20,
+        "ceil(2 x 8 x 1.25)"
     );
-    assert_eq!(s.effective_max_in_flight, 20, "ceil(2 x 8 x 1.25)");
 }
 
 #[tokio::test]
-async fn pods_that_disagree_use_the_lowest_value() {
+async fn scaled_to_zero_keeps_the_last_value_then_recovers() {
     let (client, api) = fake_api().await;
     answer(
         &api,
         "inference",
-        "app.example.com/model=m-served",
-        vec![
-            pod("old", true, &["--max-num-seqs", "4"]),
-            pod("new", true, &["--max-running-requests", "16"]),
-            pod("plain", true, &["--port", "8000"]),
-        ],
-    );
-    let handle = settings(&["inference"], TEMPLATE);
-    let mut d = Discoverer::new(Some(Ok(client)), fairshare(), 32);
-
-    d.pass(&handle, vec![kube_target("m")]).await;
-
-    let s = status(&handle, "m");
-    assert_eq!(s.ready_replicas, Some(3));
-    assert_eq!(s.per_replica_max_in_flight, Some(4));
-    assert_eq!(s.effective_max_in_flight, 12);
-}
-
-#[tokio::test]
-async fn no_ready_pod_keeps_the_last_value_then_recovers() {
-    let (client, api) = fake_api().await;
-    let sel = "app.example.com/model=m-served";
-    answer(
-        &api,
-        "inference",
-        sel,
-        vec![pod("a", true, &["--max-num-seqs", "8"])],
+        "m-served",
+        vec![slice("s", vec![ready("a", "10.0.0.1")])],
     );
     let handle = settings(&["inference"], TEMPLATE);
     let fs = fairshare();
@@ -367,12 +576,12 @@ async fn no_ready_pod_keeps_the_last_value_then_recovers() {
     d.pass(&handle, vec![kube_target("m")]).await;
     assert_eq!(status(&handle, "m").effective_max_in_flight, 8);
 
-    // Scaled to zero, or every pod restarting: the last value holds.
+    // Scaled to zero: the controller keeps one slice with no endpoints.
     answer(
         &api,
         "inference",
-        sel,
-        vec![pod("a", false, &["--max-num-seqs", "8"])],
+        "m-served",
+        vec![json!({"metadata": {"name": "s"}, "addressType": "IPv4", "endpoints": null})],
     );
     d.pass(&handle, vec![kube_target("m")]).await;
     let s = status(&handle, "m");
@@ -380,17 +589,20 @@ async fn no_ready_pod_keeps_the_last_value_then_recovers() {
     assert_eq!(s.ready_replicas, Some(0));
     assert_eq!(s.effective_max_in_flight, 8);
     assert_eq!(s.derived_max_in_flight, Some(8));
-    assert!(s.reason.unwrap().contains("no Ready pod"));
+    assert!(s.reason.unwrap().contains("no ready endpoint (0 listed)"));
     assert_eq!(pool_size(&fs, "m").await, 8);
 
     // Back with three replicas: the pool grows.
     answer(
         &api,
         "inference",
-        sel,
-        (0..3)
-            .map(|i| pod(&format!("p{i}"), true, &["--max-num-seqs", "8"]))
-            .collect(),
+        "m-served",
+        vec![slice(
+            "s",
+            (0..3)
+                .map(|i| ready(&format!("p{i}"), &format!("10.0.0.{i}")))
+                .collect(),
+        )],
     );
     d.pass(&handle, vec![kube_target("m")]).await;
     assert_eq!(status(&handle, "m").state, STATE_DISCOVERED);
@@ -400,7 +612,7 @@ async fn no_ready_pod_keeps_the_last_value_then_recovers() {
 #[tokio::test]
 async fn with_nothing_discovered_yet_the_static_value_applies() {
     let (client, api) = fake_api().await;
-    answer(&api, "inference", "app.example.com/model=m-served", vec![]);
+    answer(&api, "inference", "m-served", vec![slice("s", vec![])]);
     let handle = settings(&["inference"], TEMPLATE);
     let fs = fairshare();
     let mut d = Discoverer::new(Some(Ok(client)), fs.clone(), 32);
@@ -425,31 +637,33 @@ async fn with_nothing_discovered_yet_the_static_value_applies() {
 #[tokio::test]
 async fn an_api_failure_keeps_the_last_value_and_says_why() {
     let (client, api) = fake_api().await;
-    let sel = "app.example.com/model=m-served";
     answer(
         &api,
         "inference",
-        sel,
-        vec![pod("a", true, &["--max-num-seqs", "5"])],
+        "m-served",
+        vec![slice("s", vec![ready("a", "10.0.0.1")])],
     );
     let handle = settings(&["inference"], TEMPLATE);
     let mut d = Discoverer::new(Some(Ok(client)), fairshare(), 32);
     d.pass(&handle, vec![kube_target("m")]).await;
 
-    fail(&api, "inference", sel, 403);
+    fail(&api, "inference", "m-served", 403);
     d.pass(&handle, vec![kube_target("m")]).await;
     let s = status(&handle, "m");
     assert_eq!(s.state, STATE_STALE);
-    assert_eq!(s.effective_max_in_flight, 5);
+    assert_eq!(s.effective_max_in_flight, 8);
     assert_eq!(s.ready_replicas, None);
     let reason = s.reason.unwrap();
     assert!(reason.contains("HTTP 403"), "{reason}");
-    assert!(reason.contains("get/list on pods"), "{reason}");
+    assert!(
+        reason.contains("get/list/watch on endpointslices"),
+        "{reason}"
+    );
 
     // A model that never had a value falls back to its static one.
     let mut other = kube_target("o");
-    other.selector = Some("app=o".into());
-    fail(&api, "inference", "app=o", 500);
+    other.service = Some("o".into());
+    fail(&api, "inference", "o", 500);
     d.pass(&handle, vec![other]).await;
     assert_eq!(status(&handle, "o").state, STATE_FALLBACK);
     assert_eq!(status(&handle, "o").effective_max_in_flight, 6);
@@ -471,24 +685,58 @@ async fn an_unreachable_api_server_is_a_failure_not_a_crash() {
 }
 
 #[tokio::test]
-async fn a_server_with_no_known_flag_cannot_be_discovered() {
+async fn a_kubernetes_model_without_a_per_replica_value_is_not_counted() {
     let (client, api) = fake_api().await;
     answer(
         &api,
         "inference",
-        "app.example.com/model=m-served",
-        vec![pod("a", true, &["--port", "8000"])],
+        "m-served",
+        vec![slice("s", vec![ready("a", "10.0.0.1")])],
     );
     let handle = settings(&["inference"], TEMPLATE);
     let mut d = Discoverer::new(Some(Ok(client)), fairshare(), 32);
+    let mut t = kube_target("m");
+    t.per_replica_max_in_flight = None;
 
-    d.pass(&handle, vec![kube_target("m")]).await;
+    d.pass(&handle, vec![t]).await;
 
     let s = status(&handle, "m");
     assert_eq!(s.state, STATE_FALLBACK);
-    assert_eq!(s.ready_replicas, Some(1));
     assert_eq!(s.effective_max_in_flight, 6);
-    assert!(s.reason.unwrap().contains("per_replica_max_in_flight"));
+    let reason = s.reason.unwrap();
+    assert!(
+        reason.contains("per_replica_max_in_flight is required"),
+        "{reason}"
+    );
+    assert!(asked(&api).is_empty(), "nothing is read for it");
+}
+
+#[tokio::test]
+async fn the_default_service_template_names_each_models_service() {
+    let (client, api) = fake_api().await;
+    answer(
+        &api,
+        "inference",
+        "chat-serve",
+        vec![slice("s", vec![ready("a", "10.0.0.1")])],
+    );
+    let handle = settings(&["inference"], "{model_name}-serve");
+    let mut d = Discoverer::new(Some(Ok(client)), fairshare(), 32);
+    // A name the template cannot turn into a Service name.
+    let mut odd = kube_target("Odd/Name");
+    odd.upstream_model = "x".into();
+
+    d.pass(&handle, vec![kube_target("chat"), odd]).await;
+
+    let s = status(&handle, "chat");
+    assert_eq!(s.service.as_deref(), Some("chat-serve"));
+    assert_eq!(s.state, STATE_DISCOVERED);
+    let r = status(&handle, "Odd/Name").reason.unwrap();
+    assert!(r.contains("set capacity_service"), "{r}");
+    assert_eq!(
+        asked(&api),
+        vec![("inference".to_string(), "chat-serve".to_string())]
+    );
 }
 
 #[tokio::test]
@@ -498,16 +746,16 @@ async fn gateway_policy_problems_are_reported_without_calling_the_api() {
     let mut d = Discoverer::new(Some(Ok(client)), fairshare(), 32);
     let mut outside = kube_target("outside");
     outside.namespace = Some("kube-system".into());
-    outside.selector = Some("app=x".into());
-    let no_selector = kube_target("no-selector");
+    outside.service = Some("x".into());
+    let no_service = kube_target("no-service");
 
-    d.pass(&handle, vec![outside, no_selector]).await;
+    d.pass(&handle, vec![outside, no_service]).await;
 
     let r = status(&handle, "outside").reason.unwrap();
     assert!(r.contains("OBLETH_CAPACITY_DISCOVERY_NAMESPACES"), "{r}");
-    let r = status(&handle, "no-selector").reason.unwrap();
-    assert!(r.contains("OBLETH_CAPACITY_DEFAULT_SELECTOR"), "{r}");
-    assert!(api.lock().unwrap().seen.is_empty());
+    let r = status(&handle, "no-service").reason.unwrap();
+    assert!(r.contains("OBLETH_CAPACITY_DEFAULT_SERVICE"), "{r}");
+    assert!(api.lock().unwrap().paths.is_empty());
 
     // No namespaces at all: the kubernetes source is unavailable.
     let handle = settings(&[], "");
@@ -516,6 +764,47 @@ async fn gateway_policy_problems_are_reported_without_calling_the_api() {
     let s = status(&handle, "m");
     assert_eq!(s.state, STATE_FALLBACK);
     assert!(s.reason.unwrap().contains("not available"));
+}
+
+#[test]
+fn the_only_url_the_client_builds_is_an_endpoint_slice_list() {
+    let client = KubeClient::with_base("https://api.example:6443/", None);
+    let url = client
+        .endpoint_slices_url("inference", "my-model", None)
+        .unwrap();
+    assert_eq!(
+        url.path(),
+        "/apis/discovery.k8s.io/v1/namespaces/inference/endpointslices"
+    );
+    let query: HashMap<String, String> = url.query_pairs().into_owned().collect();
+    assert_eq!(
+        query["labelSelector"],
+        "kubernetes.io/service-name=my-model"
+    );
+    assert_eq!(query["resourceVersion"], "0");
+    let next = client
+        .endpoint_slices_url("inference", "my-model", Some("tok"))
+        .unwrap();
+    assert!(next.query().unwrap().contains("continue=tok"));
+}
+
+/// A guard on the source itself: the kubernetes source never reads pods, or
+/// any core-group resource. Only the EndpointSlice path may appear in the
+/// client and the discovery loop.
+#[test]
+fn no_code_path_in_the_kubernetes_source_targets_pods() {
+    for (file, source) in [
+        ("kube.rs", include_str!("kube.rs")),
+        ("mod.rs", include_str!("mod.rs")),
+    ] {
+        for forbidden in ["/pods", "/api/v1/", "PodList"] {
+            assert!(
+                !source.contains(forbidden),
+                "{file} mentions `{forbidden}`: the kubernetes source may only read EndpointSlices"
+            );
+        }
+    }
+    assert!(include_str!("kube.rs").contains("/apis/discovery.k8s.io/v1/namespaces/"));
 }
 
 fn endpoint(priority: i64, enabled: bool, healthy: bool, max: Option<usize>) -> ResolvedEndpoint {
@@ -535,6 +824,8 @@ fn endpoints_target(mode: &str, endpoints: Vec<ResolvedEndpoint>) -> DiscoveryTa
     DiscoveryTarget {
         source: "endpoints".into(),
         namespace: None,
+        service: None,
+        per_replica_max_in_flight: None,
         endpoint_selection_mode: mode.into(),
         endpoints,
         ..kube_target("e")
@@ -572,10 +863,7 @@ async fn the_endpoints_source_counts_enabled_healthy_endpoints() {
     let s = status(&handle, "e");
     assert_eq!(s.ready_replicas, Some(1));
     assert_eq!(s.effective_max_in_flight, 16);
-    assert_eq!(
-        s.per_replica_source.as_deref(),
-        Some("endpoint max_in_flight")
-    );
+    assert_eq!(s.per_replica_source.as_deref(), Some(PER_REPLICA_ENDPOINT));
 
     // Every endpoint down: the last value holds.
     t.endpoints.iter_mut().for_each(|e| e.healthy = false);
@@ -669,7 +957,7 @@ fn resolved(name: &str) -> ResolvedModel {
         capacity_mode: "static".into(),
         capacity_source: "endpoints".into(),
         capacity_namespace: None,
-        capacity_selector: None,
+        capacity_service: None,
         per_replica_max_in_flight: None,
         capacity_headroom: 1.0,
         enabled: true,
