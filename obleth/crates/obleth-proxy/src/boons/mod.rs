@@ -1329,6 +1329,16 @@ pub(crate) mod test_support {
     pub(crate) fn endpoint_only_route(base: &str) -> obleth_config::ResolvedModel {
         super::tests::endpoint_only_route(base)
     }
+
+    /// A plain enabled chat route named `test` at `http://localhost`.
+    pub(crate) fn test_route() -> obleth_config::ResolvedModel {
+        super::tests::test_route()
+    }
+
+    /// An active, non-internal key with no limits, budgets or policies.
+    pub(crate) fn test_key() -> obleth_config::ResolvedKey {
+        super::tests::test_key_with_policy(None)
+    }
 }
 
 #[cfg(test)]

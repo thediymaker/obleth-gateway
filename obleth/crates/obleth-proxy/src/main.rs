@@ -18,6 +18,7 @@ mod responses;
 mod router;
 mod state;
 mod verdicts;
+mod videos;
 
 mod boons;
 mod classifier;
@@ -384,7 +385,9 @@ async fn main() -> anyhow::Result<()> {
         energy: energy.clone(),
         jwt,
         knowledge: knowledge.clone(),
+        video_jobs: videos::VideoJobStore::new(store.clone()),
     };
+    videos::spawn_job_pruner(app_state.video_jobs.clone());
 
     match store.all_resolved_models().await {
         Ok(models) => {

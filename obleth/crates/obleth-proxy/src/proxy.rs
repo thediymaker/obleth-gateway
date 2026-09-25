@@ -947,6 +947,23 @@ async fn proxy_handler_inner(
         return resp;
     }
 
+    // ---- Videos API follow-ups (poll, download, delete, list) ----
+    // They carry a job id, never a model, so they are served from the job
+    // record written at create time: routed to the model and endpoint that
+    // made the job, and "not found" for any other tenant. Reads of work the
+    // create already paid for, so no admission, budget, or ledger row (see
+    // `crate::videos`).
+    if let Some(call) = crate::videos::follow_up(&method, &path) {
+        let inbound = crate::videos::Inbound {
+            method: &method,
+            path: &path,
+            query: &query,
+            headers: &headers,
+        };
+        return crate::videos::handle_follow_up(&state, &resolved, call, inbound, request_id).await;
+    }
+    let video_create = crate::videos::is_create(&method, &path);
+
     // ---- request flight-recorder tracer ----
     let mut tracer: Option<crate::tracer::SpanRecorder> = if resolved.tracing_enabled {
         tracing::debug!(request_id = %request_id, "tracing enabled — recording spans");
@@ -1431,9 +1448,12 @@ async fn proxy_handler_inner(
     let output_guardrails_armed = response_plan
         .as_ref()
         .is_some_and(|p| p.guardrails.is_some());
+    // A video create is never replayed from cache either: an identical body
+    // must start a new job, not hand back an id some earlier call recorded.
     let cache_enabled = route.as_ref().map(|r| r.cache_enabled).unwrap_or(false)
         && !tool_loop_armed
-        && !output_guardrails_armed;
+        && !output_guardrails_armed
+        && !video_create;
     let cache_ttl = route.as_ref().map(|r| r.cache_ttl_secs).unwrap_or(0);
     // TTL <= 0 means "don't cache": nothing is ever written, so a lookup could
     // never hit and would only cost a Redis round-trip.
@@ -2071,6 +2091,8 @@ async fn proxy_handler_inner(
     let mut last_err: Option<String> = None;
     let mut timed_out = false;
     let total_targets = targets.len();
+    // Which target answered: a video job lives on the backend that accepted it.
+    let mut served_target = 0usize;
 
     'targets: for (ti, target) in targets.iter().enumerate() {
         let url = build_upstream_url(&target.base, &path, &query);
@@ -2158,6 +2180,7 @@ async fn proxy_handler_inner(
                     }
                     state.metrics.record_upstream_attempt("success");
                     upstream_resp = Some(resp);
+                    served_target = ti;
                     break 'targets;
                 }
                 Ok(Err(e)) => {
@@ -2407,6 +2430,51 @@ async fn proxy_handler_inner(
 
     // Cache only successful responses.
     let store_in_cache = cache_key.clone();
+
+    // ---- video job create: record the job before its id leaves ----
+    // The response is a small JSON video object. It is read whole, its id is
+    // recorded against this tenant and the target that accepted it, and only
+    // then is it returned — an unrecorded id could never be followed up. The
+    // create is billed its flat `cost_per_video` (no tokens) once recorded,
+    // and nothing when it is not. The whole step runs as its own task so a
+    // client that leaves mid-way cannot strand a job it was charged for.
+    if video_create {
+        if let Some(t) = tracer.take() {
+            t.finish("ok");
+        }
+        let job = crate::videos::CreatedJob {
+            jobs: state.video_jobs.clone(),
+            http: state.http.clone(),
+            model: model.clone(),
+            tenant_id: resolved.tenant_id,
+            key_id: resolved.key_id,
+            target: Target {
+                base: targets[served_target].base.clone(),
+                api_key: targets[served_target].api_key.clone(),
+                headers: targets[served_target].headers.clone(),
+            },
+            started: upstream_start,
+        };
+        let recorded = tokio::spawn(async move {
+            let outcome = crate::videos::record_create(job, upstream).await;
+            drop(permit);
+            let total_ms = request_start.elapsed().as_millis() as u32;
+            let settle = accounting.settle_with(
+                (0, 0),
+                outcome.ttft_ms(),
+                total_ms,
+                outcome.status().as_u16(),
+                None,
+                outcome.billed(),
+            );
+            let _ = settle_guard.complete(settle).await;
+            outcome
+        });
+        return match recorded.await {
+            Ok(outcome) => outcome.into_response(request_id),
+            Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "video create failed"),
+        };
+    }
 
     // Extract guardrails policy for log_only output scanning (evaluated after stream drains).
     let scan_policy = resolved
@@ -4030,10 +4098,12 @@ fn model_facts_index(
 
 /// The LiteLLM-convention spelling of a modality, which many OpenAI-compatible
 /// clients read instead of obleth's own `model_type`. Identical to the obleth
-/// vocabulary except that `image` is spelled `image_generation`.
+/// vocabulary except that `image` and `video` are spelled `image_generation`
+/// and `video_generation`.
 fn mode_for_model_type(model_type: &str) -> &str {
     match model_type {
         "image" => "image_generation",
+        "video" => "video_generation",
         other => other,
     }
 }
@@ -4150,6 +4220,7 @@ fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
             "cost_per_image": model.cost_per_image,
             "cost_per_audio_second": model.cost_per_audio_second,
             "cost_per_character": model.cost_per_character,
+            "cost_per_video": model.cost_per_video,
             // Health as the gateway last observed it. False means the model is
             // registered and addressable but currently failing its probe or
             // held in a maintenance window.
@@ -4186,6 +4257,7 @@ const REGISTERED_MODEL_PATHS: &[&str] = &[
     "/v1/images/generations",
     "/v1/images/edits",
     "/v1/images/variations",
+    crate::videos::VIDEOS_PATH,
 ];
 
 fn requires_registered_model(path: &str) -> bool {
@@ -4194,8 +4266,9 @@ fn requires_registered_model(path: &str) -> bool {
 
 /// True when the endpoint takes a file upload, so the OpenAI spec sends it as
 /// `multipart/form-data` with the model as a form field rather than JSON:
-/// audio transcription/translation, and the two image endpoints that take a
-/// source image (edits and variations).
+/// audio transcription/translation, the two image endpoints that take a
+/// source image (edits and variations), and the video create, whose optional
+/// reference frame is an upload (it accepts JSON too).
 fn is_multipart_endpoint(path: &str) -> bool {
     matches!(
         path,
@@ -4203,6 +4276,7 @@ fn is_multipart_endpoint(path: &str) -> bool {
             | "/v1/audio/translations"
             | "/v1/images/edits"
             | "/v1/images/variations"
+            | crate::videos::VIDEOS_PATH
     )
 }
 
@@ -4320,8 +4394,9 @@ fn build_multipart_form(
 }
 
 /// Per-request surcharge for non-token-billed modalities: image generations are
-/// billed per image, text-to-speech per input character. Returns `0.0` for
-/// token-billed modalities (chat, embeddings) and audio transcription.
+/// billed per image, text-to-speech per input character, and a video job at a
+/// flat price per created job. Returns `0.0` for token-billed modalities
+/// (chat, embeddings) and audio transcription.
 fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value) -> f64 {
     let Some(route) = route else {
         return 0.0;
@@ -4348,6 +4423,9 @@ fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value
                 .unwrap_or(0);
             chars as f64 * route.cost_per_character
         }
+        // Frozen at the create, the only video call that reaches settlement:
+        // the polls and the download are served outside the pipeline.
+        "video" => route.cost_per_video,
         _ => 0.0,
     }
 }
@@ -4599,7 +4677,7 @@ pub(crate) fn has_path_traversal(path: &str) -> bool {
     path.split(['/', '\\']).any(|seg| seg == "..")
 }
 
-fn build_upstream_url(base: &str, path: &str, query: &str) -> String {
+pub(crate) fn build_upstream_url(base: &str, path: &str, query: &str) -> String {
     let base = base.trim_end_matches('/');
     let rel_raw = path.trim_start_matches('/');
     // Defensive: operators sometimes paste the full endpoint URL as api_base
@@ -4734,6 +4812,8 @@ fn request_type_for_path(path: &str) -> &'static str {
         "audio"
     } else if path.contains("/images/") {
         "image"
+    } else if path.ends_with("/videos") {
+        "video"
     } else if path.ends_with("/rerank") || path.ends_with("/reranking") {
         "rerank"
     } else if path.ends_with("/moderations") {
@@ -6966,12 +7046,14 @@ mod tests {
         assert_eq!(req.model_max_in_flight, None);
     }
     /// Endpoints whose OpenAI spec sends `multipart/form-data` (they take a
-    /// file upload).
+    /// file upload). The video create's upload is its optional
+    /// `input_reference` frame; it also accepts JSON.
     const SPEC_MULTIPART_PATHS: &[&str] = &[
         "/v1/audio/transcriptions",
         "/v1/audio/translations",
         "/v1/images/edits",
         "/v1/images/variations",
+        "/v1/videos",
     ];
 
     #[test]
@@ -7027,6 +7109,44 @@ mod tests {
         assert!((compute_modality_cost(Some(&route), &json_body) - 0.08).abs() < 1e-9);
         let unset = serde_json::json!({"prompt": "x"});
         assert!((compute_modality_cost(Some(&route), &unset) - 0.04).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_video_model_is_its_own_modality() {
+        use super::{
+            input_guardrails_unscannable, mode_for_model_type, model_info_entry,
+            output_guardrails_unenforceable,
+        };
+        let mut route = minimal_model("wan-2-2");
+        route.model_type = "video".into();
+        route.cost_per_video = 0.3;
+        // One flat price per created job, whatever the body asks for.
+        let body = serde_json::json!({"prompt": "a fox", "n": 4, "seconds": "5"});
+        assert!((compute_modality_cost(Some(&route), &body) - 0.3).abs() < 1e-9);
+        assert_eq!(mode_for_model_type("video"), "video_generation");
+        let info = model_info_entry(&route, true);
+        assert_eq!(info["model_info"]["mode"], "video_generation");
+        assert_eq!(info["model_info"]["cost_per_video"], 0.3);
+
+        // The create takes JSON or a form, must name a registered model, and
+        // is its own request class, which the input scanner reads and an
+        // output policy does not refuse (a video object is not model text).
+        assert!(is_multipart_endpoint("/v1/videos"));
+        assert!(requires_registered_model("/v1/videos"));
+        assert_eq!(request_type_for_path("/v1/videos"), "video");
+        let mut key = crate::boons::test_support::test_key();
+        key.guardrails_policy = Some(obleth_config::GuardrailsPolicy {
+            action: obleth_config::GuardrailsAction::Block,
+            input_scanners: vec!["pii".into()],
+            output_scanners: vec!["pii".into()],
+            guard_model: None,
+            ban_keywords: vec![],
+            fail_open: true,
+        });
+        assert!(!input_guardrails_unscannable(&key, "/v1/videos"));
+        assert!(!output_guardrails_unenforceable(&key, "/v1/videos"));
+        // Follow-ups never reach the pipeline; were one to, it is unmapped.
+        assert_eq!(request_type_for_path("/v1/videos/video_1/content"), "other");
     }
 
     #[tokio::test]

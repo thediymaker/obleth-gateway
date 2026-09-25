@@ -68,7 +68,7 @@ No new model and no external service: the gateway answers each question with its
 
 ## Operations and health
 
-**Health checks that match the model type.** Chat, embedding, speech, transcription, and image models are each verified against their real modality endpoint — a minimal inference probe, not a generic ping. A rejected probe with the model still listed in the upstream's catalog is reported as a likely misconfiguration instead of an outage; a model genuinely missing upstream alerts with catalog evidence. Fixing a model's connection settings clears stale failure state and re-checks within seconds.
+**Health checks that match the model type.** Chat, embedding, speech, and transcription models are each verified against their real modality endpoint — a minimal inference probe, not a generic ping. Image and video models, where even a minimal generation is costly (a video render takes minutes), are checked against the upstream's model catalog instead. A rejected probe with the model still listed in the upstream's catalog is reported as a likely misconfiguration instead of an outage; a model genuinely missing upstream alerts with catalog evidence. Fixing a model's connection settings clears stale failure state and re-checks within seconds.
 
 **Per-request flow view.** Every request can be traced through the gateway's own span recorder: auth resolve, auto route, fairshare admission, boon execution, upstream call. The dashboard renders the trace as a node graph with durations and attributes on each step. No external collector is required — spans land in ClickHouse next to usage data, and OTLP export is available for Jaeger or any OpenTelemetry backend.
 

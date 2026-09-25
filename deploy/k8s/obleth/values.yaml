@@ -107,6 +107,11 @@ obleth:
   # Longest a request waits in the fairshare queue before a 503 with
   # Retry-After: 5. 0 or invalid falls back to this default.
   admissionTimeoutSecs: 60
+  # How long a video job's record (which tenant owns it, which endpoint holds
+  # it) is kept, in hours. Follow-ups for an older job answer 404. The backend
+  # usually forgets finished jobs within an hour or two, so the default leaves
+  # ample room. 0 or invalid falls back to this default.
+  videoJobRetentionHours: 24
   resources:
     requests: { cpu: "250m", memory: "256Mi" }
     limits: { cpu: "2", memory: "1Gi" }
