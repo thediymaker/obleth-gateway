@@ -19,6 +19,8 @@ pub struct Metrics {
     in_flight: IntGauge,
     queue_depth: IntGauge,
     fairshare_replicas: IntGauge,
+    fairshare_slot_mode: IntGaugeVec,
+    fairshare_cluster_in_flight: IntGauge,
     capacity_discovery_models: IntGaugeVec,
     telemetry_dropped: IntGauge,
     cache_lookups: IntCounterVec,
@@ -75,7 +77,23 @@ impl Metrics {
         .unwrap();
         let fairshare_replicas = IntGauge::with_opts(Opts::new(
             "obleth_fairshare_replicas",
-            "Live gateway replicas this replica divides the configured fairshare limits across",
+            "Live gateway replicas, as this replica last counted them from Redis heartbeats",
+        ))
+        .unwrap();
+        // Labelled by mode only (a fixed set of four), not by model.
+        let fairshare_slot_mode = IntGaugeVec::new(
+            Opts::new(
+                "obleth_fairshare_shared_slots_mode",
+                "How this replica enforces the fairshare limits: 1 for the current mode \
+                 (local, split, shared or fallback), 0 for the others",
+            ),
+            &["mode"],
+        )
+        .unwrap();
+        let fairshare_cluster_in_flight = IntGauge::with_opts(Opts::new(
+            "obleth_fairshare_cluster_in_flight",
+            "In-flight requests across every gateway replica, as the shared slots last \
+             reported them; this replica's own count outside shared mode",
         ))
         .unwrap();
         // Labelled by state only (a fixed set of three), not by model, in
@@ -165,6 +183,12 @@ impl Metrics {
             .register(Box::new(fairshare_replicas.clone()))
             .unwrap();
         registry
+            .register(Box::new(fairshare_slot_mode.clone()))
+            .unwrap();
+        registry
+            .register(Box::new(fairshare_cluster_in_flight.clone()))
+            .unwrap();
+        registry
             .register(Box::new(capacity_discovery_models.clone()))
             .unwrap();
         registry
@@ -195,6 +219,8 @@ impl Metrics {
             in_flight,
             queue_depth,
             fairshare_replicas,
+            fairshare_slot_mode,
+            fairshare_cluster_in_flight,
             capacity_discovery_models,
             telemetry_dropped,
             cache_lookups,
@@ -254,6 +280,19 @@ impl Metrics {
 
     pub fn set_fairshare_replicas(&self, replicas: i64) {
         self.fairshare_replicas.set(replicas);
+    }
+
+    pub fn set_fairshare_slot_mode(
+        &self,
+        mode: obleth_fairshare::SlotMode,
+        cluster_in_flight: i64,
+    ) {
+        for m in obleth_fairshare::SlotMode::ALL {
+            self.fairshare_slot_mode
+                .with_label_values(&[m.as_str()])
+                .set(i64::from(m == mode));
+        }
+        self.fairshare_cluster_in_flight.set(cluster_in_flight);
     }
 
     pub fn set_capacity_discovery_models(&self, state: &str, count: i64) {
@@ -327,6 +366,20 @@ mod tests {
         let m = Metrics::new();
         m.set_fairshare_replicas(3);
         assert!(m.encode().contains("obleth_fairshare_replicas 3"));
+    }
+
+    #[test]
+    fn fairshare_slot_mode_marks_only_the_current_mode() {
+        let m = Metrics::new();
+        m.set_fairshare_slot_mode(obleth_fairshare::SlotMode::Shared, 12);
+        let text = m.encode();
+        assert!(text.contains("obleth_fairshare_shared_slots_mode{mode=\"shared\"} 1"));
+        assert!(text.contains("obleth_fairshare_shared_slots_mode{mode=\"fallback\"} 0"));
+        assert!(text.contains("obleth_fairshare_cluster_in_flight 12"));
+        m.set_fairshare_slot_mode(obleth_fairshare::SlotMode::Fallback, 3);
+        let text = m.encode();
+        assert!(text.contains("obleth_fairshare_shared_slots_mode{mode=\"shared\"} 0"));
+        assert!(text.contains("obleth_fairshare_shared_slots_mode{mode=\"fallback\"} 1"));
     }
 
     #[test]

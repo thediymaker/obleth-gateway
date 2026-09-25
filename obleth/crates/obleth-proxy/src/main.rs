@@ -104,12 +104,33 @@ async fn main() -> anyhow::Result<()> {
         cfg.fairshare_algorithm,
         cfg.default_model_max_in_flight,
     );
-    // Divide the configured limits across the live replicas, sized before the
-    // listeners open. Off, every replica enforces the whole of every limit.
-    let (replica_heartbeat, replicas) = if cfg.fairshare_replica_aware {
+    // Cluster-wide limits: with shared slots on and more than one replica
+    // live, every admission takes a slot in Redis against the configured
+    // (undivided) limits; alone, admission stays local. When shared slots are
+    // off or Redis is unavailable, replica-aware sizing divides the limits
+    // across the live replicas instead. Both need the heartbeat, which runs
+    // before the listeners open so the first request sees the fleet.
+    let instance = replicas::instance_id();
+    if cfg.fairshare_shared_slots {
+        fairshare.enable_shared_slots(
+            Arc::new(obleth_redis::RedisSlots::new(
+                redis.clone(),
+                instance.clone(),
+            )),
+            obleth_fairshare::SharedSlotsConfig {
+                reconcile_interval: cfg.fairshare_replica_heartbeat,
+                split_on_fallback: cfg.fairshare_replica_aware,
+                ..Default::default()
+            },
+        );
+        spawn_slot_release_listener(redis.clone(), fairshare.clone());
+    }
+    let (replica_heartbeat, replicas) = if cfg.fairshare_shared_slots || cfg.fairshare_replica_aware
+    {
         let (heartbeat, n) = replicas::ReplicaHeartbeat::start(
             redis.clone(),
             fairshare.clone(),
+            instance.clone(),
             cfg.fairshare_replica_heartbeat,
             cfg.fairshare_replica_ttl,
         )
@@ -117,11 +138,24 @@ async fn main() -> anyhow::Result<()> {
         (Some(heartbeat), n)
     } else {
         tracing::info!(
-            "OBLETH_FAIRSHARE_REPLICA_AWARE is off; each replica enforces the full configured \
-             fairshare limits"
+            "OBLETH_FAIRSHARE_SHARED_SLOTS and OBLETH_FAIRSHARE_REPLICA_AWARE are off; each \
+                 replica enforces the full configured fairshare limits"
         );
         (None, 1)
     };
+    tracing::info!(
+        instance = %instance,
+        replicas,
+        shared_slots = cfg.fairshare_shared_slots,
+        replica_aware = cfg.fairshare_replica_aware,
+        "fairshare limits are cluster-wide: {}",
+        match (cfg.fairshare_shared_slots, cfg.fairshare_replica_aware) {
+            (true, true) => "shared slots in Redis, divided across replicas if Redis is unavailable",
+            (true, false) => "shared slots in Redis, enforced in full per replica if Redis is unavailable",
+            (false, true) => "divided across the live replicas",
+            (false, false) => "no; each replica enforces them in full",
+        }
+    );
     // ---- fairshare history (dashboard activity chart) ----
     let history_len = if cfg.fairshare_history_secs == 0 {
         0
@@ -138,11 +172,18 @@ async fn main() -> anyhow::Result<()> {
     // operator configured.
     match store.list_models().await {
         Ok(models) => {
+            // Shared slots enforce the configured values as they stand; the
+            // per-replica check only applies where the limits are divided.
+            let divided_by = if cfg.fairshare_shared_slots || !cfg.fairshare_replica_aware {
+                1
+            } else {
+                replicas
+            };
             if let Some(warning) = obleth_admin::ceiling_check(
                 &models,
                 cfg.default_model_max_in_flight,
                 cfg.global_max_in_flight,
-                replicas,
+                divided_by,
             ) {
                 tracing::warn!(
                     ceiling = warning.ceiling,
@@ -525,6 +566,7 @@ async fn main() -> anyhow::Result<()> {
         fairshare_history: fairshare_history.clone(),
         fairshare_history_secs: cfg.fairshare_history_secs,
         fairshare_replica_aware: cfg.fairshare_replica_aware,
+        fairshare_shared_slots: cfg.fairshare_shared_slots,
         clickhouse: clickhouse_read,
         admin_token: cfg.admin_token.clone(),
         health: health_runtime,
@@ -598,7 +640,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
 
-    // Only once drained: a draining replica still holds its in-flight share.
+    // Only once drained: a draining replica still holds its in-flight slots.
     if let Some(heartbeat) = replica_heartbeat {
         heartbeat.stop().await;
     }
@@ -721,6 +763,10 @@ async fn metrics_handler(
     state
         .metrics
         .set_fairshare_replicas(state.fs.replicas.load(Ordering::Relaxed) as i64);
+    state.metrics.set_fairshare_slot_mode(
+        state.fs.mode(),
+        state.fs.cluster_in_flight.load(Ordering::Relaxed) as i64,
+    );
     for (discovery_state, count) in state.capacity_discovery.state_counts() {
         state
             .metrics
@@ -840,6 +886,27 @@ fn spawn_fairshare_history_sampler(fairshare: FairShare, history: Arc<FairshareH
                 history.push(sample);
             }
         }
+    });
+}
+
+/// Deliver shared-slot release wakeups from other replicas to the scheduler,
+/// so a waiter here retries as soon as a slot frees anywhere. After a
+/// reconnect every pool is retried, since wakeups sent meanwhile are lost;
+/// the scheduler's own retry timer covers the gap either way.
+fn spawn_slot_release_listener(redis: RedisStore, fairshare: FairShare) {
+    tokio::spawn(async move {
+        let woken = fairshare.clone();
+        redis
+            .run_slot_release_listener(
+                &obleth_redis::SlotKeys::default(),
+                move |pool| woken.wake(&pool),
+                move |reconnected| {
+                    if reconnected {
+                        fairshare.wake_all();
+                    }
+                },
+            )
+            .await;
     });
 }
 

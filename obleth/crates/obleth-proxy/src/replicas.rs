@@ -1,13 +1,16 @@
-//! Replica heartbeat: tells fairshare how many gateway replicas share the
-//! configured limits.
+//! Replica heartbeat: tells fairshare how many gateway replicas are live.
 //!
 //! Each process registers a heartbeat in Redis under a unique instance id and
 //! refreshes it every `interval`; the reply carries the number of unexpired
-//! heartbeats, which is handed to [`FairShare::set_replicas`]. That is one
-//! small script call per interval, nothing on the request path. A failed
-//! heartbeat keeps the last count (see [`ReplicaTracker`]), so a Redis outage
-//! freezes pool sizes instead of resizing them, and a replica that never got
-//! a count sizes pools as if it were alone.
+//! heartbeats, which is handed to [`FairShare::set_replicas`]. With shared
+//! slots on, more than one live replica switches admissions to cluster-wide
+//! slots; otherwise (and in fallback) the count divides the limits. The same
+//! script call reclaims the shared slots of any replica whose heartbeat has
+//! expired. That is one small script call per interval, nothing on the
+//! request path. A failed heartbeat keeps the last count (see
+//! [`ReplicaTracker`]), so a Redis outage freezes the count instead of
+//! resizing pools, and a replica that never got a count acts as if it were
+//! alone.
 
 use std::future::Future;
 use std::time::Duration;
@@ -16,7 +19,8 @@ use obleth_fairshare::{FairShare, ReplicaTracker};
 use obleth_redis::RedisStore;
 use tokio::task::JoinHandle;
 
-/// This process's heartbeat identity: the host name (the pod name under
+/// This process's heartbeat identity, which is also its shared-slot holder
+/// id: the host name (the pod name under
 /// Kubernetes) plus a random suffix, so a restarted pod that reuses its name
 /// never refreshes the previous process's entry.
 pub(crate) fn instance_id() -> String {
@@ -47,10 +51,10 @@ impl ReplicaHeartbeat {
     pub(crate) async fn start(
         redis: RedisStore,
         fairshare: FairShare,
+        instance: String,
         interval: Duration,
         ttl: Duration,
     ) -> (Self, usize) {
-        let instance = instance_id();
         let mut tracker = ReplicaTracker::new();
         let beat = {
             let redis = redis.clone();
@@ -71,7 +75,7 @@ impl ReplicaHeartbeat {
             known = tracker.known(),
             interval_secs = interval.as_secs(),
             ttl_secs = ttl.as_secs(),
-            "fairshare limits are divided across the live gateway replicas"
+            "gateway replica heartbeat started"
         );
         let task = tokio::spawn(run_heartbeats(beat, fairshare, tracker, interval));
         (
@@ -84,8 +88,9 @@ impl ReplicaHeartbeat {
         )
     }
 
-    /// Stop heartbeating and deregister. Best effort: if Redis is down the
-    /// entry simply expires after its TTL.
+    /// Stop heartbeating and deregister, freeing any shared slot still on
+    /// the books. Best effort: if Redis is down the entry simply expires
+    /// after its TTL and the next live replica reclaims its slots.
     pub(crate) async fn stop(self) {
         self.task.abort();
         let _ = self.task.await;
@@ -259,9 +264,13 @@ mod tests {
         let ttl = Duration::from_millis(400);
         // Shares the live key with any other gateway pointed at this Redis;
         // compare against the count before this test's replicas joined.
-        let (a, _) = ReplicaHeartbeat::start(redis.clone(), fs_a.clone(), interval, ttl).await;
+        let (a, _) =
+            ReplicaHeartbeat::start(redis.clone(), fs_a.clone(), instance_id(), interval, ttl)
+                .await;
         let base = replicas(&fs_a).await;
-        let (b, n) = ReplicaHeartbeat::start(redis.clone(), fs_b.clone(), interval, ttl).await;
+        let (b, n) =
+            ReplicaHeartbeat::start(redis.clone(), fs_b.clone(), instance_id(), interval, ttl)
+                .await;
         assert_eq!(n, base + 1);
         wait_for_replicas(&fs_a, base + 1).await;
 

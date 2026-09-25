@@ -115,38 +115,52 @@ hardened and made redundant):
 > **Replicas share the fairshare limits.** Fairshare runs one scheduling pool
 > per model (default `obleth.defaultModelMaxInFlight` slots, or the model's own
 > `max_in_flight`), and `obleth.globalMaxInFlight` is a total ceiling across
-> those pools — not a fairness input. Admission runs in each gateway process,
-> but every replica heartbeats into Redis
-> (`obleth.fairshareReplicaHeartbeatSecs`, default 5 s) and enforces its share
-> of each limit: the configured value divided by the live replica count,
-> rounded up, never below 1. That covers pool sizes, the global ceiling, and
-> per-tenant and per-key max in flight; weights are ratios and are not
-> divided. So the numbers you set are fleet-wide whatever `obleth.replicas` is,
-> and the HPA can scale the gateway without moving the concurrency that
-> reaches your upstream. The limits of this:
+> those pools — not a fairness input. Every limit you set is cluster-wide:
+> pool sizes, the global ceiling, and per-tenant and per-key max in flight.
+> Weights are ratios and apply as they are.
 >
-> - Rounding up lets the fleet run up to one slot per replica over a limit (a
->   pool of 8 over 3 replicas is 3 + 3 + 3). Every pool rounds up on its own,
->   so keep `obleth.globalMaxInFlight` at least one slot per enabled model per
->   replica above the pool sum; the gateway warns at start-up if it is not.
-> - Fairness is decided per replica, on its share. The fleet matches the
->   configured numbers, and tenants get their weighted share, only as far as
->   the Service spreads requests evenly; replicas cannot lend each other idle
->   capacity, so one replica can queue while another has free slots.
-> - A new replica is counted within one heartbeat. A crashed one is counted
->   until its heartbeat expires (`obleth.fairshareReplicaTtlSecs`, default
->   15 s), so the survivors run below the configured total for up to that
->   long; a replica that shuts down cleanly deregisters once it has drained.
->   Resizing never interrupts in-flight requests.
-> - If Redis is unreachable, each replica keeps the last count it read (or 1,
->   the per-replica behaviour, if it never read one) and logs the failure once.
+> With `obleth.fairshareSharedSlots: true` (the default) and more than one
+> replica live, those limits are slots in Redis that all replicas draw from.
+> Each replica keeps its own fair queue and decides which waiting request goes
+> next; before admitting it, it takes a slot in one Redis script call that
+> checks the model's pool, the global ceiling and the tenant's and key's caps
+> together, and it gives the slot back in one call when the request finishes.
+> So a model with 20 slots behind 3 replicas admits 20 requests on whichever
+> replica they reach — long streams and keep-alive connections piling onto one
+> replica no longer leave it queueing while the others sit on idle slots — and
+> never more than 20 across the fleet. The details:
 >
-> `obleth.fairshareReplicaAware: false` restores per-replica limits, where N
-> replicas admit N × every number. The dashboard's fairshare page shows the
-> answering replica's own counts and its share of each limit, with the live
-> replica count; its history is per replica as well
-> (`obleth.fairshareHistorySecs`, in memory), so with several replicas the
-> chart shows whichever replica answered.
+> - With a single live replica there is no Redis call on the request path.
+> - Replicas heartbeat into Redis (`obleth.fairshareReplicaHeartbeatSecs`,
+>   default 5 s). A crashed replica's slots return to the others once its
+>   heartbeat expires (`obleth.fairshareReplicaTtlSecs`, default 15 s); until
+>   then they stay taken, so the fleet runs below the limit for up to that
+>   long. A replica that shuts down cleanly gives its slots back once drained.
+>   Each replica also re-asserts what it really holds every heartbeat
+>   interval, which repairs the count after a lost release.
+> - When a slot frees on one replica, Redis notifies the replicas waiting for
+>   that model and each tries once; a short randomized retry (100–250 ms)
+>   covers a lost notification. Fairness is exact within a replica. Across
+>   replicas a freed slot goes to whichever replica claims it first, so a
+>   tenant's weighted share holds only as far as its requests reach the
+>   replicas where others compete with it.
+> - If Redis is unreachable, or answers slower than the gateway's Redis
+>   response timeout (`OBLETH_REDIS_RESPONSE_TIMEOUT_MS`, default 250 ms), a
+>   replica falls back to the split below, logs once, and returns to shared
+>   slots after its holdings are reconciled. It never admits without a limit.
+>
+> The split is what `obleth.fairshareReplicaAware: true` (the default) means:
+> each replica enforces the configured value divided by the live replica
+> count, rounded up and never below 1. It applies whenever shared slots are
+> off or unavailable. Rounding up lets the fleet run up to one slot per
+> replica over a limit, and replicas cannot lend each other idle slots, so one
+> can queue while another has room. Setting both options to `false` restores
+> per-replica limits, where N replicas admit N × every number.
+>
+> The dashboard's fairshare page shows the cluster-wide in-flight count
+> against the configured capacity in shared mode, next to the answering
+> replica's own, and flags fallback. Queues, tenant rows and the history chart
+> (`obleth.fairshareHistorySecs`, in memory) are the answering replica's own.
 
 > The bundled datastores are single plain Deployments with no replication or
 > backups — intentionally. Making them HA is the job of purpose-built operators

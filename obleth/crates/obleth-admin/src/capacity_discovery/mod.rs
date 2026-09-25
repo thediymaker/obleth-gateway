@@ -10,8 +10,9 @@
 //! ```
 //!
 //! and hands the result to fairshare as the model's configured, cluster-wide
-//! pool size ([`FairShare::set_model_caps`]), so the replica-aware division
-//! still applies on top: each gateway replica enforces its share of it.
+//! pool size ([`FairShare::set_model_caps`]), enforced across the gateway
+//! replicas like any configured size: as shared slots, or divided across
+//! them when shared slots are off or unavailable.
 //!
 //! Sources:
 //! - `endpoints`: the model's enabled, healthy endpoints (all of them under
@@ -111,8 +112,7 @@ pub struct ModelCapacityStatus {
     /// `max_in_flight`), or `endpoint and configured` when both were used.
     pub per_replica_source: Option<String>,
     pub headroom: f64,
-    /// The last value derived from the source: the cluster-wide pool size,
-    /// before the replica-aware division.
+    /// The last value derived from the source: the cluster-wide pool size.
     pub derived_max_in_flight: Option<usize>,
     /// The cluster-wide pool size fairshare uses now: the derived value, the
     /// last one kept while the source has no answer, or the static fallback.

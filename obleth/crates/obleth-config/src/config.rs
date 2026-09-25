@@ -56,8 +56,8 @@ pub struct Config {
 
     /// Total in-flight ceiling across all model pools (memory and
     /// upstream-connection guard). Not a fairness input; set it above the sum
-    /// of the pool sizes you expect. Fleet-wide, like the pools, when
-    /// `fairshare_replica_aware` is on.
+    /// of the pool sizes you expect. Fleet-wide, like the pools, with
+    /// `fairshare_shared_slots` or `fairshare_replica_aware` on.
     pub global_max_in_flight: usize,
     /// Pool size for a model that has no explicit `max_in_flight`.
     pub default_model_max_in_flight: usize,
@@ -66,15 +66,24 @@ pub struct Config {
     pub fairshare_history_secs: u64,
     /// Fairshare scheduling algorithm (`weighted` or `hierarchical`).
     pub fairshare_algorithm: FairshareAlgorithm,
-    /// Divide the fairshare limits (pool sizes, the global ceiling, tenant and
-    /// key caps) across the live gateway replicas, counted from Redis
-    /// heartbeats, so the fleet enforces the configured numbers rather than
-    /// replicas times them. With one replica it changes nothing.
+    /// Enforce the fairshare limits (pool sizes, the global ceiling, tenant
+    /// and key caps) as cluster-wide slots in Redis whenever more than one
+    /// gateway replica is live, so any replica can use a model's whole pool
+    /// and the fleet never exceeds it. With one replica there is no Redis
+    /// call on the request path.
+    pub fairshare_shared_slots: bool,
+    /// Divide the fairshare limits across the live gateway replicas, counted
+    /// from Redis heartbeats, whenever shared slots are off or unavailable:
+    /// each replica then enforces `ceil(configured / replicas)`. Off, each
+    /// replica enforces the full limits in that case. With one replica it
+    /// changes nothing.
     pub fairshare_replica_aware: bool,
-    /// How often each replica refreshes its Redis heartbeat.
+    /// How often each replica refreshes its Redis heartbeat, and re-asserts
+    /// its shared-slot holdings.
     pub fairshare_replica_heartbeat: Duration,
     /// How long a heartbeat counts a replica as live. A crashed replica stops
-    /// being counted, and its share returns to the survivors, within this.
+    /// being counted, and its shared slots (or its share) return to the
+    /// survivors, within this.
     pub fairshare_replica_ttl: Duration,
     /// Settings for models in the `discovered` capacity mode.
     pub capacity_discovery: CapacityDiscoveryConfig,
@@ -293,6 +302,7 @@ impl Config {
                 "OBLETH_FAIRSHARE_ALGORITHM",
                 "hierarchical",
             )),
+            fairshare_shared_slots: bool_or("OBLETH_FAIRSHARE_SHARED_SLOTS", true),
             fairshare_replica_aware: bool_or("OBLETH_FAIRSHARE_REPLICA_AWARE", true),
             fairshare_replica_heartbeat,
             fairshare_replica_ttl,
@@ -333,10 +343,9 @@ impl Default for Config {
 }
 
 /// Default `OBLETH_GLOBAL_MAX_IN_FLIGHT`. The per-model pools are what limit
-/// admission; this is a safety cap above them (divided across replicas like
-/// the pools when replica-aware sizing is on), so it sits well over the sum of
-/// a realistic fleet's pools (128 models at the default pool size of 32)
-/// rather than binding first.
+/// admission; this is a safety cap above them (cluster-wide like the pools),
+/// so it sits well over the sum of a realistic fleet's pools (128 models at
+/// the default pool size of 32) rather than binding first.
 pub const DEFAULT_GLOBAL_MAX_IN_FLIGHT: usize = 4096;
 
 /// `(heartbeat interval, heartbeat TTL)` from their raw seconds. A zero
