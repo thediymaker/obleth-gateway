@@ -950,7 +950,8 @@ async fn proxy_handler_inner(
     // ---- Videos API follow-ups (poll, download, delete, list) ----
     // They carry a job id, never a model, so they are served from the job
     // record written at create time: routed to the model and endpoint that
-    // made the job, and "not found" for any other tenant. Reads of work the
+    // made the job, and "not found" for anyone who does not own it (another
+    // tenant, or by default another key of this one). Reads of work the
     // create already paid for, so no admission, budget, or ledger row (see
     // `crate::videos`).
     if let Some(call) = crate::videos::follow_up(&method, &path) {
@@ -2439,11 +2440,12 @@ async fn proxy_handler_inner(
 
     // ---- video job create: record the job before its id leaves ----
     // The response is a small JSON video object. It is read whole, its id is
-    // recorded against this tenant and the target that accepted it, and only
-    // then is it returned — an unrecorded id could never be followed up. The
-    // create is billed its flat `cost_per_video` (no tokens) once recorded,
-    // and nothing when it is not. The whole step runs as its own task so a
-    // client that leaves mid-way cannot strand a job it was charged for.
+    // recorded against this tenant, this key and the target that accepted
+    // it, and only then is it returned — an unrecorded id could never be
+    // followed up. The create is billed its flat `cost_per_video` (no
+    // tokens) once recorded, and nothing when it is not. The whole step runs
+    // as its own task so a client that leaves mid-way cannot strand a job it
+    // was charged for.
     if video_create {
         if let Some(t) = tracer.take() {
             t.finish("ok");

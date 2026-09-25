@@ -49,6 +49,9 @@ async fn main() -> anyhow::Result<()> {
     let cfg = Config::from_env();
     let otel_provider = init_telemetry(&cfg);
     tracing::info!(?cfg.proxy_listen, ?cfg.admin_listen, "starting obleth gateway");
+    for warning in &cfg.warnings {
+        tracing::warn!("{warning}");
+    }
 
     // ---- connect dependencies (with simple boot-time retries) ----
     let store = retry("postgres", || Store::connect(&cfg.database_url)).await?;
@@ -426,8 +429,13 @@ async fn main() -> anyhow::Result<()> {
         energy: energy.clone(),
         jwt,
         knowledge: knowledge.clone(),
-        video_jobs: videos::VideoJobStore::new(store.clone()),
+        video_jobs: videos::VideoJobStore::new(store.clone(), cfg.video_job_scope),
     };
+    tracing::info!(
+        scope = cfg.video_job_scope.as_str(),
+        "video jobs are private to their {}",
+        cfg.video_job_scope.as_str()
+    );
     videos::spawn_job_pruner(app_state.video_jobs.clone());
 
     match store.all_resolved_models().await {

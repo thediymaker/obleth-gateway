@@ -274,6 +274,12 @@ toggles in `values.yaml`, on by sensible defaults.
   available during drains/upgrades (rendered only when the minimum replica
   count is above 1: `hpa.minReplicas > 1` with the HPA enabled, otherwise
   `replicas > 1`; a PDB over a single pod would block node drains).
+- **Private video jobs.** `obleth.videoJobScope: key` (the default) makes each
+  video generation job private to the API key that created it: another key of
+  the same tenant (in practice, another user) gets a 404 on its poll,
+  download and delete, and `GET /v1/videos` lists only the caller's own jobs.
+  Set `tenant` to share jobs across all of a tenant's keys. Another tenant's
+  job is a 404 either way; an invalid value falls back to `key`.
 - **NetworkPolicy (opt-in).** `networkPolicy.enabled: true` restricts bundled
   Postgres to the obleth and control-plane pods, bundled Redis and ClickHouse
   to the obleth pods, and the Management API port (9180) to the control-plane

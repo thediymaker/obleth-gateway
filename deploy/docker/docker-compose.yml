@@ -115,6 +115,8 @@ services:
       OBLETH_UPSTREAM_TIMEOUT_SECS: ${OBLETH_UPSTREAM_TIMEOUT_SECS:-300}
       OBLETH_ADMISSION_TIMEOUT_SECS: ${OBLETH_ADMISSION_TIMEOUT_SECS:-60}
       OBLETH_VIDEO_JOB_RETENTION_HOURS: ${OBLETH_VIDEO_JOB_RETENTION_HOURS:-24}
+      # key (default): a video job is private to the key that created it; tenant: shared tenant-wide.
+      OBLETH_VIDEO_JOB_SCOPE: ${OBLETH_VIDEO_JOB_SCOPE:-key}
       OBLETH_SESSION_ID_DERIVATION: ${OBLETH_SESSION_ID_DERIVATION:-true}
       # Boot-time seed only; the dashboard's routing settings win once saved.
       OBLETH_AUTO_CLASSIFIER_ENABLED: ${OBLETH_AUTO_CLASSIFIER_ENABLED:-false}

@@ -88,6 +88,7 @@ spec:
             - { name: OBLETH_REDIS_CONNECT_TIMEOUT_MS, value: {{ .Values.obleth.redisConnectTimeoutMs | quote }} }
             - { name: OBLETH_ADMISSION_TIMEOUT_SECS, value: {{ .Values.obleth.admissionTimeoutSecs | quote }} }
             - { name: OBLETH_VIDEO_JOB_RETENTION_HOURS, value: {{ .Values.obleth.videoJobRetentionHours | quote }} }
+            - { name: OBLETH_VIDEO_JOB_SCOPE, value: {{ .Values.obleth.videoJobScope | default "key" | quote }} }
             # Telemetry spill file used while ClickHouse is unreachable. Must be
             # writable by the non-root runtime user; backed by the wal volume.
             - { name: OBLETH_WAL_PATH, value: "/var/lib/obleth/telemetry.wal" }

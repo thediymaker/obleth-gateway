@@ -32,6 +32,41 @@ impl FairshareAlgorithm {
     }
 }
 
+/// Who may follow up a video job (poll, download, delete, list):
+/// `OBLETH_VIDEO_JOB_SCOPE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoJobScope {
+    /// Only the API key that created the job. With secret keys and with the
+    /// per-(issuer, subject) identity keys of JWT callers alike, a key is one
+    /// user, so a job is private to the user who made it.
+    #[default]
+    Key,
+    /// Any key of the tenant that created the job.
+    Tenant,
+}
+
+impl VideoJobScope {
+    /// The scope an `OBLETH_VIDEO_JOB_SCOPE` value names. Unset or blank is
+    /// the default, [`VideoJobScope::Key`]; any other value that is not `key`
+    /// or `tenant` (case-insensitive) is `Err` with the value, so the caller
+    /// can warn and fall back to the default rather than widen access on a
+    /// typo.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("key") => Ok(Self::Key),
+            Some("tenant") => Ok(Self::Tenant),
+            Some(_) => Err(raw.unwrap_or_default().to_string()),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::Tenant => "tenant",
+        }
+    }
+}
+
 /// Fairshare group — capacity is partitioned by group weight under the hierarchical algorithm.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FairshareGroup {
