@@ -198,7 +198,10 @@ impl Config {
             clickhouse_user: env_or("OBLETH_CLICKHOUSE_USER", "default"),
             clickhouse_password: env_or("OBLETH_CLICKHOUSE_PASSWORD", ""),
             admin_token: require_secret("OBLETH_ADMIN_TOKEN"),
-            global_max_in_flight: parse_or("OBLETH_GLOBAL_MAX_IN_FLIGHT", 1024),
+            global_max_in_flight: parse_or(
+                "OBLETH_GLOBAL_MAX_IN_FLIGHT",
+                DEFAULT_GLOBAL_MAX_IN_FLIGHT,
+            ),
             default_model_max_in_flight: parse_or("OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT", 32),
             fairshare_history_secs: parse_or("OBLETH_FAIRSHARE_HISTORY_SECS", 3600),
             fairshare_algorithm: FairshareAlgorithm::parse(&env_or(
@@ -239,6 +242,12 @@ impl Default for Config {
         Self::from_env()
     }
 }
+
+/// Default `OBLETH_GLOBAL_MAX_IN_FLIGHT`. The per-model pools are what limit
+/// admission; this is a per-replica safety cap above them, so it sits well over
+/// the sum of a realistic fleet's pools (128 models at the default pool size of
+/// 32) rather than binding first.
+pub const DEFAULT_GLOBAL_MAX_IN_FLIGHT: usize = 4096;
 
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())

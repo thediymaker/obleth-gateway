@@ -144,7 +144,7 @@ services:
       # Trusted JWT issuers for data-plane bearer auth (JSON array). Empty = off.
       # See the "Identity Tokens" guide.
       OBLETH_JWT_ISSUERS: ${OBLETH_JWT_ISSUERS:-}
-      OBLETH_GLOBAL_MAX_IN_FLIGHT: "1024"
+      OBLETH_GLOBAL_MAX_IN_FLIGHT: "4096"
       OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT: "32"
       OBLETH_FAIRSHARE_HISTORY_SECS: "3600"
       OBLETH_FAIRSHARE_ALGORITHM: hierarchical

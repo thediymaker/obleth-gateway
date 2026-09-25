@@ -17,7 +17,7 @@ obleth:
   # aggregate is N x the configured numbers. Keep hpa.enabled false when you
   # run more than one replica (see below).
   replicas: 1
-  globalMaxInFlight: 1024
+  globalMaxInFlight: 4096
   defaultModelMaxInFlight: 32
   # Seconds of scheduler history each replica keeps in memory for the
   # dashboard's activity chart (sampled every 2 s). 0 disables it.
