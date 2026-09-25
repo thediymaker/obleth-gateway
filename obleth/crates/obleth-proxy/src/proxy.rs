@@ -1063,7 +1063,7 @@ async fn proxy_handler_inner(
     // which still falls through for an unknown id so a wildcard passthrough
     // keeps working.
     if method == Method::GET && is_models_collection(&path) {
-        return models_list_response(&state);
+        return models_list_response(&state, &resolved);
     }
     // ---- model detail (`GET /v1/models/{id}`) ----
     // Answered from the registry for any name the gateway has a route for,
@@ -1074,8 +1074,15 @@ async fn proxy_handler_inner(
     // passthrough keeps working.
     if method == Method::GET && !is_models_collection(&path) && path.starts_with("/v1/models/") {
         let id = path.trim_start_matches("/v1/models/");
-        if let Some(entry) = registered_model_entry(&state, id) {
-            return (StatusCode::OK, axum::Json(entry)).into_response();
+        match registered_model_entry(&state, id, allowed_models_for(&resolved)) {
+            Some(Ok(entry)) => return (StatusCode::OK, axum::Json(entry)).into_response(),
+            // A registered model outside the tenant's allowlist answers like a
+            // name the gateway does not have. Falling through would forward the
+            // id to an upstream, which knows nothing of the allowlist.
+            Some(Err(())) => {
+                return error_json(StatusCode::NOT_FOUND, &format!("model '{id}' not found"));
+            }
+            None => {}
         }
     }
     // ---- model detail (`GET /model/info`) ----
@@ -3998,23 +4005,48 @@ fn maybe_alert_key_budget(
 /// registered is refused. Provisioned models are registry rows too, so nothing
 /// the union found is lost.
 ///
-/// Not filtered by the tenant's model allowlist, like the detail lookup (see
-/// [`registered_model_entry`]); `/model/info` is the view that filters.
-fn models_list_response(state: &AppState) -> Response<Body> {
+/// Tenants with a model allowlist see only the models they may call, as on
+/// `/model/info`: listing a model the caller would be refused advertises a 403.
+fn models_list_response(state: &AppState, resolved: &ResolvedKey) -> Response<Body> {
     let candidates = state.model_registry.load();
     (
         StatusCode::OK,
-        axum::Json(registry_models_list(&candidates)),
+        axum::Json(registry_models_list(
+            &candidates,
+            allowed_models_for(resolved),
+        )),
     )
         .into_response()
 }
 
+/// The model allowlist that bounds what a caller is shown, or `None` when it
+/// may see everything (internal callers, and tenants without an allowlist).
+/// Entries are canonical `model_name`s, which is also what the discovery
+/// endpoints advertise.
+fn allowed_models_for(resolved: &ResolvedKey) -> Option<&[String]> {
+    if resolved.internal {
+        None
+    } else {
+        resolved.allowed_models.as_deref()
+    }
+}
+
+/// True when `model_name` is visible under `allowed` (see [`allowed_models_for`]).
+fn model_visible(allowed: Option<&[String]>, model_name: &str) -> bool {
+    allowed.is_none_or(|list| list.iter().any(|m| m == model_name))
+}
+
 /// The OpenAI `{object:"list", data:[…]}` listing for a registry snapshot,
-/// sorted by id. Pure, so the shape is unit-testable without a registry.
-fn registry_models_list(candidates: &[obleth_config::routing::Candidate]) -> serde_json::Value {
+/// sorted by id and limited to `allowed` when set. Pure, so the shape is
+/// unit-testable without a registry.
+fn registry_models_list(
+    candidates: &[obleth_config::routing::Candidate],
+    allowed: Option<&[String]>,
+) -> serde_json::Value {
     let mut data: Vec<serde_json::Value> = candidates
         .iter()
         .filter(|c| c.model.enabled)
+        .filter(|c| model_visible(allowed, &c.model.model_name))
         .map(|c| model_entry(&ModelFacts::of(&c.model)))
         .collect();
     data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
@@ -4124,18 +4156,23 @@ fn is_models_collection(path: &str) -> bool {
 /// omitted rather than fabricated — the hot-path view of a route does not
 /// carry a registration timestamp.
 ///
-/// Deliberately not filtered by the tenant's model allowlist, matching
-/// `GET /v1/models`: these are the OpenAI-compatible discovery endpoints, and a
-/// model name is not a secret — calling it is what the allowlist gates. The
-/// gateway-native `/model/info` does filter, because its semantics are ours to
-/// choose.
-fn registered_model_entry(state: &AppState, id: &str) -> Option<serde_json::Value> {
+/// `Some(Err(()))` when a route claims the name but it is outside `allowed`:
+/// the caller answers that like an unknown model, without forwarding the id,
+/// so the detail lookup reveals no more than the filtered listing does.
+fn registered_model_entry(
+    state: &AppState,
+    id: &str,
+    allowed: Option<&[String]>,
+) -> Option<Result<serde_json::Value, ()>> {
     if id.is_empty() {
         return None;
     }
     let candidates = state.model_registry.load();
     let facts = model_facts_index(&candidates).get(id)?.clone();
-    Some(model_entry(&facts))
+    if !model_visible(allowed, &facts.model_name) {
+        return Some(Err(()));
+    }
+    Some(Ok(model_entry(&facts)))
 }
 
 /// Serve `GET /model/info` from the gateway's own registry.
@@ -4166,18 +4203,11 @@ fn registered_model_entry(state: &AppState, id: &str) -> Option<serde_json::Valu
 /// model a caller would be refused would be advertising a 403.
 fn model_info_response(state: &AppState, resolved: &ResolvedKey) -> Response<Body> {
     let candidates = state.model_registry.load();
-    let allowed = if resolved.internal {
-        None
-    } else {
-        resolved.allowed_models.as_deref()
-    };
+    let allowed = allowed_models_for(resolved);
     let data: Vec<serde_json::Value> = candidates
         .iter()
         .filter(|c| c.model.enabled)
-        .filter(|c| match allowed {
-            Some(list) => list.iter().any(|m| m == &c.model.model_name),
-            None => true,
-        })
+        .filter(|c| model_visible(allowed, &c.model.model_name))
         .map(|c| model_info_entry(&c.model, c.healthy))
         .collect();
     (
@@ -5786,7 +5816,7 @@ mod tests {
             ),
             disabled,
         ];
-        let list = registry_models_list(&candidates);
+        let list = registry_models_list(&candidates, None);
         assert_eq!(list["object"], "list");
         let data = list["data"].as_array().unwrap();
         let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
@@ -5819,9 +5849,53 @@ mod tests {
             &["glm-5-3-fp8"],
             &[],
         )];
-        let listed = registry_models_list(&candidates)["data"][0].clone();
+        let listed = registry_models_list(&candidates, None)["data"][0].clone();
         let detail = model_entry(&model_facts_index(&candidates)["glm-5-3-fp8"]);
         assert_eq!(listed, detail);
+    }
+
+    #[test]
+    fn the_models_listing_shows_a_tenant_only_its_allowed_models() {
+        use super::{model_visible, registry_models_list};
+        let candidates = vec![
+            candidate(
+                "glm-5-3",
+                "glm-5-3-mxfp4",
+                "chat",
+                "mxfp4",
+                &["glm-5-3-fp8"],
+                &[],
+            ),
+            candidate(
+                "flux-2-dev",
+                "black-forest-labs/flux-2-dev",
+                "image",
+                "bf16",
+                &[],
+                &[],
+            ),
+        ];
+        let allowed = vec!["glm-5-3".to_string()];
+        let list = registry_models_list(&candidates, Some(&allowed));
+        let ids: Vec<&str> = list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["glm-5-3"]);
+        // No allowlist, or an internal caller, sees every enabled route.
+        assert_eq!(
+            registry_models_list(&candidates, None)["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        // Visibility is decided on the canonical name an alias resolves to.
+        assert!(model_visible(Some(&allowed), "glm-5-3"));
+        assert!(!model_visible(Some(&allowed), "flux-2-dev"));
+        assert!(!model_visible(Some(&[]), "glm-5-3"));
     }
 
     #[test]
