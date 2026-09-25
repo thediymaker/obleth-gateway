@@ -1852,6 +1852,10 @@ impl Scheduler {
                 );
             }
             self.mode = mode;
+            // Published now rather than with the rest of the stats at the end
+            // of the loop turn, so a caller admitted under the new mode never
+            // reads the old one.
+            self.stats.mode.store(mode.to_u8(), Ordering::Relaxed);
         }
     }
 
