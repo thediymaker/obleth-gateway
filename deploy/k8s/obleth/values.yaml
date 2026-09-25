@@ -125,21 +125,24 @@ obleth:
   capacityDiscovery:
     enabled: false
     intervalSecs: 15
-    # Namespaces the `kubernetes` capacity source may list pods in (models on
-    # the `endpoints` source need none). For each, the chart renders a Role
-    # granting get/list/watch on pods and a RoleBinding to a gateway
-    # ServiceAccount it creates; nothing cluster-wide. Reading pods exposes
-    # their full specs in those namespaces, including plain `env` values
-    # (not Secret contents referenced through valueFrom), which is why this is
-    # opt-in and namespace-scoped: list only the namespaces your backends run
-    # in. Empty renders no RBAC and leaves the kubernetes source unavailable.
-    # The namespaces must exist, and whoever runs helm must be allowed to
-    # create Roles in them.
+    # Namespaces the `kubernetes` capacity source may read in (models on the
+    # `endpoints` source need none). A kubernetes-source model counts the
+    # ready endpoints of a Service; one that names no namespace is looked up
+    # in these in order, and the first namespace that has its Service wins.
+    # For each, the chart renders a Role granting only get/list/watch on
+    # endpointslices (discovery.k8s.io) and a RoleBinding to a gateway
+    # ServiceAccount it creates; nothing on pods, Services or Secrets, and
+    # nothing cluster-wide. The permission reveals only Service endpoint
+    # addresses and readiness. Empty renders no RBAC and leaves the kubernetes
+    # source unavailable. The namespaces must exist, and whoever runs helm
+    # must be allowed to create Roles in them.
     namespaces: []
-    # Selector template for kubernetes-source models that set no
-    # capacity_selector, with {upstream_model} and {model_name} placeholders.
-    # Empty: such a model is refused until it sets its own selector.
-    defaultSelector: ""
+    # Service name template for kubernetes-source models that set no
+    # capacity_service, with {upstream_model} and {model_name} placeholders,
+    # e.g. "{upstream_model}" when each model's Service is named after the
+    # model it serves. The result must be a valid Service name as is. Empty:
+    # such a model is refused until it names its own Service.
+    defaultService: ""
 
 # Off by default. With obleth.fairshareReplicaAware on, replicas divide the
 # fairshare limits between them, so scaling moves CPU capacity, not the

@@ -291,28 +291,36 @@ growth admits queued requests at once. Nothing is written to the database.
   `failover` only the endpoint in use counts, since the others are standbys. A
   model with no endpoint rows counts its `api_base` while it is healthy. Needs
   no Kubernetes access and works the same with backends anywhere.
-- `kubernetes`: the Ready, non-terminating pods that match the model's label
-  selector (`capacity_selector`, or the `obleth.capacityDiscovery.defaultSelector`
-  template) in its namespace (`capacity_namespace`, or every namespace in
-  `obleth.capacityDiscovery.namespaces`). Set-based and inequality selectors
-  work (`a=b,c!=d`, `x in (p, q)`), so pods that hold a model but do not serve
-  requests are excluded in the selector itself: for KubeRay, where only head
-  pods serve, add `ray.io/node-type!=worker`.
+- `kubernetes`: the ready endpoints of a Service, read from its EndpointSlices.
+  The Service is `capacity_service`, or the
+  `obleth.capacityDiscovery.defaultService` template filled in for the model
+  (`{upstream_model}`, `{model_name}`; for example `"{upstream_model}"` when
+  each Service is named after the model it serves). The namespace is
+  `capacity_namespace`, or, when unset, each namespace in
+  `obleth.capacityDiscovery.namespaces` in order: the first one that has the
+  Service wins. An endpoint counts when it is ready, serving and not
+  terminating; endpoints listed in more than one slice count once. Only
+  replica counts are read: no pod, spec or environment.
 
-**Per-replica concurrency:** the model's `per_replica_max_in_flight` when set.
-Otherwise, for `endpoints`, each endpoint's own `max_in_flight`; for
-`kubernetes`, the lowest value found on the serving pods by a table of known
-server settings (vLLM `--max-num-seqs`, SGLang `--max-running-requests`, TGI
-`--max-concurrent-requests`, llama.cpp `--parallel`/`-np`, and their literal env
-forms). A server's built-in default is never assumed; a model with no value
-anywhere keeps its static `max_in_flight` and the discovery view says why.
+Which pods a Service counts is decided by the Service's own selector. For
+multi-node serving where only some pods take requests (for example a leader or
+head pod in front of workers), point the model at a Service whose selector
+matches just those pods.
+
+**Per-replica concurrency** is set by the operator, since it rarely changes:
+the model's `per_replica_max_in_flight` (the requests one replica serves at
+once, e.g. your server's max concurrent sequences, such as vLLM
+`--max-num-seqs`). It is required for the `kubernetes` source, and for
+`endpoints` unless every endpoint sets its own `max_in_flight`; a model write
+without it is refused with a message saying what to set.
 
 **Fallbacks:** when the source reports no serving replica or does not answer
-(scale to zero, a rollout, the API server briefly away), the last derived value
-holds, or the static `max_in_flight` (or `obleth.defaultModelMaxInFlight`) if
-nothing was derived yet. A model that cannot be discovered as configured (no
-per-replica value, no selector, a namespace outside the list) uses its static
-value. Each change of state is logged once.
+(scale to zero, a rollout, the Service not there, the API server briefly
+away), the last derived value holds, or the static `max_in_flight` (or
+`obleth.defaultModelMaxInFlight`) if nothing was derived yet. A namespace that
+fails to answer is not skipped in favour of a later one. A model that cannot
+be discovered as configured (no Service, a namespace outside the list) uses its
+static value. Each change of state is logged once.
 
 **Autoscalers:** capping the gateway at 100% of ready capacity still lets an
 autoscaler that scales on backend utilization or running requests (for example
@@ -325,22 +333,26 @@ quarter more than the ready capacity).
 **RBAC (kubernetes source only):** with `obleth.capacityDiscovery.enabled` and
 at least one namespace listed, the chart creates a ServiceAccount for the
 gateway pods and, in each listed namespace, a Role granting only
-`get`/`list`/`watch` on `pods` plus a RoleBinding to that account. There is no
-ClusterRole. Reading pods exposes their full specs, plain `env` values included,
-which is why the source is opt-in and namespace-scoped: list only the
-namespaces your backends run in. The namespaces must exist and the account
-running `helm` must be allowed to create Roles in them. With no namespaces
-listed nothing is rendered and the gateway keeps its default account.
+`get`/`list`/`watch` on `endpointslices` in the `discovery.k8s.io` API group,
+plus a RoleBinding to that account. Nothing on pods, Services or Secrets is
+granted, and there is no ClusterRole: the permission reveals only Service
+endpoint addresses (pod IPs and names) and readiness. The namespaces must exist
+and the account running `helm` must be allowed to create Roles in them. With no
+namespaces listed nothing is rendered and the gateway keeps its default
+account. A Service with a selector always has at least one EndpointSlice, kept
+by the EndpointSlice controller; a Service without a selector needs slices
+labelled `kubernetes.io/service-name` from whatever manages its endpoints.
 
-A kubernetes-source model whose namespace is outside the list, or that has no
-selector and no default template to fall back on, is refused when it is saved.
-The dashboard's model page and `GET /api/v1/capacity/discovery` show, per
-discovered model, the ready replicas, the per-replica value and where it came
-from, the derived pool size, this replica's share, the last refresh and the
-reason when discovery has no answer; `obleth_capacity_discovery_models{state}`
-counts models by state. See
+A kubernetes-source model with no per-replica value, whose namespace is outside
+the list, or that has no Service and no default template to fall back on (or a
+template that does not give a valid Service name for it), is refused when it is
+saved. The dashboard's model page and `GET /api/v1/capacity/discovery` show,
+per discovered model, the Service and the namespace it was found in, the ready
+replicas, the per-replica value, the derived pool size, this replica's share,
+the last refresh and the reason when discovery has no answer;
+`obleth_capacity_discovery_models{state}` counts models by state. See
 [`values-capacity-discovery.yaml`](obleth/examples/values-capacity-discovery.yaml)
-for settings and selector examples.
+for settings and examples.
 
 ## What the chart starts
 

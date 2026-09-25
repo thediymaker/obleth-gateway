@@ -6,33 +6,41 @@
 # section for the formula and the fallbacks.
 #
 # The `endpoints` source (a model's own registered endpoints) needs nothing
-# below except `enabled`. The `kubernetes` source needs `namespaces`: for each
-# one the chart creates a Role that can only get/list/watch pods, bound to a
-# ServiceAccount it creates for the gateway. Reading pods exposes their specs,
-# plain env values included, so list only the namespaces your backends run in.
+# below except `enabled`. The `kubernetes` source counts the ready endpoints
+# of each model's Service and needs `namespaces`: for each one the chart
+# creates a Role that can only get/list/watch endpointslices
+# (discovery.k8s.io), bound to a ServiceAccount it creates for the gateway.
+# That reveals only Service endpoint addresses and readiness; nothing on pods,
+# Services or Secrets is granted.
+#
+# Replica counts are all the gateway reads. Each discovered model sets its
+# per-replica concurrency once, as `per_replica_max_in_flight` (e.g. your
+# server's max concurrent sequences, such as vLLM --max-num-seqs).
 
 obleth:
   capacityDiscovery:
     enabled: true
     intervalSecs: 15
+    # Where the Services live. A model that sets no capacity_namespace is
+    # looked up in these in order; the first namespace that has its Service
+    # wins.
     namespaces:
       - inference
-    # Used for kubernetes-source models that set no capacity_selector.
+    # Used for kubernetes-source models that set no capacity_service.
     # {upstream_model} and {model_name} are filled in per model; the result
-    # must be a valid label selector. Pick one that matches how your serving
-    # stack labels its pods, and exclude pods that hold a model but do not
-    # serve requests. A generic example:
-    defaultSelector: "app.kubernetes.io/name={upstream_model}"
+    # must be a valid Service name as is (lowercase letters, digits and '-').
+    # This one fits Services named after the model they serve:
+    defaultService: "{upstream_model}"
 
-    # Examples (use one, adjust to your labels):
+    # Other examples (use one, adjust to your naming):
     #
-    # Pods labelled with the standard app name set to the served model:
-    #   defaultSelector: "app.kubernetes.io/name={upstream_model}"
+    # A Service per gateway model name, with a suffix:
+    #   defaultService: "{model_name}-serve"
     #
-    # Multi-node serving on KubeRay: only head pods serve; worker pods hold
-    # accelerators but take no requests. `!=` also matches pods without the
-    # label, so this counts single-pod deployments and Ray heads alike:
-    #   defaultSelector: "app.kubernetes.io/name={upstream_model},ray.io/node-type!=worker"
+    # Leave it empty to make every kubernetes-source model name its own
+    # Service:
+    #   defaultService: ""
     #
-    # A plain Deployment per model, labelled by the gateway's model name:
-    #   defaultSelector: "app={model_name}"
+    # Multi-node serving, where only some pods (for example a leader or head
+    # pod) take requests: point the model at a Service whose selector matches
+    # just those pods, and the count follows them.

@@ -113,7 +113,8 @@ http://{{ .Release.Name }}-benchmark-backend:8081
 {{/*
 Non-empty when the kubernetes capacity source is configured: discovery on and
 at least one namespace listed. Gates the gateway ServiceAccount, its per-
-namespace Roles and RoleBindings, and the pod's use of that account.
+namespace EndpointSlice-read Roles and RoleBindings, and the pod's use of that
+account.
 */}}
 {{- define "obleth.capacityDiscoveryRbac" -}}
 {{- $cd := .Values.obleth.capacityDiscovery | default dict -}}

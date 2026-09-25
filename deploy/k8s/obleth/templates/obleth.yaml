@@ -28,8 +28,8 @@ spec:
       terminationGracePeriodSeconds: 345
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       {{- if include "obleth.capacityDiscoveryRbac" . }}
-      # The kubernetes capacity source reads pods with this account's token
-      # (see templates/capacity-discovery-rbac.yaml).
+      # The kubernetes capacity source reads Services' EndpointSlices with this
+      # account's token (see templates/capacity-discovery-rbac.yaml).
       serviceAccountName: {{ include "obleth.fullname" . }}
       automountServiceAccountToken: true
       {{- end }}
@@ -69,7 +69,7 @@ spec:
             - { name: OBLETH_CAPACITY_DISCOVERY_ENABLED, value: {{ .Values.obleth.capacityDiscovery.enabled | quote }} }
             - { name: OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS, value: {{ .Values.obleth.capacityDiscovery.intervalSecs | quote }} }
             - { name: OBLETH_CAPACITY_DISCOVERY_NAMESPACES, value: {{ join "," (uniq .Values.obleth.capacityDiscovery.namespaces) | quote }} }
-            - { name: OBLETH_CAPACITY_DEFAULT_SELECTOR, value: {{ .Values.obleth.capacityDiscovery.defaultSelector | quote }} }
+            - { name: OBLETH_CAPACITY_DEFAULT_SERVICE, value: {{ .Values.obleth.capacityDiscovery.defaultService | quote }} }
             - { name: OBLETH_FAIL_OPEN, value: {{ .Values.obleth.failOpen | quote }} }
             - { name: OBLETH_ALLOWED_PRIVATE_CIDRS, value: {{ .Values.obleth.allowedPrivateCidrs | quote }} }
             - { name: OBLETH_MODEL_HEALTH_ENABLED, value: {{ .Values.obleth.modelHealthEnabled | quote }} }
