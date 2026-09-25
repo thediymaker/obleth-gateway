@@ -786,6 +786,15 @@ pub struct CreateModel {
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
+    /// Extra headers sent on every request to this model's upstream, after the
+    /// client's forwarded headers so these win (e.g. an AIBrix
+    /// `routing-strategy`). Names are case-insensitive. Hop-by-hop headers,
+    /// `authorization` (use `api_key`), `host`, `content-length`,
+    /// `content-type`, and `accept-encoding` are refused. Values are
+    /// write-only: responses list only `upstream_header_names`.
+    #[serde(default)]
+    #[schema(value_type = Option<std::collections::BTreeMap<String, String>>)]
+    pub upstream_headers: Option<obleth_config::UpstreamHeadersWrite>,
     #[serde(default)]
     pub model_type: Option<String>,
     /// Serving format from the fixed `QUANTIZATIONS` vocabulary. Omitted means
@@ -851,6 +860,13 @@ pub struct UpdateModel {
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
+    /// Replaces the model's upstream headers; omitted leaves them unchanged
+    /// and `{}` removes them all. A `null` value keeps the value stored under
+    /// that name, so a client that only knows the names (values are
+    /// write-only) can add or drop one header without re-sending the others.
+    #[serde(default)]
+    #[schema(value_type = Option<std::collections::BTreeMap<String, Option<String>>>)]
+    pub upstream_headers: Option<obleth_config::UpstreamHeadersWrite>,
     #[serde(default)]
     pub model_type: Option<String>,
     /// Serving format from the fixed `QUANTIZATIONS` vocabulary; omitted
@@ -1514,6 +1530,10 @@ pub struct ModelRouteView {
     pub api_base: String,
     /// Whether an upstream API key is stored. The key itself is write-only.
     pub api_key_set: bool,
+    /// Names of the headers added to every upstream request. The values are
+    /// write-only, like `api_key`, because an operator may put a credential
+    /// in one.
+    pub upstream_header_names: Vec<String>,
     /// Modality from the fixed `MODEL_TYPES` vocabulary. Determines which
     /// OpenAI endpoint this model serves (`chat`, `embedding`,
     /// `audio_transcription`, `audio_speech`, `image`). Defaults to `chat`.
@@ -1616,6 +1636,23 @@ pub struct ModelRouteView {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// A model's operator-configured upstream headers as a header map, for every
+/// outbound call to that model (the proxied request, helper calls, health
+/// probes). Entries were validated when they were written; one that still
+/// fails to parse is skipped rather than failing the request.
+pub fn upstream_header_map(headers: &obleth_config::UpstreamHeaders) -> reqwest::header::HeaderMap {
+    let mut out = reqwest::header::HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(value),
+        ) {
+            out.insert(name, value);
+        }
+    }
+    out
+}
+
 fn secret_set(s: &Option<String>) -> bool {
     s.as_ref().is_some_and(|v| !v.is_empty())
 }
@@ -1634,6 +1671,7 @@ impl From<ModelRoute> for ModelRouteView {
             upstream_model,
             api_base,
             api_key,
+            upstream_headers,
             model_type,
             quantization,
             input_cost_per_token,
@@ -1679,6 +1717,7 @@ impl From<ModelRoute> for ModelRouteView {
             upstream_model,
             api_base,
             api_key_set: secret_set(&api_key),
+            upstream_header_names: obleth_config::upstream_header_names(&upstream_headers),
             model_type,
             quantization,
             input_cost_per_token,
@@ -5227,6 +5266,11 @@ async fn create_model(
         body.model_name.trim(),
     )
     .await?;
+    let upstream_headers = match &body.upstream_headers {
+        Some(write) => obleth_config::merge_upstream_headers(&Default::default(), write)
+            .map_err(AdminError::BadRequest)?,
+        None => Default::default(),
+    };
     let model = state
         .store
         .create_model(
@@ -5260,6 +5304,7 @@ async fn create_model(
             body.verify_upstream_model.as_deref().unwrap_or(""),
             &aliases,
             &quantization,
+            &upstream_headers,
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -5339,6 +5384,11 @@ async fn update_model(
         Some(list) => validate_aliases(&state, list, Some(id), &existing.model_name).await?,
         None => existing.aliases.clone(),
     };
+    let upstream_headers = match &body.upstream_headers {
+        Some(write) => obleth_config::merge_upstream_headers(&existing.upstream_headers, write)
+            .map_err(AdminError::BadRequest)?,
+        None => existing.upstream_headers.clone(),
+    };
     let model = state
         .store
         .update_model(
@@ -5389,6 +5439,7 @@ async fn update_model(
                 .unwrap_or(&existing.verify_upstream_model),
             &aliases,
             &quantization,
+            &upstream_headers,
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -6471,6 +6522,7 @@ async fn sync_model_from(
         upstream_model: model.upstream_model.clone(),
         api_base: model.api_base.clone(),
         api_key: model.api_key.clone(),
+        upstream_headers: model.upstream_headers.clone(),
         model_type: model.model_type.clone(),
         quantization: model.quantization.clone(),
         admission_weight: model.admission_weight,
@@ -6748,6 +6800,7 @@ mod tests {
                     "",
                     &[],
                     "",
+                    &Default::default(),
                 )
                 .await
                 .expect("create fixture model")
@@ -8315,6 +8368,7 @@ mod tests {
             upstream_model: name.to_string(),
             api_base: "http://upstream.invalid".to_string(),
             api_key: None,
+            upstream_headers: Default::default(),
             model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
             quantization: obleth_config::DEFAULT_QUANTIZATION.to_string(),
             input_cost_per_token: 0.0,
@@ -8371,6 +8425,64 @@ mod tests {
         route.api_key = Some(String::new());
         let v = serde_json::to_value(ModelRouteView::from(route)).unwrap();
         assert_eq!(v["api_key_set"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn model_route_view_lists_upstream_header_names_but_never_values() {
+        let mut route = fixture_model_route("m");
+        route.upstream_headers = [
+            ("routing-strategy".to_string(), "prefix-cache".to_string()),
+            (
+                "x-upstream-token".to_string(),
+                "tok-upstream-secret".to_string(),
+            ),
+        ]
+        .into();
+        let v = serde_json::to_value(ModelRouteView::from(route)).unwrap();
+        assert_eq!(
+            v["upstream_header_names"],
+            serde_json::json!(["routing-strategy", "x-upstream-token"])
+        );
+        assert!(
+            v.get("upstream_headers").is_none(),
+            "view leaked values: {v}"
+        );
+        assert!(!v.to_string().contains("tok-upstream-secret"));
+        assert!(!v.to_string().contains("prefix-cache"));
+    }
+
+    #[test]
+    fn model_writes_take_upstream_headers_with_null_meaning_keep() {
+        let create: CreateModel = serde_json::from_value(serde_json::json!({
+            "model_name": "m", "upstream_model": "m", "api_base": "",
+            "upstream_headers": {"Routing-Strategy": "prefix-cache"}
+        }))
+        .unwrap();
+        let write = create.upstream_headers.unwrap();
+        assert_eq!(write["Routing-Strategy"].as_deref(), Some("prefix-cache"));
+
+        let update: UpdateModel = serde_json::from_value(serde_json::json!({
+            "upstream_model": "m", "api_base": "",
+            "upstream_headers": {"x-upstream-token": null}
+        }))
+        .unwrap();
+        assert_eq!(update.upstream_headers.unwrap()["x-upstream-token"], None);
+        let omitted: UpdateModel =
+            serde_json::from_value(serde_json::json!({"upstream_model": "m", "api_base": ""}))
+                .unwrap();
+        assert!(
+            omitted.upstream_headers.is_none(),
+            "absent means keep them all"
+        );
+    }
+
+    #[test]
+    fn upstream_header_map_holds_the_validated_headers() {
+        let headers: obleth_config::UpstreamHeaders =
+            [("routing-strategy".to_string(), "prefix-cache".to_string())].into();
+        let map = upstream_header_map(&headers);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["routing-strategy"], "prefix-cache");
     }
 
     #[test]

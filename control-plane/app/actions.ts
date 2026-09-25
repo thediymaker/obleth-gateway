@@ -28,6 +28,7 @@ import type {
   SlurmHealthView,
 } from "@/lib/obleth";
 import { requireAdmin } from "@/lib/auth/roles";
+import { parseUpstreamHeaders } from "@/lib/upstream-headers";
 import { resolveRecipeById, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
 import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
 import { blockedHostReason } from "@/lib/ssrf";
@@ -780,6 +781,7 @@ export async function createModelAction(
       supports_vision: tagsInclude(tags, "vision"),
       tags,
       aliases: aliasesFromForm(formData),
+      ...upstreamHeadersFromForm(formData),
       boons: boonsFromForm(formData),
       tool_servers: toolServersFromForm(formData),
     }, { auditActor: session.email });
@@ -1070,6 +1072,7 @@ export async function updateModelConnectionAction(
       route_bias: numOr(formData.get("route_bias"), current.route_bias),
       auto_eligible: formData.get("auto_eligible") === "on",
       ...(newKey ? { api_key: newKey } : {}),
+      ...upstreamHeadersFromForm(formData),
     }, { auditActor: session.email });
   } catch (e) {
     return { ok: false, error: e instanceof Error ? e.message : "Save failed." };
@@ -1658,6 +1661,16 @@ function aliasesFromForm(formData: FormData): string[] {
     .split(/[\n,]/)
     .map((a) => a.trim())
     .filter((a) => a.length > 0);
+}
+
+// The upstream-headers textarea as an update field, only when the form has
+// one: a form without it (every other model tab) must leave the stored
+// headers alone, which the gateway does when the field is omitted.
+function upstreamHeadersFromForm(
+  formData: FormData,
+): { upstream_headers?: Record<string, string | null> } {
+  if (!formData.has("upstream_headers")) return {};
+  return { upstream_headers: parseUpstreamHeaders(String(formData.get("upstream_headers") ?? "")) };
 }
 
 function clampTagLevel(raw: FormDataEntryValue | null): number {

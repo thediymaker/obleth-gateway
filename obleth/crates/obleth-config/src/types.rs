@@ -349,6 +349,11 @@ pub struct ModelRoute {
     pub api_base: String,
     /// Optional bearer/api key for the upstream (stored encrypted-at-rest in prod).
     pub api_key: Option<String>,
+    /// Extra headers sent on every request to this model's upstream, after
+    /// the client's forwarded headers so the operator's value wins. Values
+    /// are stored encrypted at rest and never returned by the Management API.
+    #[serde(default)]
+    pub upstream_headers: UpstreamHeaders,
     /// Modality from the fixed [`MODEL_TYPES`] vocabulary. Determines which
     /// OpenAI endpoint this model serves (`chat`, `embedding`,
     /// `audio_transcription`, `audio_speech`, `image`). Defaults to `chat`.
@@ -534,6 +539,11 @@ pub struct ResolvedModel {
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
+    /// Operator-configured headers for every upstream request (see
+    /// [`ModelRoute::upstream_headers`]). `#[serde(default)]` keeps older
+    /// cached payloads deserializable as "none".
+    #[serde(default)]
+    pub upstream_headers: UpstreamHeaders,
     /// Modality from the fixed [`MODEL_TYPES`] vocabulary. `#[serde(default)]`
     /// keeps older cached payloads (without this field) deserializable as
     /// `chat`.
@@ -1467,6 +1477,120 @@ where
         }
     }
     out
+}
+
+/// Operator-configured headers added to every request sent to a model's
+/// upstream. Keyed by lowercase header name; a `BTreeMap` so the stored,
+/// cached, and compared forms are order-stable.
+pub type UpstreamHeaders = std::collections::BTreeMap<String, String>;
+
+/// A write to a model's upstream headers: the full set of names the model
+/// should carry. A string sets that header's value; `null` keeps the value
+/// already stored under that name, so a client that was only ever shown the
+/// names (values are write-only) can add or drop one header without
+/// re-sending the others. A stored name missing from the write is removed.
+pub type UpstreamHeadersWrite = std::collections::BTreeMap<String, Option<String>>;
+
+/// Maximum upstream headers per model.
+pub const MAX_UPSTREAM_HEADERS: usize = 32;
+/// Maximum length of one upstream header value, in bytes.
+pub const MAX_UPSTREAM_HEADER_VALUE_LEN: usize = 4096;
+
+/// Header names an operator may not set on a model. Hop-by-hop headers belong
+/// to one connection, not to the request. `authorization` is owned by the
+/// model's `api_key`. `host`, `content-length`, and `content-type` describe
+/// the body the gateway itself rebuilds (a re-serialized JSON body, or a
+/// multipart form with a fresh boundary), and `accept-encoding` is stripped so
+/// the gateway can read the response it meters.
+pub const DENIED_UPSTREAM_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "authorization",
+    "host",
+    "content-length",
+    "content-type",
+    "accept-encoding",
+];
+
+/// RFC 9110 token characters, the only ones a header name may contain.
+fn is_header_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// Validate one upstream header and return its canonical (lowercase) name.
+/// Values must be visible ASCII, space, or tab: no line breaks, so a value
+/// can never smuggle a second header.
+pub fn validate_upstream_header(name: &str, value: &str) -> Result<String, String> {
+    let name = name.trim().to_ascii_lowercase();
+    if name.is_empty() || !name.bytes().all(is_header_token_byte) {
+        return Err(format!(
+            "upstream header name '{name}' is not a valid header name"
+        ));
+    }
+    if DENIED_UPSTREAM_HEADERS.contains(&name.as_str()) {
+        return Err(format!(
+            "upstream header '{name}' cannot be set per model (the gateway owns it; \
+             use api_key for upstream auth)"
+        ));
+    }
+    if value.len() > MAX_UPSTREAM_HEADER_VALUE_LEN {
+        return Err(format!(
+            "upstream header '{name}' is longer than {MAX_UPSTREAM_HEADER_VALUE_LEN} bytes"
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|b| b == b'\t' || (b' '..=b'~').contains(&b))
+    {
+        return Err(format!(
+            "upstream header '{name}' has a value with characters a header cannot carry"
+        ));
+    }
+    Ok(name)
+}
+
+/// Apply an [`UpstreamHeadersWrite`] to the headers stored today, validating
+/// every entry. Names are case-insensitive: two spellings of one name in a
+/// single write are rejected rather than one silently winning.
+pub fn merge_upstream_headers(
+    stored: &UpstreamHeaders,
+    write: &UpstreamHeadersWrite,
+) -> Result<UpstreamHeaders, String> {
+    if write.len() > MAX_UPSTREAM_HEADERS {
+        return Err(format!(
+            "at most {MAX_UPSTREAM_HEADERS} upstream headers may be set per model"
+        ));
+    }
+    let mut out = UpstreamHeaders::new();
+    for (raw_name, value) in write {
+        let value = match value {
+            Some(v) => v.trim().to_string(),
+            None => {
+                let key = raw_name.trim().to_ascii_lowercase();
+                stored.get(&key).cloned().ok_or_else(|| {
+                    format!("upstream header '{key}' has no stored value to keep; send a value")
+                })?
+            }
+        };
+        let name = validate_upstream_header(raw_name, &value)?;
+        if out.insert(name.clone(), value).is_some() {
+            return Err(format!("upstream header '{name}' is given more than once"));
+        }
+    }
+    Ok(out)
+}
+
+/// Header names only, for API responses: values are write-only because an
+/// operator may put a credential in one.
+pub fn upstream_header_names(headers: &UpstreamHeaders) -> Vec<String> {
+    headers.keys().cloned().collect()
 }
 
 /// Normalize an arbitrary list of tag strings to the canonical form used for
@@ -2681,6 +2805,10 @@ pub struct ModelBackup {
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
+    /// Upstream header values as stored (ciphertext on encrypted instances),
+    /// like `api_key`. Absent in backups taken before the column existed.
+    #[serde(default)]
+    pub upstream_headers: UpstreamHeaders,
     #[serde(default = "default_model_type")]
     pub model_type: String,
     /// Declared serving format. Defaulted so backups taken before the column
@@ -3404,6 +3532,61 @@ mod tests {
     }
 
     #[test]
+    fn upstream_headers_are_validated_lowercased_and_merged() {
+        let stored: UpstreamHeaders = [("x-token".to_string(), "old".to_string())].into();
+
+        // Names fold to lowercase; `null` keeps the stored value; the rest is replaced.
+        let write: UpstreamHeadersWrite = [
+            ("X-Token".to_string(), None),
+            (
+                "Routing-Strategy".to_string(),
+                Some(" prefix-cache ".into()),
+            ),
+        ]
+        .into();
+        let merged = merge_upstream_headers(&stored, &write).unwrap();
+        assert_eq!(merged["x-token"], "old");
+        assert_eq!(merged["routing-strategy"], "prefix-cache");
+        assert_eq!(
+            upstream_header_names(&merged),
+            vec!["routing-strategy".to_string(), "x-token".to_string()]
+        );
+        assert!(
+            merge_upstream_headers(&stored, &UpstreamHeadersWrite::new())
+                .unwrap()
+                .is_empty()
+        );
+
+        // The gateway owns auth, framing, and connection headers.
+        for denied in DENIED_UPSTREAM_HEADERS {
+            let w: UpstreamHeadersWrite = [(denied.to_uppercase(), Some("v".into()))].into();
+            assert!(merge_upstream_headers(&stored, &w).is_err(), "{denied}");
+        }
+        let bad = |name: &str, value: Option<&str>| {
+            let w: UpstreamHeadersWrite = [(name.to_string(), value.map(str::to_string))].into();
+            merge_upstream_headers(&stored, &w).is_err()
+        };
+        assert!(bad("x-new", None), "nothing stored to keep");
+        assert!(bad("bad name", Some("v")));
+        assert!(bad("", Some("v")));
+        assert!(bad("x-split", Some("a\r\nx-injected: 1")));
+        assert!(bad(
+            "x-long",
+            Some(&"v".repeat(MAX_UPSTREAM_HEADER_VALUE_LEN + 1))
+        ));
+        let dup: UpstreamHeadersWrite = [
+            ("x-a".to_string(), Some("1".into())),
+            ("X-A".to_string(), Some("2".into())),
+        ]
+        .into();
+        assert!(merge_upstream_headers(&stored, &dup).is_err());
+        let many: UpstreamHeadersWrite = (0..=MAX_UPSTREAM_HEADERS)
+            .map(|i| (format!("x-{i}"), Some("v".to_string())))
+            .collect();
+        assert!(merge_upstream_headers(&stored, &many).is_err());
+    }
+
+    #[test]
     fn normalize_aliases_trims_dedupes_and_caps() {
         assert_eq!(
             normalize_aliases(["glm-5-3-fp8", "  glm-5-3-mxfp4  ", "", "glm-5-3-fp8"]),
@@ -3430,6 +3613,7 @@ mod tests {
             upstream_model: "glm-5-3-mxfp4".into(),
             api_base: "http://upstream/v1".into(),
             api_key: None,
+            upstream_headers: Default::default(),
             model_type: DEFAULT_MODEL_TYPE.to_string(),
             quantization: "mxfp4".into(),
             admission_weight: 100,

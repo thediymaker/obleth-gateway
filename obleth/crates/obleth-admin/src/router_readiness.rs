@@ -276,6 +276,7 @@ mod tests {
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
             api_key: None,
+            upstream_headers: Default::default(),
             model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
             admission_weight: 100,
             max_in_flight: None,

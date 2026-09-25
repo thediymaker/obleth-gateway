@@ -128,7 +128,7 @@ impl Store {
 
         let models = sqlx::query(
             "select id, model_name, aliases, description, upstream_model, api_base, api_key,
-                    model_type, quantization,
+                    upstream_headers, model_type, quantization,
                     input_cost_per_token, output_cost_per_token, cost_per_image,
                     cost_per_audio_second, cost_per_character, context_window, admission_weight,
                     max_in_flight, capacity_mode, capacity_tuned_at, supports_function_calling,
@@ -394,11 +394,12 @@ impl Store {
                         health_checks_enabled, health_alerts_enabled, health_check_interval_secs,
                         health_failure_threshold, health_maintenance_until,
                         health_maintenance_note, created_at,
-                        debug_diagnostics, energy_slots_per_node, aliases, quantization)
+                        debug_diagnostics, energy_slots_per_node, aliases, quantization,
+                        upstream_headers)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
                         $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46,
-                        $47, $48)
+                        $47, $48, $49)
                  on conflict (id) do update set
                         model_name = excluded.model_name,
                         description = excluded.description,
@@ -446,6 +447,7 @@ impl Store {
                         energy_slots_per_node = excluded.energy_slots_per_node,
                         aliases = excluded.aliases,
                         quantization = excluded.quantization,
+                        upstream_headers = excluded.upstream_headers,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -499,6 +501,17 @@ impl Store {
                 &m.aliases,
             )))
             .bind(obleth_config::normalize_quantization(&m.quantization))
+            .bind(sqlx::types::Json(
+                m.upstream_headers
+                    .iter()
+                    .map(|(name, value)| {
+                        (
+                            name.clone(),
+                            normalize_secret(Some(value)).unwrap_or_default(),
+                        )
+                    })
+                    .collect::<std::collections::BTreeMap<_, _>>(),
+            ))
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -675,6 +688,10 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
         upstream_model: row.try_get("upstream_model")?,
         api_base: row.try_get("api_base")?,
         api_key: row.try_get("api_key")?,
+        upstream_headers: row
+            .try_get::<sqlx::types::Json<obleth_config::UpstreamHeaders>, _>("upstream_headers")
+            .map(|j| j.0)
+            .unwrap_or_default(),
         model_type: row.try_get("model_type")?,
         quantization: row
             .try_get::<String, _>("quantization")
@@ -841,6 +858,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");

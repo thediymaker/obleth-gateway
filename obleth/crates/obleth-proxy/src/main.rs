@@ -1392,6 +1392,7 @@ mod registry_refresh_tests {
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
             api_key: None,
+            upstream_headers: Default::default(),
             model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
             quantization: obleth_config::DEFAULT_QUANTIZATION.to_string(),
             admission_weight: 100,

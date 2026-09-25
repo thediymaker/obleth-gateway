@@ -89,6 +89,8 @@ const SCHEMA_V21: &str =
 const SCHEMA_V24: &str =
     include_str!("../../../../schema/postgres/0024_model_aliases_and_quantization.sql");
 const SCHEMA_V25: &str = include_str!("../../../../schema/postgres/0025_api_key_fairshare.sql");
+const SCHEMA_V26: &str =
+    include_str!("../../../../schema/postgres/0026_model_upstream_headers.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -230,6 +232,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V23).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V24).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V25).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V26).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1319,6 +1322,7 @@ impl Store {
         verify_upstream_model: &str,
         aliases: &[String],
         quantization: &str,
+        upstream_headers: &obleth_config::UpstreamHeaders,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -1329,9 +1333,10 @@ impl Store {
                 admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                 supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
                 energy_slots_per_node, route_bias, auto_eligible,
-                draft_model, verify_api_base, verify_upstream_model, aliases, quantization
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31)
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
+                draft_model, verify_api_base, verify_upstream_model, aliases, quantization,
+                upstream_headers
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32)
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1374,6 +1379,7 @@ impl Store {
         .bind(verify_upstream_model.trim())
         .bind(sqlx::types::Json(obleth_config::normalize_aliases(aliases)))
         .bind(obleth_config::normalize_quantization(quantization))
+        .bind(encrypt_upstream_headers(upstream_headers))
         .fetch_one(&self.pool)
         .await?;
         model_from_row(&row)
@@ -1381,7 +1387,7 @@ impl Store {
 
     pub async fn list_models(&self) -> Result<Vec<ModelRoute>> {
         let rows = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
+            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                     input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1400,7 +1406,7 @@ impl Store {
 
     pub async fn get_model(&self, id: Uuid) -> Result<ModelRoute> {
         let row = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
+            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                     input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1421,7 +1427,7 @@ impl Store {
 
     pub async fn get_model_by_name(&self, model_name: &str) -> Result<ModelRoute> {
         let row = sqlx::query(
-            "select id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
+            "select id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                     input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1501,6 +1507,7 @@ impl Store {
         verify_upstream_model: &str,
         aliases: &[String],
         quantization: &str,
+        upstream_headers: &obleth_config::UpstreamHeaders,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
@@ -1517,10 +1524,10 @@ impl Store {
                 energy_slots_per_node = $24, route_bias = $25,
                 auto_eligible = $26,
                 draft_model = $27, verify_api_base = $28, verify_upstream_model = $29,
-                aliases = $30, quantization = $31,
+                aliases = $30, quantization = $31, upstream_headers = $32,
                 updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1563,6 +1570,7 @@ impl Store {
         .bind(verify_upstream_model.trim())
         .bind(sqlx::types::Json(obleth_config::normalize_aliases(aliases)))
         .bind(obleth_config::normalize_quantization(quantization))
+        .bind(encrypt_upstream_headers(upstream_headers))
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1588,7 +1596,7 @@ impl Store {
         let row = sqlx::query(
             "update models set max_in_flight = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1617,7 +1625,7 @@ impl Store {
         let row = sqlx::query(
             "update models set capacity_mode = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1647,7 +1655,7 @@ impl Store {
             "update models set max_in_flight = $2, capacity_mode = 'tuned',
                     capacity_tuned_at = now(), updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1673,7 +1681,7 @@ impl Store {
         let row = sqlx::query(
             "update models set admission_weight = $2, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1693,7 +1701,7 @@ impl Store {
 
     pub async fn all_resolved_models(&self) -> Result<Vec<(String, ResolvedModel)>> {
         let rows = sqlx::query(
-            "select id, model_name, upstream_model, api_base, api_key, model_type, aliases, quantization, admission_weight, max_in_flight, enabled,
+            "select id, model_name, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization, admission_weight, max_in_flight, enabled,
                     cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character,
                     context_window, supports_function_calling, supports_system_messages,
@@ -1757,6 +1765,7 @@ impl Store {
                     upstream_model: row.try_get("upstream_model")?,
                     api_base: row.try_get("api_base")?,
                     api_key: cipher().decrypt_opt(row.try_get("api_key")?)?,
+                    upstream_headers: upstream_headers_from_row(row)?,
                     model_type: row.try_get("model_type")?,
                     quantization: row
                         .try_get::<String, _>("quantization")
@@ -1875,7 +1884,7 @@ impl Store {
         let row = sqlx::query(
             "update models set cache_enabled = $2, cache_ttl_secs = $3, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -1911,7 +1920,7 @@ impl Store {
                     retry_backoff_ms = $4, endpoint_selection_mode = $5,
                     debug_diagnostics = $6, updated_at = now()
              where id = $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -2676,7 +2685,7 @@ impl Store {
              from due
              where m.id = due.id
              returning m.id, m.model_name, m.description, m.upstream_model, m.api_base, m.api_key,
-                       m.model_type,
+                       m.upstream_headers, m.model_type,
                        m.input_cost_per_token, m.output_cost_per_token, m.context_window,
                        m.admission_weight, m.max_in_flight,
                        m.supports_function_calling, m.supports_system_messages,
@@ -2942,7 +2951,7 @@ impl Store {
             "update models
                 set tool_servers = tool_servers - $1, updated_at = now()
               where tool_servers ? $1
-             returning id, model_name, description, upstream_model, api_base, api_key, model_type, aliases, quantization,
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
@@ -3467,6 +3476,7 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         upstream_model: row.try_get("upstream_model")?,
         api_base: row.try_get("api_base")?,
         api_key: cipher().decrypt_opt(row.try_get("api_key")?)?,
+        upstream_headers: upstream_headers_from_row(row)?,
         // Tolerant reads: SQL statements that don't select these newer columns
         // (e.g. capacity/weight toggles) degrade to defaults rather than
         // erroring. The full SELECT/RETURNING clauses do include them so the
@@ -3559,6 +3569,34 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
     })
+}
+
+/// Encrypt each upstream header value for storage, like `models.api_key`.
+pub(crate) fn encrypt_upstream_headers(
+    headers: &obleth_config::UpstreamHeaders,
+) -> sqlx::types::Json<obleth_config::UpstreamHeaders> {
+    sqlx::types::Json(
+        headers
+            .iter()
+            .map(|(name, value)| (name.clone(), cipher().encrypt(value)))
+            .collect(),
+    )
+}
+
+/// Decrypt the `upstream_headers` column. Tolerant of statements that do not
+/// select it (read as none), but a value that fails to decrypt is an error,
+/// exactly as it is for `api_key`.
+pub(crate) fn upstream_headers_from_row(row: &PgRow) -> Result<obleth_config::UpstreamHeaders> {
+    let Ok(stored) =
+        row.try_get::<sqlx::types::Json<obleth_config::UpstreamHeaders>, _>("upstream_headers")
+    else {
+        return Ok(obleth_config::UpstreamHeaders::new());
+    };
+    stored
+        .0
+        .into_iter()
+        .map(|(name, value)| Ok((name, cipher().decrypt(&value)?)))
+        .collect()
 }
 
 fn resolved_endpoint_from_row(row: &PgRow) -> Result<ResolvedEndpoint> {
@@ -3857,6 +3895,86 @@ mod tests {
         assert_eq!(truncated, "é".repeat(64));
     }
 
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn model_upstream_headers_roundtrip() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let headers: obleth_config::UpstreamHeaders = [
+            ("routing-strategy".to_string(), "prefix-cache".to_string()),
+            ("x-upstream-token".to_string(), "tok".to_string()),
+        ]
+        .into();
+        let name = format!("m-{}", Uuid::new_v4());
+        let d = default_test_model(&name);
+        let model = store
+            .create_model(
+                d.0,
+                d.1,
+                d.2,
+                d.3,
+                d.4,
+                d.5,
+                d.6,
+                d.7,
+                d.8,
+                d.9,
+                d.10,
+                d.11,
+                d.12,
+                d.13,
+                d.14,
+                d.15,
+                d.16,
+                d.17,
+                d.18,
+                &d.19,
+                &d.20,
+                &d.21,
+                d.22,
+                d.23,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "unknown",
+                &headers,
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+        assert_eq!(model.upstream_headers, headers);
+        assert_eq!(
+            store.get_model(model.id).await.unwrap().upstream_headers,
+            headers
+        );
+
+        // A narrow write (the capacity toggle) returns the headers too, so the
+        // resolver cache it republishes does not lose them.
+        let toggled = store
+            .update_model_capacity(model.id, Some(8))
+            .await
+            .expect("capacity");
+        assert_eq!(toggled.upstream_headers, headers);
+        let resolved = store
+            .all_resolved_models()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|(n, _)| n == &model.model_name)
+            .expect("model present")
+            .1;
+        assert_eq!(resolved.upstream_headers, headers);
+    }
+
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` points at a
     /// throwaway Postgres. Skips silently otherwise so unit runs stay hermetic.
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -3906,6 +4024,7 @@ mod tests {
                 &[alias.clone(), String::new(), alias.clone()],
                 // A backend's own spelling, folded onto the vocabulary value.
                 "FP8-e4m3",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -3989,6 +4108,7 @@ mod tests {
                 "",
                 &[],
                 "mxfp4",
+                &Default::default(),
             )
             .await
             .expect("update model");
@@ -4093,6 +4213,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -4414,6 +4535,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -4551,6 +4673,7 @@ mod tests {
                     "",
                     &[],
                     "",
+                    &Default::default(),
                 )
                 .await
                 .expect("create model");
@@ -4657,6 +4780,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -4861,6 +4985,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -4934,6 +5059,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("update model");
@@ -5086,6 +5212,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -5191,6 +5318,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("model");
@@ -5297,6 +5425,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -5520,6 +5649,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -5617,6 +5747,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model with both grants");
@@ -5656,6 +5787,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model with kept grant");
@@ -5732,6 +5864,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -5809,6 +5942,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -5887,6 +6021,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -5981,6 +6116,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -6095,6 +6231,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -6195,6 +6332,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -6273,6 +6411,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -6372,6 +6511,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -6441,6 +6581,7 @@ mod tests {
                 "",
                 &[],
                 "",
+                &Default::default(),
             )
             .await
             .expect("create model");

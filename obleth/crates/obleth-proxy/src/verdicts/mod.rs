@@ -160,6 +160,7 @@ pub(crate) async fn fan_out(
     http: &reqwest::Client,
     url: &str,
     api_key: Option<&str>,
+    headers: &reqwest::header::HeaderMap,
     model: &str,
     calls: Vec<QuestionCall>,
     timeout: Duration,
@@ -180,8 +181,16 @@ pub(crate) async fn fan_out(
         } else {
             (url, &call.body, false)
         };
-        let mut result =
-            one_call(http, first_url, api_key, first_body, first_spliced, timeout).await;
+        let mut result = one_call(
+            http,
+            first_url,
+            api_key,
+            headers,
+            first_body,
+            first_spliced,
+            timeout,
+        )
+        .await;
         if let Ok(success) = &mut result {
             success.used_prefill = prefill_first;
             success.used_splice = splice_first;
@@ -200,7 +209,11 @@ pub(crate) async fn fan_out(
                 } else {
                     (url, &call.prefill_body)
                 };
-                match one_call(http, retry_url, api_key, retry_body, harmony, timeout).await {
+                match one_call(
+                    http, retry_url, api_key, headers, retry_body, harmony, timeout,
+                )
+                .await
+                {
                     Ok(mut retried) => {
                         let retried_mass = in_set_of(&retried);
                         if retried_mass >= MIN_IN_SET_MASS {
@@ -254,11 +267,12 @@ async fn one_call(
     http: &reqwest::Client,
     url: &str,
     api_key: Option<&str>,
+    headers: &reqwest::header::HeaderMap,
     body: &serde_json::Value,
     spliced: bool,
     timeout: Duration,
 ) -> Result<QuestionSuccess, String> {
-    let first = one_attempt(http, url, api_key, body, spliced, timeout).await;
+    let first = one_attempt(http, url, api_key, headers, body, spliced, timeout).await;
     // "backend returned …" covers a 200 with missing or empty logprobs —
     // observed live from a crash-looping replica behind a load balancer that
     // answers with degenerate bodies. A backend that genuinely lacks logprobs
@@ -270,7 +284,8 @@ async fn one_call(
             || e.contains("backend returned"));
     if transient {
         tokio::time::sleep(TRANSIENT_RETRY_BACKOFF).await;
-        if let Ok(success) = one_attempt(http, url, api_key, body, spliced, timeout).await {
+        if let Ok(success) = one_attempt(http, url, api_key, headers, body, spliced, timeout).await
+        {
             return Ok(success);
         }
         // Fall through to the first attempt's error: it names the original
@@ -283,12 +298,13 @@ async fn one_attempt(
     http: &reqwest::Client,
     url: &str,
     api_key: Option<&str>,
+    headers: &reqwest::header::HeaderMap,
     body: &serde_json::Value,
     spliced: bool,
     timeout: Duration,
 ) -> Result<QuestionSuccess, String> {
     let fut = async {
-        let mut req = http.post(url).json(body);
+        let mut req = http.post(url).headers(headers.clone()).json(body);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
@@ -971,6 +987,7 @@ async fn handler_inner(
         &state.http,
         &url,
         target.api_key.as_deref(),
+        &target.headers,
         &model,
         calls,
         req_timeout,
@@ -1175,6 +1192,7 @@ mod tests {
             &http,
             &url,
             Some("test-key"),
+            &reqwest::header::HeaderMap::new(),
             "plain-model",
             vec![call("q1", "first question"), call("q2", "second question")],
             Duration::from_secs(5),
@@ -1206,6 +1224,7 @@ mod tests {
             &http,
             &url,
             None,
+            &reqwest::header::HeaderMap::new(),
             "plain-model-2",
             vec![
                 call("ok", "fine"),
@@ -1233,6 +1252,7 @@ mod tests {
             &http,
             "http://127.0.0.1:1/v1/chat/completions",
             None,
+            &reqwest::header::HeaderMap::new(),
             "plain-model-3",
             vec![call("q", "hello")],
             Duration::from_secs(2),
@@ -1306,6 +1326,7 @@ mod tests {
             &http,
             &url,
             None,
+            &reqwest::header::HeaderMap::new(),
             "thinking-model-e2e",
             vec![call("q1", "first")],
             Duration::from_secs(5),
@@ -1324,6 +1345,7 @@ mod tests {
             &http,
             &url,
             None,
+            &reqwest::header::HeaderMap::new(),
             "thinking-model-e2e",
             vec![call("q2", "second")],
             Duration::from_secs(5),
@@ -1420,6 +1442,7 @@ mod tests {
             &http,
             &url,
             None,
+            &reqwest::header::HeaderMap::new(),
             "harmony-model-e2e",
             vec![call("q1", "first")],
             Duration::from_secs(5),
@@ -1441,6 +1464,7 @@ mod tests {
             &http,
             &url,
             None,
+            &reqwest::header::HeaderMap::new(),
             "harmony-model-e2e",
             vec![call("q2", "second")],
             Duration::from_secs(5),
@@ -1498,6 +1522,7 @@ mod tests {
             &http,
             &format!("http://{addr}/v1/chat/completions"),
             None,
+            &reqwest::header::HeaderMap::new(),
             "flaky-model",
             vec![call("q", "hello")],
             Duration::from_secs(5),

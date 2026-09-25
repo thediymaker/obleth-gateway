@@ -117,6 +117,7 @@ pub async fn index_document(
     let target = EmbedTarget {
         api_base: model.api_base.clone(),
         api_key: model.api_key.clone(),
+        headers: crate::upstream_header_map(&model.upstream_headers),
         upstream_model: model.upstream_model.clone(),
     };
     let timeout = Duration::from_millis(settings.index_timeout_ms.max(1_000));

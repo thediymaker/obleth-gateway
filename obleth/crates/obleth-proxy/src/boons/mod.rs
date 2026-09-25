@@ -1044,7 +1044,10 @@ async fn post_chat_completion(
     target: &crate::proxy::Target,
     body: &Value,
 ) -> anyhow::Result<Value> {
-    let mut req = http.post(build_chat_url(&target.base)).json(body);
+    let mut req = http
+        .post(build_chat_url(&target.base))
+        .headers(target.headers.clone())
+        .json(body);
     if let Some(api_key) = &target.api_key {
         req = req.bearer_auth(api_key);
     }
@@ -1340,6 +1343,7 @@ mod tests {
             upstream_model: "test".to_string(),
             api_base: "http://localhost".to_string(),
             api_key: None,
+            upstream_headers: Default::default(),
             model_type: "chat".to_string(),
             admission_weight: 1,
             max_in_flight: None,

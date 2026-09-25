@@ -17,6 +17,14 @@
 #   api_base                  (required) Upstream OpenAI-compatible base URL,
 #                                        usually ending in /v1.
 #   api_key                   (optional) Upstream key. Leave blank if none.
+#   upstream_headers          (optional) Map of extra headers sent on every
+#                                        upstream request, e.g.
+#                                          upstream_headers:
+#                                            routing-strategy: prefix-cache
+#                                        Replaces the stored set when present; a
+#                                        null value keeps that header's stored
+#                                        value. Export lists only the names
+#                                        (upstream_header_names), never values.
 #   description               (optional) Free-text label shown in the UI.
 #   model_type                (optional) Modality / endpoint this route serves.
 #                                        Default "chat". One of:

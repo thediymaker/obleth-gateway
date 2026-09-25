@@ -100,6 +100,7 @@ import { ProviderImportWizard } from "@/components/provider-import-wizard";
 import { RecipeList } from "@/components/recipes/recipe-list";
 import type { RecipeCard } from "@/components/recipes/recipe-card";
 import { distinctEmbeddingModelCount } from "@/lib/knowledge-format";
+import { upstreamHeadersText } from "@/lib/upstream-headers";
 import { cn, formatNumber, getJson, parseTagLevel, TAG_LEVEL_LABELS } from "@/lib/utils";
 import { useSearchParams } from "next/navigation";
 
@@ -202,6 +203,9 @@ const QUANTIZATION_LABELS: Record<string, string> = Object.fromEntries(
 
 const QUANTIZATION_HINT =
   "Reported on /v1/models and /model/info. Keep it out of the API model name: a name like `glm-5-3-fp8` has to change when the deployment is re-quantized, and every client pinned to it breaks.";
+
+const UPSTREAM_HEADERS_HINT =
+  "One `Name: value` per line, sent on every request to this model's upstream and overriding a client header of the same name (e.g. an AIBrix routing-strategy). Values are write-only: saved headers show by name, and a name left without a value keeps its stored value. Delete a line to remove that header. Authorization, Host, Content-Length, Content-Type, and hop-by-hop headers cannot be set; use the API key for upstream auth.";
 
 const ALIASES_HINT =
   "One name per line. Extra names that resolve to this same route — register the old spelling here when you clean up an API model name, and pinned clients keep working. Only the API model name itself is advertised by /v1/models.";
@@ -1061,6 +1065,9 @@ function CreateModelWizard({
                   <Field label="API base URL" name="api_base" placeholder="http://envoy-aibrix-system.../v1" />
                 </div>
                 <Field label="Upstream API key (optional)" name="api_key" placeholder="sk_..." />
+                <div className="md:col-span-2">
+                  <UpstreamHeadersField hint={UPSTREAM_HEADERS_HINT} />
+                </div>
               </section>
 
               <section className={cn("grid gap-4 md:grid-cols-2", step !== 3 && "hidden")}>
@@ -1519,6 +1526,10 @@ function ConnectionTab({
                 name="api_key"
                 placeholder="Leave blank to keep current"
                 hint={model.api_key_set ? "Key set" : "No key"}
+              />
+              <UpstreamHeadersField
+                defaultValue={upstreamHeadersText(model.upstream_header_names)}
+                hint={UPSTREAM_HEADERS_HINT}
               />
               <SelectField
                 label="Model type"
@@ -3152,6 +3163,34 @@ function AliasesField({
         rows={3}
         defaultValue={defaultValue}
         placeholder={"glm-5-3-fp8\nglm-5-3-mxfp4"}
+        autoCapitalize="none"
+        autoCorrect="off"
+        spellCheck={false}
+        className="flex w-full rounded-md border border-input bg-background px-3 py-2 font-mono text-sm shadow-sm placeholder:text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50"
+      />
+      {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
+    </div>
+  );
+}
+
+/// Extra headers for the upstream request, one `Name: value` per line. Like
+/// the aliases field, a textarea: header names are free-form, not a vocabulary.
+function UpstreamHeadersField({
+  defaultValue,
+  hint,
+}: {
+  defaultValue?: string;
+  hint?: string;
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label htmlFor="model-upstream-headers">Upstream headers (optional)</Label>
+      <textarea
+        id="model-upstream-headers"
+        name="upstream_headers"
+        rows={3}
+        defaultValue={defaultValue}
+        placeholder={"routing-strategy: prefix-cache"}
         autoCapitalize="none"
         autoCorrect="off"
         spellCheck={false}

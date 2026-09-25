@@ -603,6 +603,7 @@ pub async fn search_collection(
     let target = embed::EmbedTarget {
         api_base: model.api_base.clone(),
         api_key: model.api_key.clone(),
+        headers: crate::upstream_header_map(&model.upstream_headers),
         upstream_model: model.upstream_model.clone(),
     };
     // `embed_timeout_ms` -- the hard bound documented for request-path query

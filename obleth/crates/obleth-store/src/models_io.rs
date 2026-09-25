@@ -40,7 +40,7 @@ pub struct ModelImportOutcome {
 /// Every column of `models` that `model_from_row` reads. Kept as one const so
 /// the insert's RETURNING clause cannot drift from the mapper.
 const MODEL_COLUMNS: &str = "id, model_name, aliases, description, upstream_model, api_base, api_key,
-     model_type, quantization, input_cost_per_token, output_cost_per_token, cost_per_image,
+     upstream_headers, model_type, quantization, input_cost_per_token, output_cost_per_token, cost_per_image,
      cost_per_audio_second, cost_per_character, context_window, admission_weight,
      max_in_flight, capacity_mode, capacity_tuned_at, supports_function_calling,
      supports_system_messages, supports_response_schema, supports_tool_choice,
@@ -77,10 +77,11 @@ impl Store {
                     tool_servers, request_timeout_secs, max_retries, retry_backoff_ms,
                     endpoint_selection_mode, debug_diagnostics, energy_slots_per_node,
                     route_bias, auto_eligible,
-                    draft_model, verify_api_base, verify_upstream_model, aliases, quantization
+                    draft_model, verify_api_base, verify_upstream_model, aliases, quantization,
+                    upstream_headers
                  ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                     $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-                    $32, $33, $34, $35, $36, $37, $38, $39, $40)
+                    $32, $33, $34, $35, $36, $37, $38, $39, $40, $41)
                  on conflict (model_name) do update set
                     description = excluded.description,
                     upstream_model = excluded.upstream_model,
@@ -120,6 +121,7 @@ impl Store {
                     verify_upstream_model = excluded.verify_upstream_model,
                     aliases = excluded.aliases,
                     quantization = excluded.quantization,
+                    upstream_headers = excluded.upstream_headers,
                     updated_at = now()
                  returning {MODEL_COLUMNS}, (xmax = 0) as inserted"
             );
@@ -169,6 +171,7 @@ impl Store {
                     &c.aliases,
                 )))
                 .bind(obleth_config::normalize_quantization(&c.quantization))
+                .bind(crate::encrypt_upstream_headers(&c.upstream_headers))
                 .fetch_one(&mut *tx)
                 .await?;
 

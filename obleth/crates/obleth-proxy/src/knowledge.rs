@@ -320,6 +320,7 @@ fn embed_target(
     Ok(obleth_admin::knowledge::embed::EmbedTarget {
         api_base: target.base,
         api_key: target.api_key,
+        headers: target.headers,
         upstream_model: route.upstream_model.clone(),
     })
 }

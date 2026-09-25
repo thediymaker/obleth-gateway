@@ -118,6 +118,12 @@ export interface ModelRoute {
   api_base: string;
   /** Whether an upstream key is stored. The key itself is write-only and never returned. */
   api_key_set: boolean;
+  /**
+   * Names of the headers the gateway adds to every upstream request for this
+   * model. Values are write-only and never returned. Absent from gateways
+   * older than the field.
+   */
+  upstream_header_names?: string[];
   model_type: string;
   /**
    * Weight/activation format this deployment serves, from the gateway's fixed
@@ -174,10 +180,16 @@ export interface ModelRoute {
 
 /**
  * Model fields accepted by create/update. `api_key` is write-only: omit it to
- * keep the stored key; responses only report `api_key_set`.
+ * keep the stored key; responses only report `api_key_set`. `upstream_headers`
+ * replaces the model's headers when present (a `null` value keeps the stored
+ * value for that name); omit it to leave them unchanged. Responses only report
+ * `upstream_header_names`.
  */
-export type ModelWriteFields = Partial<Omit<ModelRoute, "api_key_set">> & {
+export type ModelWriteFields = Partial<
+  Omit<ModelRoute, "api_key_set" | "upstream_header_names">
+> & {
   api_key?: string | null;
+  upstream_headers?: Record<string, string | null>;
 };
 
 export interface ModelEndpoint {

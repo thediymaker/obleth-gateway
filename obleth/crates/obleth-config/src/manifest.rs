@@ -17,7 +17,9 @@
 //!   plaintext `api_key` when you want to set one, and leaves the stored key
 //!   untouched when you don't. That means a manifest needs no encryption
 //!   envelope and moves between instances with different
-//!   `OBLETH_ENCRYPTION_KEY`s.
+//!   `OBLETH_ENCRYPTION_KEY`s. Per-model upstream headers follow the same
+//!   rule: export lists `upstream_header_names`, never the values, and import
+//!   takes `upstream_headers` when you want to set them.
 //!
 //! # Coverage boundary
 //!
@@ -34,8 +36,9 @@ use utoipa::ToSchema;
 
 use crate::types::{
     is_valid_capacity_mode, is_valid_endpoint_selection_mode, is_valid_model_type,
-    is_valid_quantization, normalize_aliases, normalize_boons, normalize_tool_servers,
-    parse_tag_level, ModelEndpoint, ModelRoute, CAPACITY_MODES, DEFAULT_CAPACITY_MODE,
+    is_valid_quantization, merge_upstream_headers, normalize_aliases, normalize_boons,
+    normalize_tool_servers, parse_tag_level, upstream_header_names, ModelEndpoint, ModelRoute,
+    UpstreamHeaders, UpstreamHeadersWrite, CAPACITY_MODES, DEFAULT_CAPACITY_MODE,
     DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE, DEFAULT_QUANTIZATION,
     DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES, MAX_MODEL_ALIASES, MODEL_TYPES,
     QUANTIZATIONS,
@@ -99,6 +102,16 @@ pub struct ManifestModel {
     /// exported manifest can be re-imported unchanged without wiping keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub has_api_key: Option<bool>,
+    /// Set the headers sent on every upstream request for this model. Never
+    /// written by export — see `upstream_header_names`. The whole set is
+    /// replaced when present: a `null` value keeps the stored value for that
+    /// name, and a stored name left out is removed. Absent leaves them alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_headers: Option<UpstreamHeadersWrite>,
+    /// Export-only: the names of the stored upstream headers. Ignored on
+    /// import, like `has_api_key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_header_names: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_type: Option<String>,
     /// Extra client-facing names for this model. The whole list is replaced
@@ -262,6 +275,7 @@ pub struct ModelConfig {
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
+    pub upstream_headers: UpstreamHeaders,
     pub model_type: String,
     pub quantization: String,
     pub input_cost_per_token: f64,
@@ -307,6 +321,7 @@ impl Default for ModelConfig {
             upstream_model: String::new(),
             api_base: String::new(),
             api_key: None,
+            upstream_headers: UpstreamHeaders::new(),
             model_type: DEFAULT_MODEL_TYPE.to_string(),
             quantization: DEFAULT_QUANTIZATION.to_string(),
             input_cost_per_token: 0.0,
@@ -353,6 +368,7 @@ impl From<&ModelRoute> for ModelConfig {
             upstream_model: m.upstream_model.clone(),
             api_base: m.api_base.clone(),
             api_key: m.api_key.clone(),
+            upstream_headers: m.upstream_headers.clone(),
             model_type: m.model_type.clone(),
             quantization: m.quantization.clone(),
             input_cost_per_token: m.input_cost_per_token,
@@ -413,6 +429,10 @@ impl ModelConfig {
         );
         note(self.api_base != other.api_base, "api_base");
         note(self.api_key != other.api_key, "api_key");
+        note(
+            self.upstream_headers != other.upstream_headers,
+            "upstream_headers",
+        );
         note(self.model_type != other.model_type, "model_type");
         note(self.quantization != other.quantization, "quantization");
         note(
@@ -600,6 +620,10 @@ pub fn resolve_model(
     // An explicit empty string clears the credential; absent leaves it alone.
     if let Some(v) = &entry.api_key {
         next.api_key = if v.is_empty() { None } else { Some(v.clone()) };
+    }
+    if let Some(write) = &entry.upstream_headers {
+        next.upstream_headers =
+            merge_upstream_headers(&current.upstream_headers, write).map_err(&reject)?;
     }
     if let Some(v) = &entry.model_type {
         let t = v.trim().to_ascii_lowercase();
@@ -939,7 +963,8 @@ fn reject_negative(v: f64, field: &str) -> Result<f64, String> {
 }
 
 /// Render a model as a manifest entry: every field populated, secrets replaced
-/// by `has_api_key`, endpoints attached by the caller.
+/// by `has_api_key` and `upstream_header_names`, endpoints attached by the
+/// caller.
 pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
     ManifestModel {
         model_name: m.model_name.clone(),
@@ -949,6 +974,8 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
         api_base: Some(m.api_base.clone()),
         api_key: None,
         has_api_key: Some(m.api_key.as_deref().is_some_and(|k| !k.is_empty())),
+        upstream_headers: None,
+        upstream_header_names: Some(upstream_header_names(&m.upstream_headers)),
         model_type: Some(m.model_type.clone()),
         quantization: Some(m.quantization.clone()),
         input_cost_per_token: Some(m.input_cost_per_token),
@@ -1000,6 +1027,7 @@ mod tests {
             upstream_model: "upstream/original".into(),
             api_base: "http://127.0.0.1:8000/v1".into(),
             api_key: Some("sk-original".into()),
+            upstream_headers: Default::default(),
             model_type: "chat".into(),
             quantization: "unknown".into(),
             input_cost_per_token: 1.0,
@@ -1290,6 +1318,49 @@ mod tests {
 
         assert_eq!(r.config.api_key.as_deref(), Some("sk-original"));
         assert!(r.changed_fields.is_empty());
+    }
+
+    #[test]
+    fn upstream_headers_export_as_names_and_import_as_a_write() {
+        let mut existing = route("m");
+        existing.upstream_headers = [
+            ("routing-strategy".to_string(), "prefix-cache".to_string()),
+            ("x-upstream-token".to_string(), "secret".to_string()),
+        ]
+        .into();
+
+        let exported = model_to_manifest_entry(&existing);
+        assert!(exported.upstream_headers.is_none(), "values never leave");
+        assert_eq!(
+            exported.upstream_header_names,
+            Some(vec!["routing-strategy".into(), "x-upstream-token".into()])
+        );
+        // Re-importing the export changes nothing: the names are export-only.
+        let r = resolve_model(&exported, Some(&existing), &[]).unwrap();
+        assert!(!r.changed_fields.contains(&"upstream_headers".to_string()));
+        assert_eq!(r.config.upstream_headers, existing.upstream_headers);
+
+        // A write keeps a `null` value, sets a string, and drops what is left out.
+        let mut e = entry("m");
+        e.upstream_headers = Some(
+            [
+                ("X-Upstream-Token".to_string(), None),
+                ("routing-strategy".to_string(), Some("least-request".into())),
+            ]
+            .into(),
+        );
+        let r = resolve_model(&e, Some(&existing), &[]).unwrap();
+        assert_eq!(r.changed_fields, vec!["upstream_headers"]);
+        assert_eq!(r.config.upstream_headers["x-upstream-token"], "secret");
+        assert_eq!(
+            r.config.upstream_headers["routing-strategy"],
+            "least-request"
+        );
+
+        let mut e = entry("m");
+        e.upstream_headers = Some([("Authorization".to_string(), Some("Bearer x".into()))].into());
+        let err = resolve_model(&e, Some(&existing), &[]).unwrap_err();
+        assert!(err.message.contains("authorization"), "{}", err.message);
     }
 
     /// Every numeric field the `models` table constrains must be clamped into

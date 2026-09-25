@@ -75,6 +75,7 @@ pub(crate) fn probe_config_changed(before: &ModelRoute, after: &ModelRoute) -> b
     before.api_base != after.api_base
         || before.upstream_model != after.upstream_model
         || before.model_type != after.model_type
+        || before.upstream_headers != after.upstream_headers
 }
 
 #[derive(Clone)]
@@ -317,7 +318,14 @@ pub async fn validate_model(
     }
     state.ssrf.validate(&body.api_base).await?;
 
-    match fetch_catalog_direct(&state, &body.api_base, body.api_key.as_deref()).await {
+    match fetch_catalog_direct(
+        &state,
+        &body.api_base,
+        body.api_key.as_deref(),
+        &Default::default(),
+    )
+    .await
+    {
         Ok(catalog) => match catalog.as_ref() {
             Catalog::Wildcard => {
                 warnings.push(
@@ -598,11 +606,12 @@ async fn fetch_upstream_catalog(
     state: &AdminState,
     api_base: &str,
     api_key: Option<&str>,
+    headers: &obleth_config::UpstreamHeaders,
 ) -> std::result::Result<Arc<Catalog>, CatalogError> {
     if let Some(catalog) = state.health.catalogs.get(api_base) {
         return Ok(catalog);
     }
-    let catalog = fetch_catalog_direct(state, api_base, api_key).await?;
+    let catalog = fetch_catalog_direct(state, api_base, api_key, headers).await?;
     state.health.catalogs.put(api_base, catalog.clone());
     Ok(catalog)
 }
@@ -614,10 +623,11 @@ async fn fetch_catalog_direct(
     state: &AdminState,
     api_base: &str,
     api_key: Option<&str>,
+    headers: &obleth_config::UpstreamHeaders,
 ) -> std::result::Result<Arc<Catalog>, CatalogError> {
     let mut first_error: Option<CatalogError> = None;
     for url in obleth_config::catalog_urls(api_base) {
-        match fetch_catalog_url(state, &url, api_key).await {
+        match fetch_catalog_url(state, &url, api_key, headers).await {
             Ok(catalog) => return Ok(catalog),
             Err(error) => {
                 // Only a 404 is worth a second path: unreachable, auth and 5xx
@@ -640,9 +650,15 @@ async fn fetch_catalog_url(
     state: &AdminState,
     url: &str,
     api_key: Option<&str>,
+    headers: &obleth_config::UpstreamHeaders,
 ) -> std::result::Result<Arc<Catalog>, CatalogError> {
     let timeout = Duration::from_secs(state.health.timeout_secs.max(1));
-    let mut request = state.health.http.get(url).timeout(timeout);
+    let mut request = state
+        .health
+        .http
+        .get(url)
+        .headers(crate::upstream_header_map(headers))
+        .timeout(timeout);
     if let Some(key) = api_key {
         request = request.bearer_auth(key);
     }
@@ -690,7 +706,7 @@ async fn existence_probe(
     api_key: Option<&str>,
 ) -> ProbeResult {
     let started = Instant::now();
-    let catalog = fetch_upstream_catalog(state, api_base, api_key).await;
+    let catalog = fetch_upstream_catalog(state, api_base, api_key, &model.upstream_headers).await;
     let latency_ms: Option<i64> = started.elapsed().as_millis().try_into().ok();
     match catalog {
         Ok(catalog) => classify_existence(&catalog, &model.upstream_model, latency_ms),
@@ -744,7 +760,9 @@ async fn disambiguate_rejection(
     probe_url: &str,
     original: ProbeResult,
 ) -> ProbeResult {
-    let Ok(catalog) = fetch_upstream_catalog(state, api_base, api_key).await else {
+    let Ok(catalog) =
+        fetch_upstream_catalog(state, api_base, api_key, &model.upstream_headers).await
+    else {
         return original;
     };
     refine_rejection(&catalog, model, code, probe_url, original)
@@ -807,7 +825,9 @@ async fn inference_probe(
 
     loop {
         attempt += 1;
-        let mut request = req.build(client, timeout);
+        let mut request = req
+            .build(client, timeout)
+            .headers(crate::upstream_header_map(&model.upstream_headers));
         if let Some(key) = api_key {
             request = request.bearer_auth(key);
         }
@@ -1467,6 +1487,11 @@ mod tests {
             |m: &mut ModelRoute| m.api_base = "https://other/v1".into(),
             |m: &mut ModelRoute| m.upstream_model = "renamed".into(),
             |m: &mut ModelRoute| m.model_type = "embedding".into(),
+            // A routing header decides which backend the probe reaches.
+            |m: &mut ModelRoute| {
+                m.upstream_headers
+                    .insert("routing-strategy".into(), "prefix-cache".into());
+            },
         ] {
             let mut after = before.clone();
             mutate(&mut after);

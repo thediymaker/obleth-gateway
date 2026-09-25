@@ -2097,6 +2097,9 @@ async fn proxy_handler_inner(
             let more_targets = replayable && ti + 1 < total_targets;
 
             let mut fwd_headers = forward_headers(&headers);
+            // The model's own upstream headers go on after the client's, so
+            // the operator's value wins a name both set.
+            fwd_headers.extend(target.headers.clone());
             if let Some(key) = &target.api_key {
                 if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {key}")) {
                     fwd_headers.insert(header::AUTHORIZATION, v);
@@ -4605,10 +4608,12 @@ fn prepare_upstream_body(
     serde_json::to_vec(&*json).map(Bytes::from).unwrap_or(body)
 }
 
-/// One resolved upstream target: a base URL plus an optional bearer key.
+/// One resolved upstream target: a base URL plus an optional bearer key, and
+/// the model's operator-configured upstream headers.
 pub(crate) struct Target {
     pub(crate) base: String,
     pub(crate) api_key: Option<String>,
+    pub(crate) headers: HeaderMap,
 }
 
 /// Build the ordered list of upstream targets for a request.
@@ -4628,6 +4633,9 @@ pub(crate) fn build_targets(
     session_key: &str,
 ) -> Vec<Target> {
     let mut targets: Vec<Target> = Vec::new();
+    let headers = route
+        .map(|r| obleth_admin::upstream_header_map(&r.upstream_headers))
+        .unwrap_or_default();
     if let Some(r) = route {
         let mut eligible: Vec<&ResolvedEndpoint> = r
             .endpoints
@@ -4644,6 +4652,7 @@ pub(crate) fn build_targets(
                 targets.push(Target {
                     base: e.api_base.clone(),
                     api_key: e.api_key.clone().or_else(|| r.api_key.clone()),
+                    headers: headers.clone(),
                 });
             }
             return targets;
@@ -4654,6 +4663,7 @@ pub(crate) fn build_targets(
             .map(|r| r.api_base.clone())
             .unwrap_or_else(|| default_base.to_string()),
         api_key: route.and_then(|r| r.api_key.clone()),
+        headers,
     });
     targets
 }
@@ -5329,13 +5339,14 @@ mod tests {
         admit_request_for, anthropic_error, apply_multipart_text_view,
         backfill_max_tokens_for_count_tokens, backoff_for, build_targets, build_upstream_url,
         canonical_post_path, clamp_max_tokens, compute_modality_cost, effective_request_type,
-        has_input_guardrails, has_path_traversal, input_guardrails_unscannable, is_chat_path,
-        is_models_collection, is_models_endpoint, is_multipart_endpoint, is_retryable_status,
-        looks_like_context_length_error, messages_input_estimate, multipart_text_view,
-        output_guardrails_unenforceable, parse_multipart, prepare_upstream_body, redress_error,
-        request_type_for_path, requires_registered_model, resolve_conversation, session_hash_order,
-        should_translate_as_stream, strip_beta_query, surface, tenant_active_now, weighted_order,
-        MultipartField, RequestMeta, TooLong, REGISTERED_MODEL_PATHS,
+        forward_headers, has_input_guardrails, has_path_traversal, input_guardrails_unscannable,
+        is_chat_path, is_models_collection, is_models_endpoint, is_multipart_endpoint,
+        is_retryable_status, looks_like_context_length_error, messages_input_estimate,
+        multipart_text_view, output_guardrails_unenforceable, parse_multipart,
+        prepare_upstream_body, redress_error, request_type_for_path, requires_registered_model,
+        resolve_conversation, session_hash_order, should_translate_as_stream, strip_beta_query,
+        surface, tenant_active_now, weighted_order, MultipartField, RequestMeta, TooLong,
+        REGISTERED_MODEL_PATHS,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
     use axum::body::{Body, Bytes};
@@ -6092,6 +6103,7 @@ mod tests {
             upstream_model: "m".into(),
             api_base: "http://primary/v1".into(),
             api_key: Some("model-key".into()),
+            upstream_headers: Default::default(),
             model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
             admission_weight: 100,
             max_in_flight: None,
@@ -6217,6 +6229,43 @@ mod tests {
         let model = model_with(vec![ep]);
         let targets = build_targets(Some(&model), "http://global/v1", "failover", "");
         assert_eq!(targets[0].api_key.as_deref(), Some("model-key"));
+    }
+
+    #[test]
+    fn every_target_carries_the_models_upstream_headers_over_the_clients() {
+        let mut model = model_with(vec![
+            endpoint("a", "http://a", 10, 100, true, true),
+            endpoint("b", "http://b", 20, 100, true, true),
+        ]);
+        model.upstream_headers = [
+            ("routing-strategy".to_string(), "prefix-cache".to_string()),
+            ("x-team".to_string(), "ops".to_string()),
+        ]
+        .into();
+        let targets = build_targets(Some(&model), "http://global/v1", "failover", "");
+        assert_eq!(targets.len(), 2);
+        for t in &targets {
+            assert_eq!(t.headers["routing-strategy"], "prefix-cache");
+        }
+        // The legacy single-upstream fallback carries them too.
+        model.endpoints.clear();
+        let fallback = build_targets(Some(&model), "http://global/v1", "failover", "");
+        assert_eq!(fallback[0].headers["x-team"], "ops");
+        // An unrouted request has no model headers to add.
+        assert!(build_targets(None, "http://global/v1", "failover", "")[0]
+            .headers
+            .is_empty());
+
+        // Applied the way dispatch applies them: after the client's
+        // forwarded headers, so the operator's value wins a shared name.
+        let mut client = HeaderMap::new();
+        client.insert("x-team", "client".parse().unwrap());
+        client.insert("x-trace", "t1".parse().unwrap());
+        let mut fwd = forward_headers(&client);
+        fwd.extend(fallback[0].headers.clone());
+        assert_eq!(fwd["x-team"], "ops");
+        assert_eq!(fwd.get_all("x-team").iter().count(), 1);
+        assert_eq!(fwd["x-trace"], "t1");
     }
 
     #[test]
@@ -7049,6 +7098,7 @@ mod tests {
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
             api_key: None,
+            upstream_headers: Default::default(),
             model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
             admission_weight: 100,
             max_in_flight: None,
@@ -7563,6 +7613,21 @@ mod lifecycle_tests {
         let body = serde_json::json!({ "usage": { "prompt_tokens": 4, "completion_tokens": 9 } });
         assert_eq!(completion_body_usage(&body), Some((4, 9)));
         assert_eq!(completion_body_usage(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn upstream_headers_go_on_after_the_forwarded_ones_and_before_auth() {
+        let src = squash(handler());
+        let fwd = src
+            .find("letmutfwd_headers=forward_headers(&headers);")
+            .unwrap();
+        let ext = src
+            .find("fwd_headers.extend(target.headers.clone());")
+            .unwrap();
+        let auth = src
+            .find("fwd_headers.insert(header::AUTHORIZATION,v);")
+            .unwrap();
+        assert!(fwd < ext && ext < auth);
     }
 
     #[test]
