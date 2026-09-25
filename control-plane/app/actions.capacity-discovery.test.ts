@@ -41,8 +41,8 @@ describe("saving discovered capacity settings", () => {
       form({
         capacity_source: "kubernetes",
         capacity_namespace: " inference ",
-        capacity_selector: "",
-        per_replica_max_in_flight: "",
+        capacity_service: "",
+        per_replica_max_in_flight: "8",
         capacity_headroom: "1.25",
       }),
     );
@@ -52,10 +52,23 @@ describe("saving discovered capacity settings", () => {
     expect(setModelCapacityMode.mock.calls[0][2]).toEqual({
       capacity_source: "kubernetes",
       capacity_namespace: "inference",
-      capacity_selector: null,
-      per_replica_max_in_flight: null,
+      capacity_service: null,
+      per_replica_max_in_flight: 8,
       capacity_headroom: 1.25,
     });
+  });
+
+  it("sends a Service name as given", async () => {
+    const { setModelCapacityMode } = await discoveryAction(
+      form({ capacity_source: "kubernetes", capacity_service: " my-model ", per_replica_max_in_flight: "4" }),
+    );
+    expect(setModelCapacityMode.mock.calls[0][2]).toMatchObject({ capacity_service: "my-model" });
+  });
+
+  it("lets the endpoints source leave the per-replica value to the endpoints", async () => {
+    const { result, setModelCapacityMode } = await discoveryAction(form({ capacity_source: "endpoints" }));
+    expect(result).toEqual({ ok: true });
+    expect(setModelCapacityMode.mock.calls[0][2]).toMatchObject({ per_replica_max_in_flight: null });
   });
 
   it("defaults headroom to 1 and parses the per-replica value", async () => {
@@ -70,6 +83,13 @@ describe("saving discovered capacity settings", () => {
 
   it.each([
     [{ capacity_source: "prometheus" }, "capacity source"],
+    [{ capacity_source: "kubernetes" }, "per-replica concurrency is required"],
+    [{ capacity_source: "kubernetes", per_replica_max_in_flight: "" }, "--max-num-seqs"],
+    [
+      { capacity_source: "kubernetes", per_replica_max_in_flight: "8", capacity_service: "app=my-model" },
+      "service name",
+    ],
+    [{ capacity_source: "kubernetes", per_replica_max_in_flight: "8", capacity_service: "My-Model" }, "service name"],
     [{ capacity_source: "endpoints", per_replica_max_in_flight: "0" }, "at least 1"],
     [{ capacity_source: "endpoints", per_replica_max_in_flight: "2.5" }, "whole number"],
     [{ capacity_source: "endpoints", capacity_headroom: "0" }, "above 0"],
@@ -83,7 +103,7 @@ describe("saving discovered capacity settings", () => {
 
   it("surfaces the gateway's refusal", async () => {
     const { result } = await discoveryAction(
-      form({ capacity_source: "kubernetes", capacity_namespace: "kube-system" }),
+      form({ capacity_source: "kubernetes", capacity_namespace: "kube-system", per_replica_max_in_flight: "8" }),
       new Error("capacity_namespace `kube-system` is not in OBLETH_CAPACITY_DISCOVERY_NAMESPACES"),
     );
     expect(result).toEqual({

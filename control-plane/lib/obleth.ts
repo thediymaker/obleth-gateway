@@ -166,15 +166,19 @@ export interface ModelRoute {
   capacity_tuned_at: string | null;
   /**
    * Discovered mode: where serving replicas are counted, `endpoints` (the
-   * model's enabled, healthy endpoints) or `kubernetes` (Ready pods). The
-   * discovery fields are absent from gateways older than the mode.
+   * model's enabled, healthy endpoints) or `kubernetes` (the ready endpoints
+   * of a Service). The discovery fields are absent from gateways older than
+   * the mode.
    */
   capacity_source?: string;
-  /** Kubernetes source: namespace of the backend pods; null searches the gateway's list. */
+  /** Kubernetes source: namespace of the Service; null takes the first allowed namespace that has it. */
   capacity_namespace?: string | null;
-  /** Kubernetes source: label selector for the serving pods; null uses the gateway's template. */
-  capacity_selector?: string | null;
-  /** Requests one replica takes; null reads it from the source. */
+  /** Kubernetes source: Service name; null uses the gateway's default Service template. */
+  capacity_service?: string | null;
+  /**
+   * Requests one replica serves at once. Required in discovered mode on the
+   * kubernetes source, and on endpoints unless every endpoint sets its own.
+   */
   per_replica_max_in_flight?: number | null;
   /** Multiplier on the derived pool size; 1 is exactly the ready capacity. */
   capacity_headroom?: number;
@@ -242,7 +246,7 @@ export interface ModelEndpoint {
 export interface CapacityDiscoveryFields {
   capacity_source: string;
   capacity_namespace: string | null;
-  capacity_selector: string | null;
+  capacity_service: string | null;
   per_replica_max_in_flight: number | null;
   capacity_headroom: number;
 }
@@ -251,11 +255,15 @@ export interface CapacityDiscoveryFields {
 export interface ModelCapacityStatus {
   model_name: string;
   source: string;
+  /** Kubernetes source: the namespaces the Service is looked up in, in order. */
   namespaces: string[];
-  selector: string | null;
+  /** Kubernetes source: the namespace the Service was found in. */
+  namespace: string | null;
+  /** Kubernetes source: the Service whose ready endpoints are counted. */
+  service: string | null;
   ready_replicas: number | null;
   per_replica_max_in_flight: number | null;
-  /** e.g. `per_replica_max_in_flight`, `endpoint max_in_flight`, `vLLM --max-num-seqs`. */
+  /** `configured`, `endpoint`, or `endpoint and configured`. */
   per_replica_source: string | null;
   headroom: number;
   /** Last value derived from the source: the cluster-wide pool size. */
@@ -283,7 +291,8 @@ export interface CapacityDiscoveryView {
   enabled: boolean;
   interval_secs: number;
   namespaces: string[];
-  default_selector: string;
+  /** Service name template for kubernetes models that name no Service. */
+  default_service: string;
   replicas: number;
   models: CapacityDiscoveryModelView[];
 }

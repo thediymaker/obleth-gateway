@@ -855,12 +855,23 @@ export async function setModelCapacityModeAction(
   revalidatePath("/fairshare");
 }
 
-const capacityDiscoverySchema = z.object({
+/** A Kubernetes Service name (RFC 1035 label), as the gateway checks it. */
+const SERVICE_NAME = /^[a-z]([-a-z0-9]{0,61}[a-z0-9])?$/;
+
+const capacityDiscoveryFields = z.object({
   capacity_source: z.enum(["endpoints", "kubernetes"], {
     message: "Pick a capacity source",
   }),
   capacity_namespace: optionalText,
-  capacity_selector: optionalText,
+  capacity_service: z.preprocess(
+    trimmed,
+    z
+      .string()
+      .refine(
+        (v) => v === "" || SERVICE_NAME.test(v),
+        "Service name must be lowercase letters, digits and '-', starting with a letter (at most 63 characters)",
+      ),
+  ),
   per_replica_max_in_flight: z.preprocess(
     blankToUndef,
     z.coerce
@@ -880,11 +891,25 @@ const capacityDiscoverySchema = z.object({
   ),
 });
 
+// The kubernetes source reads only replica counts, so the concurrency of one
+// replica has to come from here. The endpoints source can take it from each
+// endpoint instead; the gateway checks that against the endpoints.
+const capacityDiscoverySchema = capacityDiscoveryFields.refine(
+  (d) => d.capacity_source !== "kubernetes" || d.per_replica_max_in_flight != null,
+  {
+    message:
+      "Per-replica concurrency is required for the kubernetes source (e.g. your server's max concurrent sequences, such as vLLM --max-num-seqs)",
+    path: ["per_replica_max_in_flight"],
+  },
+);
+
 /**
  * Put a model in the discovered capacity mode with its source settings. A
  * blank field is sent as null, which clears it on the gateway (it then falls
  * back to the gateway's default for that field). The gateway checks whether
- * it can read a kubernetes source and refuses the save if not.
+ * it can read a kubernetes source, and whether an endpoints-source model
+ * without a per-replica value has one on every endpoint, and refuses the save
+ * if not.
  */
 export async function setModelCapacityDiscoveryAction(
   id: string,
@@ -894,7 +919,7 @@ export async function setModelCapacityDiscoveryAction(
   const parsed = capacityDiscoverySchema.safeParse({
     capacity_source: formData.get("capacity_source"),
     capacity_namespace: formData.get("capacity_namespace"),
-    capacity_selector: formData.get("capacity_selector"),
+    capacity_service: formData.get("capacity_service"),
     per_replica_max_in_flight: formData.get("per_replica_max_in_flight"),
     capacity_headroom: formData.get("capacity_headroom"),
   });
@@ -907,7 +932,7 @@ export async function setModelCapacityDiscoveryAction(
       {
         capacity_source: data.capacity_source,
         capacity_namespace: data.capacity_namespace || null,
-        capacity_selector: data.capacity_selector || null,
+        capacity_service: data.capacity_service || null,
         per_replica_max_in_flight: data.per_replica_max_in_flight ?? null,
         capacity_headroom: data.capacity_headroom,
       },

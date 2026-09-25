@@ -59,15 +59,20 @@
 #                                        per-replica concurrency x headroom).
 #   capacity_source           (optional) Discovered mode: endpoints (default,
 #                                        the model's healthy endpoints) or
-#                                        kubernetes (Ready pods).
-#   capacity_namespace        (optional) Kubernetes source namespace. Blank =
-#                                        every namespace the gateway allows.
-#   capacity_selector         (optional) Kubernetes label selector for the
-#                                        serving pods. Blank = the gateway's
-#                                        default selector template.
-#   per_replica_max_in_flight (optional) Requests one replica takes. Blank =
-#                                        read from the server's flags or the
-#                                        endpoints' own max_in_flight.
+#                                        kubernetes (the ready endpoints of a
+#                                        Service).
+#   capacity_namespace        (optional) Kubernetes source: namespace of the
+#                                        Service. Blank = the first namespace
+#                                        the gateway allows that has it.
+#   capacity_service          (optional) Kubernetes source: Service name.
+#                                        Blank = the gateway's default Service
+#                                        template.
+#   per_replica_max_in_flight (optional) Requests one replica serves at once,
+#                                        e.g. your server's max concurrent
+#                                        sequences (vLLM --max-num-seqs).
+#                                        Required in discovered mode for
+#                                        kubernetes, and for endpoints unless
+#                                        every endpoint sets max_in_flight.
 #   capacity_headroom         (optional) Multiplier on the derived size.
 #                                        Default 1.
 #   supports_function_calling (optional) true/false. Default false.

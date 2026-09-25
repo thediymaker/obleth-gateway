@@ -176,7 +176,7 @@ describe("the discovered capacity mode", () => {
     enabled: true,
     interval_secs: 15,
     namespaces: ["inference"],
-    default_selector: "app={upstream_model}",
+    default_service: "{upstream_model}",
     replicas: 2,
     models: [
       {
@@ -188,11 +188,12 @@ describe("the discovered capacity mode", () => {
         status: {
           model_name: "m",
           source: "kubernetes",
-          namespaces: ["inference"],
-          selector: "app=up",
+          namespaces: ["inference", "batch"],
+          namespace: "inference",
+          service: "up",
           ready_replicas: 2,
           per_replica_max_in_flight: 8,
-          per_replica_source: "vLLM --max-num-seqs",
+          per_replica_source: "configured",
           headroom: 1,
           derived_max_in_flight: 16,
           effective_max_in_flight: 16,
@@ -236,29 +237,44 @@ describe("the discovered capacity mode", () => {
         capacity_mode: "discovered",
         capacity_source: "kubernetes",
         capacity_namespace: "inference",
-        capacity_selector: "app=up,role!=worker",
-        per_replica_max_in_flight: null,
+        capacity_service: "up-head",
+        per_replica_max_in_flight: 8,
         capacity_headroom: 1.25,
       }),
       view(),
     );
     const input = (name: string) => host.querySelector<HTMLInputElement>(`input[name="${name}"]`);
     expect(input("capacity_namespace")!.value).toBe("inference");
-    expect(input("capacity_selector")!.value).toBe("app=up,role!=worker");
-    expect(input("per_replica_max_in_flight")!.value).toBe("");
+    expect(input("capacity_service")!.value).toBe("up-head");
+    expect(input("capacity_service")!.placeholder).toBe("default: {upstream_model}");
+    expect(input("per_replica_max_in_flight")!.value).toBe("8");
     expect(input("capacity_headroom")!.value).toBe("1.25");
+    expect(host.querySelector('input[name="capacity_selector"]')).toBeNull();
     const text = host.textContent ?? "";
+    expect(text).toContain("Service name");
     expect(text).toContain("discovered");
-    expect(text).toContain("8 (vLLM --max-num-seqs)");
+    expect(text).toContain("Service up in inference");
+    expect(text).toContain("8 (configured)");
     expect(text).toContain("16");
     expect(text).toContain("of 2 gateways");
   });
 
+  it("marks per-replica concurrency required for the kubernetes source, with a hint", async () => {
+    await renderPanel(model({ capacity_mode: "discovered", capacity_source: "kubernetes" }), view());
+    const perReplica = host.querySelector<HTMLInputElement>('input[name="per_replica_max_in_flight"]')!;
+    expect(perReplica.required).toBe(true);
+    const text = host.textContent ?? "";
+    expect(text).toContain("Per-replica concurrency (required)");
+    expect(text).toContain("vLLM --max-num-seqs");
+  });
+
   it("hides the kubernetes fields for the endpoints source", async () => {
     await renderPanel(model({ capacity_mode: "discovered", capacity_source: "endpoints" }), view());
-    expect(host.querySelector('input[name="capacity_selector"]')).toBeNull();
+    expect(host.querySelector('input[name="capacity_service"]')).toBeNull();
     expect(host.querySelector('input[name="capacity_namespace"]')).toBeNull();
-    expect(host.querySelector('input[name="per_replica_max_in_flight"]')).not.toBeNull();
+    const perReplica = host.querySelector<HTMLInputElement>('input[name="per_replica_max_in_flight"]');
+    expect(perReplica).not.toBeNull();
+    expect(perReplica!.required).toBe(false);
   });
 
   it("saves the form through the discovery action", async () => {
@@ -283,7 +299,7 @@ describe("the discovered capacity mode", () => {
             ...view().models[0].status,
             state: "stale",
             ready_replicas: 0,
-            reason: "no Ready pod matches `app=up` in inference (1 matched); keeping the last discovered value",
+            reason: "Service up in inference has no ready endpoint (1 listed); keeping the last discovered value",
           }}
           replicaShare={8}
           replicas={1}

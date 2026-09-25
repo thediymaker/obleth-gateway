@@ -1808,32 +1808,36 @@ export function CapacityDiscoveryPanel({ model }: { model: ModelRoute }) {
               onValueChange={setSource}
               options={[
                 { value: "endpoints", label: "endpoints", hint: "This model's enabled, healthy endpoints" },
-                { value: "kubernetes", label: "kubernetes", hint: "Ready pods matching a label selector" },
+                { value: "kubernetes", label: "kubernetes", hint: "Ready endpoints of a Kubernetes Service" },
               ]}
             />
           </div>
           <Field
-            label="Per-replica concurrency"
+            label={source === "kubernetes" ? "Per-replica concurrency (required)" : "Per-replica concurrency"}
             name="per_replica_max_in_flight"
             type="number"
             min={1}
-            placeholder={source === "kubernetes" ? "read from the server's flags" : "each endpoint's own value"}
+            required={source === "kubernetes"}
+            placeholder={source === "kubernetes" ? "e.g. 8" : "blank: each endpoint's own max in flight"}
             defaultValue={model.per_replica_max_in_flight == null ? "" : String(model.per_replica_max_in_flight)}
+            hint="Requests one replica serves at once, e.g. your server's max concurrent sequences, such as vLLM --max-num-seqs."
           />
           {source === "kubernetes" && (
             <>
               <Field
-                label="Namespace"
-                name="capacity_namespace"
-                placeholder={view?.namespaces.length ? `any of ${view.namespaces.join(", ")}` : "namespace"}
-                defaultValue={model.capacity_namespace ?? ""}
+                label="Service name"
+                name="capacity_service"
+                placeholder={view?.default_service ? `default: ${view.default_service}` : "my-model"}
+                defaultValue={model.capacity_service ?? ""}
+                hint="The Service whose ready endpoints are this model's replicas. For multi-node serving, use one that selects only the pods that take requests."
               />
               <Field
-                label="Label selector"
-                name="capacity_selector"
-                placeholder={view?.default_selector || "app=my-model,role!=worker"}
-                defaultValue={model.capacity_selector ?? ""}
-                hint="Only pods that serve requests; exclude worker pods of multi-node deployments here."
+                label="Namespace"
+                name="capacity_namespace"
+                placeholder={
+                  view?.namespaces.length ? `first of ${view.namespaces.join(", ")} with the Service` : "namespace"
+                }
+                defaultValue={model.capacity_namespace ?? ""}
               />
             </>
           )}
@@ -1887,8 +1891,12 @@ export function CapacityDiscoveryStatus({
         <Badge className={DISCOVERY_STATE_TONE[status.state] ?? DISCOVERY_STATE_TONE.fallback}>{status.state}</Badge>
         <span className="text-muted-foreground">
           source {status.source}
-          {status.selector ? ` · ${status.selector}` : ""}
-          {status.namespaces.length ? ` in ${status.namespaces.join(", ")}` : ""}
+          {status.service ? ` · Service ${status.service}` : ""}
+          {status.namespace
+            ? ` in ${status.namespace}`
+            : status.namespaces.length
+              ? ` in ${status.namespaces.join(", ")}`
+              : ""}
         </span>
         {enabled === false && <span className="text-muted-foreground">· discovery is off on this gateway</span>}
       </div>
