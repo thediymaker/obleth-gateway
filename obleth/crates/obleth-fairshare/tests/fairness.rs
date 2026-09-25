@@ -1799,3 +1799,84 @@ async fn global_ceiling_takes_its_share() {
         .expect("join")
         .expect("admit");
 }
+
+/// A model cap set from outside wins over the cap its admissions carry, is
+/// divided across replicas like any configured value, and resizes live:
+/// growth wakes waiters, a shrink keeps every held permit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn model_caps_set_from_outside_resize_the_pool() {
+    let fs = FairShare::start(
+        Arc::new(StaticCapacity::new(64)),
+        FairshareAlgorithm::Hierarchical,
+        8,
+    );
+    let t = Uuid::new_v4();
+    // The route says 2; the override (say, discovered from the backend) says 4.
+    let req = move || AdmitRequest::new(t, "m", 1).model_cap(2);
+    fs.set_model_caps([("m".to_string(), 4)].into());
+    let mut permits = admit_fast(&fs, 4, req).await;
+    let snap = fs.snapshot().await.unwrap();
+    assert_eq!(snap.pools[0].configured_cap, 4, "the override wins");
+
+    let mut waiters = Vec::new();
+    for n in 1..=2 {
+        let fs_w = fs.clone();
+        waiters.push(tokio::spawn(async move { fs_w.admit(req()).await }));
+        wait_for_queued(&fs, "m", n).await;
+    }
+
+    // Growing to 6 admits both waiters without any release.
+    fs.set_model_caps([("m".to_string(), 6)].into());
+    for w in waiters.drain(..) {
+        let admitted = tokio::time::timeout(Duration::from_secs(1), w)
+            .await
+            .expect("dispatched on growth")
+            .expect("join")
+            .expect("admit");
+        permits.push(admitted.permit);
+    }
+    assert_eq!(fs.snapshot().await.unwrap().pools[0].in_flight, 6);
+
+    // Shrinking to 2 keeps all six in flight and admits nothing new.
+    fs.set_model_caps([("m".to_string(), 2)].into());
+    let fs_w = fs.clone();
+    let waiter = tokio::spawn(async move { fs_w.admit(req()).await });
+    wait_for_queued(&fs, "m", 1).await;
+    let snap = fs.snapshot().await.unwrap();
+    assert_eq!(snap.pools[0].cap, 2);
+    assert_eq!(snap.pools[0].in_flight, 6, "held permits are untouched");
+
+    // The override is a configured value: two replicas enforce ceil(2 / 2).
+    fs.set_replicas(2);
+    let snap = fs.snapshot().await.unwrap();
+    assert_eq!(snap.pools[0].configured_cap, 2);
+    assert_eq!(snap.pools[0].cap, 1);
+
+    // Under the share again, the waiter gets its slot.
+    permits.truncate(0);
+    tokio::time::timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("dispatched once under the new size")
+        .expect("join")
+        .expect("admit");
+}
+
+/// Dropping a model from the overrides hands the pool back to the cap its
+/// admissions carry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_model_cap_falls_back_to_the_route() {
+    let fs = FairShare::start(
+        Arc::new(StaticCapacity::new(64)),
+        FairshareAlgorithm::Weighted,
+        8,
+    );
+    let t = Uuid::new_v4();
+    fs.set_model_caps([("m".to_string(), 12)].into());
+    let first = admit_fast(&fs, 1, move || AdmitRequest::new(t, "m", 1).model_cap(3)).await;
+    assert_eq!(fs.snapshot().await.unwrap().pools[0].configured_cap, 12);
+
+    fs.set_model_caps(Default::default());
+    let second = admit_fast(&fs, 1, move || AdmitRequest::new(t, "m", 1).model_cap(3)).await;
+    assert_eq!(fs.snapshot().await.unwrap().pools[0].configured_cap, 3);
+    drop((first, second));
+}

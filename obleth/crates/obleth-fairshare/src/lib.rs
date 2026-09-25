@@ -22,6 +22,14 @@
 //! stops admitting until occupancy falls under the new size, growing
 //! dispatches waiters straight away.
 //!
+//! # Model caps set from outside
+//! A model's pool size normally arrives with each admission (the route's
+//! `max_in_flight`). [`FairShare::set_model_caps`] overrides it for named
+//! models with a configured (cluster-wide) value derived elsewhere, such as
+//! the live backend capacity a `discovered` model follows. An override is
+//! still a configured value: it is divided across the replicas like any other,
+//! and a change resizes the pool the same way a replica-count change does.
+//!
 //! Requests with no resolved route share one [`PoolKey::Unrouted`] pool. A
 //! pool with no permits and no waiters for [`IDLE_POOL_TTL`] is dropped by the
 //! scheduler's housekeeping timer, which also drops queued waiters whose
@@ -320,6 +328,7 @@ enum Ctl {
         respond: oneshot::Sender<FairshareSample>,
     },
     SetReplicas(usize),
+    SetModelCaps(HashMap<String, usize>),
 }
 
 /// Handle to the fairshare scheduler. Cheap to clone.
@@ -360,6 +369,7 @@ impl FairShare {
             capacity,
             default_model_cap: default_model_max_in_flight.max(1),
             replicas: 1,
+            model_caps: HashMap::new(),
             pools: HashMap::new(),
             pool_order: Vec::new(),
             cursor: 0,
@@ -396,6 +406,17 @@ impl FairShare {
     /// requests are never cut short. 0 is read as 1.
     pub fn set_replicas(&self, replicas: usize) {
         let _ = self.ctl.send(Ctl::SetReplicas(replicas.max(1)));
+    }
+
+    /// Replace the per-model pool-size overrides: each named model's pool is
+    /// sized by its value (a configured, cluster-wide number, so still divided
+    /// across replicas) instead of the cap its admissions carry. A model left
+    /// out goes back to its admissions' cap from its next admission on.
+    /// Resizes like [`FairShare::set_replicas`]: in-flight requests are never
+    /// cut short, and growth dispatches waiters at once. 0 is read as 1.
+    pub fn set_model_caps(&self, caps: HashMap<String, usize>) {
+        let caps = caps.into_iter().map(|(m, c)| (m, c.max(1))).collect();
+        let _ = self.ctl.send(Ctl::SetModelCaps(caps));
     }
 
     pub async fn snapshot(&self) -> Option<FairshareSnapshot> {
@@ -1425,6 +1446,9 @@ struct Scheduler {
     default_model_cap: usize,
     /// Live gateway replicas; every configured limit is divided by it.
     replicas: usize,
+    /// Configured pool sizes set with [`FairShare::set_model_caps`], which win
+    /// over the cap an admission carries.
+    model_caps: HashMap<String, usize>,
     pools: HashMap<PoolKey, Pool>,
     /// Insertion order of pools, for round-robin when the ceiling binds.
     pool_order: Vec<PoolKey>,
@@ -1473,14 +1497,19 @@ impl Scheduler {
                 let ceiling = self.ceiling();
                 let headroom = ceiling.saturating_sub(self.in_flight);
                 let default_cap = self.default_model_cap;
+                let override_cap = match &key {
+                    PoolKey::Model(name) => self.model_caps.get(name).copied(),
+                    PoolKey::Unrouted => None,
+                };
                 let pool = self.pool_mut(&key);
                 pool.set_configured_cap(match key {
                     // No route means no configured cap to honour.
                     PoolKey::Unrouted => default_cap,
-                    PoolKey::Model(_) => req
-                        .model_max_in_flight
-                        .filter(|c| *c > 0)
-                        .unwrap_or(default_cap),
+                    PoolKey::Model(_) => override_cap.unwrap_or_else(|| {
+                        req.model_max_in_flight
+                            .filter(|c| *c > 0)
+                            .unwrap_or(default_cap)
+                    }),
                 });
                 pool.idle_since = None;
                 pool.track_meta(&req);
@@ -1526,6 +1555,25 @@ impl Scheduler {
                 }
                 // Growing frees slots for whoever is queued; shrinking finds
                 // nothing to dispatch and leaves every held permit alone.
+                self.dispatch_all();
+                self.publish_stats();
+            }
+            Ctl::SetModelCaps(caps) => {
+                if caps == self.model_caps {
+                    return;
+                }
+                for (key, pool) in self.pools.iter_mut() {
+                    if let PoolKey::Model(name) = key {
+                        // A pool whose override was dropped keeps its size
+                        // until its next admission brings the route's cap.
+                        if let Some(cap) = caps.get(name) {
+                            pool.set_configured_cap(*cap);
+                        }
+                    }
+                }
+                self.model_caps = caps;
+                // Same as a replica-count change: growth dispatches waiters,
+                // a shrink leaves every held permit alone.
                 self.dispatch_all();
                 self.publish_stats();
             }
