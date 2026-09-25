@@ -855,7 +855,9 @@ async fn the_endpoints_source_counts_enabled_healthy_endpoints() {
     assert_eq!(s.state, STATE_DISCOVERED);
     assert_eq!(s.ready_replicas, Some(2));
     assert_eq!(s.effective_max_in_flight, 24, "16 + 8");
-    assert_eq!(s.per_replica_max_in_flight, Some(12));
+    assert_eq!(s.per_replica_max_in_flight, None, "the endpoints differ");
+    assert_eq!(s.replica_capacity, Some(24));
+    assert_eq!(s.per_replica_source.as_deref(), Some(PER_REPLICA_BOTH));
     assert_eq!(pool_size(&fs, "e").await, 24);
 
     // Under failover only the endpoint in use takes traffic.
@@ -872,6 +874,73 @@ async fn the_endpoints_source_counts_enabled_healthy_endpoints() {
     let s = status(&handle, "e");
     assert_eq!(s.state, STATE_STALE);
     assert_eq!(s.effective_max_in_flight, 16);
+}
+
+/// Endpoints with their own values are summed, each unset one at the
+/// model's per-replica value: 8 + 2 + 4 = 14, not 3 x ceil(14 / 3) = 15.
+#[tokio::test]
+async fn mixed_endpoint_values_are_summed_not_averaged() {
+    let handle = settings(&[], "");
+    let fs = fairshare();
+    let mut d = Discoverer::new(None, fs.clone(), 32);
+    let mut t = endpoints_target(
+        "load_balance",
+        vec![
+            endpoint(0, true, true, Some(8)),
+            endpoint(1, true, true, Some(2)),
+            endpoint(2, true, true, None),
+        ],
+    );
+    t.per_replica_max_in_flight = Some(4);
+    d.pass(&handle, vec![t.clone()]).await;
+    let s = status(&handle, "e");
+    assert_eq!(s.state, STATE_DISCOVERED);
+    assert_eq!(s.ready_replicas, Some(3));
+    assert_eq!(s.replica_capacity, Some(14));
+    assert_eq!(s.effective_max_in_flight, 14);
+    assert_eq!(s.per_replica_max_in_flight, None);
+    assert_eq!(pool_size(&fs, "e").await, 14);
+
+    // Headroom scales the sum: ceil(14 x 1.1) = 16, where the average would
+    // give ceil(15 x 1.1) = 17.
+    t.headroom = 1.1;
+    d.pass(&handle, vec![t.clone()]).await;
+    assert_eq!(status(&handle, "e").effective_max_in_flight, 16);
+
+    // Only the endpoints' own values: summed the same way.
+    t.headroom = 1.0;
+    t.per_replica_max_in_flight = None;
+    t.endpoints[2].max_in_flight = Some(5);
+    d.pass(&handle, vec![t]).await;
+    let s = status(&handle, "e");
+    assert_eq!(s.effective_max_in_flight, 15, "8 + 2 + 5");
+    assert_eq!(s.per_replica_source.as_deref(), Some(PER_REPLICA_ENDPOINT));
+}
+
+/// No endpoint carries a value: every ready one counts at the model's.
+#[tokio::test]
+async fn endpoints_without_values_count_at_the_per_replica_value() {
+    let handle = settings(&[], "");
+    let mut d = Discoverer::new(None, fairshare(), 32);
+    let mut t = endpoints_target(
+        "load_balance",
+        vec![
+            endpoint(0, true, true, None),
+            endpoint(1, true, true, None),
+            endpoint(2, true, false, None),
+        ],
+    );
+    t.per_replica_max_in_flight = Some(6);
+    d.pass(&handle, vec![t]).await;
+    let s = status(&handle, "e");
+    assert_eq!(s.ready_replicas, Some(2));
+    assert_eq!(s.per_replica_max_in_flight, Some(6));
+    assert_eq!(s.replica_capacity, Some(12));
+    assert_eq!(s.effective_max_in_flight, 12);
+    assert_eq!(
+        s.per_replica_source.as_deref(),
+        Some(PER_REPLICA_CONFIGURED)
+    );
 }
 
 #[tokio::test]
@@ -924,10 +993,10 @@ async fn a_model_leaving_the_mode_leaves_the_view_and_the_overrides() {
 
 #[test]
 fn the_derivation_rounds_up_and_never_reaches_zero() {
-    assert_eq!(derive(2, 8, 1.0), 16);
-    assert_eq!(derive(3, 5, 1.1), 17, "16.5 rounds up");
-    assert_eq!(derive(1, 1, 0.1), 1, "never below 1");
-    assert_eq!(derive(usize::MAX, 2, 10.0), MAX_DERIVED);
+    assert_eq!(derive(16, 1.0), 16);
+    assert_eq!(derive(15, 1.1), 17, "16.5 rounds up");
+    assert_eq!(derive(1, 0.1), 1, "never below 1");
+    assert_eq!(derive(usize::MAX, 10.0), MAX_DERIVED);
 }
 
 #[test]
@@ -994,4 +1063,203 @@ fn resolved(name: &str) -> ResolvedModel {
         verify_upstream_model: String::new(),
         endpoints: Vec::new(),
     }
+}
+
+// ---- the Service listing behind the dashboard's Service picker ------------
+
+fn slice_of(service: &str, name: &str, endpoints: Vec<Value>) -> Value {
+    json!({
+        "metadata": {"name": name, "labels": {"kubernetes.io/service-name": service}},
+        "addressType": "IPv4",
+        "endpoints": endpoints,
+        "ports": [{"name": "http", "port": 8000, "protocol": "TCP"}]
+    })
+}
+
+/// Every Service's slices in a namespace, as the label-existence list
+/// returns them (the fake keys that list by an empty Service name).
+fn answer_namespace(api: &Shared, ns: &str, slices: Vec<Value>) {
+    answer(api, ns, "", slices);
+}
+
+fn listing_discovery(client: KubeClient, namespaces: &[&str], ttl: Duration) -> CapacityDiscovery {
+    CapacityDiscovery::build(
+        CapacityDiscoveryConfig {
+            enabled: true,
+            interval: Duration::from_secs(15),
+            namespaces: namespaces.iter().map(|s| s.to_string()).collect(),
+            default_service: TEMPLATE.into(),
+        },
+        Some(client),
+        ttl,
+    )
+}
+
+#[test]
+fn ready_endpoints_are_grouped_by_service_with_discoverys_rules() {
+    let slices: Vec<EndpointSlice> = serde_json::from_value(json!([
+        slice_of("a", "a-1", vec![ready("p1", "10.0.0.1"), ready("p2", "10.0.0.2")]),
+        // The same pod in a second slice counts once.
+        slice_of("a", "a-2", vec![ready("p2", "10.0.0.2"), ep("p3", "10.0.0.3", false, false, false)]),
+        slice_of("b", "b-1", vec![
+            ep("q1", "10.0.1.1", true, true, true),   // terminating
+            ep("q2", "10.0.1.2", true, false, false), // not serving
+            ready("q3", "10.0.1.3"),
+        ]),
+        slice_of("empty", "e-1", vec![]),
+        // No Service-name label: not a Service's slice.
+        {"metadata": {"name": "stray", "labels": {}}, "endpoints": [ready("x", "10.0.9.9")]},
+    ]))
+    .unwrap();
+    let by_service = super::kube::ready_by_service(&slices);
+    assert_eq!(
+        by_service.into_iter().collect::<Vec<_>>(),
+        vec![("a".into(), 2), ("b".into(), 1), ("empty".into(), 0)]
+    );
+}
+
+#[tokio::test]
+async fn services_are_listed_from_endpointslices_in_the_allowed_namespaces() {
+    let (client, api) = fake_api().await;
+    answer_namespace(
+        &api,
+        "inference",
+        vec![
+            slice_of(
+                "m-served",
+                "m-1",
+                vec![ready("a", "10.0.0.1"), ready("b", "10.0.0.2")],
+            ),
+            slice_of("other", "o-1", vec![ready("c", "10.0.0.3")]),
+        ],
+    );
+    answer_namespace(
+        &api,
+        "batch",
+        vec![slice_of("m-served", "m-2", vec![ready("d", "10.0.1.1")])],
+    );
+    let discovery = listing_discovery(client, &["inference", "batch"], Duration::from_secs(15));
+    let listing = discovery.list_services().await;
+    let rows: Vec<(String, String, usize)> = listing
+        .services
+        .iter()
+        .map(|s| (s.namespace.clone(), s.service.clone(), s.ready))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            ("inference".into(), "m-served".into(), 2),
+            ("inference".into(), "other".into(), 1),
+            ("batch".into(), "m-served".into(), 1),
+        ]
+    );
+    assert_eq!(listing.reason, None);
+    // One list per namespace, by label existence, and nothing but slices.
+    let seen = api.lock().unwrap().seen.clone();
+    assert_eq!(seen.len(), 2);
+    for s in &seen {
+        assert_eq!(s.query["labelSelector"], "kubernetes.io/service-name");
+        assert_eq!(s.token.as_deref(), Some("sa-token"));
+    }
+    assert_only_endpoint_slices(&api);
+
+    // The default Service resolves in the first namespace that has it.
+    let (name, found) = discovery.default_match(&listing, "m-served", "m");
+    assert_eq!(name.as_deref(), Some("m-served"));
+    let found = found.expect("found");
+    assert_eq!((found.namespace.as_str(), found.ready), ("inference", 2));
+    let (name, found) = discovery.default_match(&listing, "absent", "m");
+    assert_eq!(name.as_deref(), Some("absent"));
+    assert!(found.is_none());
+}
+
+#[tokio::test]
+async fn the_service_listing_is_cached() {
+    let (client, api) = fake_api().await;
+    answer_namespace(
+        &api,
+        "inference",
+        vec![slice_of("a", "a-1", vec![ready("p", "10.0.0.1")])],
+    );
+    let discovery = listing_discovery(client.clone(), &["inference"], Duration::from_secs(60));
+    let first = discovery.list_services().await;
+    // A change inside the TTL is not seen: the cached list answers.
+    answer_namespace(&api, "inference", vec![]);
+    let (a, b) = tokio::join!(discovery.list_services(), discovery.list_services());
+    assert_eq!(first, a);
+    assert_eq!(first, b);
+    assert_eq!(
+        api.lock().unwrap().seen.len(),
+        1,
+        "one API call for three listings"
+    );
+
+    // Past the TTL it lists again.
+    let short = listing_discovery(client, &["inference"], Duration::from_millis(1));
+    short.list_services().await;
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let fresh = short.list_services().await;
+    assert!(fresh.services.is_empty());
+    assert_eq!(api.lock().unwrap().seen.len(), 3);
+}
+
+#[tokio::test]
+async fn the_service_listing_says_why_it_is_empty() {
+    // Discovery off.
+    let off = CapacityDiscovery::disabled().list_services().await;
+    assert!(off.services.is_empty());
+    assert!(off
+        .reason
+        .unwrap()
+        .contains("OBLETH_CAPACITY_DISCOVERY_ENABLED"));
+
+    // No namespaces: no client is built at all.
+    let none = settings(&[], TEMPLATE).list_services().await;
+    assert!(none
+        .reason
+        .unwrap()
+        .contains("OBLETH_CAPACITY_DISCOVERY_NAMESPACES"));
+
+    // Namespaces with no Services.
+    let (client, api) = fake_api().await;
+    let empty = listing_discovery(client.clone(), &["inference"], Duration::from_secs(15))
+        .list_services()
+        .await;
+    assert_eq!(
+        empty.reason.as_deref(),
+        Some("no Services found in inference")
+    );
+
+    // One namespace refused: the other's Services still list, with the error.
+    fail(&api, "batch", "", 403);
+    answer_namespace(
+        &api,
+        "inference",
+        vec![slice_of("a", "a-1", vec![ready("p", "10.0.0.1")])],
+    );
+    let partial = listing_discovery(
+        client.clone(),
+        &["inference", "batch"],
+        Duration::from_secs(15),
+    )
+    .list_services()
+    .await;
+    assert_eq!(partial.services.len(), 1);
+    assert_eq!(partial.reason, None);
+    assert_eq!(partial.errors.len(), 1);
+    assert!(
+        partial.errors[0].contains("HTTP 403"),
+        "{:?}",
+        partial.errors
+    );
+
+    // Every namespace refused.
+    let refused = listing_discovery(client, &["batch"], Duration::from_secs(15))
+        .list_services()
+        .await;
+    assert!(refused.services.is_empty());
+    assert_eq!(
+        refused.reason.as_deref(),
+        Some("no allowed namespace could be listed")
+    );
 }

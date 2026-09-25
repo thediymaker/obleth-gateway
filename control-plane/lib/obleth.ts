@@ -262,9 +262,13 @@ export interface ModelCapacityStatus {
   /** Kubernetes source: the Service whose ready endpoints are counted. */
   service: string | null;
   ready_replicas: number | null;
+  /** The value every ready replica shares; null when they differ. */
   per_replica_max_in_flight: number | null;
   /** `configured`, `endpoint`, or `endpoint and configured`. */
   per_replica_source: string | null;
+  /** The ready replicas' concurrency summed: ready × per replica, or each
+   *  endpoint's own value added up. */
+  replica_capacity?: number | null;
   headroom: number;
   /** Last value derived from the source: the cluster-wide pool size. */
   derived_max_in_flight: number | null;
@@ -282,8 +286,13 @@ export interface CapacityDiscoveryModelView {
   model_name: string;
   enabled: boolean;
   static_max_in_flight: number | null;
-  /** What the answering replica enforces: its share of the effective size. */
-  replica_share: number;
+  /** Pool size the answering gateway enforces: the effective size in shared
+   *  and local mode, its share of it in split and fallback mode. */
+  enforced_max_in_flight: number;
+  /** In-flight requests across every gateway (shared mode only). */
+  cluster_in_flight: number | null;
+  /** The answering gateway's own in-flight requests. */
+  in_flight: number;
   status: ModelCapacityStatus;
 }
 
@@ -294,7 +303,30 @@ export interface CapacityDiscoveryView {
   /** Service name template for kubernetes models that name no Service. */
   default_service: string;
   replicas: number;
+  /** How the answering gateway enforces pool sizes. */
+  mode?: FairshareSlotMode;
   models: CapacityDiscoveryModelView[];
+}
+
+/** A Service the kubernetes capacity source can see, from its EndpointSlices. */
+export interface CapacityServiceSummary {
+  service: string;
+  namespace: string;
+  /** Ready, serving, non-terminating endpoints, counted as discovery counts them. */
+  ready: number;
+}
+
+/** GET /capacity/services: the Services in the allowed namespaces. */
+export interface CapacityServicesView {
+  services: CapacityServiceSummary[];
+  /** Why `services` is empty or incomplete, when it is. */
+  reason: string | null;
+  /** Namespaces that could not be listed. */
+  errors: string[];
+  /** With `model`: the Service name that model uses by default, found or not. */
+  default_service: string | null;
+  /** With `model`: that Service, in the first allowed namespace that has it. */
+  default_match: CapacityServiceSummary | null;
 }
 
 export interface ManagedModelSpec {
@@ -697,13 +729,25 @@ export interface CostAgg {
 }
 
 export interface LiveStats {
+  /** The answering gateway's own in-flight requests. */
   in_flight: number;
   queued: number;
-  /** This replica's share of the enabled models' pool sizes. */
+  /** Enabled models' pool sizes as the answering gateway enforces them. */
   max_in_flight: number;
-  /** Live gateway replicas the configured limits are divided across. */
+  /** Live gateway replicas. */
   replicas?: number;
+  mode?: FairshareSlotMode;
+  /** In-flight requests across every gateway (shared mode only). */
+  cluster_in_flight?: number | null;
 }
+
+/**
+ * How a gateway enforces the fairshare limits: `shared` (cluster-wide slots
+ * in Redis), `split` (each gateway enforces ceil(configured / gateways),
+ * shared slots off), `fallback` (shared slots unavailable, so the split
+ * applies) or `local` (one gateway enforcing the configured values).
+ */
+export type FairshareSlotMode = "local" | "split" | "shared" | "fallback";
 
 /** Wire shape of GET /overview/summary (config counts + windowed usage totals). */
 export interface OverviewSummaryView {
@@ -760,11 +804,15 @@ export interface KeyFairshareView {
 
 export interface ModelPoolView {
   model: string;
-  /** Slots this replica enforces: its share of `configured_cap`. */
+  /** Slots the answering gateway enforces: `configured_cap`, or its share
+   *  of it in split and fallback mode. */
   cap: number;
-  /** Pool size as configured, before it is divided across replicas. */
+  /** Pool size as configured: the cluster-wide size. */
   configured_cap?: number;
+  /** The answering gateway's own in-flight requests. */
   in_flight: number;
+  /** In-flight requests across every gateway (shared mode only). */
+  cluster_in_flight?: number | null;
   queued: number;
   borrowed: number;
   groups: GroupFairshareView[];
@@ -785,21 +833,28 @@ export interface FairshareLiveView {
   model_in_flight?: Record<string, number>;
   /** Live queued request count keyed by model name. */
   model_queued?: Record<string, number>;
-  /** Hard ceiling on global in-flight admission, independent of pool sums:
-   *  this replica's share of the configured ceiling. */
+  /** Hard ceiling on global in-flight admission, independent of pool sums,
+   *  as the answering gateway enforces it. */
   hard_ceiling?: number;
   /** OBLETH_GLOBAL_MAX_IN_FLIGHT as configured. */
   configured_hard_ceiling?: number;
-  /** Enabled models' pool sizes as configured, summed; `max_in_flight` is
-   *  this replica's share of it. */
+  /** Enabled models' pool sizes as configured, summed: the cluster-wide
+   *  capacity. */
   configured_max_in_flight?: number;
   /** Default per-model in-flight cap applied when a model has none configured. */
   default_model_max_in_flight?: number;
-  /** Live gateway replicas the configured limits are divided across. Every
-   *  count in the view is the answering replica's own. */
+  /** Live gateway replicas. */
   replicas?: number;
-  /** Whether limits are divided across replicas (OBLETH_FAIRSHARE_REPLICA_AWARE). */
+  /** How the answering gateway enforces the limits. */
+  mode?: FairshareSlotMode;
+  /** Whether shared slots are configured (OBLETH_FAIRSHARE_SHARED_SLOTS). */
+  shared_slots?: boolean;
+  /** Whether the split applies when shared slots are off or unavailable
+   *  (OBLETH_FAIRSHARE_REPLICA_AWARE). */
   replica_aware?: boolean;
+  /** In-flight requests across every gateway (shared mode only). Every other
+   *  count in the view is the answering gateway's own. */
+  cluster_in_flight?: number | null;
   keys?: KeyFairshareView[];
   pools?: ModelPoolView[];
 }
@@ -1839,6 +1894,8 @@ export const obleth = {
       body: JSON.stringify({ capacity_mode, ...(fields ?? {}) }),
     }),
   capacityDiscovery: () => api<CapacityDiscoveryView>("/capacity/discovery"),
+  capacityServices: (model?: string) =>
+    api<CapacityServicesView>(`/capacity/services${model ? `?model=${encodeURIComponent(model)}` : ""}`),
   autotuneModel: (
     id: string,
     opts?: {

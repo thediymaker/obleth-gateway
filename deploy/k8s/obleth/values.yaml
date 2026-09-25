@@ -12,23 +12,32 @@ obleth:
   # Fairshare runs one scheduling pool per model, sized by the model's
   # max_in_flight or defaultModelMaxInFlight. globalMaxInFlight is a total
   # in-flight ceiling across all pools, not a fairness input; keep it above
-  # the sum of the pool sizes you expect. With fairshareReplicaAware (the
-  # default) these are fleet-wide numbers: each replica enforces
-  # ceil(value / live replicas) of every pool, tenant and key cap, and the
-  # ceiling, so any replica count (or the HPA) admits about the configured
-  # concurrency. Rounding up puts the fleet at most one slot per replica over
-  # a limit, and because every pool rounds up on its own, keep the ceiling at
-  # least one slot per enabled model per replica above the pool sum.
+  # the sum of the pool sizes you expect. These are cluster-wide numbers:
+  # with fairshareSharedSlots (the default) and more than one replica live,
+  # every pool, tenant and key cap and the ceiling is a set of slots in Redis
+  # that all replicas draw from, so any one replica can use a model's whole
+  # pool while the others are idle and the fleet never exceeds it. Any
+  # replica count (or the HPA) admits the configured concurrency.
   replicas: 1
   globalMaxInFlight: 4096
   defaultModelMaxInFlight: 32
-  # Divide the fairshare limits above across the live gateway replicas,
-  # counted from Redis heartbeats. false: every replica enforces the full
-  # numbers and N replicas admit N x them (the old behaviour).
+  # Enforce the limits above as cluster-wide slots in Redis whenever more
+  # than one replica is live: one Redis script call when a request is
+  # admitted and one when it finishes. With a single replica there is no
+  # Redis call on the request path. Fairness (which waiting request goes
+  # next) is decided on each replica; across replicas a freed slot goes to
+  # whichever replica claims it first.
+  fairshareSharedSlots: true
+  # When shared slots are off, or Redis is unreachable, divide the limits
+  # across the live replicas instead: each enforces ceil(value / replicas),
+  # which rounds the fleet up to one slot per replica over a limit and keeps
+  # a busy replica from borrowing an idle one's share. false: each replica
+  # enforces the full numbers in that case, and N replicas admit N x them.
   fairshareReplicaAware: true
-  # How often each replica refreshes its heartbeat, and how long one counts it
-  # as live. A crashed replica's share returns to the survivors within about
-  # the TTL (raised to at least twice the interval).
+  # How often each replica refreshes its heartbeat (and re-asserts the slots
+  # it holds), and how long one counts it as live. A crashed replica's slots
+  # return to the survivors within about the TTL (raised to at least twice
+  # the interval).
   fairshareReplicaHeartbeatSecs: 5
   fairshareReplicaTtlSecs: 15
   # Seconds of scheduler history each replica keeps in memory for the
@@ -116,9 +125,10 @@ obleth:
     requests: { cpu: "250m", memory: "256Mi" }
     limits: { cpu: "2", memory: "1Gi" }
   # Pool sizes that follow the backend, for models in the `discovered`
-  # capacity mode: ready serving replicas x per-replica concurrency x the
-  # model's capacity_headroom, re-read by every gateway replica each interval
-  # and divided across the gateway replicas like any configured pool size.
+  # capacity mode: the ready serving replicas' concurrency summed (ready x
+  # per-replica concurrency, or each endpoint's own max in flight added up)
+  # x the model's capacity_headroom, re-read by every gateway replica each interval
+  # and enforced cluster-wide like any configured pool size.
   # Off by default; while off, a discovered model uses its static
   # max_in_flight. See the README's "Capacity discovery" section and
   # examples/values-capacity-discovery.yaml.
@@ -144,14 +154,13 @@ obleth:
     # such a model is refused until it names its own Service.
     defaultService: ""
 
-# Off by default. With obleth.fairshareReplicaAware on, replicas divide the
-# fairshare limits between them, so scaling moves CPU capacity, not the
-# concurrency reaching your upstream: pools resize within one heartbeat of a
-# pod joining, and within about the heartbeat TTL of one disappearing.
-# Fairness is decided per replica on its share, so it is exact only when the
-# Service spreads requests evenly. With fairshareReplicaAware off, each
-# replica enforces the full limits and scaling 2 -> 8 pods raises the
-# aggregate fourfold; size for maxReplicas in that case.
+# Off by default. With obleth.fairshareSharedSlots (or fairshareReplicaAware)
+# on, the fairshare limits hold across every replica, so scaling moves CPU
+# capacity, not the concurrency reaching your upstream. A pod that joins
+# starts drawing on the shared slots within one heartbeat, and a pod that
+# disappears returns its slots within about the heartbeat TTL. With both
+# off, each replica enforces the full limits and scaling 2 -> 8 pods raises
+# the aggregate fourfold; size for maxReplicas in that case.
 hpa:
   enabled: false
   minReplicas: 1

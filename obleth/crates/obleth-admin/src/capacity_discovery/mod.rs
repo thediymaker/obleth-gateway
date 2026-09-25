@@ -6,18 +6,25 @@
 //! source, derives
 //!
 //! ```text
-//! configured pool size = max(1, ceil(ready serving replicas x per-replica concurrency x headroom))
+//! configured pool size = max(1, ceil(summed concurrency of the ready replicas x headroom))
 //! ```
 //!
+//! where the summed concurrency is ready replicas x the per-replica value, or,
+//! for endpoints that carry their own `max_in_flight`, each ready endpoint's
+//! value added up.
+//!
 //! and hands the result to fairshare as the model's configured, cluster-wide
-//! pool size ([`FairShare::set_model_caps`]), so the replica-aware division
-//! still applies on top: each gateway replica enforces its share of it.
+//! pool size ([`FairShare::set_model_caps`]), enforced across the gateway
+//! replicas like any configured size: as shared slots, or divided across
+//! them when shared slots are off or unavailable.
 //!
 //! Sources:
 //! - `endpoints`: the model's enabled, healthy endpoints (all of them under
 //!   `load_balance` and `session_hash`, only the one in use under `failover`),
-//!   each counted at its own `max_in_flight` or the model's
-//!   `per_replica_max_in_flight`. A model with no endpoint rows counts its
+//!   each counted at its own `max_in_flight`, or the model's
+//!   `per_replica_max_in_flight` when it has none, and summed (8, 2 and an
+//!   unset one with a per-replica value of 4 make 14). A model with no
+//!   endpoint rows counts its
 //!   single `api_base` while the model is healthy. Needs nothing outside the
 //!   gateway.
 //! - `kubernetes`: the ready, serving, non-terminating endpoints of the
@@ -43,8 +50,8 @@
 pub mod kube;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
@@ -78,6 +85,10 @@ pub const PER_REPLICA_CONFIGURED: &str = "configured";
 pub const PER_REPLICA_ENDPOINT: &str = "endpoint";
 pub const PER_REPLICA_BOTH: &str = "endpoint and configured";
 
+/// How long a Service listing is served from cache, so a form open on the
+/// dashboard cannot hammer the API server.
+pub const SERVICES_CACHE_TTL: Duration = Duration::from_secs(15);
+
 /// Handle to the gateway's capacity discovery. Cheap to clone.
 #[derive(Clone)]
 pub struct CapacityDiscovery {
@@ -87,6 +98,45 @@ pub struct CapacityDiscovery {
 struct Inner {
     settings: CapacityDiscoveryConfig,
     status: RwLock<BTreeMap<String, ModelCapacityStatus>>,
+    /// The Kubernetes client, built on first use when namespaces are set.
+    kube: OnceLock<Result<KubeClient, String>>,
+    /// The last Service listing and when it was taken. The lock also makes
+    /// concurrent callers wait for one listing instead of each making one.
+    services: tokio::sync::Mutex<Option<(Instant, ServiceListing)>>,
+    services_ttl: Duration,
+}
+
+/// One Service the `kubernetes` source can see.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ServiceSummary {
+    pub service: String,
+    pub namespace: String,
+    /// Ready, serving, non-terminating endpoints, counted as discovery
+    /// counts them.
+    pub ready: usize,
+}
+
+/// The Services visible to the `kubernetes` source, from EndpointSlices in
+/// the allowed namespaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ServiceListing {
+    /// Sorted by namespace (in allowlist order), then Service name.
+    pub services: Vec<ServiceSummary>,
+    /// Why the list is empty or incomplete, when it is: discovery off, no
+    /// namespaces configured, no Kubernetes client, or no namespace answering.
+    pub reason: Option<String>,
+    /// Namespaces that could not be listed, with why.
+    pub errors: Vec<String>,
+}
+
+impl ServiceListing {
+    fn unavailable(reason: impl Into<String>) -> Self {
+        ServiceListing {
+            services: Vec::new(),
+            reason: Some(reason.into()),
+            errors: Vec::new(),
+        }
+    }
 }
 
 /// What discovery knows about one `discovered` model, as this replica sees it.
@@ -104,15 +154,20 @@ pub struct ModelCapacityStatus {
     pub service: Option<String>,
     /// Serving replicas the source reported on its last answer.
     pub ready_replicas: Option<usize>,
-    /// Requests one replica takes, as used in the last derivation.
+    /// Requests one replica takes, as used in the last derivation. `None`
+    /// when the ready replicas' values differ (endpoints with their own
+    /// `max_in_flight`); `replica_capacity` then has their sum.
     pub per_replica_max_in_flight: Option<usize>,
     /// Where that value came from: `configured` (the model's
     /// `per_replica_max_in_flight`), `endpoint` (each endpoint's own
     /// `max_in_flight`), or `endpoint and configured` when both were used.
     pub per_replica_source: Option<String>,
+    /// The ready replicas' concurrency summed, as used in the last
+    /// derivation: ready replicas x the per-replica value, or each
+    /// endpoint's own value added up.
+    pub replica_capacity: Option<usize>,
     pub headroom: f64,
-    /// The last value derived from the source: the cluster-wide pool size,
-    /// before the replica-aware division.
+    /// The last value derived from the source: the cluster-wide pool size.
     pub derived_max_in_flight: Option<usize>,
     /// The cluster-wide pool size fairshare uses now: the derived value, the
     /// last one kept while the source has no answer, or the static fallback.
@@ -129,12 +184,142 @@ pub struct ModelCapacityStatus {
 
 impl CapacityDiscovery {
     pub fn new(settings: CapacityDiscoveryConfig) -> Self {
+        Self::build(settings, None, SERVICES_CACHE_TTL)
+    }
+
+    /// Discovery that reads Kubernetes through `client` rather than the
+    /// in-cluster client, e.g. a fake API server in tests.
+    pub fn with_kube(settings: CapacityDiscoveryConfig, client: KubeClient) -> Self {
+        Self::build(settings, Some(client), SERVICES_CACHE_TTL)
+    }
+
+    fn build(
+        settings: CapacityDiscoveryConfig,
+        client: Option<KubeClient>,
+        services_ttl: Duration,
+    ) -> Self {
+        let kube = OnceLock::new();
+        if let Some(client) = client {
+            let _ = kube.set(Ok(client));
+        }
         CapacityDiscovery {
             inner: Arc::new(Inner {
                 settings,
                 status: RwLock::new(BTreeMap::new()),
+                kube,
+                services: tokio::sync::Mutex::new(None),
+                services_ttl,
             }),
         }
+    }
+
+    /// The Kubernetes client, or why there is none. Built once.
+    fn kube_client(&self) -> Option<Result<KubeClient, String>> {
+        if self.inner.settings.namespaces.is_empty() {
+            return None;
+        }
+        Some(self.inner.kube.get_or_init(KubeClient::in_cluster).clone())
+    }
+
+    /// Every Service in the allowed namespaces with its ready endpoint
+    /// count, built from EndpointSlices only (the one read the gateway's
+    /// Role allows), and cached for [`SERVICES_CACHE_TTL`].
+    pub async fn list_services(&self) -> ServiceListing {
+        let settings = &self.inner.settings;
+        if !settings.enabled {
+            return ServiceListing::unavailable(
+                "capacity discovery is off on this gateway (OBLETH_CAPACITY_DISCOVERY_ENABLED)",
+            );
+        }
+        let client = match self.kube_client() {
+            None => {
+                return ServiceListing::unavailable(
+                    "no namespaces are configured for the kubernetes source \
+                     (OBLETH_CAPACITY_DISCOVERY_NAMESPACES)",
+                )
+            }
+            Some(Err(e)) => return ServiceListing::unavailable(e),
+            Some(Ok(client)) => client,
+        };
+        let mut cache = self.inner.services.lock().await;
+        if let Some((at, listing)) = cache.as_ref() {
+            if at.elapsed() < self.inner.services_ttl {
+                return listing.clone();
+            }
+        }
+        let lists = stream::iter(settings.namespaces.iter().cloned())
+            .map(|ns| {
+                let client = client.clone();
+                async move {
+                    let result = client.list_service_endpoint_slices(&ns).await;
+                    (ns, result)
+                }
+            })
+            .buffered(LIST_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        let mut services = Vec::new();
+        let mut errors = Vec::new();
+        for (ns, result) in lists {
+            match result {
+                Ok(slices) => {
+                    for (service, ready) in kube::ready_by_service(&slices) {
+                        services.push(ServiceSummary {
+                            service,
+                            namespace: ns.clone(),
+                            ready,
+                        });
+                    }
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        let reason = if !errors.is_empty() && errors.len() == settings.namespaces.len() {
+            Some("no allowed namespace could be listed".to_string())
+        } else if services.is_empty() {
+            Some(format!(
+                "no Services found in {}",
+                settings.namespaces.join(", ")
+            ))
+        } else {
+            None
+        };
+        let listing = ServiceListing {
+            services,
+            reason,
+            errors,
+        };
+        *cache = Some((Instant::now(), listing.clone()));
+        listing
+    }
+
+    /// The Service a model that names none would use: the default template
+    /// rendered for it, in the first allowed namespace that has it, as
+    /// discovery looks it up. `None` when the template is empty, does not
+    /// render to a valid name, or no listed namespace has the Service.
+    pub fn default_match(
+        &self,
+        listing: &ServiceListing,
+        upstream_model: &str,
+        model_name: &str,
+    ) -> (Option<String>, Option<ServiceSummary>) {
+        let name = effective_capacity_service(
+            None,
+            &self.inner.settings.default_service,
+            upstream_model,
+            model_name,
+        )
+        .ok();
+        let found = name.as_ref().and_then(|name| {
+            self.inner.settings.namespaces.iter().find_map(|ns| {
+                listing
+                    .services
+                    .iter()
+                    .find(|s| &s.service == name && &s.namespace == ns)
+                    .cloned()
+            })
+        });
+        (name, found)
     }
 
     /// Discovery off, no namespaces, no default Service.
@@ -211,19 +396,14 @@ impl CapacityDiscovery {
             );
             return None;
         }
-        let kube = if settings.namespaces.is_empty() {
-            None
-        } else {
-            let client = KubeClient::in_cluster();
-            if let Err(e) = &client {
-                tracing::warn!(
-                    error = %e,
-                    "the kubernetes capacity source is unavailable; its models use their \
-                     static max_in_flight"
-                );
-            }
-            Some(client)
-        };
+        let kube = self.kube_client();
+        if let Some(Err(e)) = &kube {
+            tracing::warn!(
+                error = %e,
+                "the kubernetes capacity source is unavailable; its models use their \
+                 static max_in_flight"
+            );
+        }
         tracing::info!(
             interval_secs = settings.interval.as_secs(),
             namespaces = %settings.namespaces.join(","),
@@ -290,10 +470,13 @@ impl DiscoveryTarget {
 /// What one pass found for one model.
 #[derive(Debug, Clone, PartialEq)]
 enum Outcome {
-    /// Serving replicas and a per-replica value: a pool size.
+    /// Serving replicas and their summed concurrency: a pool size.
     Observed {
         ready: usize,
-        per_replica: usize,
+        /// The value every ready replica shares; `None` when they differ.
+        per_replica: Option<usize>,
+        /// The ready replicas' concurrency, summed.
+        capacity: usize,
         per_source: String,
     },
     /// The source answered, but nothing is serving.
@@ -477,6 +660,7 @@ impl Discoverer {
             ready_replicas: None,
             per_replica_max_in_flight: None,
             per_replica_source: None,
+            replica_capacity: None,
             headroom: t.headroom,
             derived_max_in_flight: None,
             effective_max_in_flight: static_cap,
@@ -489,13 +673,15 @@ impl Discoverer {
             Outcome::Observed {
                 ready,
                 per_replica,
+                capacity,
                 per_source,
             } => {
-                let derived = derive(ready, per_replica, t.headroom);
+                let derived = derive(capacity, t.headroom);
                 mem.derived = Some(derived);
                 mem.last_success = Some(now);
                 status.ready_replicas = Some(ready);
-                status.per_replica_max_in_flight = Some(per_replica);
+                status.per_replica_max_in_flight = per_replica;
+                status.replica_capacity = Some(capacity);
                 status.per_replica_source = Some(per_source);
                 status.effective_max_in_flight = derived;
                 status.state = STATE_DISCOVERED.into();
@@ -503,7 +689,7 @@ impl Discoverer {
                     tracing::info!(
                         model = %t.model_name,
                         ready_replicas = ready,
-                        per_replica,
+                        replica_capacity = capacity,
                         from = previous.unwrap_or_default(),
                         to = derived,
                         "discovered capacity changed; resizing the model's pool"
@@ -536,7 +722,7 @@ impl Discoverer {
                     model = %t.model_name,
                     source = %t.source,
                     ready_replicas = status.ready_replicas.unwrap_or_default(),
-                    per_replica = status.per_replica_max_in_flight.unwrap_or_default(),
+                    replica_capacity = status.replica_capacity.unwrap_or_default(),
                     per_replica_source = status.per_replica_source.as_deref().unwrap_or(""),
                     max_in_flight = status.effective_max_in_flight,
                     "capacity discovered"
@@ -620,9 +806,10 @@ async fn lookup_services<'a>(
     }
 }
 
-/// `max(1, ceil(ready x per_replica x headroom))`, bounded.
-fn derive(ready: usize, per_replica: usize, headroom: f64) -> usize {
-    let base = ready.saturating_mul(per_replica) as f64;
+/// `max(1, ceil(capacity x headroom))`, bounded, where `capacity` is the
+/// ready replicas' concurrency summed.
+fn derive(capacity: usize, headroom: f64) -> usize {
+    let base = capacity as f64;
     let scaled = (base * headroom).ceil();
     if !scaled.is_finite() || scaled >= MAX_DERIVED as f64 {
         MAX_DERIVED
@@ -694,8 +881,6 @@ fn endpoints_outcome(t: &DiscoveryTarget) -> Outcome {
             }
         }
     }
-    let total: usize = values.iter().sum();
-    let uniform = values.iter().all(|v| *v == values[0]);
     let per_source = match (from_endpoint, from_model) {
         (true, false) => PER_REPLICA_ENDPOINT,
         (false, true) => PER_REPLICA_CONFIGURED,
@@ -703,14 +888,10 @@ fn endpoints_outcome(t: &DiscoveryTarget) -> Outcome {
     };
     Outcome::Observed {
         ready,
-        // Endpoints that differ are summed; the per-replica figure shown is
-        // then the average, rounded up, so ready x per-replica still reads
-        // right.
-        per_replica: if uniform {
-            values[0]
-        } else {
-            total.div_ceil(ready)
-        },
+        per_replica: values.iter().all(|v| *v == values[0]).then_some(values[0]),
+        // Each ready endpoint at its own value, added up: an average would
+        // round a mix like 8, 2 and 4 up to 3 x 5.
+        capacity: values.iter().fold(0usize, |a, v| a.saturating_add(*v)),
         per_source: per_source.into(),
     }
 }
@@ -749,7 +930,8 @@ fn kubernetes_outcome(
                 } else {
                     Outcome::Observed {
                         ready: count.ready,
-                        per_replica,
+                        per_replica: Some(per_replica),
+                        capacity: count.ready.saturating_mul(per_replica),
                         per_source: PER_REPLICA_CONFIGURED.into(),
                     }
                 };

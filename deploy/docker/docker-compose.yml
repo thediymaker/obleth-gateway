@@ -148,8 +148,10 @@ services:
       OBLETH_GLOBAL_MAX_IN_FLIGHT: "4096"
       OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT: "32"
       OBLETH_FAIRSHARE_HISTORY_SECS: "3600"
-      # Divide fairshare limits across gateway replicas (Redis heartbeats).
-      # A no-op with the single gateway this file runs.
+      # Hold fairshare limits across gateway replicas: cluster-wide slots in
+      # Redis, divided across replicas when Redis is unreachable. No Redis
+      # call on the request path with the single gateway this file runs.
+      OBLETH_FAIRSHARE_SHARED_SLOTS: ${OBLETH_FAIRSHARE_SHARED_SLOTS:-true}
       OBLETH_FAIRSHARE_REPLICA_AWARE: ${OBLETH_FAIRSHARE_REPLICA_AWARE:-true}
       OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS: ${OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS:-5}
       OBLETH_FAIRSHARE_REPLICA_TTL_SECS: ${OBLETH_FAIRSHARE_REPLICA_TTL_SECS:-15}

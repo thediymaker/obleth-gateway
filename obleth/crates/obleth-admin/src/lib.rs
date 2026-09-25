@@ -46,7 +46,9 @@ use obleth_config::{
     ToolLoopSettings, VisionBoonSettings, STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS,
     TOOL_LOOP_MAX_DEADLINE_SECS, TOOL_LOOP_MAX_TURNS,
 };
-use obleth_fairshare::{replica_share, FairShare, FairshareHistory, StaticCapacity, Stats};
+use obleth_fairshare::{
+    replica_share, FairShare, FairshareHistory, PoolKey, SlotMode, StaticCapacity, Stats,
+};
 use obleth_redis::RedisStore;
 use obleth_store::{AuditEntry, Store};
 use obleth_tokenizer::Tokenizer;
@@ -99,9 +101,12 @@ pub struct AdminState {
     pub fairshare_history: Arc<FairshareHistory>,
     /// Configured retention in seconds; `0` means the sampler is off.
     pub fairshare_history_secs: u64,
-    /// Whether fairshare divides its limits across the live replicas
-    /// (`OBLETH_FAIRSHARE_REPLICA_AWARE`). Reported by the live view.
+    /// Whether fairshare divides its limits across the live replicas when
+    /// shared slots are off or unavailable (`OBLETH_FAIRSHARE_REPLICA_AWARE`).
     pub fairshare_replica_aware: bool,
+    /// Whether fairshare limits are cluster-wide slots in Redis
+    /// (`OBLETH_FAIRSHARE_SHARED_SLOTS`). Reported by the live view.
+    pub fairshare_shared_slots: bool,
     pub fairshare_stats: Arc<Stats>,
     pub clickhouse: clickhouse::Client,
     pub admin_token: String,
@@ -216,6 +221,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/overview/summary", get(get_overview_summary))
         .route("/api/v1/fairshare/live", get(get_fairshare_live))
         .route("/api/v1/capacity/discovery", get(get_capacity_discovery))
+        .route("/api/v1/capacity/services", get(get_capacity_services))
         .route("/api/v1/fairshare/history", get(get_fairshare_history))
         .route(
             "/api/v1/fairshare/groups",
@@ -678,15 +684,24 @@ pub struct CapacityView {
     pub max_in_flight: usize,
 }
 
-/// This replica's live counters. `max_in_flight` is its share of the enabled
-/// models' pool sizes, the capacity `in_flight` is measured against.
+/// Live counters of the answering gateway replica.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LiveStats {
+    /// This replica's in-flight requests.
     pub in_flight: usize,
     pub queued: i64,
+    /// The enabled models' pool sizes, summed, as this replica enforces
+    /// them: the configured (cluster-wide) sizes in `shared` and `local`
+    /// mode, this replica's share of each in `split` and `fallback` mode.
     pub max_in_flight: usize,
-    /// Live gateway replicas the configured limits are divided across.
+    /// Live gateway replicas.
     pub replicas: usize,
+    /// How this replica enforces the limits: `local`, `split`, `shared` or
+    /// `fallback`.
+    pub mode: String,
+    /// In-flight requests across every replica, from the shared slots.
+    /// `null` outside `shared` mode.
+    pub cluster_in_flight: Option<usize>,
 }
 
 /// At-a-glance dashboard summary: config counts from Postgres plus usage
@@ -758,11 +773,16 @@ pub struct KeyFairshareView {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ModelPoolView {
     pub model: String,
-    /// Slots this replica enforces: its share of `configured_cap`.
+    /// Slots this replica enforces: `configured_cap` in `shared` and `local`
+    /// mode, its share of it in `split` and `fallback` mode.
     pub cap: usize,
-    /// The pool size as configured, before it is divided across replicas.
+    /// The pool size as configured: the cluster-wide size.
     pub configured_cap: usize,
+    /// This replica's in-flight requests in the pool.
     pub in_flight: usize,
+    /// In-flight requests in the pool across every replica, from the shared
+    /// slots. `null` outside `shared` mode.
+    pub cluster_in_flight: Option<usize>,
     pub queued: usize,
     pub borrowed: usize,
     pub groups: Vec<GroupFairshareView>,
@@ -773,28 +793,41 @@ pub struct ModelPoolView {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FairshareLiveView {
     pub algorithm: String,
-    /// Slots this replica can run: its share of each enabled model's pool
-    /// size, summed, taken from the database rather than from the snapshot,
-    /// so a model that has had no traffic yet still counts. The aggregated
-    /// `weight_share` below is normalized against the sum of the caps of the
-    /// pools that are *present in the snapshot*, so the two can differ until
-    /// every enabled model has been used at least once.
+    /// Slots this replica can run: each enabled model's pool size as this
+    /// replica enforces it (see `mode`), summed, taken from the database
+    /// rather than from the snapshot, so a model that has had no traffic yet
+    /// still counts. The aggregated `weight_share` below is normalized
+    /// against the sum of the caps of the pools that are *present in the
+    /// snapshot*, so the two can differ until every enabled model has been
+    /// used at least once.
     pub max_in_flight: usize,
-    /// The enabled models' pool sizes as configured, summed: the fleet-wide
-    /// intent that `max_in_flight` is this replica's share of.
+    /// The enabled models' pool sizes as configured, summed: the
+    /// cluster-wide capacity.
     pub configured_max_in_flight: usize,
     /// Total in-flight ceiling across all pools as this replica enforces it:
-    /// its share of `OBLETH_GLOBAL_MAX_IN_FLIGHT`.
+    /// `OBLETH_GLOBAL_MAX_IN_FLIGHT` in `shared` and `local` mode, this
+    /// replica's share of it in `split` and `fallback` mode.
     pub hard_ceiling: usize,
     /// `OBLETH_GLOBAL_MAX_IN_FLIGHT` as configured.
     pub configured_hard_ceiling: usize,
     pub default_model_max_in_flight: usize,
-    /// Live gateway replicas the configured limits are divided across. Every
-    /// count in this view (in flight, queued, caps) is this replica's own.
+    /// Live gateway replicas.
     pub replicas: usize,
-    /// Whether limits are divided across replicas at all
-    /// (`OBLETH_FAIRSHARE_REPLICA_AWARE`); when off, `replicas` is 1.
+    /// How this replica enforces the limits: `shared` (cluster-wide slots
+    /// in Redis), `split` (each replica enforces `ceil(configured /
+    /// replicas)`, shared slots off), `fallback` (shared slots on but
+    /// unavailable, so the split applies) or `local` (this replica alone
+    /// enforces the configured values).
+    pub mode: String,
+    /// Whether shared slots are configured (`OBLETH_FAIRSHARE_SHARED_SLOTS`).
+    pub shared_slots: bool,
+    /// Whether the split applies when shared slots are off or unavailable
+    /// (`OBLETH_FAIRSHARE_REPLICA_AWARE`).
     pub replica_aware: bool,
+    /// In-flight requests across every replica, from the shared slots.
+    /// `null` outside `shared` mode. Every other count in this view is the
+    /// answering replica's own.
+    pub cluster_in_flight: Option<usize>,
     pub global_in_flight: usize,
     pub global_queued: i64,
     /// Total occupancy above the apportioned group caps.
@@ -4722,6 +4755,48 @@ pub fn enabled_pool_share_with(
         .sum()
 }
 
+/// How the answering replica enforces the limits right now: its mode, the
+/// live replica count, and what configured limits are divided by in that
+/// mode (1 unless the split applies).
+fn enforcement(state: &AdminState) -> (SlotMode, usize, usize) {
+    use std::sync::atomic::Ordering;
+    let stats = &state.fairshare_stats;
+    let replicas = stats.replicas.load(Ordering::Relaxed).max(1);
+    let mode = stats.mode();
+    let divisor = match mode {
+        SlotMode::Shared | SlotMode::Local => 1,
+        SlotMode::Split => replicas,
+        SlotMode::Fallback if state.fairshare_replica_aware => replicas,
+        SlotMode::Fallback => 1,
+    };
+    (mode, replicas, divisor)
+}
+
+/// Cluster-wide in-flight requests, every pool together and each of `pools`,
+/// read from the shared slots. In `shared` mode only; when Redis does not
+/// answer, the global count this replica last heard stands in and the
+/// per-pool counts are left out.
+async fn cluster_in_flight(
+    state: &AdminState,
+    mode: SlotMode,
+    pools: &[PoolKey],
+) -> Option<(usize, Vec<Option<usize>>)> {
+    use std::sync::atomic::Ordering;
+    if mode != SlotMode::Shared {
+        return None;
+    }
+    match state.fairshare.cluster_in_flight(pools).await {
+        Some((global, per)) => Some((global, per.into_iter().map(Some).collect())),
+        None => Some((
+            state
+                .fairshare_stats
+                .cluster_in_flight
+                .load(Ordering::Relaxed),
+            vec![None; pools.len()],
+        )),
+    }
+}
+
 /// Why the global ceiling would bind before the pools do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CeilingWarning {
@@ -4895,18 +4970,14 @@ async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
     use std::sync::atomic::Ordering;
     // The live counters are the point of this endpoint; a database hiccup
     // should degrade the capacity number, not fail the poll.
-    let replicas = state
-        .fairshare_stats
-        .replicas
-        .load(Ordering::Relaxed)
-        .max(1);
+    let (mode, replicas, divisor) = enforcement(&state);
     let discovered = state.capacity_discovery.effective_caps();
     let capacity = state
         .store
         .list_models()
         .await
         .map(|m| {
-            enabled_pool_share_with(&m, state.default_model_max_in_flight, replicas, &discovered)
+            enabled_pool_share_with(&m, state.default_model_max_in_flight, divisor, &discovered)
         })
         .unwrap_or(0);
     Json(LiveStats {
@@ -4915,9 +4986,11 @@ async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
         max_in_flight: if capacity > 0 {
             capacity
         } else {
-            replica_share(state.capacity.max_in_flight(), replicas)
+            replica_share(state.capacity.max_in_flight(), divisor)
         },
         replicas,
+        mode: mode.as_str().into(),
+        cluster_in_flight: cluster_in_flight(&state, mode, &[]).await.map(|(g, _)| g),
     })
 }
 
@@ -4934,8 +5007,11 @@ pub struct CapacityDiscoveryView {
     /// Service name template for `kubernetes` models that set no
     /// `capacity_service`.
     pub default_service: String,
-    /// Live gateway replicas each pool size is divided across.
+    /// Live gateway replicas.
     pub replicas: usize,
+    /// How the answering replica enforces pool sizes: `shared`, `split`,
+    /// `fallback` or `local` (see `FairshareLiveView::mode`).
+    pub mode: String,
     pub models: Vec<CapacityDiscoveryModelView>,
 }
 
@@ -4947,9 +5023,15 @@ pub struct CapacityDiscoveryModelView {
     pub enabled: bool,
     /// The model's own `max_in_flight`: the fallback.
     pub static_max_in_flight: Option<i64>,
-    /// What this replica enforces: its share of
-    /// `status.effective_max_in_flight`.
-    pub replica_share: usize,
+    /// The pool size the answering replica enforces:
+    /// `status.effective_max_in_flight` in `shared` and `local` mode, its
+    /// share of it in `split` and `fallback` mode.
+    pub enforced_max_in_flight: usize,
+    /// In-flight requests for the model across every replica, from the
+    /// shared slots. `null` outside `shared` mode.
+    pub cluster_in_flight: Option<usize>,
+    /// The answering replica's own in-flight requests for the model.
+    pub in_flight: usize,
     pub status: capacity_discovery::ModelCapacityStatus,
 }
 
@@ -4960,13 +5042,9 @@ pub struct CapacityDiscoveryModelView {
 async fn get_capacity_discovery(
     State(state): State<AdminState>,
 ) -> Result<Json<CapacityDiscoveryView>> {
-    use std::sync::atomic::Ordering;
     let settings = state.capacity_discovery.settings().clone();
-    let replicas = state
-        .fairshare_stats
-        .replicas
-        .load(Ordering::Relaxed)
-        .max(1);
+    let (mode, replicas, divisor) = enforcement(&state);
+    let local_in_flight = state.fairshare.model_load();
     let statuses: std::collections::HashMap<String, capacity_discovery::ModelCapacityStatus> =
         state
             .capacity_discovery
@@ -4974,13 +5052,25 @@ async fn get_capacity_discovery(
             .into_iter()
             .map(|s| (s.model_name.clone(), s))
             .collect();
-    let models = state
+    let discovered: Vec<obleth_config::ModelRoute> = state
         .store
         .list_models()
         .await?
         .into_iter()
         .filter(|m| m.capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE)
-        .map(|m| {
+        .collect();
+    let pool_keys: Vec<PoolKey> = discovered
+        .iter()
+        .map(|m| PoolKey::Model(m.model_name.clone()))
+        .collect();
+    let cluster = cluster_in_flight(&state, mode, &pool_keys)
+        .await
+        .map(|(_, per)| per)
+        .unwrap_or_else(|| vec![None; pool_keys.len()]);
+    let models = discovered
+        .into_iter()
+        .zip(cluster)
+        .map(|(m, cluster_in_flight)| {
             let status = statuses.get(&m.model_name).cloned().unwrap_or_else(|| {
                 // Not evaluated by this replica (yet): say why, with the value
                 // fairshare is using meanwhile.
@@ -5001,6 +5091,7 @@ async fn get_capacity_discovery(
                     ready_replicas: None,
                     per_replica_max_in_flight: None,
                     per_replica_source: None,
+                    replica_capacity: None,
                     headroom: m.capacity_headroom,
                     derived_max_in_flight: None,
                     effective_max_in_flight: m
@@ -5016,10 +5107,12 @@ async fn get_capacity_discovery(
             });
             CapacityDiscoveryModelView {
                 model_id: m.id,
-                model_name: m.model_name,
                 enabled: m.enabled,
                 static_max_in_flight: m.max_in_flight,
-                replica_share: replica_share(status.effective_max_in_flight, replicas),
+                enforced_max_in_flight: replica_share(status.effective_max_in_flight, divisor),
+                cluster_in_flight,
+                in_flight: local_in_flight.get(&m.model_name).copied().unwrap_or(0),
+                model_name: m.model_name,
                 status,
             }
         })
@@ -5030,7 +5123,70 @@ async fn get_capacity_discovery(
         namespaces: settings.namespaces,
         default_service: settings.default_service,
         replicas,
+        mode: mode.as_str().into(),
         models,
+    }))
+}
+
+/// The Services the `kubernetes` capacity source can see, for choosing a
+/// model's Service. Built from EndpointSlices in the allowed namespaces
+/// only, and cached briefly.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CapacityServicesView {
+    /// Every Service with endpoints in the allowed namespaces.
+    pub services: Vec<capacity_discovery::ServiceSummary>,
+    /// Why `services` is empty or incomplete, when it is.
+    pub reason: Option<String>,
+    /// Namespaces that could not be listed, with why.
+    pub errors: Vec<String>,
+    /// With `model`: the Service name that model would use by default
+    /// (`OBLETH_CAPACITY_DEFAULT_SERVICE` rendered for it), whether or not it
+    /// exists. `null` when there is no default.
+    pub default_service: Option<String>,
+    /// With `model`: that default Service, in the first allowed namespace
+    /// that has it, as discovery would find it. `null` when none has it.
+    pub default_match: Option<capacity_discovery::ServiceSummary>,
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct CapacityServicesQuery {
+    /// A model's name or id, to resolve its default Service.
+    pub model: Option<String>,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/capacity/services", tag = "models",
+    params(CapacityServicesQuery),
+    responses((status = 200, body = CapacityServicesView))
+)]
+async fn get_capacity_services(
+    State(state): State<AdminState>,
+    Query(q): Query<CapacityServicesQuery>,
+) -> Result<Json<CapacityServicesView>> {
+    let listing = state.capacity_discovery.list_services().await;
+    let (default_service, default_match) = match q.model.as_deref().filter(|m| !m.is_empty()) {
+        Some(wanted) => {
+            let model = state
+                .store
+                .list_models()
+                .await?
+                .into_iter()
+                .find(|m| m.model_name == wanted || m.id.to_string() == wanted)
+                .ok_or(AdminError::NotFound)?;
+            state.capacity_discovery.default_match(
+                &listing,
+                &model.upstream_model,
+                &model.model_name,
+            )
+        }
+        None => (None, None),
+    };
+    Ok(Json(CapacityServicesView {
+        services: listing.services,
+        reason: listing.reason,
+        errors: listing.errors,
+        default_service,
+        default_match,
     }))
 }
 
@@ -5063,14 +5219,30 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         .collect();
     let models = state.store.list_models().await?;
     let discovered = state.capacity_discovery.effective_caps();
+    let (mode, _, divisor) = enforcement(&state);
     let configured_capacity =
         enabled_pool_share_with(&models, state.default_model_max_in_flight, 1, &discovered);
     let capacity = enabled_pool_share_with(
         &models,
         state.default_model_max_in_flight,
-        snap.replicas,
+        divisor,
         &discovered,
     );
+    let pool_keys: Vec<PoolKey> = snap
+        .pools
+        .iter()
+        .map(|p| {
+            if p.model == obleth_fairshare::UNROUTED_POOL {
+                PoolKey::Unrouted
+            } else {
+                PoolKey::Model(p.model.clone())
+            }
+        })
+        .collect();
+    let (cluster_global, cluster_pools) = match cluster_in_flight(&state, mode, &pool_keys).await {
+        Some((global, per)) => (Some(global), per),
+        None => (None, vec![None; pool_keys.len()]),
+    };
 
     // Pools outlive their model: a renamed, deleted or disabled model keeps an
     // empty pool in the scheduler until restart. Every pool with visible
@@ -5090,7 +5262,8 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
     let mut pools: Vec<ModelPoolView> = snap
         .pools
         .iter()
-        .map(|p| {
+        .zip(cluster_pools)
+        .map(|(p, cluster_pool)| {
             let cap = p.cap;
             let hidden = p
                 .groups
@@ -5105,6 +5278,9 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
                 cap,
                 configured_cap: p.configured_cap,
                 in_flight: p.in_flight.saturating_sub(h_in),
+                // Cluster-wide counts include every replica's health probes,
+                // which are not told apart from traffic there.
+                cluster_in_flight: cluster_pool.or(p.cluster_in_flight),
                 queued: p.queued.saturating_sub(h_q),
                 borrowed: p.borrowed,
                 groups: p
@@ -5190,7 +5366,10 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         configured_hard_ceiling: snap.configured_max_in_flight,
         default_model_max_in_flight: snap.default_model_max_in_flight,
         replicas: snap.replicas,
+        mode: mode.as_str().into(),
+        shared_slots: state.fairshare_shared_slots,
         replica_aware: state.fairshare_replica_aware,
+        cluster_in_flight: cluster_global,
         global_in_flight: snap.global_in_flight.saturating_sub(hidden_in_flight),
         global_queued: snap.global_queued.saturating_sub(hidden_queued) as i64,
         global_borrowed: snap.global_borrowed,
@@ -7431,6 +7610,14 @@ mod tests {
             .await
         }
 
+        /// [`test_admin_app`] with a given capacity discovery handle.
+        pub(super) async fn test_admin_app_with_discovery(
+            discovery: capacity_discovery::CapacityDiscovery,
+        ) -> Option<TestApp> {
+            let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
+            test_admin_app_with(&redis_url, discovery).await
+        }
+
         async fn test_admin_app_with(
             redis_url: &str,
             capacity_discovery: capacity_discovery::CapacityDiscovery,
@@ -7463,6 +7650,7 @@ mod tests {
                 fairshare_history: fairshare_history.clone(),
                 fairshare_history_secs: 3600,
                 fairshare_replica_aware: true,
+                fairshare_shared_slots: false,
                 // Never dialled: no route under test reads ClickHouse.
                 clickhouse: clickhouse::Client::default(),
                 admin_token: TEST_ADMIN_TOKEN.to_string(),
@@ -7522,7 +7710,7 @@ mod tests {
 
     use harness::{
         fixture_model, send, simulate_request, test_admin_app, test_admin_app_discovering,
-        test_admin_app_on, TEST_ADMIN_TOKEN,
+        test_admin_app_on, test_admin_app_with_discovery, TEST_ADMIN_TOKEN,
     };
 
     fn json_request(
@@ -7827,6 +8015,10 @@ mod tests {
             .expect("listed");
         assert_eq!(entry["status"]["state"], "fallback");
         assert_eq!(entry["status"]["effective_max_in_flight"], 32);
+        assert_eq!(view["mode"], "local");
+        assert_eq!(entry["enforced_max_in_flight"], 32);
+        assert_eq!(entry["in_flight"], 0);
+        assert_eq!(entry["cluster_in_flight"], serde_json::Value::Null);
         assert!(entry["status"]["reason"]
             .as_str()
             .unwrap()
@@ -8806,7 +8998,9 @@ mod tests {
 
         assert_eq!(status, StatusCode::OK, "body: {body}");
         assert_eq!(body["replicas"], serde_json::json!(2));
+        assert_eq!(body["mode"], "split");
         assert_eq!(body["replica_aware"], serde_json::json!(true));
+        assert_eq!(body["cluster_in_flight"], serde_json::Value::Null);
         assert_eq!(body["hard_ceiling"], serde_json::json!(32), "ceil(64 / 2)");
         assert_eq!(body["configured_hard_ceiling"], serde_json::json!(64));
         assert!(
@@ -8824,6 +9018,183 @@ mod tests {
         assert_eq!(pool["configured_cap"], serde_json::json!(9));
         assert_eq!(stats_status, StatusCode::OK, "body: {stats}");
         assert_eq!(stats["replicas"], serde_json::json!(2));
+        assert_eq!(stats["mode"], "split");
+    }
+
+    /// The Service picker's listing: Services from the allowed namespaces'
+    /// EndpointSlices, and the model's default Service when it exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capacity_services_lists_services_and_the_models_default() {
+        use axum::routing::get as get_route;
+        let app = axum::Router::new().route(
+            "/apis/discovery.k8s.io/v1/namespaces/:ns/endpointslices",
+            get_route(|Path(ns): Path<String>| async move {
+                let items = if ns == "inference" {
+                    serde_json::json!([
+                        {"metadata": {"labels": {"kubernetes.io/service-name": "svc-picker-a"}},
+                         "endpoints": [
+                            {"addresses": ["10.0.0.1"], "conditions": {"ready": true}, "targetRef": {"uid": "a"}},
+                            {"addresses": ["10.0.0.2"], "conditions": {"ready": true}, "targetRef": {"uid": "b"}},
+                            {"addresses": ["10.0.0.3"], "conditions": {"ready": false}, "targetRef": {"uid": "c"}}
+                         ]},
+                        {"metadata": {"labels": {"kubernetes.io/service-name": "svc-picker-other"}},
+                         "endpoints": null}
+                    ])
+                } else {
+                    serde_json::json!([])
+                };
+                Json(serde_json::json!({"kind": "EndpointSliceList", "metadata": {}, "items": items}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let discovery = capacity_discovery::CapacityDiscovery::with_kube(
+            obleth_config::CapacityDiscoveryConfig {
+                enabled: true,
+                interval: std::time::Duration::from_secs(15),
+                namespaces: vec!["batch".into(), "inference".into()],
+                default_service: "{upstream_model}".into(),
+            },
+            capacity_discovery::KubeClient::with_base(format!("http://{addr}"), None),
+        );
+        let Some(t) = test_admin_app_with_discovery(discovery).await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let model = fixture_model(&t.store, "svc-picker-a", 0.0).await;
+        let get = |path: String| {
+            axum::http::Request::get(path)
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::empty())
+                .expect("build request")
+        };
+        let (status, body) = send(&t.app, get("/api/v1/capacity/services".into())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["services"],
+            serde_json::json!([
+                {"service": "svc-picker-a", "namespace": "inference", "ready": 2},
+                {"service": "svc-picker-other", "namespace": "inference", "ready": 0}
+            ])
+        );
+        assert_eq!(body["reason"], serde_json::Value::Null);
+        assert_eq!(body["default_match"], serde_json::Value::Null);
+
+        let (status, body) = send(
+            &t.app,
+            get(format!(
+                "/api/v1/capacity/services?model={}",
+                model.model_name
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["default_service"], "svc-picker-a");
+        assert_eq!(
+            body["default_match"],
+            serde_json::json!({"service": "svc-picker-a", "namespace": "inference", "ready": 2})
+        );
+        let (status, _) = send(
+            &t.app,
+            get("/api/v1/capacity/services?model=no-such-model".into()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = t.store.delete_model(model.id).await;
+    }
+
+    /// Discovery off: an empty listing that says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn capacity_services_says_why_when_discovery_is_off() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let req = axum::http::Request::get("/api/v1/capacity/services")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (status, body) = send(&t.app, req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["services"], serde_json::json!([]));
+        assert!(body["reason"]
+            .as_str()
+            .unwrap()
+            .contains("OBLETH_CAPACITY_DISCOVERY_ENABLED"));
+    }
+
+    /// With shared slots, the view reports the configured sizes as this
+    /// replica's caps and the cluster-wide occupancy next to its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fairshare_live_reports_cluster_wide_counts_in_shared_mode() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let cluster = obleth_fairshare::InMemoryCluster::new();
+        t.fairshare.enable_shared_slots(
+            Arc::new(cluster.gateway("this")),
+            obleth_fairshare::SharedSlotsConfig::default(),
+        );
+        t.fairshare.set_replicas(3);
+        let stats = t.fairshare.stats();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while stats.mode() != SlotMode::Shared {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("shared mode");
+        // Another gateway holds two of the pool's slots.
+        let other = cluster.gateway("other");
+        for _ in 0..2 {
+            let claim = obleth_fairshare::SlotClaim {
+                pool: PoolKey::Model("shared".into()).slot_id(),
+                tenant: Uuid::new_v4(),
+                key: Uuid::new_v4(),
+                pool_cap: 9,
+                global_cap: 64,
+                tenant_cap: None,
+                key_cap: None,
+            };
+            use obleth_fairshare::SharedSlots;
+            other.acquire(claim).await.expect("claimed");
+        }
+        let admitted = t
+            .fairshare
+            .admit(obleth_fairshare::AdmitRequest::new(Uuid::new_v4(), "shared", 1).model_cap(9))
+            .await
+            .expect("admitted");
+        let get = |path: &str| {
+            axum::http::Request::get(path)
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::empty())
+                .expect("build request")
+        };
+        let (status, body) = send(&t.app, get("/api/v1/fairshare/live")).await;
+        let (_, stats) = send(&t.app, get("/api/v1/stats")).await;
+        drop(admitted);
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["mode"], "shared");
+        assert_eq!(body["replicas"], 3);
+        assert_eq!(body["hard_ceiling"], 64, "the ceiling is not divided");
+        assert_eq!(body["cluster_in_flight"], 3);
+        let pool = body["pools"]
+            .as_array()
+            .expect("pools")
+            .iter()
+            .find(|p| p["model"] == serde_json::json!("shared"))
+            .cloned()
+            .expect("the pool is reported");
+        assert_eq!(pool["cap"], 9, "the whole pool is usable here");
+        assert_eq!(pool["configured_cap"], 9);
+        assert_eq!(pool["in_flight"], 1);
+        assert_eq!(pool["cluster_in_flight"], 3);
+        assert_eq!(stats["mode"], "shared");
+        assert_eq!(stats["cluster_in_flight"], 3);
+        assert_eq!(stats["in_flight"], 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
@@ -9526,6 +9897,7 @@ mod tests {
             cap,
             configured_cap: cap,
             in_flight,
+            cluster_in_flight: None,
             queued: 0,
             borrowed: 0,
             groups: vec![GroupFairshareView {

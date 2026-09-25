@@ -94,6 +94,7 @@ use obleth_config::{
         // fairshare
         crate::get_fairshare_live,
         crate::get_capacity_discovery,
+        crate::get_capacity_services,
         crate::get_fairshare_history,
         crate::list_fairshare_groups,
         crate::create_fairshare_group,
@@ -255,6 +256,8 @@ use obleth_config::{
         CapacityDiscoveryView,
         CapacityDiscoveryModelView,
         crate::capacity_discovery::ModelCapacityStatus,
+        crate::CapacityServicesView,
+        crate::capacity_discovery::ServiceSummary,
         FairshareHistoryView,
         FairshareHistoryPointView,
         FairshareHistoryQuery,

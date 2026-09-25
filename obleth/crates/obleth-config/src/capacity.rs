@@ -2,13 +2,13 @@
 //! (validated when a model is written) and the gateway's discovery loop
 //! (defaults applied when the source is read).
 //!
-//! A discovered model's pool size is `ready serving replicas x per-replica
-//! concurrency x headroom`. The replicas are counted by its capacity source:
+//! A discovered model's pool size is the ready serving replicas' concurrency
+//! summed, times headroom. The replicas are counted by its capacity source:
 //! the model's own enabled, healthy endpoints (`endpoints`), or the ready
 //! endpoints of a Kubernetes Service (`kubernetes`). The per-replica
 //! concurrency is always the operator's: the model's
 //! `per_replica_max_in_flight`, or for the `endpoints` source an endpoint's
-//! own `max_in_flight`. Which pods a Service counts is the Service's own
+//! own `max_in_flight`, which wins for that endpoint. Which pods a Service counts is the Service's own
 //! selector: a multi-node deployment where only some pods take requests points
 //! the Service at those pods.
 

@@ -1,12 +1,13 @@
-//! Replica-aware pool sizing.
+//! Replica counting and the split.
 //!
 //! Admission state is per process, so with N gateway replicas behind one
 //! Service every replica would admit a model's whole `max_in_flight` and the
-//! upstream would see N times the configured concurrency. Each replica instead
-//! enforces its share of every cluster-wide limit: `ceil(configured / live)`,
-//! never below 1. The live count comes from Redis heartbeats (see
-//! `obleth-redis`); this module holds the arithmetic and the fallback rules
-//! for when that count cannot be read.
+//! upstream would see N times the configured concurrency. Shared slots (see
+//! [`crate::shared`]) solve that exactly; when they are off or unavailable,
+//! each replica instead enforces its share of every cluster-wide limit:
+//! `ceil(configured / live)`, never below 1 (the split). The live count comes
+//! from Redis heartbeats (see `obleth-redis`); this module holds the
+//! arithmetic and the rules for when that count cannot be read.
 //!
 //! Rounding up means the fleet can admit slightly more than configured, by
 //! fewer than `live` slots per limit (8 slots over 3 replicas is 3 + 3 + 3).

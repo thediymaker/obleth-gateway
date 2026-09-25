@@ -24,11 +24,10 @@ obleth:
   # Fairshare runs one pool per model (default 32 slots via
   # defaultModelMaxInFlight, or the model's own max_in_flight); globalMaxInFlight
   # is a total ceiling across those pools, not a fairness input. Both are
-  # fleet-wide: each replica enforces ceil(value / live replicas) of them
-  # (fairshareReplicaAware, the default). 256 covers seven concurrently active
-  # models at the default pool size across 3 replicas (86 of the ceiling each,
-  # against 11 per pool); raise it if you register more. Replicas cannot lend
-  # each other idle capacity.
+  # cluster-wide: the replicas draw on one set of slots in Redis
+  # (fairshareSharedSlots, the default), so any replica can use a model's
+  # whole pool. 256 covers eight concurrently active models at the default
+  # pool size; raise it if you register more.
   replicas: 3
   globalMaxInFlight: 256
   adminToken: ""        # REQUIRED

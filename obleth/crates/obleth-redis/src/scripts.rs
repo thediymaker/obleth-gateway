@@ -1,4 +1,5 @@
-//! Atomic token-bucket Lua scripts.
+//! Atomic Lua scripts: token buckets, replica heartbeats and shared fairshare
+//! slots.
 //!
 //! Budget enforcement must be atomic across many gateway pods, so the
 //! check-refill-reserve sequence runs server-side in Redis. Fairness is measured
@@ -309,29 +310,265 @@ redis.call('PERSIST', key)
 return { tokens, cost }
 "#;
 
-/// Register one gateway replica's heartbeat and count the live replicas, in
+// ---------------------------------------------------------------------------
+// Shared fairshare slots
+//
+// Cluster-wide admission slots live in two kinds of hash, both without a TTL
+// so volatile-lru never evicts them:
+//
+// - the totals hash (`obleth:fairshare:slots`): the cluster-wide count per
+//   limit, `g` for every pool together, `p|<pool>` per pool, and
+//   `t|<pool>|<tenant>` and `k|<pool>|<key>` per tenant and key in a pool,
+//   plus wait markers (`w|<pool>`, and `w` for the global ceiling) holding
+//   the Redis time until which some replica is waiting for a slot there;
+// - one holdings hash per replica (`obleth:fairshare:held:<instance>`) with
+//   the same count fields for what that replica holds.
+//
+// Every change to a holdings hash is applied to the totals in the same
+// script, so the totals are always the sum of the holdings. A replica's
+// holdings are reclaimed when its heartbeat expires from the replica set, by
+// whichever live replica heartbeats next. A release only frees what its
+// replica's holdings record, so a release that arrives after a reclaim is a
+// no-op instead of freeing someone else's slot. Counts at zero are deleted.
+//
+// Releases, reconciles and reclaims publish the freed pool's id on the
+// release channel, but only while a wait marker for that pool (or the global
+// ceiling) is current, so an uncontended fleet publishes nothing.
+// ---------------------------------------------------------------------------
+
+/// Lua helpers shared by the slot scripts: the Redis clock in ms, a counter
+/// adjustment that deletes the field at zero, the release wakeup, and the
+/// reclaim of one replica's holdings.
+macro_rules! slot_helpers {
+    () => {
+        r#"
+if redis.replicate_commands then redis.replicate_commands() end
+local function now_ms()
+  local t = redis.call('TIME')
+  return tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+end
+local function adjust(key, field, n)
+  local v = redis.call('HINCRBY', key, field, n)
+  if v <= 0 then redis.call('HDEL', key, field) end
+  return v
+end
+local function wake(totals, pool, channel, now)
+  local w = redis.call('HMGET', totals, 'w|' .. pool, 'w')
+  local wp, wg = tonumber(w[1]) or 0, tonumber(w[2]) or 0
+  if wp > now or wg > now then
+    redis.call('PUBLISH', channel, pool)
+  end
+  if wp ~= 0 and wp <= now then redis.call('HDEL', totals, 'w|' .. pool) end
+  if wg ~= 0 and wg <= now then redis.call('HDEL', totals, 'w') end
+end
+local function reclaim(totals, held, channel, now)
+  local h = redis.call('HGETALL', held)
+  for i = 1, #h, 2 do
+    local n = tonumber(h[i + 1]) or 0
+    if n > 0 then
+      adjust(totals, h[i], -n)
+      if string.sub(h[i], 1, 2) == 'p|' then
+        wake(totals, string.sub(h[i], 3), channel, now)
+      end
+    end
+  end
+  redis.call('DEL', held)
+end
+"#
+    };
+}
+
+/// Register one gateway replica's heartbeat, reclaim the slot holdings of
+/// every replica whose heartbeat has expired, and count the live replicas, in
 /// one round trip.
 ///
 /// KEYS[1] = replica set (sorted set: member = instance id, score = expiry ms)
+/// KEYS[2] = slot totals hash
 /// ARGV[1] = instance id
 /// ARGV[2] = heartbeat TTL in ms
+/// ARGV[3] = holdings hash prefix (the instance id is appended)
+/// ARGV[4] = release channel
 ///
 /// Expiry is scored on the Redis clock (`TIME`), not the caller's, so skew
 /// between pods cannot keep a dead replica counted or drop a live one. Expired
 /// members are pruned on every call, so a crashed replica stops being counted
-/// one TTL after its last heartbeat. The set itself carries no TTL: it is one
-/// member per live replica, and under the chart's volatile-lru policy a TTL
-/// would make it evictable, briefly collapsing every replica's count to 1.
+/// one TTL after its last heartbeat, and its slots return to the fleet at the
+/// same moment. A live replica's holdings are never touched. The set itself
+/// carries no TTL: it is one member per live replica, and under the chart's
+/// volatile-lru policy a TTL would make it evictable, briefly collapsing
+/// every replica's count to 1.
+///
+/// The holdings keys are derived from the member names inside the script,
+/// which a standalone Redis (the only topology the gateway supports) allows.
 ///
 /// Returns the live replica count, this one included.
-pub const REPLICA_HEARTBEAT: &str = r#"
-if redis.replicate_commands then redis.replicate_commands() end
+pub const REPLICA_HEARTBEAT: &str = concat!(
+    slot_helpers!(),
+    r#"
 local key = KEYS[1]
 local ttl = tonumber(ARGV[2])
-local t   = redis.call('TIME')
-local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+local now = now_ms()
 
 redis.call('ZADD', key, now + ttl, ARGV[1])
+local expired = redis.call('ZRANGEBYSCORE', key, '-inf', now)
+for _, instance in ipairs(expired) do
+  reclaim(KEYS[2], ARGV[3] .. instance, ARGV[4], now)
+end
 redis.call('ZREMRANGEBYSCORE', key, '-inf', now)
 return redis.call('ZCARD', key)
-"#;
+"#
+);
+
+/// Deregister a replica on clean shutdown: drop it from the replica set and
+/// free anything its holdings still record (normally nothing, once drained).
+///
+/// KEYS[1] = replica set, KEYS[2] = slot totals hash, KEYS[3] = its holdings
+/// ARGV[1] = instance id, ARGV[2] = release channel
+pub const REPLICA_DEREGISTER: &str = concat!(
+    slot_helpers!(),
+    r#"
+reclaim(KEYS[2], KEYS[3], ARGV[2], now_ms())
+redis.call('ZREM', KEYS[1], ARGV[1])
+return 1
+"#
+);
+
+/// Take one cluster-wide slot, checked against every limit at once.
+///
+/// KEYS[1] = slot totals hash, KEYS[2] = this replica's holdings,
+/// KEYS[3] = replica set
+/// ARGV[1] = instance id, ARGV[2] = pool id, ARGV[3] = tenant, ARGV[4] = key
+/// ARGV[5] = pool cap, ARGV[6] = global cap,
+/// ARGV[7] = tenant cap (0: none), ARGV[8] = key cap (0: none)
+/// ARGV[9] = how long a refusal marks the pool as waited on, in ms
+///
+/// A replica whose heartbeat has expired may not take slots: its holdings
+/// are about to be (or have been) reclaimed. Otherwise, if the pool, the
+/// global count, the tenant and the key are all under their caps, all four
+/// counters are taken together, in the totals and in the holdings; if any is
+/// at its cap nothing is taken and the pool (or, for the global ceiling, the
+/// ceiling) is marked as waited on, so the next release there publishes.
+///
+/// Returns `{code, pool count, global count}`, counts after the call. Codes:
+/// 1 granted, 0 pool full, -1 global ceiling full, -2 tenant cap, -3 key cap,
+/// -4 not live.
+pub const SLOT_ACQUIRE: &str = concat!(
+    slot_helpers!(),
+    r#"
+local totals, held = KEYS[1], KEYS[2]
+local pool = ARGV[2]
+local pf = 'p|' .. pool
+local tf = 't|' .. pool .. '|' .. ARGV[3]
+local kf = 'k|' .. pool .. '|' .. ARGV[4]
+local now = now_ms()
+local c = redis.call('HMGET', totals, 'g', pf, tf, kf)
+local g, p = tonumber(c[1]) or 0, tonumber(c[2]) or 0
+local tn, kn = tonumber(c[3]) or 0, tonumber(c[4]) or 0
+
+local live = tonumber(redis.call('ZSCORE', KEYS[3], ARGV[1]))
+if live == nil or live <= now then
+  return { -4, p, g }
+end
+
+local tcap, kcap = tonumber(ARGV[7]), tonumber(ARGV[8])
+local code = 1
+if p >= tonumber(ARGV[5]) then code = 0
+elseif g >= tonumber(ARGV[6]) then code = -1
+elseif tcap > 0 and tn >= tcap then code = -2
+elseif kcap > 0 and kn >= kcap then code = -3
+end
+if code ~= 1 then
+  local mark = 'w|' .. pool
+  if code == -1 then mark = 'w' end
+  redis.call('HSET', totals, mark, now + tonumber(ARGV[9]))
+  return { code, p, g }
+end
+
+for _, f in ipairs({ 'g', pf, tf, kf }) do
+  redis.call('HINCRBY', totals, f, 1)
+  redis.call('HINCRBY', held, f, 1)
+end
+return { 1, p + 1, g + 1 }
+"#
+);
+
+/// Give back one slot this replica holds.
+///
+/// KEYS[1] = slot totals hash, KEYS[2] = this replica's holdings
+/// ARGV[1] = pool id, ARGV[2] = tenant, ARGV[3] = key, ARGV[4] = release
+/// channel
+///
+/// Each counter is decremented only where this replica's holdings still
+/// record it, so a release after a reclaim or a reconcile that already
+/// dropped the slot frees nothing twice. Publishes the pool id when a slot
+/// was freed and someone is waiting on the pool or the ceiling.
+///
+/// Returns `{freed (0|1), pool count, global count}`.
+pub const SLOT_RELEASE: &str = concat!(
+    slot_helpers!(),
+    r#"
+local totals, held = KEYS[1], KEYS[2]
+local pool = ARGV[1]
+local pf = 'p|' .. pool
+local freed = 0
+for _, f in ipairs({ 'g', pf, 't|' .. pool .. '|' .. ARGV[2], 'k|' .. pool .. '|' .. ARGV[3] }) do
+  if (tonumber(redis.call('HGET', held, f)) or 0) > 0 then
+    adjust(held, f, -1)
+    adjust(totals, f, -1)
+    if f == pf then freed = 1 end
+  end
+end
+if freed == 1 then wake(totals, pool, ARGV[4], now_ms()) end
+local c = redis.call('HMGET', totals, pf, 'g')
+return { freed, tonumber(c[1]) or 0, tonumber(c[2]) or 0 }
+"#
+);
+
+/// Replace everything this replica is recorded as holding.
+///
+/// KEYS[1] = slot totals hash, KEYS[2] = this replica's holdings,
+/// KEYS[3] = replica set
+/// ARGV[1] = instance id, ARGV[2] = release channel,
+/// ARGV[3..] = field, count pairs (the fields of the totals hash)
+///
+/// The old holdings are taken out of the totals and the new ones put in, so
+/// drift from a lost release or a timed-out call is repaired. Refused (and
+/// nothing written) when the replica is not live, like a claim. Publishes
+/// for any pool whose count this lowered while it is waited on.
+///
+/// Returns 1, or -4 when the replica is not live.
+pub const SLOT_RECONCILE: &str = concat!(
+    slot_helpers!(),
+    r#"
+local totals, held = KEYS[1], KEYS[2]
+local now = now_ms()
+local live = tonumber(redis.call('ZSCORE', KEYS[3], ARGV[1]))
+if live == nil or live <= now then
+  return -4
+end
+
+local new = {}
+for i = 3, #ARGV, 2 do
+  local n = tonumber(ARGV[i + 1]) or 0
+  if n > 0 then new[ARGV[i]] = n end
+end
+local old = {}
+local h = redis.call('HGETALL', held)
+for i = 1, #h, 2 do old[h[i]] = tonumber(h[i + 1]) or 0 end
+
+local lowered = {}
+for f, n in pairs(old) do
+  local d = (new[f] or 0) - n
+  if d ~= 0 then adjust(totals, f, d) end
+  if d < 0 and string.sub(f, 1, 2) == 'p|' then table.insert(lowered, string.sub(f, 3)) end
+end
+for f, n in pairs(new) do
+  if old[f] == nil then adjust(totals, f, n) end
+end
+
+redis.call('DEL', held)
+for f, n in pairs(new) do redis.call('HSET', held, f, n) end
+for _, pool in ipairs(lowered) do wake(totals, pool, ARGV[2], now) end
+return 1
+"#
+);
