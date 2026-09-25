@@ -94,12 +94,12 @@ describe("upstream headers round-trip through the model form", () => {
     const updateModel = await connectionUpdate(
       model({ upstream_header_names: ["x-upstream-token"] }),
       connectionForm({
-        upstream_headers: "x-upstream-token:\nrouting-strategy: prefix-cache",
+        upstream_headers: "x-upstream-token:\nx-routing-hint: sticky",
       }),
     );
     expect(updateModel.mock.calls[0][1].upstream_headers).toEqual({
       "x-upstream-token": null,
-      "routing-strategy": "prefix-cache",
+      "x-routing-hint": "sticky",
     });
   });
 

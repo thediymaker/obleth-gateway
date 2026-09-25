@@ -3643,18 +3643,15 @@ mod tests {
         // Names fold to lowercase; `null` keeps the stored value; the rest is replaced.
         let write: UpstreamHeadersWrite = [
             ("X-Token".to_string(), None),
-            (
-                "Routing-Strategy".to_string(),
-                Some(" prefix-cache ".into()),
-            ),
+            ("X-Routing-Hint".to_string(), Some(" sticky ".into())),
         ]
         .into();
         let merged = merge_upstream_headers(&stored, &write).unwrap();
         assert_eq!(merged["x-token"], "old");
-        assert_eq!(merged["routing-strategy"], "prefix-cache");
+        assert_eq!(merged["x-routing-hint"], "sticky");
         assert_eq!(
             upstream_header_names(&merged),
-            vec!["routing-strategy".to_string(), "x-token".to_string()]
+            vec!["x-routing-hint".to_string(), "x-token".to_string()]
         );
         assert!(
             merge_upstream_headers(&stored, &UpstreamHeadersWrite::new())

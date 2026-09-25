@@ -3,8 +3,8 @@ import { parseUpstreamHeaders, upstreamHeadersText } from "./upstream-headers";
 
 describe("parseUpstreamHeaders", () => {
   it("reads one `Name: value` per line and skips blank lines", () => {
-    expect(parseUpstreamHeaders("routing-strategy: prefix-cache\n\nX-Team:  ops \n")).toEqual({
-      "routing-strategy": "prefix-cache",
+    expect(parseUpstreamHeaders("x-routing-hint: sticky\n\nX-Team:  ops \n")).toEqual({
+      "x-routing-hint": "sticky",
       "X-Team": "ops",
     });
   });
@@ -16,9 +16,9 @@ describe("parseUpstreamHeaders", () => {
   });
 
   it("sends a name without a value as null, meaning keep the stored value", () => {
-    expect(parseUpstreamHeaders("x-upstream-token:\nrouting-strategy")).toEqual({
+    expect(parseUpstreamHeaders("x-upstream-token:\nx-routing-hint")).toEqual({
       "x-upstream-token": null,
-      "routing-strategy": null,
+      "x-routing-hint": null,
     });
   });
 
@@ -29,10 +29,10 @@ describe("parseUpstreamHeaders", () => {
 
 describe("upstreamHeadersText", () => {
   it("lists stored names with blank values, which round-trip as keep", () => {
-    const text = upstreamHeadersText(["routing-strategy", "x-upstream-token"]);
-    expect(text).toBe("routing-strategy:\nx-upstream-token:");
+    const text = upstreamHeadersText(["x-routing-hint", "x-upstream-token"]);
+    expect(text).toBe("x-routing-hint:\nx-upstream-token:");
     expect(parseUpstreamHeaders(text)).toEqual({
-      "routing-strategy": null,
+      "x-routing-hint": null,
       "x-upstream-token": null,
     });
     expect(upstreamHeadersText(undefined)).toBe("");

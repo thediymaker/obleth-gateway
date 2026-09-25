@@ -825,8 +825,9 @@ pub struct CreateModel {
     pub api_base: String,
     pub api_key: Option<String>,
     /// Extra headers sent on every request to this model's upstream, after the
-    /// client's forwarded headers so these win (e.g. an AIBrix
-    /// `routing-strategy`). Names are case-insensitive. Hop-by-hop headers,
+    /// client's forwarded headers so these win (e.g. a routing hint an
+    /// inference gateway reads, or a tenant or organization header a provider
+    /// requires). Names are case-insensitive. Hop-by-hop headers,
     /// `authorization` (use `api_key`), `host`, `content-length`,
     /// `content-type`, and `accept-encoding` are refused. Values are
     /// write-only: responses list only `upstream_header_names`.
@@ -9257,7 +9258,7 @@ mod tests {
     fn model_route_view_lists_upstream_header_names_but_never_values() {
         let mut route = fixture_model_route("m");
         route.upstream_headers = [
-            ("routing-strategy".to_string(), "prefix-cache".to_string()),
+            ("x-routing-hint".to_string(), "sticky".to_string()),
             (
                 "x-upstream-token".to_string(),
                 "tok-upstream-secret".to_string(),
@@ -9267,25 +9268,25 @@ mod tests {
         let v = serde_json::to_value(ModelRouteView::from(route)).unwrap();
         assert_eq!(
             v["upstream_header_names"],
-            serde_json::json!(["routing-strategy", "x-upstream-token"])
+            serde_json::json!(["x-routing-hint", "x-upstream-token"])
         );
         assert!(
             v.get("upstream_headers").is_none(),
             "view leaked values: {v}"
         );
         assert!(!v.to_string().contains("tok-upstream-secret"));
-        assert!(!v.to_string().contains("prefix-cache"));
+        assert!(!v.to_string().contains("sticky"));
     }
 
     #[test]
     fn model_writes_take_upstream_headers_with_null_meaning_keep() {
         let create: CreateModel = serde_json::from_value(serde_json::json!({
             "model_name": "m", "upstream_model": "m", "api_base": "",
-            "upstream_headers": {"Routing-Strategy": "prefix-cache"}
+            "upstream_headers": {"X-Routing-Hint": "sticky"}
         }))
         .unwrap();
         let write = create.upstream_headers.unwrap();
-        assert_eq!(write["Routing-Strategy"].as_deref(), Some("prefix-cache"));
+        assert_eq!(write["X-Routing-Hint"].as_deref(), Some("sticky"));
 
         let update: UpdateModel = serde_json::from_value(serde_json::json!({
             "upstream_model": "m", "api_base": "",
@@ -9305,10 +9306,10 @@ mod tests {
     #[test]
     fn upstream_header_map_holds_the_validated_headers() {
         let headers: obleth_config::UpstreamHeaders =
-            [("routing-strategy".to_string(), "prefix-cache".to_string())].into();
+            [("x-routing-hint".to_string(), "sticky".to_string())].into();
         let map = upstream_header_map(&headers);
         assert_eq!(map.len(), 1);
-        assert_eq!(map["routing-strategy"], "prefix-cache");
+        assert_eq!(map["x-routing-hint"], "sticky");
     }
 
     #[test]

@@ -20,7 +20,7 @@
 #   upstream_headers          (optional) Map of extra headers sent on every
 #                                        upstream request, e.g.
 #                                          upstream_headers:
-#                                            routing-strategy: prefix-cache
+#                                            x-routing-hint: sticky
 #                                        Replaces the stored set when present; a
 #                                        null value keeps that header's stored
 #                                        value. Export lists only the names
@@ -161,14 +161,16 @@ models:
 
   # ---- Example 7: video generation (/v1/videos) ----
   # The OpenAI Videos API is job-based: POST /v1/videos returns a job id,
-  # and clients poll GET /v1/videos/{id}, then fetch the mp4 from
-  # GET /v1/videos/{id}/content (409 while it renders). The create takes JSON
-  # or multipart/form-data (a reference frame as `input_reference`).
+  # and clients poll GET /v1/videos/{id}, then fetch the video from
+  # GET /v1/videos/{id}/content; the upstream's status is passed through
+  # unchanged (for example a not-ready answer while it renders). The create
+  # takes JSON or multipart/form-data (a reference frame; OpenAI's field is
+  # `input_reference`), forwarded untouched.
   # cost_per_video is charged once per created job; polls and downloads are
   # free. No generation probe is sent: health is the catalog check only.
-  - model_name: wan-2-2
+  - model_name: my-video-model
     description: Text- and image-to-video generation
-    upstream_model: wan-2-2
+    upstream_model: my-video-model
     api_base: http://video.internal:8000/v1
     model_type: video
     cost_per_video: 0.50

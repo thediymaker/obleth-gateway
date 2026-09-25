@@ -1515,7 +1515,7 @@ mod tests {
             // A routing header decides which backend the probe reaches.
             |m: &mut ModelRoute| {
                 m.upstream_headers
-                    .insert("routing-strategy".into(), "prefix-cache".into());
+                    .insert("x-routing-hint".into(), "sticky".into());
             },
         ] {
             let mut after = before.clone();
@@ -1765,7 +1765,7 @@ mod tests {
     fn image_models_still_have_no_inference_probe() {
         // A generation costs accelerator time per sweep; the catalog stays the
         // default signal (see `classify_catalog_failure`).
-        assert!(build_probe_request("http://up/v1", "image", "flux").is_none());
+        assert!(build_probe_request("http://up/v1", "image", "image-model").is_none());
     }
 
     #[test]

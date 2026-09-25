@@ -5,7 +5,7 @@
 //! ```text
 //! POST   /v1/videos               prompt [+ reference image] -> job id
 //! GET    /v1/videos/{id}          status + progress
-//! GET    /v1/videos/{id}/content  the finished mp4 (409 while rendering)
+//! GET    /v1/videos/{id}/content  the finished video
 //! DELETE /v1/videos/{id}          drop the job and its file
 //! GET    /v1/videos               list jobs
 //! ```
@@ -22,7 +22,9 @@
 //! model the usual way. [`handle_follow_up`] reads the record instead: it
 //! routes the call back to the model and base that created the job, answers
 //! "not found" for an id this tenant does not own, and passes the upstream
-//! answer through untouched, streaming the mp4 rather than buffering it.
+//! answer through untouched (its status included, for example a not-ready
+//! answer while the video renders), streaming the file rather than buffering
+//! it.
 //! Follow-ups are authenticated and tenant-checked but take no fairshare slot,
 //! reserve no budget, and are not billed or written to the usage ledger: they
 //! are reads of work already paid for.
@@ -136,15 +138,45 @@ pub(crate) fn is_create(method: &Method, path: &str) -> bool {
     method == Method::POST && path == VIDEOS_PATH
 }
 
-/// A job id this gateway will look up and forward. Backends mint ids like
-/// `video_<hex>`; anything outside a conservative alphabet is refused rather
-/// than spliced into an upstream URL.
+/// A job id this gateway will look up and forward. Ids are the upstream's to
+/// mint (for example OpenAI's `video_<hex>`), so nothing is assumed beyond
+/// URL safety: 1 to 256 printable, non-whitespace ASCII characters, none of
+/// the ones that would change how a URL is split or decoded (`/`, `\`, `?`,
+/// `#`, `%`), and not a dot segment. The id is percent-encoded as a single
+/// path segment when it is forwarded (see [`follow_up_path`]).
 fn valid_job_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
+    (1..=256).contains(&id.len())
+        && id != "."
+        && id != ".."
         && id
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            .all(|b| b.is_ascii_graphic() && !matches!(b, b'/' | b'\\' | b'?' | b'#' | b'%'))
+}
+
+/// `s` percent-encoded as one URL path segment: everything but RFC 3986's
+/// unreserved characters is escaped, so no id can add a segment or a query.
+fn encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// The upstream path of a follow-up: the Videos API path, rebuilt with the
+/// job id encoded as a single segment rather than copied from the client.
+fn follow_up_path(call: FollowUp<'_>) -> String {
+    match call {
+        FollowUp::List => VIDEOS_PATH.to_string(),
+        FollowUp::Retrieve(id) | FollowUp::Delete(id) => {
+            format!("{VIDEOS_PATH}/{}", encode_path_segment(id))
+        }
+        FollowUp::Content(id) => format!("{VIDEOS_PATH}/{}/content", encode_path_segment(id)),
+    }
 }
 
 /// The not-found answer for an id that is unknown, malformed, or owned by
@@ -256,8 +288,6 @@ async fn job_target(
 /// The parts of the client's request a follow-up forwards.
 pub(crate) struct Inbound<'a> {
     pub(crate) method: &'a Method,
-    /// Forwarded as-is: the upstream serves the same Videos API paths.
-    pub(crate) path: &'a str,
     /// Empty, or `?` and the query string.
     pub(crate) query: &'a str,
     pub(crate) headers: &'a HeaderMap,
@@ -300,7 +330,7 @@ pub(crate) async fn handle_follow_up(
         Err((status, message)) => return error_json(status, message),
     };
 
-    let url = build_upstream_url(&target.base, inbound.path, inbound.query);
+    let url = build_upstream_url(&target.base, &follow_up_path(call), inbound.query);
     let send = state
         .http
         .request(inbound.method.clone(), &url)
@@ -658,14 +688,79 @@ mod tests {
     }
 
     #[test]
-    fn job_ids_are_limited_to_a_url_safe_alphabet() {
-        assert!(valid_job_id("video_0123abcdef"));
-        assert!(valid_job_id("video-9"));
-        assert!(!valid_job_id(""));
-        assert!(!valid_job_id("video?x=1"));
-        assert!(!valid_job_id("video%2F.."));
-        assert!(!valid_job_id("a.b"));
-        assert!(!valid_job_id(&"a".repeat(129)));
+    fn job_ids_are_anything_url_safe() {
+        for ok in [
+            "video_0123abcdef",
+            "video-9",
+            "3f2b8c1e-5d4a-4e6f-9a7b-0c1d2e3f4a5b",
+            "job.2026.09.24",
+            "job:abc:1",
+            "a.b",
+            "~tilde",
+            "...",
+        ] {
+            assert!(valid_job_id(ok), "{ok}");
+        }
+        assert!(valid_job_id(&"a".repeat(256)));
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "../etc",
+            "a\\b",
+            "video?x=1",
+            "video#frag",
+            "video%2F..",
+            "has space",
+            "tab\tid",
+            "caf\u{e9}",
+        ] {
+            assert!(!valid_job_id(bad), "{bad:?}");
+        }
+        assert!(!valid_job_id(&"a".repeat(257)));
+    }
+
+    #[test]
+    fn a_job_id_is_forwarded_as_one_encoded_segment() {
+        fn decode(s: &str) -> String {
+            let bytes = s.as_bytes();
+            let mut out = Vec::new();
+            let mut i = 0;
+            while i < bytes.len() {
+                if bytes[i] == b'%' {
+                    out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
+                }
+            }
+            String::from_utf8(out).unwrap()
+        }
+        for id in [
+            "video_0123",
+            "job:abc:1",
+            "a.b~c_d-e",
+            "x+y=z&w",
+            "(paren)[br]{cu}!*'@$,;",
+            "...",
+        ] {
+            assert!(valid_job_id(id), "{id}");
+            let enc = encode_path_segment(id);
+            assert!(
+                !enc.contains('/') && !enc.contains('?') && !enc.contains('#'),
+                "{enc}"
+            );
+            assert_eq!(decode(&enc), id, "round trip of {id}");
+        }
+        assert_eq!(encode_path_segment("job:abc"), "job%3Aabc");
+        assert_eq!(
+            follow_up_path(FollowUp::Content("job:1")),
+            "/v1/videos/job%3A1/content"
+        );
+        assert_eq!(follow_up_path(FollowUp::Retrieve("v_1")), "/v1/videos/v_1");
+        assert_eq!(follow_up_path(FollowUp::Delete("a.b")), "/v1/videos/a.b");
     }
 
     #[test]
@@ -683,7 +778,7 @@ mod tests {
         route.api_key = Some("model-key".into());
         route
             .upstream_headers
-            .insert("x-route".into(), "wan".into());
+            .insert("x-route".into(), "video".into());
         route.endpoints = vec![
             obleth_config::ResolvedEndpoint {
                 id: "a".into(),
@@ -709,7 +804,7 @@ mod tests {
         let b = affinity_target(&route, "http://b/v1").expect("configured endpoint");
         assert_eq!(b.base, "http://b/v1");
         assert_eq!(b.api_key.as_deref(), Some("b-key"));
-        assert_eq!(b.headers.get("x-route").unwrap(), "wan");
+        assert_eq!(b.headers.get("x-route").unwrap(), "video");
         let a = affinity_target(&route, "http://a/v1").expect("configured endpoint");
         assert_eq!(
             a.api_key.as_deref(),
@@ -1043,14 +1138,14 @@ mod pipeline_tests {
     fn video_route(name: &str, base: &str) -> ResolvedModel {
         let mut route = crate::boons::test_support::test_route();
         route.model_name = name.into();
-        route.upstream_model = "wan-upstream".into();
+        route.upstream_model = "video-upstream".into();
         route.api_base = base.into();
         route.api_key = Some("up-key".into());
         route.model_type = "video".into();
         route.cost_per_video = COST;
         route
             .upstream_headers
-            .insert("x-route".into(), "wan".into());
+            .insert("x-route".into(), "video".into());
         route
     }
 
@@ -1162,11 +1257,11 @@ mod pipeline_tests {
     async fn a_json_create_is_routed_recorded_and_billed_once() {
         let Some(gw) = gateway().await else { return };
         let (backend, base) = spawn_backend("a").await;
-        gw.register(video_route("wan-2-2", &base)).await;
+        gw.register(video_route("video-model", &base)).await;
         let (secret, key) = gw.tenant(None).await;
         let rows_before = gw.ledger_rows();
 
-        let resp = gw.create_json(&secret, "wan-2-2", "a red fox").await;
+        let resp = gw.create_json(&secret, "video-model", "a red fox").await;
         assert_eq!(resp.status(), StatusCode::CREATED);
         let job = json_of(resp).await;
         let id = job["id"].as_str().expect("job id").to_string();
@@ -1174,10 +1269,10 @@ mod pipeline_tests {
 
         // The backend saw the upstream model name, the model's key and header.
         let seen = backend.creates.lock().unwrap()[0].clone();
-        assert_eq!(seen.model, "wan-upstream");
+        assert_eq!(seen.model, "video-upstream");
         assert_eq!(seen.prompt, "a red fox");
         assert_eq!(seen.authorization.as_deref(), Some("Bearer up-key"));
-        assert_eq!(seen.route_header.as_deref(), Some("wan"));
+        assert_eq!(seen.route_header.as_deref(), Some("video"));
 
         // Recorded against the tenant, the key and the base that took it.
         let rec = gw
@@ -1186,7 +1281,7 @@ mod pipeline_tests {
             .await
             .unwrap()
             .expect("recorded");
-        assert_eq!(rec.model_name, "wan-2-2");
+        assert_eq!(rec.model_name, "video-model");
         assert_eq!(rec.key_id, key.key_id);
         assert_eq!(rec.upstream_base, base);
 
@@ -1208,7 +1303,7 @@ mod pipeline_tests {
     async fn a_multipart_create_resolves_the_model_from_the_form() {
         let Some(gw) = gateway().await else { return };
         let (backend, base) = spawn_backend("m").await;
-        gw.register(video_route("wan-2-2", &base)).await;
+        gw.register(video_route("video-model", &base)).await;
         let (secret, key) = gw.tenant(None).await;
 
         let resp = gw
@@ -1217,14 +1312,14 @@ mod pipeline_tests {
                 "/v1/videos",
                 &secret,
                 Some(&multipart_type()),
-                multipart_create("wan-2-2", "the camera pushes forward"),
+                multipart_create("video-model", "the camera pushes forward"),
             )
             .await;
         assert_eq!(resp.status(), StatusCode::CREATED);
         let id = json_of(resp).await["id"].as_str().unwrap().to_string();
 
         let seen = backend.creates.lock().unwrap()[0].clone();
-        assert_eq!(seen.model, "wan-upstream", "the form's model is swapped");
+        assert_eq!(seen.model, "video-upstream", "the form's model is swapped");
         assert_eq!(seen.prompt, "the camera pushes forward");
         assert_eq!(
             seen.file_name.as_deref(),
@@ -1245,10 +1340,10 @@ mod pipeline_tests {
         let Some(gw) = gateway().await else { return };
         let (backend, base) = spawn_backend("f").await;
         backend.reject_creates.store(true, Ordering::SeqCst);
-        gw.register(video_route("wan-2-2", &base)).await;
+        gw.register(video_route("video-model", &base)).await;
         let (secret, key) = gw.tenant(None).await;
 
-        let resp = gw.create_json(&secret, "wan-2-2", "a red fox").await;
+        let resp = gw.create_json(&secret, "video-model", "a red fox").await;
         assert_eq!(
             resp.status(),
             StatusCode::BAD_REQUEST,
@@ -1267,7 +1362,7 @@ mod pipeline_tests {
     async fn an_unregistered_or_missing_model_is_refused_before_dispatch() {
         let Some(gw) = gateway().await else { return };
         let (backend, base) = spawn_backend("u").await;
-        gw.register(video_route("wan-2-2", &base)).await;
+        gw.register(video_route("video-model", &base)).await;
         let (secret, _) = gw.tenant(None).await;
 
         let resp = gw.create_json(&secret, "no-such-model", "x").await;
@@ -1289,11 +1384,11 @@ mod pipeline_tests {
     async fn another_tenants_job_and_an_unknown_id_are_both_not_found() {
         let Some(gw) = gateway().await else { return };
         let (backend, base) = spawn_backend("x").await;
-        gw.register(video_route("wan-2-2", &base)).await;
+        gw.register(video_route("video-model", &base)).await;
         let (owner, owner_key) = gw.tenant(None).await;
         let (intruder, intruder_key) = gw.tenant(None).await;
 
-        let id = json_of(gw.create_json(&owner, "wan-2-2", "a fox").await).await["id"]
+        let id = json_of(gw.create_json(&owner, "video-model", "a fox").await).await["id"]
             .as_str()
             .unwrap()
             .to_string();
@@ -1340,12 +1435,12 @@ mod pipeline_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn the_download_is_409_while_rendering_then_streams_with_its_headers() {
+    async fn the_download_passes_a_not_ready_status_through_then_streams_with_its_headers() {
         let Some(gw) = gateway().await else { return };
         let (backend, base) = spawn_backend("c").await;
-        gw.register(video_route("wan-2-2", &base)).await;
+        gw.register(video_route("video-model", &base)).await;
         let (secret, key) = gw.tenant(None).await;
-        let id = json_of(gw.create_json(&secret, "wan-2-2", "a fox").await).await["id"]
+        let id = json_of(gw.create_json(&secret, "video-model", "a fox").await).await["id"]
             .as_str()
             .unwrap()
             .to_string();
@@ -1398,9 +1493,9 @@ mod pipeline_tests {
     async fn delete_removes_the_job_and_its_record() {
         let Some(gw) = gateway().await else { return };
         let (backend, base) = spawn_backend("d").await;
-        gw.register(video_route("wan-2-2", &base)).await;
+        gw.register(video_route("video-model", &base)).await;
         let (secret, key) = gw.tenant(None).await;
-        let id = json_of(gw.create_json(&secret, "wan-2-2", "a fox").await).await["id"]
+        let id = json_of(gw.create_json(&secret, "video-model", "a fox").await).await["id"]
             .as_str()
             .unwrap()
             .to_string();
@@ -1438,17 +1533,17 @@ mod pipeline_tests {
     async fn the_list_holds_only_the_callers_jobs() {
         let Some(gw) = gateway().await else { return };
         let (backend, base) = spawn_backend("l").await;
-        gw.register(video_route("wan-2-2", &base)).await;
+        gw.register(video_route("video-model", &base)).await;
         let (alice, _) = gw.tenant(None).await;
         let (bob, _) = gw.tenant(None).await;
         let (carol, _) = gw.tenant(None).await;
 
         let mut mine = Vec::new();
         for prompt in ["one", "two"] {
-            let job = json_of(gw.create_json(&alice, "wan-2-2", prompt).await).await;
+            let job = json_of(gw.create_json(&alice, "video-model", prompt).await).await;
             mine.push(job["id"].as_str().unwrap().to_string());
         }
-        let theirs = json_of(gw.create_json(&bob, "wan-2-2", "three").await).await["id"]
+        let theirs = json_of(gw.create_json(&bob, "video-model", "three").await).await["id"]
             .as_str()
             .unwrap()
             .to_string();
@@ -1487,14 +1582,14 @@ mod pipeline_tests {
             healthy: true,
             max_in_flight: None,
         };
-        let mut route = video_route("wan-2-2", "");
+        let mut route = video_route("video-model", "");
         route.endpoints = vec![
             endpoint("p", &first_base, 0),
             endpoint("s", &second_base, 1),
         ];
         gw.register(route.clone()).await;
         let (secret, _) = gw.tenant(None).await;
-        let id = json_of(gw.create_json(&secret, "wan-2-2", "a fox").await).await["id"]
+        let id = json_of(gw.create_json(&secret, "video-model", "a fox").await).await["id"]
             .as_str()
             .unwrap()
             .to_string();
@@ -1517,7 +1612,7 @@ mod pipeline_tests {
     async fn guardrails_scan_the_prompt_of_a_json_or_multipart_create() {
         let Some(gw) = gateway().await else { return };
         let (backend, base) = spawn_backend("g").await;
-        gw.register(video_route("wan-2-2", &base)).await;
+        gw.register(video_route("video-model", &base)).await;
         let policy = obleth_config::GuardrailsPolicy {
             action: obleth_config::GuardrailsAction::Block,
             input_scanners: vec!["ban_keywords".into()],
@@ -1528,7 +1623,9 @@ mod pipeline_tests {
         };
         let (secret, key) = gw.tenant(Some(policy)).await;
 
-        let resp = gw.create_json(&secret, "wan-2-2", "a forbidden fox").await;
+        let resp = gw
+            .create_json(&secret, "video-model", "a forbidden fox")
+            .await;
         assert!(resp.status().is_client_error(), "{}", resp.status());
         let resp = gw
             .send(
@@ -1536,7 +1633,7 @@ mod pipeline_tests {
                 "/v1/videos",
                 &secret,
                 Some(&multipart_type()),
-                multipart_create("wan-2-2", "a forbidden fox"),
+                multipart_create("video-model", "a forbidden fox"),
             )
             .await;
         assert!(resp.status().is_client_error(), "{}", resp.status());
@@ -1544,7 +1641,7 @@ mod pipeline_tests {
         assert_eq!(gw.spent(&key).await, 0.0);
 
         // A clean prompt goes through under the same policy.
-        let resp = gw.create_json(&secret, "wan-2-2", "a red fox").await;
+        let resp = gw.create_json(&secret, "video-model", "a red fox").await;
         assert_eq!(resp.status(), StatusCode::CREATED);
     }
 }

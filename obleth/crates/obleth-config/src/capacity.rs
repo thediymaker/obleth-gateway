@@ -456,7 +456,7 @@ mod tests {
             "app.example.com/name=qwen3-32b",
             "app==vllm",
             "app!=sidecar",
-            "app=vllm,tier in (gpu, hpu),!canary",
+            "app=vllm,tier in (gpu, accel),!canary",
             "environment notin (dev)",
             "ray.io/node-type!=worker",
             "gpu",

@@ -4024,7 +4024,7 @@ mod tests {
         let mut fixtures = FixtureGuard::new(&store);
 
         let headers: obleth_config::UpstreamHeaders = [
-            ("routing-strategy".to_string(), "prefix-cache".to_string()),
+            ("x-routing-hint".to_string(), "sticky".to_string()),
             ("x-upstream-token".to_string(), "tok".to_string()),
         ]
         .into();

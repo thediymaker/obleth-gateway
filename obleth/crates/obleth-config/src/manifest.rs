@@ -1422,7 +1422,7 @@ mod tests {
 
     #[test]
     fn a_video_model_imports_with_its_flat_price() {
-        let mut e = entry("wan-2-2");
+        let mut e = entry("video-model");
         e.model_type = Some("video".into());
         e.cost_per_video = Some(0.5);
 
@@ -1431,11 +1431,11 @@ mod tests {
         assert_eq!(r.config.model_type, "video");
         assert_eq!(r.config.cost_per_video, 0.5);
 
-        let existing = route("wan-2-2");
+        let existing = route("video-model");
         let r = resolve_model(&e, Some(&existing), &[]).unwrap();
         assert!(r.changed_fields.contains(&"cost_per_video".to_string()));
 
-        let mut e = entry("wan-2-2");
+        let mut e = entry("video-model");
         e.cost_per_video = Some(-0.5);
         let err = resolve_model(&e, Some(&existing), &[]).unwrap_err();
         assert!(err.message.contains("cost_per_video"), "{}", err.message);
@@ -1570,7 +1570,7 @@ mod tests {
     fn upstream_headers_export_as_names_and_import_as_a_write() {
         let mut existing = route("m");
         existing.upstream_headers = [
-            ("routing-strategy".to_string(), "prefix-cache".to_string()),
+            ("x-routing-hint".to_string(), "sticky".to_string()),
             ("x-upstream-token".to_string(), "secret".to_string()),
         ]
         .into();
@@ -1579,7 +1579,7 @@ mod tests {
         assert!(exported.upstream_headers.is_none(), "values never leave");
         assert_eq!(
             exported.upstream_header_names,
-            Some(vec!["routing-strategy".into(), "x-upstream-token".into()])
+            Some(vec!["x-routing-hint".into(), "x-upstream-token".into()])
         );
         // Re-importing the export changes nothing: the names are export-only.
         let r = resolve_model(&exported, Some(&existing), &[]).unwrap();
@@ -1591,17 +1591,14 @@ mod tests {
         e.upstream_headers = Some(
             [
                 ("X-Upstream-Token".to_string(), None),
-                ("routing-strategy".to_string(), Some("least-request".into())),
+                ("x-routing-hint".to_string(), Some("least-busy".into())),
             ]
             .into(),
         );
         let r = resolve_model(&e, Some(&existing), &[]).unwrap();
         assert_eq!(r.changed_fields, vec!["upstream_headers"]);
         assert_eq!(r.config.upstream_headers["x-upstream-token"], "secret");
-        assert_eq!(
-            r.config.upstream_headers["routing-strategy"],
-            "least-request"
-        );
+        assert_eq!(r.config.upstream_headers["x-routing-hint"], "least-busy");
 
         let mut e = entry("m");
         e.upstream_headers = Some([("Authorization".to_string(), Some("Bearer x".into()))].into());

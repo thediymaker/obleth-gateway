@@ -141,7 +141,13 @@ mod tests {
         let key = Uuid::new_v4();
         let job = format!("video_{}", Uuid::new_v4().simple());
         store
-            .insert_video_job(&job, "wan-2-2", owner, key, "http://wan:8000/v1")
+            .insert_video_job(
+                &job,
+                "video-model",
+                owner,
+                key,
+                "http://video-upstream:8000/v1",
+            )
             .await
             .expect("insert");
 
@@ -150,9 +156,9 @@ mod tests {
             .await
             .expect("get")
             .expect("the owner sees its job");
-        assert_eq!(found.model_name, "wan-2-2");
+        assert_eq!(found.model_name, "video-model");
         assert_eq!(found.key_id, key);
-        assert_eq!(found.upstream_base, "http://wan:8000/v1");
+        assert_eq!(found.upstream_base, "http://video-upstream:8000/v1");
         assert!(
             store
                 .get_video_job(&job, other)
@@ -201,7 +207,13 @@ mod tests {
 
         // Delete by the owner.
         store
-            .insert_video_job(&job, "wan-2-2", owner, key, "http://wan:8000/v1")
+            .insert_video_job(
+                &job,
+                "video-model",
+                owner,
+                key,
+                "http://video-upstream:8000/v1",
+            )
             .await
             .expect("insert");
         assert!(store.delete_video_job(&job, owner).await.expect("delete"));

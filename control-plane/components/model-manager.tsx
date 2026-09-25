@@ -207,7 +207,7 @@ const QUANTIZATION_HINT =
   "Reported on /v1/models and /model/info. Keep it out of the API model name: a name like `glm-5-3-fp8` has to change when the deployment is re-quantized, and every client pinned to it breaks.";
 
 const UPSTREAM_HEADERS_HINT =
-  "One `Name: value` per line, sent on every request to this model's upstream and overriding a client header of the same name (e.g. an AIBrix routing-strategy). Values are write-only: saved headers show by name, and a name left without a value keeps its stored value. Delete a line to remove that header. Authorization, Host, Content-Length, Content-Type, and hop-by-hop headers cannot be set; use the API key for upstream auth.";
+  "One `Name: value` per line, sent on every request to this model's upstream and overriding a client header of the same name (e.g. a routing hint an inference gateway reads, or a tenant or organization header a provider requires). Values are write-only: saved headers show by name, and a name left without a value keeps its stored value. Delete a line to remove that header. Authorization, Host, Content-Length, Content-Type, and hop-by-hop headers cannot be set; use the API key for upstream auth.";
 
 const ALIASES_HINT =
   "One name per line. Extra names that resolve to this same route — register the old spelling here when you clean up an API model name, and pinned clients keep working. Only the API model name itself is advertised by /v1/models.";
@@ -3368,7 +3368,7 @@ function UpstreamHeadersField({
         name="upstream_headers"
         rows={3}
         defaultValue={defaultValue}
-        placeholder={"routing-strategy: prefix-cache"}
+        placeholder={"x-routing-hint: sticky"}
         autoCapitalize="none"
         autoCorrect="off"
         spellCheck={false}

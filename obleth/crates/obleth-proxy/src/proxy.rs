@@ -956,7 +956,6 @@ async fn proxy_handler_inner(
     if let Some(call) = crate::videos::follow_up(&method, &path) {
         let inbound = crate::videos::Inbound {
             method: &method,
-            path: &path,
             query: &query,
             headers: &headers,
         };
@@ -5808,8 +5807,8 @@ mod tests {
                 &["coding"],
             ),
             candidate(
-                "flux-2-dev",
-                "black-forest-labs/flux-2-dev",
+                "image-model",
+                "vendor/image-model",
                 "image",
                 "bf16",
                 &[],
@@ -5822,9 +5821,9 @@ mod tests {
         let data = list["data"].as_array().unwrap();
         let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
         // Sorted, enabled routes only, and never a backend id.
-        assert_eq!(ids, vec!["flux-2-dev", "glm-5-3"]);
+        assert_eq!(ids, vec!["glm-5-3", "image-model"]);
 
-        let glm = &data[1];
+        let glm = &data[0];
         assert_eq!(glm["object"], "model");
         assert_eq!(glm["owned_by"], "obleth");
         assert_eq!(glm["quantization"], "mxfp4");
@@ -5833,8 +5832,8 @@ mod tests {
         // it can see where it went instead of finding it simply gone.
         assert_eq!(glm["aliases"], serde_json::json!(["glm-5-3-fp8"]));
         // Both the obleth vocabulary and the LiteLLM-convention alias.
-        assert_eq!(data[0]["model_type"], "image");
-        assert_eq!(data[0]["mode"], "image_generation");
+        assert_eq!(data[1]["model_type"], "image");
+        assert_eq!(data[1]["mode"], "image_generation");
         assert_eq!(glm["mode"], "chat");
         assert!(!list.to_string().contains("glm-5-3-mxfp4"));
     }
@@ -5868,8 +5867,8 @@ mod tests {
                 &[],
             ),
             candidate(
-                "flux-2-dev",
-                "black-forest-labs/flux-2-dev",
+                "image-model",
+                "vendor/image-model",
                 "image",
                 "bf16",
                 &[],
@@ -5895,7 +5894,7 @@ mod tests {
         );
         // Visibility is decided on the canonical name an alias resolves to.
         assert!(model_visible(Some(&allowed), "glm-5-3"));
-        assert!(!model_visible(Some(&allowed), "flux-2-dev"));
+        assert!(!model_visible(Some(&allowed), "image-model"));
         assert!(!model_visible(Some(&[]), "glm-5-3"));
     }
 
@@ -6155,14 +6154,14 @@ mod tests {
             endpoint("b", "http://b", 20, 100, true, true),
         ]);
         model.upstream_headers = [
-            ("routing-strategy".to_string(), "prefix-cache".to_string()),
+            ("x-routing-hint".to_string(), "sticky".to_string()),
             ("x-team".to_string(), "ops".to_string()),
         ]
         .into();
         let targets = build_targets(Some(&model), "http://global/v1", "failover", "");
         assert_eq!(targets.len(), 2);
         for t in &targets {
-            assert_eq!(t.headers["routing-strategy"], "prefix-cache");
+            assert_eq!(t.headers["x-routing-hint"], "sticky");
         }
         // The legacy single-upstream fallback carries them too.
         model.endpoints.clear();
@@ -7163,7 +7162,7 @@ mod tests {
     fn image_edit_form() -> (String, Bytes) {
         let boundary = "XBOUNDARYX".to_string();
         let body = format!(
-            "--{b}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nflux\r\n\
+            "--{b}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nimage-model\r\n\
              --{b}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nadd a hat\r\n\
              --{b}\r\nContent-Disposition: form-data; name=\"n\"\r\n\r\n3\r\n\
              --{b}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"cat.png\"\r\n\
@@ -7184,11 +7183,11 @@ mod tests {
         // The file is not text the scanners or the estimate should read.
         assert_eq!(
             view,
-            serde_json::json!({"model": "flux", "prompt": "add a hat", "n": "3"})
+            serde_json::json!({"model": "image-model", "prompt": "add a hat", "n": "3"})
         );
 
         // Priced per image from the form's `n`, like a JSON generation.
-        let mut route = minimal_model("flux");
+        let mut route = minimal_model("image-model");
         route.model_type = "image".into();
         route.cost_per_image = 0.04;
         assert!((compute_modality_cost(Some(&route), &view) - 0.12).abs() < 1e-9);
@@ -7204,7 +7203,7 @@ mod tests {
             input_guardrails_unscannable, mode_for_model_type, model_info_entry,
             output_guardrails_unenforceable,
         };
-        let mut route = minimal_model("wan-2-2");
+        let mut route = minimal_model("video-model");
         route.model_type = "video".into();
         route.cost_per_video = 0.3;
         // One flat price per created job, whatever the body asks for.
