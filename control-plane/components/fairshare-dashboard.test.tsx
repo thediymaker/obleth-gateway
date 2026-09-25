@@ -7,7 +7,8 @@ import {
   buildHistoryChart,
   FairshareDashboard,
   fetchHistory,
-  replicaNote,
+  limitsNote,
+  slotModeBadge,
   replicaShare,
   thinHistory,
   type FairshareLiveView,
@@ -137,24 +138,56 @@ describe("fairshare operations", () => {
     expect(host.textContent).not.toContain("hard limits");
   });
 
-  it("says the numbers are this replica's share when several replicas are live", async () => {
-    mocks.view = { ...mocks.view!, replicas: 3, replica_aware: true, configured_max_in_flight: 48 };
+  it("shows cluster-wide numbers with shared slots, and this gateway's next to them", async () => {
+    mocks.view = {
+      ...mocks.view!,
+      replicas: 3,
+      mode: "shared",
+      shared_slots: true,
+      replica_aware: true,
+      configured_max_in_flight: 20,
+      max_in_flight: 20,
+      global_in_flight: 5,
+      cluster_in_flight: 12,
+      pools: [{ model: "llama", cap: 20, configured_cap: 20, in_flight: 5, cluster_in_flight: 12, queued: 0, borrowed: 0, groups: [], tenants: [], keys: [] }],
+    };
+    mocks.view.model_in_flight = { llama: 5 };
+    mocks.routes = [{ model_name: "llama", max_in_flight: 20 }];
+    await render();
+    expect(host.textContent).toContain("In flight 12 of 20 (cluster-wide, 3 gateways) · this gateway 5");
+    expect(host.querySelector('[data-testid="slot-mode"]')!.textContent).toBe("Shared slots · 3 gateways");
+    expect(host.textContent).not.toContain("This replica's share");
+    expect(host.textContent).not.toContain("ceil(configured");
+    await tab("Allocation");
+    expect(host.textContent).toContain("12 active cluster-wide / 20 cap");
+    expect(host.textContent).toContain("5 on this gateway");
+    expect(host.textContent).not.toContain("configured");
+  });
+
+  it("flags fallback mode and measures against the split while in it", async () => {
+    mocks.view = { ...mocks.view!, replicas: 3, mode: "fallback", shared_slots: true, replica_aware: true, configured_max_in_flight: 48 };
     mocks.view.model_in_flight = { llama: 2 };
     mocks.routes = [{ model_name: "llama", max_in_flight: 8 }];
     await render();
-    expect(host.textContent).toContain("3 live gateway replicas");
+    const badge = host.querySelector('[data-testid="slot-mode"]')!;
+    expect(badge.textContent).toBe("Fallback · split");
+    expect(badge.className).toContain("amber");
+    expect(host.textContent).toContain("Fallback: shared slots are unavailable");
     expect(host.textContent).toContain("ceil(configured / 3)");
-    expect(host.textContent).toContain("of 48 configured pool slots");
     await tab("Allocation");
     expect(host.textContent).toContain("2 active / 3 cap");
     expect(host.textContent).toContain("of 8 configured");
   });
 
-  it("says when replica-aware sizing is off or there is one replica", () => {
+  it("describes every mode in one line", () => {
     const base = mocks.view!;
-    expect(replicaNote({ ...base, replica_aware: false, replicas: 1 })).toContain("full configured limits");
-    expect(replicaNote({ ...base, replica_aware: true, replicas: 1 })).toContain("configured size");
-    expect(replicaNote(base)).toBe("");
+    expect(limitsNote({ ...base, mode: "split", replicas: 2 })).toContain("Shared slots are off");
+    expect(limitsNote({ ...base, mode: "local", replicas: 1 })).toContain("configured size");
+    expect(limitsNote({ ...base, mode: "local", replicas: 2 })).toContain("full configured limits");
+    expect(limitsNote({ ...base, mode: "fallback", replica_aware: false, replicas: 2 })).toContain("full configured limits");
+    expect(limitsNote(base)).toBe("");
+    expect(slotModeBadge({ ...base, mode: "local", replicas: 1 })).toBe("");
+    expect(slotModeBadge({ ...base, mode: "split", replicas: 4 })).toBe("Split across 4 gateways");
   });
 
   it("computes a replica's share the way the gateway does", () => {

@@ -572,7 +572,11 @@ function summarizeOverviewStatus(
 }
 
 function summarizeCapacity(view?: FairshareLiveView, stats?: LiveStats): CapacitySummary {
-  const inFlight = view?.global_in_flight ?? stats?.in_flight ?? 0;
+  // With shared slots the fleet's in-flight count is known, and every
+  // gateway can use the whole configured capacity: show the cluster-wide
+  // figures. Otherwise the answering gateway's own, against what it enforces.
+  const cluster = view?.mode === "shared" ? view.cluster_in_flight : stats?.mode === "shared" ? stats.cluster_in_flight : null;
+  const inFlight = cluster ?? view?.global_in_flight ?? stats?.in_flight ?? 0;
   const queued = view?.global_queued ?? stats?.queued ?? 0;
   const max = view?.max_in_flight ?? stats?.max_in_flight ?? 0;
   const utilization = max > 0 ? (inFlight / max) * 100 : 0;

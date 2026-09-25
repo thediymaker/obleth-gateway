@@ -530,13 +530,25 @@ function LiveConsoleHeader({
               {label}
             </Badge>
             <Badge className="capitalize">{view?.algorithm ?? "loading"} admission</Badge>
+            {view && slotModeBadge(view) && (
+              <Badge
+                data-testid="slot-mode"
+                className={cn(view.mode === "fallback" && "border-amber-500/35 bg-amber-500/10 text-amber-300")}
+              >
+                {slotModeBadge(view)}
+              </Badge>
+            )}
             <Badge className="gap-1.5">
               <span className="h-1.5 w-1.5 rounded-full bg-[hsl(160_14%_58%)]" />
               poll {FAIRSHARE_POLL_MS / 1000}s
             </Badge>
           </div>
           <p className="mt-2 text-xs text-muted-foreground">{detail}</p>
-          {view && <p className="mt-1 text-xs text-muted-foreground">{replicaNote(view)}</p>}
+          {view && limitsNote(view) && (
+            <p className={cn("mt-1 text-xs", view.mode === "fallback" ? "text-amber-300" : "text-muted-foreground")}>
+              {limitsNote(view)}
+            </p>
+          )}
           {isError && <p role="alert" className="mt-2 text-xs text-amber-400">{view ? `Showing the last snapshot from ${new Date(dataUpdatedAt).toLocaleTimeString()}. Refresh failed; retrying automatically.` : "Could not load scheduler state. Retrying automatically."}</p>}
         </div>
         <div className="flex flex-wrap items-center gap-2">
@@ -931,46 +943,98 @@ function GroupNumber({
   );
 }
 
-/** This replica's share of a fleet-wide limit, as the gateway computes it. */
+/** A gateway's share of a cluster-wide limit in split mode, as the gateway computes it. */
 export function replicaShare(configured: number, replicas: number): number {
   return Math.max(Math.ceil(configured / Math.max(replicas, 1)), 1);
 }
 
-/** One line saying whether the numbers on the page are per-replica shares. */
-export function replicaNote(view: FairshareLiveView): string {
-  if (view.replica_aware === undefined) return "";
-  if (!view.replica_aware) {
-    return "Replica-aware sizing is off (OBLETH_FAIRSHARE_REPLICA_AWARE): every gateway replica enforces the full configured limits.";
-  }
+/** What the answering gateway divides the configured limits by in its current mode. */
+export function limitDivisor(view: FairshareLiveView): number {
   const n = Math.max(view.replicas ?? 1, 1);
-  if (n === 1) return "1 live gateway replica: pools, caps and the ceiling are enforced at their configured size.";
-  const configured = view.configured_max_in_flight;
-  return `${formatNumber(n)} live gateway replicas: pool sizes, tenant and key caps and the ceiling shown here are this replica's share, ceil(configured / ${formatNumber(n)})${configured ? `, of ${formatNumber(configured)} configured pool slots` : ""}. Counts are this replica's own.`;
+  switch (view.mode) {
+    case "split":
+      return n;
+    case "fallback":
+      return view.replica_aware === false ? 1 : n;
+    case "shared":
+    case "local":
+      return 1;
+    default:
+      return view.replica_aware ? n : 1;
+  }
+}
+
+/** Short label for the header badge; empty for a single gateway. */
+export function slotModeBadge(view: FairshareLiveView): string {
+  const n = Math.max(view.replicas ?? 1, 1);
+  switch (view.mode) {
+    case "shared":
+      return `Shared slots · ${formatNumber(n)} gateways`;
+    case "fallback":
+      return view.replica_aware === false ? "Fallback · per gateway" : "Fallback · split";
+    case "split":
+      return `Split across ${formatNumber(n)} gateways`;
+    default:
+      return "";
+  }
+}
+
+/** One line saying whose numbers the page shows and how the limits hold across gateways. */
+export function limitsNote(view: FairshareLiveView): string {
+  const n = Math.max(view.replicas ?? 1, 1);
+  const here = `this gateway ${formatNumber(view.global_in_flight)}`;
+  switch (view.mode) {
+    case "shared": {
+      const configured = view.configured_max_in_flight ?? view.max_in_flight;
+      const cluster = view.cluster_in_flight == null ? "—" : formatNumber(view.cluster_in_flight);
+      return `In flight ${cluster} of ${formatNumber(configured)} (cluster-wide, ${formatNumber(n)} gateways) · ${here}. Any gateway can use a model's whole pool; pool sizes, tenant and key caps and the ceiling hold across all of them. Queues and fairness below are this gateway's.`;
+    }
+    case "fallback":
+      return view.replica_aware === false
+        ? `Fallback: shared slots are unavailable, so each of ${formatNumber(n)} gateways enforces the full configured limits until Redis answers again. Counts are this gateway's own.`
+        : `Fallback: shared slots are unavailable, so each of ${formatNumber(n)} gateways enforces ceil(configured / ${formatNumber(n)}) of every limit until Redis answers again. Counts are this gateway's own.`;
+    case "split":
+      return `Shared slots are off: each of ${formatNumber(n)} live gateways enforces ceil(configured / ${formatNumber(n)}) of every limit. Counts are this gateway's own.`;
+    case "local":
+      return n > 1
+        ? `Shared slots and replica-aware sizing are off: each of ${formatNumber(n)} gateways enforces the full configured limits. Counts are this gateway's own.`
+        : "1 live gateway: pools, caps and the ceiling are enforced at their configured size.";
+    default:
+      return "";
+  }
 }
 
 function ModelSlotPressure({ view, routes }: { view?: FairshareLiveView; routes: ModelRoute[] }) {
-  const replicas = Math.max(view?.replicas ?? 1, 1);
+  const divisor = view ? limitDivisor(view) : 1;
+  const shared = view?.mode === "shared";
   const rows = useMemo(() => {
     const inFlight = view?.model_in_flight ?? {};
     const queued = view?.model_queued ?? {};
+    const cluster = new Map(
+      (view?.pools ?? []).filter((p) => p.cluster_in_flight != null).map((p) => [p.model, p.cluster_in_flight as number]),
+    );
     const capByName = new Map(routes.map((r) => [r.model_name, r.max_in_flight ?? null]));
     const names = new Set<string>([...Object.keys(inFlight), ...Object.keys(queued)]);
+    if (shared) for (const [name, n] of cluster) if (n > 0) names.add(name);
     return [...names]
       .map((name) => {
         const configured = capByName.get(name) ?? null;
+        const here = inFlight[name] ?? 0;
         return {
           name,
-          inFlight: inFlight[name] ?? 0,
+          // Shared slots: measure the cluster-wide count against the whole
+          // pool. Otherwise counts are this gateway's, against what it enforces.
+          inFlight: shared ? (cluster.get(name) ?? here) : here,
+          here,
           queued: queued[name] ?? 0,
-          // In-flight counts are this replica's, so measure them against its share.
-          cap: configured === null ? null : replicaShare(configured, replicas),
+          cap: configured === null ? null : replicaShare(configured, divisor),
           configured,
           capKnown: capByName.has(name),
         };
       })
       .filter((r) => r.inFlight > 0 || r.queued > 0)
       .sort((a, b) => b.queued - a.queued || b.inFlight - a.inFlight);
-  }, [view, routes, replicas]);
+  }, [view, routes, divisor, shared]);
 
   return (
     <Card className="rounded-md">
@@ -999,8 +1063,9 @@ function ModelSlotPressure({ view, routes }: { view?: FairshareLiveView; routes:
                     {r.capKnown && r.cap !== null && <div className="h-full bg-[hsl(205_55%_52%)] transition-all duration-500" style={{ width: `${inflightPct}%` }} />}
                   </div>
                   <span className="tabular-nums text-muted-foreground sm:text-right">
-                    {formatNumber(r.inFlight)} active / {!r.capKnown ? "cap unavailable" : r.cap == null ? "no model cap" : `${formatNumber(r.cap)} cap`}
-                    {replicas > 1 && r.configured !== null && <span className="block">of {formatNumber(r.configured)} configured</span>}
+                    {formatNumber(r.inFlight)} active{shared ? " cluster-wide" : ""} / {!r.capKnown ? "cap unavailable" : r.cap == null ? "no model cap" : `${formatNumber(r.cap)} cap`}
+                    {shared && <span className="block">{formatNumber(r.here)} on this gateway</span>}
+                    {divisor > 1 && r.configured !== null && <span className="block">of {formatNumber(r.configured)} configured</span>}
                     <span className={cn("block", r.queued > 0 && "text-amber-400")}>{formatNumber(r.queued)} queued</span>
                   </span>
                 </div>

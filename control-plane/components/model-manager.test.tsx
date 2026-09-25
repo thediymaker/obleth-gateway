@@ -6,6 +6,7 @@ import { setModelCapacityDiscoveryAction, setModelCapacityModeAction } from "@/a
 import {
   CapacityDiscoveryPanel,
   CapacityDiscoveryStatus,
+  capacityInFlight,
   CapacityModeToggle,
   ChatCapabilityFields,
 } from "./model-manager";
@@ -178,13 +179,16 @@ describe("the discovered capacity mode", () => {
     namespaces: ["inference"],
     default_service: "{upstream_model}",
     replicas: 2,
+    mode: "shared",
     models: [
       {
         model_id: "u",
         model_name: "m",
         enabled: true,
         static_max_in_flight: 6,
-        replica_share: 8,
+        enforced_max_in_flight: 16,
+        cluster_in_flight: 11,
+        in_flight: 4,
         status: {
           model_name: "m",
           source: "kubernetes",
@@ -256,7 +260,28 @@ describe("the discovered capacity mode", () => {
     expect(text).toContain("Service up in inference");
     expect(text).toContain("8 (configured)");
     expect(text).toContain("16");
-    expect(text).toContain("of 2 gateways");
+    expect(host.querySelector('[data-testid="capacity-in-flight"]')!.textContent).toBe(
+      "11 of 16 (cluster-wide, 2 gateways)this gateway 4",
+    );
+    expect(text).not.toContain("replica's share");
+  });
+
+  it("labels the split and the fallback as this gateway's own limit", () => {
+    const entry = { enforced_max_in_flight: 8, cluster_in_flight: null, in_flight: 3 };
+    expect(capacityInFlight(entry, 16, "split", 2)).toEqual({
+      value: "3 of 8",
+      note: "this gateway's share, split across 2 gateways",
+      fallback: false,
+    });
+    const fallback = capacityInFlight(entry, 16, "fallback", 2);
+    expect(fallback.value).toBe("3 of 8");
+    expect(fallback.fallback).toBe(true);
+    expect(fallback.note).toContain("shared slots unavailable");
+    expect(capacityInFlight({ ...entry, enforced_max_in_flight: 16 }, 16, "local", 1)).toEqual({
+      value: "3 of 16",
+      note: null,
+      fallback: false,
+    });
   });
 
   it("marks per-replica concurrency required for the kubernetes source, with a hint", async () => {
@@ -301,7 +326,8 @@ describe("the discovered capacity mode", () => {
             ready_replicas: 0,
             reason: "Service up in inference has no ready endpoint (1 listed); keeping the last discovered value",
           }}
-          replicaShare={8}
+          entry={{ enforced_max_in_flight: 16, cluster_in_flight: null, in_flight: 0 }}
+          mode="local"
           replicas={1}
         />,
       );

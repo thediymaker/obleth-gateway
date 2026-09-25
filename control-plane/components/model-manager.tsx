@@ -92,7 +92,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { AutotuneReport, AutotuneWorkload, CacheStats, CapacityDiscoveryView, KnowledgeCollection, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelImportReport, ModelKnowledgeCollections, ModelReplica, ModelRoute } from "@/lib/obleth";
+import type { AutotuneReport, AutotuneWorkload, CacheStats, CapacityDiscoveryModelView, CapacityDiscoveryView, FairshareSlotMode, KnowledgeCollection, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelImportReport, ModelKnowledgeCollections, ModelReplica, ModelRoute } from "@/lib/obleth";
 import type { BoonBlockers } from "@/lib/boon-availability";
 import { providerForModel } from "@/lib/model-providers";
 import { normalizeModelApiNameDraft, normalizeModelApiNameFinal } from "@/lib/model-name";
@@ -1859,7 +1859,8 @@ export function CapacityDiscoveryPanel({ model }: { model: ModelRoute }) {
       </EditForm>
       <CapacityDiscoveryStatus
         status={status}
-        replicaShare={entry?.replica_share}
+        entry={entry}
+        mode={view?.mode}
         replicas={view?.replicas}
         enabled={view?.enabled}
       />
@@ -1867,20 +1868,58 @@ export function CapacityDiscoveryPanel({ model }: { model: ModelRoute }) {
   );
 }
 
+/**
+ * The model's live occupancy against its pool: cluster-wide with shared
+ * slots, otherwise the answering gateway's own count against what it
+ * enforces, with a note when that is a split share or a fallback.
+ */
+export function capacityInFlight(
+  entry: Pick<CapacityDiscoveryModelView, "enforced_max_in_flight" | "cluster_in_flight" | "in_flight"> | undefined,
+  effective: number,
+  mode: FairshareSlotMode | undefined,
+  replicas: number | undefined,
+): { value: string; note: string | null; fallback: boolean } {
+  if (!entry) return { value: "—", note: null, fallback: false };
+  const n = Math.max(replicas ?? 1, 1);
+  if (mode === "shared") {
+    const cluster = entry.cluster_in_flight == null ? "—" : String(entry.cluster_in_flight);
+    return {
+      value: `${cluster} of ${effective} (cluster-wide, ${n} gateways)`,
+      note: `this gateway ${entry.in_flight}`,
+      fallback: false,
+    };
+  }
+  const value = `${entry.in_flight} of ${entry.enforced_max_in_flight}`;
+  if (mode === "fallback") {
+    return {
+      value,
+      note: `fallback: shared slots unavailable, this gateway's own limit (${n} gateways)`,
+      fallback: true,
+    };
+  }
+  if (mode === "split" || (mode === undefined && n > 1 && entry.enforced_max_in_flight < effective)) {
+    return { value, note: `this gateway's share, split across ${n} gateways`, fallback: false };
+  }
+  return { value, note: null, fallback: false };
+}
+
 export function CapacityDiscoveryStatus({
   status,
-  replicaShare,
+  entry,
+  mode,
   replicas,
   enabled,
 }: {
   status?: CapacityDiscoveryView["models"][number]["status"];
-  replicaShare?: number;
+  entry?: Pick<CapacityDiscoveryModelView, "enforced_max_in_flight" | "cluster_in_flight" | "in_flight">;
+  mode?: FairshareSlotMode;
   replicas?: number;
   enabled?: boolean;
 }) {
   if (!status) {
     return <p className="text-xs text-muted-foreground">Waiting for the gateway&apos;s discovery state…</p>;
   }
+  const inFlight = capacityInFlight(entry, status.effective_max_in_flight, mode, replicas);
   const perReplica =
     status.per_replica_max_in_flight == null
       ? "—"
@@ -1907,10 +1946,14 @@ export function CapacityDiscoveryStatus({
         <div><dt className="text-muted-foreground">Derived (cluster-wide)</dt><dd className="tabular-nums">{status.derived_max_in_flight ?? "—"}</dd></div>
         <div><dt className="text-muted-foreground">In force (cluster-wide)</dt><dd className="tabular-nums">{status.effective_max_in_flight}</dd></div>
         <div>
-          <dt className="text-muted-foreground">This replica&apos;s share</dt>
-          <dd className="tabular-nums">
-            {replicaShare ?? "—"}
-            {replicas && replicas > 1 ? ` of ${replicas} gateways` : ""}
+          <dt className="text-muted-foreground">In flight</dt>
+          <dd className="tabular-nums" data-testid="capacity-in-flight">
+            {inFlight.value}
+            {inFlight.note && (
+              <span className={cn("block", inFlight.fallback ? "text-amber-300" : "text-muted-foreground")}>
+                {inFlight.note}
+              </span>
+            )}
           </dd>
         </div>
         <div><dt className="text-muted-foreground">Last refresh</dt><dd>{status.last_refresh ? formatTime(status.last_refresh) : "—"}</dd></div>
