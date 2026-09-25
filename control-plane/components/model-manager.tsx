@@ -92,7 +92,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { AutotuneReport, AutotuneWorkload, CacheStats, CapacityDiscoveryModelView, CapacityDiscoveryView, FairshareSlotMode, KnowledgeCollection, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelImportReport, ModelKnowledgeCollections, ModelReplica, ModelRoute } from "@/lib/obleth";
+import type { AutotuneReport, AutotuneWorkload, CacheStats, CapacityDiscoveryModelView, CapacityDiscoveryView, CapacityServiceSummary, CapacityServicesView, FairshareSlotMode, KnowledgeCollection, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelImportReport, ModelKnowledgeCollections, ModelReplica, ModelRoute } from "@/lib/obleth";
 import type { BoonBlockers } from "@/lib/boon-availability";
 import { providerForModel } from "@/lib/model-providers";
 import { normalizeModelApiNameDraft, normalizeModelApiNameFinal } from "@/lib/model-name";
@@ -1759,6 +1759,150 @@ export function CapacityModeToggle({ id, mode }: { id: string; mode: string }) {
   );
 }
 
+/** The live derivation in one line: ready × per replica (× headroom) = limit. */
+export function discoveryEquation(status?: CapacityDiscoveryView["models"][number]["status"]): string | null {
+  if (!status) return null;
+  const ready = status.ready_replicas ?? "—";
+  const per = status.per_replica_max_in_flight ?? "—";
+  const headroom = status.headroom !== 1 ? ` × ${status.headroom}` : "";
+  return `${ready} ready × ${per} per replica${headroom} = ${status.effective_max_in_flight}`;
+}
+
+function serviceLine(s: CapacityServiceSummary): string {
+  return `${s.service} · ${s.namespace} · ${s.ready} ready`;
+}
+
+/**
+ * Chooses the Service whose ready endpoints are the model's replicas, from
+ * the Services the gateway can see. Shows the model's default Service as a
+ * confirmed line when one matches, otherwise (or on "Change") a searchable
+ * list. Choosing one sets the Service and its namespace together; "Use
+ * default" clears both. The choice rides the surrounding form as hidden
+ * `capacity_service` / `capacity_namespace` fields.
+ */
+export function CapacityServicePicker({
+  model,
+  status,
+}: {
+  model: ModelRoute;
+  status?: CapacityDiscoveryView["models"][number]["status"];
+}) {
+  const [service, setService] = useState(model.capacity_service ?? "");
+  const [namespace, setNamespace] = useState(model.capacity_namespace ?? "");
+  const [choosing, setChoosing] = useState(false);
+  const [search, setSearch] = useState("");
+  useEffect(() => {
+    setService(model.capacity_service ?? "");
+    setNamespace(model.capacity_namespace ?? "");
+  }, [model.capacity_service, model.capacity_namespace]);
+  const { data, isError } = useQuery({
+    queryKey: ["capacity-services", model.model_name],
+    queryFn: () =>
+      getJson<CapacityServicesView>(`/api/live/capacity/services?model=${encodeURIComponent(model.model_name)}`),
+    staleTime: 15_000,
+  });
+  const services = data?.services ?? [];
+  const chosen: CapacityServiceSummary | null = service
+    ? (services.find((s) => s.service === service && (!namespace || s.namespace === namespace)) ?? {
+        service,
+        namespace: namespace || "an allowed namespace",
+        ready: -1,
+      })
+    : (data?.default_match ?? null);
+  const showPicker = choosing || !chosen;
+  const q = search.trim().toLowerCase();
+  const filtered = q
+    ? services.filter((s) => s.service.toLowerCase().includes(q) || s.namespace.toLowerCase().includes(q))
+    : services;
+  const choose = (next: CapacityServiceSummary | null) => {
+    setService(next?.service ?? "");
+    setNamespace(next?.namespace ?? "");
+    setChoosing(false);
+    setSearch("");
+  };
+  const equation = discoveryEquation(status);
+
+  return (
+    <div className="space-y-1.5" data-testid="service-picker">
+      <Label>Service</Label>
+      <input type="hidden" name="capacity_service" value={service} />
+      <input type="hidden" name="capacity_namespace" value={namespace} />
+      {chosen && !showPicker && (
+        <p className="text-xs" data-testid="service-chosen">
+          Using <code className="rounded bg-muted/50 px-1">{chosen.service}</code> in{" "}
+          <code className="rounded bg-muted/50 px-1">{chosen.namespace}</code>
+          {chosen.ready >= 0 ? ` · ${chosen.ready} ready` : " · not listed right now"}
+          {!service && <span className="text-muted-foreground"> (default)</span>}{" "}
+          <button
+            type="button"
+            className="text-primary underline-offset-2 hover:underline"
+            onClick={() => setChoosing(true)}
+          >
+            Change
+          </button>
+        </p>
+      )}
+      {showPicker && (
+        <div className="rounded-md border border-border/60">
+          <Input
+            aria-label="Search Services"
+            placeholder="Search Services"
+            className="h-8 rounded-b-none border-0 border-b border-border/60 text-xs"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <div role="listbox" aria-label="Services" className="max-h-48 overflow-y-auto py-1 text-xs">
+            <button
+              type="button"
+              role="option"
+              aria-selected={!service}
+              className="block w-full px-2 py-1 text-left hover:bg-muted/50"
+              onClick={() => choose(null)}
+            >
+              Use default
+              {data?.default_service && <span className="text-muted-foreground"> · {data.default_service}</span>}
+            </button>
+            {filtered.map((s) => (
+              <button
+                key={`${s.namespace}/${s.service}`}
+                type="button"
+                role="option"
+                aria-selected={s.service === service && s.namespace === namespace}
+                className="block w-full px-2 py-1 text-left tabular-nums hover:bg-muted/50"
+                onClick={() => choose(s)}
+              >
+                {serviceLine(s)}
+              </button>
+            ))}
+            {data && filtered.length === 0 && (
+              <p className="px-2 py-1 text-muted-foreground">
+                {services.length === 0 ? (data.reason ?? "No Services found.") : "No Service matches the search."}
+              </p>
+            )}
+            {isError && <p className="px-2 py-1 text-amber-300">Could not list the Services.</p>}
+          </div>
+        </div>
+      )}
+      {!service && data?.default_service && !data.default_match && (
+        <p className="text-xs text-amber-300/90">
+          No Service named {data.default_service} was found in the allowed namespaces; choose one above.
+        </p>
+      )}
+      {data?.errors.map((e) => (
+        <p key={e} className="text-xs text-amber-300/90">{e}</p>
+      ))}
+      <p className="text-xs text-muted-foreground">
+        For multi-node serving, pick a Service that selects only the pods that take requests.
+      </p>
+      {equation && (
+        <p className="text-xs tabular-nums text-muted-foreground" data-testid="discovery-equation">
+          Live: {equation}
+        </p>
+      )}
+    </div>
+  );
+}
+
 const DISCOVERY_STATE_TONE: Record<string, string> = {
   discovered: "border-emerald-500/35 bg-emerald-500/10 text-emerald-300",
   stale: "border-amber-500/35 bg-amber-500/10 text-amber-300",
@@ -1823,23 +1967,9 @@ export function CapacityDiscoveryPanel({ model }: { model: ModelRoute }) {
             hint="Requests one replica serves at once, e.g. your server's max concurrent sequences, such as vLLM --max-num-seqs."
           />
           {source === "kubernetes" && (
-            <>
-              <Field
-                label="Service name"
-                name="capacity_service"
-                placeholder={view?.default_service ? `default: ${view.default_service}` : "my-model"}
-                defaultValue={model.capacity_service ?? ""}
-                hint="The Service whose ready endpoints are this model's replicas. For multi-node serving, use one that selects only the pods that take requests."
-              />
-              <Field
-                label="Namespace"
-                name="capacity_namespace"
-                placeholder={
-                  view?.namespaces.length ? `first of ${view.namespaces.join(", ")} with the Service` : "namespace"
-                }
-                defaultValue={model.capacity_namespace ?? ""}
-              />
-            </>
+            <div className="md:col-span-2">
+              <CapacityServicePicker model={model} status={status} />
+            </div>
           )}
           <Field
             label="Headroom"

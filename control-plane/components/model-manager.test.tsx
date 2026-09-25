@@ -11,7 +11,7 @@ import {
   ChatCapabilityFields,
 } from "./model-manager";
 import { TooltipProvider } from "./ui/tooltip";
-import type { CapacityDiscoveryView, ModelRoute } from "@/lib/obleth";
+import type { CapacityDiscoveryView, CapacityServicesView, ModelRoute } from "@/lib/obleth";
 
 // model-manager.tsx statically imports every model server action; stub them
 // so importing the module doesn't pull in "@/app/actions" (a "use server"
@@ -211,9 +211,23 @@ describe("the discovered capacity mode", () => {
     ],
   });
 
-  async function renderPanel(m: ModelRoute, v: CapacityDiscoveryView) {
-    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const services = (over: Partial<CapacityServicesView> = {}): CapacityServicesView => ({
+    services: [
+      { service: "up", namespace: "inference", ready: 2 },
+      { service: "up-head", namespace: "inference", ready: 1 },
+      { service: "other", namespace: "batch", ready: 0 },
+    ],
+    reason: null,
+    errors: [],
+    default_service: "up",
+    default_match: { service: "up", namespace: "inference", ready: 2 },
+    ...over,
+  });
+
+  async function renderPanel(m: ModelRoute, v: CapacityDiscoveryView, svc: CapacityServicesView = services()) {
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: Infinity } } });
     client.setQueryData(["capacity-discovery"], v);
+    client.setQueryData(["capacity-services", m.model_name], svc);
     await act(async () => {
       root.render(
         <QueryClientProvider client={client}>
@@ -250,13 +264,17 @@ describe("the discovered capacity mode", () => {
     const input = (name: string) => host.querySelector<HTMLInputElement>(`input[name="${name}"]`);
     expect(input("capacity_namespace")!.value).toBe("inference");
     expect(input("capacity_service")!.value).toBe("up-head");
-    expect(input("capacity_service")!.placeholder).toBe("default: {upstream_model}");
+    expect(host.querySelector('[data-testid="service-chosen"]')!.textContent).toContain(
+      "Using up-head in inference · 1 ready",
+    );
     expect(input("per_replica_max_in_flight")!.value).toBe("8");
     expect(input("capacity_headroom")!.value).toBe("1.25");
     expect(host.querySelector('input[name="capacity_selector"]')).toBeNull();
     const text = host.textContent ?? "";
-    expect(text).toContain("Service name");
     expect(text).toContain("discovered");
+    expect(host.querySelector('[data-testid="discovery-equation"]')!.textContent).toBe(
+      "Live: 2 ready × 8 per replica = 16",
+    );
     expect(text).toContain("Service up in inference");
     expect(text).toContain("8 (configured)");
     expect(text).toContain("16");
@@ -282,6 +300,79 @@ describe("the discovered capacity mode", () => {
       note: null,
       fallback: false,
     });
+  });
+
+  const hidden = (name: string) => host.querySelector<HTMLInputElement>(`input[name="${name}"]`)!.value;
+  const option = (label: string) =>
+    [...host.querySelectorAll<HTMLButtonElement>('[role="option"]')].find((b) => b.textContent?.startsWith(label));
+
+  it("confirms the model's default Service when one matches, with no template text", async () => {
+    await renderPanel(model({ capacity_mode: "discovered", capacity_source: "kubernetes" }), view());
+    const chosen = host.querySelector('[data-testid="service-chosen"]')!;
+    expect(chosen.textContent).toContain("Using up in inference · 2 ready");
+    expect(chosen.textContent).toContain("(default)");
+    expect(host.querySelector('[role="listbox"]')).toBeNull();
+    expect(hidden("capacity_service")).toBe("");
+    expect(hidden("capacity_namespace")).toBe("");
+    expect(host.textContent).not.toContain("{");
+    expect(host.textContent).toContain("pick a Service that selects only the pods that take requests");
+  });
+
+  it("picks a Service and namespace together from the searchable list", async () => {
+    await renderPanel(model({ capacity_mode: "discovered", capacity_source: "kubernetes" }), view());
+    const change = [...host.querySelectorAll("button")].find((b) => b.textContent === "Change")!;
+    await act(async () => change.click());
+    const labels = [...host.querySelectorAll('[role="option"]')].map((o) => o.textContent);
+    expect(labels).toEqual(["Use default · up", "up · inference · 2 ready", "up-head · inference · 1 ready", "other · batch · 0 ready"]);
+    const search = host.querySelector<HTMLInputElement>('input[aria-label="Search Services"]')!;
+    await act(async () => {
+      const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!;
+      setter.call(search, "batch");
+      search.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect([...host.querySelectorAll('[role="option"]')].map((o) => o.textContent)).toEqual([
+      "Use default · up",
+      "other · batch · 0 ready",
+    ]);
+    await act(async () => option("other")!.click());
+    expect(hidden("capacity_service")).toBe("other");
+    expect(hidden("capacity_namespace")).toBe("batch");
+    expect(host.querySelector('[data-testid="service-chosen"]')!.textContent).toContain("Using other in batch · 0 ready");
+    expect(host.textContent).not.toContain("{");
+  });
+
+  it("clears the Service and namespace with Use default", async () => {
+    await renderPanel(
+      model({ capacity_mode: "discovered", capacity_source: "kubernetes", capacity_service: "up-head", capacity_namespace: "inference" }),
+      view(),
+    );
+    expect(hidden("capacity_service")).toBe("up-head");
+    const change = [...host.querySelectorAll("button")].find((b) => b.textContent === "Change")!;
+    await act(async () => change.click());
+    await act(async () => option("Use default")!.click());
+    expect(hidden("capacity_service")).toBe("");
+    expect(hidden("capacity_namespace")).toBe("");
+    expect(host.querySelector('[data-testid="service-chosen"]')!.textContent).toContain("(default)");
+  });
+
+  it("opens the list when no Service matches the default", async () => {
+    await renderPanel(
+      model({ capacity_mode: "discovered", capacity_source: "kubernetes" }),
+      view(),
+      services({ default_match: null, default_service: "up" }),
+    );
+    expect(host.querySelector('[role="listbox"]')).not.toBeNull();
+    expect(host.textContent).toContain("No Service named up was found in the allowed namespaces");
+  });
+
+  it("says why the Service list is empty", async () => {
+    await renderPanel(
+      model({ capacity_mode: "discovered", capacity_source: "kubernetes" }),
+      view(),
+      services({ services: [], default_match: null, default_service: null, reason: "no namespaces are configured for the kubernetes source (OBLETH_CAPACITY_DISCOVERY_NAMESPACES)" }),
+    );
+    expect(host.textContent).toContain("no namespaces are configured for the kubernetes source");
+    expect(host.textContent).not.toContain("{");
   });
 
   it("marks per-replica concurrency required for the kubernetes source, with a hint", async () => {

@@ -44,8 +44,8 @@
 pub mod kube;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use futures::stream::{self, StreamExt};
@@ -79,6 +79,10 @@ pub const PER_REPLICA_CONFIGURED: &str = "configured";
 pub const PER_REPLICA_ENDPOINT: &str = "endpoint";
 pub const PER_REPLICA_BOTH: &str = "endpoint and configured";
 
+/// How long a Service listing is served from cache, so a form open on the
+/// dashboard cannot hammer the API server.
+pub const SERVICES_CACHE_TTL: Duration = Duration::from_secs(15);
+
 /// Handle to the gateway's capacity discovery. Cheap to clone.
 #[derive(Clone)]
 pub struct CapacityDiscovery {
@@ -88,6 +92,45 @@ pub struct CapacityDiscovery {
 struct Inner {
     settings: CapacityDiscoveryConfig,
     status: RwLock<BTreeMap<String, ModelCapacityStatus>>,
+    /// The Kubernetes client, built on first use when namespaces are set.
+    kube: OnceLock<Result<KubeClient, String>>,
+    /// The last Service listing and when it was taken. The lock also makes
+    /// concurrent callers wait for one listing instead of each making one.
+    services: tokio::sync::Mutex<Option<(Instant, ServiceListing)>>,
+    services_ttl: Duration,
+}
+
+/// One Service the `kubernetes` source can see.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ServiceSummary {
+    pub service: String,
+    pub namespace: String,
+    /// Ready, serving, non-terminating endpoints, counted as discovery
+    /// counts them.
+    pub ready: usize,
+}
+
+/// The Services visible to the `kubernetes` source, from EndpointSlices in
+/// the allowed namespaces.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
+pub struct ServiceListing {
+    /// Sorted by namespace (in allowlist order), then Service name.
+    pub services: Vec<ServiceSummary>,
+    /// Why the list is empty or incomplete, when it is: discovery off, no
+    /// namespaces configured, no Kubernetes client, or no namespace answering.
+    pub reason: Option<String>,
+    /// Namespaces that could not be listed, with why.
+    pub errors: Vec<String>,
+}
+
+impl ServiceListing {
+    fn unavailable(reason: impl Into<String>) -> Self {
+        ServiceListing {
+            services: Vec::new(),
+            reason: Some(reason.into()),
+            errors: Vec::new(),
+        }
+    }
 }
 
 /// What discovery knows about one `discovered` model, as this replica sees it.
@@ -129,12 +172,142 @@ pub struct ModelCapacityStatus {
 
 impl CapacityDiscovery {
     pub fn new(settings: CapacityDiscoveryConfig) -> Self {
+        Self::build(settings, None, SERVICES_CACHE_TTL)
+    }
+
+    /// Discovery that reads Kubernetes through `client` rather than the
+    /// in-cluster client, e.g. a fake API server in tests.
+    pub fn with_kube(settings: CapacityDiscoveryConfig, client: KubeClient) -> Self {
+        Self::build(settings, Some(client), SERVICES_CACHE_TTL)
+    }
+
+    fn build(
+        settings: CapacityDiscoveryConfig,
+        client: Option<KubeClient>,
+        services_ttl: Duration,
+    ) -> Self {
+        let kube = OnceLock::new();
+        if let Some(client) = client {
+            let _ = kube.set(Ok(client));
+        }
         CapacityDiscovery {
             inner: Arc::new(Inner {
                 settings,
                 status: RwLock::new(BTreeMap::new()),
+                kube,
+                services: tokio::sync::Mutex::new(None),
+                services_ttl,
             }),
         }
+    }
+
+    /// The Kubernetes client, or why there is none. Built once.
+    fn kube_client(&self) -> Option<Result<KubeClient, String>> {
+        if self.inner.settings.namespaces.is_empty() {
+            return None;
+        }
+        Some(self.inner.kube.get_or_init(KubeClient::in_cluster).clone())
+    }
+
+    /// Every Service in the allowed namespaces with its ready endpoint
+    /// count, built from EndpointSlices only (the one read the gateway's
+    /// Role allows), and cached for [`SERVICES_CACHE_TTL`].
+    pub async fn list_services(&self) -> ServiceListing {
+        let settings = &self.inner.settings;
+        if !settings.enabled {
+            return ServiceListing::unavailable(
+                "capacity discovery is off on this gateway (OBLETH_CAPACITY_DISCOVERY_ENABLED)",
+            );
+        }
+        let client = match self.kube_client() {
+            None => {
+                return ServiceListing::unavailable(
+                    "no namespaces are configured for the kubernetes source \
+                     (OBLETH_CAPACITY_DISCOVERY_NAMESPACES)",
+                )
+            }
+            Some(Err(e)) => return ServiceListing::unavailable(e),
+            Some(Ok(client)) => client,
+        };
+        let mut cache = self.inner.services.lock().await;
+        if let Some((at, listing)) = cache.as_ref() {
+            if at.elapsed() < self.inner.services_ttl {
+                return listing.clone();
+            }
+        }
+        let lists = stream::iter(settings.namespaces.iter().cloned())
+            .map(|ns| {
+                let client = client.clone();
+                async move {
+                    let result = client.list_service_endpoint_slices(&ns).await;
+                    (ns, result)
+                }
+            })
+            .buffered(LIST_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        let mut services = Vec::new();
+        let mut errors = Vec::new();
+        for (ns, result) in lists {
+            match result {
+                Ok(slices) => {
+                    for (service, ready) in kube::ready_by_service(&slices) {
+                        services.push(ServiceSummary {
+                            service,
+                            namespace: ns.clone(),
+                            ready,
+                        });
+                    }
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        let reason = if !errors.is_empty() && errors.len() == settings.namespaces.len() {
+            Some("no allowed namespace could be listed".to_string())
+        } else if services.is_empty() {
+            Some(format!(
+                "no Services found in {}",
+                settings.namespaces.join(", ")
+            ))
+        } else {
+            None
+        };
+        let listing = ServiceListing {
+            services,
+            reason,
+            errors,
+        };
+        *cache = Some((Instant::now(), listing.clone()));
+        listing
+    }
+
+    /// The Service a model that names none would use: the default template
+    /// rendered for it, in the first allowed namespace that has it, as
+    /// discovery looks it up. `None` when the template is empty, does not
+    /// render to a valid name, or no listed namespace has the Service.
+    pub fn default_match(
+        &self,
+        listing: &ServiceListing,
+        upstream_model: &str,
+        model_name: &str,
+    ) -> (Option<String>, Option<ServiceSummary>) {
+        let name = effective_capacity_service(
+            None,
+            &self.inner.settings.default_service,
+            upstream_model,
+            model_name,
+        )
+        .ok();
+        let found = name.as_ref().and_then(|name| {
+            self.inner.settings.namespaces.iter().find_map(|ns| {
+                listing
+                    .services
+                    .iter()
+                    .find(|s| &s.service == name && &s.namespace == ns)
+                    .cloned()
+            })
+        });
+        (name, found)
     }
 
     /// Discovery off, no namespaces, no default Service.
@@ -211,19 +384,14 @@ impl CapacityDiscovery {
             );
             return None;
         }
-        let kube = if settings.namespaces.is_empty() {
-            None
-        } else {
-            let client = KubeClient::in_cluster();
-            if let Err(e) = &client {
-                tracing::warn!(
-                    error = %e,
-                    "the kubernetes capacity source is unavailable; its models use their \
-                     static max_in_flight"
-                );
-            }
-            Some(client)
-        };
+        let kube = self.kube_client();
+        if let Some(Err(e)) = &kube {
+            tracing::warn!(
+                error = %e,
+                "the kubernetes capacity source is unavailable; its models use their \
+                 static max_in_flight"
+            );
+        }
         tracing::info!(
             interval_secs = settings.interval.as_secs(),
             namespaces = %settings.namespaces.join(","),

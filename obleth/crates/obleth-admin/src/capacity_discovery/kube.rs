@@ -1,5 +1,6 @@
-//! The one Kubernetes call capacity discovery makes: list the EndpointSlices
-//! of a named Service in a namespace, and count its ready endpoints.
+//! The one kind of Kubernetes call capacity discovery makes: list
+//! EndpointSlices in a namespace, those of one named Service or those of
+//! every Service, and count their ready endpoints.
 //!
 //! Plain `reqwest` against the API server rather than a Kubernetes client
 //! crate: one read-only endpoint does not justify the `kube`/`k8s-openapi`
@@ -16,7 +17,7 @@
 //! never a pod spec, environment or Secret. Only the fields discovery counts
 //! are deserialized, and nothing read here is logged.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -110,14 +111,25 @@ impl KubeClient {
         }
     }
 
-    /// The URL of one page of `service`'s EndpointSlices in `namespace`: the
-    /// only request this client makes. The first page is asked for at
-    /// `resourceVersion=0`, which the API server may answer from its watch
-    /// cache instead of etcd.
+    /// The URL of one page of `service`'s EndpointSlices in `namespace`.
+    #[cfg(test)]
     pub(crate) fn endpoint_slices_url(
         &self,
         namespace: &str,
         service: &str,
+        cont: Option<&str>,
+    ) -> Result<reqwest::Url, String> {
+        self.slices_url(namespace, &format!("{SERVICE_NAME_LABEL}={service}"), cont)
+    }
+
+    /// The URL of one page of EndpointSlices in `namespace` matching the
+    /// label `selector`: the only request this client makes. The first page
+    /// is asked for at `resourceVersion=0`, which the API server may answer
+    /// from its watch cache instead of etcd.
+    fn slices_url(
+        &self,
+        namespace: &str,
+        selector: &str,
         cont: Option<&str>,
     ) -> Result<reqwest::Url, String> {
         let mut url = reqwest::Url::parse(&format!(
@@ -127,7 +139,7 @@ impl KubeClient {
         .map_err(|e| format!("bad Kubernetes API URL: {e}"))?;
         {
             let mut q = url.query_pairs_mut();
-            q.append_pair("labelSelector", &format!("{SERVICE_NAME_LABEL}={service}"));
+            q.append_pair("labelSelector", selector);
             q.append_pair("limit", &PAGE_LIMIT.to_string());
             match cont {
                 Some(token) => {
@@ -150,10 +162,34 @@ impl KubeClient {
         namespace: &str,
         service: &str,
     ) -> Result<Vec<EndpointSlice>, String> {
+        self.list_slices(
+            namespace,
+            &format!("{SERVICE_NAME_LABEL}={service}"),
+            &format!("Service {service}"),
+        )
+        .await
+    }
+
+    /// The EndpointSlices of every Service in `namespace`: those carrying
+    /// the Service-name label, which the EndpointSlice controller sets.
+    pub async fn list_service_endpoint_slices(
+        &self,
+        namespace: &str,
+    ) -> Result<Vec<EndpointSlice>, String> {
+        self.list_slices(namespace, SERVICE_NAME_LABEL, "the Services")
+            .await
+    }
+
+    async fn list_slices(
+        &self,
+        namespace: &str,
+        selector: &str,
+        what: &str,
+    ) -> Result<Vec<EndpointSlice>, String> {
         let mut out = Vec::new();
         let mut cont: Option<String> = None;
         loop {
-            let url = self.endpoint_slices_url(namespace, service, cont.as_deref())?;
+            let url = self.slices_url(namespace, selector, cont.as_deref())?;
             let mut req = self.http.get(url).header("accept", "application/json");
             if let Some(token) = self.bearer()? {
                 req = req.bearer_auth(token);
@@ -176,7 +212,7 @@ impl KubeClient {
                     ""
                 };
                 return Err(format!(
-                    "listing the EndpointSlices of Service {service} in {namespace} failed: \
+                    "listing the EndpointSlices of {what} in {namespace} failed: \
                      HTTP {}{}{hint}",
                     status.as_u16(),
                     if message.is_empty() {
@@ -187,7 +223,7 @@ impl KubeClient {
                 ));
             }
             let page: EndpointSliceList = res.json().await.map_err(|e| {
-                format!("unreadable EndpointSlice list for Service {service} in {namespace}: {e}")
+                format!("unreadable EndpointSlice list for {what} in {namespace}: {e}")
             })?;
             out.extend(page.items);
             match page.metadata.cont.filter(|c| !c.is_empty()) {
@@ -221,9 +257,28 @@ struct ListMeta {
 /// The parts of an EndpointSlice discovery reads.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct EndpointSlice {
+    #[serde(default)]
+    pub metadata: SliceMeta,
     /// `null` in JSON for a slice with no endpoints.
     #[serde(default, deserialize_with = "null_as_empty")]
     pub endpoints: Vec<Endpoint>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct SliceMeta {
+    #[serde(default, deserialize_with = "null_as_empty_map")]
+    pub labels: HashMap<String, String>,
+}
+
+impl EndpointSlice {
+    /// The Service the slice belongs to, from its Service-name label.
+    pub fn service(&self) -> Option<&str> {
+        self.metadata
+            .labels
+            .get(SERVICE_NAME_LABEL)
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -259,6 +314,13 @@ where
     T: Deserialize<'de>,
 {
     Ok(Option::<Vec<T>>::deserialize(d)?.unwrap_or_default())
+}
+
+fn null_as_empty_map<'de, D>(d: D) -> Result<HashMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::<HashMap<String, String>>::deserialize(d)?.unwrap_or_default())
 }
 
 impl Endpoint {
@@ -325,4 +387,23 @@ pub fn count_endpoints(slices: &[EndpointSlice]) -> EndpointCount {
         total: all.len(),
         ready: ready.len(),
     }
+}
+
+/// Ready endpoints per Service among one namespace's slices, counted like
+/// [`count_endpoints`] counts one Service's, by Service name. Slices without
+/// the Service-name label are skipped.
+pub fn ready_by_service(slices: &[EndpointSlice]) -> BTreeMap<String, usize> {
+    let mut by_service: BTreeMap<String, Vec<EndpointSlice>> = BTreeMap::new();
+    for slice in slices {
+        if let Some(service) = slice.service() {
+            by_service
+                .entry(service.to_string())
+                .or_default()
+                .push(slice.clone());
+        }
+    }
+    by_service
+        .into_iter()
+        .map(|(service, slices)| (service, count_endpoints(&slices).ready))
+        .collect()
 }

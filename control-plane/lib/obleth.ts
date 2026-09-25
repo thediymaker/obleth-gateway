@@ -304,6 +304,27 @@ export interface CapacityDiscoveryView {
   models: CapacityDiscoveryModelView[];
 }
 
+/** A Service the kubernetes capacity source can see, from its EndpointSlices. */
+export interface CapacityServiceSummary {
+  service: string;
+  namespace: string;
+  /** Ready, serving, non-terminating endpoints, counted as discovery counts them. */
+  ready: number;
+}
+
+/** GET /capacity/services: the Services in the allowed namespaces. */
+export interface CapacityServicesView {
+  services: CapacityServiceSummary[];
+  /** Why `services` is empty or incomplete, when it is. */
+  reason: string | null;
+  /** Namespaces that could not be listed. */
+  errors: string[];
+  /** With `model`: the Service name that model uses by default, found or not. */
+  default_service: string | null;
+  /** With `model`: that Service, in the first allowed namespace that has it. */
+  default_match: CapacityServiceSummary | null;
+}
+
 export interface ManagedModelSpec {
   model_id: string;
   enabled: boolean;
@@ -1869,6 +1890,8 @@ export const obleth = {
       body: JSON.stringify({ capacity_mode, ...(fields ?? {}) }),
     }),
   capacityDiscovery: () => api<CapacityDiscoveryView>("/capacity/discovery"),
+  capacityServices: (model?: string) =>
+    api<CapacityServicesView>(`/capacity/services${model ? `?model=${encodeURIComponent(model)}` : ""}`),
   autotuneModel: (
     id: string,
     opts?: {

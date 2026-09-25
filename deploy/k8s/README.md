@@ -364,7 +364,12 @@ saved. The dashboard's model page and `GET /api/v1/capacity/discovery` show,
 per discovered model, the Service and the namespace it was found in, the ready
 replicas, the per-replica value, the derived pool size, the model's
 cluster-wide and this gateway's in-flight counts, the last refresh and the reason when discovery has no answer;
-`obleth_capacity_discovery_models{state}` counts models by state. See
+`obleth_capacity_discovery_models{state}` counts models by state. The model
+page picks the Service from those the gateway can see:
+`GET /api/v1/capacity/services` lists every Service in the allowed namespaces
+with its ready endpoint count, built from the same EndpointSlice reads (no
+extra permission) and cached for 15 seconds, and with `?model=` names the
+Service that model would use by default and where it was found. See
 [`values-capacity-discovery.yaml`](obleth/examples/values-capacity-discovery.yaml)
 for settings and examples.
 

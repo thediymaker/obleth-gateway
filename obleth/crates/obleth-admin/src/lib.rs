@@ -221,6 +221,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/overview/summary", get(get_overview_summary))
         .route("/api/v1/fairshare/live", get(get_fairshare_live))
         .route("/api/v1/capacity/discovery", get(get_capacity_discovery))
+        .route("/api/v1/capacity/services", get(get_capacity_services))
         .route("/api/v1/fairshare/history", get(get_fairshare_history))
         .route(
             "/api/v1/fairshare/groups",
@@ -5126,6 +5127,68 @@ async fn get_capacity_discovery(
     }))
 }
 
+/// The Services the `kubernetes` capacity source can see, for choosing a
+/// model's Service. Built from EndpointSlices in the allowed namespaces
+/// only, and cached briefly.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CapacityServicesView {
+    /// Every Service with endpoints in the allowed namespaces.
+    pub services: Vec<capacity_discovery::ServiceSummary>,
+    /// Why `services` is empty or incomplete, when it is.
+    pub reason: Option<String>,
+    /// Namespaces that could not be listed, with why.
+    pub errors: Vec<String>,
+    /// With `model`: the Service name that model would use by default
+    /// (`OBLETH_CAPACITY_DEFAULT_SERVICE` rendered for it), whether or not it
+    /// exists. `null` when there is no default.
+    pub default_service: Option<String>,
+    /// With `model`: that default Service, in the first allowed namespace
+    /// that has it, as discovery would find it. `null` when none has it.
+    pub default_match: Option<capacity_discovery::ServiceSummary>,
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct CapacityServicesQuery {
+    /// A model's name or id, to resolve its default Service.
+    pub model: Option<String>,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/capacity/services", tag = "models",
+    params(CapacityServicesQuery),
+    responses((status = 200, body = CapacityServicesView))
+)]
+async fn get_capacity_services(
+    State(state): State<AdminState>,
+    Query(q): Query<CapacityServicesQuery>,
+) -> Result<Json<CapacityServicesView>> {
+    let listing = state.capacity_discovery.list_services().await;
+    let (default_service, default_match) = match q.model.as_deref().filter(|m| !m.is_empty()) {
+        Some(wanted) => {
+            let model = state
+                .store
+                .list_models()
+                .await?
+                .into_iter()
+                .find(|m| m.model_name == wanted || m.id.to_string() == wanted)
+                .ok_or(AdminError::NotFound)?;
+            state.capacity_discovery.default_match(
+                &listing,
+                &model.upstream_model,
+                &model.model_name,
+            )
+        }
+        None => (None, None),
+    };
+    Ok(Json(CapacityServicesView {
+        services: listing.services,
+        reason: listing.reason,
+        errors: listing.errors,
+        default_service,
+        default_match,
+    }))
+}
+
 #[utoipa::path(
     get, path = "/api/v1/fairshare/live", tag = "fairshare",
     responses((status = 200, body = FairshareLiveView))
@@ -7546,6 +7609,14 @@ mod tests {
             .await
         }
 
+        /// [`test_admin_app`] with a given capacity discovery handle.
+        pub(super) async fn test_admin_app_with_discovery(
+            discovery: capacity_discovery::CapacityDiscovery,
+        ) -> Option<TestApp> {
+            let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
+            test_admin_app_with(&redis_url, discovery).await
+        }
+
         async fn test_admin_app_with(
             redis_url: &str,
             capacity_discovery: capacity_discovery::CapacityDiscovery,
@@ -7638,7 +7709,7 @@ mod tests {
 
     use harness::{
         fixture_model, send, simulate_request, test_admin_app, test_admin_app_discovering,
-        test_admin_app_on, TEST_ADMIN_TOKEN,
+        test_admin_app_on, test_admin_app_with_discovery, TEST_ADMIN_TOKEN,
     };
 
     fn json_request(
@@ -8947,6 +9018,109 @@ mod tests {
         assert_eq!(stats_status, StatusCode::OK, "body: {stats}");
         assert_eq!(stats["replicas"], serde_json::json!(2));
         assert_eq!(stats["mode"], "split");
+    }
+
+    /// The Service picker's listing: Services from the allowed namespaces'
+    /// EndpointSlices, and the model's default Service when it exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capacity_services_lists_services_and_the_models_default() {
+        use axum::routing::get as get_route;
+        let app = axum::Router::new().route(
+            "/apis/discovery.k8s.io/v1/namespaces/:ns/endpointslices",
+            get_route(|Path(ns): Path<String>| async move {
+                let items = if ns == "inference" {
+                    serde_json::json!([
+                        {"metadata": {"labels": {"kubernetes.io/service-name": "svc-picker-a"}},
+                         "endpoints": [
+                            {"addresses": ["10.0.0.1"], "conditions": {"ready": true}, "targetRef": {"uid": "a"}},
+                            {"addresses": ["10.0.0.2"], "conditions": {"ready": true}, "targetRef": {"uid": "b"}},
+                            {"addresses": ["10.0.0.3"], "conditions": {"ready": false}, "targetRef": {"uid": "c"}}
+                         ]},
+                        {"metadata": {"labels": {"kubernetes.io/service-name": "svc-picker-other"}},
+                         "endpoints": null}
+                    ])
+                } else {
+                    serde_json::json!([])
+                };
+                Json(serde_json::json!({"kind": "EndpointSliceList", "metadata": {}, "items": items}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let discovery = capacity_discovery::CapacityDiscovery::with_kube(
+            obleth_config::CapacityDiscoveryConfig {
+                enabled: true,
+                interval: std::time::Duration::from_secs(15),
+                namespaces: vec!["batch".into(), "inference".into()],
+                default_service: "{upstream_model}".into(),
+            },
+            capacity_discovery::KubeClient::with_base(format!("http://{addr}"), None),
+        );
+        let Some(t) = test_admin_app_with_discovery(discovery).await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let model = fixture_model(&t.store, "svc-picker-a", 0.0).await;
+        let get = |path: String| {
+            axum::http::Request::get(path)
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::empty())
+                .expect("build request")
+        };
+        let (status, body) = send(&t.app, get("/api/v1/capacity/services".into())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["services"],
+            serde_json::json!([
+                {"service": "svc-picker-a", "namespace": "inference", "ready": 2},
+                {"service": "svc-picker-other", "namespace": "inference", "ready": 0}
+            ])
+        );
+        assert_eq!(body["reason"], serde_json::Value::Null);
+        assert_eq!(body["default_match"], serde_json::Value::Null);
+
+        let (status, body) = send(
+            &t.app,
+            get(format!(
+                "/api/v1/capacity/services?model={}",
+                model.model_name
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["default_service"], "svc-picker-a");
+        assert_eq!(
+            body["default_match"],
+            serde_json::json!({"service": "svc-picker-a", "namespace": "inference", "ready": 2})
+        );
+        let (status, _) = send(
+            &t.app,
+            get("/api/v1/capacity/services?model=no-such-model".into()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = t.store.delete_model(model.id).await;
+    }
+
+    /// Discovery off: an empty listing that says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn capacity_services_says_why_when_discovery_is_off() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let req = axum::http::Request::get("/api/v1/capacity/services")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (status, body) = send(&t.app, req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["services"], serde_json::json!([]));
+        assert!(body["reason"]
+            .as_str()
+            .unwrap()
+            .contains("OBLETH_CAPACITY_DISCOVERY_ENABLED"));
     }
 
     /// With shared slots, the view reports the configured sizes as this
