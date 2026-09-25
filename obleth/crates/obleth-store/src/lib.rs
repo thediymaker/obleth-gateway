@@ -95,6 +95,8 @@ const SCHEMA_V26: &str =
     include_str!("../../../../schema/postgres/0026_model_upstream_headers.sql");
 const SCHEMA_V27: &str = include_str!("../../../../schema/postgres/0027_model_cost_per_video.sql");
 const SCHEMA_V28: &str = include_str!("../../../../schema/postgres/0028_video_jobs.sql");
+const SCHEMA_V29: &str =
+    include_str!("../../../../schema/postgres/0029_model_capacity_discovery.sql");
 
 /// Arbitrary, fixed key for the advisory lock that serializes `migrate()`
 /// across connections, replicas and parallel test binaries.
@@ -239,6 +241,7 @@ impl Store {
             sqlx::raw_sql(SCHEMA_V26).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V27).execute(&mut *conn).await?;
             sqlx::raw_sql(SCHEMA_V28).execute(&mut *conn).await?;
+            sqlx::raw_sql(SCHEMA_V29).execute(&mut *conn).await?;
             Ok(())
         }
         .await;
@@ -1330,8 +1333,11 @@ impl Store {
         quantization: &str,
         upstream_headers: &obleth_config::UpstreamHeaders,
         cost_per_video: f64,
+        capacity_mode: &str,
+        discovery: &obleth_config::capacity::DiscoveryFields,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
+        let discovery = discovery.normalized();
         let row = sqlx::query(
             "insert into models (
                 id, model_name, description, upstream_model, api_base, api_key, model_type,
@@ -1341,15 +1347,17 @@ impl Store {
                 supports_response_schema, supports_tool_choice, supports_vision, tags, boons, tool_servers,
                 energy_slots_per_node, route_bias, auto_eligible,
                 draft_model, verify_api_base, verify_upstream_model, aliases, quantization,
-                upstream_headers, cost_per_video
-             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33)
+                upstream_headers, cost_per_video, capacity_mode, capacity_namespace,
+                capacity_selector, per_replica_max_in_flight, capacity_source, capacity_headroom
+             ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35, $36, $37, $38, $39)
              returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
                        cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
@@ -1388,6 +1396,12 @@ impl Store {
         .bind(obleth_config::normalize_quantization(quantization))
         .bind(encrypt_upstream_headers(upstream_headers))
         .bind(cost_per_video.max(0.0))
+        .bind(obleth_config::normalize_capacity_mode(capacity_mode))
+        .bind(&discovery.namespace)
+        .bind(&discovery.selector)
+        .bind(discovery.per_replica_max_in_flight.map(|n| n.max(1)))
+        .bind(&discovery.source)
+        .bind(discovery.headroom)
         .fetch_one(&self.pool)
         .await?;
         model_from_row(&row)
@@ -1401,7 +1415,8 @@ impl Store {
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                    capacity_mode, capacity_tuned_at,
+                    capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       per_replica_max_in_flight, capacity_headroom,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
                     debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                     created_at, updated_at
@@ -1420,7 +1435,8 @@ impl Store {
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                    capacity_mode, capacity_tuned_at,
+                    capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       per_replica_max_in_flight, capacity_headroom,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
                     debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                     created_at, updated_at
@@ -1441,7 +1457,8 @@ impl Store {
                     admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                     supports_response_schema, supports_tool_choice, supports_vision, enabled,
                     cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                    capacity_mode, capacity_tuned_at,
+                    capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       per_replica_max_in_flight, capacity_headroom,
                     request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
                     debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                     created_at, updated_at
@@ -1517,8 +1534,11 @@ impl Store {
         quantization: &str,
         upstream_headers: &obleth_config::UpstreamHeaders,
         cost_per_video: f64,
+        capacity_mode: &str,
+        discovery: &obleth_config::capacity::DiscoveryFields,
     ) -> Result<ModelRoute> {
         let api_key = cipher().encrypt_opt(api_key);
+        let discovery = discovery.normalized();
         let row = sqlx::query(
             "update models set
                 description = $2, upstream_model = $3, api_base = $4, api_key = $5,
@@ -1534,7 +1554,9 @@ impl Store {
                 auto_eligible = $26,
                 draft_model = $27, verify_api_base = $28, verify_upstream_model = $29,
                 aliases = $30, quantization = $31, upstream_headers = $32,
-                cost_per_video = $33,
+                cost_per_video = $33, capacity_mode = $34, capacity_namespace = $35,
+                capacity_selector = $36, per_replica_max_in_flight = $37,
+                capacity_source = $38, capacity_headroom = $39,
                 updated_at = now()
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
@@ -1543,7 +1565,8 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
@@ -1582,6 +1605,12 @@ impl Store {
         .bind(obleth_config::normalize_quantization(quantization))
         .bind(encrypt_upstream_headers(upstream_headers))
         .bind(cost_per_video.max(0.0))
+        .bind(obleth_config::normalize_capacity_mode(capacity_mode))
+        .bind(&discovery.namespace)
+        .bind(&discovery.selector)
+        .bind(discovery.per_replica_max_in_flight.map(|n| n.max(1)))
+        .bind(&discovery.source)
+        .bind(discovery.headroom)
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1613,7 +1642,8 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
@@ -1625,16 +1655,27 @@ impl Store {
         model_from_row(&row)
     }
 
-    /// Set the capacity-tuning mode (`static` or `tuned`) for a model. Switching
-    /// to `static` leaves `max_in_flight` and `capacity_tuned_at` untouched so
-    /// operators can keep or edit the value the tuner found.
+    /// Set the capacity mode (`static`, `tuned` or `discovered`) for a model.
+    /// Switching mode leaves `max_in_flight` and `capacity_tuned_at` untouched
+    /// so operators can keep or edit the value the tuner found (and it stays
+    /// the fallback of a `discovered` model). `discovery` replaces the
+    /// discovery fields when given and leaves them alone when `None`.
     pub async fn update_model_capacity_mode(
         &self,
         id: Uuid,
         capacity_mode: &str,
+        discovery: Option<&obleth_config::capacity::DiscoveryFields>,
     ) -> Result<ModelRoute> {
+        let discovery = discovery.map(|d| d.normalized());
         let row = sqlx::query(
-            "update models set capacity_mode = $2, updated_at = now()
+            "update models set capacity_mode = $2,
+                    capacity_namespace = case when $3 then $4 else capacity_namespace end,
+                    capacity_selector = case when $3 then $5 else capacity_selector end,
+                    per_replica_max_in_flight =
+                        case when $3 then $6 else per_replica_max_in_flight end,
+                    capacity_source = case when $3 then $7 else capacity_source end,
+                    capacity_headroom = case when $3 then $8 else capacity_headroom end,
+                    updated_at = now()
              where id = $1
              returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
                        input_cost_per_token, output_cost_per_token,
@@ -1642,12 +1683,29 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
         .bind(id)
         .bind(obleth_config::normalize_capacity_mode(capacity_mode))
+        .bind(discovery.is_some())
+        .bind(discovery.as_ref().and_then(|d| d.namespace.clone()))
+        .bind(discovery.as_ref().and_then(|d| d.selector.clone()))
+        .bind(
+            discovery
+                .as_ref()
+                .and_then(|d| d.per_replica_max_in_flight)
+                .map(|n| n.max(1)),
+        )
+        .bind(
+            discovery
+                .as_ref()
+                .map(|d| d.source.clone())
+                .unwrap_or_else(|| obleth_config::DEFAULT_CAPACITY_SOURCE.to_string()),
+        )
+        .bind(discovery.as_ref().map(|d| d.headroom).unwrap_or(1.0))
         .fetch_optional(&self.pool)
         .await?
         .ok_or(StoreError::NotFound)?;
@@ -1672,7 +1730,8 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
@@ -1698,7 +1757,8 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
@@ -1713,6 +1773,8 @@ impl Store {
     pub async fn all_resolved_models(&self) -> Result<Vec<(String, ResolvedModel)>> {
         let rows = sqlx::query(
             "select id, model_name, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization, admission_weight, max_in_flight, enabled,
+                    capacity_mode, capacity_source, capacity_namespace, capacity_selector,
+                    per_replica_max_in_flight, capacity_headroom,
                     cache_enabled, cache_ttl_secs, input_cost_per_token, output_cost_per_token,
                     cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video,
                     context_window, supports_function_calling, supports_system_messages,
@@ -1733,7 +1795,8 @@ impl Store {
             .map(|r| r.try_get("id"))
             .collect::<std::result::Result<_, _>>()?;
         let endpoint_rows = sqlx::query(
-            "select model_id, id, api_base, api_key, priority, weight, enabled, health_status
+            "select model_id, id, api_base, api_key, priority, weight, enabled, health_status,
+                    max_in_flight
              from model_endpoints
              where model_id = any($1)
              order by priority asc, created_at asc",
@@ -1785,6 +1848,20 @@ impl Store {
                     max_in_flight: row
                         .try_get::<Option<i64>, _>("max_in_flight")?
                         .and_then(|n| usize::try_from(n).ok()),
+                    capacity_mode: row
+                        .try_get::<String, _>("capacity_mode")
+                        .unwrap_or_else(|_| obleth_config::DEFAULT_CAPACITY_MODE.to_string()),
+                    capacity_source: row
+                        .try_get::<String, _>("capacity_source")
+                        .unwrap_or_else(|_| obleth_config::DEFAULT_CAPACITY_SOURCE.to_string()),
+                    capacity_namespace: row.try_get("capacity_namespace").unwrap_or(None),
+                    capacity_selector: row.try_get("capacity_selector").unwrap_or(None),
+                    per_replica_max_in_flight: row
+                        .try_get::<Option<i64>, _>("per_replica_max_in_flight")
+                        .unwrap_or(None)
+                        .and_then(|n| usize::try_from(n).ok())
+                        .filter(|n| *n > 0),
+                    capacity_headroom: row.try_get("capacity_headroom").unwrap_or(1.0),
                     enabled: row.try_get("enabled")?,
                     cache_enabled: row.try_get("cache_enabled")?,
                     cache_ttl_secs: row.try_get("cache_ttl_secs")?,
@@ -1902,7 +1979,8 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
@@ -1938,7 +2016,8 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       per_replica_max_in_flight, capacity_headroom,
                        request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
@@ -1963,7 +2042,7 @@ impl Store {
     /// decrypted upstream keys and current health, ordered by priority.
     pub async fn resolved_endpoints_for(&self, model_id: Uuid) -> Result<Vec<ResolvedEndpoint>> {
         let rows = sqlx::query(
-            "select id, api_base, api_key, priority, weight, enabled, health_status
+            "select id, api_base, api_key, priority, weight, enabled, health_status, max_in_flight
              from model_endpoints
              where model_id = $1
              order by priority asc, created_at asc",
@@ -1976,7 +2055,7 @@ impl Store {
 
     pub async fn list_model_endpoints(&self, model_id: Uuid) -> Result<Vec<ModelEndpoint>> {
         let rows = sqlx::query(
-            "select id, model_id, name, api_base, api_key, priority, weight, enabled,
+            "select id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
                     health_status, consecutive_failures, alert_state,
                     last_checked_at, last_latency_ms, last_http_status, last_message,
                     created_at, updated_at
@@ -1993,7 +2072,7 @@ impl Store {
     /// per-endpoint health scheduler).
     pub async fn all_model_endpoints(&self) -> Result<Vec<ModelEndpoint>> {
         let rows = sqlx::query(
-            "select id, model_id, name, api_base, api_key, priority, weight, enabled,
+            "select id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
                     health_status, consecutive_failures, alert_state,
                     last_checked_at, last_latency_ms, last_http_status, last_message,
                     created_at, updated_at
@@ -2006,7 +2085,7 @@ impl Store {
 
     pub async fn get_model_endpoint(&self, id: Uuid) -> Result<ModelEndpoint> {
         let row = sqlx::query(
-            "select id, model_id, name, api_base, api_key, priority, weight, enabled,
+            "select id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
                     health_status, consecutive_failures, alert_state,
                     last_checked_at, last_latency_ms, last_http_status, last_message,
                     created_at, updated_at
@@ -2029,12 +2108,14 @@ impl Store {
         priority: i64,
         weight: i64,
         enabled: bool,
+        max_in_flight: Option<i64>,
     ) -> Result<ModelEndpoint> {
         let api_key = cipher().encrypt_opt(api_key);
         let row = sqlx::query(
-            "insert into model_endpoints (id, model_id, name, api_base, api_key, priority, weight, enabled)
-             values ($1, $2, $3, $4, $5, $6, $7, $8)
-             returning id, model_id, name, api_base, api_key, priority, weight, enabled,
+            "insert into model_endpoints
+                (id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight)
+             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+             returning id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
                        health_status, consecutive_failures, alert_state,
                        last_checked_at, last_latency_ms, last_http_status, last_message,
                        created_at, updated_at",
@@ -2047,6 +2128,7 @@ impl Store {
         .bind(priority.max(0))
         .bind(weight.max(1))
         .bind(enabled)
+        .bind(max_in_flight.map(|n| n.max(1)))
         .fetch_one(&self.pool)
         .await?;
         // A new endpoint starts as `unknown` and is only ever health-checked as a
@@ -2086,7 +2168,9 @@ impl Store {
         priority: i64,
         weight: i64,
         enabled: bool,
+        max_in_flight: Option<i64>,
     ) -> Result<ModelEndpoint> {
+        let max_in_flight = max_in_flight.map(|n| n.max(1));
         // A `None` api_key leaves the stored secret untouched (so the UI can
         // edit other fields without re-entering the key); an empty string
         // clears it.
@@ -2095,9 +2179,10 @@ impl Store {
                 let enc = cipher().encrypt_opt(Some(secret));
                 sqlx::query(
                     "update model_endpoints set name = $2, api_base = $3, api_key = $4,
-                            priority = $5, weight = $6, enabled = $7, updated_at = now()
+                            priority = $5, weight = $6, enabled = $7, max_in_flight = $9,
+                            updated_at = now()
                      where id = $1 and model_id = $8
-                     returning id, model_id, name, api_base, api_key, priority, weight, enabled,
+                     returning id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
                                health_status, consecutive_failures, alert_state,
                                last_checked_at, last_latency_ms, last_http_status, last_message,
                                created_at, updated_at",
@@ -2110,15 +2195,17 @@ impl Store {
                 .bind(weight.max(1))
                 .bind(enabled)
                 .bind(model_id)
+                .bind(max_in_flight)
                 .fetch_optional(&self.pool)
                 .await?
             }
             None => {
                 sqlx::query(
                     "update model_endpoints set name = $2, api_base = $3,
-                            priority = $4, weight = $5, enabled = $6, updated_at = now()
+                            priority = $4, weight = $5, enabled = $6, max_in_flight = $8,
+                            updated_at = now()
                      where id = $1 and model_id = $7
-                     returning id, model_id, name, api_base, api_key, priority, weight, enabled,
+                     returning id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
                                health_status, consecutive_failures, alert_state,
                                last_checked_at, last_latency_ms, last_http_status, last_message,
                                created_at, updated_at",
@@ -2130,6 +2217,7 @@ impl Store {
                 .bind(weight.max(1))
                 .bind(enabled)
                 .bind(model_id)
+                .bind(max_in_flight)
                 .fetch_optional(&self.pool)
                 .await?
             }
@@ -2530,7 +2618,7 @@ impl Store {
                 last_message = $6,
                 updated_at = now()
              where id = $1
-             returning id, model_id, name, api_base, api_key, priority, weight, enabled,
+             returning id, model_id, name, api_base, api_key, priority, weight, enabled, max_in_flight,
                        health_status, consecutive_failures, alert_state,
                        last_checked_at, last_latency_ms, last_http_status, last_message,
                        created_at, updated_at",
@@ -2969,7 +3057,8 @@ impl Store {
                        admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
                        supports_response_schema, supports_tool_choice, supports_vision, enabled,
                        cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
-                       capacity_mode, capacity_tuned_at,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_selector,
+                       per_replica_max_in_flight, capacity_headroom,
                        debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
                        created_at, updated_at",
         )
@@ -3511,6 +3600,13 @@ fn model_from_row(row: &PgRow) -> Result<ModelRoute> {
             .try_get::<String, _>("capacity_mode")
             .unwrap_or_else(|_| obleth_config::DEFAULT_CAPACITY_MODE.to_string()),
         capacity_tuned_at: row.try_get("capacity_tuned_at").unwrap_or(None),
+        capacity_source: row
+            .try_get::<String, _>("capacity_source")
+            .unwrap_or_else(|_| obleth_config::DEFAULT_CAPACITY_SOURCE.to_string()),
+        capacity_namespace: row.try_get("capacity_namespace").unwrap_or(None),
+        capacity_selector: row.try_get("capacity_selector").unwrap_or(None),
+        per_replica_max_in_flight: row.try_get("per_replica_max_in_flight").unwrap_or(None),
+        capacity_headroom: row.try_get("capacity_headroom").unwrap_or(1.0),
         supports_function_calling: row.try_get("supports_function_calling")?,
         supports_system_messages: row.try_get("supports_system_messages")?,
         supports_response_schema: row.try_get("supports_response_schema")?,
@@ -3624,6 +3720,12 @@ fn resolved_endpoint_from_row(row: &PgRow) -> Result<ResolvedEndpoint> {
         // Treat unknown/degraded as eligible (soft-pass); only an
         // explicit unhealthy/disabled state removes an endpoint.
         healthy: !matches!(status.as_str(), "unhealthy" | "disabled"),
+        // Tolerant read: statements that don't select it read as unset.
+        max_in_flight: row
+            .try_get::<Option<i64>, _>("max_in_flight")
+            .unwrap_or(None)
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0),
     })
 }
 
@@ -3698,6 +3800,7 @@ fn endpoint_from_row(row: &PgRow) -> Result<ModelEndpoint> {
         priority: row.try_get("priority")?,
         weight: row.try_get("weight")?,
         enabled: row.try_get("enabled")?,
+        max_in_flight: row.try_get("max_in_flight").unwrap_or(None),
         health_status: row.try_get("health_status")?,
         consecutive_failures: row.try_get("consecutive_failures")?,
         alert_state: row.try_get("alert_state")?,
@@ -3961,6 +4064,8 @@ mod tests {
                 "unknown",
                 &headers,
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -4040,6 +4145,8 @@ mod tests {
                 "FP8-e4m3",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -4125,6 +4232,8 @@ mod tests {
                 "mxfp4",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("update model");
@@ -4135,6 +4244,182 @@ mod tests {
             .await
             .expect("owner")
             .is_none());
+    }
+
+    /// The discovered mode's fields survive every read path, the capacity-mode
+    /// write replaces them only when given, and an endpoint's own concurrency
+    /// reaches the hot-path view.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn capacity_discovery_fields_roundtrip() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        // Re-running the migrations is a no-op, including the constraint swap.
+        store.migrate().await.expect("migrate twice");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let name = format!("m-{}", Uuid::new_v4());
+        let discovery = obleth_config::capacity::DiscoveryFields {
+            source: " Kubernetes ".into(),
+            namespace: Some(" inference ".into()),
+            selector: Some("app=served,role!=worker".into()),
+            per_replica_max_in_flight: Some(8),
+            headroom: 1.25,
+        };
+        let model = store
+            .create_model(
+                &name,
+                "discovery round trip",
+                "served",
+                "http://127.0.0.1:8081",
+                None,
+                obleth_config::DEFAULT_MODEL_TYPE,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                8192,
+                100,
+                Some(6),
+                false,
+                true,
+                false,
+                false,
+                false,
+                &[],
+                &[],
+                &[],
+                0,
+                1.0,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
+                &Default::default(),
+                0.0,
+                "discovered",
+                &discovery,
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+        let check = |m: &ModelRoute| {
+            assert_eq!(m.capacity_mode, "discovered");
+            assert_eq!(m.capacity_source, "kubernetes");
+            assert_eq!(m.capacity_namespace.as_deref(), Some("inference"));
+            assert_eq!(
+                m.capacity_selector.as_deref(),
+                Some("app=served,role!=worker")
+            );
+            assert_eq!(m.per_replica_max_in_flight, Some(8));
+            assert_eq!(m.capacity_headroom, 1.25);
+        };
+        check(&model);
+        check(&store.get_model(model.id).await.expect("get"));
+        check(&store.get_model_by_name(&name).await.expect("by name"));
+        check(
+            store
+                .list_models()
+                .await
+                .expect("list")
+                .iter()
+                .find(|m| m.id == model.id)
+                .expect("listed"),
+        );
+
+        let endpoint = store
+            .create_model_endpoint(
+                model.id,
+                "a",
+                "http://127.0.0.1:8082",
+                None,
+                0,
+                100,
+                true,
+                Some(16),
+            )
+            .await
+            .expect("create endpoint");
+        assert_eq!(endpoint.max_in_flight, Some(16));
+
+        let resolved = store
+            .all_resolved_models()
+            .await
+            .expect("resolved")
+            .into_iter()
+            .find(|(n, _)| n == &name)
+            .expect("present")
+            .1;
+        assert_eq!(resolved.capacity_mode, "discovered");
+        assert_eq!(resolved.capacity_source, "kubernetes");
+        assert_eq!(resolved.capacity_namespace.as_deref(), Some("inference"));
+        assert_eq!(resolved.per_replica_max_in_flight, Some(8));
+        assert_eq!(resolved.capacity_headroom, 1.25);
+        assert_eq!(resolved.max_in_flight, Some(6), "the static fallback");
+        assert_eq!(resolved.endpoints[0].max_in_flight, Some(16));
+
+        // A mode switch with no fields leaves them alone...
+        let m = store
+            .update_model_capacity_mode(model.id, "static", None)
+            .await
+            .expect("mode only");
+        assert_eq!(m.capacity_mode, "static");
+        assert_eq!(
+            m.capacity_selector.as_deref(),
+            Some("app=served,role!=worker")
+        );
+        // ...and with fields replaces them.
+        let m = store
+            .update_model_capacity_mode(
+                model.id,
+                "discovered",
+                Some(&obleth_config::capacity::DiscoveryFields {
+                    per_replica_max_in_flight: Some(4),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("mode and fields");
+        assert_eq!(m.capacity_source, "endpoints");
+        assert_eq!(m.capacity_namespace, None);
+        assert_eq!(m.capacity_selector, None);
+        assert_eq!(m.per_replica_max_in_flight, Some(4));
+        assert_eq!(m.capacity_headroom, 1.0);
+
+        // The columns' CHECK constraints hold whatever the caller sends.
+        let bad = sqlx::query("update models set capacity_mode = 'automatic' where id = $1")
+            .bind(model.id)
+            .execute(&store.pool)
+            .await;
+        assert!(bad.is_err(), "capacity_mode is a closed vocabulary");
+        let bad = sqlx::query("update models set capacity_headroom = 0 where id = $1")
+            .bind(model.id)
+            .execute(&store.pool)
+            .await;
+        assert!(bad.is_err(), "headroom must be above 0");
+
+        let updated = store
+            .update_model_endpoint(
+                model.id,
+                endpoint.id,
+                "a",
+                "http://127.0.0.1:8082",
+                None,
+                0,
+                100,
+                true,
+                None,
+            )
+            .await
+            .expect("update endpoint");
+        assert_eq!(updated.max_in_flight, None);
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` points at a
@@ -4231,6 +4516,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -4370,6 +4657,7 @@ mod tests {
                 0,
                 1,
                 true,
+                None,
             )
             .await
             .expect("create endpoint");
@@ -4554,6 +4842,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -4693,6 +4983,8 @@ mod tests {
                     "",
                     &Default::default(),
                     0.0,
+                    "static",
+                    &Default::default(),
                 )
                 .await
                 .expect("create model");
@@ -4701,7 +4993,16 @@ mod tests {
         }
         let (model_a, model_b) = (ids[0], ids[1]);
         let ep_b = store
-            .create_model_endpoint(model_b, "b", "http://127.0.0.1:8082", None, 0, 1, true)
+            .create_model_endpoint(
+                model_b,
+                "b",
+                "http://127.0.0.1:8082",
+                None,
+                0,
+                1,
+                true,
+                None,
+            )
             .await
             .expect("create endpoint");
 
@@ -4715,6 +5016,7 @@ mod tests {
                 0,
                 1,
                 true,
+                None,
             )
             .await
             .unwrap_err();
@@ -4741,6 +5043,7 @@ mod tests {
                 0,
                 1,
                 true,
+                None,
             )
             .await
             .expect("owner update");
@@ -4801,6 +5104,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -4815,6 +5120,7 @@ mod tests {
                 0,
                 1,
                 true,
+                None,
             )
             .await
             .expect("create endpoint");
@@ -5007,6 +5313,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -5082,6 +5390,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("update model");
@@ -5236,6 +5546,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -5343,6 +5655,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("model");
@@ -5451,6 +5765,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -5676,6 +5992,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -5775,6 +6093,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model with both grants");
@@ -5816,6 +6136,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model with kept grant");
@@ -5894,6 +6216,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -5973,6 +6297,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -6053,6 +6379,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -6149,6 +6477,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -6265,6 +6595,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -6367,6 +6699,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -6447,6 +6781,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -6548,6 +6884,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");
@@ -6619,6 +6957,8 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "static",
+                &Default::default(),
             )
             .await
             .expect("create model");

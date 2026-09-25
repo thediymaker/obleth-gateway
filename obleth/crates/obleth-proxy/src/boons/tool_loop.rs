@@ -1051,6 +1051,7 @@ mod tests {
             weight: 1,
             enabled: true,
             healthy: true,
+            max_in_flight: None,
         });
         let plan = ToolLoopPlan {
             tool_servers: HashMap::new(),

@@ -76,6 +76,8 @@ pub struct Config {
     /// How long a heartbeat counts a replica as live. A crashed replica stops
     /// being counted, and its share returns to the survivors, within this.
     pub fairshare_replica_ttl: Duration,
+    /// Settings for models in the `discovered` capacity mode.
+    pub capacity_discovery: CapacityDiscoveryConfig,
 
     /// Fail-open: keep serving from cache + buffer telemetry to WAL when
     /// Redis/ClickHouse are unavailable. Fail-closed rejects instead.
@@ -109,6 +111,72 @@ pub struct Config {
     pub auto_classifier_enabled: bool,
     pub auto_classifier_model: Option<String>,
     pub auto_classifier_timeout_ms: u64,
+}
+
+/// Capacity discovery: how the gateway derives the pool size of models in the
+/// `discovered` capacity mode from their live backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapacityDiscoveryConfig {
+    /// Run the discovery loop (`OBLETH_CAPACITY_DISCOVERY_ENABLED`, default
+    /// off). Off, a `discovered` model keeps its static `max_in_flight`.
+    pub enabled: bool,
+    /// How often each replica re-reads the sources
+    /// (`OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS`, default 15, at least 1).
+    pub interval: Duration,
+    /// Namespaces the `kubernetes` source may list pods in
+    /// (`OBLETH_CAPACITY_DISCOVERY_NAMESPACES`, comma-separated). Also the
+    /// namespaces searched for a model that names none. Empty leaves the
+    /// `kubernetes` source unavailable and no Kubernetes client is built.
+    pub namespaces: Vec<String>,
+    /// Selector template for `kubernetes`-source models that set no selector
+    /// (`OBLETH_CAPACITY_DEFAULT_SELECTOR`), with `{upstream_model}` and
+    /// `{model_name}` placeholders. Empty: such a model is refused.
+    pub default_selector: String,
+}
+
+impl CapacityDiscoveryConfig {
+    pub const DEFAULT_INTERVAL_SECS: u64 = 15;
+
+    pub fn from_env() -> Self {
+        Self::from_values(
+            env::var("OBLETH_CAPACITY_DISCOVERY_ENABLED")
+                .ok()
+                .as_deref(),
+            env::var("OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS")
+                .ok()
+                .as_deref(),
+            env::var("OBLETH_CAPACITY_DISCOVERY_NAMESPACES")
+                .ok()
+                .as_deref(),
+            env::var("OBLETH_CAPACITY_DEFAULT_SELECTOR").ok().as_deref(),
+        )
+    }
+
+    /// Build from raw env values. An unparseable or zero interval falls back
+    /// to the default.
+    pub fn from_values(
+        enabled: Option<&str>,
+        interval_secs: Option<&str>,
+        namespaces: Option<&str>,
+        default_selector: Option<&str>,
+    ) -> Self {
+        let secs = interval_secs
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(Self::DEFAULT_INTERVAL_SECS);
+        CapacityDiscoveryConfig {
+            enabled: lenient_bool(enabled, false),
+            interval: Duration::from_secs(secs),
+            namespaces: crate::capacity::parse_namespace_list(namespaces.unwrap_or_default()),
+            default_selector: default_selector.unwrap_or_default().trim().to_string(),
+        }
+    }
+}
+
+impl Default for CapacityDiscoveryConfig {
+    fn default() -> Self {
+        Self::from_values(None, None, None, None)
+    }
 }
 
 /// Slack alerting configuration. The webhook URL is intentionally redacted from
@@ -226,6 +294,7 @@ impl Config {
             fairshare_replica_aware: bool_or("OBLETH_FAIRSHARE_REPLICA_AWARE", true),
             fairshare_replica_heartbeat,
             fairshare_replica_ttl,
+            capacity_discovery: CapacityDiscoveryConfig::from_env(),
             fail_open: require_bool("OBLETH_FAIL_OPEN", true),
             wal_path: env_or("OBLETH_WAL_PATH", "./obleth-telemetry.wal"),
             model_health_enabled: bool_or("OBLETH_MODEL_HEALTH_ENABLED", true),
@@ -405,6 +474,30 @@ mod tests {
         assert_eq!(t.connect, Duration::from_millis(500));
         let t = RedisTimeouts::from_values(Some("nope"), None);
         assert_eq!(t, RedisTimeouts::default());
+    }
+
+    #[test]
+    fn capacity_discovery_is_off_by_default_and_parses_its_settings() {
+        let d = CapacityDiscoveryConfig::default();
+        assert!(!d.enabled);
+        assert_eq!(d.interval, Duration::from_secs(15));
+        assert!(d.namespaces.is_empty());
+        assert!(d.default_selector.is_empty());
+
+        let c = CapacityDiscoveryConfig::from_values(
+            Some("true"),
+            Some("30"),
+            Some(" llm, image ,llm"),
+            Some(" app={upstream_model} "),
+        );
+        assert!(c.enabled);
+        assert_eq!(c.interval, Duration::from_secs(30));
+        assert_eq!(c.namespaces, vec!["llm", "image"]);
+        assert_eq!(c.default_selector, "app={upstream_model}");
+
+        let c = CapacityDiscoveryConfig::from_values(Some("off"), Some("0"), None, None);
+        assert!(!c.enabled);
+        assert_eq!(c.interval, Duration::from_secs(15), "zero falls back");
     }
 
     #[test]

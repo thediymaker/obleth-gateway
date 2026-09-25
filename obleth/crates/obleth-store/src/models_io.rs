@@ -42,7 +42,8 @@ pub struct ModelImportOutcome {
 const MODEL_COLUMNS: &str = "id, model_name, aliases, description, upstream_model, api_base, api_key,
      upstream_headers, model_type, quantization, input_cost_per_token, output_cost_per_token, cost_per_image,
      cost_per_audio_second, cost_per_character, cost_per_video, context_window, admission_weight,
-     max_in_flight, capacity_mode, capacity_tuned_at, supports_function_calling,
+     max_in_flight, capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace,
+     capacity_selector, per_replica_max_in_flight, capacity_headroom, supports_function_calling,
      supports_system_messages, supports_response_schema, supports_tool_choice,
      supports_vision, enabled, cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
      request_timeout_secs, max_retries, retry_backoff_ms, endpoint_selection_mode,
@@ -50,6 +51,7 @@ const MODEL_COLUMNS: &str = "id, model_name, aliases, description, upstream_mode
      created_at, updated_at";
 
 const ENDPOINT_COLUMNS: &str = "id, model_id, name, api_base, api_key, priority, weight, enabled,
+     max_in_flight,
      health_status, consecutive_failures, alert_state,
      last_checked_at, last_latency_ms, last_http_status, last_message,
      created_at, updated_at";
@@ -78,10 +80,11 @@ impl Store {
                     endpoint_selection_mode, debug_diagnostics, energy_slots_per_node,
                     route_bias, auto_eligible,
                     draft_model, verify_api_base, verify_upstream_model, aliases, quantization,
-                    upstream_headers, cost_per_video
+                    upstream_headers, cost_per_video, capacity_namespace, capacity_selector,
+                    per_replica_max_in_flight, capacity_source, capacity_headroom
                  ) values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                     $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
-                    $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42)
+                    $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46, $47)
                  on conflict (model_name) do update set
                     description = excluded.description,
                     upstream_model = excluded.upstream_model,
@@ -123,6 +126,11 @@ impl Store {
                     quantization = excluded.quantization,
                     upstream_headers = excluded.upstream_headers,
                     cost_per_video = excluded.cost_per_video,
+                    capacity_namespace = excluded.capacity_namespace,
+                    capacity_selector = excluded.capacity_selector,
+                    per_replica_max_in_flight = excluded.per_replica_max_in_flight,
+                    capacity_source = excluded.capacity_source,
+                    capacity_headroom = excluded.capacity_headroom,
                     updated_at = now()
                  returning {MODEL_COLUMNS}, (xmax = 0) as inserted"
             );
@@ -174,6 +182,15 @@ impl Store {
                 .bind(obleth_config::normalize_quantization(&c.quantization))
                 .bind(crate::encrypt_upstream_headers(&c.upstream_headers))
                 .bind(c.cost_per_video.max(0.0))
+                .bind(obleth_config::capacity::normalize_optional_text(
+                    c.capacity_namespace.as_deref(),
+                ))
+                .bind(obleth_config::capacity::normalize_optional_text(
+                    c.capacity_selector.as_deref(),
+                ))
+                .bind(c.per_replica_max_in_flight.map(|n| n.max(1)))
+                .bind(&c.capacity_source)
+                .bind(c.capacity_headroom)
                 .fetch_one(&mut *tx)
                 .await?;
 
@@ -187,14 +204,16 @@ impl Store {
                     for e in list {
                         let sql = format!(
                             "insert into model_endpoints
-                                (id, model_id, name, api_base, api_key, priority, weight, enabled)
-                             values ($1, $2, $3, $4, $5, $6, $7, $8)
+                                (id, model_id, name, api_base, api_key, priority, weight, enabled,
+                                 max_in_flight)
+                             values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
                              on conflict (model_id, name) do update set
                                 api_base = excluded.api_base,
                                 api_key = excluded.api_key,
                                 priority = excluded.priority,
                                 weight = excluded.weight,
                                 enabled = excluded.enabled,
+                                max_in_flight = excluded.max_in_flight,
                                 updated_at = now()
                              returning {ENDPOINT_COLUMNS}"
                         );
@@ -207,6 +226,7 @@ impl Store {
                             .bind(e.priority)
                             .bind(e.weight)
                             .bind(e.enabled)
+                            .bind(e.max_in_flight.map(|n| n.max(1)))
                             .fetch_one(&mut *tx)
                             .await?;
                         written.push(endpoint_from_row(&row)?);

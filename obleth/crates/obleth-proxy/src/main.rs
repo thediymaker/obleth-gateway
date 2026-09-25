@@ -523,6 +523,9 @@ async fn main() -> anyhow::Result<()> {
                     as std::pin::Pin<Box<dyn std::future::Future<Output = router::Intent> + Send>>
             }
         })),
+        capacity_discovery: obleth_admin::capacity_discovery::CapacityDiscovery::new(
+            cfg.capacity_discovery.clone(),
+        ),
     };
     obleth_admin::model_health::spawn_worker(admin_state.clone());
     obleth_admin::usage_retention::spawn_worker(admin_state.clone());
@@ -1430,6 +1433,12 @@ mod registry_refresh_tests {
             quantization: obleth_config::DEFAULT_QUANTIZATION.to_string(),
             admission_weight: 100,
             max_in_flight: None,
+            capacity_mode: "static".into(),
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_selector: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             enabled: true,
             cache_enabled: false,
             cache_ttl_secs: 0,

@@ -132,7 +132,8 @@ impl Store {
                     input_cost_per_token, output_cost_per_token, cost_per_image,
                     cost_per_audio_second, cost_per_character, cost_per_video, context_window,
                     admission_weight, max_in_flight, capacity_mode, capacity_tuned_at,
-                    supports_function_calling,
+                    capacity_source, capacity_namespace, capacity_selector,
+                    per_replica_max_in_flight, capacity_headroom, supports_function_calling,
                     supports_system_messages, supports_response_schema, supports_tool_choice,
                     supports_vision, enabled, cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
                     route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model, request_timeout_secs, max_retries, retry_backoff_ms,
@@ -149,7 +150,8 @@ impl Store {
         .collect::<Result<Vec<_>>>()?;
 
         let model_endpoints = sqlx::query(
-            "select id, model_id, name, api_base, api_key, priority, weight, enabled, created_at
+            "select id, model_id, name, api_base, api_key, priority, weight, enabled,
+                    max_in_flight, created_at
              from model_endpoints order by created_at",
         )
         .fetch_all(&self.pool)
@@ -165,6 +167,7 @@ impl Store {
                 priority: row.try_get("priority")?,
                 weight: row.try_get("weight")?,
                 enabled: row.try_get("enabled")?,
+                max_in_flight: row.try_get("max_in_flight").unwrap_or(None),
                 created_at: row.try_get("created_at")?,
             })
         })
@@ -396,11 +399,12 @@ impl Store {
                         health_failure_threshold, health_maintenance_until,
                         health_maintenance_note, created_at,
                         debug_diagnostics, energy_slots_per_node, aliases, quantization,
-                        upstream_headers, cost_per_video)
+                        upstream_headers, cost_per_video, capacity_namespace, capacity_selector,
+                        per_replica_max_in_flight, capacity_source, capacity_headroom)
                  values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
                         $17, $18, $19, $20, $21, $22, $23, $24, $25, $26, $27, $28, $29, $30, $31,
                         $32, $33, $34, $35, $36, $37, $38, $39, $40, $41, $42, $43, $44, $45, $46,
-                        $47, $48, $49, $50)
+                        $47, $48, $49, $50, $51, $52, $53, $54, $55)
                  on conflict (id) do update set
                         model_name = excluded.model_name,
                         description = excluded.description,
@@ -450,6 +454,11 @@ impl Store {
                         quantization = excluded.quantization,
                         upstream_headers = excluded.upstream_headers,
                         cost_per_video = excluded.cost_per_video,
+                        capacity_namespace = excluded.capacity_namespace,
+                        capacity_selector = excluded.capacity_selector,
+                        per_replica_max_in_flight = excluded.per_replica_max_in_flight,
+                        capacity_source = excluded.capacity_source,
+                        capacity_headroom = excluded.capacity_headroom,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -515,6 +524,28 @@ impl Store {
                     .collect::<std::collections::BTreeMap<_, _>>(),
             ))
             .bind(m.cost_per_video.max(0.0))
+            .bind(obleth_config::capacity::normalize_optional_text(
+                m.capacity_namespace.as_deref(),
+            ))
+            .bind(obleth_config::capacity::normalize_optional_text(
+                m.capacity_selector.as_deref(),
+            ))
+            .bind(m.per_replica_max_in_flight.filter(|n| *n >= 1))
+            .bind(
+                if obleth_config::is_valid_capacity_source(&m.capacity_source) {
+                    m.capacity_source.as_str()
+                } else {
+                    obleth_config::DEFAULT_CAPACITY_SOURCE
+                },
+            )
+            .bind(
+                if obleth_config::capacity::validate_capacity_headroom(m.capacity_headroom).is_ok()
+                {
+                    m.capacity_headroom
+                } else {
+                    1.0
+                },
+            )
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -524,8 +555,8 @@ impl Store {
         for e in &data.model_endpoints {
             let row = sqlx::query(
                 "insert into model_endpoints (id, model_id, name, api_base, api_key, priority,
-                        weight, enabled, created_at)
-                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                        weight, enabled, created_at, max_in_flight)
+                 values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                  on conflict (id) do update set
                         model_id = excluded.model_id,
                         name = excluded.name,
@@ -534,6 +565,7 @@ impl Store {
                         priority = excluded.priority,
                         weight = excluded.weight,
                         enabled = excluded.enabled,
+                        max_in_flight = excluded.max_in_flight,
                         updated_at = now()
                  returning (xmax = 0) as inserted",
             )
@@ -546,6 +578,7 @@ impl Store {
             .bind(e.weight)
             .bind(e.enabled)
             .bind(e.created_at)
+            .bind(e.max_in_flight.filter(|n| *n >= 1))
             .fetch_one(&mut *tx)
             .await
             .map_err(restore_db_error)?;
@@ -710,6 +743,13 @@ fn model_backup_from_row(row: &PgRow) -> Result<ModelBackup> {
         max_in_flight: row.try_get("max_in_flight")?,
         capacity_mode: row.try_get("capacity_mode")?,
         capacity_tuned_at: row.try_get("capacity_tuned_at")?,
+        capacity_source: row
+            .try_get::<String, _>("capacity_source")
+            .unwrap_or_else(|_| obleth_config::DEFAULT_CAPACITY_SOURCE.to_string()),
+        capacity_namespace: row.try_get("capacity_namespace").unwrap_or(None),
+        capacity_selector: row.try_get("capacity_selector").unwrap_or(None),
+        per_replica_max_in_flight: row.try_get("per_replica_max_in_flight").unwrap_or(None),
+        capacity_headroom: row.try_get("capacity_headroom").unwrap_or(1.0),
         supports_function_calling: row.try_get("supports_function_calling")?,
         supports_system_messages: row.try_get("supports_system_messages")?,
         supports_response_schema: row.try_get("supports_response_schema")?,
@@ -864,11 +904,32 @@ mod tests {
                 "",
                 &Default::default(),
                 0.0,
+                "discovered",
+                &obleth_config::capacity::DiscoveryFields {
+                    source: "kubernetes".into(),
+                    namespace: Some("inference".into()),
+                    selector: Some("app=upstream-model".into()),
+                    per_replica_max_in_flight: Some(8),
+                    headroom: 1.5,
+                },
             )
             .await
             .expect("create model");
         fixtures.track_model(model.id);
         assert_eq!(model.route_bias, 2.5);
+        let endpoint = store
+            .create_model_endpoint(
+                model.id,
+                "a",
+                "http://127.0.0.1:8082",
+                None,
+                0,
+                100,
+                true,
+                Some(12),
+            )
+            .await
+            .expect("create endpoint");
 
         // Export carries the stored hash and the tenant config.
         let data = store.export_backup_data().await.expect("export");
@@ -908,6 +969,22 @@ mod tests {
             .execute(&store.pool)
             .await
             .expect("drift route_bias and auto_eligible");
+        // And its capacity discovery fields, and the endpoint's concurrency.
+        sqlx::query(
+            "update models set capacity_mode = 'static', capacity_source = 'endpoints',
+                    capacity_namespace = null, capacity_selector = null,
+                    per_replica_max_in_flight = null, capacity_headroom = 1
+             where id = $1",
+        )
+        .bind(model.id)
+        .execute(&store.pool)
+        .await
+        .expect("drift capacity fields");
+        sqlx::query("update model_endpoints set max_in_flight = null where id = $1")
+            .bind(endpoint.id)
+            .execute(&store.pool)
+            .await
+            .expect("drift endpoint concurrency");
         let report = store.restore_backup_data(&data).await.expect("restore");
         assert!(report.tenants.updated >= 1);
         let restored_model = store.get_model(model.id).await.expect("get model");
@@ -920,6 +997,23 @@ mod tests {
             "restore must not re-include a model the backup had excluded"
         );
         assert_eq!(restored_model.tags, vec!["coding:3".to_string()]);
+        assert_eq!(restored_model.capacity_mode, "discovered");
+        assert_eq!(restored_model.capacity_source, "kubernetes");
+        assert_eq!(
+            restored_model.capacity_namespace.as_deref(),
+            Some("inference")
+        );
+        assert_eq!(
+            restored_model.capacity_selector.as_deref(),
+            Some("app=upstream-model")
+        );
+        assert_eq!(restored_model.per_replica_max_in_flight, Some(8));
+        assert_eq!(restored_model.capacity_headroom, 1.5);
+        let restored_endpoint = store
+            .get_model_endpoint(endpoint.id)
+            .await
+            .expect("get endpoint");
+        assert_eq!(restored_endpoint.max_in_flight, Some(12));
         assert_eq!(report.tenants.inserted, 0);
         let restored = store.get_tenant(tenant.id).await.expect("get tenant");
         assert_eq!(restored.weight, 250);

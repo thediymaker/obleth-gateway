@@ -1853,7 +1853,7 @@ async fn model_caps_set_from_outside_resize_the_pool() {
     assert_eq!(snap.pools[0].cap, 1);
 
     // Under the share again, the waiter gets its slot.
-    permits.truncate(0);
+    permits.clear();
     tokio::time::timeout(Duration::from_secs(1), waiter)
         .await
         .expect("dispatched once under the new size")

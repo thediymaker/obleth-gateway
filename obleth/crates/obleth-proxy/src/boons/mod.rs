@@ -1357,6 +1357,12 @@ mod tests {
             model_type: "chat".to_string(),
             admission_weight: 1,
             max_in_flight: None,
+            capacity_mode: "static".into(),
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_selector: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             enabled: true,
             cache_enabled: false,
             cache_ttl_secs: 0,
@@ -1739,6 +1745,7 @@ mod tests {
             weight: 1,
             enabled: true,
             healthy,
+            max_in_flight: None,
         }
     }
 

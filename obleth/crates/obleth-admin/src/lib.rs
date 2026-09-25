@@ -9,6 +9,7 @@
 pub mod alerts;
 pub mod autotune;
 mod backup;
+pub mod capacity_discovery;
 pub mod energy_probe;
 mod error;
 pub mod knowledge;
@@ -73,6 +74,17 @@ pub(crate) fn audit_actor(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "admin".to_string())
 }
 
+/// Serde helper for a patch field that tells "absent" (keep) from `null`
+/// (clear): use with `#[serde(default, deserialize_with = "nullable")]` on an
+/// `Option<Option<T>>`.
+fn nullable<'de, D, T>(d: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
 /// Shared state for the Management API. All fields are cheap-clone handles.
 #[derive(Clone)]
 pub struct AdminState {
@@ -115,6 +127,9 @@ pub struct AdminState {
     /// proxy; `None` (a standalone admin process) means simulate stays
     /// heuristic-only and says so.
     pub classify: Option<ClassifyFn>,
+    /// The gateway's capacity discovery: its settings, which model writes are
+    /// checked against.
+    pub capacity_discovery: capacity_discovery::CapacityDiscovery,
 }
 
 /// A boxed call into the data plane's classifier: `(prompt, available_tags)`
@@ -837,6 +852,29 @@ pub struct CreateModel {
     pub context_window: Option<i64>,
     pub admission_weight: Option<i64>,
     pub max_in_flight: Option<i64>,
+    /// `static` (default), `tuned` or `discovered`. In `discovered` mode the
+    /// pool size follows the live backend and `max_in_flight` is the fallback.
+    #[serde(default)]
+    pub capacity_mode: Option<String>,
+    /// `discovered` mode: `endpoints` (default) or `kubernetes`.
+    #[serde(default)]
+    pub capacity_source: Option<String>,
+    /// `kubernetes` source: namespace of the backend pods. Omitted searches
+    /// the gateway's `OBLETH_CAPACITY_DISCOVERY_NAMESPACES`.
+    #[serde(default)]
+    pub capacity_namespace: Option<String>,
+    /// `kubernetes` source: label selector for the serving pods. Omitted uses
+    /// the gateway's `OBLETH_CAPACITY_DEFAULT_SELECTOR`.
+    #[serde(default)]
+    pub capacity_selector: Option<String>,
+    /// Requests one serving replica takes. Omitted reads a known concurrency
+    /// flag off the serving container (`kubernetes`) or uses each endpoint's
+    /// `max_in_flight` (`endpoints`).
+    #[serde(default)]
+    pub per_replica_max_in_flight: Option<i64>,
+    /// Multiplier on the derived pool size (default 1.0).
+    #[serde(default)]
+    pub capacity_headroom: Option<f64>,
     pub supports_function_calling: Option<bool>,
     pub supports_system_messages: Option<bool>,
     pub supports_response_schema: Option<bool>,
@@ -912,6 +950,27 @@ pub struct UpdateModel {
     pub context_window: Option<i64>,
     pub admission_weight: Option<i64>,
     pub max_in_flight: Option<i64>,
+    /// `static`, `tuned` or `discovered`; omitted leaves it unchanged.
+    #[serde(default)]
+    pub capacity_mode: Option<String>,
+    /// `endpoints` or `kubernetes`; omitted leaves it unchanged.
+    #[serde(default)]
+    pub capacity_source: Option<String>,
+    /// Omitted leaves it unchanged; `null` or `""` clears it.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<String>)]
+    pub capacity_namespace: Option<Option<String>>,
+    /// Omitted leaves it unchanged; `null` or `""` clears it.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<String>)]
+    pub capacity_selector: Option<Option<String>>,
+    /// Omitted leaves it unchanged; `null` clears it.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub per_replica_max_in_flight: Option<Option<i64>>,
+    /// Omitted leaves it unchanged.
+    #[serde(default)]
+    pub capacity_headroom: Option<f64>,
     pub supports_function_calling: Option<bool>,
     pub supports_system_messages: Option<bool>,
     pub supports_response_schema: Option<bool>,
@@ -996,6 +1055,11 @@ pub struct CreateModelEndpoint {
     pub weight: i64,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Requests this endpoint takes at once, for a `discovered` model using
+    /// the `endpoints` source. Omitted uses the model's
+    /// `per_replica_max_in_flight`.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1011,6 +1075,10 @@ pub struct UpdateModelEndpoint {
     pub weight: i64,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Omitted keeps the stored value; `null` clears it.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub max_in_flight: Option<Option<i64>>,
 }
 
 fn default_endpoint_priority() -> i64 {
@@ -1099,6 +1167,21 @@ pub struct SetModelCapacity {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetModelCapacityMode {
     pub capacity_mode: String,
+    /// The `discovered`-mode fields, with the same rules as on
+    /// `PUT /api/v1/models/{id}`: omitted leaves a field unchanged.
+    #[serde(default)]
+    pub capacity_source: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<String>)]
+    pub capacity_namespace: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<String>)]
+    pub capacity_selector: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub per_replica_max_in_flight: Option<Option<i64>>,
+    #[serde(default)]
+    pub capacity_headroom: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1596,6 +1679,22 @@ pub struct ModelRouteView {
     /// When the tuned `max_in_flight` was last written by auto-tune. `None`
     /// until the model has been tuned.
     pub capacity_tuned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `discovered` mode: where serving replicas are counted, `endpoints`
+    /// (the model's enabled, healthy endpoints) or `kubernetes` (Ready pods).
+    pub capacity_source: String,
+    /// `kubernetes` source: namespace of the backend pods. `None` searches
+    /// the gateway's `OBLETH_CAPACITY_DISCOVERY_NAMESPACES`.
+    pub capacity_namespace: Option<String>,
+    /// `kubernetes` source: label selector for the serving pods. `None` uses
+    /// the gateway's `OBLETH_CAPACITY_DEFAULT_SELECTOR`.
+    pub capacity_selector: Option<String>,
+    /// Requests one serving replica takes. `None` reads a known concurrency
+    /// flag off the serving container (`kubernetes`) or each endpoint's
+    /// `max_in_flight` (`endpoints`).
+    pub per_replica_max_in_flight: Option<i64>,
+    /// Multiplier on the derived pool size; `1.0` is exactly the ready
+    /// capacity.
+    pub capacity_headroom: f64,
     pub supports_function_calling: bool,
     pub supports_system_messages: bool,
     pub supports_response_schema: bool,
@@ -1717,6 +1816,11 @@ impl From<ModelRoute> for ModelRouteView {
             max_in_flight,
             capacity_mode,
             capacity_tuned_at,
+            capacity_source,
+            capacity_namespace,
+            capacity_selector,
+            per_replica_max_in_flight,
+            capacity_headroom,
             supports_function_calling,
             supports_system_messages,
             supports_response_schema,
@@ -1764,6 +1868,11 @@ impl From<ModelRoute> for ModelRouteView {
             max_in_flight,
             capacity_mode,
             capacity_tuned_at,
+            capacity_source,
+            capacity_namespace,
+            capacity_selector,
+            per_replica_max_in_flight,
+            capacity_headroom,
             supports_function_calling,
             supports_system_messages,
             supports_response_schema,
@@ -1806,6 +1915,10 @@ pub struct ModelEndpointView {
     pub priority: i64,
     pub weight: i64,
     pub enabled: bool,
+    /// Requests this endpoint takes at once, counted by a `discovered` model
+    /// using the `endpoints` source. `None` uses the model's
+    /// `per_replica_max_in_flight`.
+    pub max_in_flight: Option<i64>,
     pub health_status: String,
     pub consecutive_failures: i64,
     pub alert_state: String,
@@ -1828,6 +1941,7 @@ impl From<ModelEndpoint> for ModelEndpointView {
             priority,
             weight,
             enabled,
+            max_in_flight,
             health_status,
             consecutive_failures,
             alert_state,
@@ -1847,6 +1961,7 @@ impl From<ModelEndpoint> for ModelEndpointView {
             priority,
             weight,
             enabled,
+            max_in_flight,
             health_status,
             consecutive_failures,
             alert_state,
@@ -5346,6 +5461,62 @@ async fn validate_aliases(
     Ok(aliases)
 }
 
+/// Validate a capacity mode against the fixed vocabulary, returning its
+/// canonical form. Rejected rather than normalized: a typo must not quietly
+/// turn a model back to `static`.
+fn validate_capacity_mode(raw: &str) -> Result<String> {
+    let m = raw.trim().to_ascii_lowercase();
+    if !obleth_config::is_valid_capacity_mode(&m) {
+        return Err(AdminError::BadRequest(format!(
+            "invalid capacity_mode `{raw}` (expected one of: {})",
+            obleth_config::CAPACITY_MODES.join(", ")
+        )));
+    }
+    Ok(m)
+}
+
+/// The stored discovery fields with a patch applied: an omitted field keeps
+/// its value, a `null` (or blank text) clears it.
+fn patch_discovery_fields(
+    existing: &ModelRoute,
+    source: Option<&str>,
+    namespace: Option<&Option<String>>,
+    selector: Option<&Option<String>>,
+    per_replica_max_in_flight: Option<Option<i64>>,
+    headroom: Option<f64>,
+) -> obleth_config::capacity::DiscoveryFields {
+    let current = obleth_config::capacity::DiscoveryFields::of(existing);
+    obleth_config::capacity::DiscoveryFields {
+        source: source.map(str::to_string).unwrap_or(current.source),
+        namespace: namespace.cloned().unwrap_or(current.namespace),
+        selector: selector.cloned().unwrap_or(current.selector),
+        per_replica_max_in_flight: per_replica_max_in_flight
+            .unwrap_or(current.per_replica_max_in_flight),
+        headroom: headroom.unwrap_or(current.headroom),
+    }
+    .normalized()
+}
+
+/// Check a model's capacity fields, and for a `discovered` model on the
+/// `kubernetes` source that this gateway can read it (see
+/// [`obleth_config::capacity::validate_discovery_fields`]).
+fn validate_capacity_fields(
+    state: &AdminState,
+    capacity_mode: &str,
+    model_name: &str,
+    upstream_model: &str,
+    fields: &obleth_config::capacity::DiscoveryFields,
+) -> Result<()> {
+    obleth_config::capacity::validate_discovery_fields(
+        model_name,
+        upstream_model,
+        fields,
+        capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE,
+        state.capacity_discovery.policy(),
+    )
+    .map_err(AdminError::BadRequest)
+}
+
 #[utoipa::path(
     post, path = "/api/v1/models", tag = "models",
     request_body = CreateModel,
@@ -5376,6 +5547,29 @@ async fn create_model(
             .map_err(AdminError::BadRequest)?,
         None => Default::default(),
     };
+    let capacity_mode = validate_capacity_mode(
+        body.capacity_mode
+            .as_deref()
+            .unwrap_or(obleth_config::DEFAULT_CAPACITY_MODE),
+    )?;
+    let discovery = obleth_config::capacity::DiscoveryFields {
+        source: body
+            .capacity_source
+            .clone()
+            .unwrap_or_else(|| obleth_config::DEFAULT_CAPACITY_SOURCE.to_string()),
+        namespace: body.capacity_namespace.clone(),
+        selector: body.capacity_selector.clone(),
+        per_replica_max_in_flight: body.per_replica_max_in_flight,
+        headroom: body.capacity_headroom.unwrap_or(1.0),
+    }
+    .normalized();
+    validate_capacity_fields(
+        &state,
+        &capacity_mode,
+        body.model_name.trim(),
+        &body.upstream_model,
+        &discovery,
+    )?;
     let model = state
         .store
         .create_model(
@@ -5411,6 +5605,8 @@ async fn create_model(
             &quantization,
             &upstream_headers,
             body.cost_per_video.unwrap_or(0.0),
+            &capacity_mode,
+            &discovery,
         )
         .await?;
     if state.health.default_interval_secs != 900 {
@@ -5495,6 +5691,25 @@ async fn update_model(
             .map_err(AdminError::BadRequest)?,
         None => existing.upstream_headers.clone(),
     };
+    let capacity_mode = match body.capacity_mode.as_deref() {
+        Some(m) => validate_capacity_mode(m)?,
+        None => existing.capacity_mode.clone(),
+    };
+    let discovery = patch_discovery_fields(
+        &existing,
+        body.capacity_source.as_deref(),
+        body.capacity_namespace.as_ref(),
+        body.capacity_selector.as_ref(),
+        body.per_replica_max_in_flight,
+        body.capacity_headroom,
+    );
+    validate_capacity_fields(
+        &state,
+        &capacity_mode,
+        &existing.model_name,
+        &body.upstream_model,
+        &discovery,
+    )?;
     let model = state
         .store
         .update_model(
@@ -5547,6 +5762,8 @@ async fn update_model(
             &quantization,
             &upstream_headers,
             body.cost_per_video.unwrap_or(existing.cost_per_video),
+            &capacity_mode,
+            &discovery,
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -5611,15 +5828,26 @@ async fn set_model_capacity_mode(
     headers: HeaderMap,
     Json(body): Json<SetModelCapacityMode>,
 ) -> Result<Json<ModelRouteView>> {
-    if !obleth_config::is_valid_capacity_mode(body.capacity_mode.trim()) {
-        return Err(AdminError::BadRequest(format!(
-            "invalid capacity_mode `{}` (expected `static` or `tuned`)",
-            body.capacity_mode
-        )));
-    }
+    let capacity_mode = validate_capacity_mode(&body.capacity_mode)?;
+    let existing = state.store.get_model(id).await?;
+    let discovery = patch_discovery_fields(
+        &existing,
+        body.capacity_source.as_deref(),
+        body.capacity_namespace.as_ref(),
+        body.capacity_selector.as_ref(),
+        body.per_replica_max_in_flight,
+        body.capacity_headroom,
+    );
+    validate_capacity_fields(
+        &state,
+        &capacity_mode,
+        &existing.model_name,
+        &existing.upstream_model,
+        &discovery,
+    )?;
     let model = state
         .store
-        .update_model_capacity_mode(id, &body.capacity_mode)
+        .update_model_capacity_mode(id, &capacity_mode, Some(&discovery))
         .await?;
     sync_model(&state, &model).await?;
     state
@@ -5629,7 +5857,14 @@ async fn set_model_capacity_mode(
             "set_model_capacity_mode",
             "model",
             &id.to_string(),
-            serde_json::json!({ "capacity_mode": model.capacity_mode }),
+            serde_json::json!({
+                "capacity_mode": model.capacity_mode,
+                "capacity_source": model.capacity_source,
+                "capacity_namespace": model.capacity_namespace,
+                "capacity_selector": model.capacity_selector,
+                "per_replica_max_in_flight": model.per_replica_max_in_flight,
+                "capacity_headroom": model.capacity_headroom,
+            }),
         )
         .await?;
     Ok(Json(model.into()))
@@ -5839,6 +6074,17 @@ async fn list_model_endpoints(
     Ok(Json(views(state.store.list_model_endpoints(id).await?)))
 }
 
+/// An endpoint's own concurrency, when given, has the same bounds as a
+/// model's `per_replica_max_in_flight`.
+fn validate_endpoint_max_in_flight(value: Option<i64>) -> Result<()> {
+    obleth_config::capacity::validate_per_replica_max_in_flight(value).map_err(|_| {
+        AdminError::BadRequest(format!(
+            "max_in_flight must be between 1 and {}",
+            obleth_config::capacity::MAX_PER_REPLICA_MAX_IN_FLIGHT
+        ))
+    })
+}
+
 #[utoipa::path(
     post, path = "/api/v1/models/{id}/endpoints", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
@@ -5852,6 +6098,7 @@ async fn create_model_endpoint(
     Json(body): Json<CreateModelEndpoint>,
 ) -> Result<Json<ModelEndpointView>> {
     state.ssrf.validate(&body.api_base).await?;
+    validate_endpoint_max_in_flight(body.max_in_flight)?;
     let model = state.store.get_model(id).await?;
     let endpoint = state
         .store
@@ -5863,6 +6110,7 @@ async fn create_model_endpoint(
             body.priority,
             body.weight,
             body.enabled,
+            body.max_in_flight,
         )
         .await?;
     sync_model(&state, &model).await?;
@@ -5900,6 +6148,19 @@ async fn update_model_endpoint(
 ) -> Result<Json<ModelEndpointView>> {
     state.ssrf.validate(&body.api_base).await?;
     let model = state.store.get_model(id).await?;
+    let max_in_flight = match body.max_in_flight {
+        Some(v) => v,
+        // Omitted keeps the stored value. An id outside this model finds
+        // nothing here and is refused by the scoped update below.
+        None => state
+            .store
+            .list_model_endpoints(model.id)
+            .await?
+            .into_iter()
+            .find(|e| e.id == endpoint_id)
+            .and_then(|e| e.max_in_flight),
+    };
+    validate_endpoint_max_in_flight(max_in_flight)?;
     let endpoint = state
         .store
         // Scoped to the path model: another model's endpoint id is a 404.
@@ -5912,6 +6173,7 @@ async fn update_model_endpoint(
             body.priority,
             body.weight,
             body.enabled,
+            max_in_flight,
         )
         .await?;
     sync_model(&state, &model).await?;
@@ -6634,6 +6896,15 @@ async fn sync_model_from(
         quantization: model.quantization.clone(),
         admission_weight: model.admission_weight,
         max_in_flight: model.max_in_flight.and_then(|n| usize::try_from(n).ok()),
+        capacity_mode: model.capacity_mode.clone(),
+        capacity_source: model.capacity_source.clone(),
+        capacity_namespace: model.capacity_namespace.clone(),
+        capacity_selector: model.capacity_selector.clone(),
+        per_replica_max_in_flight: model
+            .per_replica_max_in_flight
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0),
+        capacity_headroom: model.capacity_headroom,
         enabled: model.enabled,
         cache_enabled: model.cache_enabled,
         cache_ttl_secs: model.cache_ttl_secs,
@@ -6910,6 +7181,8 @@ mod tests {
                     "",
                     &Default::default(),
                     0.0,
+                    "static",
+                    &Default::default(),
                 )
                 .await
                 .expect("create fixture model")
@@ -6941,6 +7214,25 @@ mod tests {
         /// [`test_admin_app`] against an explicit Redis URL (e.g. a
         /// restricted ACL user, to inject cache failures).
         pub(super) async fn test_admin_app_on(redis_url: &str) -> Option<TestApp> {
+            test_admin_app_with(redis_url, capacity_discovery::CapacityDiscovery::disabled()).await
+        }
+
+        /// [`test_admin_app`] with the gateway's capacity discovery settings.
+        pub(super) async fn test_admin_app_discovering(
+            discovery: obleth_config::CapacityDiscoveryConfig,
+        ) -> Option<TestApp> {
+            let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
+            test_admin_app_with(
+                &redis_url,
+                capacity_discovery::CapacityDiscovery::new(discovery),
+            )
+            .await
+        }
+
+        async fn test_admin_app_with(
+            redis_url: &str,
+            capacity_discovery: capacity_discovery::CapacityDiscovery,
+        ) -> Option<TestApp> {
             let db_url = test_db_url()?;
 
             // Taken before the first database touch (`migrate()` runs DDL) and
@@ -6974,6 +7266,7 @@ mod tests {
                 admin_token: TEST_ADMIN_TOKEN.to_string(),
                 output_stats: Default::default(),
                 classify: None,
+                capacity_discovery,
                 health: ModelHealthRuntime {
                     scheduled_enabled: false,
                     default_interval_secs: 60,
@@ -7026,8 +7319,222 @@ mod tests {
     }
 
     use harness::{
-        fixture_model, send, simulate_request, test_admin_app, test_admin_app_on, TEST_ADMIN_TOKEN,
+        fixture_model, send, simulate_request, test_admin_app, test_admin_app_discovering,
+        test_admin_app_on, TEST_ADMIN_TOKEN,
     };
+
+    fn json_request(
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("build request")
+    }
+
+    /// The discovered mode's fields go through create, update and the
+    /// capacity-mode endpoint with their patch rules, and a `kubernetes`
+    /// source this gateway cannot read is refused when the model is written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn discovered_capacity_fields_are_validated_and_patched() {
+        let Some(t) = test_admin_app_discovering(obleth_config::CapacityDiscoveryConfig {
+            enabled: true,
+            interval: std::time::Duration::from_secs(15),
+            namespaces: vec!["inference".into()],
+            default_selector: "app.example.com/model={upstream_model}".into(),
+        })
+        .await
+        else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let name = format!("disc-{}", Uuid::new_v4());
+        let base = serde_json::json!({
+            "model_name": name,
+            "upstream_model": "served-model",
+            "api_base": "http://127.0.0.1:9/v1",
+        });
+        let with = |extra: serde_json::Value| {
+            let mut b = base.clone();
+            for (k, v) in extra.as_object().unwrap() {
+                b[k] = v.clone();
+            }
+            b
+        };
+
+        // Refused: a namespace outside the allowlist, a bad selector, an
+        // unknown source or mode, a zero per-replica value.
+        for (bad, why) in [
+            (
+                serde_json::json!({"capacity_mode": "discovered", "capacity_source": "kubernetes",
+                                   "capacity_namespace": "kube-system"}),
+                "OBLETH_CAPACITY_DISCOVERY_NAMESPACES",
+            ),
+            (
+                serde_json::json!({"capacity_mode": "discovered", "capacity_source": "kubernetes",
+                                   "capacity_selector": "app in (a"}),
+                "capacity_selector",
+            ),
+            (
+                serde_json::json!({"capacity_mode": "discovered", "capacity_source": "prometheus"}),
+                "capacity_source",
+            ),
+            (
+                serde_json::json!({"capacity_mode": "automatic"}),
+                "capacity_mode",
+            ),
+            (
+                serde_json::json!({"per_replica_max_in_flight": 0}),
+                "per_replica_max_in_flight",
+            ),
+            (
+                serde_json::json!({"capacity_headroom": 50.0}),
+                "capacity_headroom",
+            ),
+        ] {
+            let (status, body) =
+                send(&t.app, json_request("POST", "/api/v1/models", with(bad))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.to_string().contains(why), "{why}: {body}");
+        }
+
+        // Accepted: the default selector template renders for this model.
+        let (status, created) = send(
+            &t.app,
+            json_request(
+                "POST",
+                "/api/v1/models",
+                with(serde_json::json!({
+                    "capacity_mode": "discovered",
+                    "capacity_source": "kubernetes",
+                    "capacity_namespace": " inference ",
+                    "per_replica_max_in_flight": 8,
+                    "capacity_headroom": 1.25,
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["capacity_mode"], "discovered");
+        assert_eq!(created["capacity_source"], "kubernetes");
+        assert_eq!(created["capacity_namespace"], "inference");
+        assert_eq!(created["capacity_selector"], serde_json::Value::Null);
+        assert_eq!(created["per_replica_max_in_flight"], 8);
+        assert_eq!(created["capacity_headroom"], 1.25);
+        let id = created["id"].as_str().unwrap().to_string();
+
+        // Update: omitted fields are kept, null clears, "" clears text.
+        let (status, updated) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}"),
+                serde_json::json!({
+                    "upstream_model": "served-model",
+                    "api_base": "http://127.0.0.1:9/v1",
+                    "capacity_selector": "app=served-model,role!=worker",
+                    "per_replica_max_in_flight": null,
+                    "capacity_namespace": "",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["capacity_mode"], "discovered", "kept");
+        assert_eq!(updated["capacity_headroom"], 1.25, "kept");
+        assert_eq!(
+            updated["capacity_selector"],
+            "app=served-model,role!=worker"
+        );
+        assert_eq!(
+            updated["per_replica_max_in_flight"],
+            serde_json::Value::Null
+        );
+        assert_eq!(updated["capacity_namespace"], serde_json::Value::Null);
+
+        // An upstream name the template cannot use needs its own selector.
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}"),
+                serde_json::json!({
+                    "upstream_model": "org/served-model",
+                    "api_base": "http://127.0.0.1:9/v1",
+                    "capacity_selector": null,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        // The capacity-mode endpoint switches mode and source together.
+        let (status, switched) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}/capacity-mode"),
+                serde_json::json!({
+                    "capacity_mode": "discovered",
+                    "capacity_source": "endpoints",
+                    "per_replica_max_in_flight": 4,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{switched}");
+        assert_eq!(switched["capacity_source"], "endpoints");
+        assert_eq!(switched["per_replica_max_in_flight"], 4);
+        assert_eq!(
+            switched["capacity_selector"], "app=served-model,role!=worker",
+            "omitted fields are kept"
+        );
+
+        // An endpoint carries its own concurrency; omitted on update keeps it.
+        let (status, ep) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &format!("/api/v1/models/{id}/endpoints"),
+                serde_json::json!({"name": "a", "api_base": "http://127.0.0.1:9/v1",
+                                   "max_in_flight": 16}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ep}");
+        assert_eq!(ep["max_in_flight"], 16);
+        let ep_id = ep["id"].as_str().unwrap().to_string();
+        let (status, ep) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}/endpoints/{ep_id}"),
+                serde_json::json!({"name": "a", "api_base": "http://127.0.0.1:9/v1",
+                                   "weight": 50}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ep}");
+        assert_eq!(ep["max_in_flight"], 16, "kept");
+        let (status, ep) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}/endpoints/{ep_id}"),
+                serde_json::json!({"name": "a", "api_base": "http://127.0.0.1:9/v1",
+                                   "max_in_flight": 0}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{ep}");
+
+        let _ = t.store.delete_model(Uuid::parse_str(&id).unwrap()).await;
+    }
 
     /// The simulator sits behind the same bearer gate as every other write-side
     /// route: it reads the whole model fleet and every tenant's allowlist.
@@ -8538,6 +9045,11 @@ mod tests {
             max_in_flight: None,
             capacity_mode: obleth_config::DEFAULT_CAPACITY_MODE.to_string(),
             capacity_tuned_at: None,
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_selector: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             supports_function_calling: false,
             supports_system_messages: false,
             supports_response_schema: false,
@@ -8654,6 +9166,7 @@ mod tests {
             priority: 0,
             weight: 100,
             enabled: true,
+            max_in_flight: None,
             health_status: "unknown".into(),
             consecutive_failures: 0,
             alert_state: "ok".into(),

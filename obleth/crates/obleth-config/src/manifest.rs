@@ -39,9 +39,9 @@ use crate::types::{
     is_valid_quantization, merge_upstream_headers, normalize_aliases, normalize_boons,
     normalize_tool_servers, parse_tag_level, upstream_header_names, ModelEndpoint, ModelRoute,
     UpstreamHeaders, UpstreamHeadersWrite, CAPACITY_MODES, DEFAULT_CAPACITY_MODE,
-    DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE, DEFAULT_QUANTIZATION,
-    DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES, MAX_MODEL_ALIASES, MODEL_TYPES,
-    QUANTIZATIONS,
+    DEFAULT_CAPACITY_SOURCE, DEFAULT_ENDPOINT_SELECTION_MODE, DEFAULT_MODEL_TYPE,
+    DEFAULT_QUANTIZATION, DEFAULT_RETRY_BACKOFF_MS, ENDPOINT_SELECTION_MODES, MAX_MODEL_ALIASES,
+    MODEL_TYPES, QUANTIZATIONS,
 };
 
 /// File-format discriminator for model manifests.
@@ -80,7 +80,8 @@ pub struct ModelManifest {
 /// is optional and absent means "leave unchanged" (or, for a model that does
 /// not exist yet, "use the default").
 ///
-/// Nullable columns (`max_in_flight`, `request_timeout_secs`) cannot be
+/// Nullable columns (`max_in_flight`, `request_timeout_secs`,
+/// `per_replica_max_in_flight`, an endpoint's `max_in_flight`) cannot be
 /// *cleared* from a manifest — a JSON `null` reads the same as an absent field.
 /// This matches the existing `PUT /api/v1/models/{id}` behaviour, where those
 /// fields also fall back to the stored value; clear them from the dashboard.
@@ -145,6 +146,19 @@ pub struct ManifestModel {
     pub max_in_flight: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capacity_mode: Option<String>,
+    /// `discovered` mode: `endpoints` or `kubernetes`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_source: Option<String>,
+    /// `kubernetes` source namespace; an empty string clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_namespace: Option<String>,
+    /// `kubernetes` source label selector; an empty string clears it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_selector: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_replica_max_in_flight: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capacity_headroom: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supports_function_calling: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,6 +241,10 @@ pub struct ManifestEndpoint {
     pub weight: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Requests this endpoint takes at once, for a `discovered` model using
+    /// the `endpoints` source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_in_flight: Option<i64>,
 }
 
 // ---- the report -------------------------------------------------------------
@@ -290,6 +308,11 @@ pub struct ModelConfig {
     pub admission_weight: i64,
     pub max_in_flight: Option<i64>,
     pub capacity_mode: String,
+    pub capacity_source: String,
+    pub capacity_namespace: Option<String>,
+    pub capacity_selector: Option<String>,
+    pub per_replica_max_in_flight: Option<i64>,
+    pub capacity_headroom: f64,
     pub supports_function_calling: bool,
     pub supports_system_messages: bool,
     pub supports_response_schema: bool,
@@ -337,6 +360,11 @@ impl Default for ModelConfig {
             admission_weight: DEFAULT_ADMISSION_WEIGHT,
             max_in_flight: None,
             capacity_mode: DEFAULT_CAPACITY_MODE.to_string(),
+            capacity_source: DEFAULT_CAPACITY_SOURCE.to_string(),
+            capacity_namespace: None,
+            capacity_selector: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             supports_function_calling: false,
             // Matches `create_model`: system messages are assumed supported.
             supports_system_messages: true,
@@ -385,6 +413,11 @@ impl From<&ModelRoute> for ModelConfig {
             admission_weight: m.admission_weight,
             max_in_flight: m.max_in_flight,
             capacity_mode: m.capacity_mode.clone(),
+            capacity_source: m.capacity_source.clone(),
+            capacity_namespace: m.capacity_namespace.clone(),
+            capacity_selector: m.capacity_selector.clone(),
+            per_replica_max_in_flight: m.per_replica_max_in_flight,
+            capacity_headroom: m.capacity_headroom,
             supports_function_calling: m.supports_function_calling,
             supports_system_messages: m.supports_system_messages,
             supports_response_schema: m.supports_response_schema,
@@ -474,6 +507,26 @@ impl ModelConfig {
         );
         note(self.max_in_flight != other.max_in_flight, "max_in_flight");
         note(self.capacity_mode != other.capacity_mode, "capacity_mode");
+        note(
+            self.capacity_source != other.capacity_source,
+            "capacity_source",
+        );
+        note(
+            self.capacity_namespace != other.capacity_namespace,
+            "capacity_namespace",
+        );
+        note(
+            self.capacity_selector != other.capacity_selector,
+            "capacity_selector",
+        );
+        note(
+            self.per_replica_max_in_flight != other.per_replica_max_in_flight,
+            "per_replica_max_in_flight",
+        );
+        note(
+            self.capacity_headroom != other.capacity_headroom,
+            "capacity_headroom",
+        );
         note(
             self.supports_function_calling != other.supports_function_calling,
             "supports_function_calling",
@@ -664,6 +717,40 @@ pub fn resolve_model(
         }
         next.capacity_mode = m;
     }
+    if let Some(v) = &entry.capacity_source {
+        next.capacity_source = v.trim().to_ascii_lowercase();
+    }
+    if let Some(v) = &entry.capacity_namespace {
+        next.capacity_namespace = crate::capacity::normalize_optional_text(Some(v));
+    }
+    if let Some(v) = &entry.capacity_selector {
+        next.capacity_selector = crate::capacity::normalize_optional_text(Some(v));
+    }
+    if let Some(v) = entry.per_replica_max_in_flight {
+        next.per_replica_max_in_flight = Some(v);
+    }
+    if let Some(v) = entry.capacity_headroom {
+        next.capacity_headroom = v;
+    }
+    // Syntax only: whether this gateway can read a `kubernetes` source (its
+    // namespace allowlist, its default selector) is the importer's check.
+    crate::capacity::validate_discovery_fields(
+        name,
+        &next.upstream_model,
+        &crate::capacity::DiscoveryFields {
+            source: next.capacity_source.clone(),
+            namespace: next.capacity_namespace.clone(),
+            selector: next.capacity_selector.clone(),
+            per_replica_max_in_flight: next.per_replica_max_in_flight,
+            headroom: next.capacity_headroom,
+        },
+        false,
+        crate::capacity::DiscoveryPolicy {
+            namespaces: &[],
+            default_selector: "",
+        },
+    )
+    .map_err(reject)?;
     if let Some(v) = &entry.endpoint_selection_mode {
         let m = v.trim().to_ascii_lowercase();
         if !is_valid_endpoint_selection_mode(&m) {
@@ -842,6 +929,7 @@ pub struct EndpointConfig {
     pub priority: i64,
     pub weight: i64,
     pub enabled: bool,
+    pub max_in_flight: Option<i64>,
 }
 
 impl Default for EndpointConfig {
@@ -854,6 +942,7 @@ impl Default for EndpointConfig {
             priority: DEFAULT_ENDPOINT_PRIORITY,
             weight: DEFAULT_ENDPOINT_WEIGHT,
             enabled: true,
+            max_in_flight: None,
         }
     }
 }
@@ -867,6 +956,7 @@ impl From<&ModelEndpoint> for EndpointConfig {
             priority: e.priority,
             weight: e.weight,
             enabled: e.enabled,
+            max_in_flight: e.max_in_flight,
         }
     }
 }
@@ -917,6 +1007,18 @@ pub fn resolve_endpoint(
     if let Some(v) = entry.enabled {
         next.enabled = v;
     }
+    if let Some(v) = entry.max_in_flight {
+        crate::capacity::validate_per_replica_max_in_flight(Some(v)).map_err(|_| {
+            ManifestError {
+                model_name: model_name.to_string(),
+                message: format!(
+                    "endpoint '{name}': max_in_flight must be between 1 and {}",
+                    crate::capacity::MAX_PER_REPLICA_MAX_IN_FLIGHT
+                ),
+            }
+        })?;
+        next.max_in_flight = Some(v);
+    }
 
     // An endpoint is dispatched to, so it must have somewhere to dispatch. The
     // model row tolerates a blank `api_base` (Slurm-provisioned models get one
@@ -944,6 +1046,9 @@ pub fn resolve_endpoint(
     if current.enabled != next.enabled {
         changed_fields.push(format!("endpoints.{name}.enabled"));
     }
+    if current.max_in_flight != next.max_in_flight {
+        changed_fields.push(format!("endpoints.{name}.max_in_flight"));
+    }
 
     Ok(ResolvedManifestEndpoint {
         config: next,
@@ -963,6 +1068,7 @@ pub fn endpoint_to_manifest_entry(e: &ModelEndpoint) -> ManifestEndpoint {
         priority: Some(e.priority),
         weight: Some(e.weight),
         enabled: Some(e.enabled),
+        max_in_flight: e.max_in_flight,
     }
 }
 
@@ -1000,6 +1106,11 @@ pub fn model_to_manifest_entry(m: &ModelRoute) -> ManifestModel {
         admission_weight: Some(m.admission_weight),
         max_in_flight: m.max_in_flight,
         capacity_mode: Some(m.capacity_mode.clone()),
+        capacity_source: Some(m.capacity_source.clone()),
+        capacity_namespace: m.capacity_namespace.clone(),
+        capacity_selector: m.capacity_selector.clone(),
+        per_replica_max_in_flight: m.per_replica_max_in_flight,
+        capacity_headroom: Some(m.capacity_headroom),
         supports_function_calling: Some(m.supports_function_calling),
         supports_system_messages: Some(m.supports_system_messages),
         supports_response_schema: Some(m.supports_response_schema),
@@ -1054,6 +1165,11 @@ mod tests {
             max_in_flight: Some(4),
             capacity_mode: "static".into(),
             capacity_tuned_at: None,
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_selector: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             supports_function_calling: true,
             supports_system_messages: true,
             supports_response_schema: false,
@@ -1323,6 +1439,101 @@ mod tests {
         e.cost_per_video = Some(-0.5);
         let err = resolve_model(&e, Some(&existing), &[]).unwrap_err();
         assert!(err.message.contains("cost_per_video"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_discovered_model_carries_its_capacity_source() {
+        let mut e = entry("m");
+        e.capacity_mode = Some("discovered".into());
+        e.capacity_source = Some(" Kubernetes ".into());
+        e.capacity_namespace = Some(" inference ".into());
+        e.capacity_selector = Some("app=m,role!=worker".into());
+        e.per_replica_max_in_flight = Some(8);
+        e.capacity_headroom = Some(1.25);
+
+        let r = resolve_model(&e, None, &[]).unwrap();
+        assert_eq!(r.config.capacity_mode, "discovered");
+        assert_eq!(r.config.capacity_source, "kubernetes");
+        assert_eq!(r.config.capacity_namespace.as_deref(), Some("inference"));
+        assert_eq!(
+            r.config.capacity_selector.as_deref(),
+            Some("app=m,role!=worker")
+        );
+        assert_eq!(r.config.per_replica_max_in_flight, Some(8));
+        assert_eq!(r.config.capacity_headroom, 1.25);
+
+        let existing = route("m");
+        let r = resolve_model(&e, Some(&existing), &[]).unwrap();
+        for field in [
+            "capacity_mode",
+            "capacity_source",
+            "capacity_namespace",
+            "capacity_selector",
+            "per_replica_max_in_flight",
+            "capacity_headroom",
+        ] {
+            assert!(r.changed_fields.contains(&field.to_string()), "{field}");
+        }
+
+        // An empty string clears a text field.
+        let mut stored = route("m");
+        stored.capacity_namespace = Some("inference".into());
+        let mut clear = entry("m");
+        clear.capacity_namespace = Some(String::new());
+        let r = resolve_model(&clear, Some(&stored), &[]).unwrap();
+        assert_eq!(r.config.capacity_namespace, None);
+
+        // Export and re-import is a no-op.
+        let mut stored = route("m");
+        stored.capacity_mode = "discovered".into();
+        stored.capacity_source = "kubernetes".into();
+        stored.capacity_selector = Some("app=m".into());
+        stored.per_replica_max_in_flight = Some(4);
+        stored.capacity_headroom = 1.5;
+        let exported = model_to_manifest_entry(&stored);
+        let r = resolve_model(&exported, Some(&stored), &[]).unwrap();
+        assert!(r.changed_fields.is_empty(), "{:?}", r.changed_fields);
+    }
+
+    #[test]
+    fn bad_capacity_fields_are_refused_with_the_field_named() {
+        for (field, apply) in [
+            (
+                "capacity_source",
+                (|e: &mut ManifestModel| e.capacity_source = Some("prometheus".into()))
+                    as fn(&mut ManifestModel),
+            ),
+            ("capacity_namespace", |e| {
+                e.capacity_namespace = Some("Not_A_Namespace".into())
+            }),
+            ("capacity_selector", |e| {
+                e.capacity_selector = Some("app in (a".into())
+            }),
+            ("per_replica_max_in_flight", |e| {
+                e.per_replica_max_in_flight = Some(0)
+            }),
+            ("capacity_headroom", |e| e.capacity_headroom = Some(0.0)),
+        ] {
+            let mut e = entry("m");
+            apply(&mut e);
+            let err = resolve_model(&e, None, &[]).expect_err(field);
+            assert!(err.message.contains(field), "{field}: {}", err.message);
+        }
+    }
+
+    #[test]
+    fn an_endpoint_carries_its_own_concurrency() {
+        let mut e = ManifestEndpoint {
+            name: "a".into(),
+            api_base: Some("http://a/v1".into()),
+            max_in_flight: Some(16),
+            ..Default::default()
+        };
+        let r = resolve_endpoint(&e, None, "m").unwrap();
+        assert_eq!(r.config.max_in_flight, Some(16));
+        e.max_in_flight = Some(0);
+        let err = resolve_endpoint(&e, None, "m").unwrap_err();
+        assert!(err.message.contains("max_in_flight"), "{}", err.message);
     }
 
     #[test]

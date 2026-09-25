@@ -693,6 +693,7 @@ mod tests {
                 weight: 1,
                 enabled: true,
                 healthy: true,
+                max_in_flight: None,
             },
             obleth_config::ResolvedEndpoint {
                 id: "b".into(),
@@ -702,6 +703,7 @@ mod tests {
                 weight: 1,
                 enabled: false,
                 healthy: false,
+                max_in_flight: None,
             },
         ];
         let b = affinity_target(&route, "http://b/v1").expect("configured endpoint");
@@ -1483,6 +1485,7 @@ mod pipeline_tests {
             weight: 1,
             enabled: true,
             healthy: true,
+            max_in_flight: None,
         };
         let mut route = video_route("wan-2-2", "");
         route.endpoints = vec![

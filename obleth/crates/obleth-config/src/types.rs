@@ -396,6 +396,30 @@ pub struct ModelRoute {
     /// until the model has been tuned.
     #[serde(default)]
     pub capacity_tuned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `discovered` mode: where serving replicas are counted, from the fixed
+    /// [`CAPACITY_SOURCES`] vocabulary. `endpoints` (default) counts the
+    /// model's own enabled, healthy endpoints; `kubernetes` counts Ready pods
+    /// matching `capacity_selector`.
+    #[serde(default = "default_capacity_source")]
+    pub capacity_source: String,
+    /// `kubernetes` source: namespace of the backend pods. `None` searches
+    /// every namespace in `OBLETH_CAPACITY_DISCOVERY_NAMESPACES`.
+    #[serde(default)]
+    pub capacity_namespace: Option<String>,
+    /// `kubernetes` source: label selector for the serving pods. `None` uses
+    /// the gateway's `OBLETH_CAPACITY_DEFAULT_SELECTOR` template.
+    #[serde(default)]
+    pub capacity_selector: Option<String>,
+    /// `discovered` mode: concurrent requests one serving replica takes.
+    /// `None` reads a known concurrency flag off the serving container
+    /// (`kubernetes`) or each endpoint's own `max_in_flight` (`endpoints`).
+    #[serde(default)]
+    pub per_replica_max_in_flight: Option<i64>,
+    /// `discovered` mode: multiplier on the derived pool size. `1.0` admits
+    /// exactly the ready capacity; above it lets requests queue at the
+    /// backend, which an autoscaler scaling on queue depth needs to see.
+    #[serde(default = "default_capacity_headroom")]
+    pub capacity_headroom: f64,
     pub supports_function_calling: bool,
     pub supports_system_messages: bool,
     pub supports_response_schema: bool,
@@ -561,6 +585,23 @@ pub struct ResolvedModel {
     pub quantization: String,
     pub admission_weight: i64,
     pub max_in_flight: Option<usize>,
+    /// How the pool size is decided (see [`ModelRoute::capacity_mode`]). The
+    /// data plane only acts on `discovered`. `#[serde(default …)]` keeps
+    /// older cached payloads deserializable as `static`.
+    #[serde(default = "default_capacity_mode")]
+    pub capacity_mode: String,
+    /// `discovered` mode inputs (see [`ModelRoute::capacity_source`] and
+    /// its siblings). The defaults keep older cached payloads readable.
+    #[serde(default = "default_capacity_source")]
+    pub capacity_source: String,
+    #[serde(default)]
+    pub capacity_namespace: Option<String>,
+    #[serde(default)]
+    pub capacity_selector: Option<String>,
+    #[serde(default)]
+    pub per_replica_max_in_flight: Option<usize>,
+    #[serde(default = "default_capacity_headroom")]
+    pub capacity_headroom: f64,
     pub enabled: bool,
     pub cache_enabled: bool,
     pub cache_ttl_secs: i64,
@@ -704,6 +745,11 @@ pub struct ResolvedEndpoint {
     /// Last observed health. Unhealthy endpoints are skipped during selection.
     #[serde(default)]
     pub healthy: bool,
+    /// Requests this endpoint takes at once, for a `discovered` model using
+    /// the `endpoints` source. `None` uses the model's
+    /// `per_replica_max_in_flight`.
+    #[serde(default)]
+    pub max_in_flight: Option<usize>,
 }
 
 /// Persisted upstream endpoint of a model (control-plane/API view). Several
@@ -724,6 +770,11 @@ pub struct ModelEndpoint {
     /// Relative share in `load_balance` mode.
     pub weight: i64,
     pub enabled: bool,
+    /// Requests this endpoint takes at once, counted by a `discovered` model
+    /// using the `endpoints` source. `None` uses the model's
+    /// `per_replica_max_in_flight`.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
     pub health_status: String,
     pub consecutive_failures: i64,
     pub alert_state: String,
@@ -1286,8 +1337,36 @@ fn default_model_type() -> String {
 }
 
 /// Fixed vocabulary of capacity-tuning modes. `static` keeps the operator-set
-/// `max_in_flight`; `tuned` lets auto-tune set it from a ramp probe.
-pub const CAPACITY_MODES: &[&str] = &["static", "tuned"];
+/// `max_in_flight`; `tuned` lets auto-tune set it from a ramp probe;
+/// `discovered` derives the pool size from the live backend on Kubernetes
+/// (ready serving replicas x per-replica concurrency), with `max_in_flight`
+/// kept as the fallback when discovery has no answer.
+pub const CAPACITY_MODES: &[&str] = &["static", "tuned", "discovered"];
+
+/// The capacity mode whose pool size the gateway discovers from the backend.
+pub const DISCOVERED_CAPACITY_MODE: &str = "discovered";
+
+/// Fixed vocabulary of capacity sources for the `discovered` mode.
+/// `endpoints` counts the model's own enabled, healthy endpoints and needs
+/// nothing outside the gateway; `kubernetes` counts the Ready pods matching a
+/// label selector through the Kubernetes API.
+pub const CAPACITY_SOURCES: &[&str] = &["endpoints", "kubernetes"];
+
+/// The capacity source assigned to a model when none is specified.
+pub const DEFAULT_CAPACITY_SOURCE: &str = "endpoints";
+
+fn default_capacity_source() -> String {
+    DEFAULT_CAPACITY_SOURCE.to_string()
+}
+
+fn default_capacity_headroom() -> f64 {
+    1.0
+}
+
+/// True when `source` is part of the fixed [`CAPACITY_SOURCES`] vocabulary.
+pub fn is_valid_capacity_source(source: &str) -> bool {
+    CAPACITY_SOURCES.contains(&source)
+}
 
 /// The default capacity mode assigned to a model when none is specified.
 pub const DEFAULT_CAPACITY_MODE: &str = "static";
@@ -2841,6 +2920,18 @@ pub struct ModelBackup {
     pub capacity_mode: String,
     #[serde(default)]
     pub capacity_tuned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `discovered` mode inputs. Absent in backups taken before the columns
+    /// existed.
+    #[serde(default = "default_capacity_source")]
+    pub capacity_source: String,
+    #[serde(default)]
+    pub capacity_namespace: Option<String>,
+    #[serde(default)]
+    pub capacity_selector: Option<String>,
+    #[serde(default)]
+    pub per_replica_max_in_flight: Option<i64>,
+    #[serde(default = "default_capacity_headroom")]
+    pub capacity_headroom: f64,
     pub supports_function_calling: bool,
     pub supports_system_messages: bool,
     pub supports_response_schema: bool,
@@ -2919,6 +3010,9 @@ pub struct ModelEndpointBackup {
     pub priority: i64,
     pub weight: i64,
     pub enabled: bool,
+    /// Absent in backups taken before the column existed.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -3629,6 +3723,12 @@ mod tests {
             quantization: "mxfp4".into(),
             admission_weight: 100,
             max_in_flight: None,
+            capacity_mode: "static".into(),
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_selector: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             enabled: true,
             cache_enabled: false,
             cache_ttl_secs: 0,

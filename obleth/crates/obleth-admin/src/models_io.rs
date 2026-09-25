@@ -160,6 +160,27 @@ pub(crate) async fn import_models(
             }
         }
 
+        // The field syntax was checked by `resolve_model`; whether this gateway
+        // can read a `discovered` model's `kubernetes` source is checked here,
+        // like the create and update forms do.
+        let c = &resolved.config;
+        if let Err(e) = obleth_config::capacity::validate_discovery_fields(
+            &name,
+            &c.upstream_model,
+            &obleth_config::capacity::DiscoveryFields {
+                source: c.capacity_source.clone(),
+                namespace: c.capacity_namespace.clone(),
+                selector: c.capacity_selector.clone(),
+                per_replica_max_in_flight: c.per_replica_max_in_flight,
+                headroom: c.capacity_headroom,
+            },
+            c.capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE,
+            state.capacity_discovery.policy(),
+        ) {
+            errors.push(format!("model '{name}': {e}"));
+            continue;
+        }
+
         let mut changed_fields = resolved.changed_fields.clone();
         let warnings = resolved.warnings.clone();
 

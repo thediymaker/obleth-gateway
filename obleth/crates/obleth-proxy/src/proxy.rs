@@ -5279,6 +5279,7 @@ mod tests {
             weight,
             enabled,
             healthy,
+            max_in_flight: None,
         }
     }
 
@@ -6016,6 +6017,12 @@ mod tests {
             model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
             admission_weight: 100,
             max_in_flight: None,
+            capacity_mode: "static".into(),
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_selector: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             enabled: true,
             cache_enabled: false,
             cache_ttl_secs: 0,
@@ -7012,6 +7019,12 @@ mod tests {
             model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
             admission_weight: 100,
             max_in_flight: None,
+            capacity_mode: "static".into(),
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_selector: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             enabled: true,
             cache_enabled: false,
             cache_ttl_secs: 0,
