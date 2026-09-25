@@ -849,10 +849,77 @@ export async function setModelCapacityModeAction(
   capacityMode: string,
 ) {
   const session = await requireAdmin();
-  await obleth.setModelCapacityMode(id, capacityMode, { auditActor: session.email });
+  await obleth.setModelCapacityMode(id, capacityMode, undefined, { auditActor: session.email });
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   revalidatePath("/fairshare");
+}
+
+const capacityDiscoverySchema = z.object({
+  capacity_source: z.enum(["endpoints", "kubernetes"], {
+    message: "Pick a capacity source",
+  }),
+  capacity_namespace: optionalText,
+  capacity_selector: optionalText,
+  per_replica_max_in_flight: z.preprocess(
+    blankToUndef,
+    z.coerce
+      .number()
+      .int("Per-replica concurrency must be a whole number")
+      .min(1, "Per-replica concurrency must be at least 1")
+      .max(100_000, "Per-replica concurrency must be at most 100000")
+      .optional(),
+  ),
+  capacity_headroom: z.preprocess(
+    blankToUndef,
+    z.coerce
+      .number()
+      .gt(0, "Headroom must be above 0")
+      .max(10, "Headroom must be at most 10")
+      .default(1),
+  ),
+});
+
+/**
+ * Put a model in the discovered capacity mode with its source settings. A
+ * blank field is sent as null, which clears it on the gateway (it then falls
+ * back to the gateway's default for that field). The gateway checks whether
+ * it can read a kubernetes source and refuses the save if not.
+ */
+export async function setModelCapacityDiscoveryAction(
+  id: string,
+  formData: FormData,
+): Promise<ActionResult> {
+  const session = await requireAdmin();
+  const parsed = capacityDiscoverySchema.safeParse({
+    capacity_source: formData.get("capacity_source"),
+    capacity_namespace: formData.get("capacity_namespace"),
+    capacity_selector: formData.get("capacity_selector"),
+    per_replica_max_in_flight: formData.get("per_replica_max_in_flight"),
+    capacity_headroom: formData.get("capacity_headroom"),
+  });
+  if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
+  const data = parsed.data;
+  try {
+    await obleth.setModelCapacityMode(
+      id,
+      "discovered",
+      {
+        capacity_source: data.capacity_source,
+        capacity_namespace: data.capacity_namespace || null,
+        capacity_selector: data.capacity_selector || null,
+        per_replica_max_in_flight: data.per_replica_max_in_flight ?? null,
+        capacity_headroom: data.capacity_headroom,
+      },
+      { auditActor: session.email },
+    );
+  } catch (e) {
+    return actionError(e);
+  }
+  updateTag(CACHE_TAGS.models);
+  revalidatePath("/models");
+  revalidatePath("/fairshare");
+  return { ok: true };
 }
 
 export async function autotuneModelAction(
@@ -941,6 +1008,7 @@ export async function createModelEndpointAction(
     priority: numOr(formData.get("priority"), 100),
     weight: numOr(formData.get("weight"), 100),
     enabled: formData.get("enabled") !== "off",
+    max_in_flight: numOrNull(formData.get("max_in_flight")),
   }, { auditActor: session.email });
   revalidatePath("/models");
 }
@@ -955,6 +1023,7 @@ export async function updateModelEndpointAction(
     priority?: number;
     weight?: number;
     enabled?: boolean;
+    max_in_flight?: number | null;
   },
 ) {
   const session = await requireAdmin();

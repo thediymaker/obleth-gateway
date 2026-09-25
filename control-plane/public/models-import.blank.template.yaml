@@ -52,6 +52,24 @@
 #   context_window            (optional) Max tokens. Default 8192.
 #   admission_weight          (optional) Fair-share weight. Default 100.
 #   max_in_flight             (optional) Concurrency cap. Blank = no cap.
+#                                        The fallback in discovered mode.
+#   capacity_mode             (optional) static (default), tuned, or
+#                                        discovered: the pool size follows the
+#                                        live backend (ready replicas x
+#                                        per-replica concurrency x headroom).
+#   capacity_source           (optional) Discovered mode: endpoints (default,
+#                                        the model's healthy endpoints) or
+#                                        kubernetes (Ready pods).
+#   capacity_namespace        (optional) Kubernetes source namespace. Blank =
+#                                        every namespace the gateway allows.
+#   capacity_selector         (optional) Kubernetes label selector for the
+#                                        serving pods. Blank = the gateway's
+#                                        default selector template.
+#   per_replica_max_in_flight (optional) Requests one replica takes. Blank =
+#                                        read from the server's flags or the
+#                                        endpoints' own max_in_flight.
+#   capacity_headroom         (optional) Multiplier on the derived size.
+#                                        Default 1.
 #   supports_function_calling (optional) true/false. Default false.
 #   supports_system_messages  (optional) true/false. Default true.
 #   supports_response_schema  (optional) true/false. Default false.

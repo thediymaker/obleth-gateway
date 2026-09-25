@@ -42,6 +42,7 @@ import {
   applyModelManifestAction,
   setModelCacheAction,
   setModelCapacityAction,
+  setModelCapacityDiscoveryAction,
   setModelCapacityModeAction,
   setModelHealthConfigAction,
   restartReplicaAction,
@@ -91,7 +92,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from "@/components/ui/tooltip";
-import type { AutotuneReport, AutotuneWorkload, CacheStats, KnowledgeCollection, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelImportReport, ModelKnowledgeCollections, ModelReplica, ModelRoute } from "@/lib/obleth";
+import type { AutotuneReport, AutotuneWorkload, CacheStats, CapacityDiscoveryView, KnowledgeCollection, McpServer, ModelEndpoint, ModelHealthDetail, ModelHealthSummary, ModelImportReport, ModelKnowledgeCollections, ModelReplica, ModelRoute } from "@/lib/obleth";
 import type { BoonBlockers } from "@/lib/boon-availability";
 import { providerForModel } from "@/lib/model-providers";
 import { normalizeModelApiNameDraft, normalizeModelApiNameFinal } from "@/lib/model-name";
@@ -1385,16 +1386,24 @@ function ModelDetailPanel({
                     <ModelWeightControl id={model.id} initial={model.admission_weight} />
                   </div>
                 </SettingRow>
-                <SettingRow label="Capacity mode" hint="Static uses the max-slots cap below; tuned follows the auto-tune result.">
-                  <div className="w-44">
+                <SettingRow label="Capacity mode" hint="Static uses the max-slots cap below; tuned follows the auto-tune result; discovered follows the live backend.">
+                  <div className="w-56">
                     <CapacityModeToggle id={model.id} mode={model.capacity_mode} />
                   </div>
                 </SettingRow>
-                <SettingRow label="Max slots" hint="Hard cap on concurrent in-flight requests to the upstream.">
+                <SettingRow
+                  label="Max slots"
+                  hint={
+                    model.capacity_mode === "discovered"
+                      ? "Fallback used while discovery has no answer."
+                      : "Hard cap on concurrent in-flight requests to the upstream."
+                  }
+                >
                   <div className="w-44">
                     <ModelCapacityControl id={model.id} initial={model.max_in_flight} />
                   </div>
                 </SettingRow>
+                {model.capacity_mode === "discovered" && <CapacityDiscoveryPanel model={model} />}
                 <AutotunePanel model={model} />
               </div>
             </PanelCard>
@@ -1718,16 +1727,21 @@ export function ModelCapacityControl({ id, initial }: { id: string; initial: num
   );
 }
 
+const CAPACITY_MODES = ["static", "tuned", "discovered"] as const;
+type CapacityMode = (typeof CAPACITY_MODES)[number];
+
 export function CapacityModeToggle({ id, mode }: { id: string; mode: string }) {
   const [pending, start] = useTransition();
-  const current = mode === "tuned" ? "tuned" : "static";
-  const set = (next: "static" | "tuned") => {
+  const current: CapacityMode = (CAPACITY_MODES as readonly string[]).includes(mode)
+    ? (mode as CapacityMode)
+    : "static";
+  const set = (next: CapacityMode) => {
     if (next === current) return;
     start(() => setModelCapacityModeAction(id, next));
   };
   return (
     <div className="inline-flex w-full overflow-hidden rounded-md border border-border" role="group" aria-label="Capacity mode">
-      {(["static", "tuned"] as const).map((opt) => (
+      {CAPACITY_MODES.map((opt) => (
         <button
           key={opt}
           type="button"
@@ -1741,6 +1755,160 @@ export function CapacityModeToggle({ id, mode }: { id: string; mode: string }) {
           {opt}
         </button>
       ))}
+    </div>
+  );
+}
+
+const DISCOVERY_STATE_TONE: Record<string, string> = {
+  discovered: "border-emerald-500/35 bg-emerald-500/10 text-emerald-300",
+  stale: "border-amber-500/35 bg-amber-500/10 text-amber-300",
+  fallback: "border-border bg-muted/30 text-muted-foreground",
+};
+
+/**
+ * The discovered mode's settings and what the answering gateway replica
+ * derived from them: ready replicas x per-replica concurrency x headroom.
+ */
+export function CapacityDiscoveryPanel({ model }: { model: ModelRoute }) {
+  const flashSaved = useContext(SaveFlashContext);
+  const [busy, start] = useTransition();
+  const [error, setError] = useState<string | null>(null);
+  const [source, setSource] = useState(model.capacity_source ?? "endpoints");
+  useEffect(() => {
+    setSource(model.capacity_source ?? "endpoints");
+  }, [model.capacity_source]);
+  const { data: view } = useQuery({
+    queryKey: ["capacity-discovery"],
+    queryFn: () => getJson<CapacityDiscoveryView>("/api/live/capacity/discovery"),
+    staleTime: 5_000,
+    refetchInterval: 15_000,
+  });
+  const entry = view?.models.find((m) => m.model_id === model.id);
+  const status = entry?.status;
+
+  function save(formData: FormData) {
+    setError(null);
+    start(async () => {
+      const result = await setModelCapacityDiscoveryAction(model.id, formData);
+      if (result.ok) flashSaved();
+      else setError(result.error);
+    });
+  }
+
+  return (
+    <div className="grid gap-3 p-3" data-testid="capacity-discovery">
+      <EditForm action={save}>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="space-y-1.5">
+            <Label htmlFor={`capacity-source-${model.id}`}>Capacity source</Label>
+            <Select
+              id={`capacity-source-${model.id}`}
+              name="capacity_source"
+              value={source}
+              onValueChange={setSource}
+              options={[
+                { value: "endpoints", label: "endpoints", hint: "This model's enabled, healthy endpoints" },
+                { value: "kubernetes", label: "kubernetes", hint: "Ready pods matching a label selector" },
+              ]}
+            />
+          </div>
+          <Field
+            label="Per-replica concurrency"
+            name="per_replica_max_in_flight"
+            type="number"
+            min={1}
+            placeholder={source === "kubernetes" ? "read from the server's flags" : "each endpoint's own value"}
+            defaultValue={model.per_replica_max_in_flight == null ? "" : String(model.per_replica_max_in_flight)}
+          />
+          {source === "kubernetes" && (
+            <>
+              <Field
+                label="Namespace"
+                name="capacity_namespace"
+                placeholder={view?.namespaces.length ? `any of ${view.namespaces.join(", ")}` : "namespace"}
+                defaultValue={model.capacity_namespace ?? ""}
+              />
+              <Field
+                label="Label selector"
+                name="capacity_selector"
+                placeholder={view?.default_selector || "app=my-model,role!=worker"}
+                defaultValue={model.capacity_selector ?? ""}
+                hint="Only pods that serve requests; exclude worker pods of multi-node deployments here."
+              />
+            </>
+          )}
+          <Field
+            label="Headroom"
+            name="capacity_headroom"
+            type="number"
+            step={0.05}
+            min={0.05}
+            max={10}
+            defaultValue={String(model.capacity_headroom ?? 1)}
+            hint="Above 1 lets requests queue at the backend, for autoscalers that scale on queue depth."
+          />
+        </div>
+        <div className="mt-3 flex items-center gap-3">
+          <SaveButton pending={busy} idleLabel="Save discovery settings" variant="secondary" />
+          {error && <p className="text-xs text-destructive" role="alert">{error}</p>}
+        </div>
+      </EditForm>
+      <CapacityDiscoveryStatus
+        status={status}
+        replicaShare={entry?.replica_share}
+        replicas={view?.replicas}
+        enabled={view?.enabled}
+      />
+    </div>
+  );
+}
+
+export function CapacityDiscoveryStatus({
+  status,
+  replicaShare,
+  replicas,
+  enabled,
+}: {
+  status?: CapacityDiscoveryView["models"][number]["status"];
+  replicaShare?: number;
+  replicas?: number;
+  enabled?: boolean;
+}) {
+  if (!status) {
+    return <p className="text-xs text-muted-foreground">Waiting for the gateway&apos;s discovery state…</p>;
+  }
+  const perReplica =
+    status.per_replica_max_in_flight == null
+      ? "—"
+      : `${status.per_replica_max_in_flight}${status.per_replica_source ? ` (${status.per_replica_source})` : ""}`;
+  return (
+    <div className="rounded-md border border-border/60 bg-background/30 p-3 text-xs" aria-label="Discovery status">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge className={DISCOVERY_STATE_TONE[status.state] ?? DISCOVERY_STATE_TONE.fallback}>{status.state}</Badge>
+        <span className="text-muted-foreground">
+          source {status.source}
+          {status.selector ? ` · ${status.selector}` : ""}
+          {status.namespaces.length ? ` in ${status.namespaces.join(", ")}` : ""}
+        </span>
+        {enabled === false && <span className="text-muted-foreground">· discovery is off on this gateway</span>}
+      </div>
+      <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 md:grid-cols-3">
+        <div><dt className="text-muted-foreground">Ready replicas</dt><dd className="tabular-nums">{status.ready_replicas ?? "—"}</dd></div>
+        <div><dt className="text-muted-foreground">Per replica</dt><dd className="tabular-nums">{perReplica}</dd></div>
+        <div><dt className="text-muted-foreground">Headroom</dt><dd className="tabular-nums">×{status.headroom}</dd></div>
+        <div><dt className="text-muted-foreground">Derived (cluster-wide)</dt><dd className="tabular-nums">{status.derived_max_in_flight ?? "—"}</dd></div>
+        <div><dt className="text-muted-foreground">In force (cluster-wide)</dt><dd className="tabular-nums">{status.effective_max_in_flight}</dd></div>
+        <div>
+          <dt className="text-muted-foreground">This replica&apos;s share</dt>
+          <dd className="tabular-nums">
+            {replicaShare ?? "—"}
+            {replicas && replicas > 1 ? ` of ${replicas} gateways` : ""}
+          </dd>
+        </div>
+        <div><dt className="text-muted-foreground">Last refresh</dt><dd>{status.last_refresh ? formatTime(status.last_refresh) : "—"}</dd></div>
+        <div><dt className="text-muted-foreground">Last discovered</dt><dd>{status.last_success ? formatTime(status.last_success) : "—"}</dd></div>
+      </dl>
+      {status.reason && <p className="mt-2 text-amber-300/90">{status.reason}</p>}
     </div>
   );
 }
@@ -2363,6 +2531,7 @@ function ReliabilityPanel({
                   <th className="py-2 pr-3 font-medium">API base</th>
                   <th className="py-2 pr-3 font-medium">Priority</th>
                   <th className="py-2 pr-3 font-medium">Weight</th>
+                  <th className="py-2 pr-3 font-medium" title="Requests this endpoint takes at once (discovered capacity)">Max in flight</th>
                   <th className="py-2 pr-3 font-medium">Health</th>
                   <th className="py-2 pr-4" />
                 </tr>
@@ -2384,6 +2553,7 @@ function ReliabilityPanel({
                     <td className="py-2 pr-3 font-mono text-[11px] text-muted-foreground">{ep.api_base}</td>
                     <td className="py-2 pr-3 tabular-nums">{ep.priority}</td>
                     <td className="py-2 pr-3 tabular-nums">{ep.weight}</td>
+                    <td className="py-2 pr-3 tabular-nums">{ep.max_in_flight ?? "—"}</td>
                     <td className="py-2 pr-3">
                       <StatusPill status={ep.enabled ? ep.health_status : "disabled"} />
                     </td>
@@ -2456,9 +2626,10 @@ function ReliabilityPanel({
             <Field label="Name" name="name" placeholder="cluster-b" required />
             <Field label="API base URL" name="api_base" placeholder="http://cluster-b/v1" required />
             <Field label="API key" name="api_key" placeholder="Leave blank to inherit" />
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-3 gap-3">
               <Field label="Priority" name="priority" type="number" defaultValue="100" />
               <Field label="Weight" name="weight" type="number" defaultValue="100" />
+              <Field label="Max in flight" name="max_in_flight" type="number" min={1} placeholder="model default" />
             </div>
           </div>
           <Button type="submit" size="sm" variant="secondary" disabled={disabled} className="mt-3">

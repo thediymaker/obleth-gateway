@@ -158,8 +158,26 @@ export interface ModelRoute {
   context_window: number;
   admission_weight: number;
   max_in_flight: number | null;
+  /**
+   * `static`, `tuned` or `discovered`. In `discovered` mode the pool size
+   * follows the live backend and `max_in_flight` is only the fallback.
+   */
   capacity_mode: string;
   capacity_tuned_at: string | null;
+  /**
+   * Discovered mode: where serving replicas are counted, `endpoints` (the
+   * model's enabled, healthy endpoints) or `kubernetes` (Ready pods). The
+   * discovery fields are absent from gateways older than the mode.
+   */
+  capacity_source?: string;
+  /** Kubernetes source: namespace of the backend pods; null searches the gateway's list. */
+  capacity_namespace?: string | null;
+  /** Kubernetes source: label selector for the serving pods; null uses the gateway's template. */
+  capacity_selector?: string | null;
+  /** Requests one replica takes; null reads it from the source. */
+  per_replica_max_in_flight?: number | null;
+  /** Multiplier on the derived pool size; 1 is exactly the ready capacity. */
+  capacity_headroom?: number;
   supports_function_calling: boolean;
   supports_system_messages: boolean;
   supports_response_schema: boolean;
@@ -204,6 +222,11 @@ export interface ModelEndpoint {
   priority: number;
   weight: number;
   enabled: boolean;
+  /**
+   * Requests this endpoint takes at once, counted by a discovered model on the
+   * `endpoints` source. Null uses the model's per-replica value.
+   */
+  max_in_flight?: number | null;
   health_status: string;
   consecutive_failures: number;
   alert_state: string;
@@ -213,6 +236,56 @@ export interface ModelEndpoint {
   last_message: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** The discovered-mode fields sent with a capacity-mode change. */
+export interface CapacityDiscoveryFields {
+  capacity_source: string;
+  capacity_namespace: string | null;
+  capacity_selector: string | null;
+  per_replica_max_in_flight: number | null;
+  capacity_headroom: number;
+}
+
+/** What one gateway replica's discovery knows about a discovered model. */
+export interface ModelCapacityStatus {
+  model_name: string;
+  source: string;
+  namespaces: string[];
+  selector: string | null;
+  ready_replicas: number | null;
+  per_replica_max_in_flight: number | null;
+  /** e.g. `per_replica_max_in_flight`, `endpoint max_in_flight`, `vLLM --max-num-seqs`. */
+  per_replica_source: string | null;
+  headroom: number;
+  /** Last value derived from the source: the cluster-wide pool size. */
+  derived_max_in_flight: number | null;
+  /** The cluster-wide pool size in force (derived, last kept, or static). */
+  effective_max_in_flight: number;
+  /** `discovered`, `stale` or `fallback`. */
+  state: string;
+  last_refresh: string | null;
+  last_success: string | null;
+  reason: string | null;
+}
+
+export interface CapacityDiscoveryModelView {
+  model_id: string;
+  model_name: string;
+  enabled: boolean;
+  static_max_in_flight: number | null;
+  /** What the answering replica enforces: its share of the effective size. */
+  replica_share: number;
+  status: ModelCapacityStatus;
+}
+
+export interface CapacityDiscoveryView {
+  enabled: boolean;
+  interval_secs: number;
+  namespaces: string[];
+  default_selector: string;
+  replicas: number;
+  models: CapacityDiscoveryModelView[];
 }
 
 export interface ManagedModelSpec {
@@ -1748,13 +1821,15 @@ export const obleth = {
   setModelCapacityMode: (
     id: string,
     capacity_mode: string,
+    fields?: CapacityDiscoveryFields,
     options?: AuditOptions,
   ) =>
     api<ModelRoute>(`/models/${id}/capacity-mode`, {
       method: "PUT",
       headers: auditActorHeaders(options),
-      body: JSON.stringify({ capacity_mode }),
+      body: JSON.stringify({ capacity_mode, ...(fields ?? {}) }),
     }),
+  capacityDiscovery: () => api<CapacityDiscoveryView>("/capacity/discovery"),
   autotuneModel: (
     id: string,
     opts?: {
@@ -1879,6 +1954,7 @@ export const obleth = {
       priority?: number;
       weight?: number;
       enabled?: boolean;
+      max_in_flight?: number | null;
     },
     options?: AuditOptions,
   ) =>
@@ -1897,6 +1973,7 @@ export const obleth = {
       priority?: number;
       weight?: number;
       enabled?: boolean;
+      max_in_flight?: number | null;
     },
     options?: AuditOptions,
   ) =>
