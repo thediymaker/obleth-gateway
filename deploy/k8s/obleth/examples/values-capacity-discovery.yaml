@@ -1,0 +1,39 @@
+# Capacity discovery: pool sizes that follow the backend
+# -----------------------------------------------------------------------------
+# Layer this on top of any other profile (-f values-production.yaml -f this).
+# It only matters for models whose capacity mode is `discovered`; every other
+# model keeps its static max_in_flight. See the README's "Capacity discovery"
+# section for the formula and the fallbacks.
+#
+# The `endpoints` source (a model's own registered endpoints) needs nothing
+# below except `enabled`. The `kubernetes` source needs `namespaces`: for each
+# one the chart creates a Role that can only get/list/watch pods, bound to a
+# ServiceAccount it creates for the gateway. Reading pods exposes their specs,
+# plain env values included, so list only the namespaces your backends run in.
+
+obleth:
+  capacityDiscovery:
+    enabled: true
+    intervalSecs: 15
+    namespaces:
+      - inference
+    # Used for kubernetes-source models that set no capacity_selector.
+    # {upstream_model} and {model_name} are filled in per model; the result
+    # must be a valid label selector. Pick one that matches how your serving
+    # stack labels its pods, and exclude pods that hold a model but do not
+    # serve requests. A generic example:
+    defaultSelector: "app.kubernetes.io/name={upstream_model}"
+
+    # Examples for common stacks (use one, adjust to your labels):
+    #
+    # AIBrix labels every pod of a model deployment with the served model
+    # name:
+    #   defaultSelector: "model.aibrix.ai/name={upstream_model}"
+    #
+    # KubeRay (multi-node serving): only head pods serve; worker pods hold
+    # GPUs but take no requests. `!=` also matches pods without the label, so
+    # this counts single-pod deployments and Ray heads alike:
+    #   defaultSelector: "model.aibrix.ai/name={upstream_model},ray.io/node-type!=worker"
+    #
+    # A plain Deployment per model, labelled by the gateway's model name:
+    #   defaultSelector: "app={model_name}"

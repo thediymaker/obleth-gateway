@@ -153,6 +153,14 @@ services:
       OBLETH_FAIRSHARE_REPLICA_AWARE: ${OBLETH_FAIRSHARE_REPLICA_AWARE:-true}
       OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS: ${OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS:-5}
       OBLETH_FAIRSHARE_REPLICA_TTL_SECS: ${OBLETH_FAIRSHARE_REPLICA_TTL_SECS:-15}
+      # Capacity discovery for models in the `discovered` capacity mode. Off by
+      # default. The `endpoints` source (a model's own endpoints) works here;
+      # the `kubernetes` source needs the gateway to run in a Kubernetes pod,
+      # so its namespace list stays empty in this file.
+      OBLETH_CAPACITY_DISCOVERY_ENABLED: ${OBLETH_CAPACITY_DISCOVERY_ENABLED:-false}
+      OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS: ${OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS:-15}
+      OBLETH_CAPACITY_DISCOVERY_NAMESPACES: ""
+      OBLETH_CAPACITY_DEFAULT_SELECTOR: ""
       OBLETH_FAIRSHARE_ALGORITHM: hierarchical
       OBLETH_FAIL_OPEN: "true"
       # Fail-open telemetry WAL: usage batches spill here while ClickHouse is

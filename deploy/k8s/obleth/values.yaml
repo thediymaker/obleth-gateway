@@ -115,6 +115,31 @@ obleth:
   resources:
     requests: { cpu: "250m", memory: "256Mi" }
     limits: { cpu: "2", memory: "1Gi" }
+  # Pool sizes that follow the backend, for models in the `discovered`
+  # capacity mode: ready serving replicas x per-replica concurrency x the
+  # model's capacity_headroom, re-read by every gateway replica each interval
+  # and divided across the gateway replicas like any configured pool size.
+  # Off by default; while off, a discovered model uses its static
+  # max_in_flight. See the README's "Capacity discovery" section and
+  # examples/values-capacity-discovery.yaml.
+  capacityDiscovery:
+    enabled: false
+    intervalSecs: 15
+    # Namespaces the `kubernetes` capacity source may list pods in (models on
+    # the `endpoints` source need none). For each, the chart renders a Role
+    # granting get/list/watch on pods and a RoleBinding to a gateway
+    # ServiceAccount it creates; nothing cluster-wide. Reading pods exposes
+    # their full specs in those namespaces, including plain `env` values
+    # (not Secret contents referenced through valueFrom), which is why this is
+    # opt-in and namespace-scoped: list only the namespaces your backends run
+    # in. Empty renders no RBAC and leaves the kubernetes source unavailable.
+    # The namespaces must exist, and whoever runs helm must be allowed to
+    # create Roles in them.
+    namespaces: []
+    # Selector template for kubernetes-source models that set no
+    # capacity_selector, with {upstream_model} and {model_name} placeholders.
+    # Empty: such a model is refused until it sets its own selector.
+    defaultSelector: ""
 
 # Off by default. With obleth.fairshareReplicaAware on, replicas divide the
 # fairshare limits between them, so scaling moves CPU capacity, not the

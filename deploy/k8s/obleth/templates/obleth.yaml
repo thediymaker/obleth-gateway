@@ -27,6 +27,12 @@ spec:
       # obleth.shutdownGraceSecs comment before changing either number.
       terminationGracePeriodSeconds: 345
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- if include "obleth.capacityDiscoveryRbac" . }}
+      # The kubernetes capacity source reads pods with this account's token
+      # (see templates/capacity-discovery-rbac.yaml).
+      serviceAccountName: {{ include "obleth.fullname" . }}
+      automountServiceAccountToken: true
+      {{- end }}
       {{- include "obleth.antiAffinity" . | nindent 6 }}
       {{- with .Values.nodeResolution.hostAliases }}
       hostAliases: {{- toYaml . | nindent 8 }}
@@ -60,6 +66,10 @@ spec:
             - { name: OBLETH_FAIRSHARE_REPLICA_AWARE, value: {{ .Values.obleth.fairshareReplicaAware | quote }} }
             - { name: OBLETH_FAIRSHARE_REPLICA_HEARTBEAT_SECS, value: {{ .Values.obleth.fairshareReplicaHeartbeatSecs | quote }} }
             - { name: OBLETH_FAIRSHARE_REPLICA_TTL_SECS, value: {{ .Values.obleth.fairshareReplicaTtlSecs | quote }} }
+            - { name: OBLETH_CAPACITY_DISCOVERY_ENABLED, value: {{ .Values.obleth.capacityDiscovery.enabled | quote }} }
+            - { name: OBLETH_CAPACITY_DISCOVERY_INTERVAL_SECS, value: {{ .Values.obleth.capacityDiscovery.intervalSecs | quote }} }
+            - { name: OBLETH_CAPACITY_DISCOVERY_NAMESPACES, value: {{ join "," (uniq .Values.obleth.capacityDiscovery.namespaces) | quote }} }
+            - { name: OBLETH_CAPACITY_DEFAULT_SELECTOR, value: {{ .Values.obleth.capacityDiscovery.defaultSelector | quote }} }
             - { name: OBLETH_FAIL_OPEN, value: {{ .Values.obleth.failOpen | quote }} }
             - { name: OBLETH_ALLOWED_PRIVATE_CIDRS, value: {{ .Values.obleth.allowedPrivateCidrs | quote }} }
             - { name: OBLETH_MODEL_HEALTH_ENABLED, value: {{ .Values.obleth.modelHealthEnabled | quote }} }

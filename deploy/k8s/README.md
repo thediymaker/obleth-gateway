@@ -268,6 +268,80 @@ toggles in `values.yaml`, on by sensible defaults.
   another namespace can scrape it. Requires a CNI that enforces NetworkPolicy;
   inert otherwise. The datastore policies are a no-op for external datastores.
 
+## Capacity discovery
+
+A model's fairshare pool is normally sized by its `max_in_flight`. A model in
+the `discovered` capacity mode instead takes its pool size from its live
+backend, so the gateway's limit follows whatever scales the backend:
+
+```text
+pool size = max(1, ceil(ready serving replicas × per-replica concurrency × capacity_headroom))
+```
+
+Every gateway replica re-reads the backend every
+`obleth.capacityDiscovery.intervalSecs` (default 15) and treats the result as
+the model's configured, fleet-wide pool size, so the replica-aware division
+above still applies: with three gateway replicas each enforces a third of it,
+rounded up. A change resizes the pool without cutting in-flight requests, and
+growth admits queued requests at once. Nothing is written to the database.
+
+**Where replicas are counted** (`capacity_source`, per model):
+
+- `endpoints` (the default): the model's enabled, healthy endpoints; under
+  `failover` only the endpoint in use counts, since the others are standbys. A
+  model with no endpoint rows counts its `api_base` while it is healthy. Needs
+  no Kubernetes access and works the same with backends anywhere.
+- `kubernetes`: the Ready, non-terminating pods that match the model's label
+  selector (`capacity_selector`, or the `obleth.capacityDiscovery.defaultSelector`
+  template) in its namespace (`capacity_namespace`, or every namespace in
+  `obleth.capacityDiscovery.namespaces`). Set-based and inequality selectors
+  work (`a=b,c!=d`, `x in (p, q)`), so pods that hold a model but do not serve
+  requests are excluded in the selector itself: for KubeRay, where only head
+  pods serve, add `ray.io/node-type!=worker`.
+
+**Per-replica concurrency:** the model's `per_replica_max_in_flight` when set.
+Otherwise, for `endpoints`, each endpoint's own `max_in_flight`; for
+`kubernetes`, the lowest value found on the serving pods by a table of known
+server settings (vLLM `--max-num-seqs`, SGLang `--max-running-requests`, TGI
+`--max-concurrent-requests`, llama.cpp `--parallel`/`-np`, and their literal env
+forms). A server's built-in default is never assumed; a model with no value
+anywhere keeps its static `max_in_flight` and the discovery view says why.
+
+**Fallbacks:** when the source reports no serving replica or does not answer
+(scale to zero, a rollout, the API server briefly away), the last derived value
+holds, or the static `max_in_flight` (or `obleth.defaultModelMaxInFlight`) if
+nothing was derived yet. A model that cannot be discovered as configured (no
+per-replica value, no selector, a namespace outside the list) uses its static
+value. Each change of state is logged once.
+
+**Autoscalers:** capping the gateway at 100% of ready capacity still lets an
+autoscaler that scales on backend utilization or running requests (for example
+one targeting a fraction of the server's own concurrency limit) see saturation
+and add replicas; the new replicas raise the pool on the next pass. An
+autoscaler that scales on queue depth only sees a queue if requests can wait at
+the backend: give such models a `capacity_headroom` above 1 (1.25 admits a
+quarter more than the ready capacity).
+
+**RBAC (kubernetes source only):** with `obleth.capacityDiscovery.enabled` and
+at least one namespace listed, the chart creates a ServiceAccount for the
+gateway pods and, in each listed namespace, a Role granting only
+`get`/`list`/`watch` on `pods` plus a RoleBinding to that account. There is no
+ClusterRole. Reading pods exposes their full specs, plain `env` values included,
+which is why the source is opt-in and namespace-scoped: list only the
+namespaces your backends run in. The namespaces must exist and the account
+running `helm` must be allowed to create Roles in them. With no namespaces
+listed nothing is rendered and the gateway keeps its default account.
+
+A kubernetes-source model whose namespace is outside the list, or that has no
+selector and no default template to fall back on, is refused when it is saved.
+The dashboard's model page and `GET /api/v1/capacity/discovery` show, per
+discovered model, the ready replicas, the per-replica value and where it came
+from, the derived pool size, this replica's share, the last refresh and the
+reason when discovery has no answer; `obleth_capacity_discovery_models{state}`
+counts models by state. See
+[`values-capacity-discovery.yaml`](obleth/examples/values-capacity-discovery.yaml)
+for settings and selector examples.
+
 ## What the chart starts
 
 A self-contained demo install brings up:
