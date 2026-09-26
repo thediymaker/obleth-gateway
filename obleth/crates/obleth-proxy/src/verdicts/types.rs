@@ -7,6 +7,7 @@
 //! without breaking older gateways.
 
 use std::collections::BTreeMap;
+use std::io;
 
 use serde::{Deserialize, Serialize};
 
@@ -107,6 +108,56 @@ pub(crate) struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
+}
+
+/// Decimal places kept on every float in the response body.
+pub(crate) const FLOAT_DECIMALS: usize = 6;
+
+/// Serialize the response with every float written as a fixed-point decimal.
+///
+/// serde_json's default float output is the shortest round-trip form, which
+/// switches to scientific notation below 1e-5: a distribution comes back as
+/// `{"billing": 0.9999, "account": 1.55e-6}`, two notations in one object.
+/// Probabilities, confidences, and expected values are all written as plain
+/// decimals rounded to [`FLOAT_DECIMALS`] places instead, so a client (or a
+/// person reading the body) never has to parse an exponent. Six places is
+/// far more than a first-token distribution can be trusted to.
+pub(crate) fn to_json_bytes(response: &VerdictsResponse) -> Result<Vec<u8>, serde_json::Error> {
+    let mut ser = serde_json::Serializer::with_formatter(Vec::new(), FixedPointFormatter);
+    response.serialize(&mut ser)?;
+    Ok(ser.into_inner())
+}
+
+/// serde_json's compact formatter with `write_f64` replaced by fixed-point
+/// output. Every other method keeps its default (compact) behavior.
+struct FixedPointFormatter;
+
+impl serde_json::ser::Formatter for FixedPointFormatter {
+    fn write_f64<W: ?Sized + io::Write>(&mut self, writer: &mut W, value: f64) -> io::Result<()> {
+        if !value.is_finite() {
+            return writer.write_all(b"null");
+        }
+        writer.write_all(fixed_point(value).as_bytes())
+    }
+}
+
+/// Render a finite float as a decimal with at most [`FLOAT_DECIMALS`] places,
+/// trailing zeros trimmed but at least one digit after the point so the token
+/// still reads as a float (`1.0`, not `1`). Values that round to zero come out
+/// as `0.0`, never `-0.0`.
+fn fixed_point(value: f64) -> String {
+    let mut s = format!("{value:.FLOAT_DECIMALS$}");
+    if s.contains('.') {
+        let trimmed = s.trim_end_matches('0').len();
+        s.truncate(trimmed);
+        if s.ends_with('.') {
+            s.push('0');
+        }
+    }
+    if s == "-0.0" {
+        return "0.0".to_string();
+    }
+    s
 }
 
 /// Validate the request against the MVP limits. The returned string becomes
@@ -355,5 +406,87 @@ mod tests {
         assert!(v["probabilities"].is_array());
         assert_eq!(v["type"], "score");
         assert!((v["expected_value"].as_f64().unwrap() - 2.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn floats_are_written_as_fixed_point_decimals() {
+        assert_eq!(fixed_point(0.9999305114863566), "0.999931");
+        assert_eq!(fixed_point(1.5534903124299995e-6), "0.000002");
+        assert_eq!(fixed_point(2.26e-9), "0.0");
+        assert_eq!(fixed_point(-0.0), "0.0");
+        assert_eq!(fixed_point(1.0), "1.0");
+        assert_eq!(fixed_point(0.0), "0.0");
+        assert_eq!(fixed_point(2.9956345671093089), "2.995635");
+        assert_eq!(fixed_point(0.5), "0.5");
+    }
+
+    #[test]
+    fn the_response_body_never_uses_scientific_notation() {
+        let mut verdicts = BTreeMap::new();
+        verdicts.insert(
+            "department".to_string(),
+            Verdict {
+                kind: "choice",
+                value: serde_json::json!("billing"),
+                probabilities: serde_json::json!({
+                    "account": 1.5534903124299995e-6,
+                    "billing": 0.9999961861946203,
+                    "technical": 2.26031506727819e-6,
+                }),
+                confidence: 0.9999305114863566,
+                expected_value: None,
+            },
+        );
+        verdicts.insert(
+            "frustration".to_string(),
+            Verdict {
+                kind: "score",
+                value: serde_json::json!(3),
+                probabilities: serde_json::json!([
+                    0.0021827164453451808,
+                    0.0,
+                    0.9978172835546547,
+                    0.0
+                ]),
+                confidence: 0.733957935578729,
+                expected_value: Some(2.9956345671093089),
+            },
+        );
+        let response = VerdictsResponse {
+            model: "glm-5-3".to_string(),
+            verdicts,
+            usage: Usage {
+                prompt_tokens: 590,
+                completion_tokens: 5,
+                total_tokens: 595,
+            },
+        };
+        let bytes = to_json_bytes(&response).unwrap();
+        let text = std::str::from_utf8(&bytes).unwrap();
+        // An exponent is a digit followed by `e` (`1.5e-6`); words carry `e`
+        // too, so look for the numeric form specifically.
+        let has_exponent = text
+            .as_bytes()
+            .windows(2)
+            .any(|w| w[0].is_ascii_digit() && (w[1] == b'e' || w[1] == b'E'));
+        assert!(!has_exponent, "scientific notation in body: {text}");
+        assert!(text.contains("\"account\":0.000002"), "{text}");
+        assert!(
+            text.contains("\"probabilities\":[0.002183,0.0,0.997817,0.0]"),
+            "{text}"
+        );
+        assert!(text.contains("\"expected_value\":2.995635"), "{text}");
+        // Still valid JSON with the same shape and integer fields intact.
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["usage"]["prompt_tokens"], 590);
+        assert_eq!(v["verdicts"]["frustration"]["value"], 3);
+        assert!(
+            (v["verdicts"]["department"]["probabilities"]["billing"]
+                .as_f64()
+                .unwrap()
+                - 0.999996)
+                .abs()
+                < 1e-12
+        );
     }
 }

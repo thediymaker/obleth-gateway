@@ -25,7 +25,6 @@ use std::time::{Duration, Instant};
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{header, Request, Response, StatusCode};
-use axum::response::IntoResponse;
 use obleth_config::Admission;
 use obleth_tokenizer::{CostEstimate, Tokenizer};
 use uuid::Uuid;
@@ -1093,7 +1092,21 @@ async fn handler_inner(
         verdicts: verdicts_map,
         usage,
     };
-    let mut resp = (StatusCode::OK, axum::Json(response)).into_response();
+    // Not `axum::Json`: floats are written fixed-point (see `types::to_json_bytes`).
+    let body = match types::to_json_bytes(&response) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("failed to serialize verdicts response: {e}"),
+            )
+        }
+    };
+    let mut resp = Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body))
+        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"));
     if let Ok(value) = header::HeaderValue::from_str(&request_id.to_string()) {
         resp.headers_mut().insert("x-obleth-request-id", value);
     }
