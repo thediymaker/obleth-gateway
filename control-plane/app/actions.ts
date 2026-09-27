@@ -519,6 +519,41 @@ export async function setWeightAction(id: string, weight: number) {
   revalidatePath("/");
 }
 
+/** A fairshare group's weight: its share of a full pool against the other active groups. */
+export async function setGroupWeightAction(name: string, weight: number): Promise<ActionResult> {
+  const session = await requireAdmin();
+  if (!name || !Number.isInteger(weight) || weight < 1) return { ok: false, error: "Weight must be a whole number of at least 1." };
+  try {
+    await obleth.setFairshareGroupWeight(name, weight, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/fairshare");
+  revalidatePath("/fairshare/groups");
+  return { ok: true };
+}
+
+/**
+ * A tenant's per-model in-flight cap (null clears it). The quota endpoint
+ * sets tokens per minute alongside, so the tenant's current value is read and
+ * carried over rather than reset.
+ */
+export async function setTenantMaxInFlightAction(id: string, maxInFlight: number | null): Promise<ActionResult> {
+  const session = await requireAdmin();
+  if (maxInFlight !== null && (!Number.isInteger(maxInFlight) || maxInFlight < 1)) return { ok: false, error: "The cap must be a whole number of at least 1, or empty for no limit." };
+  try {
+    const tenant = (await obleth.listTenants()).find((t) => t.id === id);
+    if (!tenant) return { ok: false, error: "Tenant not found." };
+    await obleth.setQuota(id, tenant.tokens_per_minute, maxInFlight, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  updateTag(CACHE_TAGS.tenants);
+  revalidatePath("/fairshare");
+  revalidatePath("/tenants");
+  return { ok: true };
+}
+
 export async function setQuotaAction(formData: FormData) {
   const session = await requireAdmin();
   const id = String(formData.get("id"));

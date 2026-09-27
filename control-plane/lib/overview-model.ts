@@ -124,7 +124,7 @@ export interface FleetTile {
  * to capacity discovery (its enforced size and cluster-wide count), then to
  * the configured size.
  */
-function poolFor(name: string, model: ModelRoute, fairshare?: FairshareLiveView, discovery?: CapacityDiscoveryView) {
+export function poolOccupancy(name: string, model: ModelRoute, fairshare?: FairshareLiveView, discovery?: CapacityDiscoveryView) {
   const shared = fairshare?.mode === "shared";
   const pool = fairshare?.pools?.find((p) => p.model === name);
   if (pool) {
@@ -170,7 +170,7 @@ export function buildFleet(
     .map<FleetTile>((m) => {
       const row = healthById.get(m.id);
       const state = healthState(row, now);
-      const pool = poolFor(m.model_name, m, fairshare, discovery);
+      const pool = poolOccupancy(m.model_name, m, fairshare, discovery);
       const u = usageByName.get(m.model_name);
       const full = pool.queued > 0 && pool.cap > 0 && pool.inFlight >= pool.cap;
       return {
@@ -258,7 +258,7 @@ export function buildAttention(fleet: FleetTile[], fairshare: FairshareLiveView 
       urgent: true,
       title: `${t.name} is at capacity and queuing`,
       detail: `${t.inFlight.toLocaleString()} of ${t.cap.toLocaleString()} slots in use · ${t.queued.toLocaleString()} queued`,
-      actions: [{ label: "Open Fairshare", href: "/fairshare", primary: true }, { label: "Capacity", href: `/models?model=${encodeURIComponent(t.name)}` }],
+      actions: [{ label: "Open the pool", href: `/fairshare?pool=${encodeURIComponent(t.name)}`, primary: true }, { label: "Capacity", href: `/models?model=${encodeURIComponent(t.name)}` }],
     });
   }
   const queued = fairshare?.global_queued ?? 0;
