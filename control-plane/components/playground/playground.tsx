@@ -2,17 +2,19 @@
 
 import { useEffect, useState } from "react";
 import { z } from "zod";
-import { ArrowDownToLine, History, Image as ImageIcon, MessageSquare, Plus, Route, Scale, SlidersHorizontal, Trash2 } from "lucide-react";
+import { ArrowDownToLine, Code2, PanelLeft, PanelRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Select } from "@/components/ui/select";
 import { generationSchema } from "@/lib/charo/chat-request";
 import { useEnabledModels } from "@/components/charo/use-enabled-models";
 import { UnifiedWorkspace } from "./workspaces";
 import { RouterWorkspace } from "./router-workspace";
 import { ImageWorkspace } from "./image-workspace";
 import { VerdictsWorkspace } from "./verdicts-workspace";
+import { NewSession } from "./new-session";
+import { GetCode } from "./get-code";
+import { SessionsRail } from "./sessions-rail";
 import { migrateLegacySessions } from "./session-migration";
+import { MODES } from "./ui";
 import { cn } from "@/lib/utils";
 
 // Shared by the zod cap below and the Router textarea's `maxLength`
@@ -32,6 +34,13 @@ export const sessionSchema = z.object({
   id: z.string(), title: z.string(), mode: z.enum(["chat", "compare", "router", "image", "verdicts"]),
   models: z.array(z.string()).min(1).max(4), generation: generationSchema,
   recipients: z.array(z.number().int().min(0).max(3)).optional(),
+  // Last touched, for ordering and grouping the session rail.
+  updatedAt: z.number().optional(),
+  // A new session shows the "What do you want to try?" launcher until a mode is picked.
+  launcher: z.boolean().optional(),
+  // Text handed to the chat composer by another mode (Router's "Open in Chat");
+  // read once when the chat workspace mounts, then cleared.
+  chatDraft: z.string().max(ROUTER_PROMPT_MAX_LENGTH).optional(),
   // Router mode's form draft — everything here is cheap to carry on the
   // session (not component-local state) so it survives a Chat<->Router
   // toggle, which remounts RouterWorkspace since the two modes render
@@ -74,33 +83,53 @@ export const sessionSchema = z.object({
   })).max(32).optional(),
 });
 export type PlaygroundSession = z.infer<typeof sessionSchema>;
-const fresh = (): PlaygroundSession => ({ id: crypto.randomUUID(), title: "Untitled session", mode: "compare", models: ["charo"], generation: { systemPrompt: "" } });
 
-export function Playground({ scope }: { scope: string }) {
+/** Work the shell queues for a session's chat workspace to run once it is ready. */
+export type PendingAction = { kind: "send" | "activity"; value: string };
+
+const fresh = (): PlaygroundSession => ({
+  id: crypto.randomUUID(), title: "Untitled session", mode: "compare", models: ["auto"], generation: { systemPrompt: "" },
+  launcher: true, updatedAt: Date.now(),
+});
+
+export function Playground({ scope, gatewayBase = "http://localhost:8080" }: { scope: string; gatewayBase?: string }) {
   const root = `obleth-playground:${encodeURIComponent(scope)}`;
   const [sessions, setSessions] = useState<PlaygroundSession[]>([]);
   const [active, setActive] = useState("");
-  const [storageError, setStorageError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
   const [showSessions, setShowSessions] = useState(true);
-  const [showSettings, setShowSettings] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(true);
+  const [codeOpen, setCodeOpen] = useState(false);
+  const [pending, setPending] = useState<(PendingAction & { sessionId: string }) | null>(null);
   const { models, loading, error, reload } = useEnabledModels();
+  useEffect(() => {
+    // Narrow screens start with the work surface unobstructed.
+    if (window.innerWidth < 1024) setSettingsOpen(false);
+    if (window.innerWidth < 768) setShowSessions(false);
+  }, []);
   useEffect(() => {
     try {
       const parsed = z.array(sessionSchema).max(100).safeParse(JSON.parse(localStorage.getItem(root) ?? "[]"));
       const stored = parsed.success && parsed.data.length ? parsed.data : [fresh()];
       migrateLegacySessions(stored, root, localStorage);
       setSessions(stored); setActive(stored[0].id);
-    } catch { const session = fresh(); setSessions([session]); setActive(session.id); setStorageError("Browser storage is unavailable. Sessions will last only until you leave."); }
+    } catch { const session = fresh(); setSessions([session]); setActive(session.id); setNotice("Browser storage is unavailable. Sessions will last only until you leave."); }
   }, [root]);
   useEffect(() => {
     if (!sessions.length) return;
     try { localStorage.setItem(root, JSON.stringify(sessions)); }
-    catch { setStorageError("Session settings could not be saved. Export important conversations before leaving."); }
+    catch { setNotice("Session settings could not be saved. Export important conversations before leaving."); }
   }, [root, sessions]);
   const session = sessions.find((s) => s.id === active);
-  const update = (patch: Partial<PlaygroundSession>) => setSessions((all) => all.map((s) => s.id === active ? { ...s, ...patch } : s));
+  const update = (patch: Partial<PlaygroundSession>) =>
+    setSessions((all) => all.map((s) => s.id === active ? { ...s, ...patch, updatedAt: Date.now() } : s));
   const create = () => {
     const next = fresh(); setSessions((all) => [next, ...all]); setActive(next.id);
+  };
+  const openSession = (seed: Partial<PlaygroundSession>, action?: PendingAction) => {
+    const next = { ...fresh(), launcher: false, ...seed };
+    setSessions((all) => [next, ...all]); setActive(next.id);
+    if (action) setPending({ ...action, sessionId: next.id });
   };
   const remove = (id: string) => {
     const remaining = sessions.filter((s) => s.id !== id);
@@ -117,78 +146,104 @@ export function Playground({ scope }: { scope: string }) {
     const conversations: Record<string, unknown> = {};
     try {
       Object.keys(localStorage).filter((k) => k.startsWith(`${root}:${active}:`)).forEach((k) => { conversations[k.slice(root.length + active.length + 2)] = JSON.parse(localStorage.getItem(k) ?? "null"); });
-    } catch { setStorageError("Only the open conversations could be exported; browser storage is unavailable."); }
+    } catch { setNotice("Only the open conversations could be exported; browser storage is unavailable."); }
     const live: Record<string, unknown> = {};
     window.dispatchEvent(new CustomEvent("playground-export", { detail: live }));
     Object.entries(live).filter(([k]) => k.startsWith(`${root}:${active}:`)).forEach(([k, value]) => { conversations[k.slice(root.length + active.length + 2)] = value; });
     const url = URL.createObjectURL(new Blob([JSON.stringify({ session, conversations }, null, 2)], { type: "application/json" }));
     const link = document.createElement("a"); link.href = url; link.download = "playground-session.json"; link.click(); URL.revokeObjectURL(url);
   };
+  // The inverse of exportSession: a fresh id, so importing twice never collides.
+  const importSession = async (file: File) => {
+    try {
+      const data = JSON.parse(await file.text()) as { session?: unknown; conversations?: Record<string, unknown> };
+      const parsed = sessionSchema.safeParse(data.session);
+      if (!parsed.success) { setNotice("That file is not a Playground session export."); return; }
+      const next = { ...parsed.data, id: crypto.randomUUID(), updatedAt: Date.now() };
+      for (const [key, value] of Object.entries(data.conversations ?? {})) {
+        // Only conversation lanes; images are not persisted anyway.
+        if (/^compare:\d$/.test(key) && value) localStorage.setItem(`${root}:${next.id}:${key}`, JSON.stringify(value));
+      }
+      setSessions((all) => [next, ...all]); setActive(next.id); setNotice(null);
+    } catch { setNotice("Could not import that file."); }
+  };
   if (!session) return <p className="p-6 text-sm text-muted-foreground">Loading Playground…</p>;
+  const hasSettings = !session.launcher && session.mode !== "verdicts";
+  const tabActive = (mode: PlaygroundSession["mode"]) => !session.launcher && (session.mode === mode || (mode === "compare" && session.mode === "chat"));
+  const sessionPending = pending?.sessionId === session.id ? pending : undefined;
   return (
-    <div className="flex h-full min-h-[36rem] flex-col">
-      {storageError && <p role="alert" className="px-4 py-2 text-xs text-amber-600">{storageError}</p>}
-      {error && <div role="alert" className="flex items-center gap-3 px-4 py-2 text-sm text-destructive">{error}<Button variant="outline" size="sm" onClick={reload}>Retry loading models</Button></div>}
-      <div className="flex min-h-0 flex-1 flex-col md:flex-row">
-        {showSessions && <aside className="flex shrink-0 flex-col gap-3 border-b border-border bg-secondary/10 p-3 md:w-52 md:border-b-0 md:border-r">
-          <Button variant="outline" size="sm" onClick={create} disabled={sessions.length >= 50}><Plus className="mr-2 h-4 w-4" />New session</Button>
-
-          <div className="max-h-40 min-h-0 flex-1 space-y-1 overflow-y-auto md:max-h-none">{sessions.map((s) => <div key={s.id} className={cn("group flex w-full items-center rounded-md", active === s.id ? "bg-secondary text-foreground" : "text-muted-foreground hover:bg-accent")}>
-            <button onClick={() => setActive(s.id)} aria-current={active === s.id ? "true" : undefined} className="flex min-w-0 flex-1 items-center gap-2 rounded-md px-2 py-2 text-left text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-              <MessageSquare className="h-3.5 w-3.5 shrink-0" /><span className="truncate">{s.title}</span>
-            </button>
-            <Button variant="ghost" size="icon" className="mr-1 h-7 w-7 shrink-0 text-muted-foreground hover:text-destructive" title="Delete session" aria-label={`Delete session: ${s.title}`} onClick={() => remove(s.id)}><Trash2 className="h-3.5 w-3.5" /></Button>
-          </div>)}</div>
-          <p className="hidden text-[11px] text-muted-foreground md:block">Sessions are saved in this browser for your account.</p>
-        </aside>}
-        <div className="flex min-h-0 min-w-0 flex-1 flex-col">
-          {/* One control row for the whole page. There used to be a second header above this one carrying a duplicate "Playground" title and a second panel toggle; the app shell already names the page and already owns the navigation toggle. */}
-          <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-2">
-            <Button variant="ghost" size="icon" title="Toggle session list" aria-label="Toggle session list" aria-expanded={showSessions} onClick={() => setShowSessions(!showSessions)}><History className="h-4 w-4" /></Button>
-            {!showSessions && <Button variant="ghost" size="icon" title="New session" onClick={create} disabled={sessions.length >= 50}><Plus className="h-4 w-4" /></Button>}
-            <input aria-label="Session name" maxLength={100} className="min-w-0 flex-1 bg-transparent text-sm outline-none focus:ring-1 focus:ring-ring" value={session.title} onChange={(e) => update({ title: e.target.value })} />
-            <div role="group" aria-label="Playground mode" className="flex shrink-0 items-center gap-0.5 rounded-md border border-border p-0.5">
-              <Button type="button" variant={session.mode === "chat" || session.mode === "compare" ? "secondary" : "ghost"} size="sm" aria-pressed={session.mode === "chat" || session.mode === "compare"} onClick={() => update({ mode: "compare" })}><MessageSquare className="mr-1.5 h-3.5 w-3.5" />Chat</Button>
-              <Button type="button" variant={session.mode === "router" ? "secondary" : "ghost"} size="sm" aria-pressed={session.mode === "router"} onClick={() => update({ mode: "router" })}><Route className="mr-1.5 h-3.5 w-3.5" />Router</Button>
-              <Button type="button" variant={session.mode === "image" ? "secondary" : "ghost"} size="sm" aria-pressed={session.mode === "image"} onClick={() => update({ mode: "image" })}><ImageIcon className="mr-1.5 h-3.5 w-3.5" />Image</Button>
-              <Button type="button" variant={session.mode === "verdicts" ? "secondary" : "ghost"} size="sm" aria-pressed={session.mode === "verdicts"} onClick={() => update({ mode: "verdicts" })}><Scale className="mr-1.5 h-3.5 w-3.5" />Verdicts</Button>
-            </div>
-            {/* Every mode has request parameters worth hiding until asked for, and every mode puts them in the same place. */}
-            <Button variant="outline" size="sm" onClick={() => setShowSettings(!showSettings)} aria-expanded={showSettings}><SlidersHorizontal className="mr-2 h-4 w-4" />Parameters</Button>
-            <Button variant="ghost" size="icon" title="Export saved session" onClick={exportSession}><ArrowDownToLine className="h-4 w-4" /></Button>
+    <div className="flex h-full min-h-[36rem] flex-col md:flex-row">
+      {showSessions && (
+        <SessionsRail
+          sessions={sessions}
+          active={active}
+          onSelect={setActive}
+          onCreate={create}
+          onRemove={remove}
+          onImport={(f) => void importSession(f)}
+          canCreate={sessions.length < 50}
+        />
+      )}
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        {/* One control row for the whole page. The app shell already names the page and already owns the navigation toggle. */}
+        <header className="flex h-14 shrink-0 items-center gap-2 border-b border-border px-2 md:px-3">
+          <div className="flex min-w-0 flex-1 items-center gap-1">
+            <Button variant="ghost" size="icon" className="text-muted-foreground" title="Toggle session list" aria-label="Toggle session list" aria-expanded={showSessions} onClick={() => setShowSessions(!showSessions)}><PanelLeft className="h-4 w-4" /></Button>
+            <input
+              aria-label="Session name"
+              maxLength={100}
+              className="h-8 w-full min-w-0 max-w-xs truncate rounded-md bg-transparent px-2 text-sm font-semibold outline-none hover:bg-accent/50 focus:bg-accent/50 focus:ring-1 focus:ring-ring"
+              value={session.title}
+              onChange={(e) => update({ title: e.target.value })}
+            />
           </div>
-          {showSettings && (session.mode === "chat" || session.mode === "compare") && <div className="grid gap-3 border-b border-border bg-secondary/20 p-4 sm:grid-cols-[1fr_9rem_10rem]">
-            <label className="text-xs font-medium">System prompt<textarea aria-label="System prompt" value={session.generation.systemPrompt} maxLength={32000} onChange={(e) => update({ generation: { ...session.generation, systemPrompt: e.target.value } })} className="mt-1 w-full resize-y rounded-md border border-border bg-background p-2 text-sm" rows={2} placeholder="Instructions for direct chat and comparison" /></label>
-            <label className="text-xs font-medium">Temperature<Input aria-label="Temperature" className="mt-1" type="number" min={0} max={2} step={0.1} placeholder="Model default" value={session.generation.temperature ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (n >= 0 && n <= 2)) update({ generation: { ...session.generation, temperature: e.target.value ? n : undefined } }); }} /></label>
-            <label className="text-xs font-medium">Max output tokens<Input aria-label="Max output tokens" className="mt-1" type="number" min={1} max={131072} placeholder="Model default" value={session.generation.maxTokens ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 131072)) update({ generation: { ...session.generation, maxTokens: e.target.value ? n : undefined } }); }} /></label>
-          </div>}
-          {showSettings && session.mode === "router" && <div className="grid gap-3 border-b border-border bg-secondary/20 p-4 sm:grid-cols-4">
-            <label className="text-xs font-medium">Tenant ID<Input aria-label="Tenant ID" className="mt-1" maxLength={200} placeholder="Optional" value={session.routerTenantId ?? ""} onChange={(e) => update({ routerTenantId: e.target.value })} /></label>
-            <label className="text-xs font-medium">Effort<Select aria-label="Effort" className="mt-1 font-normal" value={session.routerEffort ?? ""} onValueChange={(value) => update({ routerEffort: value ? (value as "low" | "medium" | "high") : undefined })} options={[{ value: "", label: "Default" }, { value: "low", label: "Low" }, { value: "medium", label: "Medium" }, { value: "high", label: "High" }]} /></label>
-            <label className="text-xs font-medium">Max output tokens<Input aria-label="Max output tokens" className="mt-1" type="number" min={1} max={131072} placeholder="Unset" value={session.routerMaxTokens ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 131072)) update({ routerMaxTokens: e.target.value ? n : undefined }); }} /></label>
-            <div className="flex flex-col justify-end gap-1 text-xs">
-              <label className="flex items-center gap-2"><input type="checkbox" checked={session.routerNeedsFunctionCalling ?? false} onChange={(e) => update({ routerNeedsFunctionCalling: e.target.checked })} className="h-3.5 w-3.5" />Function calling</label>
-              <label className="flex items-center gap-2"><input type="checkbox" checked={session.routerNeedsToolChoice ?? false} onChange={(e) => update({ routerNeedsToolChoice: e.target.checked })} className="h-3.5 w-3.5" />Forced tool choice</label>
-              <label className="flex items-center gap-2"><input type="checkbox" checked={session.routerNeedsResponseSchema ?? false} onChange={(e) => update({ routerNeedsResponseSchema: e.target.checked })} className="h-3.5 w-3.5" />Response schema</label>
-            </div>
-          </div>}
-          {showSettings && session.mode === "image" && <div className="grid gap-3 border-b border-border bg-secondary/20 p-4 sm:grid-cols-[1fr_9rem_10rem]">
-            <label className="text-xs font-medium">Negative prompt<textarea aria-label="Negative prompt" id="image-negative-prompt" value={session.imageNegativePrompt ?? ""} maxLength={4000} onChange={(e) => update({ imageNegativePrompt: e.target.value })} className="mt-1 w-full resize-y rounded-md border border-border bg-background p-2 text-sm" rows={2} placeholder="blurry, watermark" /></label>
-            <label className="text-xs font-medium">Steps<Input aria-label="Steps" id="image-steps" className="mt-1" type="number" min={1} max={150} placeholder="Backend default" value={session.imageSteps ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 150)) update({ imageSteps: e.target.value ? n : undefined }); }} /></label>
-            <label className="text-xs font-medium">Seed<Input aria-label="Seed" id="image-seed" className="mt-1" type="number" min={0} max={4_294_967_295} placeholder="Random" value={session.imageSeed ?? ""} onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 0 && n <= 4_294_967_295)) update({ imageSeed: e.target.value ? n : undefined }); }} /></label>
-            <p className="text-[11px] text-muted-foreground sm:col-span-3">Negative prompt, steps, and seed are not part of the OpenAI images API. They are passed through to the backend, which may ignore them.</p>
-          </div>}
-          <div className="min-h-0 flex-1" key={`${session.id}:${session.mode}`}>
-            {session.mode === "router"
-              ? <RouterWorkspace session={session} update={update} />
-              : session.mode === "image"
-              ? <ImageWorkspace storageKey={`${root}:${session.id}:image`} session={session} update={update} models={models} loading={loading} />
-              : session.mode === "verdicts"
-              ? <VerdictsWorkspace session={session} update={update} models={models} loading={loading} />
-              : <UnifiedWorkspace storageKey={`${root}:${session.id}:compare`} session={session} update={update} models={models} loading={loading} />}
+          <div role="group" aria-label="Playground mode" className="flex shrink-0 self-stretch">
+            {MODES.map(({ mode, label, icon: Icon }) => (
+              <button
+                key={mode}
+                type="button"
+                aria-pressed={tabActive(mode)}
+                title={label}
+                aria-label={label}
+                onClick={() => update({ mode, launcher: false })}
+                className={cn(
+                  "-mb-px flex items-center gap-1.5 border-b-2 px-2.5 text-[13px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-ring sm:px-3.5",
+                  tabActive(mode) ? "border-violet-400 text-foreground" : "border-transparent text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <Icon className="h-3.5 w-3.5" aria-hidden="true" /><span className="hidden sm:inline">{label}</span>
+              </button>
+            ))}
           </div>
+          <div className="flex flex-1 items-center justify-end gap-1">
+            {!session.launcher && <Button variant="ghost" size="sm" className="text-muted-foreground" onClick={() => setCodeOpen(true)}><Code2 className="h-4 w-4" /><span className="hidden lg:inline">Get code</span></Button>}
+            <Button variant="ghost" size="icon" className="text-muted-foreground" title="Export session" aria-label="Export session" onClick={exportSession}><ArrowDownToLine className="h-4 w-4" /></Button>
+            {hasSettings && (
+              <Button variant="ghost" size="icon" className={cn("text-muted-foreground", settingsOpen && "bg-secondary text-foreground")} title={settingsOpen ? "Hide settings" : "Show settings"} aria-label={settingsOpen ? "Hide settings" : "Show settings"} aria-pressed={settingsOpen} onClick={() => setSettingsOpen(!settingsOpen)}>
+                <PanelRight className="h-4 w-4" />
+              </Button>
+            )}
+          </div>
+        </header>
+        {notice && <p role="alert" className="flex items-center justify-between gap-3 border-b border-border bg-secondary/40 px-4 py-2 text-xs text-secondary-foreground">{notice}<button type="button" className="underline" onClick={() => setNotice(null)}>Dismiss</button></p>}
+        {error && <div role="alert" className="flex items-center gap-3 border-b border-border bg-secondary/40 px-4 py-2 text-sm">{error}<Button variant="outline" size="sm" onClick={reload}>Retry loading models</Button></div>}
+        <div className="relative min-h-0 flex-1" key={`${session.id}:${session.launcher ? "launcher" : session.mode}`}>
+          {session.launcher
+            ? <NewSession
+                onPick={(mode) => update({ mode, launcher: false })}
+                onQuickStart={(text) => { update({ mode: "compare", models: ["auto"], recipients: [0], launcher: false }); setPending({ sessionId: session.id, kind: "send", value: text }); }}
+                onAssistant={(activity) => { update({ mode: "compare", models: ["charo"], recipients: [0], launcher: false, title: activity === "benchmark" ? "Benchmark" : "Capability test" }); setPending({ sessionId: session.id, kind: "activity", value: activity }); }}
+              />
+            : session.mode === "router"
+            ? <RouterWorkspace session={session} update={update} settingsOpen={settingsOpen} onOpenSession={openSession} />
+            : session.mode === "image"
+            ? <ImageWorkspace storageKey={`${root}:${session.id}:image`} session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} />
+            : session.mode === "verdicts"
+            ? <VerdictsWorkspace session={session} update={update} models={models} loading={loading} />
+            : <UnifiedWorkspace storageKey={`${root}:${session.id}:compare`} session={session} update={update} models={models} loading={loading} settingsOpen={settingsOpen} onOpenSession={openSession} pending={sessionPending} onPendingDone={() => setPending(null)} />}
         </div>
       </div>
+      <GetCode open={codeOpen} onOpenChange={setCodeOpen} session={session} gatewayBase={gatewayBase} />
     </div>
   );
 }

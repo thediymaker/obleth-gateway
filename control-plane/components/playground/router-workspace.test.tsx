@@ -102,8 +102,8 @@ describe("RouterWorkspace", () => {
   it('reports weights as unavailable, not "matches live", when no baseline has ever been fetched', async () => {
     vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ error: "gateway unreachable" }), { status: 502 })));
     await flush();
-    expect(host.textContent).toContain("live weights unavailable");
-    expect(host.textContent).not.toContain("matches live");
+    expect(host.textContent).toContain("Live weights unavailable");
+    expect(host.textContent).not.toContain("Matches live");
     const applyButton = [...host.querySelectorAll("button")].find((b) => b.textContent?.includes("Apply to gateway")) as HTMLButtonElement;
     expect(applyButton.disabled).toBe(true); // no baseline to be dirty against, so nothing to apply
   });
@@ -121,26 +121,45 @@ describe("RouterWorkspace", () => {
     expect(calls.some((c) => c.capacity_weight !== undefined)).toBe(true);
   });
 
-  it('reports "matches live" until a slider moves, then "✎ edited", and only writes settings on Apply', async () => {
+  it('reports "Matches live" until a slider moves, then "Draft", and only writes settings once Apply is confirmed', async () => {
     await flush(); // let the initial (empty-prompt) seed run settle
-    expect(host.textContent).toContain("matches live");
+    expect(host.textContent).toContain("Matches live");
 
-    const applyButton = [...host.querySelectorAll("button")].find((b) => b.textContent?.includes("Apply to gateway")) as HTMLButtonElement;
+    const applyButton = [...host.querySelectorAll("button")].find((b) => b.textContent === "Apply to gateway…") as HTMLButtonElement;
     expect(applyButton.disabled).toBe(true);
     expect(setAutoRouterSettingsAction).not.toHaveBeenCalled();
 
     const slider = host.querySelector<HTMLInputElement>("#router-capacity-weight")!;
     await act(async () => setNativeValue(slider, "0.95"));
-    expect(host.textContent).toContain("✎ edited");
+    expect(host.textContent).toContain("Draft");
+    expect(host.textContent).not.toContain("Matches live");
     expect(applyButton.disabled).toBe(false);
-    expect(setAutoRouterSettingsAction).not.toHaveBeenCalled();
 
+    // The first click only asks, listing what would change.
+    await act(async () => { applyButton.dispatchEvent(new MouseEvent("click", { bubbles: true })); });
+    expect(setAutoRouterSettingsAction).not.toHaveBeenCalled();
+    expect(document.body.textContent).toContain("Capacity weight");
+    expect(document.body.textContent).toContain("0.95");
+
+    const confirm = [...document.querySelectorAll("button")].find((b) => b.textContent === "Apply to gateway") as HTMLButtonElement;
     await act(async () => {
-      applyButton.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      confirm.dispatchEvent(new MouseEvent("click", { bubbles: true }));
       await new Promise((r) => setTimeout(r, 50));
     });
     expect(setAutoRouterSettingsAction).toHaveBeenCalledTimes(1);
     expect(vi.mocked(setAutoRouterSettingsAction).mock.calls[0][0].capacity_weight).toBeCloseTo(0.95);
+  });
+
+  it("Reset to live puts the sliders back on the saved weights without writing anything", async () => {
+    await flush();
+    const slider = host.querySelector<HTMLInputElement>("#router-cost-weight")!;
+    await act(async () => setNativeValue(slider, "0.1"));
+    expect(host.textContent).toContain("Draft");
+    const reset = [...host.querySelectorAll("button")].find((b) => b.textContent === "Reset to live") as HTMLButtonElement;
+    await act(async () => reset.click());
+    expect(host.querySelector<HTMLInputElement>("#router-cost-weight")!.value).toBe("0.4");
+    expect(host.textContent).toContain("Matches live");
+    expect(setAutoRouterSettingsAction).not.toHaveBeenCalled();
   });
 
   it("debounces slider drags instead of firing a request per change", async () => {
