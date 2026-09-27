@@ -783,6 +783,14 @@ export interface OverviewSummaryView {
   co2_g?: number;
 }
 
+/** A fairshare group: tenants in it split the group's share by tenant weight. */
+export interface FairshareGroup {
+  name: string;
+  weight: number;
+  created_at: string;
+  updated_at: string;
+}
+
 export interface TenantFairshareView {
   tenant_id: string;
   name: string;
@@ -1649,6 +1657,13 @@ export const obleth = {
     }),
   setWeight: (id: string, weight: number, options?: AuditOptions) =>
     api<Tenant>(`/tenants/${id}/weight`, {
+      method: "PATCH",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ weight }),
+    }),
+  listFairshareGroups: () => api<FairshareGroup[]>("/fairshare/groups"),
+  setFairshareGroupWeight: (name: string, weight: number, options?: AuditOptions) =>
+    api<FairshareGroup>(`/fairshare/groups/${encodeURIComponent(name)}/weight`, {
       method: "PATCH",
       headers: auditActorHeaders(options),
       body: JSON.stringify({ weight }),
