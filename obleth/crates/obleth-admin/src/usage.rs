@@ -348,6 +348,16 @@ pub struct UsageTotals {
     pub cost_usd: f64,
     /// Distinct tenants with at least one request in the window.
     pub active_tenants: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Requests that ended with an HTTP status of 400 or above.
+    pub errors: u64,
+    /// Median time to first token over requests that produced one; 0 when none did.
+    pub p50_ttft_ms: f64,
+    pub avg_ttft_ms: f64,
+    pub energy_wh: f64,
+    pub energy_cost_usd: f64,
+    pub co2_g: f64,
 }
 
 pub async fn query_usage_totals(
@@ -361,7 +371,12 @@ pub async fn query_usage_totals(
         "select count() as requests, \
          sum(input_tokens) + sum(output_tokens) as total_tokens, \
          sum(cost_usd) as cost_usd, \
-         uniqExact(tenant_id) as active_tenants \
+         uniqExact(tenant_id) as active_tenants, \
+         sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens, \
+         countIf(status_code >= 400) as errors, \
+         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft_ms, \
+         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms, \
+         sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
          from usage where ts_ms >= ?{filter}"
     );
     client
@@ -384,6 +399,8 @@ pub struct UsageAgg {
     pub energy_wh: f64,
     pub energy_cost_usd: f64,
     pub co2_g: f64,
+    /// Sum of each request's frozen `cost_usd`.
+    pub cost_usd: f64,
 }
 
 /// Per-key usage aggregate.
@@ -448,6 +465,13 @@ pub struct UsageTimePoint {
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub energy_wh: f64,
+    /// Requests in the bucket that ended with an HTTP status of 400 or above.
+    pub errors: u64,
+    /// Sum of each request's frozen `cost_usd`.
+    pub cost_usd: f64,
+    /// Median time to first token in the bucket; 0 when no request produced one.
+    pub p50_ttft_ms: f64,
+    pub avg_ttft_ms: f64,
 }
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
@@ -538,7 +562,8 @@ pub async fn query_usage(
                 "select tenant_id, count() as requests, \
                  sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
                  sum(input_tokens) + sum(output_tokens) as total_tok, \
-                 sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
+                 sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g, \
+                 sum(cost_usd) as cost_usd \
                  from usage where ts_ms >= ?",
             );
             sql.push_str(&usage_filter_sql(&q));
@@ -816,7 +841,11 @@ pub async fn query_usage_series(
          count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
          sum(input_tokens) + sum(output_tokens) as total_tok, \
-         sum(energy_wh) as energy_wh \
+         sum(energy_wh) as energy_wh, \
+         countIf(status_code >= 400) as errors, \
+         sum(cost_usd) as cost_usd, \
+         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft_ms, \
+         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms \
          from usage where ts_ms >= ?"
     );
     if q.tenant_id.is_some() {
