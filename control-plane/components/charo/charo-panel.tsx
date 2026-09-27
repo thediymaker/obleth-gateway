@@ -108,6 +108,8 @@ export function CharoPanel({
   embedded = false,
   hideComposer = false,
   inline = false,
+  variant = "bubble",
+  hideTrace = false,
 }: {
   open: boolean;
   /** When true the panel renders as a large centered modal instead of the dock. */
@@ -119,6 +121,10 @@ export function CharoPanel({
   embedded?: boolean;
   hideComposer?: boolean;
   inline?: boolean;
+  /** "plain" drops the assistant bubble so the host can frame answers itself (the Playground). */
+  variant?: "bubble" | "plain";
+  /** Omit the per-turn trace line; for hosts that render their own metrics. */
+  hideTrace?: boolean;
 }) {
   const { messages, busy, send, stop, reset, confirmRun, confirmCancel,
           startActivity, submitActivity, cancelActivity, activeTarget, clearTarget } = stream;
@@ -203,10 +209,12 @@ export function CharoPanel({
   };
 
   const canSend = !busy && (!!text.trim() || !!image);
-  const assistantBubbleClass = cn(
-    "min-w-0 max-w-full rounded-[14px] rounded-bl-[4px] border border-border/70 bg-secondary/45 px-3 py-[7px] shadow-[0_1px_0_hsl(240_5%_100%/0.03)]",
-    inline ? "w-full" : expanded ? "sm:max-w-[82%]" : "sm:max-w-[88%]",
-  );
+  const assistantBubbleClass = variant === "plain"
+    ? "min-w-0 w-full max-w-full text-[14.5px] leading-relaxed"
+    : cn(
+      "min-w-0 max-w-full rounded-[14px] rounded-bl-[4px] border border-border/70 bg-secondary/45 px-3 py-[7px] shadow-[0_1px_0_hsl(240_5%_100%/0.03)]",
+      inline ? "w-full" : expanded ? "sm:max-w-[82%]" : "sm:max-w-[88%]",
+    );
 
   // Shown while a file drag hovers the panel.
   const dropOverlay = dragOver ? (
@@ -258,7 +266,7 @@ export function CharoPanel({
       ref={threadRef}
       className={cn(
         inline ? "w-full space-y-3" : "w-full flex-1 space-y-4 overflow-y-auto",
-        inline ? "p-3" : expanded ? "h-full px-5 py-4" : "mx-auto max-w-3xl px-4 py-3",
+        inline ? (variant === "plain" ? "p-0" : "p-3") : expanded ? "h-full px-5 py-4" : "mx-auto max-w-3xl px-4 py-3",
       )}
     >
       {messages.length === 0 && hideComposer ? (
@@ -302,7 +310,7 @@ export function CharoPanel({
         }
 
         if (m.role === "assistant") {
-          const hasTrace = m.trace !== undefined || m.tracePending || m.metrics || m.requestId;
+          const hasTrace = !hideTrace && (m.trace !== undefined || m.tracePending || m.metrics || m.requestId);
           const hasLiveBench = (m.liveSteps?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0;
           const hasLiveCaps = (m.liveCapabilities?.length ?? 0) > 0 && (m.toolResults?.length ?? 0) === 0;
           const hasToolResults = (m.toolResults?.length ?? 0) > 0;
