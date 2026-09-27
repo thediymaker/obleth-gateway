@@ -537,6 +537,8 @@ export interface UsageAgg {
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
+  /** Absent from gateways older than the field. */
+  cost_usd?: number;
 }
 
 export interface UsageKeyAgg {
@@ -592,6 +594,14 @@ export interface UsageTimePoint {
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
+  // Absent from gateways older than the fields.
+  energy_wh?: number;
+  /** Requests in the bucket that ended with an HTTP status of 400 or above. */
+  errors?: number;
+  cost_usd?: number;
+  /** Median time to first token in the bucket; 0 when no request produced one. */
+  p50_ttft_ms?: number;
+  avg_ttft_ms?: number;
 }
 
 /// One row of the permanent daily rollup (`usage_daily`).
@@ -760,6 +770,17 @@ export interface OverviewSummaryView {
   model_count: number;
   enabled_models: number;
   key_count: number;
+  // Window detail; absent from gateways older than the field.
+  input_tokens?: number;
+  output_tokens?: number;
+  /** Requests that ended with an HTTP status of 400 or above. */
+  errors?: number;
+  /** Median time to first token; 0 when no request produced one. */
+  p50_ttft_ms?: number;
+  avg_ttft_ms?: number;
+  energy_wh?: number;
+  energy_cost_usd?: number;
+  co2_g?: number;
 }
 
 export interface TenantFairshareView {

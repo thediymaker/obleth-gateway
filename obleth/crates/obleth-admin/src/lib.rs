@@ -718,6 +718,16 @@ pub struct OverviewSummaryView {
     pub model_count: i64,
     pub enabled_models: i64,
     pub key_count: i64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Requests in the window that ended with an HTTP status of 400 or above.
+    pub errors: u64,
+    /// Median time to first token over the window; 0 when no request produced one.
+    pub p50_ttft_ms: f64,
+    pub avg_ttft_ms: f64,
+    pub energy_wh: f64,
+    pub energy_cost_usd: f64,
+    pub co2_g: f64,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -4716,6 +4726,14 @@ async fn get_overview_summary(
         model_count: counts.model_count,
         enabled_models: counts.enabled_models,
         key_count: counts.key_count,
+        input_tokens: totals.input_tokens,
+        output_tokens: totals.output_tokens,
+        errors: totals.errors,
+        p50_ttft_ms: totals.p50_ttft_ms,
+        avg_ttft_ms: totals.avg_ttft_ms,
+        energy_wh: totals.energy_wh,
+        energy_cost_usd: totals.energy_cost_usd,
+        co2_g: totals.co2_g,
     }))
 }
 
