@@ -110,49 +110,43 @@ pub(crate) struct Usage {
     pub total_tokens: u32,
 }
 
-/// Decimal places kept on every float in the response body.
-pub(crate) const FLOAT_DECIMALS: usize = 6;
-
-/// Serialize the response with every float written as a fixed-point decimal.
+/// Serialize the response with every float written as a plain decimal.
 ///
 /// serde_json's default float output is the shortest round-trip form, which
 /// switches to scientific notation below 1e-5: a distribution comes back as
-/// `{"billing": 0.9999, "account": 1.55e-6}`, two notations in one object.
-/// Probabilities, confidences, and expected values are all written as plain
-/// decimals rounded to [`FLOAT_DECIMALS`] places instead, so a client (or a
-/// person reading the body) never has to parse an exponent. Six places is
-/// far more than a first-token distribution can be trusted to.
+/// `{"billing": 0.9999, "account": 1.55e-6}`, two notations in one object,
+/// and a `1.9e-9` tail is easy to misread as a value above 1. Probabilities,
+/// confidences, and expected values are written positionally instead
+/// (`0.00000000195569113838022`), at full precision: the digits are exactly
+/// the shortest sequence that round-trips to the same `f64`, so nothing is
+/// lost, only the exponent is gone.
 pub(crate) fn to_json_bytes(response: &VerdictsResponse) -> Result<Vec<u8>, serde_json::Error> {
-    let mut ser = serde_json::Serializer::with_formatter(Vec::new(), FixedPointFormatter);
+    let mut ser = serde_json::Serializer::with_formatter(Vec::new(), PlainDecimalFormatter);
     response.serialize(&mut ser)?;
     Ok(ser.into_inner())
 }
 
-/// serde_json's compact formatter with `write_f64` replaced by fixed-point
-/// output. Every other method keeps its default (compact) behavior.
-struct FixedPointFormatter;
+/// serde_json's compact formatter with `write_f64` replaced by positional
+/// decimal output. Every other method keeps its default (compact) behavior.
+struct PlainDecimalFormatter;
 
-impl serde_json::ser::Formatter for FixedPointFormatter {
+impl serde_json::ser::Formatter for PlainDecimalFormatter {
     fn write_f64<W: ?Sized + io::Write>(&mut self, writer: &mut W, value: f64) -> io::Result<()> {
         if !value.is_finite() {
             return writer.write_all(b"null");
         }
-        writer.write_all(fixed_point(value).as_bytes())
+        writer.write_all(plain_decimal(value).as_bytes())
     }
 }
 
-/// Render a finite float as a decimal with at most [`FLOAT_DECIMALS`] places,
-/// trailing zeros trimmed but at least one digit after the point so the token
-/// still reads as a float (`1.0`, not `1`). Values that round to zero come out
-/// as `0.0`, never `-0.0`.
-fn fixed_point(value: f64) -> String {
-    let mut s = format!("{value:.FLOAT_DECIMALS$}");
-    if s.contains('.') {
-        let trimmed = s.trim_end_matches('0').len();
-        s.truncate(trimmed);
-        if s.ends_with('.') {
-            s.push('0');
-        }
+/// Render a finite float as a positional decimal at full round-trip
+/// precision, never with an exponent. `f64`'s `Display` already does exactly
+/// that; this only guarantees a fractional part so the token still reads as a
+/// float (`1.0`, not `1`) and folds `-0` into `0.0`.
+fn plain_decimal(value: f64) -> String {
+    let mut s = format!("{value}");
+    if !s.contains('.') {
+        s.push_str(".0");
     }
     if s == "-0.0" {
         return "0.0".to_string();
@@ -409,15 +403,22 @@ mod tests {
     }
 
     #[test]
-    fn floats_are_written_as_fixed_point_decimals() {
-        assert_eq!(fixed_point(0.9999305114863566), "0.999931");
-        assert_eq!(fixed_point(1.5534903124299995e-6), "0.000002");
-        assert_eq!(fixed_point(2.26e-9), "0.0");
-        assert_eq!(fixed_point(-0.0), "0.0");
-        assert_eq!(fixed_point(1.0), "1.0");
-        assert_eq!(fixed_point(0.0), "0.0");
-        assert_eq!(fixed_point(2.9956345671093089), "2.995635");
-        assert_eq!(fixed_point(0.5), "0.5");
+    fn floats_are_written_as_plain_decimals_at_full_precision() {
+        assert_eq!(plain_decimal(0.9999999980443088), "0.9999999980443088");
+        assert_eq!(
+            plain_decimal(1.95569113838022e-9),
+            "0.00000000195569113838022"
+        );
+        assert_eq!(
+            plain_decimal(1.5534903124299995e-6),
+            "0.0000015534903124299995"
+        );
+        assert_eq!(plain_decimal(-0.0), "0.0");
+        assert_eq!(plain_decimal(1.0), "1.0");
+        assert_eq!(plain_decimal(0.0), "0.0");
+        assert_eq!(plain_decimal(2.9956345671093089), "2.9956345671093088");
+        assert_eq!(plain_decimal(0.5), "0.5");
+        assert_eq!(plain_decimal(10.0), "10.0");
     }
 
     #[test]
@@ -470,12 +471,18 @@ mod tests {
             .windows(2)
             .any(|w| w[0].is_ascii_digit() && (w[1] == b'e' || w[1] == b'E'));
         assert!(!has_exponent, "scientific notation in body: {text}");
-        assert!(text.contains("\"account\":0.000002"), "{text}");
         assert!(
-            text.contains("\"probabilities\":[0.002183,0.0,0.997817,0.0]"),
+            text.contains("\"account\":0.0000015534903124299995"),
             "{text}"
         );
-        assert!(text.contains("\"expected_value\":2.995635"), "{text}");
+        assert!(
+            text.contains("\"probabilities\":[0.0021827164453451808,0.0,0.9978172835546547,0.0]"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\"expected_value\":2.9956345671093088"),
+            "{text}"
+        );
         // Still valid JSON with the same shape and integer fields intact.
         let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(v["usage"]["prompt_tokens"], 590);
@@ -484,9 +491,9 @@ mod tests {
             (v["verdicts"]["department"]["probabilities"]["billing"]
                 .as_f64()
                 .unwrap()
-                - 0.999996)
+                - 0.9999961861946203)
                 .abs()
-                < 1e-12
+                < 1e-15
         );
     }
 }
