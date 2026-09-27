@@ -360,25 +360,33 @@ pub struct UsageTotals {
     pub co2_g: f64,
 }
 
+/// Columns are read positionally into [`UsageTotals`], so aliases need not
+/// match field names, and must not: ClickHouse resolves an alias anywhere in
+/// the query, so `sum(input_tokens) as input_tokens` would turn the
+/// `total_tokens` expression into an aggregate of an aggregate and fail the
+/// whole read (which the summary then reports as zeros).
+fn usage_totals_sql(filter: &str) -> String {
+    format!(
+        "select count() as requests, \
+         sum(input_tokens) + sum(output_tokens) as total_tokens, \
+         sum(cost_usd) as cost_usd, \
+         uniqExact(tenant_id) as active_tenants, \
+         sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
+         countIf(status_code >= 400) as errors, \
+         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft_ms, \
+         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms, \
+         sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
+         from usage where ts_ms >= ?{filter}"
+    )
+}
+
 pub async fn query_usage_totals(
     client: &clickhouse::Client,
     since_ms: Option<i64>,
     include_internal: Option<bool>,
 ) -> Result<UsageTotals, clickhouse::error::Error> {
     let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let filter = internal_filter(include_internal);
-    let sql = format!(
-        "select count() as requests, \
-         sum(input_tokens) + sum(output_tokens) as total_tokens, \
-         sum(cost_usd) as cost_usd, \
-         uniqExact(tenant_id) as active_tenants, \
-         sum(input_tokens) as input_tokens, sum(output_tokens) as output_tokens, \
-         countIf(status_code >= 400) as errors, \
-         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft_ms, \
-         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms, \
-         sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
-         from usage where ts_ms >= ?{filter}"
-    );
+    let sql = usage_totals_sql(&internal_filter(include_internal));
     client
         .query(&sql)
         .bind(since)
@@ -830,13 +838,9 @@ fn usage_by_model_sql(q: &UsageQuery) -> String {
     sql
 }
 
-pub async fn query_usage_series(
-    client: &clickhouse::Client,
-    q: UsageSeriesQuery,
-) -> Result<Vec<UsageTimePoint>, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let bucket = series_bucket_ms(since, q.bucket_ms, 60_000, now_ms());
-    let mut sql = format!(
+/// Aliases stay clear of the column names the query reads; see [`usage_totals_sql`].
+fn usage_series_sql(bucket: i64) -> String {
+    format!(
         "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
          count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
@@ -847,7 +851,16 @@ pub async fn query_usage_series(
          round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft_ms, \
          round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms \
          from usage where ts_ms >= ?"
-    );
+    )
+}
+
+pub async fn query_usage_series(
+    client: &clickhouse::Client,
+    q: UsageSeriesQuery,
+) -> Result<Vec<UsageTimePoint>, clickhouse::error::Error> {
+    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let bucket = series_bucket_ms(since, q.bucket_ms, 60_000, now_ms());
+    let mut sql = usage_series_sql(bucket);
     if q.tenant_id.is_some() {
         sql.push_str(" and tenant_id = toUUID(?)");
     }
@@ -1423,5 +1436,76 @@ mod internal_filter_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    /// The select list's top-level expressions, each with its alias.
+    fn select_items(sql: &str) -> Vec<(String, String)> {
+        let body = sql.split_once("select ").unwrap().1;
+        let body = body.split(" from ").next().unwrap();
+        let (mut items, mut depth, mut cur) = (Vec::new(), 0i32, String::new());
+        for c in body.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    items.push(std::mem::take(&mut cur));
+                    continue;
+                }
+                _ => {}
+            }
+            cur.push(c);
+        }
+        items.push(cur);
+        items
+            .into_iter()
+            .map(|item| {
+                let (expr, alias) = item.rsplit_once(" as ").expect("every column is aliased");
+                (expr.trim().to_string(), alias.trim().to_string())
+            })
+            .collect()
+    }
+
+    fn reads(expr: &str, column: &str) -> bool {
+        expr.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|word| word == column)
+    }
+
+    /// ClickHouse resolves an alias anywhere in the query, so an alias that
+    /// names a column another expression reads turns that expression into an
+    /// aggregate of an aggregate and fails the read.
+    fn assert_no_shadowing(sql: &str) {
+        let items = select_items(sql);
+        for (i, (_, alias)) in items.iter().enumerate() {
+            for (j, (expr, other)) in items.iter().enumerate() {
+                assert!(
+                    i == j || !reads(expr, alias),
+                    "alias `{alias}` shadows a column that `{other}` reads: {expr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn totals_aliases_do_not_shadow_columns() {
+        assert_no_shadowing(&usage_totals_sql(""));
+        assert_eq!(select_items(&usage_totals_sql("")).len(), 12);
+    }
+
+    #[test]
+    fn series_aliases_do_not_shadow_columns() {
+        assert_no_shadowing(&usage_series_sql(60_000));
+        assert_eq!(select_items(&usage_series_sql(60_000)).len(), 10);
+    }
+
+    #[test]
+    fn the_check_catches_the_bug_it_exists_for() {
+        let bad = "select sum(input_tokens) + sum(output_tokens) as total_tokens, \
+                   sum(input_tokens) as input_tokens from usage";
+        assert!(std::panic::catch_unwind(|| assert_no_shadowing(bad)).is_err());
     }
 }
