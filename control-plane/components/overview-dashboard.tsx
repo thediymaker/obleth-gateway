@@ -3,7 +3,7 @@
 import { useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { RefreshCw } from "lucide-react";
-import type { FairshareLiveView, LiveStats, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
+import type { CapacityDiscoveryView, FairshareLiveView, LiveStats, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
 import type { OverviewContext, OverviewWindow } from "@/lib/overview-data";
 import {
   PREVIOUS_LABEL,
@@ -78,6 +78,8 @@ export function OverviewDashboard({
   const fairshareQuery = useQuery({ queryKey: ["fairshare-live"], queryFn: () => getJson<FairshareLiveView>("/api/live/fairshare"), initialData: initialFairshare, refetchInterval: FAST_POLL_MS });
   const statsQuery = useQuery({ queryKey: ["gateway-stats"], queryFn: () => getJson<LiveStats>("/api/live/stats"), initialData: initialStats, refetchInterval: STATS_POLL_MS });
   const modelsQuery = useQuery({ queryKey: ["model-routes"], queryFn: () => getJson<ModelRoute[]>("/api/live/models"), initialData: initialModels, refetchInterval: SLOW_POLL_MS });
+  // Pool sizes and cluster-wide counts for models the answering gateway has not served yet.
+  const discoveryQuery = useQuery({ queryKey: ["capacity-discovery"], queryFn: () => getJson<CapacityDiscoveryView>("/api/live/capacity/discovery"), refetchInterval: STATS_POLL_MS, retry: false });
   const healthQuery = useQuery({ queryKey: ["model-health"], queryFn: () => getJson<ModelHealthSummary[]>("/api/live/models/health"), initialData: initialHealth, refetchInterval: HEALTH_POLL_MS });
 
   const win = windowQuery.data ?? initialWindow;
@@ -87,7 +89,8 @@ export function OverviewDashboard({
   const health = healthQuery.data ?? initialHealth;
 
   const series = useMemo(() => buildSeries(win.series, win.range, win.now), [win]);
-  const fleet = useMemo(() => buildFleet(models, health, fairshare, win.models), [models, health, fairshare, win.models]);
+  const discovery = discoveryQuery.data;
+  const fleet = useMemo(() => buildFleet(models, health, fairshare, win.models, Date.now(), discovery), [models, health, fairshare, win.models, discovery]);
   const { items, watching } = useMemo(() => buildAttention(fleet, fairshare), [fleet, fairshare]);
   const capacity = useMemo(() => liveCapacity(fairshare, statsQuery.data), [fairshare, statsQuery.data]);
   const liveTenants = useMemo(() => new Map((fairshare?.tenants ?? []).map((t) => [t.tenant_id, t])), [fairshare]);
@@ -107,7 +110,7 @@ export function OverviewDashboard({
   const fetching = windowQuery.isFetching || contextQuery.isFetching;
 
   function refreshAll() {
-    for (const key of ["overview-window", "overview-context", "fairshare-live", "gateway-stats", "model-routes", "model-health"]) {
+    for (const key of ["overview-window", "overview-context", "fairshare-live", "gateway-stats", "model-routes", "model-health", "capacity-discovery"]) {
       void queryClient.invalidateQueries({ queryKey: [key] });
     }
   }

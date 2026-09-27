@@ -1,5 +1,6 @@
 import type {
   AuditEntry,
+  CapacityDiscoveryView,
   FairshareLiveView,
   ModelHealthSummary,
   ModelRoute,
@@ -116,8 +117,14 @@ export interface FleetTile {
   attention: "down" | "full" | null;
 }
 
-/** Live pool occupancy for one model: cluster-wide in shared mode, else this gateway's own. */
-function poolFor(name: string, model: ModelRoute, fairshare?: FairshareLiveView) {
+/**
+ * Live pool occupancy for one model: cluster-wide in shared mode, else this
+ * gateway's own. The fairshare snapshot lists only the pools the answering
+ * gateway has served since it started, so a model it has not seen falls back
+ * to capacity discovery (its enforced size and cluster-wide count), then to
+ * the configured size.
+ */
+function poolFor(name: string, model: ModelRoute, fairshare?: FairshareLiveView, discovery?: CapacityDiscoveryView) {
   const shared = fairshare?.mode === "shared";
   const pool = fairshare?.pools?.find((p) => p.model === name);
   if (pool) {
@@ -125,6 +132,14 @@ function poolFor(name: string, model: ModelRoute, fairshare?: FairshareLiveView)
       inFlight: shared ? pool.cluster_in_flight ?? pool.in_flight : pool.in_flight,
       cap: shared ? pool.configured_cap ?? pool.cap : pool.cap,
       queued: pool.queued,
+    };
+  }
+  const found = discovery?.models.find((d) => d.model_name === name && d.enforced_max_in_flight > 0);
+  if (found) {
+    return {
+      inFlight: found.cluster_in_flight ?? found.in_flight,
+      cap: found.enforced_max_in_flight,
+      queued: fairshare?.model_queued?.[name] ?? 0,
     };
   }
   return {
@@ -146,6 +161,7 @@ export function buildFleet(
   fairshare: FairshareLiveView | undefined,
   usage: UsageModelAgg[],
   now = Date.now(),
+  discovery?: CapacityDiscoveryView,
 ): FleetTile[] {
   const healthById = new Map(health.map((h) => [h.model_id, h]));
   const usageByName = new Map(usage.map((u) => [u.model, u]));
@@ -154,7 +170,7 @@ export function buildFleet(
     .map<FleetTile>((m) => {
       const row = healthById.get(m.id);
       const state = healthState(row, now);
-      const pool = poolFor(m.model_name, m, fairshare);
+      const pool = poolFor(m.model_name, m, fairshare, discovery);
       const u = usageByName.get(m.model_name);
       const full = pool.queued > 0 && pool.cap > 0 && pool.inFlight >= pool.cap;
       return {

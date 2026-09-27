@@ -69,6 +69,18 @@ describe("buildFleet", () => {
     expect(tile).toMatchObject({ inFlight: 58, cap: 64, attention: null });
   });
 
+  it("falls back to capacity discovery for a model the answering gateway has not served yet", () => {
+    const [tile] = buildFleet([model("glm", { max_in_flight: 4 })], [health("glm", "healthy")], fairshare({
+      mode: "shared",
+      pools: [],
+      model_in_flight: { glm: 1 },
+    }), [], Date.now(), {
+      enabled: true, interval_secs: 15, namespaces: [], default_service: "", replicas: 5,
+      models: [{ model_id: "id-glm", model_name: "glm", enabled: true, static_max_in_flight: 4, enforced_max_in_flight: 48, cluster_in_flight: 30, in_flight: 6, status: "discovered" } as never],
+    });
+    expect(tile).toMatchObject({ inFlight: 30, cap: 48 });
+  });
+
   it("treats a maintenance window as maintenance, whatever the last check said", () => {
     const [tile] = buildFleet([model("m")], [health("m", "unhealthy", { maintenance_until: new Date(Date.now() + HOUR).toISOString() })], undefined, []);
     expect(tile).toMatchObject({ health: "maintenance", attention: null });
