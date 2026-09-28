@@ -3892,28 +3892,14 @@ fn budget_period_key(
     timezone: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
-    if budget_tokens.is_none() && budget_cost_usd.is_none() {
-        return None;
-    }
-    let period = budget_period.unwrap_or("lifetime");
-    let key = match period {
-        "monthly" => {
-            use chrono::Datelike;
-            let tz: chrono_tz::Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
-            let local = now.with_timezone(&tz);
-            format!("m:{}-{:02}", local.year(), local.month())
-        }
-        "term" => {
-            let anchor = budget_started_at.map(|t| t.timestamp()).unwrap_or(0);
-            format!("t:{anchor}")
-        }
-        // "lifetime" and any unknown value: a single non-rolling bucket.
-        _ => {
-            let anchor = budget_started_at.map(|t| t.timestamp()).unwrap_or(0);
-            format!("l:{anchor}")
-        }
-    };
-    Some(key)
+    obleth_config::budget::period_key(
+        budget_tokens,
+        budget_cost_usd,
+        budget_period,
+        budget_started_at,
+        timezone,
+        now,
+    )
 }
 
 /// Emit warning/exhaustion alerts when a tenant crosses 80% / 100% of either

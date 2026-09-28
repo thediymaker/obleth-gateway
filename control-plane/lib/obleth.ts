@@ -561,6 +561,21 @@ export interface UsageKeyAgg {
 
 /// Per-key activity summary: last-used metadata plus rolling usage totals.
 /// `last_used_ms` is `0` when the key has no requests in the queried range.
+/** `GET /budgets/usage`: one capped budget and how much of its current period is used. */
+export interface BudgetUsage {
+  scope: "tenant" | "key";
+  id: string;
+  tenant_id: string;
+  period: "monthly" | "term" | "lifetime" | string;
+  budget_tokens: number | null;
+  budget_cost_usd: number | null;
+  used_tokens: number;
+  used_cost_usd: number;
+  period_start: string | null;
+  /** When a monthly budget next resets; null for term and lifetime. */
+  resets_at: string | null;
+}
+
 export interface KeyUsageSummary {
   key_id: string;
   tenant_id: string;
@@ -1701,6 +1716,12 @@ export const obleth = {
       body: JSON.stringify({ weight }),
     }),
   listFairshareGroups: () => api<FairshareGroup[]>("/fairshare/groups"),
+  createFairshareGroup: (name: string, weight = 100, options?: AuditOptions) =>
+    api<FairshareGroup>("/fairshare/groups", {
+      method: "POST",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ name, weight }),
+    }),
   setFairshareGroupWeight: (name: string, weight: number, options?: AuditOptions) =>
     api<FairshareGroup>(`/fairshare/groups/${encodeURIComponent(name)}/weight`, {
       method: "PATCH",
@@ -1799,6 +1820,13 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify({ policy }),
     }),
+  /** Move a tenant into another fairshare group (one with no weight shares at the default). */
+  setTenantGroup: (id: string, fairshare_group: string, options?: AuditOptions) =>
+    api<Tenant>(`/tenants/${id}/group`, {
+      method: "PATCH",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ fairshare_group }),
+    }),
   deleteTenant: (id: string, options?: AuditOptions) =>
     api<void>(`/tenants/${id}`, {
       method: "DELETE",
@@ -1846,6 +1874,15 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
+  /** Move a key to another tenant, keeping its secret and settings. */
+  moveKey: (id: string, tenant_id: string, options?: AuditOptions) =>
+    api<ApiKey>(`/keys/${id}/tenant`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ tenant_id }),
+    }),
+  /** Every capped tenant and key budget, with its current period's use from the enforcement counters. */
+  budgetUsage: () => api<BudgetUsage[]>("/budgets/usage"),
   setKeyDisabled: (id: string, disabled: boolean, options?: AuditOptions) =>
     api<void>(`/keys/${id}/disabled`, {
       method: "PUT",

@@ -1088,6 +1088,56 @@ impl Store {
         Ok((hash, key, resolved))
     }
 
+    /// Move a key to another tenant. Its secret, settings and budget stay as
+    /// they are; from now on its requests count against the new tenant (past
+    /// usage keeps the tenant it was recorded under). Returns the key's hash,
+    /// the key, and its hot-path view under the new tenant, plus the tenant it
+    /// left.
+    pub async fn move_api_key(
+        &self,
+        id: Uuid,
+        tenant_id: Uuid,
+    ) -> Result<(String, ApiKey, ResolvedKey, Uuid)> {
+        self.guard_reserved_key(id).await?;
+        Self::guard_reserved_tenant(tenant_id)?;
+        let mut tx = self.pool.begin().await?;
+        let from: Uuid = sqlx::query("select tenant_id from api_keys where id = $1 for update")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?
+            .try_get("tenant_id")?;
+        let exists: bool = sqlx::query("select exists(select 1 from tenants where id = $1) as e")
+            .bind(tenant_id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("e")?;
+        if !exists {
+            return Err(StoreError::NotFound);
+        }
+        let row = sqlx::query(
+            "update api_keys set tenant_id = $2, updated_at = now()
+             where id = $1
+             returning key_hash, id, tenant_id, name, description, key_prefix,
+                    budget_tokens, budget_cost_usd, budget_period, budget_started_at,
+                    disabled, tracing_enabled, created_at, updated_at,
+                    kind, identity_issuer, identity_subject, identity_claims,
+                    weight, max_in_flight",
+        )
+        .bind(id)
+        .bind(tenant_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        let hash: String = row.try_get("key_hash")?;
+        let key = api_key_from_row(&row)?;
+        let resolved = self
+            .resolved_key_by_hash(&hash)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+        Ok((hash, key, resolved, from))
+    }
+
     pub async fn set_key_disabled(
         &self,
         id: Uuid,
@@ -6349,6 +6399,101 @@ mod tests {
         // Clean up the now-orphaned replica row, matching the teardown discipline
         // of the other replica integration tests.
         store.delete_replica(replica.id).await.ok();
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Moving a key keeps its secret and settings, and its hot-path view picks
+    /// up the new tenant's limits; a missing or reserved tenant is refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn move_api_key_carries_the_key_to_the_new_tenant() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let from = store
+            .create_tenant(&format!("from-{}", Uuid::new_v4()), 100, 0, None, None)
+            .await
+            .expect("from");
+        fixtures.track_tenant(from.id);
+        // A tenant's group must exist first (tenants_fairshare_group_fkey).
+        let group = format!("heavy-{}", Uuid::new_v4().simple());
+        store
+            .create_fairshare_group(&group, 100)
+            .await
+            .expect("group");
+        let to = store
+            .create_tenant(
+                &format!("to-{}", Uuid::new_v4()),
+                300,
+                5000,
+                Some(2),
+                Some(&group),
+            )
+            .await
+            .expect("to");
+        fixtures.track_tenant(to.id);
+        let (key, secret) = store
+            .create_api_key(
+                from.id,
+                "heavy-user",
+                "",
+                None,
+                Some(25.0),
+                Some("monthly"),
+                None,
+                150,
+                Some(3),
+            )
+            .await
+            .expect("create key");
+        let hash = hash_api_key(&secret);
+
+        let (moved_hash, moved, resolved, left) =
+            store.move_api_key(key.id, to.id).await.expect("move");
+        assert_eq!(moved_hash, hash, "the secret is unchanged");
+        assert_eq!(left, from.id);
+        assert_eq!(moved.tenant_id, to.id);
+        assert_eq!(moved.weight, 150);
+        assert_eq!(moved.budget_cost_usd, Some(25.0));
+        assert_eq!(resolved.tenant_id, to.id);
+        assert_eq!(resolved.fairshare_group, group);
+        assert_eq!(resolved.tokens_per_minute, 5000);
+
+        assert!(matches!(
+            store.move_api_key(key.id, Uuid::new_v4()).await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(matches!(
+            store
+                .move_api_key(key.id, Store::CONTROL_PLANE_TENANT_ID)
+                .await,
+            Err(StoreError::Protected(_))
+        ));
+        assert!(matches!(
+            store.move_api_key(Uuid::new_v4(), to.id).await,
+            Err(StoreError::NotFound)
+        ));
+        assert_eq!(
+            store
+                .resolved_key_by_hash(&hash)
+                .await
+                .unwrap()
+                .unwrap()
+                .tenant_id,
+            to.id
+        );
+
+        // The group outlives the fixture guard's tenant cleanup otherwise.
+        let _ = store.delete_tenant(to.id).await;
+        let _ = sqlx::query("delete from fairshare_groups where name = $1")
+            .bind(&group)
+            .execute(&store.pool)
+            .await;
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.

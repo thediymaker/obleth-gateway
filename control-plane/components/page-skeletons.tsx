@@ -148,6 +148,84 @@ export function ModelSkeleton() {
   );
 }
 
+function Table({ rows, filters }: { rows: number; filters: number }) {
+  return (
+    <>
+      <div className="flex flex-wrap gap-2">
+        <Skeleton className="h-9 w-[24rem] max-w-full rounded-lg" />
+        {Array.from({ length: filters }, (_, i) => <Skeleton key={i} className="h-9 w-28 rounded-lg" />)}
+      </div>
+      <SkeletonPanel className="gap-0 p-0">
+        <Skeleton className="m-4 h-3 w-2/3" />
+        {Array.from({ length: rows }, (_, i) => (
+          <div key={i} className="flex items-center gap-4 border-t border-border px-4 py-3.5">
+            <Skeleton className="h-4 w-44" />
+            <Skeleton className="h-3.5 w-16" />
+            <Skeleton className="h-3.5 w-24" />
+            <Skeleton className="h-2 w-28" />
+            <Skeleton className="ml-auto h-3.5 w-32" />
+          </div>
+        ))}
+      </SkeletonPanel>
+    </>
+  );
+}
+
+/** Tenants: header, five tiles, the filter row, and the table. */
+export function TenantsSkeleton() {
+  return (
+    <Loading label="Loading tenants">
+      <Header controls={1} />
+      <Tiles count={5} className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5" />
+      <Table rows={6} filters={3} />
+    </Loading>
+  );
+}
+
+/** A tenant's own page: header, the section list, the tiles, the chart and its limits. */
+export function TenantSkeleton() {
+  return (
+    <Loading label="Loading the tenant">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div className="space-y-2.5"><Skeleton className="h-3 w-24" /><Skeleton className="h-8 w-64" /><Skeleton className="h-5 w-[26rem] max-w-[70vw]" /></div>
+        <div className="flex gap-2"><Skeleton className="h-9 w-24 rounded-lg" /><Skeleton className="h-9 w-32 rounded-lg" /><Skeleton className="h-9 w-24 rounded-lg" /><Skeleton className="h-9 w-9 rounded-lg" /></div>
+      </div>
+      <div className="grid gap-6 lg:grid-cols-[200px_minmax(0,1fr)]">
+        <div className="hidden space-y-2 lg:block"><Skeleton className="h-9 rounded-lg" /><Rows count={11} className="h-7 rounded-lg" /></div>
+        <div className="flex flex-col gap-4">
+          <Tiles count={5} className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5" />
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
+            <SkeletonPanel className="h-[290px]"><Skeleton className="h-4 w-28" /><Skeleton className="mt-2 flex-1" /></SkeletonPanel>
+            <div className="flex flex-col gap-4"><SkeletonPanel className="h-[180px]"><Rows count={5} /></SkeletonPanel><SkeletonPanel className="h-[94px]" /></div>
+          </div>
+        </div>
+      </div>
+    </Loading>
+  );
+}
+
+/** API keys: header, four tiles, the filter row, and the table. */
+export function KeysSkeleton() {
+  return (
+    <Loading label="Loading API keys">
+      <Header controls={1} />
+      <Tiles count={4} className="grid grid-cols-2 gap-3 xl:grid-cols-4" />
+      <Table rows={9} filters={5} />
+    </Loading>
+  );
+}
+
+/** Users: header, the approvals, the filter row, and the people. */
+export function UsersSkeleton() {
+  return (
+    <Loading label="Loading users">
+      <Header controls={0} />
+      <SkeletonPanel className="gap-3"><Skeleton className="h-4 w-48" /><Rows count={2} className="h-9 rounded-lg" /></SkeletonPanel>
+      <Table rows={7} filters={2} />
+    </Loading>
+  );
+}
+
 /** Request logs: header, search and filters, the per-minute strip, then rows. */
 export function LogsSkeleton() {
   return (
