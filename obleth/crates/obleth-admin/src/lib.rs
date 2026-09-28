@@ -192,9 +192,11 @@ pub fn router(state: AdminState) -> Router {
             put(set_tenant_synthetic_handler),
         )
         .route("/api/v1/keys", get(list_keys))
+        .route("/api/v1/budgets/usage", get(get_budget_usage))
         .route("/api/v1/resync", post(resync_resolver_cache))
         .route("/api/v1/keys/:id", put(update_key).delete(delete_key))
         .route("/api/v1/keys/:id/disabled", put(set_key_disabled))
+        .route("/api/v1/keys/:id/tenant", put(move_key))
         .route("/api/v1/keys/:id/tracing", put(set_key_tracing_handler))
         .route("/api/v1/keys/:id/usage", get(get_key_usage))
         .route("/api/v1/usage", get(get_usage))
@@ -563,6 +565,13 @@ pub struct UpdateTenantGroup {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateWeight {
     pub weight: i64,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MoveKey {
+    /// The tenant the key moves to.
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -3975,6 +3984,123 @@ async fn create_key(
     Ok(Json(CreatedKey { key, secret }))
 }
 
+/// How much of one budget cap its current period has used, from the same
+/// counters the gateway enforces the cap with.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BudgetUsage {
+    /// `tenant` or `key`.
+    pub scope: String,
+    #[schema(value_type = String)]
+    pub id: Uuid,
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    /// `monthly`, `term` or `lifetime`.
+    pub period: String,
+    pub budget_tokens: Option<i64>,
+    pub budget_cost_usd: Option<f64>,
+    pub used_tokens: i64,
+    pub used_cost_usd: f64,
+    /// When the current period began (a month's first day in the tenant's
+    /// time zone; a term's or lifetime's start, when set).
+    pub period_start: Option<chrono::DateTime<chrono::Utc>>,
+    /// When a monthly budget next resets; none for term and lifetime.
+    pub resets_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Every tenant and key budget with a cap, and how much of its current period
+/// it has used. Reads the enforcement counters without changing them, so a
+/// period that has rolled over reads as zero until its first request.
+#[utoipa::path(
+    get, path = "/api/v1/budgets/usage", tag = "keys",
+    responses((status = 200, body = [BudgetUsage]))
+)]
+async fn get_budget_usage(State(state): State<AdminState>) -> Result<Json<Vec<BudgetUsage>>> {
+    let now = chrono::Utc::now();
+    let tenants = state.store.list_tenants().await?;
+    let zones: std::collections::HashMap<Uuid, String> =
+        tenants.iter().map(|t| (t.id, t.timezone.clone())).collect();
+    let mut wanted = Vec::new();
+    for t in &tenants {
+        if t.id == Store::CONTROL_PLANE_TENANT_ID {
+            continue;
+        }
+        if let Some(period) = obleth_config::budget::period_key(
+            t.budget_tokens,
+            t.budget_cost_usd,
+            t.budget_period.as_deref(),
+            t.budget_started_at,
+            &t.timezone,
+            now,
+        ) {
+            wanted.push((
+                "tenant",
+                t.id,
+                t.id,
+                period,
+                t.budget_period.clone(),
+                t.budget_tokens,
+                t.budget_cost_usd,
+                t.budget_started_at,
+                t.timezone.clone(),
+            ));
+        }
+    }
+    for k in state.store.list_keys(None).await? {
+        if k.tenant_id == Store::CONTROL_PLANE_TENANT_ID {
+            continue;
+        }
+        let tz = zones
+            .get(&k.tenant_id)
+            .cloned()
+            .unwrap_or_else(|| "UTC".into());
+        if let Some(period) = obleth_config::budget::period_key(
+            k.budget_tokens,
+            k.budget_cost_usd,
+            k.budget_period.as_deref(),
+            k.budget_started_at,
+            &tz,
+            now,
+        ) {
+            wanted.push((
+                "key",
+                k.id,
+                k.tenant_id,
+                period,
+                k.budget_period.clone(),
+                k.budget_tokens,
+                k.budget_cost_usd,
+                k.budget_started_at,
+                tz,
+            ));
+        }
+    }
+    let mut out = Vec::with_capacity(wanted.len());
+    for chunk in wanted.chunks(32) {
+        let reads = chunk
+            .iter()
+            .map(|w| state.redis.term_usage_peek(&w.1, &w.3));
+        let used = futures::future::join_all(reads).await;
+        for (w, u) in chunk.iter().zip(used) {
+            let (used_tokens, used_cost_usd) = u?;
+            let (period_start, resets_at) =
+                obleth_config::budget::period_bounds(w.4.as_deref(), w.7, &w.8, now);
+            out.push(BudgetUsage {
+                scope: w.0.to_string(),
+                id: w.1,
+                tenant_id: w.2,
+                period: w.4.clone().unwrap_or_else(|| "lifetime".into()),
+                budget_tokens: w.5,
+                budget_cost_usd: w.6,
+                used_tokens,
+                used_cost_usd,
+                period_start,
+                resets_at,
+            });
+        }
+    }
+    Ok(Json(out))
+}
+
 #[utoipa::path(
     get, path = "/api/v1/keys", tag = "keys",
     params(ListKeysQuery),
@@ -4134,6 +4260,36 @@ async fn set_key_disabled(
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// Move a key to another tenant, keeping its secret and settings. From now
+/// on its requests count against the new tenant's limits, budget and share;
+/// past usage stays recorded under the tenant it was made in.
+#[utoipa::path(
+    put, path = "/api/v1/keys/{id}/tenant", tag = "keys",
+    params(("id" = Uuid, Path, description = "Key id")),
+    request_body = MoveKey,
+    responses((status = 200, body = ApiKey), (status = 404, description = "No such key or tenant"))
+)]
+async fn move_key(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<MoveKey>,
+) -> Result<Json<ApiKey>> {
+    let (hash, key, resolved, from) = state.store.move_api_key(id, body.tenant_id).await?;
+    push_key(&state, &hash, &resolved).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "move_key",
+            "api_key",
+            &id.to_string(),
+            serde_json::json!({ "prefix": key.key_prefix, "from": from, "tenant_id": key.tenant_id }),
+        )
+        .await?;
+    Ok(Json(key))
 }
 
 #[utoipa::path(

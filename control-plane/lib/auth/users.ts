@@ -7,6 +7,8 @@ export interface AdminUser {
   role: "admin" | "user";
   status: "pending" | "active";
   tenantId: string | null;
+  /** When the account first signed in. */
+  createdAt?: string | Date;
 }
 
 /** Outcome of a role/status change guarded against removing the last active admin. */
@@ -19,7 +21,7 @@ const ADMIN_CHANGE_LOCK_KEY = 0x0b1e_7480_0101;
 
 export async function listUsers(): Promise<AdminUser[]> {
   const { rows } = await getDb().query(
-    `select id, email, role, status, "tenantId" as "tenantId" from "user" order by "createdAt" desc`,
+    `select id, email, role, status, "tenantId" as "tenantId", "createdAt" as "createdAt" from "user" order by "createdAt" desc`,
   );
   return rows as AdminUser[];
 }

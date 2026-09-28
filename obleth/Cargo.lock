@@ -1696,6 +1696,7 @@ name = "obleth-config"
 version = "1.2.0"
 dependencies = [
  "chrono",
+ "chrono-tz",
  "hex",
  "rand 0.8.8",
  "serde",

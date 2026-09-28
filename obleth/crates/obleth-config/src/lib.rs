@@ -3,6 +3,7 @@
 //! This crate has no internal dependencies so every other crate can rely on a
 //! single canonical definition of tenants, keys, quotas and runtime config.
 
+pub mod budget;
 pub mod capacity;
 pub mod config;
 pub mod jwt;

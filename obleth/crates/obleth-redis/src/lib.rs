@@ -659,6 +659,28 @@ impl RedisStore {
         Ok((tokens, cost.parse().unwrap_or(0.0)))
     }
 
+    /// Read a scope's (tenant or key id) committed term usage for `period_key`
+    /// without touching it: counters stored for another period read as zero,
+    /// since that is what the next request would find after rolling them.
+    pub async fn term_usage_peek(&self, scope: &Uuid, period_key: &str) -> Result<(i64, f64)> {
+        let mut conn = self.conn.clone();
+        let (period, tokens, cost): (Option<String>, Option<i64>, Option<String>) =
+            redis::cmd("HMGET")
+                .arg(Self::term_usage_key(scope))
+                .arg("period")
+                .arg("tokens")
+                .arg("cost")
+                .query_async(&mut conn)
+                .await?;
+        if period.as_deref() != Some(period_key) {
+            return Ok((0, 0.0));
+        }
+        Ok((
+            tokens.unwrap_or(0),
+            cost.and_then(|c| c.parse().ok()).unwrap_or(0.0),
+        ))
+    }
+
     /// Add observed `(tokens, cost_usd)` to a tenant's term counters (rolling the
     /// period first) and return the new cumulative `(tokens, cost_usd)`.
     pub async fn term_usage_add(

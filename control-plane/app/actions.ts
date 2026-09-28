@@ -7,6 +7,7 @@ import { parse as parseYaml } from "yaml";
 import { z } from "zod";
 import { CACHE_TAGS, obleth, OblethApiError } from "@/lib/obleth";
 import type {
+  ApiKey,
   AutotuneReport,
   AutotuneWorkload,
   ConfigBackup,
@@ -364,132 +365,19 @@ export async function createTenantAction(formData: FormData): Promise<ActionResu
   return { ok: true };
 }
 
-export async function updateTenantAction(formData: FormData) {
+export async function setTenantStatusAction(id: string, status: string): Promise<ActionResult> {
   const session = await requireAdmin();
-  const parsed = tenantUpdateSchema.safeParse({
-    id: formData.get("id"),
-    name: formData.get("name"),
-    description: formData.get("description"),
-    organization: formData.get("organization"),
-    contact_email: formData.get("contact_email"),
-  });
-  if (!parsed.success) return;
-  const { id, ...rest } = parsed.data;
-  await obleth.updateTenant(id, {
-    name: rest.name,
-    description: rest.description,
-    organization: rest.organization,
-    contact_email: rest.contact_email ?? "",
-  }, { auditActor: session.email });
+  if (!id) return { ok: false, error: "Missing tenant id" };
+  if (!["active", "suspended", "archived"].includes(status)) return { ok: false, error: "Unknown status." };
+  try {
+    await obleth.setTenantStatus(id, status, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
   updateTag(CACHE_TAGS.tenants);
-  revalidatePath("/tenants");
-  revalidatePath("/");
-}
-
-export async function setTenantStatusAction(id: string, status: string) {
-  const session = await requireAdmin();
-  if (!id) return;
-  await obleth.setTenantStatus(id, status, { auditActor: session.email });
-  updateTag(CACHE_TAGS.tenants);
+  updateTag(CACHE_TAGS.keys);
   revalidatePath("/tenants");
   revalidatePath("/fairshare");
-  revalidatePath("/");
-}
-
-export async function setTenantScheduleAction(
-  id: string,
-  body: {
-    timezone: string;
-    active_from?: string | null;
-    active_until?: string | null;
-    weekly_windows?:
-      | { day: number; start_min: number; end_min: number }[]
-      | null;
-  },
-): Promise<ActionResult> {
-  const session = await requireAdmin();
-  if (!id) return { ok: false, error: "Missing tenant id" };
-  try {
-    await obleth.setTenantSchedule(id, body, { auditActor: session.email });
-  } catch (e) {
-    return actionError(e);
-  }
-  updateTag(CACHE_TAGS.tenants);
-  revalidatePath("/tenants");
-  revalidatePath("/fairshare");
-  revalidatePath("/");
-  return { ok: true };
-}
-
-export async function setTenantBudgetAction(
-  id: string,
-  body: {
-    budget_tokens?: number | null;
-    budget_cost_usd?: number | null;
-    budget_period?: string | null;
-    budget_started_at?: string | null;
-  },
-): Promise<ActionResult> {
-  const session = await requireAdmin();
-  if (!id) return { ok: false, error: "Missing tenant id" };
-  try {
-    await obleth.setTenantBudget(id, body, { auditActor: session.email });
-  } catch (e) {
-    return actionError(e);
-  }
-  updateTag(CACHE_TAGS.tenants);
-  revalidatePath("/tenants");
-  revalidatePath("/");
-  return { ok: true };
-}
-
-export async function setTenantAllowlistAction(
-  id: string,
-  allowed_models: string[],
-): Promise<ActionResult> {
-  const session = await requireAdmin();
-  if (!id) return { ok: false, error: "Missing tenant id" };
-  try {
-    await obleth.setTenantAllowlist(id, allowed_models, { auditActor: session.email });
-  } catch (e) {
-    return actionError(e);
-  }
-  updateTag(CACHE_TAGS.tenants);
-  revalidatePath("/tenants");
-  revalidatePath("/");
-  return { ok: true };
-}
-
-export async function setTenantGuardrailsAction(
-  id: string,
-  policy: GuardrailsPolicy | null,
-): Promise<ActionResult> {
-  const session = await requireAdmin();
-  if (!id) return { ok: false, error: "Missing tenant id" };
-  try {
-    await obleth.setTenantGuardrails(id, policy, { auditActor: session.email });
-  } catch (e) {
-    return actionError(e);
-  }
-  updateTag(CACHE_TAGS.tenants);
-  revalidatePath("/tenants");
-  revalidatePath("/");
-  return { ok: true };
-}
-
-export async function setTenantCompressionAction(
-  id: string,
-  policy: CompressionPolicy | null,
-): Promise<ActionResult> {
-  const session = await requireAdmin();
-  if (!id) return { ok: false, error: "Missing tenant id" };
-  try {
-    await obleth.setTenantCompression(id, policy, { auditActor: session.email });
-  } catch (e) {
-    return actionError(e);
-  }
-  updateTag(CACHE_TAGS.tenants);
-  revalidatePath("/tenants");
   revalidatePath("/");
   return { ok: true };
 }
@@ -552,18 +440,6 @@ export async function setTenantMaxInFlightAction(id: string, maxInFlight: number
   revalidatePath("/fairshare");
   revalidatePath("/tenants");
   return { ok: true };
-}
-
-export async function setQuotaAction(formData: FormData) {
-  const session = await requireAdmin();
-  const id = String(formData.get("id"));
-  const tpm = numOrUndef(formData.get("tokens_per_minute")) ?? 0;
-  const mif = numOrNull(formData.get("max_in_flight"));
-  if (!id || tpm < 0 || (mif !== null && mif <= 0)) return;
-  await obleth.setQuota(id, tpm, mif, { auditActor: session.email });
-  updateTag(CACHE_TAGS.tenants);
-  revalidatePath("/tenants");
-  revalidatePath("/");
 }
 
 export async function createKeyAction(
@@ -651,32 +527,336 @@ export async function updateKeyAction(
   return { ok: true };
 }
 
-export async function toggleKeyAction(id: string, disabled: boolean) {
+// ----------------------------------------------------------------------------
+// A tenant's page, and the key panel
+//
+// The tenant page submits every setting as one form and saves with one
+// button; each changed section goes through the endpoint that owns it, in a
+// fixed order, and a refusal says which sections were already saved.
+// ----------------------------------------------------------------------------
+
+export type TenantSettingsSection =
+  | "profile"
+  | "group"
+  | "weight"
+  | "quota"
+  | "tracing"
+  | "synthetic"
+  | "schedule"
+  | "budget"
+  | "allowlist"
+  | "guardrails"
+  | "compression";
+
+const TENANT_SECTIONS: readonly TenantSettingsSection[] = ["profile", "group", "weight", "quota", "tracing", "synthetic", "schedule", "budget", "allowlist", "guardrails", "compression"];
+
+const TENANT_SECTION_LABELS: Record<TenantSettingsSection, string> = {
+  profile: "Profile",
+  group: "Fairshare group",
+  weight: "Weight",
+  quota: "Limits",
+  tracing: "Tracing",
+  synthetic: "Synthetic",
+  schedule: "Access hours",
+  budget: "Budget",
+  allowlist: "Models",
+  guardrails: "Guardrails",
+  compression: "Compression",
+};
+
+export type SettingsSaveResult<S extends string> =
+  | { ok: true }
+  | { ok: false; error: string; saved: S[] };
+
+function jsonField<T>(v: FormDataEntryValue | null): { ok: true; value: T | null } | { ok: false } {
+  const raw = trimmed(v);
+  if (!raw) return { ok: true, value: null };
+  try {
+    return { ok: true, value: JSON.parse(raw) as T };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/**
+ * Save a tenant's settings form. `formData` carries `id`, `sections` (the
+ * changed ones, comma-separated) and the fields; JSON fields
+ * (`weekly_windows`, `guardrails_policy`, `compression_policy`) are
+ * blank for none.
+ */
+export async function saveTenantSettingsAction(formData: FormData): Promise<SettingsSaveResult<TenantSettingsSection>> {
   const session = await requireAdmin();
-  await obleth.setKeyDisabled(id, disabled, { auditActor: session.email });
+  const audit = { auditActor: session.email };
+  const id = trimmed(formData.get("id"));
+  const wanted = new Set(trimmed(formData.get("sections")).split(",").map((x) => x.trim()));
+  const sections = TENANT_SECTIONS.filter((x) => wanted.has(x));
+  const saved: TenantSettingsSection[] = [];
+  if (!id) return { ok: false, error: "Missing tenant id.", saved };
+
+  const refresh = () => {
+    updateTag(CACHE_TAGS.tenants);
+    updateTag(CACHE_TAGS.keys);
+    revalidatePath("/tenants");
+    revalidatePath("/fairshare");
+    revalidatePath("/");
+  };
+  const fail = (section: TenantSettingsSection, error: string) => {
+    refresh();
+    return { ok: false as const, error: `${TENANT_SECTION_LABELS[section]}: ${error}`, saved };
+  };
+
+  for (const section of sections) {
+    try {
+      if (section === "profile") {
+        const parsed = tenantUpdateSchema.safeParse({
+          id,
+          name: formData.get("name"),
+          description: formData.get("description"),
+          organization: formData.get("organization"),
+          contact_email: formData.get("contact_email"),
+        });
+        if (!parsed.success) return fail(section, firstIssue(parsed.error));
+        await obleth.updateTenant(id, {
+          name: parsed.data.name,
+          description: parsed.data.description,
+          organization: parsed.data.organization,
+          contact_email: parsed.data.contact_email ?? "",
+        }, audit);
+      } else if (section === "group") {
+        const group = trimmed(formData.get("fairshare_group"));
+        if (!group || group.length > 64) return fail(section, "Name the group (up to 64 characters).");
+        await obleth.setTenantGroup(id, group, audit);
+      } else if (section === "weight") {
+        const weight = Number(trimmed(formData.get("weight")));
+        if (!Number.isInteger(weight) || weight < 1) return fail(section, "Weight must be a whole number of at least 1.");
+        await obleth.setWeight(id, weight, audit);
+      } else if (section === "quota") {
+        const tpm = numOrUndef(formData.get("tokens_per_minute")) ?? 0;
+        const mif = numOrNull(formData.get("max_in_flight"));
+        if (!Number.isInteger(tpm) || tpm < 0) return fail(section, "Token rate must be a whole number, or blank for no limit.");
+        if (mif !== null && (!Number.isInteger(mif) || mif < 1)) return fail(section, "In flight must be at least 1, or blank for no limit.");
+        await obleth.setQuota(id, tpm, mif, audit);
+      } else if (section === "tracing") {
+        await obleth.setTenantTracing(id, formData.get("tracing_enabled") === "on", audit);
+      } else if (section === "synthetic") {
+        await obleth.setTenantSynthetic(id, formData.get("synthetic") === "on", audit);
+      } else if (section === "schedule") {
+        const timezone = trimmed(formData.get("timezone")) || "UTC";
+        const windows = parseWeeklyWindows(formData.get("weekly_windows"));
+        if (!windows.success) return fail(section, firstIssue(windows.error));
+        const from = trimmed(formData.get("active_from")) || null;
+        const until = trimmed(formData.get("active_until")) || null;
+        if (from && until && new Date(until) <= new Date(from)) return fail(section, "The end must be after the start.");
+        await obleth.setTenantSchedule(id, {
+          timezone,
+          active_from: from,
+          active_until: until,
+          weekly_windows: windows.data.length ? windows.data : null,
+        }, audit);
+      } else if (section === "budget") {
+        const tokens = numOrNull(formData.get("budget_tokens"));
+        const cost = numOrNull(formData.get("budget_cost_usd"));
+        if ((tokens !== null && tokens < 0) || (cost !== null && cost < 0)) return fail(section, "Caps can't be negative.");
+        const period = trimmed(formData.get("budget_period")) || "lifetime";
+        await obleth.setTenantBudget(id, {
+          budget_tokens: tokens,
+          budget_cost_usd: cost,
+          budget_period: tokens === null && cost === null ? null : period,
+          ...(formData.get("budget_restart") === "on" ? { budget_started_at: new Date().toISOString() } : {}),
+        }, audit);
+      } else if (section === "allowlist") {
+        if (!formData.has("has_allowlist")) continue;
+        const models = formData.getAll("allowed_model").map((m) => trimmed(m)).filter(Boolean);
+        await obleth.setTenantAllowlist(id, formData.get("allow_all") === "on" ? [] : models, audit);
+      } else if (section === "guardrails") {
+        const policy = jsonField<GuardrailsPolicy>(formData.get("guardrails_policy"));
+        if (!policy.ok) return fail(section, "The policy could not be read.");
+        await obleth.setTenantGuardrails(id, policy.value, audit);
+      } else if (section === "compression") {
+        const policy = jsonField<CompressionPolicy>(formData.get("compression_policy"));
+        if (!policy.ok) return fail(section, "The policy could not be read.");
+        await obleth.setTenantCompression(id, policy.value, audit);
+      }
+      saved.push(section);
+    } catch (e) {
+      return fail(section, actionError(e).error);
+    }
+  }
+  refresh();
+  return { ok: true };
+}
+
+export type KeySettingsSection = "key" | "tracing";
+
+/** Save a key's panel: its fields (one update) and its tracing switch, each only when changed. */
+export async function saveKeySettingsAction(formData: FormData): Promise<SettingsSaveResult<KeySettingsSection>> {
+  const session = await requireAdmin();
+  const id = trimmed(formData.get("id"));
+  const wanted = new Set(trimmed(formData.get("sections")).split(","));
+  const saved: KeySettingsSection[] = [];
+  if (!id) return { ok: false, error: "Missing key id.", saved };
+  if (wanted.has("key")) {
+    const result = await updateKeyAction(formData);
+    if (!result.ok) return { ok: false, error: result.error, saved };
+    saved.push("key");
+  }
+  if (wanted.has("tracing")) {
+    try {
+      await obleth.setKeyTracing(id, formData.get("tracing_enabled") === "on", { auditActor: session.email });
+    } catch (e) {
+      return { ok: false, error: `Tracing: ${actionError(e).error}`, saved };
+    }
+    saved.push("tracing");
+  }
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
+  revalidatePath("/tenants");
+  return { ok: true };
 }
 
-export async function toggleKeyTracingAction(id: string, tracing_enabled: boolean) {
-  const session = await requireAdmin();
-  await obleth.setKeyTracing(id, tracing_enabled, { auditActor: session.email });
+export interface BulkKeyResult {
+  done: number;
+  failed: { name: string; error: string }[];
+}
+
+/** Run `task` over the chosen keys, a few at a time, collecting failures by name. */
+async function eachKey(ids: string[], task: (key: ApiKey) => Promise<void>): Promise<BulkKeyResult> {
+  const wanted = new Set(ids);
+  const keys = (await obleth.listKeys()).filter((k) => wanted.has(k.id));
+  const failed: BulkKeyResult["failed"] = [];
+  let done = 0;
+  for (let i = 0; i < keys.length; i += 8) {
+    await Promise.all(
+      keys.slice(i, i + 8).map(async (key) => {
+        try {
+          await task(key);
+          done += 1;
+        } catch (e) {
+          failed.push({ name: key.name || key.key_prefix, error: actionError(e).error });
+        }
+      }),
+    );
+  }
   updateTag(CACHE_TAGS.keys);
   revalidatePath("/keys");
+  revalidatePath("/tenants");
+  revalidatePath("/");
+  return { done, failed };
 }
 
-export async function toggleTenantTracingAction(id: string, tracing_enabled: boolean) {
+export async function setKeysDisabledAction(ids: string[], disabled: boolean): Promise<BulkKeyResult> {
   const session = await requireAdmin();
-  await obleth.setTenantTracing(id, tracing_enabled, { auditActor: session.email });
-  updateTag(CACHE_TAGS.tenants);
-  revalidatePath("/tenants");
+  return eachKey(ids, async (key) => {
+    if (key.disabled === disabled) return;
+    await obleth.setKeyDisabled(key.id, disabled, { auditActor: session.email });
+  });
 }
 
-export async function toggleTenantSyntheticAction(id: string, synthetic: boolean) {
+/** Give every chosen key the same budget (blank caps clear it). Their other settings stay. */
+export async function setKeysBudgetAction(
+  ids: string[],
+  budget: { budget_tokens: number | null; budget_cost_usd: number | null; budget_period: string },
+): Promise<BulkKeyResult> {
   const session = await requireAdmin();
-  await obleth.setTenantSynthetic(id, synthetic, { auditActor: session.email });
-  updateTag(CACHE_TAGS.tenants);
-  revalidatePath("/tenants");
+  const capped = budget.budget_tokens != null || budget.budget_cost_usd != null;
+  if ((budget.budget_tokens ?? 0) < 0 || (budget.budget_cost_usd ?? 0) < 0) return { done: 0, failed: [{ name: "all", error: "Caps can't be negative." }] };
+  return eachKey(ids, async (key) => {
+    await obleth.updateKey(key.id, {
+      name: key.name,
+      description: key.description,
+      weight: key.weight,
+      max_in_flight: key.max_in_flight,
+      budget_tokens: budget.budget_tokens,
+      budget_cost_usd: budget.budget_cost_usd,
+      budget_period: capped ? budget.budget_period : null,
+      budget_started_at: capped ? key.budget_started_at : null,
+    }, { auditActor: session.email });
+  });
+}
+
+export type MoveTarget =
+  | { tenantId: string }
+  | { newTenant: { name: string; copyFrom?: string } };
+
+/**
+ * Move keys to another tenant, or to a new one made for them (optionally
+ * with the limits, budget, hours, models and policies of `copyFrom`, and
+ * placed in its fairshare group). Their secrets keep working; past usage
+ * stays under the tenant it was recorded in.
+ */
+export async function moveKeysAction(ids: string[], target: MoveTarget): Promise<BulkKeyResult & { tenantId?: string; error?: string }> {
+  const session = await requireAdmin();
+  const audit = { auditActor: session.email };
+  let tenantId: string;
+  if ("tenantId" in target) {
+    tenantId = target.tenantId;
+  } else {
+    const name = target.newTenant.name.trim();
+    if (!name) return { done: 0, failed: [], error: "Name the new tenant." };
+    try {
+      const source = target.newTenant.copyFrom ? ((await obleth.listTenants()).find((t) => t.id === target.newTenant.copyFrom) ?? null) : null;
+      const created = await obleth.createTenant({
+        name,
+        weight: source?.weight ?? 100,
+        tokens_per_minute: source?.tokens_per_minute ?? 0,
+        max_in_flight: source?.max_in_flight ?? null,
+        fairshare_group: source?.fairshare_group || undefined,
+      }, audit);
+      tenantId = created.id;
+      if (source) {
+        await obleth.setTenantSchedule(tenantId, {
+          timezone: source.timezone,
+          active_from: source.active_from,
+          active_until: source.active_until,
+          weekly_windows: source.weekly_windows,
+        }, audit);
+        if (source.budget_tokens != null || source.budget_cost_usd != null) {
+          await obleth.setTenantBudget(tenantId, { budget_tokens: source.budget_tokens, budget_cost_usd: source.budget_cost_usd, budget_period: source.budget_period }, audit);
+        }
+        if (source.allowed_models?.length) await obleth.setTenantAllowlist(tenantId, source.allowed_models, audit);
+        if (source.guardrails_policy) await obleth.setTenantGuardrails(tenantId, source.guardrails_policy, audit);
+        if (source.compression_policy) await obleth.setTenantCompression(tenantId, source.compression_policy, audit);
+      }
+    } catch (e) {
+      return { done: 0, failed: [], error: actionError(e).error };
+    }
+    updateTag(CACHE_TAGS.tenants);
+  }
+  const result = await eachKey(ids, async (key) => {
+    if (key.tenant_id === tenantId) return;
+    await obleth.moveKey(key.id, tenantId, audit);
+  });
+  revalidatePath("/fairshare");
+  return { ...result, tenantId };
+}
+
+/**
+ * A new key with this key's tenant and settings, for a client to switch to.
+ * The old key keeps working until it is turned off.
+ */
+export async function replaceKeyAction(id: string): Promise<{ ok: true; secret: string; key: ApiKey } | { ok: false; error: string }> {
+  const session = await requireAdmin();
+  try {
+    const old = (await obleth.listKeys()).find((k) => k.id === id);
+    if (!old) return { ok: false, error: "Key not found." };
+    if (old.kind === "identity") return { ok: false, error: "An identity key has no secret to replace." };
+    const created = await obleth.createKey(old.tenant_id, {
+      name: `${old.name} (new)`,
+      description: old.description,
+      weight: old.weight,
+      max_in_flight: old.max_in_flight,
+      budget_tokens: old.budget_tokens,
+      budget_cost_usd: old.budget_cost_usd,
+      budget_period: old.budget_period,
+      budget_started_at: old.budget_started_at,
+    }, { auditActor: session.email });
+    if (old.tracing_enabled) await obleth.setKeyTracing(created.key.id, true, { auditActor: session.email });
+    updateTag(CACHE_TAGS.keys);
+    revalidatePath("/keys");
+    return { ok: true, secret: created.secret, key: created.key };
+  } catch (e) {
+    return actionError(e);
+  }
 }
 
 export async function deleteKeyAction(id: string): Promise<ActionResult> {
@@ -701,56 +881,6 @@ export async function deleteKeysAction(
   revalidatePath("/keys");
   revalidatePath("/");
   return result;
-}
-
-export async function deleteFilteredKeysAction(filters: {
-  query?: string;
-  tenantId?: string;
-  status?: "all" | "active" | "disabled";
-  budget?: "all" | "budgeted" | "unlimited";
-}): Promise<{ deleted: number; failed: number; matched: number }> {
-  const session = await requireAdmin();
-  const query = String(filters.query ?? "")
-    .trim()
-    .toLowerCase();
-  const tenantId = String(filters.tenantId ?? "all");
-  const status = filters.status ?? "all";
-  const budget = filters.budget ?? "all";
-  const hasFilter =
-    query !== "" || tenantId !== "all" || status !== "all" || budget !== "all";
-  if (!hasFilter) return { deleted: 0, failed: 0, matched: 0 };
-
-  const [tenants, keys] = await Promise.all([
-    obleth.listTenants(),
-    obleth.listKeys(),
-  ]);
-  const tenantNames = new Map(
-    tenants.map((tenant) => [tenant.id, tenant.name]),
-  );
-  const matched = keys.filter((key) => {
-    if (tenantId !== "all" && key.tenant_id !== tenantId) return false;
-    if (status === "active" && key.disabled) return false;
-    if (status === "disabled" && !key.disabled) return false;
-    const keyHasBudget =
-      key.budget_tokens != null || key.budget_cost_usd != null;
-    if (budget === "budgeted" && !keyHasBudget) return false;
-    if (budget === "unlimited" && keyHasBudget) return false;
-    if (!query) return true;
-    const tenantName =
-      tenantNames.get(key.tenant_id) ?? key.tenant_id.slice(0, 8);
-    return (
-      key.key_prefix.toLowerCase().includes(query) ||
-      key.name.toLowerCase().includes(query) ||
-      key.description.toLowerCase().includes(query) ||
-      tenantName.toLowerCase().includes(query)
-    );
-  });
-
-  const result = await deleteKeys(matched.map((key) => key.id), session.email);
-  updateTag(CACHE_TAGS.keys);
-  revalidatePath("/keys");
-  revalidatePath("/");
-  return { ...result, matched: matched.length };
 }
 
 export async function setCapacityAction(max: number) {
