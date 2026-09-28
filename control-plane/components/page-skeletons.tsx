@@ -98,6 +98,56 @@ export function GroupsSkeleton() {
   );
 }
 
+/** The Models list: header, four tiles, the filter row, and the table. */
+export function ModelsSkeleton() {
+  return (
+    <Loading label="Loading models">
+      <Header controls={2} />
+      <Tiles count={4} className="grid grid-cols-2 gap-3 xl:grid-cols-4" />
+      <div className="flex flex-wrap gap-2">
+        <Skeleton className="h-9 w-[26rem] max-w-full rounded-lg" />
+        <Skeleton className="h-9 w-80 rounded-lg" />
+        <Skeleton className="h-9 w-28 rounded-lg" />
+        <Skeleton className="h-9 w-28 rounded-lg" />
+      </div>
+      <SkeletonPanel className="gap-0 p-0">
+        <Skeleton className="m-4 h-3 w-2/3" />
+        {Array.from({ length: 10 }, (_, i) => (
+          <div key={i} className="flex items-center gap-4 border-t border-border px-4 py-3">
+            <Skeleton className="h-5 w-5 rounded-md" />
+            <Skeleton className="h-4 w-48" />
+            <Skeleton className="h-3.5 w-16" />
+            <Skeleton className="h-2 w-24" />
+            <Skeleton className="ml-auto h-3.5 w-32" />
+          </div>
+        ))}
+      </SkeletonPanel>
+    </Loading>
+  );
+}
+
+/** A model's own page: header, the section list, then the Overview's tiles and chart. */
+export function ModelSkeleton() {
+  return (
+    <Loading label="Loading the model">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div className="space-y-2.5"><Skeleton className="h-3 w-24" /><Skeleton className="h-8 w-72" /><Skeleton className="h-5 w-[28rem] max-w-[70vw]" /></div>
+        <div className="flex gap-2"><Skeleton className="h-9 w-28 rounded-lg" /><Skeleton className="h-9 w-36 rounded-lg" /><Skeleton className="h-9 w-9 rounded-lg" /></div>
+      </div>
+      <div className="grid gap-6 lg:grid-cols-[200px_minmax(0,1fr)]">
+        <div className="hidden space-y-2 lg:block"><Skeleton className="h-9 rounded-lg" /><Rows count={10} className="h-7 rounded-lg" /></div>
+        <div className="flex flex-col gap-4">
+          <Tiles count={5} className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5" />
+          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">
+            <SkeletonPanel className="h-[300px]"><Skeleton className="h-4 w-28" /><Skeleton className="mt-2 flex-1" /></SkeletonPanel>
+            <div className="flex flex-col gap-4"><SkeletonPanel className="h-[92px]" /><SkeletonPanel className="h-[92px]" /><SkeletonPanel className="h-[92px]" /></div>
+          </div>
+        </div>
+      </div>
+    </Loading>
+  );
+}
+
 /** The Playground fills the page edge to edge: sessions, header, surface, composer. */
 export function PlaygroundSkeleton() {
   return (

@@ -7,7 +7,8 @@ use utoipa::OpenApi;
 
 use crate::autotune::{AutotuneReport, AutotuneRequest, AutotuneStep, KneeReason, WorkloadProfile};
 use crate::model_health::{
-    BulkModelHealthResult, UpdateModelHealthConfig, ValidateModelRequest, ValidateModelResult,
+    BulkModelHealthResult, ModelActivation, UpdateModelHealthConfig, ValidateModelRequest,
+    ValidateModelResult,
 };
 use crate::usage::{
     CacheStats, CostAgg, KeyUsageSummary, KeyUsageSummaryQuery, ModelUsageTimePoint,
@@ -134,6 +135,7 @@ use obleth_config::{
         crate::model_health::list_health,
         crate::model_health::get_health,
         crate::model_health::check_one,
+        crate::model_health::activate,
         crate::model_health::check_all,
         crate::model_health::update_config,
         crate::model_health::validate_model,
@@ -208,6 +210,7 @@ use obleth_config::{
         ModelHealthDetail,
         UpdateModelHealthConfig,
         BulkModelHealthResult,
+        ModelActivation,
         ValidateModelRequest,
         ValidateModelResult,
         CreateTenant,

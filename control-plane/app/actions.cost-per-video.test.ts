@@ -75,14 +75,15 @@ async function connectionUpdate(current: Record<string, unknown>, fd: FormData) 
     CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
     OblethApiError: class OblethApiError extends Error {},
   }));
-  const { updateModelConnectionAction } = await import("./actions");
-  await updateModelConnectionAction(null, fd);
+  const { saveModelSettingsAction } = await import("./actions");
+  await saveModelSettingsAction(fd);
   return updateModel;
 }
 
 function connectionForm(over: Record<string, string> = {}) {
   const fd = new FormData();
   fd.set("id", "m-1");
+  fd.set("sections", "model");
   fd.set("upstream_model", "up");
   fd.set("api_base", "http://a");
   for (const [k, v] of Object.entries(over)) fd.set(k, v);

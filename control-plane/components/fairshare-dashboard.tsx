@@ -42,6 +42,7 @@ export {
   slotModeBadge,
   thinHistory,
 } from "@/lib/fairshare-model";
+import { modelHref } from "@/lib/model-links";
 export type { FairshareLiveView, GroupFairshareView, KeyFairshareView, ModelPoolView, TenantFairshareView } from "@/lib/obleth";
 
 const FIRST_POOLS = 8;
@@ -195,7 +196,7 @@ function WhatYouCanDo({ pool, view }: { pool?: PoolRow; view: FairshareLiveView 
   const waiting = rows.find((r) => r.standing === "next");
   return (
     <HelpTip label="What you can do about a full pool">
-      <span className="block"><strong className="font-medium text-foreground">Grow the pool.</strong> Add capacity to the model; a discovered pool follows its backend by itself. <Link className="underline underline-offset-2" href={`/models?model=${encodeURIComponent(pool?.model ?? "")}`}>Capacity settings</Link></span>
+      <span className="block"><strong className="font-medium text-foreground">Grow the pool.</strong> Add capacity to the model; a discovered pool follows its backend by itself. <Link className="underline underline-offset-2" href={modelHref(pool?.model ?? "", "capacity")}>Capacity settings</Link></span>
       <span className="block"><strong className="font-medium text-foreground">Cap a tenant on this model.</strong> {holder ? `${holder.tenant.name} holds ${holder.above} above its share. ` : ""}A per-model limit stops one tenant borrowing the whole pool next time; running requests are not cut off.</span>
       <span className="block"><strong className="font-medium text-foreground">Give someone a bigger share.</strong> {waiting ? `Raise ${waiting.tenant.name}'s weight, or its group's, ` : "Raise a tenant's or a group's weight "}to move it up the line when pools are full. <Link className="underline underline-offset-2" href="/fairshare/groups">Groups &amp; weights</Link></span>
     </HelpTip>

@@ -9,6 +9,7 @@ import type { AuditEntry, ModelHealthDetail, ModelRoute, ModelUsageTimePoint, Us
 import { compact, describeAudit, formatMs, modelTypeLabel, RANGE_BUCKET_MS, RANGE_LABEL, RANGE_MS, type FleetTile, type OverviewRange } from "@/lib/overview-model";
 import { cn, getJson } from "@/lib/utils";
 import { HealthGlyph, Meter, Pill, SectionLabel, Sparkline } from "./ui";
+import { modelHref } from "@/lib/model-links";
 
 const HEALTH_LABEL = { healthy: "Healthy", unhealthy: "Failing", unknown: "No health data", maintenance: "In maintenance" } as const;
 
@@ -76,7 +77,7 @@ export function ModelPeek({ tile, model, usage, audit, range, onClose }: {
                   {model && !model.auto_eligible && <Pill>Not eligible for auto</Pill>}
                 </div>
                 <div className="flex flex-wrap gap-2">
-                  <Link href={`/models?model=${encodeURIComponent(name)}`} className="inline-flex h-8 items-center rounded-lg border border-foreground bg-foreground px-3 text-[12.5px] font-medium text-background hover:bg-foreground/90">Open model</Link>
+                  <Link href={modelHref(name)} className="inline-flex h-8 items-center rounded-lg border border-foreground bg-foreground px-3 text-[12.5px] font-medium text-background hover:bg-foreground/90">Open model</Link>
                   <Link href="/playground" className="inline-flex h-8 items-center rounded-lg border border-border px-3 text-[12.5px] font-medium hover:bg-accent">Try in Playground</Link>
                   <Link href="/logs" className="inline-flex h-8 items-center rounded-lg border border-border px-3 text-[12.5px] font-medium hover:bg-accent">Request logs</Link>
                 </div>

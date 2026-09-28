@@ -255,6 +255,10 @@ pub fn router(state: AdminState) -> Router {
             post(model_health::check_one),
         )
         .route(
+            "/api/v1/models/:id/health/activate",
+            post(model_health::activate),
+        )
+        .route(
             "/api/v1/models/:id/health/config",
             put(model_health::update_config),
         )
@@ -958,6 +962,11 @@ pub struct CreateModel {
     /// Name that scoring backend serves, if not this model's `upstream_model`.
     #[serde(default)]
     pub verify_upstream_model: Option<String>,
+    /// `false` creates the route switched off, so it serves nothing until it is
+    /// turned on — for example by `POST /models/{id}/health/activate` once a
+    /// health check passes. Omitted = on.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -6004,6 +6013,13 @@ async fn create_model(
             &discovery,
         )
         .await?;
+    // Switched off before the first publish below, so the data plane never
+    // sees the route on.
+    let model = if body.enabled == Some(false) {
+        state.store.set_model_enabled(model.id, false).await?
+    } else {
+        model
+    };
     if state.health.default_interval_secs != 900 {
         let _ = state
             .store

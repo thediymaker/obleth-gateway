@@ -1965,6 +1965,30 @@ impl Store {
         Ok(candidates)
     }
 
+    /// Turn a model's route on or off, leaving every other field alone.
+    pub async fn set_model_enabled(&self, id: Uuid, enabled: bool) -> Result<ModelRoute> {
+        let row = sqlx::query(
+            "update models set enabled = $2, updated_at = now()
+             where id = $1
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+                       input_cost_per_token, output_cost_per_token,
+                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
+                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
+                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
+                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
+                       per_replica_max_in_flight, capacity_headroom,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
+                       created_at, updated_at",
+        )
+        .bind(id)
+        .bind(enabled)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+        model_from_row(&row)
+    }
+
     /// Toggle (and set the TTL of) the response cache for a model.
     pub async fn update_model_cache(
         &self,
@@ -6325,6 +6349,84 @@ mod tests {
         // Clean up the now-orphaned replica row, matching the teardown discipline
         // of the other replica integration tests.
         store.delete_replica(replica.id).await.ok();
+    }
+
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// `set_model_enabled` flips only the route switch: the model keeps every
+    /// other field, and reads report the new state.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn set_model_enabled_flips_only_the_switch() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let model = store
+            .create_model(
+                &format!("enabled-{}", Uuid::new_v4()),
+                "enabled switch test model",
+                "upstream-model",
+                "http://127.0.0.1:8081",
+                None,
+                "chat",
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+                8192,
+                100,
+                Some(12),
+                false,
+                true,
+                false,
+                false,
+                false,
+                &["coding".to_string()],
+                &[],
+                &[],
+                0,
+                1.0,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
+                &Default::default(),
+                0.0,
+                "static",
+                &Default::default(),
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+        assert!(model.enabled, "a new model starts enabled");
+
+        let off = store
+            .set_model_enabled(model.id, false)
+            .await
+            .expect("disable");
+        assert!(!off.enabled);
+        assert_eq!(off.max_in_flight, Some(12));
+        assert_eq!(off.tags, vec!["coding".to_string()]);
+        assert!(!store.get_model(model.id).await.unwrap().enabled);
+
+        let on = store
+            .set_model_enabled(model.id, true)
+            .await
+            .expect("enable");
+        assert!(on.enabled);
+        assert!(store.get_model(model.id).await.unwrap().enabled);
+
+        assert!(matches!(
+            store.set_model_enabled(Uuid::new_v4(), true).await,
+            Err(StoreError::NotFound)
+        ));
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.

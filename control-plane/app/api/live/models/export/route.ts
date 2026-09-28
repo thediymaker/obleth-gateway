@@ -1,3 +1,4 @@
+import type { NextRequest } from "next/server";
 import { obleth } from "@/lib/obleth";
 import { guardAdmin } from "@/lib/auth/guard";
 
@@ -5,14 +6,17 @@ import { guardAdmin } from "@/lib/auth/guard";
 // the proxy middleware only checks session presence, so this route
 // independently enforces the admin role. Unlike the config backup this file
 // carries no secrets — upstream keys are reported as a presence flag only — so
-// it is safe to keep in a repository.
-export async function GET() {
+// it is safe to keep in a repository. `?names=a,b` exports just those models.
+export async function GET(req: NextRequest) {
   const denied = await guardAdmin();
   if (denied) return denied;
   try {
-    const manifest = await obleth.exportModels();
+    const full = await obleth.exportModels();
+    const names = (req.nextUrl.searchParams.get("names") ?? "").split(",").map((n) => n.trim()).filter(Boolean);
+    const wanted = new Set(names);
+    const manifest = names.length ? { ...full, models: full.models.filter((m) => wanted.has(m.model_name)) } : full;
     const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
-    const filename = `obleth-models-${stamp}.json`;
+    const filename = names.length === 1 ? `obleth-model-${names[0]}-${stamp}.json` : `obleth-models-${stamp}.json`;
 
     return new Response(JSON.stringify(manifest, null, 2), {
       status: 200,
