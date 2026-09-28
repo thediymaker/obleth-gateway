@@ -51,7 +51,7 @@ before the first stable tag of a version.
 ## Version surfaces
 
 - Gateway: `GET /api/v1/version` (public) — version, git SHA, build timestamp.
-- Dashboard: Settings → Version card (also compares against the latest GitHub
+- Dashboard: Settings → About (also compares against the latest GitHub
   release) and the user menu footer.
 - CI guard: the `versions` job in `ci.yml` fails any PR where the five version
   declarations drift apart.
@@ -73,4 +73,4 @@ toward a release.
       private and unauthenticated pulls 403 until flipped.
 - [ ] Verify `docker pull ghcr.io/thediymaker/obleth-gateway/obleth:latest`
       works logged out.
-- [ ] Verify the dashboard Settings → Version card reports "Up to date".
+- [ ] Verify the dashboard Settings → About shows the gateway as "Latest".
