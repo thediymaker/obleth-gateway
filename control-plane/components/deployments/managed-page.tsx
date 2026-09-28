@@ -347,7 +347,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
 
       {!provisionerOk && (
         <Notice strong>
-          {!data.slurm?.enabled ? <>Slurm is turned off in <Link href="/settings?tab=slurm" className="underline underline-offset-2">Settings</Link>, so nothing is launched or replaced.</> : <>The provisioner hasn&apos;t checked in{data.slurm?.provisioner_last_seen_secs != null ? ` for ${duration(data.slurm.provisioner_last_seen_secs * 1000)}` : ""}. What you see may be out of date, and nothing is launched or replaced until it&apos;s back.</>}
+          {!data.slurm?.enabled ? <>Slurm is turned off in its <Link href="/deployments?slurm=1" className="underline underline-offset-2">connection settings</Link>, so nothing is launched or replaced.</> : <>The provisioner hasn&apos;t checked in{data.slurm?.provisioner_last_seen_secs != null ? ` for ${duration(data.slurm.provisioner_last_seen_secs * 1000)}` : ""}. What you see may be out of date, and nothing is launched or replaced until it&apos;s back.</>}
         </Notice>
       )}
       {notice && <Notice onDismiss={() => setNotice(null)} strong={notice.strong}>{notice.text}</Notice>}

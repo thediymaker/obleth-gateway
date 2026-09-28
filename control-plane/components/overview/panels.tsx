@@ -188,12 +188,12 @@ export function FooterTiles({ summary, cache, readiness, range }: { summary: Ove
         <span className="text-xl font-semibold">{hitRate === null ? "No lookups" : `${hitRate.toFixed(1)}% hits`}</span>
         <span className="truncate text-xs text-muted-foreground">{cache && Number(cache.tokens_saved) > 0 ? `${compact(Number(cache.tokens_saved))} tokens not recomputed` : "Caching is set per model"}</span>
       </Link>
-      <Link href="/settings" className={tile}>
+      <Link href="/settings?tab=energy" className={tile}>
         <SectionLabel>Energy · {suffix}</SectionLabel>
         <span className="text-xl font-semibold">{summary.energyWh > 0 ? `${summary.energyWh >= 1000 ? (summary.energyWh / 1000).toFixed(1) : summary.energyWh.toFixed(0)} ${summary.energyWh >= 1000 ? "kWh" : "Wh"}` : "Not measured"}</span>
         <span className="truncate text-xs text-muted-foreground">{summary.energyWh > 0 ? `${summary.co2G >= 1000 ? `${(summary.co2G / 1000).toFixed(1)} kg` : `${summary.co2G.toFixed(0)} g`} CO₂${summary.energyCostUsd > 0 ? ` · $${summary.energyCostUsd.toFixed(2)} at the set rate` : ""}` : "Turn on energy tracking in Settings"}</span>
       </Link>
-      <Link href="/settings" className={tile}>
+      <Link href="/settings?tab=routing" className={tile}>
         <SectionLabel>Routing readiness</SectionLabel>
         <span className="text-xl font-semibold">{readiness ? (warn.length ? `${warn.length} finding${warn.length === 1 ? "" : "s"}` : "Ready") : "Unavailable"}</span>
         <span className="truncate text-xs text-muted-foreground">{readiness ? [warn[0]?.title, readiness.classifier_active ? "classifier on" : "classifier off"].filter(Boolean).join(" · ") : "Could not read the router"}</span>

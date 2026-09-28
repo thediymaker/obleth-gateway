@@ -3,7 +3,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { launchRecipeAction, setDeploymentEnabledAction, setDeploymentReplicasAction } from "@/app/actions";
+import { launchRecipeAction, setDeploymentEnabledAction, setDeploymentReplicasAction, setSlurmSettingsAction } from "@/app/actions";
 import { DeploymentsList } from "./deployments-list";
 import { ManagedPage } from "./managed-page";
 import { NewDeployment } from "./new-deployment";
@@ -21,6 +21,8 @@ vi.mock("@/app/actions", () => ({
   clearLostReplicasAction: vi.fn(async () => ({ ok: true })),
   deleteTemplateAction: vi.fn(async () => ({ ok: true })),
   saveTemplateAction: vi.fn(async () => ({ ok: true })),
+  setSlurmSettingsAction: vi.fn(async () => ({ ok: true })),
+  testSlurmConnectionAction: vi.fn(async () => ({ ok: true })),
 }));
 const push = vi.fn();
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn(), push, replace: vi.fn() }), usePathname: () => "/deployments" }));
@@ -57,6 +59,7 @@ beforeEach(() => {
   vi.mocked(launchRecipeAction).mockClear();
   vi.mocked(setDeploymentEnabledAction).mockClear();
   vi.mocked(setDeploymentReplicasAction).mockClear();
+  vi.mocked(setSlurmSettingsAction).mockClear();
   push.mockClear();
   host = document.createElement("div");
   document.body.appendChild(host);
@@ -95,6 +98,36 @@ describe("the Deployments list", () => {
     await act(async () => button("Needs you 1").click());
     expect(table.textContent).not.toContain("glm-5.2");
     expect(table.textContent).toContain("No replicas ready");
+  });
+});
+
+describe("the Slurm connection", () => {
+  const slurm = {
+    enabled: true, slurmrestd_url: "http://slurm:6820", slurmrestd_api_version: "v0.0.40", slurm_user: "obleth", jwt_set: true, jwt_last4: "a1b2",
+    node_aliases: [{ host: "gh-007", ip: "10.0.0.7" }], provisioner_running: true, provisioner_last_seen_secs: 4, provisioner_tick_status: "ok",
+  } as DeploymentsData["slurm"];
+
+  it("keeps the stored JWT unless a new one is typed, and sends the whole connection", async () => {
+    await render(<DeploymentsList initial={data({ slurm })} recipes={[]} tab="deployments" slurmSheet />);
+    const sheet = document.querySelector('[role="dialog"][aria-label="Slurm connection"]')!;
+    expect(sheet.textContent).toContain("A JWT ending a1b2 is set");
+    expect(sheet.textContent).toContain("Provisioner checked in just now");
+    await type(sheet.querySelector<HTMLInputElement>('input[name="user"]')!, "svc-obleth");
+    await act(async () => { await new Promise((r) => requestAnimationFrame(r)); });
+    await act(async () => button("Save changes").click());
+    expect(setSlurmSettingsAction).toHaveBeenCalledWith({ enabled: true, slurmrestd_url: "http://slurm:6820", slurmrestd_api_version: "v0.0.40", slurm_user: "svc-obleth", node_aliases: [{ host: "gh-007", ip: "10.0.0.7" }] });
+  });
+
+  it("asks before turning Slurm off while jobs run", async () => {
+    await render(<DeploymentsList initial={data({ slurm })} recipes={[]} tab="deployments" slurmSheet />);
+    const off = document.querySelector<HTMLInputElement>('[role="dialog"] input[name="enabled"]')!;
+    await act(async () => off.click());
+    await act(async () => { await new Promise((r) => requestAnimationFrame(r)); });
+    await act(async () => button("Save changes").click());
+    expect(document.body.textContent).toContain("Turn Slurm off?");
+    expect(setSlurmSettingsAction).not.toHaveBeenCalled();
+    await act(async () => button("Turn off").click());
+    expect(setSlurmSettingsAction).toHaveBeenCalledWith(expect.objectContaining({ enabled: false }));
   });
 });
 

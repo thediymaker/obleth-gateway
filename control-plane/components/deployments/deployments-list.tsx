@@ -6,6 +6,7 @@ import { usePathname, useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import { Plus, Search } from "lucide-react";
 import { RecipesTab } from "@/components/deployments/recipes-tab";
+import { SlurmConnection } from "@/components/deployments/slurm-connection";
 import { Glyph, ReplicaDots, StateMark } from "@/components/deployments/ui";
 import { useFairshareLive } from "@/components/fairshare/hooks";
 import { Tile } from "@/components/models/ui";
@@ -46,10 +47,11 @@ function inFlightOf(r: DeploymentRow, live: Record<string, number> | undefined):
   return live?.[r.model.model_name] ?? 0;
 }
 
-export function DeploymentsList({ initial, recipes, tab: initialTab }: { initial: DeploymentsData; recipes: RecipeCard[]; tab: "deployments" | "recipes" }) {
+export function DeploymentsList({ initial, recipes, tab: initialTab, slurmSheet = false }: { initial: DeploymentsData; recipes: RecipeCard[]; tab: "deployments" | "recipes"; slurmSheet?: boolean }) {
   const router = useRouter();
   const pathname = usePathname();
   const [tab, setTab] = useState(initialTab);
+  const [slurmOpen, setSlurmOpen] = useState(slurmSheet);
   const [query, setQuery] = useState("");
   const [runs, setRuns] = useState<RunsFilter>("all");
   const [sort, setSort] = useState<DeploySort>("requests");
@@ -85,8 +87,14 @@ export function DeploymentsList({ initial, recipes, tab: initialTab }: { initial
     router.replace(t === "recipes" ? `${pathname}?tab=recipes` : pathname, { scroll: false });
   };
 
+  function closeSlurm() {
+    setSlurmOpen(false);
+    if (slurmSheet) router.replace(tab === "recipes" ? `${pathname}?tab=recipes` : pathname, { scroll: false });
+  }
+
   return (
     <div className="mx-auto flex max-w-[1600px] flex-col gap-[18px]">
+      {slurmOpen && data.slurm && <SlurmConnection settings={data.slurm} replicas={queued + slurmReady} onClose={closeSlurm} onSaved={() => { void live.refetch(); router.refresh(); }} />}
       <div className="flex flex-wrap items-end justify-between gap-4">
         <div className="flex min-w-0 flex-col gap-1.5">
           <h1 className="text-[26px] font-semibold tracking-tight">Deployments</h1>
@@ -158,12 +166,12 @@ export function DeploymentsList({ initial, recipes, tab: initialTab }: { initial
                   ) : (
                     <p className="text-[12.5px] text-secondary-foreground">Connected to {data.slurm?.slurmrestd_url || "slurmrestd"}. The cluster&apos;s partitions and nodes will show here.</p>
                   )}
-                  <p className="text-xs text-muted-foreground">{slurm.length ? `${slurmReady} of ${slurmWanted} replicas serving${queued ? ` · ${queued} starting` : ""}` : "Nothing launched yet."} <Link href="/settings?tab=slurm" className="text-secondary-foreground underline underline-offset-2 hover:text-foreground">Slurm settings</Link></p>
+                  <p className="text-xs text-muted-foreground">{slurm.length ? `${slurmReady} of ${slurmWanted} replicas serving${queued ? ` · ${queued} starting` : ""}` : "Nothing launched yet."} <button type="button" onClick={() => setSlurmOpen(true)} className="text-secondary-foreground underline underline-offset-2 hover:text-foreground">Slurm connection</button></p>
                 </>
               ) : (
                 <p className="text-[12.5px] text-secondary-foreground">
                   obleth can launch models as jobs on a Slurm cluster, keep them at a replica count, and route to them once healthy.{" "}
-                  <Link href="/settings?tab=slurm" className="text-foreground underline underline-offset-2">Set up Slurm ›</Link>
+                  <button type="button" onClick={() => setSlurmOpen(true)} disabled={!data.slurm} className="text-foreground underline underline-offset-2 disabled:no-underline disabled:text-muted-foreground">{data.slurm ? "Set up Slurm ›" : "Slurm settings couldn't be read"}</button>
                 </p>
               )}
             </section>

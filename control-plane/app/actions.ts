@@ -25,6 +25,7 @@ import type {
   UpdateAlertSettings,
   UpdateAutoRouterSettings,
   UpdateBoonSettings,
+  SpeculationCategoryGate,
   UpdateEnergySettings,
   UpdateKnowledgeSettings,
   UpdateSlurmSettings,
@@ -1873,6 +1874,172 @@ export async function deleteMcpServerAction(id: string): Promise<ActionResult> {
   );
 }
 
+// ----------------------------------------------------------------------------
+// The Settings page
+//
+// Every section submits as one form (`section.field` names) and saves with one
+// button. Each changed section goes through the action that owns it, in a
+// fixed order; a refusal says which sections were already saved.
+// ----------------------------------------------------------------------------
+
+type SettingsPageSection = "alerts" | "routing" | "boons" | "energy" | "assistant" | "retention";
+const SETTINGS_PAGE_ORDER: SettingsPageSection[] = ["alerts", "routing", "boons", "energy", "assistant", "retention"];
+const SETTINGS_PAGE_LABEL: Record<SettingsPageSection, string> = { alerts: "Alerts", routing: "Routing", boons: "Boons", energy: "Energy", assistant: "Assistant", retention: "Data" };
+
+const BOON_BOOLS = [
+  "vision_enabled", "structured_output_enabled", "tool_loop_enabled", "image_generation_enabled", "speculation_enabled",
+  "compression_enabled", "compression_code_compaction", "compression_dedup", "compression_compact_logs", "compression_allow_lossy",
+] as const;
+const BOON_NUMBERS = [
+  "vision_max_images", "vision_timeout_ms", "structured_output_max_repair_attempts", "structured_output_timeout_ms",
+  "tool_loop_max_turns", "tool_loop_tool_timeout_ms", "tool_loop_deadline_secs",
+  "image_generation_max_images_per_request", "image_generation_timeout_ms",
+  "speculation_agree_min", "speculation_lp_min", "speculation_abort_agree", "speculation_abort_lp", "speculation_first_chunk_tokens",
+  "speculation_chunk_tokens", "speculation_decide_by_tokens", "speculation_max_draft_tokens", "speculation_pace_ms", "speculation_timeout_ms",
+  "compression_min_tokens", "compression_max_segments", "compression_max_lossy_segments", "compression_original_ttl_secs", "compression_neural_keep_ratio",
+] as const;
+/** Model pickers: blank means none. */
+const BOON_MODELS = ["vision_fallback_model", "structured_output_fixer_model", "image_generation_model", "speculation_draft_model", "speculation_classify_model"] as const;
+const BOON_TEXTS = ["vision_describe_prompt", "tool_loop_nudge", "image_generation_tool_description", "speculation_verify_url_template"] as const;
+
+/** The boons section of the Settings form as the gateway's update, or why not. */
+function boonSettingsFromForm(formData: FormData): { ok: true; body: UpdateBoonSettings } | { ok: false; error: string } {
+  const get = (k: string) => formData.get(`boons.${k}`);
+  const body: Record<string, unknown> = {};
+  for (const k of BOON_BOOLS) body[k] = get(k) === "on";
+  for (const k of BOON_NUMBERS) {
+    const raw = trimmed(get(k));
+    if (raw === "") continue;
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return { ok: false, error: `${k.replace(/_/g, " ")} must be a number.` };
+    body[k] = n;
+  }
+  for (const k of BOON_MODELS) body[k] = trimmed(get(k)) || null;
+  for (const k of BOON_TEXTS) if (formData.has(`boons.${k}`)) body[k] = String(get(k) ?? "");
+  body.image_generation_allowed_sizes = trimmed(get("image_generation_allowed_sizes")).split(/[\s,]+/).filter(Boolean);
+  body.speculation_unlisted_categories_speculate = get("speculation_unlisted") === "on";
+  const gates = trimmed(get("speculation_gates"));
+  try {
+    body.speculation_category_gates = gates ? (JSON.parse(gates) as SpeculationCategoryGate[]) : [];
+  } catch {
+    return { ok: false, error: "The category rules couldn't be read." };
+  }
+  const kwargs = trimmed(get("speculation_draft_chat_template_kwargs"));
+  if (kwargs) {
+    try {
+      const parsed = JSON.parse(kwargs);
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return { ok: false, error: "The drafter's template arguments must be a JSON object." };
+      body.speculation_draft_chat_template_kwargs = parsed;
+    } catch {
+      return { ok: false, error: "The drafter's template arguments aren't valid JSON." };
+    }
+  } else {
+    body.speculation_draft_chat_template_kwargs = {};
+  }
+  const attempts = body.structured_output_max_repair_attempts as number | undefined;
+  if (attempts !== undefined && (attempts < 0 || attempts > 3)) return { ok: false, error: "Structured output: 0 to 3 retries." };
+  const turns = body.tool_loop_max_turns as number | undefined;
+  if (turns !== undefined && (turns < 1 || turns > 8)) return { ok: false, error: "Tool loop: 1 to 8 turns." };
+  const images = body.image_generation_max_images_per_request as number | undefined;
+  if (images !== undefined && (images < 1 || images > 4)) return { ok: false, error: "Image generation: 1 to 4 images a call." };
+  const keep = body.compression_neural_keep_ratio as number | undefined;
+  if (keep !== undefined && (keep < 0.05 || keep > 1)) return { ok: false, error: "Compression: keep between 5% and 100% of prose." };
+  return { ok: true, body: body as UpdateBoonSettings };
+}
+
+export async function saveSettingsAction(formData: FormData): Promise<SettingsSaveResult<SettingsPageSection>> {
+  await requireAdmin();
+  const wanted = new Set(trimmed(formData.get("sections")).split(",").map((x) => x.trim()));
+  const saved: SettingsPageSection[] = [];
+  const g = (section: string, k: string) => formData.get(`${section}.${k}`);
+  const num = (section: string, k: string) => {
+    const raw = trimmed(g(section, k));
+    return raw === "" ? undefined : Number(raw);
+  };
+  const fail = (section: SettingsPageSection, error: string) => ({ ok: false as const, error: `${SETTINGS_PAGE_LABEL[section]}: ${error}`, saved });
+
+  for (const section of SETTINGS_PAGE_ORDER.filter((x) => wanted.has(x))) {
+    let res: ActionResult;
+    if (section === "alerts") {
+      const minutes = num("alerts", "quiet_minutes");
+      if (minutes !== undefined && (!Number.isFinite(minutes) || minutes < 0)) return fail(section, "The quiet period is minutes, 0 or more.");
+      const body: UpdateAlertSettings = { min_interval_secs: Math.round((minutes ?? 5) * 60) };
+      const webhook = trimmed(g("alerts", "slack_webhook_url"));
+      if (webhook) body.slack_webhook_url = webhook;
+      else if (g("alerts", "clear_slack") === "on") body.clear_slack_webhook = true;
+      if (g("alerts", "email_enabled") === "on") {
+        const host = trimmed(g("alerts", "smtp_host"));
+        const from = trimmed(g("alerts", "from_address"));
+        const recipients = trimmed(g("alerts", "recipients")).split(/[\n,]/).map((r) => r.trim()).filter(Boolean);
+        if (!host || !from || recipients.length === 0) return fail(section, "Email needs a server, a from address and at least one recipient.");
+        body.email = {
+          smtp_host: host,
+          smtp_port: num("alerts", "smtp_port") || 587,
+          username: trimmed(g("alerts", "smtp_username")) || null,
+          from_address: from,
+          recipients,
+          starttls: g("alerts", "starttls") === "on",
+        };
+        const password = trimmed(g("alerts", "smtp_password"));
+        if (password) body.email.smtp_password = password;
+        else if (g("alerts", "clear_password") === "on") body.email.clear_smtp_password = true;
+      } else {
+        body.email = null;
+      }
+      res = await setAlertSettingsAction(body);
+    } else if (section === "routing") {
+      res = await setAutoRouterSettingsAction({
+        classifier_enabled: g("routing", "classifier_enabled") === "on",
+        classifier_model: trimmed(g("routing", "classifier_model")),
+        classifier_timeout_ms: num("routing", "classifier_timeout_ms"),
+        capacity_weight: num("routing", "capacity_weight"),
+        cost_weight: num("routing", "cost_weight"),
+        tag_weight: num("routing", "tag_weight"),
+        temperature: num("routing", "temperature"),
+        default_soft_cap: num("routing", "soft_cap"),
+        difficulty_enabled: g("routing", "difficulty") === "on",
+        tier_source: (trimmed(g("routing", "tier_source")) || "hybrid") as "hybrid" | "derived" | "declared",
+        messages_default_model: trimmed(g("routing", "messages_default_model")),
+      });
+    } else if (section === "boons") {
+      const parsed = boonSettingsFromForm(formData);
+      if (!parsed.ok) return fail(section, parsed.error);
+      res = await setBoonSettingsAction(parsed.body);
+    } else if (section === "energy") {
+      const body: UpdateEnergySettings = {
+        enabled: g("energy", "enabled") === "on",
+        prometheus_url: trimmed(g("energy", "prometheus_url")),
+        power_query: String(g("energy", "power_query") ?? "").trim(),
+        poll_interval_secs: num("energy", "poll_interval_secs"),
+        energy_cost_per_kwh: num("energy", "energy_cost_per_kwh"),
+        carbon_g_per_kwh: num("energy", "carbon_g_per_kwh"),
+        pue: num("energy", "pue"),
+      };
+      if (body.poll_interval_secs !== undefined && body.poll_interval_secs < 10) return fail(section, "Poll at most every 10 seconds.");
+      if (body.pue !== undefined && body.pue < 1) return fail(section, "PUE is 1 or more.");
+      if (body.enabled && !body.prometheus_url) return fail(section, "Energy needs a Prometheus URL.");
+      res = await setEnergySettingsAction(body);
+    } else if (section === "assistant") {
+      const limits = ["bench_max_concurrency", "bench_max_duration_s", "bench_max_requests"].map((k) => num("assistant", k));
+      if (limits.some((v) => v === undefined || !Number.isInteger(v) || v < 1)) return fail(section, "Benchmark limits are whole numbers of 1 or more.");
+      res = await setCharoSettingsAction({
+        enabled: g("assistant", "enabled") === "on",
+        brain_model: trimmed(g("assistant", "brain_model")) || null,
+        tools_enabled: { run_benchmark: g("assistant", "tool_run_benchmark") === "on" },
+        bench_max_concurrency: limits[0]!,
+        bench_max_duration_s: limits[1]!,
+        bench_max_requests: limits[2]!,
+      });
+    } else {
+      res = await setUsageRetentionAction(num("retention", "days") ?? 0);
+    }
+    if (!res.ok) return fail(section, res.error);
+    saved.push(section);
+  }
+  revalidatePath("/settings");
+  return { ok: true };
+}
+
 export async function setAlertSettingsAction(
   body: UpdateAlertSettings,
 ): Promise<ActionResult> {
@@ -2051,6 +2218,7 @@ export async function setSlurmSettingsAction(
   } catch (e) {
     return actionError(e);
   }
+  revalidatePath("/deployments");
   revalidatePath("/settings");
   // The model-create dialog gates the Slurm option on these settings.
   revalidatePath("/models");

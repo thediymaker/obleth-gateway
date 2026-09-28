@@ -22,6 +22,7 @@ export function SettingsForm({
   labelOf,
   save,
   validate,
+  confirmSave,
   onSaved,
   onDirtyChange,
   children,
@@ -37,6 +38,8 @@ export function SettingsForm({
   save: (data: FormData) => Promise<SaveResult>;
   /** A check the browser can't make; its message stops the save. */
   validate?: (data: FormData) => string | null;
+  /** Asked before saving, for changes that delete something; false keeps everything as it is. */
+  confirmSave?: (data: FormData, sections: string[]) => Promise<boolean>;
   onSaved?: (data: FormData) => void;
   onDirtyChange?: (sections: string[], count: number) => void;
   children: ReactNode;
@@ -119,7 +122,7 @@ export function SettingsForm({
     return () => clearTimeout(t);
   }, [result]);
 
-  function submit() {
+  async function submit() {
     const el = form.current;
     if (!el || sections.length === 0 || !el.reportValidity()) return;
     const data = new FormData(el);
@@ -132,6 +135,8 @@ export function SettingsForm({
     }
     const submitted = snapshotForm(data);
     setResult(null);
+    // Asked outside the transition: a dialog opened inside it wouldn't show until the save ended.
+    if (confirmSave && !(await confirmSave(data, sections))) return;
     start(async () => {
       const res = await save(data);
       const done = res.ok ? sections : res.saved;
@@ -161,7 +166,7 @@ export function SettingsForm({
         key={version}
         ref={form}
         aria-label={ariaLabel}
-        onSubmit={(e) => { e.preventDefault(); submit(); }}
+        onSubmit={(e) => { e.preventDefault(); void submit(); }}
         onInput={recompute}
         onChange={recompute}
         onClick={recompute}
@@ -193,7 +198,7 @@ export function SettingsForm({
             {changed.length > 0 && (
               <>
                 <Button type="button" size="sm" variant="outline" disabled={pending} onClick={() => { setResult(null); setVersion((v) => v + 1); }}>Discard</Button>
-                <Button type="button" size="sm" disabled={pending} onClick={submit}>{pending ? "Saving…" : "Save changes"}</Button>
+                <Button type="button" size="sm" disabled={pending} onClick={() => void submit()}>{pending ? "Saving…" : "Save changes"}</Button>
               </>
             )}
           </div>

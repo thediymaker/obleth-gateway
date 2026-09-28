@@ -179,7 +179,7 @@ export function NewDeployment({ recipes, takenNames, slurmOn, initialRecipe }: {
       </div>
 
       {!slurmOn && (
-        <Notice strong>Slurm isn&apos;t set up on this gateway yet, so nothing can be launched. <Link href="/settings?tab=slurm" className="underline underline-offset-2">Set up Slurm ›</Link></Notice>
+        <Notice strong>Slurm isn&apos;t set up on this gateway yet, so nothing can be launched. <Link href="/deployments?slurm=1" className="underline underline-offset-2">Set up Slurm ›</Link></Notice>
       )}
 
       <div className="grid min-h-[560px] overflow-hidden rounded-xl border border-border bg-card xl:grid-cols-[minmax(0,1fr)_400px]">

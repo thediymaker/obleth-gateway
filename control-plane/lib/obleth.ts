@@ -1287,6 +1287,8 @@ export interface BoonSettingsView {
   tool_loop_max_turns: number;
   tool_loop_tool_timeout_ms: number;
   tool_loop_nudge: string;
+  /** Wall-clock budget for a whole tool-loop request, in seconds. */
+  tool_loop_deadline_secs: number;
   compression_enabled: boolean;
   compression_min_tokens: number;
   compression_max_segments: number;
@@ -1346,6 +1348,7 @@ export interface UpdateBoonSettings {
   tool_loop_max_turns?: number;
   tool_loop_tool_timeout_ms?: number;
   tool_loop_nudge?: string;
+  tool_loop_deadline_secs?: number;
   compression_enabled?: boolean;
   compression_min_tokens?: number;
   compression_max_segments?: number;

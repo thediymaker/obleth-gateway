@@ -1,11 +1,12 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, expect, it } from "vitest";
-import { AuditSkeleton, CollectionSkeleton, DashboardSkeleton, KnowledgeSkeleton, McpSkeleton, DeploymentSkeleton, DeploymentsSkeleton, FairshareSkeleton, GroupsSkeleton, KeysSkeleton, LogsSkeleton, ModelSkeleton, ModelsSkeleton, OverviewSkeleton, PlaygroundSkeleton, ReportsSkeleton, TenantSkeleton, TenantsSkeleton, UsersSkeleton } from "./page-skeletons";
+import { AuditSkeleton, CollectionSkeleton, DashboardSkeleton, KnowledgeSkeleton, McpSkeleton, DeploymentSkeleton, DeploymentsSkeleton, FairshareSkeleton, GroupsSkeleton, KeysSkeleton, LogsSkeleton, ModelSkeleton, ModelsSkeleton, OverviewSkeleton, PlaygroundSkeleton, ReportsSkeleton, SettingsSkeleton, TenantSkeleton, TenantsSkeleton, UsersSkeleton } from "./page-skeletons";
 
 describe("page skeletons", () => {
   it.each([
     ["Loading the overview", OverviewSkeleton],
+    ["Loading settings", SettingsSkeleton],
     ["Loading fairshare", FairshareSkeleton],
     ["Loading groups and weights", GroupsSkeleton],
     ["Loading the playground", PlaygroundSkeleton],

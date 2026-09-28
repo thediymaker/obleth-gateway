@@ -1,17 +1,20 @@
+import { redirect } from "next/navigation";
 import { requireAdmin } from "@/lib/auth/roles";
-import { SettingsTabs } from "@/components/settings-tabs";
-import { VersionCard } from "@/components/version-card";
+import { SettingsPage } from "@/components/settings/settings-page";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
+import { TAB_ANCHOR } from "@/lib/settings-model";
+import { CONTROL_PLANE_SHA, CONTROL_PLANE_VERSION, fetchLatestRelease, isNewer } from "@/lib/version";
 
 export const dynamic = "force-dynamic";
 
-const SETTINGS_TABS = ["alerts","routing","boons","compression","knowledge","energy","data","slurm","assistant","about"];
-
-export default async function SettingsPage({ searchParams }: { searchParams: Promise<{ tab?: string }> }) {
+export default async function Page({ searchParams }: { searchParams: Promise<{ tab?: string }> }) {
   await requireAdmin();
   const { tab } = await searchParams;
-  const [settings, autoRouter, boons, compressor, charo, energy, knowledge, models, retention, slurm, routerReadiness] =
+  // Old links: Slurm moved to Deployments, retrieval to Knowledge.
+  if (tab === "slurm") redirect("/deployments?slurm=1");
+  if (tab === "knowledge") redirect("/knowledge?tab=retrieval");
+  const [alerts, router, boons, compressor, charo, energy, knowledge, models, retention, slurm, readiness, gateway, latest] =
     await Promise.all([
       safe(obleth.getAlertSettings(), null),
       safe(obleth.getAutoRouterSettings(), null),
@@ -24,32 +27,22 @@ export default async function SettingsPage({ searchParams }: { searchParams: Pro
       safe(obleth.getUsageRetention(), null),
       safe(obleth.getSlurmSettings(), null),
       safe(obleth.getRouterReadiness(), null),
+      safe(obleth.gatewayVersion(), null),
+      fetchLatestRelease(),
     ]);
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-lg font-semibold tracking-tight">Settings</h1>
-        <p className="text-sm text-muted-foreground">
-          Configure alerting, routing, and data retention. Changes apply immediately to the running
-          gateway&mdash;no restart required.
-        </p>
-      </div>
-      <SettingsTabs
-        alertSettings={settings}
-        autoRouter={autoRouter}
-        boons={boons}
-        charo={charo}
-        compressor={compressor}
-        energy={energy}
-        knowledge={knowledge}
-        models={models}
-        retention={retention}
-        routerReadiness={routerReadiness}
-        slurm={slurm}
-        versionCard={<VersionCard />}
-        initialTab={tab && SETTINGS_TABS.includes(tab) ? tab : undefined}
-      />
-    </div>
+    <SettingsPage
+      anchor={tab ? TAB_ANCHOR[tab] : undefined}
+      data={{
+        alerts, router, readiness, boons, compressor, knowledge, energy, charo, retention, slurm, models,
+        version: {
+          gateway,
+          controlPlane: { version: CONTROL_PLANE_VERSION, sha: CONTROL_PLANE_SHA },
+          latest: latest?.tag ?? null,
+          updateAvailable: latest !== null && isNewer(latest.tag, CONTROL_PLANE_VERSION),
+        },
+      }}
+    />
   );
 }
