@@ -7,9 +7,11 @@
 
 **obleth is a multi-tenant AI gateway for shared GPU infrastructure — university clusters, on-prem deployments, and cloud.**
 
-![obleth dashboard overview](.github/assets/dashboard.png)
+![The obleth Overview: what needs attention, traffic, and every model at a glance](.github/assets/dashboard.png)
 
-Point your clients at obleth and register your models. The gateway adds identity, weighted fairshare admission, automatic model selection, health verification, and cost, energy, and chargeback accounting on top of any OpenAI-compatible backend — vLLM, SGLang, llama.cpp, OpenAI, Together, or your own servers. On HPC clusters, a companion Slurm provisioner submits, monitors, and routes to inference jobs automatically. Clients keep their existing OpenAI SDKs; only the base URL changes.
+Point your clients at obleth and register your models. The gateway adds identity, weighted fairshare admission, automatic model selection, health verification, and cost, energy, and chargeback accounting on top of any OpenAI-compatible backend — vLLM, SGLang, llama.cpp, OpenAI, Together, or your own servers. On HPC clusters it launches models as Slurm jobs and keeps them running; on Kubernetes it sizes each model's pool from the replicas that are actually ready. Clients keep their existing OpenAI or Anthropic SDKs; only the base URL changes.
+
+**One endpoint for every kind of model.** Chat and completions, the Responses API, embeddings, rerank, moderation, speech, transcription and translation, image generation, edits and variations, video jobs (the OpenAI Videos API), the Anthropic Messages API (so Claude Code works against your own models), MCP servers at `/mcp/<name>`, and typed decisions at `/v1/verdicts`. Every surface runs the same admission, budgets, guardrails, and accounting.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/assets/architecture-dark.svg">
@@ -18,23 +20,19 @@ Point your clients at obleth and register your models. The gateway adds identity
 
 The design keeps the request path independent of everything that can fail around it: the data plane reads configuration only from Redis and in-process caches (never Postgres), telemetry is written asynchronously and spills to a local WAL if ClickHouse is down, and optional helpers fail open. A Postgres, ClickHouse, or sidecar outage degrades freshness or accounting — never request serving.
 
-Telemetry spill is stored beside `OBLETH_WAL_PATH` in a `.segments` directory;
-persist that directory together with the original WAL when configuring volumes.
-Replay reads at most 500 records / 1 MiB per batch and backs off up to 60 seconds
-after failures. New spill is capped at 256 MiB or 1,024 files; rejected spill is
-logged and counted in `obleth_telemetry_dropped`. Existing WAL files are replayed
-first and are never truncated to enforce the cap. Corrupt or oversized legacy
-records are retained with an error for operator repair; they do not prevent new
-usage from being inserted when ClickHouse is healthy. Replay is at-least-once:
-a crash after insertion but before checkpointing can duplicate the last batch.
-
 ## Scheduling and routing
 
-**Weighted fairshare admission.** A purpose-built weighted fair-queuing scheduler controls admission. Each tenant has a weight; when demand exceeds capacity, throughput divides proportionally, so no tenant can starve another. Tenants can be organized into groups — capacity splits between groups first, then among tenants within each group. Weights and group assignments update live, with no restart.
+**Weighted fairshare admission, per model.** A purpose-built weighted fair-queuing scheduler admits every request. Each model has its own pool, so a saturated model never delays one with free capacity, and usage on one model never costs a tenant priority on another. Inside a pool, capacity splits between groups, then tenants, then a tenant's keys, each by weight, so no tenant starves another and no user starves their team. With several gateway replicas the limits are cluster-wide slots in Redis, so any replica can use the whole of them. Weights and group assignments update live, with no restart.
 
-**Automatic model selection.** Send `model: "auto"` and obleth picks the best available model from the registered fleet. Hard filters remove models that are down, over capacity, or missing a required capability (function calling, JSON schema, context window); remaining candidates are scored by spare capacity and cost. An optional small-model classifier maps requests to intent tags (`coding`, `reasoning`, `vision`, `long-context`, …) to prefer the right specialist, with heuristics as fallback.
+**Pool sizes that follow the backend.** A model in `discovered` capacity mode takes its pool size from the replicas actually serving it (ready endpoints in a Kubernetes Service, or its registered endpoints), times a headroom factor, so the gateway's limit tracks the backend's own autoscaler instead of a number someone typed in.
 
-**Model boons.** Runtime-toggleable capabilities the gateway grants to models that lack native support. **Vision** relays image parts to a designator model and substitutes the description. **Structured output** enforces `response_format` JSON schemas and optionally repairs the response. **Gateway tool loop** injects registered MCP server tools into plain chat requests and executes the calls until a final answer, streamed live. **Context compression** compacts oversized JSON, logs, and repeated context before they reach the model — losslessly by default, with an optional self-hosted neural sidecar for prose. Every boon fails open: any error leaves the request unchanged.
+**Automatic model selection.** Send `model: "auto"` and obleth picks the best available model from the registered fleet. Hard filters remove models that are down, over capacity, or missing a required capability (function calling, JSON schema, context window); remaining candidates are scored by spare capacity and cost. An optional small classifier model tags each request (`coding`, `reasoning`, `vision`, `long-context`, …) and rates its difficulty through single-token verdicts, so harder questions can go to stronger models; heuristics take over if it fails. The Playground's Router tab shows the whole decision for any prompt.
+
+![The Playground's Router tab: every candidate model scored on capacity, cost and task fit](.github/assets/router.png)
+
+**Model boons.** Abilities the gateway adds to models that lack them, granted per model and composed per request. **Vision** describes images for text-only models. **Structured output** holds replies to a `response_format` JSON schema and repairs them if needed. **Tool loop** runs registered MCP server tools inside the gateway until a final answer, streamed live. **Image generation** lets a chat model draw through a registered image model. **Speculation** answers from a fast drafter when the target model agrees, gated per category. **Knowledge** retrieves from document collections and hands the model what it needs. **Context compression** compacts oversized JSON, logs, and repeated context — losslessly by default, with an optional self-hosted neural sidecar for prose. Every boon fails open: any error leaves the request unchanged.
+
+**Guardrails per tenant.** A tenant's policy scans input and output on every text path, including tool output and non-chat requests, and blocks, redacts, or only logs. The model-based harm scan reads its verdict off token probabilities, so a guard model that doesn't answer is an error the policy's `fail_open` setting decides, never a silent pass.
 
 **Model names that describe the model, not the deployment.** How a model is served — `fp8`, `mxfp4`, `awq` — is a `quantization` field on the route, not something spelled into the name clients call, so re-quantizing a deployment is an edit rather than a rename. A route can also answer to aliases, which lets an old name keep working while only the clean one is advertised. `GET /v1/models` reports the gateway's own name even when the backend knows itself by its quantized one, and `GET /model/info` (LiteLLM-compatible) adds the serving format, routing tags, context window, prices, capabilities, and health from the gateway's own registry.
 
@@ -70,11 +68,15 @@ No new model and no external service: the gateway answers each question with its
 
 **Health checks that match the model type.** Chat, embedding, speech, and transcription models are each verified against their real modality endpoint — a minimal inference probe, not a generic ping. Image and video models, where even a minimal generation is costly (a video render takes minutes), are checked against the upstream's model catalog instead. A rejected probe with the model still listed in the upstream's catalog is reported as a likely misconfiguration instead of an outage; a model genuinely missing upstream alerts with catalog evidence. Fixing a model's connection settings clears stale failure state and re-checks within seconds.
 
-**Per-request flow view.** Every request can be traced through the gateway's own span recorder: auth resolve, auto route, fairshare admission, boon execution, upstream call. The dashboard renders the trace as a node graph with durations and attributes on each step. No external collector is required — spans land in ClickHouse next to usage data, and OTLP export is available for Jaeger or any OpenTelemetry backend.
+**Request logs you can search.** The log opens live and takes filters as you'd type them (`status:error model:… team:… key:…`); a strip charts the window with failures shown bright, and a panel counts what's in it. A request opens with a line saying what happened, a timeline of waiting for a slot, first token, and the rest, and every number. Turn tracing on for a tenant or key and each step (auth, auto route, admission, boons, upstream) is recorded by the gateway's own span recorder into ClickHouse next to usage data; OTLP export is available for Jaeger or any OpenTelemetry backend.
 
-![Request flow view: a traced request rendered as a node graph](.github/assets/flow-view.png)
+![Request logs with a request open: what happened, its timeline, and every number](.github/assets/request.png)
 
-**Slurm provisioner.** A companion service manages inference servers on HPC clusters via `slurmrestd`: it submits jobs, health-probes each replica, promotes healthy ones into the routing table, and resubmits when jobs are preempted. Fresh replicas are warmed with a throwaway request before they take real traffic. Zombie jobs — RUNNING in Slurm but dead or hung at inference — are detected on two independent signals and restarted automatically, capped at one restart per model per tick. When the provisioner can't reach Slurm, the dashboard says so loudly instead of showing stale state as healthy.
+**Deployments on your own compute.** One page lists the models obleth launches on Slurm next to the Kubernetes models it watches. On Slurm, a companion provisioner talks to `slurmrestd`: pick a recipe, choose a partition (the dashboard shows whether a replica fits and how many fitting nodes are idle), review the exact script, and launch; it submits the jobs, health-probes each replica, promotes healthy ones into the routing table, and resubmits when jobs are preempted. Fresh replicas are warmed before they take traffic, and zombie jobs — RUNNING in Slurm but dead or hung at inference — are detected on two independent signals and restarted. Scale, pause, or restart from the deployment's page. When the provisioner can't reach Slurm, the dashboard says so instead of showing stale state as healthy.
+
+![Deployments: Kubernetes models watched and Slurm models launched, in one table](.github/assets/deployments.png)
+
+**Telemetry that survives outages.** Usage rows spill to a local write-ahead file while ClickHouse is down and replay when it returns. Spill is stored beside `OBLETH_WAL_PATH` in a `.segments` directory; persist that directory together with the original WAL when configuring volumes. Replay reads at most 500 records / 1 MiB per batch and backs off up to 60 seconds after failures. New spill is capped at 256 MiB or 1,024 files; rejected spill is logged and counted in `obleth_telemetry_dropped`. Existing WAL files are replayed first and are never truncated to enforce the cap. Corrupt or oversized legacy records are retained with an error for operator repair; they do not prevent new usage from being inserted when ClickHouse is healthy. Replay is at-least-once: a crash after insertion but before checkpointing can duplicate the last batch.
 
 **Local-first network posture.** Private, LAN, and loopback addresses are valid upstream targets out of the box — no allowlist needed for cluster-internal endpoints. Link-local and cloud-metadata ranges are always blocked. `OBLETH_BLOCK_PRIVATE_NETWORKS=1` enables strict mode with explicit CIDR exceptions.
 
@@ -86,17 +88,32 @@ No new model and no external service: the gateway answers each question with its
 
 **Energy and carbon per request.** Point the gateway at your Prometheus with any PromQL expression returning per-node power — Habana, DCGM, and IPMI exporters all work — and each request is charged its wall-time share of a serving slot's draw: watt-hours, electricity cost, and CO₂, recorded next to token cost. Queue time is never charged and idle power is never attributed, so totals understate rather than overstate. Off by default; if Prometheus is unreachable, requests are never delayed.
 
-**Chargeback reports.** Historical usage filtered by team and key, grouped by day, team, key, or model, with spend on every row and CSV export that carries exactly the columns and filters you're looking at.
+**Chargeback reports.** Pick a period (7 or 30 days, this or last month, or any range) and filter by team, key and model: five totals against the previous period, one chart split by team or model, the teams and models that cost the most, and a breakdown by day, team, key or model that ends in a totals row. Every number links to the requests behind it, and exports preview their first rows before the download.
 
 ![Reports: daily volume, spend, and per-team breakdowns](.github/assets/reports.png)
+
+## The dashboard
+
+Every page leads with what needs attention and saves with one bar where settings are edited. Models is a searchable table with a page per model; Fairshare leads with the model pools, who is waiting, and why; Tenants and API keys show each tenant's use, budget and limits, and keys can move between tenants; Settings opens on anything that needs you.
+
+<table>
+  <tr>
+    <td><img alt="Models: health, load, requests, price and tags for every model" src=".github/assets/models.png"></td>
+    <td><img alt="Fairshare: one model's pool, each tenant against its fair share" src=".github/assets/fairshare.png"></td>
+  </tr>
+  <tr>
+    <td><img alt="A tenant's page: requests, budget, limits, models and keys" src=".github/assets/tenant.png"></td>
+    <td><img alt="Settings: what needs you, then every setting with one save bar" src=".github/assets/settings.png"></td>
+  </tr>
+</table>
 
 ## Benchmarking and testing
 
 **`obench score`.** A graded readiness scorecard for the whole deployment. Six sections — capacity ramp, gateway overhead, streaming quality, overload behavior, resilience (fault-injected MTTD/MTTR), and fairshare dynamics — roll up into a weighted, letter-graded report. Scores are stored as baselines and diffed on later runs to catch regressions. A GPU-free fixture backend ships in the compose stack, so the full suite runs without touching real models.
 
-**Playground.** A dedicated dashboard tab for chatting with one model or comparing up to four in a shared timeline. Each question appears once, with independent responses below it. Model selection, generation settings, browser-local sessions, per-response retry and cancellation, and “Continue with this model” keep testing in one place. Charo’s guided assistant is available from the same model picker. Charo carries a prompt to any configured model and returns the answer with its cost: latency, token counts, and which boons actually fired. Guided activities probe a model's capabilities, chat with a specific model through the gateway, verify MCP servers end-to-end, or run a concurrency-ramp benchmark with knee detection and a graded capacity curve — rendered inline in the conversation.
+**Playground.** One workspace for trying the gateway: chat with one model or compare several side by side (each answer reports time to first token, tokens per second, tokens, cost and a link to its trace), see how `auto` would route a prompt, generate images, and build Verdicts questions. Get code turns the current request into cURL, Python, or JavaScript. The built-in assistant can check a new model's capabilities, verify MCP servers end to end, or run a concurrency-ramp benchmark with a graded capacity curve, inline in the conversation.
 
-![Charo model-testing console](.github/assets/charo.png)
+![The Playground: sessions, a new-session launcher, and run settings](.github/assets/playground.png)
 
 **Synthetic tenants.** Tenants can be flagged synthetic (obench seeds its fixture tenants that way). Their traffic is recorded as benchmark traffic and, together with health probes, excluded from usage and cost statistics by default — test runs never pollute the numbers you bill against.
 
