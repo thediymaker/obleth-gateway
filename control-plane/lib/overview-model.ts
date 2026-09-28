@@ -9,6 +9,7 @@ import type {
 } from "@/lib/obleth";
 import type { OverviewSummary } from "@/lib/overview-summary";
 import { isWaitingBelowShare } from "@/lib/fairshare";
+import { modelHref } from "@/lib/model-links";
 
 /** The Overview's one time control. Every tile, chart and table follows it. */
 export type OverviewRange = "1h" | "24h" | "7d";
@@ -247,7 +248,7 @@ export function buildAttention(fleet: FleetTile[], fairshare: FairshareLiveView 
       urgent: true,
       title: `${t.name} is failing health checks`,
       detail: parts.join(" · "),
-      actions: [{ label: "Open model", href: `/models?model=${encodeURIComponent(t.name)}`, primary: true }, { label: "Request logs", href: "/logs" }],
+      actions: [{ label: "Open model", href: modelHref(t.name), primary: true }, { label: "Request logs", href: "/logs" }],
     });
   }
   const full = fleet.filter((f) => f.attention === "full");
@@ -258,7 +259,7 @@ export function buildAttention(fleet: FleetTile[], fairshare: FairshareLiveView 
       urgent: true,
       title: `${t.name} is at capacity and queuing`,
       detail: `${t.inFlight.toLocaleString()} of ${t.cap.toLocaleString()} slots in use · ${t.queued.toLocaleString()} queued`,
-      actions: [{ label: "Open the pool", href: `/fairshare?pool=${encodeURIComponent(t.name)}`, primary: true }, { label: "Capacity", href: `/models?model=${encodeURIComponent(t.name)}` }],
+      actions: [{ label: "Open the pool", href: `/fairshare?pool=${encodeURIComponent(t.name)}`, primary: true }, { label: "Capacity", href: modelHref(t.name, "capacity") }],
     });
   }
   const queued = fairshare?.global_queued ?? 0;

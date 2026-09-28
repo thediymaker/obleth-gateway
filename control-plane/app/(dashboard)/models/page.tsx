@@ -1,65 +1,42 @@
+import { redirect } from "next/navigation";
+import { ModelsList } from "@/components/models/models-list";
+import type { AddMode } from "@/components/models/add-model";
 import { requireAdmin } from "@/lib/auth/roles";
-import { ModelManager } from "@/components/model-manager";
-import {
-  obleth,
-  type BoonSettingsView,
-  type CacheStats,
-  type KnowledgeSettingsView,
-  type McpServer,
-  type ModelHealthSummary,
-} from "@/lib/obleth";
-import { boonBlockers } from "@/lib/boon-availability";
+import { modelHref } from "@/lib/models-model";
+import { obleth, type CacheStats, type ModelHealthSummary } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 import { loadRecipeCards } from "@/lib/sbatch-recipes";
 
 export const dynamic = "force-dynamic";
 
-export default async function ModelsPage() {
+const ADD_MODES: AddMode[] = ["connect", "provider", "file", "slurm"];
+
+export default async function ModelsPage({ searchParams }: { searchParams: Promise<{ model?: string; add?: string }> }) {
   await requireAdmin();
-  const [models, cacheStats, health, mcpServers, slurm, managedSpecs, boonSettings, knowledgeSettings] =
-    await Promise.all([
-      safe(obleth.listModels(), []),
-      safe<CacheStats | undefined>(obleth.cacheStats(), undefined),
-      safe<ModelHealthSummary[]>(obleth.modelHealth(), []),
-      safe<McpServer[]>(obleth.listMcpServers(), []),
-      safe(obleth.getSlurmSettings(), null),
-      safe(obleth.listManagedModels(), []),
-      safe<BoonSettingsView | null>(obleth.getBoonSettings(), null),
-      safe<KnowledgeSettingsView | null>(obleth.getKnowledgeSettings(), null),
-    ]);
-  // Which models are Slurm-provisioned (have a managed spec). One bulk call —
-  // per-model health detail and endpoint lists load lazily when a card is
-  // expanded, so the page no longer fans out 3 admin requests per model.
+  const params = await searchParams;
+  // Older links opened a model inline with `?model=`; each model has its own page now.
+  if (params.model) redirect(modelHref(params.model));
+
+  const [models, cacheStats, health, slurm, managedSpecs, recipeCards] = await Promise.all([
+    safe(obleth.listModels(), []),
+    safe<CacheStats | undefined>(obleth.cacheStats(), undefined),
+    safe<ModelHealthSummary[]>(obleth.modelHealth(), []),
+    safe(obleth.getSlurmSettings(), null),
+    safe(obleth.listManagedModels(), []),
+    loadRecipeCards(),
+  ]);
   const managed = Object.fromEntries(managedSpecs.map((spec) => [spec.model_id, true]));
-
-  // Admin-authored *.recipe files and editable DB templates, mapped to flat cards
-  // for the create gallery.
-  const recipeCards = await loadRecipeCards();
-
-  // A boon grant is inert unless the boon is also switched on globally, so the
-  // capabilities form needs to know which ones are unconfigured. Both settings
-  // fetches fail open to null, which yields no blockers.
-  const blockers = boonBlockers(boonSettings, knowledgeSettings);
+  const add = ADD_MODES.find((m) => m === params.add) ?? (params.add ? "connect" : null);
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-lg font-semibold tracking-tight">Models</h1>
-        <p className="text-sm text-muted-foreground">
-          Route client model names to upstream inference endpoints. Replica
-          selection stays with your inference backend.
-        </p>
-      </div>
-      <ModelManager
-        models={models}
-        cacheStats={cacheStats}
-        health={health}
-        mcpServers={mcpServers}
-        managed={managed}
-        slurmEnabled={slurm?.enabled ?? false}
-        recipeCards={recipeCards}
-        boonBlockers={blockers}
-      />
-    </div>
+    <ModelsList
+      models={models}
+      health={health}
+      managed={managed}
+      cacheStats={cacheStats}
+      slurmEnabled={slurm?.enabled ?? false}
+      recipeCards={recipeCards}
+      initialAdd={add}
+    />
   );
 }

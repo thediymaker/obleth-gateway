@@ -1,0 +1,193 @@
+import { describe, expect, it } from "vitest";
+import {
+  awaitingFirstPass,
+  buildModelRows,
+  changedFields,
+  changedSections,
+  changeSummary,
+  contextLabel,
+  EMPTY_FILTERS,
+  fieldSection,
+  filterRows,
+  modelStatus,
+  priceLabel,
+  runsOn,
+  searchSettings,
+  snapshotForm,
+  sortRows,
+  statusLine,
+  touches,
+  typeGroup,
+} from "./models-model";
+import type { ModelHealthSummary, ModelRoute } from "./obleth";
+
+const model = (over: Partial<ModelRoute> = {}): ModelRoute => ({
+  id: over.model_name ?? "m", model_name: "m", description: "", upstream_model: "up", api_base: "http://a",
+  api_key_set: false, model_type: "chat", quantization: "unknown", aliases: [],
+  input_cost_per_token: 0, output_cost_per_token: 0,
+  cost_per_image: 0, cost_per_audio_second: 0, cost_per_character: 0, cost_per_video: 0, energy_slots_per_node: 0,
+  route_bias: 1, auto_eligible: true, draft_model: "", verify_api_base: "", verify_upstream_model: "",
+  context_window: 131072, admission_weight: 100, max_in_flight: null, capacity_mode: "static",
+  capacity_tuned_at: null, supports_function_calling: false, supports_system_messages: true,
+  supports_response_schema: false, supports_tool_choice: false, supports_vision: false,
+  enabled: true, cache_enabled: false, cache_ttl_secs: 0, request_timeout_secs: null,
+  max_retries: 0, retry_backoff_ms: 200, endpoint_selection_mode: "failover", debug_diagnostics: false,
+  tags: [], boons: [], tool_servers: [], created_at: "2026-09-01T00:00:00Z", updated_at: "",
+  ...over,
+});
+
+const health = (model_id: string, status: string, over: Partial<ModelHealthSummary> = {}): ModelHealthSummary => ({
+  model_id, model_name: model_id, checks_enabled: true, alerts_enabled: true, check_interval_secs: 900,
+  failure_threshold: 2, maintenance_until: null, maintenance_note: null, status, consecutive_failures: 0,
+  alert_state: "ok", next_check_at: "", last_checked_at: "2026-09-27T00:00:00Z", last_latency_ms: 200,
+  last_http_status: 200, last_message: null, updated_at: "", ...over,
+});
+
+describe("where a model stands", () => {
+  it("reads a switched-off route as off whatever its checks say", () => {
+    expect(modelStatus(model({ enabled: false }), health("m", "healthy"))).toBe("off");
+    expect(modelStatus(model({ enabled: false }), health("m", "unhealthy"))).toBe("off");
+  });
+
+  it("puts maintenance ahead of the check result, and an unknown result as not checked", () => {
+    const later = new Date(Date.now() + 3_600_000).toISOString();
+    expect(modelStatus(model(), health("m", "unhealthy", { maintenance_until: later }))).toBe("maintenance");
+    expect(modelStatus(model(), health("m", "unhealthy"))).toBe("down");
+    expect(modelStatus(model(), health("m", "degraded"))).toBe("unchecked");
+    expect(modelStatus(model(), undefined)).toBe("unchecked");
+  });
+
+  it("counts switched-off models apart in the header line", () => {
+    expect(statusLine([{ status: "serving" }, { status: "serving" }, { status: "down" }, { status: "off" }])).toBe(
+      "2 of 3 serving · 1 failing checks · 1 off",
+    );
+  });
+
+  it("waits for a first pass until a probe that actually ran came back healthy", () => {
+    // The scheduler records a switched-off model as `disabled`: those checks never probed.
+    expect(awaitingFirstPass([{ status: "disabled" }, { status: "unhealthy", message: "404" }])).toEqual({ waiting: true, last: { status: "unhealthy", message: "404" } });
+    expect(awaitingFirstPass([{ status: "disabled" }, { status: "healthy" }]).waiting).toBe(false);
+    expect(awaitingFirstPass([])).toEqual({ waiting: true, last: null });
+  });
+});
+
+describe("types, places and prices", () => {
+  it("folds both audio types into one filter", () => {
+    expect(typeGroup("audio_speech")).toBe("audio");
+    expect(typeGroup("audio_transcription")).toBe("audio");
+    expect(typeGroup("image")).toBe("image");
+    expect(typeGroup("something-new")).toBe("chat");
+  });
+
+  it("says where replicas come from", () => {
+    expect(runsOn(model(), true)).toBe("slurm");
+    expect(runsOn(model({ capacity_mode: "discovered", capacity_source: "kubernetes" }), false)).toBe("kubernetes");
+    expect(runsOn(model({ capacity_mode: "discovered", capacity_source: "endpoints" }), false)).toBe("endpoint");
+  });
+
+  it("prices each type in the unit it bills by", () => {
+    expect(priceLabel(model({ input_cost_per_token: 0.0000006, output_cost_per_token: 0.0000025 }))).toBe("$0.6 · $2.5");
+    expect(priceLabel(model({ model_type: "image", cost_per_image: 0.04 }))).toBe("$0.04 / image");
+    expect(priceLabel(model({ model_type: "video", cost_per_video: 2 }))).toBe("$2 / video");
+    expect(priceLabel(model({ model_type: "audio_transcription", cost_per_audio_second: 0.0001 }))).toBe("$0.006 / min");
+    expect(priceLabel(model())).toBeNull();
+  });
+
+  it("writes context windows the way people say them", () => {
+    expect(contextLabel(131072)).toBe("128K");
+    expect(contextLabel(200000)).toBe("200K");
+    expect(contextLabel(1_048_576)).toBe("1M");
+    expect(contextLabel(0)).toBe("—");
+  });
+});
+
+describe("finding a model in the list", () => {
+  const models = [
+    model({ id: "a", model_name: "kimi-k2-7-code", upstream_model: "moonshot/Kimi-K2.7", aliases: ["kimi-code"], tags: ["coding:3"] }),
+    model({ id: "b", model_name: "flux-2", model_type: "image" }),
+    model({ id: "c", model_name: "gemma4", enabled: false }),
+    model({ id: "d", model_name: "benchmark-endpoint-1" }),
+    model({ id: "e", model_name: "glm-5-3", capacity_mode: "discovered", capacity_source: "kubernetes" }),
+  ];
+  const rows = buildModelRows(models, [health("a", "healthy"), health("b", "unhealthy")], {});
+
+  it("matches every word against the name, aliases, upstream and tags", () => {
+    const names = (q: string) => filterRows(rows, { ...EMPTY_FILTERS, query: q }).map((r) => r.name);
+    expect(names("kimi-code")).toEqual(["kimi-k2-7-code"]);
+    expect(names("moonshot coding")).toEqual(["kimi-k2-7-code"]);
+    expect(names("nothing-like-it")).toEqual([]);
+  });
+
+  it("hides benchmark routes unless asked", () => {
+    expect(filterRows(rows, EMPTY_FILTERS).map((r) => r.name)).not.toContain("benchmark-endpoint-1");
+    expect(filterRows(rows, { ...EMPTY_FILTERS, benchmarks: true }).map((r) => r.name)).toContain("benchmark-endpoint-1");
+  });
+
+  it("filters by type, status and where it runs", () => {
+    expect(filterRows(rows, { ...EMPTY_FILTERS, group: "image" }).map((r) => r.name)).toEqual(["flux-2"]);
+    expect(filterRows(rows, { ...EMPTY_FILTERS, status: "attention" }).map((r) => r.name)).toEqual(["flux-2"]);
+    expect(filterRows(rows, { ...EMPTY_FILTERS, status: "off" }).map((r) => r.name)).toEqual(["gemma4"]);
+    expect(filterRows(rows, { ...EMPTY_FILTERS, runs: "kubernetes" }).map((r) => r.name)).toEqual(["glm-5-3"]);
+  });
+
+  it("puts failing models first, switched-off ones last, when sorting by busiest", () => {
+    const sorted = sortRows(filterRows(rows, EMPTY_FILTERS), "busiest").map((r) => r.name);
+    expect(sorted[0]).toBe("flux-2");
+    expect(sorted.at(-1)).toBe("gemma4");
+    expect(sortRows(filterRows(rows, EMPTY_FILTERS), "name").map((r) => r.name)).toEqual(["flux-2", "gemma4", "glm-5-3", "kimi-k2-7-code"]);
+  });
+});
+
+describe("finding a setting", () => {
+  it("finds a setting by the start of its name, then by what people call it", () => {
+    expect(searchSettings("retr", "chat")[0]).toMatchObject({ label: "Max retries", section: "connection" });
+    expect(searchSettings("concurrency", "chat").map((r) => r.label)).toContain("Max slots");
+    expect(searchSettings("ttl", "chat").map((r) => r.label)).toContain("Response cache");
+  });
+
+  it("leaves out settings a type doesn't have", () => {
+    expect(searchSettings("router tags", "chat").map((r) => r.label)).toContain("Router tags");
+    expect(searchSettings("router tags", "image").map((r) => r.label)).not.toContain("Router tags");
+    expect(searchSettings("", "chat")).toEqual([]);
+  });
+});
+
+describe("tracking changes on the settings form", () => {
+  const snap = (entries: [string, string][]) => {
+    const fd = new FormData();
+    for (const [k, v] of entries) fd.append(k, v);
+    return snapshotForm(fd);
+  };
+
+  it("sees a checkbox that was cleared, which submits nothing", () => {
+    const before = snap([["auto_eligible", "on"], ["has_routing", "1"], ["route_bias", "1"]]);
+    const after = snap([["has_routing", "1"], ["route_bias", "1"]]);
+    expect(changedFields(before, after)).toEqual(["auto_eligible"]);
+  });
+
+  it("compares a repeated field as a whole and ignores the markers", () => {
+    const before = snap([["knowledge_collection", "a"], ["knowledge_collection", "b"], ["has_tags", "1"]]);
+    const after = snap([["knowledge_collection", "a"]]);
+    expect(changedFields(before, after)).toEqual(["knowledge_collection"]);
+  });
+
+  it("sends each change to the call that owns it", () => {
+    expect(fieldSection("max_retries")).toBe("reliability");
+    expect(fieldSection("capacity_headroom")).toBe("capacity");
+    expect(fieldSection("cache_ttl_secs")).toBe("cache");
+    expect(fieldSection("maintenance_note")).toBe("health");
+    expect(fieldSection("tag_level_coding")).toBe("model");
+    expect(fieldSection("has_tags")).toBeNull();
+    expect(changedSections(["route_bias", "tag_coding", "max_in_flight"])).toEqual(["model", "capacity"]);
+  });
+
+  it("summarises the changes once each, in page order", () => {
+    expect(changeSummary(["route_bias", "tag_level_math", "tag_math", "description"])).toEqual(["Description", "Router tags", "Routing bias"]);
+  });
+
+  it("matches a setting's fields by name or by prefix", () => {
+    expect(touches(["tag_math"], ["tag_"])).toBe(true);
+    expect(touches(["route_bias"], ["tag_"])).toBe(false);
+    expect(touches(["max_in_flight"], ["max_in_flight"])).toBe(true);
+  });
+});

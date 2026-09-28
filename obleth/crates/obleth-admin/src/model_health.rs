@@ -178,6 +178,72 @@ pub async fn check_one(
     run_and_fetch_detail(&state, model, "manual").await
 }
 
+/// What `POST /models/{id}/health/activate` did.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ModelActivation {
+    /// Whether the route is on after the call.
+    pub enabled: bool,
+    /// Whether this call is what turned it on.
+    pub activated: bool,
+    pub detail: ModelHealthDetail,
+}
+
+/// Probe a model as though it were serving, and turn its route on when the
+/// probe comes back `healthy`. A new model can be created switched off and
+/// activated here, so it takes no traffic until it has shown it answers. A
+/// failed probe is recorded like any manual check (the reason shows in the
+/// model's history) and leaves the route off; no alert is sent for a route
+/// that was never serving. An already-enabled model just gets a manual check.
+#[utoipa::path(
+    post, path = "/api/v1/models/{id}/health/activate", tag = "models",
+    params(("id" = String, Path, description = "Model route id")),
+    responses((status = 200, body = ModelActivation))
+)]
+pub async fn activate(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<ModelActivation>> {
+    let model = state.store.get_model(id).await?;
+    if model.enabled {
+        let Json(detail) = run_and_fetch_detail(&state, model, "manual").await?;
+        return Ok(Json(ModelActivation {
+            enabled: true,
+            activated: false,
+            detail,
+        }));
+    }
+    let probe = ModelRoute {
+        enabled: true,
+        ..model
+    };
+    let outcome = run_model_health_check(&state, probe, "activation").await?;
+    let activated = outcome.summary.status == "healthy";
+    if activated {
+        let model = state.store.set_model_enabled(id, true).await?;
+        crate::sync_model(&state, &model).await?;
+        state
+            .store
+            .record_audit(
+                &audit_actor(&headers),
+                "activate_model",
+                "model",
+                &id.to_string(),
+                serde_json::json!({
+                    "enabled": true,
+                    "latency_ms": outcome.summary.last_latency_ms,
+                }),
+            )
+            .await?;
+    }
+    let detail = state.store.get_model_health_detail(id, CHECK_LIMIT).await?;
+    Ok(Json(ModelActivation {
+        enabled: activated,
+        activated,
+        detail,
+    }))
+}
+
 #[utoipa::path(
     post, path = "/api/v1/models/health/check", tag = "models",
     responses((status = 200, body = BulkModelHealthResult))

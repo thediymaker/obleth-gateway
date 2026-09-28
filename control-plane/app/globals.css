@@ -38,36 +38,25 @@
   }
 }
 
-@layer components {
-  .provider-logo-backdrop-shell {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    transition: transform 450ms cubic-bezier(0.22, 1, 0.36, 1);
-  }
+/* "Find a setting" on a model's page: the setting it lands on lights up for a moment. */
+.setting-flash {
+  animation: setting-flash 1.8s ease-out;
+}
 
-  .provider-logo-backdrop {
-    opacity: 0.09;
-    filter: grayscale(1);
-    transition:
-      opacity 450ms cubic-bezier(0.22, 1, 0.36, 1),
-      transform 450ms cubic-bezier(0.22, 1, 0.36, 1);
+@keyframes setting-flash {
+  0%,
+  35% {
+    background-color: hsl(var(--secondary));
   }
-
-  .provider-logo-backdrop-shell.is-selected .provider-logo-backdrop {
-    opacity: 0.12;
+  100% {
+    background-color: transparent;
   }
+}
 
-  .group:hover .provider-logo-backdrop-shell {
-    transform: scale(1.06);
-  }
-
-  .group:hover .provider-logo-backdrop {
-    opacity: 0.16;
-  }
-
-  .group:hover .provider-logo-backdrop-shell.is-selected .provider-logo-backdrop {
-    opacity: 0.18;
+@media (prefers-reduced-motion: reduce) {
+  .setting-flash {
+    animation: none;
+    outline: 1px solid hsl(var(--muted-foreground));
   }
 }
 

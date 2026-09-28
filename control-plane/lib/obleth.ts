@@ -486,6 +486,15 @@ export interface ModelHealthDetail {
   checks: ModelHealthCheck[];
 }
 
+/** What `POST /models/{id}/health/activate` did. */
+export interface ModelActivation {
+  /** Whether the route is on after the call. */
+  enabled: boolean;
+  /** Whether this call is what turned it on. */
+  activated: boolean;
+  detail: ModelHealthDetail;
+}
+
 export interface BulkModelHealthResult {
   checked: ModelHealthDetail[];
   skipped: number;
@@ -1886,6 +1895,12 @@ export const obleth = {
     api<ModelHealthDetail>(`/models/${id}/health`),
   checkModelHealth: (id: string) =>
     api<ModelHealthDetail>(`/models/${id}/health/check`, { method: "POST" }),
+  /** Probe a switched-off model and turn it on if the probe comes back healthy. */
+  activateModel: (id: string, options?: AuditOptions) =>
+    api<ModelActivation>(`/models/${id}/health/activate`, {
+      method: "POST",
+      headers: auditActorHeaders(options),
+    }),
   checkAllModelHealth: () =>
     api<BulkModelHealthResult>("/models/health/check", { method: "POST" }),
   setModelHealthConfig: (

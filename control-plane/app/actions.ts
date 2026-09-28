@@ -38,7 +38,7 @@ export type ActionResult =
   | { ok: true; warnings?: string[] }
   | { ok: false; error: string };
 
-function actionError(e: unknown): ActionResult {
+function actionError(e: unknown): { ok: false; error: string } {
   if (e instanceof OblethApiError) return { ok: false, error: e.message };
   return {
     ok: false,
@@ -760,9 +760,27 @@ export async function setCapacityAction(max: number) {
   revalidatePath("/fairshare");
 }
 
+export type CreateModelResult =
+  | {
+      ok: true;
+      warnings?: string[];
+      model: { id: string; name: string };
+      /** Whether the first health check passed and turned the route on. */
+      enabled: boolean;
+      /** The first check's message when it did not pass. */
+      check: string | null;
+    }
+  | { ok: false; error: string };
+
+/**
+ * Create a model. A model that connects to an endpoint is created switched
+ * off and health-checked straight away; it comes on only if that check
+ * passes, so a mistyped URL or name never takes traffic. A Slurm model is
+ * created on: its provisioner brings replicas up and health-gates them.
+ */
 export async function createModelAction(
   formData: FormData,
-): Promise<ActionResult> {
+): Promise<CreateModelResult> {
   const session = await requireAdmin();
   const parsed = modelCreateSchema.safeParse({
     model_name: formData.get("model_name"),
@@ -805,12 +823,13 @@ export async function createModelAction(
     return { ok: false, error: "Slurm launch command or job script is required" };
   }
 
+  let created: ModelRoute;
   try {
     const tags = tagsFromForm(formData);
     // Slurm-provisioned models have no static upstream: the provisioner promotes
     // healthy replicas into the endpoint rotation. The gateway accepts a blank
     // api_base for these.
-    const created = await obleth.createModel({
+    created = await obleth.createModel({
       ...parsed.data,
       api_base: isSlurm ? "" : parsed.data.api_base,
       api_key: isSlurm ? null : strOrNull(formData.get("api_key")),
@@ -821,6 +840,7 @@ export async function createModelAction(
       ...upstreamHeadersFromForm(formData),
       boons: boonsFromForm(formData),
       tool_servers: toolServersFromForm(formData),
+      ...(isSlurm ? {} : { enabled: false }),
     }, { auditActor: session.email });
 
     if (isSlurm) {
@@ -856,6 +876,17 @@ export async function createModelAction(
   } catch (e) {
     return actionError(e);
   }
+  let enabled = isSlurm;
+  let check: string | null = null;
+  if (!isSlurm) {
+    try {
+      const activation = await obleth.activateModel(created.id, { auditActor: session.email });
+      enabled = activation.enabled;
+      if (!enabled) check = activation.detail.summary.last_message ?? `Health check came back ${activation.detail.summary.status}.`;
+    } catch (e) {
+      check = `The first health check could not run: ${actionError(e).error}`;
+    }
+  }
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
   const warnings = isSlurm
@@ -865,29 +896,7 @@ export async function createModelAction(
         upstream_model: parsed.data.upstream_model,
         model_type: parsed.data.model_type,
       });
-  return { ok: true, warnings };
-}
-
-export async function setModelCapacityAction(
-  id: string,
-  max_in_flight: number | null,
-) {
-  const session = await requireAdmin();
-  await obleth.setModelCapacity(id, max_in_flight, { auditActor: session.email });
-  updateTag(CACHE_TAGS.models);
-  revalidatePath("/models");
-  revalidatePath("/fairshare");
-}
-
-export async function setModelCapacityModeAction(
-  id: string,
-  capacityMode: string,
-) {
-  const session = await requireAdmin();
-  await obleth.setModelCapacityMode(id, capacityMode, undefined, { auditActor: session.email });
-  updateTag(CACHE_TAGS.models);
-  revalidatePath("/models");
-  revalidatePath("/fairshare");
+  return { ok: true, warnings, model: { id: created.id, name: created.model_name }, enabled, check };
 }
 
 /** A Kubernetes Service name (RFC 1035 label), as the gateway checks it. */
@@ -938,50 +947,6 @@ const capacityDiscoverySchema = capacityDiscoveryFields.refine(
   },
 );
 
-/**
- * Put a model in the discovered capacity mode with its source settings. A
- * blank field is sent as null, which clears it on the gateway (it then falls
- * back to the gateway's default for that field). The gateway checks whether
- * it can read a kubernetes source, and whether an endpoints-source model
- * without a per-replica value has one on every endpoint, and refuses the save
- * if not.
- */
-export async function setModelCapacityDiscoveryAction(
-  id: string,
-  formData: FormData,
-): Promise<ActionResult> {
-  const session = await requireAdmin();
-  const parsed = capacityDiscoverySchema.safeParse({
-    capacity_source: formData.get("capacity_source"),
-    capacity_namespace: formData.get("capacity_namespace"),
-    capacity_service: formData.get("capacity_service"),
-    per_replica_max_in_flight: formData.get("per_replica_max_in_flight"),
-    capacity_headroom: formData.get("capacity_headroom"),
-  });
-  if (!parsed.success) return { ok: false, error: firstIssue(parsed.error) };
-  const data = parsed.data;
-  try {
-    await obleth.setModelCapacityMode(
-      id,
-      "discovered",
-      {
-        capacity_source: data.capacity_source,
-        capacity_namespace: data.capacity_namespace || null,
-        capacity_service: data.capacity_service || null,
-        per_replica_max_in_flight: data.per_replica_max_in_flight ?? null,
-        capacity_headroom: data.capacity_headroom,
-      },
-      { auditActor: session.email },
-    );
-  } catch (e) {
-    return actionError(e);
-  }
-  updateTag(CACHE_TAGS.models);
-  revalidatePath("/models");
-  revalidatePath("/fairshare");
-  return { ok: true };
-}
-
 export async function autotuneModelAction(
   id: string,
   opts?: {
@@ -1007,17 +972,6 @@ export async function applyAutotuneCapacityAction(
   revalidatePath("/fairshare");
 }
 
-export async function setModelWeightAction(
-  id: string,
-  admission_weight: number,
-) {
-  const session = await requireAdmin();
-  await obleth.setModelWeight(id, admission_weight, { auditActor: session.email });
-  updateTag(CACHE_TAGS.models);
-  revalidatePath("/models");
-  revalidatePath("/fairshare");
-}
-
 export async function deleteModelAction(id: string): Promise<ActionResult> {
   const session = await requireAdmin();
   return deleteAndRevalidate(
@@ -1029,48 +983,26 @@ export async function deleteModelAction(id: string): Promise<ActionResult> {
   );
 }
 
-export async function setModelCacheAction(
-  id: string,
-  enabled: boolean,
-  ttlSecs?: number,
-) {
-  const session = await requireAdmin();
-  await obleth.setModelCache(id, enabled, ttlSecs, { auditActor: session.email });
-  updateTag(CACHE_TAGS.models);
-  revalidatePath("/models");
-}
-
-export async function setModelReliabilityAction(
-  id: string,
-  body: {
-    request_timeout_secs: number | null;
-    max_retries: number;
-    retry_backoff_ms: number;
-    endpoint_selection_mode: string;
-    debug_diagnostics: boolean;
-  },
-) {
-  const session = await requireAdmin();
-  await obleth.setModelReliability(id, body, { auditActor: session.email });
-  updateTag(CACHE_TAGS.models);
-  revalidatePath("/models");
-}
-
 export async function createModelEndpointAction(
   id: string,
   formData: FormData,
-) {
+): Promise<ActionResult> {
   const session = await requireAdmin();
-  await obleth.createModelEndpoint(id, {
-    name: String(formData.get("name") ?? "").trim(),
-    api_base: String(formData.get("api_base") ?? "").trim(),
-    api_key: strOrNull(formData.get("api_key")),
-    priority: numOr(formData.get("priority"), 100),
-    weight: numOr(formData.get("weight"), 100),
-    enabled: formData.get("enabled") !== "off",
-    max_in_flight: numOrNull(formData.get("max_in_flight")),
-  }, { auditActor: session.email });
+  try {
+    await obleth.createModelEndpoint(id, {
+      name: String(formData.get("name") ?? "").trim(),
+      api_base: String(formData.get("api_base") ?? "").trim(),
+      api_key: strOrNull(formData.get("api_key")),
+      priority: numOr(formData.get("priority"), 100),
+      weight: numOr(formData.get("weight"), 100),
+      enabled: formData.get("enabled") !== "off",
+      max_in_flight: numOrNull(formData.get("max_in_flight")),
+    }, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
   revalidatePath("/models");
+  return { ok: true };
 }
 
 export async function updateModelEndpointAction(
@@ -1085,28 +1017,27 @@ export async function updateModelEndpointAction(
     enabled?: boolean;
     max_in_flight?: number | null;
   },
-) {
+): Promise<ActionResult> {
   const session = await requireAdmin();
-  await obleth.updateModelEndpoint(id, endpointId, body, { auditActor: session.email });
+  try {
+    await obleth.updateModelEndpoint(id, endpointId, body, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
   revalidatePath("/models");
+  return { ok: true };
 }
 
 export async function deleteModelEndpointAction(
   id: string,
   endpointId: string,
-) {
+): Promise<ActionResult> {
   const session = await requireAdmin();
-  await obleth.deleteModelEndpoint(id, endpointId, { auditActor: session.email });
-  revalidatePath("/models");
+  return deleteAndRevalidate(
+    () => obleth.deleteModelEndpoint(id, endpointId, { auditActor: session.email }),
+    () => revalidatePath("/models"),
+  );
 }
-
-// ----------------------------------------------------------------------------
-// Granular model update actions (split-tab UI)
-// ----------------------------------------------------------------------------
-
-export type ModelActionState =
-  | { ok: true; warnings?: string[] }
-  | { ok: false; error: string };
 
 // Advisory post-save validation: does the upstream actually list this model?
 // Never blocks or fails a save — validation trouble just means no warnings.
@@ -1172,105 +1103,330 @@ async function loadModel(id: string): Promise<ModelRoute | undefined> {
   return models.find((m) => m.id === id);
 }
 
-// Connection tab: upstream binding, model type, description, enabled, and costs.
-// Preserves capabilities/tags/boons/tools/capacity by spreading the current model.
-export async function updateModelConnectionAction(
-  _prev: ModelActionState | null,
-  formData: FormData,
-): Promise<ModelActionState> {
-  const session = await requireAdmin();
-  const id = String(formData.get("id") ?? "");
-  if (!id) return { ok: false, error: "Missing model id." };
-  const current = await loadModel(id);
-  if (!current) return { ok: false, error: "Model not found." };
+// ----------------------------------------------------------------------------
+// The model page's settings form
+//
+// Every setting on a model's page submits as one form and saves with one
+// button. The client names the sections that changed; each section maps to
+// the admin endpoint that owns it, so an untouched section is never written.
+// ----------------------------------------------------------------------------
 
-  const newKey = strOrNull(formData.get("api_key")); // only sent when non-empty
-  try {
-    await obleth.updateModel(id, {
-      ...toModelUpdateBody(current),
-      upstream_model: String(formData.get("upstream_model") ?? current.upstream_model),
-      api_base: String(formData.get("api_base") ?? current.api_base),
-      model_type: String(formData.get("model_type") ?? current.model_type),
-      quantization: String(formData.get("quantization") ?? current.quantization),
-      aliases: aliasesFromForm(formData),
-      description: String(formData.get("description") ?? ""),
-      enabled: formData.get("enabled") === "on",
-      input_cost_per_token: numOr(formData.get("input_cost_per_token"), current.input_cost_per_token),
-      output_cost_per_token: numOr(formData.get("output_cost_per_token"), current.output_cost_per_token),
-      cost_per_image: numOr(formData.get("cost_per_image"), current.cost_per_image),
-      cost_per_character: numOr(formData.get("cost_per_character"), current.cost_per_character),
-      cost_per_video: numOr(formData.get("cost_per_video"), current.cost_per_video),
-      cost_per_audio_second: numOr(formData.get("cost_per_audio_second"), current.cost_per_audio_second),
-      energy_slots_per_node: numOr(formData.get("energy_slots_per_node"), current.energy_slots_per_node),
-      route_bias: numOr(formData.get("route_bias"), current.route_bias),
-      auto_eligible: formData.get("auto_eligible") === "on",
-      ...(newKey ? { api_key: newKey } : {}),
-      ...upstreamHeadersFromForm(formData),
-    }, { auditActor: session.email });
-  } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "Save failed." };
+/** The parts of a model's settings form, each saved through its own endpoint. */
+export type ModelSettingsSection = "model" | "cache" | "reliability" | "health" | "capacity" | "knowledge";
+
+const MODEL_SETTINGS_SECTIONS: readonly ModelSettingsSection[] = ["model", "cache", "reliability", "health", "capacity", "knowledge"];
+
+const SECTION_LABELS: Record<ModelSettingsSection, string> = {
+  model: "Model settings",
+  cache: "Response cache",
+  reliability: "Delivery",
+  health: "Health checks",
+  capacity: "Capacity",
+  knowledge: "Knowledge collections",
+};
+
+export type ModelSettingsResult =
+  | { ok: true; warnings?: string[] }
+  | { ok: false; error: string; saved: ModelSettingsSection[] };
+
+/**
+ * The PUT body for a model from its settings form, starting from the stored
+ * model so nothing the form leaves out is lost. Text and number fields apply
+ * when present. Checkbox groups submit nothing when every box is clear, so
+ * each group carries a marker (`has_routing`, `has_tags`, `has_capabilities`)
+ * and applies only when its marker is there. The route switch is not part of
+ * the form (the page header owns it), so `enabled` always carries through.
+ */
+function modelSettingsBody(formData: FormData, current: ModelRoute) {
+  const has = (name: string) => formData.has(name);
+  const text = (name: string, fallback: string) => (has(name) ? String(formData.get(name) ?? "") : fallback);
+  const on = (name: string) => formData.get(name) === "on";
+  const newKey = strOrNull(formData.get("api_key"));
+  const tags = has("has_tags") ? tagsFromForm(formData) : null;
+  const capabilities = has("has_capabilities");
+  return {
+    ...toModelUpdateBody(current),
+    description: text("description", current.description),
+    model_type: text("model_type", current.model_type),
+    quantization: text("quantization", current.quantization),
+    ...(has("aliases") ? { aliases: aliasesFromForm(formData) } : {}),
+    upstream_model: text("upstream_model", current.upstream_model),
+    api_base: text("api_base", current.api_base),
+    ...(newKey ? { api_key: newKey } : {}),
+    ...upstreamHeadersFromForm(formData),
+    input_cost_per_token: numOr(formData.get("input_cost_per_token"), current.input_cost_per_token),
+    output_cost_per_token: numOr(formData.get("output_cost_per_token"), current.output_cost_per_token),
+    cost_per_image: numOr(formData.get("cost_per_image"), current.cost_per_image),
+    cost_per_character: numOr(formData.get("cost_per_character"), current.cost_per_character),
+    cost_per_video: numOr(formData.get("cost_per_video"), current.cost_per_video),
+    cost_per_audio_second: numOr(formData.get("cost_per_audio_second"), current.cost_per_audio_second),
+    energy_slots_per_node: numOr(formData.get("energy_slots_per_node"), current.energy_slots_per_node),
+    context_window: numOr(formData.get("context_window"), current.context_window),
+    admission_weight: numOr(formData.get("admission_weight"), current.admission_weight),
+    route_bias: numOr(formData.get("route_bias"), current.route_bias),
+    auto_eligible: has("has_routing") ? on("auto_eligible") : current.auto_eligible,
+    ...(tags ? { tags, supports_vision: tagsInclude(tags, "vision") } : {}),
+    ...(capabilities
+      ? {
+          supports_function_calling: on("supports_function_calling"),
+          supports_system_messages: on("supports_system_messages"),
+          supports_response_schema: on("supports_response_schema"),
+          supports_tool_choice: on("supports_tool_choice"),
+          boons: boonsFromForm(formData),
+          tool_servers: toolServersFromForm(formData),
+        }
+      : {}),
+    draft_model: text("draft_model", current.draft_model ?? ""),
+    verify_api_base: text("verify_api_base", current.verify_api_base ?? ""),
+    verify_upstream_model: text("verify_upstream_model", current.verify_upstream_model ?? ""),
+    enabled: current.enabled,
+  };
+}
+
+/**
+ * Save a model's settings form. `formData` carries `id` and `sections` (the
+ * changed sections, comma-separated) alongside the fields. Sections save in
+ * a fixed order and stop at the first refusal, which names what was already
+ * saved so the page can say so.
+ */
+export async function saveModelSettingsAction(formData: FormData): Promise<ModelSettingsResult> {
+  const session = await requireAdmin();
+  const audit = { auditActor: session.email };
+  const id = String(formData.get("id") ?? "");
+  const wanted = new Set(String(formData.get("sections") ?? "").split(",").map((s) => s.trim()));
+  const sections = MODEL_SETTINGS_SECTIONS.filter((s) => wanted.has(s));
+  const saved: ModelSettingsSection[] = [];
+  if (!id) return { ok: false, error: "Missing model id.", saved };
+  if (sections.length === 0) return { ok: true };
+  const current = await loadModel(id);
+  if (!current) return { ok: false, error: "Model not found.", saved };
+
+  let warnings: string[] | undefined;
+  const refresh = () => {
+    updateTag(CACHE_TAGS.models);
+    revalidatePath("/models");
+    revalidatePath("/fairshare");
+  };
+  for (const section of sections) {
+    try {
+      if (section === "model") {
+        const body = modelSettingsBody(formData, current);
+        await obleth.updateModel(id, body, audit);
+        const moved =
+          body.api_base !== current.api_base ||
+          body.upstream_model !== current.upstream_model ||
+          body.model_type !== current.model_type;
+        if (moved) warnings = await modelRegistrationWarnings(body);
+      } else if (section === "cache") {
+        await obleth.setModelCache(id, formData.get("cache_enabled") === "on", numOr(formData.get("cache_ttl_secs"), 300), audit);
+      } else if (section === "reliability") {
+        const rawTimeout = trimmed(formData.get("request_timeout_secs"));
+        await obleth.setModelReliability(id, {
+          request_timeout_secs: rawTimeout === "" ? null : Number(rawTimeout),
+          max_retries: numOr(formData.get("max_retries"), current.max_retries),
+          retry_backoff_ms: numOr(formData.get("retry_backoff_ms"), current.retry_backoff_ms),
+          endpoint_selection_mode: trimmed(formData.get("endpoint_selection_mode")) || current.endpoint_selection_mode,
+          debug_diagnostics: formData.get("debug_diagnostics") === "on",
+        }, audit);
+      } else if (section === "health") {
+        await obleth.setModelHealthConfig(id, {
+          checks_enabled: formData.get("checks_enabled") === "on",
+          alerts_enabled: formData.get("alerts_enabled") === "on",
+          check_interval_secs: numOr(formData.get("check_interval_secs"), 900),
+          failure_threshold: numOr(formData.get("failure_threshold"), 2),
+          maintenance_until: datetimeOrNull(formData.get("maintenance_until")),
+          maintenance_note: strOrNull(formData.get("maintenance_note")) ?? null,
+        }, audit);
+      } else if (section === "capacity") {
+        const error = await saveCapacity(id, formData, current, audit);
+        if (error) {
+          refresh();
+          return { ok: false, error: `${SECTION_LABELS.capacity}: ${error}`, saved };
+        }
+      } else if (section === "knowledge" && formData.has("knowledge_loaded")) {
+        await obleth.setModelCollections(id, formData.getAll("knowledge_collection").map(String), audit);
+      }
+      saved.push(section);
+    } catch (e) {
+      refresh();
+      return { ok: false, error: `${SECTION_LABELS[section]}: ${actionError(e).error}`, saved };
+    }
   }
-  updateTag(CACHE_TAGS.models);
-  revalidatePath("/models");
-  revalidatePath("/fairshare");
-  const warnings = await modelRegistrationWarnings({
-    api_base: String(formData.get("api_base") ?? current.api_base),
-    upstream_model: String(formData.get("upstream_model") ?? current.upstream_model),
-    model_type: String(formData.get("model_type") ?? current.model_type),
-  });
+  refresh();
   return { ok: true, warnings };
 }
 
-// Capabilities tab: native capabilities, context window, routing tags, boons,
-// tools. Preserves connection/cost fields by spreading the current model.
-export async function updateModelCapabilitiesAction(
-  _prev: ModelActionState | null,
+/**
+ * The Capacity section: the static cap (also the fallback while discovery
+ * has no answer), then the mode, with the discovered mode's settings.
+ * Returns a message when the form fails validation.
+ */
+async function saveCapacity(
+  id: string,
   formData: FormData,
-): Promise<ModelActionState> {
+  current: ModelRoute,
+  audit: { auditActor: string },
+): Promise<string | null> {
+  const cap = numOrNull(formData.get("max_in_flight"));
+  const nextCap = cap == null ? null : Math.max(1, Math.round(cap));
+  if (nextCap !== current.max_in_flight) await obleth.setModelCapacity(id, nextCap, audit);
+  const mode = trimmed(formData.get("capacity_mode")) || current.capacity_mode;
+  if (mode === "discovered") {
+    const parsed = capacityDiscoverySchema.safeParse({
+      capacity_source: formData.get("capacity_source"),
+      capacity_namespace: formData.get("capacity_namespace"),
+      capacity_service: formData.get("capacity_service"),
+      per_replica_max_in_flight: formData.get("per_replica_max_in_flight"),
+      capacity_headroom: formData.get("capacity_headroom"),
+    });
+    if (!parsed.success) return firstIssue(parsed.error);
+    const data = parsed.data;
+    await obleth.setModelCapacityMode(id, "discovered", {
+      capacity_source: data.capacity_source,
+      capacity_namespace: data.capacity_namespace || null,
+      capacity_service: data.capacity_service || null,
+      per_replica_max_in_flight: data.per_replica_max_in_flight ?? null,
+      capacity_headroom: data.capacity_headroom,
+    }, audit);
+  } else if (mode !== current.capacity_mode) {
+    await obleth.setModelCapacityMode(id, mode, undefined, audit);
+  }
+  return null;
+}
+
+/** The page header's Serving switch. */
+export async function setModelEnabledAction(id: string, enabled: boolean): Promise<ActionResult> {
   const session = await requireAdmin();
-  const id = String(formData.get("id") ?? "");
-  if (!id) return { ok: false, error: "Missing model id." };
   const current = await loadModel(id);
   if (!current) return { ok: false, error: "Model not found." };
-
-  const tags = tagsFromForm(formData);
   try {
-    await obleth.updateModel(id, {
-      ...toModelUpdateBody(current),
-      context_window: numOr(formData.get("context_window"), current.context_window),
-      supports_function_calling: formData.get("supports_function_calling") === "on",
-      supports_system_messages: formData.get("supports_system_messages") === "on",
-      supports_response_schema: formData.get("supports_response_schema") === "on",
-      supports_tool_choice: formData.get("supports_tool_choice") === "on",
-      supports_vision: tagsInclude(tags, "vision"),
-      tags,
-      boons: boonsFromForm(formData),
-      tool_servers: toolServersFromForm(formData),
-      draft_model: String(formData.get("draft_model") ?? current.draft_model ?? ""),
-      verify_api_base: String(formData.get("verify_api_base") ?? current.verify_api_base ?? ""),
-      verify_upstream_model: String(
-        formData.get("verify_upstream_model") ?? current.verify_upstream_model ?? "",
-      ),
-    }, { auditActor: session.email });
+    await obleth.updateModel(id, { ...toModelUpdateBody(current), enabled }, { auditActor: session.email });
   } catch (e) {
-    return { ok: false, error: e instanceof Error ? e.message : "Save failed." };
+    return actionError(e);
   }
   updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
-  revalidatePath("/fairshare");
+  revalidatePath("/");
   return { ok: true };
 }
 
-export async function checkModelHealthAction(id: string) {
-  await requireAdmin();
-  await obleth.checkModelHealth(id);
-  revalidatePath("/models");
+export type ActivateModelResult =
+  | { ok: true; enabled: boolean; activated: boolean; status: string; message: string | null }
+  | { ok: false; error: string };
+
+/**
+ * Health-check a model and, when it is switched off, turn it on if the check
+ * comes back healthy. New models are created off and come on this way.
+ */
+export async function activateModelAction(id: string): Promise<ActivateModelResult> {
+  const session = await requireAdmin();
+  try {
+    const result = await obleth.activateModel(id, { auditActor: session.email });
+    updateTag(CACHE_TAGS.models);
+    revalidatePath("/models");
+    return {
+      ok: true,
+      enabled: result.enabled,
+      activated: result.activated,
+      status: result.detail.summary.status,
+      message: result.detail.summary.last_message,
+    };
+  } catch (e) {
+    return actionError(e);
+  }
 }
 
-export async function checkAllModelHealthAction() {
-  await requireAdmin();
-  await obleth.checkAllModelHealth();
+export interface BulkModelResult {
+  done: number;
+  failed: { name: string; error: string }[];
+}
+
+/** Run `task` over the chosen models, a few at a time, collecting failures by name. */
+async function eachModel(
+  ids: string[],
+  task: (model: ModelRoute) => Promise<void>,
+): Promise<BulkModelResult> {
+  const wanted = new Set(ids);
+  const models = (await obleth.listModels()).filter((m) => wanted.has(m.id));
+  const failed: BulkModelResult["failed"] = [];
+  let done = 0;
+  for (let i = 0; i < models.length; i += 4) {
+    await Promise.all(
+      models.slice(i, i + 4).map(async (model) => {
+        try {
+          await task(model);
+          done += 1;
+        } catch (e) {
+          failed.push({ name: model.model_name, error: actionError(e).error });
+        }
+      }),
+    );
+  }
+  updateTag(CACHE_TAGS.models);
   revalidatePath("/models");
+  revalidatePath("/");
+  return { done, failed };
+}
+
+export async function setModelsEnabledAction(ids: string[], enabled: boolean): Promise<BulkModelResult> {
+  const session = await requireAdmin();
+  return eachModel(ids, async (model) => {
+    if (model.enabled === enabled) return;
+    await obleth.updateModel(model.id, { ...toModelUpdateBody(model), enabled }, { auditActor: session.email });
+  });
+}
+
+/**
+ * First health check for models that were just imported switched off: each
+ * that passes comes on, the rest stay off with the check's reason.
+ */
+export async function activateModelsAction(names: string[]): Promise<{ on: string[]; off: { name: string; error: string }[] }> {
+  const session = await requireAdmin();
+  const wanted = new Set(names);
+  const models = (await obleth.listModels()).filter((m) => wanted.has(m.model_name) && !m.enabled);
+  const on: string[] = [];
+  const off: { name: string; error: string }[] = [];
+  for (let i = 0; i < models.length; i += 4) {
+    await Promise.all(
+      models.slice(i, i + 4).map(async (model) => {
+        try {
+          const result = await obleth.activateModel(model.id, { auditActor: session.email });
+          if (result.enabled) on.push(model.model_name);
+          else off.push({ name: model.model_name, error: result.detail.summary.last_message ?? `Health check came back ${result.detail.summary.status}.` });
+        } catch (e) {
+          off.push({ name: model.model_name, error: actionError(e).error });
+        }
+      }),
+    );
+  }
+  updateTag(CACHE_TAGS.models);
+  revalidatePath("/models");
+  return { on, off };
+}
+
+export async function checkModelsHealthAction(ids: string[]): Promise<BulkModelResult> {
+  await requireAdmin();
+  return eachModel(ids, async (model) => {
+    await obleth.checkModelHealth(model.id);
+  });
+}
+
+export async function deleteModelsAction(ids: string[]): Promise<BulkModelResult> {
+  const session = await requireAdmin();
+  return eachModel(ids, async (model) => {
+    await obleth.deleteModel(model.id, { auditActor: session.email });
+  });
+}
+
+export async function checkModelHealthAction(id: string): Promise<ActionResult> {
+  await requireAdmin();
+  try {
+    await obleth.checkModelHealth(id);
+  } catch (e) {
+    return actionError(e);
+  }
+  revalidatePath("/models");
+  return { ok: true };
 }
 
 
@@ -1487,21 +1643,6 @@ export async function applyModelManifestAction(
     const err = actionError(e);
     return err.ok ? { ok: false, error: "Unexpected error" } : err;
   }
-}
-
-export async function setModelHealthConfigAction(formData: FormData) {
-  const session = await requireAdmin();
-  const id = String(formData.get("id") ?? "");
-  if (!id) return;
-  await obleth.setModelHealthConfig(id, {
-    checks_enabled: formData.get("checks_enabled") === "on",
-    alerts_enabled: formData.get("alerts_enabled") === "on",
-    check_interval_secs: numOr(formData.get("check_interval_secs"), 900),
-    failure_threshold: numOr(formData.get("failure_threshold"), 2),
-    maintenance_until: datetimeOrNull(formData.get("maintenance_until")),
-    maintenance_note: strOrNull(formData.get("maintenance_note")) ?? null,
-  }, { auditActor: session.email });
-  revalidatePath("/models");
 }
 
 export async function createMcpServerAction(

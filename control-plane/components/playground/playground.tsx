@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { z } from "zod";
 import { ArrowDownToLine, Code2, PanelLeft, PanelRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
@@ -93,7 +93,12 @@ const fresh = (): PlaygroundSession => ({
   launcher: true, updatedAt: Date.now(),
 });
 
-export function Playground({ scope, gatewayBase = "http://localhost:8080" }: { scope: string; gatewayBase?: string }) {
+export function Playground({ scope, gatewayBase = "http://localhost:8080", openModel }: {
+  scope: string;
+  gatewayBase?: string;
+  /** From `?model=`: open a new session on this model (the Models page's "Try in Playground"). */
+  openModel?: { name: string; type: string };
+}) {
   const root = `obleth-playground:${encodeURIComponent(scope)}`;
   const [sessions, setSessions] = useState<PlaygroundSession[]>([]);
   const [active, setActive] = useState("");
@@ -121,6 +126,24 @@ export function Playground({ scope, gatewayBase = "http://localhost:8080" }: { s
     try { localStorage.setItem(root, JSON.stringify(sessions)); }
     catch { setNotice("Session settings could not be saved. Export important conversations before leaving."); }
   }, [root, sessions]);
+  const opened = useRef(false);
+  useEffect(() => {
+    if (!openModel || opened.current || !sessions.length) return;
+    opened.current = true;
+    const image = openModel.type === "image";
+    const next: PlaygroundSession = {
+      ...fresh(),
+      title: openModel.name,
+      launcher: false,
+      mode: image ? "image" : "chat",
+      models: [openModel.name],
+      ...(image ? { imageModel: openModel.name } : {}),
+    };
+    setSessions((all) => [next, ...all]);
+    setActive(next.id);
+    // Drop the parameter so a reload does not open the model a second time.
+    window.history.replaceState(null, "", window.location.pathname);
+  }, [openModel, sessions.length]);
   const session = sessions.find((s) => s.id === active);
   const update = (patch: Partial<PlaygroundSession>) =>
     setSessions((all) => all.map((s) => s.id === active ? { ...s, ...patch, updatedAt: Date.now() } : s));

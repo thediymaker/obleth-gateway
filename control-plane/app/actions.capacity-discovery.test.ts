@@ -19,14 +19,22 @@ async function discoveryAction(fd: FormData, reject?: Error) {
   const setModelCapacityMode = reject
     ? vi.fn().mockRejectedValue(new OblethApiError(reject.message))
     : vi.fn().mockResolvedValue({});
+  const setModelCapacity = vi.fn().mockResolvedValue({});
   vi.doMock("@/lib/obleth", () => ({
-    obleth: { setModelCapacityMode },
+    obleth: {
+      setModelCapacityMode,
+      setModelCapacity,
+      listModels: vi.fn().mockResolvedValue([{ id: "m-1", model_name: "m", capacity_mode: "static", max_in_flight: null }]),
+    },
     CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
     OblethApiError,
   }));
-  const { setModelCapacityDiscoveryAction } = await import("./actions");
-  const result = await setModelCapacityDiscoveryAction("m-1", fd);
-  return { result, setModelCapacityMode };
+  const { saveModelSettingsAction } = await import("./actions");
+  fd.set("id", "m-1");
+  fd.set("sections", "capacity");
+  fd.set("capacity_mode", "discovered");
+  const result = await saveModelSettingsAction(fd);
+  return { result, setModelCapacityMode, setModelCapacity };
 }
 
 function form(fields: Record<string, string>) {
@@ -36,6 +44,11 @@ function form(fields: Record<string, string>) {
 }
 
 describe("saving discovered capacity settings", () => {
+  it("leaves the cap alone when the form's matches the stored one", async () => {
+    const { setModelCapacity } = await discoveryAction(form({ capacity_source: "endpoints" }));
+    expect(setModelCapacity).not.toHaveBeenCalled();
+  });
+
   it("sends the mode with every field, blanks as null", async () => {
     const { result, setModelCapacityMode } = await discoveryAction(
       form({
@@ -108,7 +121,8 @@ describe("saving discovered capacity settings", () => {
     );
     expect(result).toEqual({
       ok: false,
-      error: "capacity_namespace `kube-system` is not in OBLETH_CAPACITY_DISCOVERY_NAMESPACES",
+      error: "Capacity: capacity_namespace `kube-system` is not in OBLETH_CAPACITY_DISCOVERY_NAMESPACES",
+      saved: [],
     });
   });
 });

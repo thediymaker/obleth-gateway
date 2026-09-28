@@ -11,8 +11,8 @@ import { Button } from "@/components/ui/button";
 /// anything is written.
 
 const ACTION_STYLES: Record<string, string> = {
-  created: "text-emerald-600 dark:text-emerald-500",
-  updated: "text-amber-600 dark:text-amber-500",
+  created: "font-medium text-foreground",
+  updated: "text-secondary-foreground",
   unchanged: "text-muted-foreground",
 };
 
@@ -46,7 +46,7 @@ export function ManifestEntryList({
             </p>
           ) : null}
           {entry.warnings.map((w) => (
-            <p key={w} className="text-xs text-amber-600 dark:text-amber-500">
+            <p key={w} className="text-xs text-foreground">
               {w}
             </p>
           ))}
