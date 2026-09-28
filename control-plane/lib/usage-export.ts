@@ -3,10 +3,11 @@
 // formatting without a Next request context.
 import type { UsageDailyRow } from "@/lib/obleth";
 
-/// Every column the export can emit, in display order. Rows are grouped
-/// across the whole range, so there is no per-row `day`; `start_day`/`end_day`
-/// carry the range each row covers.
+/// Every column the export can emit, in display order. `day` is the row's own
+/// date for the per-day groupings (blank otherwise); `start_day`/`end_day`
+/// carry the range the export covers.
 export const ALL_COLUMNS = [
+  "day",
   "start_day",
   "end_day",
   "tenant_id",
@@ -33,6 +34,34 @@ export const ALL_COLUMNS = [
 ] as const;
 
 export type ExportColumn = (typeof ALL_COLUMNS)[number];
+
+/** What each column is called on the page. */
+export const COLUMN_LABELS: Record<ExportColumn, string> = {
+  day: "Date",
+  start_day: "Start date",
+  end_day: "End date",
+  tenant_id: "Team ID",
+  tenant_name: "Team",
+  key_id: "Key ID",
+  key_name: "Key name",
+  key_prefix: "Key prefix",
+  model: "Model",
+  requests: "Requests",
+  success_requests: "Succeeded",
+  error_requests: "Failed",
+  input_tokens: "Tokens in",
+  output_tokens: "Tokens out",
+  total_tokens: "Total tokens",
+  estimated_tokens: "Estimated tokens",
+  cache_hits: "Cache hits",
+  cache_misses: "Cache misses",
+  avg_ttft_ms: "Avg first token (ms)",
+  avg_total_ms: "Avg total time (ms)",
+  cost_usd: "Spend (USD)",
+  energy_kwh: "Energy (kWh)",
+  co2_g: "CO₂ (g)",
+  energy_cost_usd: "Energy cost (USD)",
+};
 
 export const EMPTY_UUID = "00000000-0000-0000-0000-000000000000";
 
@@ -64,8 +93,11 @@ export function selectColumns(requested: string | null): ExportColumn[] {
   return selected.length > 0 ? selected : [...ALL_COLUMNS];
 }
 
-function cellValue(row: UsageDailyRow, col: ExportColumn, ctx: ExportContext): string | number {
+/** One cell as the CSV writes it, before quoting: the preview shows the same. */
+export function exportCell(row: UsageDailyRow, col: ExportColumn, ctx: ExportContext): string | number {
   switch (col) {
+    case "day":
+      return row.day;
     case "start_day":
       return ctx.startDay;
     case "end_day":
@@ -97,7 +129,7 @@ export function buildUsageCsv(
 ): string {
   const lines = [
     columns.join(","),
-    ...rows.map((row) => columns.map((c) => csvField(cellValue(row, c, ctx))).join(",")),
+    ...rows.map((row) => columns.map((c) => csvField(exportCell(row, c, ctx))).join(",")),
   ];
   return lines.join("\r\n");
 }

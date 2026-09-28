@@ -145,7 +145,7 @@ export function OverviewDashboard({
       <div className={cn("grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5", windowQuery.isPlaceholderData && "opacity-60")}>
         <Kpi label={`Requests · ${win.range}`} value={compact(s.requests)} detail={prev ? changeLabel(s.requests, prev.requests, against) : null} trend={series.map((p) => p.requests)} href="/reports" />
         <Kpi label={`Tokens · ${win.range}`} value={compact(s.tokens)} detail={s.inputTokens || s.outputTokens ? `${compact(s.inputTokens)} in · ${compact(s.outputTokens)} out` : prev ? changeLabel(s.tokens, prev.tokens, against) : null} trend={series.map((p) => p.tokens)} href="/reports" />
-        <Kpi label={`Error rate · ${win.range}`} value={hasErrors ? pct(errorRate) : "—"} detail={errorDetail} trend={series.map((p) => p.errors)} href="/logs" emphasis={hasErrors && errorRate >= 2 && errorRate > prevErrorRate * 2} />
+        <Kpi label={`Error rate · ${win.range}`} value={hasErrors ? pct(errorRate) : "—"} detail={errorDetail} trend={series.map((p) => p.errors)} href={`/logs?status=error&window=${win.range}`} emphasis={hasErrors && errorRate >= 2 && errorRate > prevErrorRate * 2} />
         <Kpi label="First token · p50" value={formatMs(s.p50TtftMs)} detail={s.avgTtftMs ? `avg ${formatMs(s.avgTtftMs)}` : null} trend={series.map((p) => p.ttft ?? 0)} href="/reports" />
         <Kpi label={`Spend · ${win.range}`} value={s.hasPricing ? money(s.cost) : "—"} detail={s.hasPricing ? `at list price · ${s.activeTenants} tenant${s.activeTenants === 1 ? "" : "s"}` : "No prices set on models"} trend={series.map((p) => p.cost)} href="/reports" />
       </div>

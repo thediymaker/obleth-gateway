@@ -2,7 +2,7 @@
 // component so grouping behavior is vitest-testable.
 import type { UsageDailyRow } from "@/lib/obleth";
 
-export type BreakdownGroup = "day" | "tenant" | "key" | "model";
+export type BreakdownGroup = "day" | "tenant" | "key" | "model" | "key_model";
 
 export interface NameLookups {
   tenantNames: Map<string, string>;
@@ -16,7 +16,7 @@ export interface BreakdownRow extends UsageDailyRow {
 }
 
 /// Label rollup rows for display. Day rows stay chronological; every other
-/// grouping is a chargeback view, so it sorts by frozen spend descending.
+/// grouping sorts by frozen spend, highest first.
 /// Name lookups degrade to a truncated raw id (deleted tenants/keys).
 export function toBreakdownRows(
   rows: UsageDailyRow[],
@@ -39,6 +39,10 @@ export function toBreakdownRows(
         break;
       case "model":
         label = r.model || "(unknown)";
+        break;
+      case "key_model":
+        label = `${lookups.keyNames.get(r.key_id) || r.key_id.slice(0, 8)} · ${r.model || "(unknown)"}`;
+        sublabel = lookups.tenantNames.get(r.tenant_id) ?? "";
         break;
     }
     return { ...r, label, sublabel };

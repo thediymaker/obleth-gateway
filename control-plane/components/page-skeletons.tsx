@@ -148,6 +148,41 @@ export function ModelSkeleton() {
   );
 }
 
+/** Request logs: header, search and filters, the per-minute strip, then rows. */
+export function LogsSkeleton() {
+  return (
+    <Loading label="Loading request logs">
+      <Header controls={2} />
+      <div className="flex flex-wrap gap-2"><Skeleton className="h-9 flex-1 rounded-lg" /><Skeleton className="h-9 w-72 rounded-lg" /></div>
+      <div className="flex flex-wrap gap-2">{Array.from({ length: 7 }, (_, i) => <Skeleton key={i} className="h-8 w-28 rounded-lg" />)}</div>
+      <SkeletonPanel className="h-[112px]"><Skeleton className="h-3 w-48" /><Skeleton className="flex-1" /></SkeletonPanel>
+      <SkeletonPanel className="gap-0 p-0">
+        {Array.from({ length: 12 }, (_, i) => (
+          <div key={i} className="flex items-center gap-4 border-t border-border px-4 py-3 first:border-t-0">
+            <Skeleton className="h-3.5 w-16" /><Skeleton className="h-5 w-10 rounded-full" /><Skeleton className="h-4 w-40" /><Skeleton className="h-4 w-32" /><Skeleton className="ml-auto h-1.5 w-40" />
+          </div>
+        ))}
+      </SkeletonPanel>
+    </Loading>
+  );
+}
+
+/** Reports: header, five tiles, the chart, the two ranked lists, then the table. */
+export function ReportsSkeleton() {
+  return (
+    <Loading label="Loading reports">
+      <Header controls={4} />
+      <Tiles count={5} className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5" />
+      <SkeletonPanel className="h-[340px]"><Skeleton className="h-4 w-32" /><Skeleton className="mt-2 flex-1" /></SkeletonPanel>
+      <div className="grid gap-4 lg:grid-cols-2">
+        <SkeletonPanel><Skeleton className="h-4 w-28" /><Rows count={6} /></SkeletonPanel>
+        <SkeletonPanel><Skeleton className="h-4 w-28" /><Rows count={6} /></SkeletonPanel>
+      </div>
+      <SkeletonPanel><Skeleton className="h-4 w-24" /><Rows count={8} /></SkeletonPanel>
+    </Loading>
+  );
+}
+
 /** The Playground fills the page edge to edge: sessions, header, surface, composer. */
 export function PlaygroundSkeleton() {
   return (

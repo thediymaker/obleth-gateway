@@ -191,7 +191,7 @@ export function ModelSettings({
       e.returnValue = "";
     };
     const onClick = (e: MouseEvent) => {
-      const a = (e.target as HTMLElement).closest("a");
+      const a = e.target instanceof Element ? e.target.closest("a") : null;
       if (!a || a.target === "_blank" || e.metaKey || e.ctrlKey || e.shiftKey) return;
       const href = a.getAttribute("href") ?? "";
       if (href.startsWith("#") || !href) return;

@@ -13,8 +13,8 @@ use crate::model_health::{
 use crate::usage::{
     CacheStats, CostAgg, KeyUsageSummary, KeyUsageSummaryQuery, ModelUsageTimePoint,
     TenantUsageTimePoint, UsageAgg, UsageBreakdownQuery, UsageDailyQuery, UsageDailyRow,
-    UsageKeyAgg, UsageKeyModelBreakdown, UsageLogQuery, UsageLogRow, UsageModelAgg, UsageQuery,
-    UsageSeriesQuery, UsageTimePoint,
+    UsageKeyAgg, UsageKeyModelBreakdown, UsageLogBucket, UsageLogHistogram, UsageLogQuery,
+    UsageLogRow, UsageModelAgg, UsageQuery, UsageSeriesQuery, UsageTimePoint,
 };
 use crate::{
     AlertSettingsView, ApplyAutotuneCapacity, AuditEntryView, AuditQuery, AutoRouterSettingsView,
@@ -86,6 +86,7 @@ use obleth_config::{
         crate::get_usage_breakdown,
         crate::get_cache_stats,
         crate::get_usage_logs,
+        crate::get_usage_log_histogram,
         crate::get_request_spans,
         crate::get_usage_daily,
         crate::compact_usage,
@@ -251,6 +252,8 @@ use obleth_config::{
         UsageKeyModelBreakdown,
         CacheStats,
         UsageLogRow,
+        UsageLogHistogram,
+        UsageLogBucket,
         UsageDailyRow,
         CostAgg,
         LiveStats,

@@ -210,6 +210,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/usage/breakdown", get(get_usage_breakdown))
         .route("/api/v1/usage/cache", get(get_cache_stats))
         .route("/api/v1/usage/logs", get(get_usage_logs))
+        .route("/api/v1/usage/logs/histogram", get(get_usage_log_histogram))
         .route(
             "/api/v1/usage/logs/:request_id/spans",
             get(get_request_spans),
@@ -4491,6 +4492,22 @@ async fn get_usage_logs(
         .collect();
 
     Ok(Json(entries))
+}
+
+/// Requests and failures over time for the request log's window, counted with
+/// the log's own filters so the chart and the list always agree. Only
+/// non-empty buckets come back.
+#[utoipa::path(
+    get, path = "/api/v1/usage/logs/histogram", tag = "usage",
+    params(usage::UsageLogQuery),
+    responses((status = 200, body = usage::UsageLogHistogram))
+)]
+async fn get_usage_log_histogram(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::UsageLogQuery>,
+) -> Result<Json<usage::UsageLogHistogram>> {
+    let (bucket_ms, buckets) = usage::query_usage_log_histogram(&state.clickhouse, q).await?;
+    Ok(Json(usage::UsageLogHistogram { bucket_ms, buckets }))
 }
 
 #[utoipa::path(
