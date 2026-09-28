@@ -15,6 +15,7 @@ import { GetCode } from "./get-code";
 import { SessionsRail } from "./sessions-rail";
 import { migrateLegacySessions } from "./session-migration";
 import { MODES } from "./ui";
+import { PlaygroundSkeleton } from "@/components/page-skeletons";
 import { cn } from "@/lib/utils";
 
 // Shared by the zod cap below and the Router textarea's `maxLength`
@@ -167,7 +168,7 @@ export function Playground({ scope, gatewayBase = "http://localhost:8080" }: { s
       setSessions((all) => [next, ...all]); setActive(next.id); setNotice(null);
     } catch { setNotice("Could not import that file."); }
   };
-  if (!session) return <p className="p-6 text-sm text-muted-foreground">Loading Playground…</p>;
+  if (!session) return <PlaygroundSkeleton />;
   const hasSettings = !session.launcher && session.mode !== "verdicts";
   const tabActive = (mode: PlaygroundSession["mode"]) => !session.launcher && (session.mode === mode || (mode === "compare" && session.mode === "chat"));
   const sessionPending = pending?.sessionId === session.id ? pending : undefined;

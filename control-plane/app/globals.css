@@ -357,3 +357,32 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/* Loading placeholders: a flat block with one soft highlight sweeping across,
+   instead of the whole page pulsing. Every block shares the same sweep phase
+   (background-attachment: fixed), so a page of them reads as one pass of light
+   rather than many flickers. Motion stops for people who ask for less. */
+.skeleton {
+  background-color: hsl(240 4% 11%);
+  background-image: linear-gradient(90deg, transparent 0, hsl(240 5% 100% / 0.045) 50%, transparent 100%);
+  background-size: 60vw 100%;
+  background-repeat: no-repeat;
+  background-attachment: fixed;
+  animation: skeleton-sweep 1.6s ease-in-out infinite;
+}
+
+@keyframes skeleton-sweep {
+  0% {
+    background-position: -60vw 0;
+  }
+  100% {
+    background-position: 160vw 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .skeleton {
+    animation: none;
+    background-image: none;
+  }
+}
