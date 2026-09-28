@@ -398,3 +398,20 @@ export function DashboardSkeleton() {
     </Loading>
   );
 }
+
+/** Settings: header, the section list, and the first sections. */
+export function SettingsSkeleton() {
+  return (
+    <Loading label="Loading settings">
+      <div className="space-y-2.5"><Skeleton className="h-8 w-40" /><Skeleton className="h-4 w-96 max-w-full" /></div>
+      <div className="grid items-start gap-6 lg:grid-cols-[200px_minmax(0,1fr)]">
+        <div className="flex flex-col gap-2"><Skeleton className="h-9 rounded-lg" />{Array.from({ length: 8 }, (_, i) => <Skeleton key={i} className="h-7 rounded-lg" />)}</div>
+        <div className="flex flex-col gap-4">
+          <SkeletonPanel className="h-[120px]" />
+          <SkeletonPanel className="gap-3"><Skeleton className="h-4 w-24" /><Rows count={4} /></SkeletonPanel>
+          <SkeletonPanel className="gap-3"><Skeleton className="h-4 w-24" /><Rows count={5} /></SkeletonPanel>
+        </div>
+      </div>
+    </Loading>
+  );
+}

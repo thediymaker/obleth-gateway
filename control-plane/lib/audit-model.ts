@@ -78,14 +78,17 @@ const SETTINGS_TABS: Record<string, string> = {
   set_boon_settings: "boons",
   set_charo_settings: "assistant",
   set_energy_settings: "energy",
-  set_slurm_settings: "slurm",
   set_usage_retention: "data",
 };
 
 /** Where an event's thing lives in the dashboard, or null when it has no page (or is gone). */
 export function thingHref(e: Pick<AuditEntry, "entity_type" | "entity_id" | "action">, names: Record<string, string>, alive: Set<string>): string | null {
   const name = names[e.entity_id];
-  if (e.entity_type === "settings") return e.action === "set_knowledge_settings" ? "/knowledge?tab=retrieval" : `/settings${SETTINGS_TABS[e.action] ? `?tab=${SETTINGS_TABS[e.action]}` : ""}`;
+  if (e.entity_type === "settings") {
+    if (e.action === "set_knowledge_settings") return "/knowledge?tab=retrieval";
+    if (e.action === "set_slurm_settings") return "/deployments?slurm=1";
+    return `/settings${SETTINGS_TABS[e.action] ? `?tab=${SETTINGS_TABS[e.action]}` : ""}`;
+  }
   if (!alive.has(e.entity_id)) return null;
   switch (e.entity_type) {
     case "model":
