@@ -211,6 +211,7 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/usage/cache", get(get_cache_stats))
         .route("/api/v1/usage/logs", get(get_usage_logs))
         .route("/api/v1/usage/logs/histogram", get(get_usage_log_histogram))
+        .route("/api/v1/usage/logs/facets", get(get_usage_log_facets))
         .route(
             "/api/v1/usage/logs/:request_id/spans",
             get(get_request_spans),
@@ -4492,6 +4493,55 @@ async fn get_usage_logs(
         .collect();
 
     Ok(Json(entries))
+}
+
+/// What the requests matching the log's filters are made of: the busiest
+/// status codes, models, tenants, keys and request types, each with its
+/// failures, and the status code and model pairs that fail most. Tenant and
+/// key ids come back with their names.
+#[utoipa::path(
+    get, path = "/api/v1/usage/logs/facets", tag = "usage",
+    params(usage::UsageLogQuery),
+    responses((status = 200, body = usage::UsageLogFacets))
+)]
+async fn get_usage_log_facets(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::UsageLogQuery>,
+) -> Result<Json<usage::UsageLogFacets>> {
+    let mut facets = usage::query_usage_log_facets(&state.clickhouse, q).await?;
+    let tenant_names: std::collections::HashMap<String, String> = state
+        .store
+        .list_tenants()
+        .await?
+        .into_iter()
+        .map(|t| (t.id.to_string(), t.name))
+        .collect();
+    for t in &mut facets.tenants {
+        t.label = tenant_names.get(&t.value).cloned().unwrap_or_default();
+    }
+    let key_ids: Vec<Uuid> = facets
+        .keys
+        .iter()
+        .filter_map(|k| Uuid::parse_str(&k.value).ok())
+        .collect();
+    let key_names: std::collections::HashMap<String, String> = state
+        .store
+        .keys_by_ids(&key_ids)
+        .await?
+        .into_iter()
+        .map(|k| {
+            let label = if k.name.is_empty() {
+                k.key_prefix
+            } else {
+                format!("{} · {}", k.name, k.key_prefix)
+            };
+            (k.id.to_string(), label)
+        })
+        .collect();
+    for k in &mut facets.keys {
+        k.label = key_names.get(&k.value).cloned().unwrap_or_default();
+    }
+    Ok(Json(facets))
 }
 
 /// Requests and failures over time for the request log's window, counted with

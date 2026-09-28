@@ -37,6 +37,7 @@ import {
 } from "@/lib/models-model";
 import type { CacheStats, ModelHealthSummary, ModelRoute, UsageModelAgg } from "@/lib/obleth";
 import { compact, formatMs, isBenchmarkRoute } from "@/lib/overview-model";
+import { logsHref } from "@/lib/log-links";
 import { cn, getJson } from "@/lib/utils";
 
 const DAY_MS = 86_400_000;
@@ -389,7 +390,11 @@ function Row({ row, selected, onToggle, onOpen }: { row: ModelRow; selected: boo
           <span className="font-mono text-[12px] tabular-nums text-muted-foreground">{row.inFlight > 0 ? `${row.inFlight} in flight` : "no cap"}</span>
         )}
       </td>
-      <td className="py-2.5 pr-3 text-right font-mono text-[12px] tabular-nums">{row.requests ? compact(row.requests) : "—"}</td>
+      <td className="py-2.5 pr-3 text-right font-mono text-[12px] tabular-nums">
+        {row.requests ? (
+          <Link href={logsHref({ model: row.name, window: "24h" })} onClick={(e) => e.stopPropagation()} title="See these requests" className="underline-offset-2 hover:underline">{compact(row.requests)}</Link>
+        ) : "—"}
+      </td>
       <td className="py-2.5 pr-3 text-right font-mono text-[12px] tabular-nums">{row.p50TtftMs ? formatMs(row.p50TtftMs) : "—"}</td>
       <td className="whitespace-nowrap py-2.5 pr-3 font-mono text-[12px]">{row.price ?? <span className="text-muted-foreground">not set</span>}</td>
       <td className="py-2.5 pr-3 text-right font-mono text-[12px] tabular-nums">{textual ? contextLabel(m.context_window) : "—"}</td>

@@ -1,15 +1,17 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import Link from "next/link";
 import { Area, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis, CartesianGrid } from "recharts";
 import { axisTick, chartGrid, compactAxis, timeCursor } from "@/components/chart-tooltip";
 import { Meter, Panel, Segmented } from "@/components/overview/ui";
 import { Tile } from "@/components/models/ui";
 import { MODEL_SERIES_BUCKET_MS, priceLabel, RUNS_LABELS, tagLabels, type ModelOverviewData, type RunsOn } from "@/lib/models-model";
-import type { ModelCapacityStatus, ModelHealthCheck, ModelHealthSummary, ModelRoute } from "@/lib/obleth";
+import type { ModelCapacityStatus, ModelHealthCheck, ModelHealthSummary, ModelRoute, UsageLogHistogram } from "@/lib/obleth";
+import { logsHref } from "@/lib/log-links";
 import { changeLabel, compact, describeAudit, formatMs } from "@/lib/overview-model";
-import { cn } from "@/lib/utils";
+import { cn, getJson } from "@/lib/utils";
 
 const DAY_MS = 86_400_000;
 const CURRENT = "hsl(240 5% 90%)";
@@ -225,6 +227,13 @@ export function ModelOverview({
   endpoints: number;
 }) {
   const u = data?.usage;
+  // Failures come from the raw log, which the rollup's per-model read lacks.
+  const { data: hist } = useQuery({
+    queryKey: ["model-failed-24h", model.model_name],
+    queryFn: () => getJson<UsageLogHistogram>(`/api/live/usage/logs/histogram?model=${encodeURIComponent(model.model_name)}&since_ms=${Date.now() - DAY_MS}&bucket_ms=3600000`),
+    refetchInterval: 60_000,
+  });
+  const failed = hist ? hist.buckets.reduce((t, b) => ({ requests: t.requests + b.requests, errors: t.errors + b.errors }), { requests: 0, errors: 0 }) : null;
   const chat = model.model_type === "chat";
   const caps = [
     model.supports_function_calling && "Function calling",
@@ -245,10 +254,16 @@ export function ModelOverview({
           detail={!model.enabled ? "Takes no requests" : load.queued > 0 ? `${load.queued} waiting` : load.cap > 0 ? `${Math.round((load.inFlight / load.cap) * 100)}% of the pool` : "No slot cap"}
           emphasis={load.queued > 0}
         />
-        <Tile label="Requests · 24h" value={u ? compact(u.requests) : data ? "0" : "—"} detail={data && data.previousRequests !== null ? changeLabel(Number(u?.requests ?? 0), data.previousRequests, "yesterday") : null} />
+        <Tile label="Requests · 24h" href={u?.requests ? logsHref({ model: model.model_name, window: "24h" }) : undefined} value={u ? compact(u.requests) : data ? "0" : "—"} detail={data && data.previousRequests !== null ? changeLabel(Number(u?.requests ?? 0), data.previousRequests, "yesterday") : null} />
+        <Tile
+          label="Failed · 24h"
+          href={failed?.errors ? logsHref({ model: model.model_name, window: "24h", status: "error" }) : undefined}
+          value={failed ? compact(failed.errors) : "—"}
+          detail={failed ? (failed.requests ? `${((failed.errors / failed.requests) * 100).toFixed(1)}% of requests${failed.errors ? " · see them" : ""}` : "No requests") : null}
+          emphasis={!!failed && failed.requests > 0 && failed.errors / failed.requests >= 0.05}
+        />
         <Tile label="First token · p50" value={u?.p50_ttft_ms ? formatMs(u.p50_ttft_ms) : "—"} detail={u?.avg_ttft_ms ? `avg ${formatMs(u.avg_ttft_ms)}` : null} />
-        <Tile label="Tokens · 24h" value={u ? compact(u.total_tokens) : "—"} detail={u ? `${compact(u.input_tokens)} in · ${compact(u.output_tokens)} out` : null} />
-        <Tile label="Users · 24h" value={u ? compact(u.users) : "—"} detail={u?.gen_tokens_per_sec ? `${compact(u.gen_tokens_per_sec)} tok/s while generating` : null} />
+        <Tile label="Tokens · 24h" value={u ? compact(u.total_tokens) : "—"} detail={u ? `${compact(u.input_tokens)} in · ${compact(u.output_tokens)} out · ${compact(u.users)} users` : null} />
       </div>
 
       <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_340px]">

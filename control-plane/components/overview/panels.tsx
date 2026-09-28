@@ -6,6 +6,7 @@ import type { AuditEntry, CacheStats, RouterReadinessView, TenantFairshareView }
 import type { OverviewSummary } from "@/lib/overview-summary";
 import type { OverviewTenantRow, OverviewWindow } from "@/lib/overview-data";
 import { compact, describeAudit, RANGE_LABEL, type AttentionItem, type OverviewRange } from "@/lib/overview-model";
+import { logsHref } from "@/lib/log-links";
 import { cn } from "@/lib/utils";
 import { HealthGlyph, Meter, Panel, PanelLink, Pill, SectionLabel } from "./ui";
 
@@ -107,10 +108,14 @@ export function TopTenants({ window, live }: { window: OverviewWindow; live: Map
   const hasCost = rows.some((r) => r.cost !== null);
   const cols = hasCost ? "grid-cols-[minmax(0,1fr)_4.5rem_4rem_4.5rem_3.5rem]" : "grid-cols-[minmax(0,1fr)_4.5rem_4rem_3.5rem]";
   const money = (v: number | null) => (v === null ? "—" : `$${v >= 100 ? v.toFixed(0) : v.toFixed(2)}`);
-  const line = (r: Pick<OverviewTenantRow, "requests" | "tokens" | "cost">, now: number | string, name: React.ReactNode, key: string, muted = false) => (
+  const line = (r: Pick<OverviewTenantRow, "requests" | "tokens" | "cost">, now: number | string, name: React.ReactNode, key: string, muted = false, tenantId?: string) => (
     <div key={key} className={cn("grid items-center gap-3 border-t border-border px-[18px] py-[9px] text-[13px]", cols, muted && "text-muted-foreground")}>
       {name}
-      <span className="text-right font-mono text-xs tabular-nums">{compact(r.requests)}</span>
+      {tenantId ? (
+        <Link href={logsHref({ team: tenantId, window: window.range })} title="See these requests" className="text-right font-mono text-xs tabular-nums underline-offset-2 hover:underline">{compact(r.requests)}</Link>
+      ) : (
+        <span className="text-right font-mono text-xs tabular-nums">{compact(r.requests)}</span>
+      )}
       <span className="text-right font-mono text-xs tabular-nums">{compact(r.tokens)}</span>
       {hasCost && <span className="text-right font-mono text-xs tabular-nums">{money(r.cost)}</span>}
       <span className="text-right font-mono text-xs tabular-nums">{now}</span>
@@ -128,7 +133,7 @@ export function TopTenants({ window, live }: { window: OverviewWindow; live: Map
             </div>
             {rows.map((r) => line(r, live.get(r.id)?.in_flight ?? 0, (
               <span className="flex min-w-0 flex-col gap-1.5"><span className="truncate" title={r.name}>{r.name}</span><Meter value={r.requests} max={top} className="h-[3px]" /></span>
-            ), r.id))}
+            ), r.id, false, r.id))}
             {window.otherTenants.count > 0 && line(window.otherTenants, "", <span>{window.otherTenants.count} more tenant{window.otherTenants.count === 1 ? "" : "s"}</span>, "rest", true)}
           </>
         )}

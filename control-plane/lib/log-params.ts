@@ -18,6 +18,7 @@ export function logParamsFrom(sp: URLSearchParams): UsageLogParams {
     requestType: str("request_type"),
     sessionId: str("session_id"),
     status,
+    statusCode: num("status_code"),
     requestId: str("request_id"),
     sinceMs: num("since_ms"),
     untilMs: num("until_ms"),

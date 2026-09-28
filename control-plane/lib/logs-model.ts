@@ -24,6 +24,8 @@ export interface LogFilters {
   sinceMs?: number;
   untilMs?: number;
   status: "" | "success" | "error";
+  /** One exact HTTP status, as text ("" for any). */
+  statusCode: string;
   model: string;
   tenantId: string;
   keyId: string;
@@ -38,6 +40,7 @@ export interface LogFilters {
 export const DEFAULT_LOG_FILTERS: LogFilters = {
   window: "1h",
   status: "",
+  statusCode: "",
   model: "",
   tenantId: "",
   keyId: "",
@@ -72,6 +75,7 @@ export function logParams(f: LogFilters, range: { since: number; until: number }
   p.set("since_ms", String(Math.floor(range.since)));
   if (f.window === "custom") p.set("until_ms", String(Math.floor(range.until)));
   if (f.status) p.set("status", f.status);
+  if (f.statusCode) p.set("status_code", f.statusCode);
   if (f.model) p.set("model", f.model);
   if (f.tenantId) p.set("tenant_id", f.tenantId);
   if (f.keyId) p.set("key_id", f.keyId);
@@ -85,7 +89,7 @@ export function logParams(f: LogFilters, range: { since: number; until: number }
 }
 
 export function filtersActive(f: LogFilters): boolean {
-  return !!(f.status || f.model || f.tenantId || f.keyId || f.requestType || f.sessionId || f.requestId || f.tracedOnly || f.includeInternal || f.window === "custom");
+  return !!(f.status || f.statusCode || f.model || f.tenantId || f.keyId || f.requestType || f.sessionId || f.requestId || f.tracedOnly || f.includeInternal || f.window === "custom");
 }
 
 // ---------------------------------------------------------------------------
@@ -122,7 +126,8 @@ export function parseSearch(text: string, lookups: SearchLookups): { patch: Part
     }
     if (key === "status") {
       const v = lower(value);
-      if (["error", "failed", "fail"].includes(v)) patch.status = "error";
+      if (/^[1-5]\d\d$/.test(v)) patch.statusCode = v;
+      else if (["error", "failed", "fail"].includes(v)) patch.status = "error";
       else if (["ok", "success", "succeeded"].includes(v)) patch.status = "success";
       else unknown.push(token);
     } else if (key === "model") {

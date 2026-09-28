@@ -688,6 +688,8 @@ export interface UsageLogParams {
   sessionId?: string;
   deviceId?: string;
   status?: UsageLogStatus;
+  /** One exact HTTP status, e.g. 502. */
+  statusCode?: number;
   requestId?: string;
   sinceMs?: number;
   untilMs?: number;
@@ -699,6 +701,25 @@ export interface UsageLogParams {
   tracedOnly?: boolean;
   /** When true, include internal traffic (e.g. health probes) hidden by default. */
   includeInternal?: boolean;
+}
+
+/** One value of a log facet; `label` is a tenant's or key's name. */
+export interface UsageLogFacet {
+  value: string;
+  label: string;
+  requests: number;
+  errors: number;
+}
+
+/** `GET /usage/logs/facets`. */
+export interface UsageLogFacets {
+  status_codes: UsageLogFacet[];
+  models: UsageLogFacet[];
+  tenants: UsageLogFacet[];
+  keys: UsageLogFacet[];
+  request_types: UsageLogFacet[];
+  /** Status code and model pairs among the failures, most common first. */
+  failures: { status_code: number; model: string; requests: number }[];
 }
 
 /** `GET /usage/logs/histogram`: the width used, and each non-empty bucket. */
@@ -2234,6 +2255,7 @@ export const obleth = {
         session_id: params.sessionId,
         device_id: params.deviceId,
         status: params.status,
+        status_code: params.statusCode,
         request_id: params.requestId,
         since_ms: params.sinceMs,
         until_ms: params.untilMs,
@@ -2255,12 +2277,32 @@ export const obleth = {
         session_id: params.sessionId,
         device_id: params.deviceId,
         status: params.status,
+        status_code: params.statusCode,
         request_id: params.requestId,
         since_ms: params.sinceMs,
         until_ms: params.untilMs,
         traced_only: params.tracedOnly ? "true" : undefined,
         include_internal: params.includeInternal ? "true" : undefined,
         bucket_ms: params.bucketMs,
+      })}`,
+    ),
+  /** What the requests matching the log's filters are made of, busiest first. */
+  usageLogFacets: (params: UsageLogParams = {}) =>
+    api<UsageLogFacets>(
+      `/usage/logs/facets${qs({
+        tenant_id: params.tenantId,
+        key_id: params.keyId,
+        model: params.model,
+        request_type: params.requestType,
+        session_id: params.sessionId,
+        device_id: params.deviceId,
+        status: params.status,
+        status_code: params.statusCode,
+        request_id: params.requestId,
+        since_ms: params.sinceMs,
+        until_ms: params.untilMs,
+        traced_only: params.tracedOnly ? "true" : undefined,
+        include_internal: params.includeInternal ? "true" : undefined,
       })}`,
     ),
   getRequestSpans: (requestId: string) =>

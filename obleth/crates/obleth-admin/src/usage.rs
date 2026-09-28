@@ -130,6 +130,8 @@ pub struct UsageLogQuery {
     pub device_id: Option<String>,
     /// Status filter: `success` (2xx/3xx), `error` (>=400), or all (default).
     pub status: Option<String>,
+    /// One exact HTTP status, e.g. `502`. Combines with `status`.
+    pub status_code: Option<u16>,
     /// Case-insensitive prefix match on the request id, for the search box.
     pub request_id: Option<String>,
     /// Inclusive lower bound, unix epoch millis. Defaults to the last 24h.
@@ -191,6 +193,7 @@ pub struct UsageLogRow {
 }
 
 /// A bind value for the request-log filters, in placeholder order.
+#[derive(Clone)]
 enum LogBind {
     Int(i64),
     Text(String),
@@ -235,6 +238,10 @@ fn log_filter_sql(q: &UsageLogQuery, since: i64) -> (String, Vec<LogBind>) {
         Some("success") => sql.push_str(" and status_code >= 200 and status_code < 400"),
         Some("error") => sql.push_str(" and status_code >= 400"),
         _ => {}
+    }
+    if let Some(code) = q.status_code {
+        // A u16 prints as digits only, so it is safe to inline.
+        sql.push_str(&format!(" and status_code = {code}"));
     }
     if let Some(rid) = &q.request_id {
         sql.push_str(" and startsWith(lower(toString(request_id)), lower(?))");
@@ -357,6 +364,121 @@ pub async fn query_usage_log_histogram(
         .fetch_all::<UsageLogBucket>()
         .await?;
     Ok((bucket, rows))
+}
+
+/// Most values a facet lists.
+const LOG_FACET_LIMIT: u64 = 12;
+
+/// What one facet of the log counts: the dimension's value, how many requests
+/// had it, and how many of those failed.
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+pub struct UsageLogFacetRow {
+    pub facet: String,
+    pub requests: u64,
+    pub errors: u64,
+}
+
+/// One value of a facet. `label` is the tenant's or key's name, resolved by
+/// the handler; the other facets leave it empty.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UsageLogFacet {
+    pub value: String,
+    pub label: String,
+    pub requests: u64,
+    pub errors: u64,
+}
+
+/// A status code and model that failed together, the most common first.
+#[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
+pub struct UsageLogFailure {
+    pub status_code: u16,
+    pub model: String,
+    pub requests: u64,
+}
+
+/// `GET /usage/logs/facets`: what the requests matching the log's filters
+/// are made of, each dimension's busiest values first.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UsageLogFacets {
+    pub status_codes: Vec<UsageLogFacet>,
+    pub models: Vec<UsageLogFacet>,
+    pub tenants: Vec<UsageLogFacet>,
+    pub keys: Vec<UsageLogFacet>,
+    pub request_types: Vec<UsageLogFacet>,
+    pub failures: Vec<UsageLogFailure>,
+}
+
+/// The dimensions a facet can count, and the expression that reads each.
+pub const LOG_FACET_DIMENSIONS: &[(&str, &str)] = &[
+    ("status_codes", "toString(status_code)"),
+    ("models", "model"),
+    ("tenants", "toString(tenant_id)"),
+    ("keys", "toString(key_id)"),
+    ("request_types", "request_type"),
+];
+
+fn usage_log_facet_sql(expr: &str, filter: &str) -> String {
+    format!(
+        "select {expr} as facet, \
+         count() as requests, \
+         countIf(status_code >= 400) as errors \
+         from usage{filter} group by facet order by requests desc, facet limit {LOG_FACET_LIMIT}"
+    )
+}
+
+fn usage_log_failures_sql(filter: &str) -> String {
+    format!(
+        "select status_code, model, count() as requests \
+         from usage{filter} and status_code >= 400 \
+         group by status_code, model order by requests desc, model limit {LOG_FACET_LIMIT}"
+    )
+}
+
+/// Each facet of the requests matching the log's filters, and the most common
+/// failures. The reads run together; labels are left to the handler.
+pub async fn query_usage_log_facets(
+    client: &clickhouse::Client,
+    q: UsageLogQuery,
+) -> Result<UsageLogFacets, clickhouse::error::Error> {
+    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let (filter, binds) = log_filter_sql(&q, since);
+    let facet = |expr: &str| {
+        let sql = usage_log_facet_sql(expr, &filter);
+        let query = bind_log_filters(client.query(&sql), binds.clone());
+        async move {
+            let rows = query.fetch_all::<UsageLogFacetRow>().await?;
+            Ok::<_, clickhouse::error::Error>(
+                rows.into_iter()
+                    .map(|r| UsageLogFacet {
+                        value: r.facet,
+                        label: String::new(),
+                        requests: r.requests,
+                        errors: r.errors,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+    };
+    let failures_sql = usage_log_failures_sql(&filter);
+    let failures =
+        bind_log_filters(client.query(&failures_sql), binds.clone()).fetch_all::<UsageLogFailure>();
+    let dims = LOG_FACET_DIMENSIONS;
+    let (status_codes, models, tenants, keys, request_types, failures) = tokio::try_join!(
+        facet(dims[0].1),
+        facet(dims[1].1),
+        facet(dims[2].1),
+        facet(dims[3].1),
+        facet(dims[4].1),
+        failures,
+    )?;
+    Ok(UsageLogFacets {
+        status_codes,
+        models,
+        tenants,
+        keys,
+        request_types,
+        failures,
+    })
 }
 
 /// `traced_only` subquery. It takes the outer query's resolved `since` so the
@@ -1614,6 +1736,7 @@ mod alias_tests {
             session_id: None,
             device_id: None,
             status: None,
+            status_code: None,
             request_id: None,
             since_ms: None,
             until_ms: None,
@@ -1638,6 +1761,7 @@ mod alias_tests {
             session_id: Some("s".into()),
             device_id: Some("d".into()),
             status: Some("error".into()),
+            status_code: Some(502),
             request_id: Some("7c1e".into()),
             until_ms: Some(10),
             traced_only: Some(true),
@@ -1647,7 +1771,32 @@ mod alias_tests {
         assert_eq!(sql.matches('?').count(), binds.len());
         assert_eq!(binds.len(), 9);
         assert!(sql.contains("status_code >= 400"));
+        assert!(sql.contains("status_code = 502"));
         assert!(sql.contains("FROM spans"));
+    }
+
+    #[test]
+    fn log_facet_aliases_do_not_shadow_columns() {
+        for (_, expr) in LOG_FACET_DIMENSIONS {
+            let sql = usage_log_facet_sql(expr, " where ts_ms >= ?");
+            assert_no_shadowing(&sql);
+            assert_eq!(select_items(&sql).len(), 3);
+        }
+    }
+
+    #[test]
+    fn log_failures_count_only_failures_and_keep_the_filters() {
+        let (filter, binds) = log_filter_sql(
+            &UsageLogQuery {
+                model: Some("m".into()),
+                ..log_query()
+            },
+            0,
+        );
+        let sql = usage_log_failures_sql(&filter);
+        assert!(sql.contains(" and model = ?"));
+        assert!(sql.contains(" and status_code >= 400 group by"));
+        assert_eq!(sql.matches('?').count(), binds.len());
     }
 
     #[test]

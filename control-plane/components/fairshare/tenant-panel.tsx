@@ -2,6 +2,7 @@
 
 import { useEffect, useMemo, useState, useTransition } from "react";
 import Link from "next/link";
+import { logsHref } from "@/lib/log-links";
 import { useQueryClient } from "@tanstack/react-query";
 import { Minus, Plus, X } from "lucide-react";
 import * as DialogPrimitive from "@radix-ui/react-dialog";
@@ -100,6 +101,7 @@ function Body({ tenant, view, keys, series }: { tenant: TenantFairshareView; vie
           {!tenant.queued && <Pill>No queued requests</Pill>}
           <Pill>{tenant.in_flight.toLocaleString()} running</Pill>
           <Link href="/tenants" className="inline-flex h-[22px] items-center rounded-full border border-border px-2 text-[11.5px] font-medium hover:bg-accent">Open tenant ›</Link>
+          <Link href={logsHref({ team: tenant.tenant_id, window: "1h" })} className="inline-flex h-[22px] items-center rounded-full border border-border px-2 text-[11.5px] font-medium hover:bg-accent">Its requests ›</Link>
         </div>
       </div>
 

@@ -1,12 +1,13 @@
 import { requireAdmin } from "@/lib/auth/roles";
 import { RequestLogs } from "@/components/logs/request-logs";
+import { linkTime } from "@/lib/log-links";
 import { LOG_WINDOWS, type LogFilters } from "@/lib/logs-model";
 import { obleth } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
 
-type Params = { requestId?: string; model?: string; status?: string; team?: string; key?: string; session?: string; window?: string };
+type Params = { requestId?: string; model?: string; status?: string; code?: string; team?: string; key?: string; session?: string; window?: string; since?: string; until?: string };
 
 export default async function LogsPage({ searchParams }: { searchParams: Promise<Params> }) {
   await requireAdmin();
@@ -25,15 +26,20 @@ export default async function LogsPage({ searchParams }: { searchParams: Promise
     .sort((a, b) => (a.name || a.prefix).localeCompare(b.name || b.prefix));
   const modelOptions = models.map((m) => m.model_name).sort((a, b) => a.localeCompare(b));
 
-  // Other pages link here with a filter already chosen: `?status=error`,
-  // `?model=<name>`, `?team=<tenant id>`, `?key=<key id>`, `?session=<id>`.
+  // Other pages link here with a filter already chosen (lib/log-links.ts):
+  // `status`, `code`, `model`, `team`, `key`, `session`, and a `window` or
+  // exact `since`/`until`.
+  const since = linkTime(q.since, false);
+  const until = linkTime(q.until, true);
   const initial: Partial<LogFilters> = {
     ...(q.status === "error" || q.status === "success" ? { status: q.status } : {}),
+    ...(q.code && /^[1-5]\d\d$/.test(q.code) ? { statusCode: q.code } : {}),
     ...(q.model && modelOptions.includes(q.model) ? { model: q.model } : {}),
     ...(q.team && tenantOptions.some((t) => t.id === q.team) ? { tenantId: q.team } : {}),
     ...(q.key ? (() => { const k = keyOptions.find((x) => x.id === q.key); return k ? { keyId: k.id, tenantId: k.tenantId } : {}; })() : {}),
     ...(q.session ? { sessionId: q.session } : {}),
     ...(LOG_WINDOWS.some((w) => w.id === q.window) ? { window: q.window as LogFilters["window"] } : {}),
+    ...(since !== undefined ? { window: "custom" as const, sinceMs: since, untilMs: until } : {}),
   };
 
   return (

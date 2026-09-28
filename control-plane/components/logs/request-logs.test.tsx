@@ -25,7 +25,16 @@ beforeEach(() => {
   calls.length = 0;
   vi.stubGlobal("fetch", vi.fn(async (url: string) => {
     calls.push(url);
-    const body = url.includes("/histogram")
+    const body = url.includes("/facets")
+      ? {
+          status_codes: [{ value: "200", label: "", requests: 38, errors: 0 }, { value: "502", label: "", requests: 2, errors: 2 }],
+          models: [{ value: "glm-5-3", label: "", requests: 30, errors: 2 }],
+          tenants: [{ value: "t-cs", label: "cs-teaching", requests: 40, errors: 2 }],
+          keys: [{ value: "k-1", label: "canvas-tutor · sk-ct9", requests: 40, errors: 2 }],
+          request_types: [{ value: "chat", label: "", requests: 40, errors: 2 }],
+          failures: [{ status_code: 502, model: "granite41-30b", requests: 2 }],
+        }
+      : url.includes("/histogram")
       ? { bucket_ms: 60_000, buckets: [{ bucket_ms: Math.floor((now - 60_000) / 60_000) * 60_000, requests: 40, errors: 2 }] }
       : url.includes("status=error")
         ? [entry({ request_id: "bad00000-0000-0000-0000-000000000000", status_code: 502, cost_usd: 0, output_tokens: 0, ttft_ms: 0 })]
@@ -116,6 +125,20 @@ describe("the request log", () => {
     expect(host.querySelector('[role="dialog"]')).toBeNull();
     expect(calls.some((c) => c.includes("session_id=sess_8f2c"))).toBe(true);
     expect(host.textContent).toContain("sess_8f2c");
+  });
+
+  it("breaks the window down, and narrows the list to what is clicked", async () => {
+    await render();
+    const panel = host.querySelector('[aria-label="What\'s in this window"]')!;
+    expect(panel.textContent).toContain("502 Bad gateway");
+    expect(panel.textContent).toContain("canvas-tutor · sk-ct9");
+    const pair = [...panel.querySelectorAll("button")].find((b) => b.textContent?.includes("granite41-30b"))!;
+    await act(async () => pair.click());
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)); });
+    expect(calls.some((c) => c.startsWith("/api/live/usage/logs?") && c.includes("status_code=502") && c.includes("model=granite41-30b"))).toBe(true);
+    expect(host.textContent).toContain("HTTP 502");
+    // Looking at failures, the panel says so.
+    expect(host.querySelector('[aria-label="Failures by"]')).not.toBeNull();
   });
 
   it("pauses to page back through history", async () => {

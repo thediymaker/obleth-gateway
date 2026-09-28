@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { Bookmark, Search, X } from "lucide-react";
+import { Facets } from "@/components/logs/facets";
 import { RequestPanel } from "@/components/logs/request-panel";
 import { Segmented } from "@/components/overview/ui";
 import { Button } from "@/components/ui/button";
@@ -34,7 +35,7 @@ import {
   type Named,
   type SavedView,
 } from "@/lib/logs-model";
-import type { UsageLogEntry, UsageLogHistogram } from "@/lib/obleth";
+import type { UsageLogEntry, UsageLogFacets, UsageLogHistogram } from "@/lib/obleth";
 import { cn, getJson } from "@/lib/utils";
 
 const PAGE = 50;
@@ -154,7 +155,7 @@ export function RequestLogs({
   initialRequestId?: string;
 }) {
   const [filters, setFilters] = useState<LogFilters>({ ...DEFAULT_LOG_FILTERS, ...initial, ...(initialRequestId ? { requestId: initialRequestId, includeInternal: true, window: "30d" as const } : {}) });
-  const [live, setLive] = useState(!initialRequestId);
+  const [live, setLive] = useState(!initialRequestId && initial?.window !== "custom");
   const [pinnedAt, setPinnedAt] = useState(() => Date.now());
   const [older, setOlder] = useState<UsageLogEntry[]>([]);
   const [loadingOlder, setLoadingOlder] = useState(false);
@@ -201,6 +202,12 @@ export function RequestLogs({
     queryKey: ["request-logs-histogram", filters, rangeAt, bucketMs],
     queryFn: () => getJson<UsageLogHistogram>(`/api/live/usage/logs/histogram?${logParams(filters, windowRange(filters, rangeAt ?? Date.now()), { bucket_ms: bucketMs })}`),
     refetchInterval: live ? 15_000 : false,
+    placeholderData: keepPreviousData,
+  });
+  const facets = useQuery({
+    queryKey: ["request-logs-facets", filters, rangeAt],
+    queryFn: () => getJson<UsageLogFacets>(`/api/live/usage/logs/facets?${logParams(filters, windowRange(filters, rangeAt ?? Date.now()))}`),
+    refetchInterval: live ? 30_000 : false,
     placeholderData: keepPreviousData,
   });
   const top = head.data?.[0];
@@ -259,7 +266,9 @@ export function RequestLogs({
 
   const tenantName = new Map(tenants.map((t) => [t.id, t.name]));
   const teamKeys = filters.tenantId ? keys.filter((k) => k.tenantId === filters.tenantId) : keys;
-  const winLabel = filters.window === "custom" ? `between ${new Date(range.since).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} and ${new Date(range.until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : `in the last ${{ "15m": "15 minutes", "1h": "hour", "24h": "24 hours", "7d": "7 days", "30d": "30 days" }[filters.window]}`;
+  const at = (t: number) => new Date(t).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  const sameDay = new Date(range.since).toDateString() === new Date(range.until).toDateString();
+  const winLabel = filters.window === "custom" ? `between ${at(range.since)} and ${sameDay ? new Date(range.until).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : at(range.until)}` : `in the last ${{ "15m": "15 minutes", "1h": "hour", "24h": "24 hours", "7d": "7 days", "30d": "30 days" }[filters.window]}`;
   const saveView = () => {
     const name = naming?.trim();
     if (!name) return;
@@ -329,7 +338,7 @@ export function RequestLogs({
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter") runSearch(); if (e.key === "Escape") setDraft(""); }}
-              placeholder="Request ID, or model:, team:, key:, status:, type:, session:"
+              placeholder="Request ID, or model:, team:, key:, status: (error, ok or a code), type:, session:"
               aria-label="Search requests"
               className="min-w-0 flex-1 bg-transparent outline-none placeholder:text-muted-foreground"
             />
@@ -339,7 +348,7 @@ export function RequestLogs({
             label="Time window"
             value={filters.window}
             onChange={(w) => { if (w !== "custom") { patch({ window: w, sinceMs: undefined, untilMs: undefined }); } }}
-            options={[...LOG_WINDOWS.map((w) => ({ value: w.id, label: w.label })), ...(filters.window === "custom" ? [{ value: "custom" as const, label: "Zoomed" }] : [])]}
+            options={[...LOG_WINDOWS.map((w) => ({ value: w.id, label: w.label })), ...(filters.window === "custom" ? [{ value: "custom" as const, label: "Custom" }] : [])]}
           />
         </div>
         {searchNote && <p className="text-xs text-foreground">{searchNote}</p>}
@@ -351,6 +360,7 @@ export function RequestLogs({
           <Select aria-label="Type" value={filters.requestType} onValueChange={(v) => patch({ requestType: v })} className={cn("h-8 w-auto min-w-[7.5rem] text-[12.5px]", filters.requestType && "border-foreground")} options={[{ value: "", label: "Any type" }, ...REQUEST_TYPES.map((t) => ({ value: t, label: t }))]} />
           <Toggle on={filters.tracedOnly} onClick={() => patch({ tracedOnly: !filters.tracedOnly })}>Traced only</Toggle>
           <Toggle on={filters.includeInternal} onClick={() => patch({ includeInternal: !filters.includeInternal })}>Include health checks</Toggle>
+          {filters.statusCode && <Chip active onClear={() => patch({ statusCode: "" })}>HTTP <span className="font-mono">{filters.statusCode}</span></Chip>}
           {filters.sessionId && <Chip active onClear={() => patch({ sessionId: "" })}>Session <span className="font-mono">{filters.sessionId.slice(0, 12)}{filters.sessionId.length > 12 ? "…" : ""}</span></Chip>}
           {filters.requestId && <Chip active onClear={() => patch({ requestId: "" })}>ID starts <span className="font-mono">{filters.requestId}</span></Chip>}
           {filtersActive(filters) && (
@@ -365,6 +375,8 @@ export function RequestLogs({
         loading={histogram.isLoading}
         onZoom={(since, until) => { setLive(false); patch({ window: "custom", sinceMs: since, untilMs: Math.min(until, Date.now()) }); }}
       />
+
+      <Facets facets={facets.data} filters={filters} onPatch={patch} loading={facets.isLoading} />
 
       <section aria-label="Requests" className="overflow-hidden rounded-xl border border-border bg-card">
         {!live && (newer.data?.length ?? 0) > 0 && (
