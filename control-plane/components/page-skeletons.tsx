@@ -226,6 +226,41 @@ export function UsersSkeleton() {
   );
 }
 
+/** Deployments: header, the two cluster cards, four tiles, filters, and the table. */
+export function DeploymentsSkeleton() {
+  return (
+    <Loading label="Loading deployments">
+      <Header controls={2} />
+      <div className="grid gap-3 lg:grid-cols-2">
+        <SkeletonPanel className="h-[112px] gap-2.5"><Skeleton className="h-4 w-32" /><Skeleton className="h-3 w-3/4" /><Skeleton className="h-3 w-1/2" /></SkeletonPanel>
+        <SkeletonPanel className="h-[112px] gap-2.5"><Skeleton className="h-4 w-24" /><Skeleton className="h-2 w-full" /><Skeleton className="h-3 w-2/3" /></SkeletonPanel>
+      </div>
+      <Tiles count={4} className="grid grid-cols-2 gap-3 xl:grid-cols-4" />
+      <Table rows={9} filters={2} />
+    </Loading>
+  );
+}
+
+/** A deployment's page: header, section list, tiles, replicas and load. */
+export function DeploymentSkeleton() {
+  return (
+    <Loading label="Loading the deployment">
+      <div className="flex flex-wrap items-end justify-between gap-4">
+        <div className="space-y-2.5"><Skeleton className="h-3 w-28" /><Skeleton className="h-8 w-64" /><Skeleton className="h-5 w-[28rem] max-w-[70vw]" /></div>
+        <div className="flex gap-2"><Skeleton className="h-9 w-32 rounded-lg" /><Skeleton className="h-9 w-24 rounded-lg" /><Skeleton className="h-9 w-9 rounded-lg" /></div>
+      </div>
+      <div className="grid gap-6 lg:grid-cols-[200px_minmax(0,1fr)]">
+        <div className="hidden space-y-2 lg:block"><Rows count={6} className="h-7 rounded-lg" /></div>
+        <div className="flex flex-col gap-4">
+          <Tiles count={4} className="grid grid-cols-2 gap-3 xl:grid-cols-4" />
+          <div className="grid gap-3 xl:grid-cols-2"><SkeletonPanel className="h-[150px]" /><SkeletonPanel className="h-[150px]" /></div>
+          <SkeletonPanel className="h-[220px]"><Skeleton className="h-4 w-28" /><Skeleton className="mt-2 flex-1" /></SkeletonPanel>
+        </div>
+      </div>
+    </Loading>
+  );
+}
+
 /** Request logs: header, search and filters, the per-minute strip, then rows. */
 export function LogsSkeleton() {
   return (

@@ -55,6 +55,7 @@ export function SettingsTabs({
   routerReadiness,
   slurm,
   versionCard,
+  initialTab = "alerts",
 }: {
   alertSettings: AlertSettingsView | null;
   autoRouter: AutoRouterSettingsView | null;
@@ -68,9 +69,11 @@ export function SettingsTabs({
   routerReadiness: RouterReadinessView | null;
   slurm: SlurmSettingsView | null;
   versionCard: ReactNode;
+  /** The tab to open on, from `?tab=` (e.g. Deployments links to `slurm`). */
+  initialTab?: string;
 }) {
   return (
-    <Tabs defaultValue="alerts">
+    <Tabs defaultValue={initialTab}>
       <TabsList>
         <TabsTrigger value="alerts">
           <Bell className="h-3.5 w-3.5" />

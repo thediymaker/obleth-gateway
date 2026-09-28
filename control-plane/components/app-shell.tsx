@@ -6,7 +6,7 @@ import { authClient } from "@/lib/auth/client";
 import { useEffect, useMemo, useState } from "react";
 import {
   BookOpen,
-  BookText,
+  Rocket,
   Boxes,
   BarChart3,
   ChevronDown,
@@ -46,6 +46,7 @@ const navGroups = [
   { label: "Operations", items: [
     { href: "/fairshare", label: "Fairshare", icon: Gauge },
     { href: "/models", label: "Models", icon: Boxes },
+    { href: "/deployments", label: "Deployments", icon: Rocket },
     { href: "/playground", label: "Playground", icon: FlaskConical },
     { href: "/logs", label: "Request Logs", icon: Radio },
     { href: "/reports", label: "Reports", icon: BarChart3 },
@@ -56,7 +57,6 @@ const navGroups = [
     { href: "/users", label: "Users", icon: UserCog },
   ] },
   { label: "Configuration", items: [
-    { href: "/recipes", label: "Recipes", icon: BookText },
     { href: "/mcp", label: "MCP Servers", icon: Plug },
     { href: "/knowledge", label: "Knowledge", icon: BookOpen },
     { href: "/settings", label: "Settings", icon: Settings },

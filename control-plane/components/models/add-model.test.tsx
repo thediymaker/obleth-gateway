@@ -12,7 +12,6 @@ vi.mock("@/app/actions", () => ({
   activateModelsAction: vi.fn(),
 }));
 vi.mock("@/components/provider-import-wizard", () => ({ ProviderImportWizard: () => null }));
-vi.mock("@/components/recipes/recipe-list", () => ({ RecipeList: () => null }));
 const push = vi.fn();
 vi.mock("next/navigation", () => ({ useRouter: () => ({ refresh: vi.fn(), push }) }));
 
@@ -41,7 +40,7 @@ const button = (text: string) => [...document.querySelectorAll("button")].find((
 
 async function open(models: Partial<ModelRoute>[] = []) {
   await act(async () => {
-    root.render(<AddModelSheet mode="connect" onModeChange={() => {}} onClose={() => {}} slurmEnabled={false} recipeCards={[]} models={models as ModelRoute[]} />);
+    root.render(<AddModelSheet mode="connect" onModeChange={() => {}} onClose={() => {}} slurmEnabled={false} models={models as ModelRoute[]} />);
   });
 }
 

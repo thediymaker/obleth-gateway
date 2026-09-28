@@ -60,6 +60,21 @@ describe("buildManagedFromRecipe", () => {
     expect(p.managedBody.time_limit).toBe("02:00:00");
   });
 
+  it("applies the launch flow's placement and replica overrides", () => {
+    const p = buildManagedFromRecipe(parseRecipe("glm", file()), {
+      gres: "gpu:h100:2",
+      cpus_per_task: 32,
+      mem: "256G",
+      account: "ai-gateway",
+      min_replicas: 2,
+      max_job_failures: 5,
+    });
+    expect(p.managedBody).toMatchObject({ gres: "gpu:h100:2", cpus_per_task: 32, mem: "256G", account: "ai-gateway", min_replicas: 2, max_job_failures: 5 });
+    // A blank CPU count clears the recipe's; an omitted one keeps it.
+    expect(buildManagedFromRecipe(parseRecipe("glm", file("cpus_per_task: 72")), { cpus_per_task: null }).managedBody.cpus_per_task).toBeNull();
+    expect(buildManagedFromRecipe(parseRecipe("glm", file("cpus_per_task: 72")), {}).managedBody.cpus_per_task).toBe(72);
+  });
+
   it("keeps the recipe value when an override field is omitted", () => {
     const p = buildManagedFromRecipe(parseRecipe("glm", file()), { qos: "private" });
     expect(p.managedBody.qos).toBe("private");

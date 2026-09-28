@@ -398,6 +398,10 @@ export type ClusterResources = {
     cpus: number | null;
     real_memory_mb: number | null;
     features: string[];
+    /** Slurm's state flags, e.g. ["IDLE"] or ["MIXED", "DRAIN"]; absent from older gateways. */
+    state?: string[];
+    alloc_cpus?: number | null;
+    alloc_memory_mb?: number | null;
   }[];
   accounts: string[];
   qos: string[];
@@ -2117,6 +2121,8 @@ export const obleth = {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
+  /** Every replica of every managed model. */
+  listAllReplicas: () => api<ModelReplica[]>("/replicas"),
   listReplicas: (id: string) =>
     api<ModelReplica[]>(`/models/${id}/replicas`),
   clearLostReplicas: (id: string, options?: AuditOptions) =>

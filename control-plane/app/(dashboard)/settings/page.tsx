@@ -6,8 +6,11 @@ import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
 
-export default async function SettingsPage() {
+const SETTINGS_TABS = ["alerts","routing","boons","compression","knowledge","energy","data","slurm","assistant","about"];
+
+export default async function SettingsPage({ searchParams }: { searchParams: Promise<{ tab?: string }> }) {
   await requireAdmin();
+  const { tab } = await searchParams;
   const [settings, autoRouter, boons, compressor, charo, energy, knowledge, models, retention, slurm, routerReadiness] =
     await Promise.all([
       safe(obleth.getAlertSettings(), null),
@@ -45,6 +48,7 @@ export default async function SettingsPage() {
         routerReadiness={routerReadiness}
         slurm={slurm}
         versionCard={<VersionCard />}
+        initialTab={tab && SETTINGS_TABS.includes(tab) ? tab : undefined}
       />
     </div>
   );
