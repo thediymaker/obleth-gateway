@@ -24,10 +24,12 @@ git push origin main v0.3.0
 # 3. Once the tag pipeline is green, move every running deployment to the
 #    release. The chart's empty image tags resolve to v{appVersion}, so one
 #    chart upgrade carries the compressor and every other component along;
-#    --reuse-values keeps any deliberate per-environment overrides (such as
-#    edge :dev tags) intact. A release is not done until this has run.
+#    --reset-then-reuse-values keeps your overrides (such as edge :dev tags)
+#    and still picks up defaults the new chart changed, which plain
+#    --reuse-values would pin at their old values. A release is not done
+#    until this has run.
 helm upgrade obleth oci://ghcr.io/thediymaker/charts/obleth \
-  --version 0.3.0 --namespace obleth --reuse-values
+  --version 0.3.0 --namespace obleth --reset-then-reuse-values
 ```
 
 Pushing the tag triggers `.github/workflows/release.yml`, which:

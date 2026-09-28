@@ -1326,7 +1326,8 @@ export interface BoonSettingsView {
 }
 
 // One per-category gate of the speculation boon. Missing thresholds fall back
-// to the global floors server-side; `speculate: false` excludes the category.
+// to fixed floors (agree 0.5, lp -1.0) server-side, not the global ones;
+// `speculate: false` excludes the category.
 export interface SpeculationCategoryGate {
   tag: string;
   speculate?: boolean;

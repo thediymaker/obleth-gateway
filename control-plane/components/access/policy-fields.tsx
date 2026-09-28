@@ -207,7 +207,7 @@ const COMPRESSION_PARTS: { key: keyof Omit<CompressionPolicy, "enabled">; label:
   { key: "code_compaction", label: "Code compaction", hint: "Strip spare whitespace from fenced code." },
   { key: "dedup", label: "Cross-turn dedup", hint: "Replace repeated blocks with a reference the model can expand." },
   { key: "compact_logs", label: "Log compaction", hint: "Collapse repeated log lines; errors and warnings stay." },
-  { key: "allow_lossy", label: "Allow lossy", hint: "Summarize long prose with a helper model; the original stays retrievable." },
+  { key: "allow_lossy", label: "Allow lossy", hint: "Shorten long prose by keeping its most relevant sentences; the original stays retrievable." },
 ];
 
 const OFF: CompressionPolicy = { enabled: false, code_compaction: false, dedup: false, compact_logs: false, allow_lossy: false };
@@ -241,7 +241,7 @@ export function CompressionFields({ policy }: { policy: CompressionPolicy | null
             </Setting>
           ))}
           {p.enabled && (p.dedup || p.allow_lossy) && (
-            <p className="border-t border-border px-[18px] py-2.5 text-[11.5px] text-muted-foreground">Dedup and lossy need a model with function calling and the gateway tool loop on.</p>
+            <p className="border-t border-border px-[18px] py-2.5 text-[11.5px] text-muted-foreground">Fetching a replaced original back needs a model with function calling and the gateway tool loop on.</p>
           )}
         </>
       )}
