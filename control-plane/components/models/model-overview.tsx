@@ -12,6 +12,7 @@ import type { ModelCapacityStatus, ModelHealthCheck, ModelHealthSummary, ModelRo
 import { logsHref } from "@/lib/log-links";
 import { changeLabel, compact, describeAudit, formatMs } from "@/lib/overview-model";
 import { cn, getJson } from "@/lib/utils";
+import { auditHref } from "@/lib/audit-model";
 
 const DAY_MS = 86_400_000;
 const CURRENT = "hsl(240 5% 90%)";
@@ -291,7 +292,7 @@ export function ModelOverview({
         <section id="activity" aria-label="Recent changes" className="scroll-mt-24 rounded-xl border border-border bg-card px-[18px] pb-2 pt-4">
           <div className="flex items-center justify-between pb-1.5">
             <h2 className="text-sm font-semibold">Recent changes</h2>
-            <Link href="/audit" className="text-[12.5px] text-secondary-foreground hover:text-foreground">Audit log ›</Link>
+            <Link href={auditHref("model", model.id)} className="text-[12.5px] text-secondary-foreground hover:text-foreground">Audit log ›</Link>
           </div>
           {!data ? (
             <div className="space-y-2 pb-2"><div className="skeleton h-4" /><div className="skeleton h-4" /></div>

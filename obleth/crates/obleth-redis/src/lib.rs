@@ -659,6 +659,77 @@ impl RedisStore {
         Ok((tokens, cost.parse().unwrap_or(0.0)))
     }
 
+    /// How long daily counters live: a little over a month of history.
+    const DAILY_STATS_TTL_SECS: i64 = 40 * 86_400;
+
+    fn daily_stats_key(kind: &str, id: &str, day: &str) -> String {
+        format!("obleth:daily:{kind}:{id}:{day}")
+    }
+
+    /// Add to one thing's counters for `day` (`YYYY-MM-DD`, UTC), e.g. an MCP
+    /// server's calls, failures and milliseconds. Counters expire after about
+    /// 40 days. Best-effort: callers on the request path fire and forget.
+    pub async fn bump_daily(
+        &self,
+        kind: &str,
+        id: &str,
+        day: &str,
+        fields: &[(&str, i64)],
+    ) -> Result<()> {
+        if fields.is_empty() {
+            return Ok(());
+        }
+        let key = Self::daily_stats_key(kind, id, day);
+        let mut pipe = redis::pipe();
+        for (field, by) in fields {
+            pipe.cmd("HINCRBY").arg(&key).arg(*field).arg(*by).ignore();
+        }
+        pipe.cmd("EXPIRE")
+            .arg(&key)
+            .arg(Self::DAILY_STATS_TTL_SECS)
+            .ignore();
+        let mut conn = self.conn.clone();
+        pipe.query_async::<()>(&mut conn).await?;
+        Ok(())
+    }
+
+    /// Each id's counters on each of `days`, as `(day, field → value)`; days with
+    /// nothing recorded are left out.
+    pub async fn read_daily(
+        &self,
+        kind: &str,
+        ids: &[String],
+        days: &[String],
+    ) -> Result<
+        std::collections::HashMap<String, Vec<(String, std::collections::HashMap<String, i64>)>>,
+    > {
+        let mut out = std::collections::HashMap::new();
+        if ids.is_empty() || days.is_empty() {
+            return Ok(out);
+        }
+        let mut pipe = redis::pipe();
+        for id in ids {
+            for day in days {
+                pipe.cmd("HGETALL")
+                    .arg(Self::daily_stats_key(kind, id, day));
+            }
+        }
+        let mut conn = self.conn.clone();
+        let rows: Vec<std::collections::HashMap<String, i64>> = pipe.query_async(&mut conn).await?;
+        let mut rows = rows.into_iter();
+        for id in ids {
+            let mut per_day = Vec::new();
+            for day in days {
+                let fields = rows.next().unwrap_or_default();
+                if !fields.is_empty() {
+                    per_day.push((day.clone(), fields));
+                }
+            }
+            out.insert(id.clone(), per_day);
+        }
+        Ok(out)
+    }
+
     /// Read a scope's (tenant or key id) committed term usage for `period_key`
     /// without touching it: counters stored for another period read as zero,
     /// since that is what the next request would find after rolling them.
@@ -1237,6 +1308,58 @@ mod tests {
     }
 
     /// Integration test; runs only when `OBLETH_TEST_REDIS_URL` is set.
+    #[tokio::test]
+    async fn daily_counters_add_up_and_expire() {
+        let Some(store) = test_store().await else {
+            return;
+        };
+        let id = Uuid::new_v4().to_string();
+        store
+            .bump_daily("test", &id, "2026-09-27", &[("calls", 1), ("ms", 40)])
+            .await
+            .unwrap();
+        store
+            .bump_daily(
+                "test",
+                &id,
+                "2026-09-27",
+                &[("calls", 1), ("ms", 60), ("errors", 1)],
+            )
+            .await
+            .unwrap();
+        store
+            .bump_daily("test", &id, "2026-09-28", &[("calls", 3)])
+            .await
+            .unwrap();
+        let days = [
+            "2026-09-26".to_string(),
+            "2026-09-27".to_string(),
+            "2026-09-28".to_string(),
+        ];
+        let read = store
+            .read_daily("test", &[id.clone(), "nobody".into()], &days)
+            .await
+            .unwrap();
+        let mine = &read[&id];
+        assert_eq!(mine.len(), 2, "a day with nothing recorded is left out");
+        assert_eq!(mine[0].0, "2026-09-27");
+        assert_eq!(mine[0].1["calls"], 2);
+        assert_eq!(mine[0].1["ms"], 100);
+        assert_eq!(mine[0].1["errors"], 1);
+        assert_eq!(mine[1].1["calls"], 3);
+        assert!(read["nobody"].is_empty());
+        let mut conn = store.conn.clone();
+        let ttl: i64 = redis::cmd("TTL")
+            .arg(RedisStore::daily_stats_key("test", &id, "2026-09-27"))
+            .query_async(&mut conn)
+            .await
+            .unwrap();
+        assert!(
+            ttl > 0 && ttl <= RedisStore::DAILY_STATS_TTL_SECS,
+            "counters must expire, got {ttl}"
+        );
+    }
+
     #[tokio::test]
     async fn committed_term_usage_never_expires_and_drops_a_legacy_ttl() {
         let Some(store) = test_store().await else {

@@ -371,6 +371,7 @@ pub fn router(state: AdminState) -> Router {
                 .delete(delete_mcp_server),
         )
         .route("/api/v1/audit", get(get_audit))
+        .route("/api/v1/stats/daily", get(get_daily_stats))
         .route("/api/v1/capacity", get(get_capacity).put(set_capacity))
         .route(
             "/api/v1/settings/alerts",
@@ -1271,8 +1272,35 @@ pub struct CreateMcpServer {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateMcpServer {
     pub upstream_url: String,
+    /// A new Authorization header; omit to keep the stored one.
     pub auth_header: Option<String>,
+    /// Remove the stored Authorization header (ignored when `auth_header` is set).
+    #[serde(default)]
+    pub clear_auth: bool,
     pub enabled: Option<bool>,
+    /// A new name; the server's `/mcp/<name>` path and every model grant follow it.
+    pub name: Option<String>,
+}
+
+/// A server's name is the `/mcp/<name>` path segment and the key models grant
+/// it by: letters, digits, `.`, `_` and `-`, up to 64, starting with a letter or digit.
+fn validate_mcp_server_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(AdminError::BadRequest(
+            "server name must be 1-64 letters, digits, '.', '_' or '-', starting with a letter or digit".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
@@ -1284,6 +1312,19 @@ pub struct ListKeysQuery {
 #[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
 pub struct AuditQuery {
     pub limit: Option<i64>,
+    /// Exact actor (an email, `admin`, …).
+    pub actor: Option<String>,
+    pub entity_type: Option<String>,
+    pub entity_id: Option<String>,
+    /// One action or several, comma-separated.
+    pub action: Option<String>,
+    /// RFC 3339; `since` inclusive, `until` exclusive.
+    pub since: Option<String>,
+    pub until: Option<String>,
+    /// Page back from this row id (exclusive).
+    pub before_id: Option<i64>,
+    /// Free text over actor, action, entity id and detail.
+    pub q: Option<String>,
 }
 
 /// OpenAPI shape for audit-log rows (`GET /api/v1/audit`).
@@ -7238,6 +7279,7 @@ async fn create_mcp_server(
     headers: HeaderMap,
     Json(body): Json<CreateMcpServer>,
 ) -> Result<Json<McpServerView>> {
+    validate_mcp_server_name(&body.name)?;
     state.ssrf.validate(&body.upstream_url).await?;
     let server = state
         .store
@@ -7291,11 +7333,26 @@ async fn update_mcp_server(
 ) -> Result<Json<McpServerView>> {
     state.ssrf.validate(&body.upstream_url).await?;
     let existing = state.store.get_mcp_server(id).await?;
-    let auth = body
+    let rename = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| *n != existing.name)
+        .map(str::to_string);
+    if let Some(name) = &rename {
+        validate_mcp_server_name(name)?;
+    }
+    let auth = match body
         .auth_header
         .as_deref()
-        .or(existing.auth_header.as_deref());
-    let server = state
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        Some(new) => Some(new),
+        None if body.clear_auth => None,
+        None => existing.auth_header.as_deref(),
+    };
+    let mut server = state
         .store
         .update_mcp_server(
             id,
@@ -7304,6 +7361,26 @@ async fn update_mcp_server(
             body.enabled.unwrap_or(existing.enabled),
         )
         .await?;
+    let mut regranted: Vec<String> = Vec::new();
+    if let Some(name) = &rename {
+        let (renamed, models) = state.store.rename_mcp_server(id, name).await?;
+        server = renamed;
+        // The old name leaves the data-plane cache; the new one is published below.
+        state
+            .redis
+            .delete_resolved_mcp_server(&existing.name)
+            .await
+            .map_err(|e| eviction_failed("the MCP server's old name", e))?;
+        state
+            .redis
+            .publish_invalidation(&format!("mcp:{}", existing.name))
+            .await
+            .map_err(|e| eviction_failed("the MCP server's old name", e))?;
+        for model in &models {
+            sync_model(&state, model).await?;
+        }
+        regranted = models.into_iter().map(|m| m.model_name).collect();
+    }
     sync_mcp_server(&state, &server).await?;
     state
         .store
@@ -7312,7 +7389,15 @@ async fn update_mcp_server(
             "update_mcp_server",
             "mcp_server",
             &id.to_string(),
-            serde_json::json!({ "name": server.name }),
+            serde_json::json!({
+                "name": server.name,
+                "renamed_from": rename.as_ref().map(|_| existing.name.clone()),
+                "upstream_url": server.upstream_url,
+                "enabled": server.enabled,
+                "auth_header_set": server.auth_header.is_some(),
+                "auth_changed": body.auth_header.as_deref().is_some_and(|a| !a.trim().is_empty()) || (body.clear_auth && existing.auth_header.is_some()),
+                "models_regranted": regranted,
+            }),
         )
         .await?;
     Ok(Json(server.into()))
@@ -7379,6 +7464,108 @@ async fn delete_mcp_server(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
+pub struct DailyStatsQuery {
+    /// `mcp` (per server: `direct`, `tool_calls`, `errors`, `ms`) or
+    /// `knowledge` (per collection: `searches`, `hits`, `chunks`).
+    pub kind: String,
+    /// Days back from today, UTC; 1 to 40, default 7.
+    pub days: Option<u32>,
+}
+
+/// One thing's counters on one day.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DailyStat {
+    pub day: String,
+    pub counts: std::collections::HashMap<String, i64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DailyStatsItem {
+    /// The MCP server's name, or the collection's id.
+    pub id: String,
+    pub days: Vec<DailyStat>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DailyStatsView {
+    pub kind: String,
+    /// The days covered, oldest first.
+    pub days: Vec<String>,
+    pub items: Vec<DailyStatsItem>,
+}
+
+/// Daily usage counters the proxy keeps in Redis: MCP calls per server and
+/// knowledge searches per collection. Best-effort and about 40 days deep.
+#[utoipa::path(
+    get, path = "/api/v1/stats/daily", tag = "stats",
+    params(DailyStatsQuery),
+    responses((status = 200, body = DailyStatsView))
+)]
+async fn get_daily_stats(
+    State(state): State<AdminState>,
+    Query(q): Query<DailyStatsQuery>,
+) -> Result<Json<DailyStatsView>> {
+    let ids: Vec<String> = match q.kind.as_str() {
+        "mcp" => state
+            .store
+            .list_mcp_servers()
+            .await?
+            .into_iter()
+            .map(|s| s.name)
+            .collect(),
+        "knowledge" => state
+            .store
+            .list_collections()
+            .await?
+            .into_iter()
+            .map(|c| c.id.to_string())
+            .collect(),
+        _ => {
+            return Err(AdminError::BadRequest(
+                "kind must be mcp or knowledge".into(),
+            ))
+        }
+    };
+    let n = q.days.unwrap_or(7).clamp(1, 40);
+    let today = chrono::Utc::now().date_naive();
+    let days: Vec<String> = (0..n)
+        .rev()
+        .map(|back| {
+            (today - chrono::Duration::days(i64::from(back)))
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .collect();
+    let read = state
+        .redis
+        .read_daily(&q.kind, &ids, &days)
+        .await
+        .map_err(|e| AdminError::Internal(format!("daily stats unavailable: {e}")))?;
+    let items = ids
+        .into_iter()
+        .map(|id| DailyStatsItem {
+            days: read
+                .get(&id)
+                .map(|rows| {
+                    rows.iter()
+                        .map(|(day, counts)| DailyStat {
+                            day: day.clone(),
+                            counts: counts.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            id,
+        })
+        .collect();
+    Ok(Json(DailyStatsView {
+        kind: q.kind,
+        days,
+        items,
+    }))
+}
+
 #[utoipa::path(
     get, path = "/api/v1/audit", tag = "audit",
     params(AuditQuery),
@@ -7388,7 +7575,34 @@ async fn get_audit(
     State(state): State<AdminState>,
     Query(q): Query<AuditQuery>,
 ) -> Result<Json<Vec<AuditEntry>>> {
-    Ok(Json(state.store.list_audit(q.limit.unwrap_or(100)).await?))
+    let time = |v: &Option<String>, name: &str| -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        v.as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s.trim())
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|_| AdminError::BadRequest(format!("{name} must be an RFC 3339 time")))
+            })
+            .transpose()
+    };
+    let text = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let filter = obleth_store::AuditFilter {
+        since: time(&q.since, "since")?,
+        until: time(&q.until, "until")?,
+        actor: text(q.actor),
+        entity_type: text(q.entity_type),
+        entity_id: text(q.entity_id),
+        actions: text(q.action).map(|a| {
+            a.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        }),
+        before_id: q.before_id,
+        q: text(q.q),
+        limit: q.limit.unwrap_or(100),
+    };
+    Ok(Json(state.store.list_audit_filtered(&filter).await?))
 }
 
 #[utoipa::path(
@@ -10116,6 +10330,30 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(v["api_key_set"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn mcp_server_names_are_path_safe() {
+        for ok in ["github", "rc-docs", "jira.v2", "a_b", "x1"] {
+            assert!(
+                validate_mcp_server_name(ok).is_ok(),
+                "{ok} should be allowed"
+            );
+        }
+        for bad in [
+            "",
+            "-lead",
+            "has space",
+            "a/b",
+            "../up",
+            "ünï",
+            &"x".repeat(65),
+        ] {
+            assert!(
+                validate_mcp_server_name(bad).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
     }
 
     #[test]

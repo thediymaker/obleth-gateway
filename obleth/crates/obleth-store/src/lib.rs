@@ -1337,6 +1337,49 @@ impl Store {
         Ok(())
     }
 
+    /// Audit rows matching `f`, newest first. `before_id` pages back: pass the
+    /// last id of one page to get the next. `q` matches the actor, action,
+    /// entity id and the detail's text, case-insensitively.
+    pub async fn list_audit_filtered(&self, f: &AuditFilter) -> Result<Vec<AuditEntry>> {
+        let q =
+            f.q.as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| {
+                    let escaped = s
+                        .replace('\\', "\\\\")
+                        .replace('%', "\\%")
+                        .replace('_', "\\_");
+                    format!("%{escaped}%")
+                });
+        let rows = sqlx::query(
+            "select id, ts, actor, action, entity_type, entity_id, detail
+             from audit_log
+             where ($1::text is null or actor = $1)
+               and ($2::text is null or entity_type = $2)
+               and ($3::text is null or entity_id = $3)
+               and ($4::text[] is null or action = any($4))
+               and ($5::timestamptz is null or ts >= $5)
+               and ($6::timestamptz is null or ts < $6)
+               and ($7::bigint is null or id < $7)
+               and ($8::text is null or actor ilike $8 or action ilike $8 or entity_id ilike $8 or detail::text ilike $8)
+             order by id desc
+             limit $9",
+        )
+        .bind(f.actor.as_deref())
+        .bind(f.entity_type.as_deref())
+        .bind(f.entity_id.as_deref())
+        .bind(f.actions.as_deref())
+        .bind(f.since)
+        .bind(f.until)
+        .bind(f.before_id)
+        .bind(q)
+        .bind(f.limit.clamp(1, 1000))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(audit_from_row).collect()
+    }
+
     pub async fn list_audit(&self, limit: i64) -> Result<Vec<AuditEntry>> {
         let rows = sqlx::query(
             "select id, ts, actor, action, entity_type, entity_id, detail
@@ -3107,6 +3150,57 @@ impl Store {
         mcp_server_from_row(&row)
     }
 
+    /// Rename an MCP server and carry the new name into every model's
+    /// `tool_servers` grant, in one transaction. Returns the server and the
+    /// models whose grants changed, so the caller can republish them.
+    pub async fn rename_mcp_server(
+        &self,
+        id: Uuid,
+        new_name: &str,
+    ) -> Result<(McpServer, Vec<ModelRoute>)> {
+        let mut tx = self.pool.begin().await?;
+        let old: String = sqlx::query("select name from mcp_servers where id = $1 for update")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or(StoreError::NotFound)?
+            .try_get("name")?;
+        let row = sqlx::query(
+            "update mcp_servers set name = $2, updated_at = now() where id = $1
+             returning id, name, upstream_url, auth_header, enabled, created_at, updated_at",
+        )
+        .bind(id)
+        .bind(new_name)
+        .fetch_one(&mut *tx)
+        .await?;
+        let server = mcp_server_from_row(&row)?;
+        let rows = sqlx::query(
+            "update models
+                set tool_servers = (tool_servers - $1) || jsonb_build_array($2::text), updated_at = now()
+              where tool_servers ? $1
+             returning id, model_name, description, upstream_model, api_base, api_key, upstream_headers, model_type, aliases, quantization,
+                       input_cost_per_token, output_cost_per_token,
+                       cost_per_image, cost_per_audio_second, cost_per_character, cost_per_video, context_window,
+                       admission_weight, max_in_flight, supports_function_calling, supports_system_messages,
+                       supports_response_schema, supports_tool_choice, supports_vision, enabled,
+                       cache_enabled, cache_ttl_secs, tags, boons, tool_servers,
+                       capacity_mode, capacity_tuned_at, capacity_source, capacity_namespace, capacity_service,
+                       per_replica_max_in_flight, capacity_headroom,
+                       debug_diagnostics, energy_slots_per_node, route_bias, auto_eligible, draft_model, verify_api_base, verify_upstream_model,
+                       created_at, updated_at",
+        )
+        .bind(&old)
+        .bind(new_name)
+        .fetch_all(&mut *tx)
+        .await?;
+        let models = rows
+            .iter()
+            .map(model_from_row)
+            .collect::<Result<Vec<_>>>()?;
+        tx.commit().await?;
+        Ok((server, models))
+    }
+
     /// Delete an MCP server, returning its name so the cache can be invalidated.
     pub async fn delete_mcp_server(&self, id: Uuid) -> Result<String> {
         let row = sqlx::query("delete from mcp_servers where id = $1 returning name")
@@ -3423,6 +3517,20 @@ impl Store {
 }
 
 /// A single audit-log entry.
+/// What `list_audit_filtered` narrows to; every field is optional but `limit`.
+#[derive(Debug, Clone, Default)]
+pub struct AuditFilter {
+    pub actor: Option<String>,
+    pub entity_type: Option<String>,
+    pub entity_id: Option<String>,
+    pub actions: Option<Vec<String>>,
+    pub since: Option<chrono::DateTime<chrono::Utc>>,
+    pub until: Option<chrono::DateTime<chrono::Utc>>,
+    pub before_id: Option<i64>,
+    pub q: Option<String>,
+    pub limit: i64,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct AuditEntry {
     pub id: i64,
@@ -4494,6 +4602,93 @@ mod tests {
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` points at a
     /// throwaway Postgres. Skips silently otherwise so unit runs stay hermetic.
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// The audit log narrows by actor, entity, action, time and text, and pages back by id.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn audit_filters_and_pages() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let actor = format!("audit-{}@example.edu", Uuid::new_v4().simple());
+        let thing = Uuid::new_v4().to_string();
+        for (action, detail) in [
+            (
+                "create_model",
+                serde_json::json!({"model_name": "needle-model"}),
+            ),
+            (
+                "update_model",
+                serde_json::json!({"model_name": "needle-model", "note": "50%_off"}),
+            ),
+            ("delete_model", serde_json::json!({})),
+        ] {
+            store
+                .record_audit(&actor, action, "model", &thing, detail)
+                .await
+                .expect("audit");
+        }
+        let base = AuditFilter {
+            actor: Some(actor.clone()),
+            limit: 100,
+            ..Default::default()
+        };
+
+        let all = store.list_audit_filtered(&base).await.expect("all");
+        assert_eq!(
+            all.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(),
+            ["delete_model", "update_model", "create_model"]
+        );
+
+        let two = AuditFilter {
+            actions: Some(vec!["create_model".into(), "delete_model".into()]),
+            ..base.clone()
+        };
+        assert_eq!(store.list_audit_filtered(&two).await.unwrap().len(), 2);
+
+        let page = AuditFilter {
+            before_id: Some(all[0].id),
+            limit: 1,
+            ..base.clone()
+        };
+        assert_eq!(
+            store.list_audit_filtered(&page).await.unwrap()[0].action,
+            "update_model"
+        );
+
+        // % and _ in the text are literal, not wildcards.
+        let text = AuditFilter {
+            q: Some("50%_off".into()),
+            ..base.clone()
+        };
+        assert_eq!(store.list_audit_filtered(&text).await.unwrap().len(), 1);
+        let wild = AuditFilter {
+            q: Some("50%%off".into()),
+            ..base.clone()
+        };
+        assert!(store.list_audit_filtered(&wild).await.unwrap().is_empty());
+
+        let other = AuditFilter {
+            entity_type: Some("tenant".into()),
+            ..base.clone()
+        };
+        assert!(store.list_audit_filtered(&other).await.unwrap().is_empty());
+        let later = AuditFilter {
+            since: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+            ..base.clone()
+        };
+        assert!(store.list_audit_filtered(&later).await.unwrap().is_empty());
+        let byid = AuditFilter {
+            entity_id: Some(thing.clone()),
+            actor: None,
+            ..base
+        };
+        assert_eq!(store.list_audit_filtered(&byid).await.unwrap().len(), 3);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn tenant_key_audit_roundtrip() {
         let Some(url) = crate::test_support::test_db_url() else {
@@ -6107,6 +6302,88 @@ mod tests {
     /// touching grants for other servers (the stale-grant bug: a deleted
     /// server's name lingered in `tool_servers` forever, failing tool
     /// discovery on every request with no way to clear it from the UI).
+    /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.
+    /// Renaming a server carries the new name into every model that granted it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn rename_mcp_server_moves_model_grants() {
+        let Some(url) = crate::test_support::test_db_url() else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+        let _g = serial().lock().await;
+        let store = Store::connect(&url).await.expect("connect");
+        store.migrate().await.expect("migrate");
+        let mut fixtures = FixtureGuard::new(&store);
+
+        let old = format!("mcp-{}", Uuid::new_v4());
+        let new = format!("mcp-{}", Uuid::new_v4());
+        let other = format!("mcp-{}", Uuid::new_v4());
+        let server = store
+            .create_mcp_server(&old, "http://127.0.0.1:1/mcp", None)
+            .await
+            .expect("create mcp server");
+        fixtures.track_mcp_server(server.id);
+        let name = format!("m-{}", Uuid::new_v4());
+        let args = default_test_model(&name);
+        let model = store
+            .create_model(
+                args.0,
+                args.1,
+                args.2,
+                args.3,
+                args.4,
+                args.5,
+                args.6,
+                args.7,
+                args.8,
+                args.9,
+                args.10,
+                args.11,
+                args.12,
+                args.13,
+                args.14,
+                args.15,
+                args.16,
+                args.17,
+                args.18,
+                &args.19,
+                &args.20,
+                &[old.clone(), other.clone()],
+                args.22,
+                args.23,
+                true,
+                "",
+                "",
+                "",
+                &[],
+                "",
+                &Default::default(),
+                0.0,
+                "static",
+                &Default::default(),
+            )
+            .await
+            .expect("create model");
+        fixtures.track_model(model.id);
+
+        let (renamed, models) = store
+            .rename_mcp_server(server.id, &new)
+            .await
+            .expect("rename");
+        assert_eq!(renamed.name, new);
+        let changed = models
+            .iter()
+            .find(|m| m.id == model.id)
+            .expect("model regranted");
+        assert!(changed.tool_servers.contains(&new));
+        assert!(changed.tool_servers.contains(&other));
+        assert!(!changed.tool_servers.contains(&old));
+        assert!(matches!(
+            store.rename_mcp_server(Uuid::new_v4(), "x").await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
     async fn strip_tool_server_grants_removes_only_the_deleted_server() {
         let Some(url) = crate::test_support::test_db_url() else {

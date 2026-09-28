@@ -208,8 +208,12 @@ const modelCreateSchema = z.object({
   ...modelFieldsSchema,
 });
 
+// Mirrors the gateway: the name is the `/mcp/<name>` path segment and the key models grant it by.
+const MCP_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+const MCP_NAME_HINT = "Use letters, digits, '.', '_' or '-', starting with a letter or digit (up to 64).";
+
 const mcpCreateSchema = z.object({
-  name: requiredText("Name is required"),
+  name: z.preprocess(trimmed, z.string().min(1, "Name is required").regex(MCP_NAME_RE, MCP_NAME_HINT)),
   upstream_url: z.preprocess(
     trimmed,
     z.string().url("A valid upstream URL is required"),
@@ -1803,14 +1807,62 @@ export async function createMcpServerAction(
   return { ok: true };
 }
 
-export async function toggleMcpServerAction(
-  id: string,
-  upstreamUrl: string,
-  enabled: boolean,
-) {
+/** Turn an MCP server on or off. Off, its tools disappear from every model and `/mcp/<name>` answers 403. */
+export async function setMcpServerEnabledAction(id: string, enabled: boolean): Promise<ActionResult> {
   const session = await requireAdmin();
-  await obleth.updateMcpServer(id, { upstream_url: upstreamUrl, enabled }, { auditActor: session.email });
+  try {
+    const server = (await obleth.listMcpServers()).find((m) => m.id === id);
+    if (!server) return { ok: false, error: "That server no longer exists." };
+    await obleth.updateMcpServer(id, { upstream_url: server.upstream_url, enabled }, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
   revalidatePath("/mcp");
+  return { ok: true };
+}
+
+/**
+ * Save an MCP server's name, URL and key. A blank key keeps the stored one;
+ * `clearAuth` removes it. Renaming carries the new name into every model grant.
+ */
+export async function saveMcpServerAction(input: { id: string; name: string; upstreamUrl: string; authHeader?: string; clearAuth?: boolean }): Promise<ActionResult & { name?: string }> {
+  const session = await requireAdmin();
+  const name = input.name.trim();
+  if (!MCP_NAME_RE.test(name)) return { ok: false, error: MCP_NAME_HINT };
+  const url = input.upstreamUrl.trim();
+  if (!z.string().url().safeParse(url).success) return { ok: false, error: "A valid upstream URL is required." };
+  try {
+    const saved = await obleth.updateMcpServer(input.id, {
+      upstream_url: url,
+      name,
+      ...(input.authHeader?.trim() ? { auth_header: input.authHeader.trim() } : {}),
+      clear_auth: !!input.clearAuth && !input.authHeader?.trim(),
+    }, { auditActor: session.email });
+    revalidatePath("/mcp");
+    revalidatePath("/models");
+    return { ok: true, name: saved.name };
+  } catch (e) {
+    return actionError(e);
+  }
+}
+
+/** Grant a model an MCP server's tools, or take them away. */
+export async function setModelToolServerAction(modelId: string, server: string, on: boolean): Promise<ActionResult> {
+  const session = await requireAdmin();
+  try {
+    const model = await loadModel(modelId);
+    if (!model) return { ok: false, error: "That model no longer exists." };
+    const current = model.tool_servers ?? [];
+    const next = on ? [...new Set([...current, server])] : current.filter((s) => s !== server);
+    if (next.length === current.length && next.every((s, i) => s === current[i])) return { ok: true };
+    await obleth.updateModel(modelId, { ...toModelUpdateBody(model), tool_servers: next }, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  updateTag(CACHE_TAGS.models);
+  revalidatePath("/mcp");
+  revalidatePath("/models");
+  return { ok: true };
 }
 
 export async function deleteMcpServerAction(id: string): Promise<ActionResult> {
@@ -1876,6 +1928,66 @@ export async function setBoonSettingsAction(
   return { ok: true };
 }
 
+/** Turn knowledge retrieval on or off for every model that has the boon and a collection. */
+export async function setKnowledgeEnabledAction(enabled: boolean): Promise<ActionResult> {
+  return setKnowledgeSettingsAction({ enabled });
+}
+
+/** The Knowledge page's retrieval settings form, saved as one. */
+export async function saveRetrievalSettingsAction(formData: FormData): Promise<SettingsSaveResult<"retrieval">> {
+  const num = (k: string) => {
+    const v = trimmed(formData.get(k));
+    return v === "" ? undefined : Number(v);
+  };
+  const body: UpdateKnowledgeSettings = {
+    enabled: formData.get("enabled") === "on",
+    top_k: num("top_k"),
+    min_score: num("min_score"),
+    max_context_tokens: num("max_context_tokens"),
+    query_turns: num("query_turns"),
+    embed_timeout_ms: num("embed_timeout_ms"),
+    query_cache_ttl_s: num("query_cache_ttl_s"),
+    max_upload_bytes: num("max_upload_mb") === undefined ? undefined : Math.round(num("max_upload_mb")! * 1024 * 1024),
+    max_chunks_per_collection: num("max_chunks_per_collection"),
+    index_batch_size: num("index_batch_size"),
+    index_timeout_ms: num("index_timeout_ms"),
+    index_stale_after_secs: num("index_stale_after_secs"),
+    debug_snapshot: formData.get("debug_snapshot") === "on",
+  };
+  const bad = Object.entries(body).find(([, v]) => typeof v === "number" && (!Number.isFinite(v) || v < 0));
+  if (bad) return { ok: false, error: `${bad[0].replace(/_/g, " ")} must be a number of 0 or more.`, saved: [] };
+  if (body.min_score !== undefined && body.min_score > 1) return { ok: false, error: "Minimum score is between 0 and 1.", saved: [] };
+  const res = await setKnowledgeSettingsAction(body);
+  if (!res.ok) return { ok: false, error: res.error, saved: [] };
+  revalidatePath("/knowledge");
+  return { ok: true };
+}
+
+/**
+ * Attach a collection to a model, or detach it. Attaching also grants the
+ * model the Knowledge boon, which retrieval needs; detaching the last
+ * collection leaves the boon for the model page to manage.
+ */
+export async function attachCollectionAction(modelId: string, collectionId: string, attach: boolean): Promise<ActionResult> {
+  const session = await requireAdmin();
+  try {
+    const model = await loadModel(modelId);
+    if (!model) return { ok: false, error: "That model no longer exists." };
+    const { collection_ids } = await obleth.getModelCollections(modelId);
+    const next = attach ? [...new Set([...collection_ids, collectionId])] : collection_ids.filter((c) => c !== collectionId);
+    await obleth.setModelCollections(modelId, next, { auditActor: session.email });
+    if (attach && !(model.boons ?? []).includes("knowledge")) {
+      await obleth.updateModel(modelId, { ...toModelUpdateBody(model), boons: [...(model.boons ?? []), "knowledge"] }, { auditActor: session.email });
+    }
+  } catch (e) {
+    return actionError(e);
+  }
+  updateTag(CACHE_TAGS.models);
+  revalidatePath("/knowledge");
+  revalidatePath("/models");
+  return { ok: true };
+}
+
 export async function setKnowledgeSettingsAction(
   body: UpdateKnowledgeSettings,
 ): Promise<ActionResult> {
@@ -1886,6 +1998,7 @@ export async function setKnowledgeSettingsAction(
     return actionError(e);
   }
   revalidatePath("/settings");
+  revalidatePath("/knowledge");
   return { ok: true };
 }
 

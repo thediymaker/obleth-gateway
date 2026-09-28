@@ -881,6 +881,7 @@ impl BoonEngine {
                             }),
                         );
                     }
+                    record_collection_stats(state, &retrieval.collections);
                     retrieval.outcome
                 }
             };
@@ -2127,4 +2128,32 @@ mod tests {
             "the synthetic server entry must be in the map before the plan is built"
         );
     }
+}
+
+/// Count a retrieval in each searched collection's daily stats: one search,
+/// whether it contributed, and how many of its chunks were injected. Fire and
+/// forget, like the MCP call stats.
+fn record_collection_stats(state: &crate::state::AppState, collections: &[(uuid::Uuid, usize)]) {
+    if collections.is_empty() {
+        return;
+    }
+    let redis = state.redis.clone();
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let collections = collections.to_vec();
+    tokio::spawn(async move {
+        for (id, used) in collections {
+            let fields = [
+                ("searches", 1),
+                ("hits", i64::from(used > 0)),
+                ("chunks", used as i64),
+            ];
+            if let Err(e) = redis
+                .bump_daily("knowledge", &id.to_string(), &day, &fields)
+                .await
+            {
+                tracing::debug!(error = %e, "knowledge daily stats not recorded");
+                return;
+            }
+        }
+    });
 }

@@ -120,34 +120,33 @@ export function DocumentUpload({
           void handleFiles(e.dataTransfer.files);
         }}
         className={cn(
-          "flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed px-6 py-8 text-center transition-colors",
-          dragOver ? "border-primary/60 bg-primary/5" : "border-border/70 bg-background/30 hover:border-border",
+          "flex cursor-pointer flex-col items-center justify-center gap-1.5 rounded-lg border border-dashed px-6 py-5 text-center transition-colors",
+          dragOver ? "border-foreground bg-secondary/60" : "border-border hover:border-muted-foreground/60",
           pending && "pointer-events-none opacity-60",
         )}
       >
-        <UploadCloud className="h-6 w-6 text-muted-foreground/70" />
+        <UploadCloud className="h-5 w-5 text-muted-foreground" aria-hidden />
         <p className="text-sm font-medium">
           {progress
             ? progress.total === 1
               ? "Uploading…"
               : `Uploading ${progress.done + 1} of ${progress.total}…`
-            : "Drop files here, or click to browse"}
+            : "Drop .md, .txt or .csv files here, or click to pick them"}
         </p>
         <p className="text-xs text-muted-foreground">
-          {maxUploadBytes != null
-            ? `Up to ${formatBytes(maxUploadBytes)} per file`
-            : "Any size the gateway accepts"}
+          {`UTF-8 text only${maxUploadBytes != null ? `, up to ${formatBytes(maxUploadBytes)} each` : ""}. Each is split into chunks and embedded as it arrives.`}
         </p>
       </div>
       <input
         ref={inputRef}
         type="file"
         multiple
+        accept=".md,.markdown,.txt,.csv,text/markdown,text/plain,text/csv"
         className="hidden"
         onChange={(e) => void handleFiles(e.target.files)}
       />
       {errors.length > 0 && (
-        <div className="mt-2 space-y-1 rounded-md border border-destructive/35 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+        <div role="alert" className="mt-2 space-y-1 rounded-lg border border-foreground px-3 py-2 text-xs">
           {errors.length > 1 && (
             <p className="font-medium">{errors.length} files were not uploaded</p>
           )}
