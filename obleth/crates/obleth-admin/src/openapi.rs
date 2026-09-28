@@ -7,24 +7,28 @@ use utoipa::OpenApi;
 
 use crate::autotune::{AutotuneReport, AutotuneRequest, AutotuneStep, KneeReason, WorkloadProfile};
 use crate::model_health::{
-    BulkModelHealthResult, UpdateModelHealthConfig, ValidateModelRequest, ValidateModelResult,
+    BulkModelHealthResult, ModelActivation, UpdateModelHealthConfig, ValidateModelRequest,
+    ValidateModelResult,
 };
 use crate::usage::{
     CacheStats, CostAgg, KeyUsageSummary, KeyUsageSummaryQuery, ModelUsageTimePoint,
     TenantUsageTimePoint, UsageAgg, UsageBreakdownQuery, UsageDailyQuery, UsageDailyRow,
-    UsageKeyAgg, UsageKeyModelBreakdown, UsageLogQuery, UsageLogRow, UsageModelAgg, UsageQuery,
+    UsageKeyAgg, UsageKeyModelBreakdown, UsageLogBucket, UsageLogFacet, UsageLogFacets,
+    UsageLogFailure, UsageLogHistogram, UsageLogQuery, UsageLogRow, UsageModelAgg, UsageQuery,
     UsageSeriesQuery, UsageTimePoint,
 };
 use crate::{
     AlertSettingsView, ApplyAutotuneCapacity, AuditEntryView, AuditQuery, AutoRouterSettingsView,
-    BoonSettingsView, CapacityView, CharoSettingsView, CompactUsageResult, CompressorStatusView,
-    CreateFairshareGroup, CreateKey, CreateMcpServer, CreateModel, CreateModelEndpoint,
-    CreateTenant, CreatedKey, EmailSettingsView, EnergySettingsView, EnergyTestResult,
-    FairshareLiveView, GroupFairshareView, ListKeysQuery, LiveStats, OverviewSummaryView,
-    SetCapacity, SetDisabled, SetModelCache, SetModelCapacity, SetModelCapacityMode,
-    SetModelReliability, SetModelWeight, SetTenantAllowlist, SetTenantBudget, SetTenantCompression,
-    SetTenantGuardrails, SetTenantSchedule, SetTenantStatus, SetTenantSynthetic,
-    TenantFairshareView, TestAlertResult, TestEnergyQuery, UpdateAlertSettings,
+    BoonSettingsView, CapacityDiscoveryModelView, CapacityDiscoveryView, CapacityView,
+    CharoSettingsView, CompactUsageResult, CompressorStatusView, CreateFairshareGroup, CreateKey,
+    CreateMcpServer, CreateModel, CreateModelEndpoint, CreateTenant, CreatedKey, EmailSettingsView,
+    EnergySettingsView, EnergyTestResult, FairshareHistoryPointView, FairshareHistoryQuery,
+    FairshareHistoryView, FairshareLiveView, GroupFairshareView, KeyFairshareView, ListKeysQuery,
+    LiveStats, McpServerView, ModelEndpointView, ModelPoolView, ModelRouteView,
+    OverviewSummaryView, SetCapacity, SetDisabled, SetModelCache, SetModelCapacity,
+    SetModelCapacityMode, SetModelReliability, SetModelWeight, SetTenantAllowlist, SetTenantBudget,
+    SetTenantCompression, SetTenantGuardrails, SetTenantSchedule, SetTenantStatus,
+    SetTenantSynthetic, TenantFairshareView, TestAlertResult, TestEnergyQuery, UpdateAlertSettings,
     UpdateAutoRouterSettings, UpdateBoonSettings, UpdateEmailSettings, UpdateEnergySettings,
     UpdateGroupWeight, UpdateKey, UpdateMcpServer, UpdateModel, UpdateModelEndpoint, UpdateQuota,
     UpdateTenant, UpdateTenantGroup, UpdateUsageRetention, UpdateWeight, UsageRetentionView,
@@ -32,10 +36,9 @@ use crate::{
 use obleth_config::{
     ApiKey, ApiKeyBackup, AppSettingBackup, BackupData, BackupEncryption, CompressionPolicy,
     ConfigBackup, FairshareGroup, FairshareGroupBackup, GuardrailsPolicy, ManagedModelSpec,
-    ManifestEndpoint, ManifestModel, McpServer, McpServerBackup, ModelBackup, ModelEndpoint,
-    ModelEndpointBackup, ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelImportEntry,
-    ModelImportReport, ModelManifest, ModelReplica, ModelRoute, RestoreCounts, RestoreReport,
-    Tenant, TenantBackup, WeeklyWindow,
+    ManifestEndpoint, ManifestModel, McpServerBackup, ModelBackup, ModelEndpointBackup,
+    ModelHealthCheck, ModelHealthDetail, ModelHealthSummary, ModelImportEntry, ModelImportReport,
+    ModelManifest, ModelReplica, RestoreCounts, RestoreReport, Tenant, TenantBackup, WeeklyWindow,
 };
 
 #[derive(OpenApi)]
@@ -47,6 +50,7 @@ use obleth_config::{
     paths(
         // meta
         crate::get_version,
+        crate::resync_resolver_cache,
         // tenants
         crate::create_tenant,
         crate::list_tenants,
@@ -60,6 +64,7 @@ use obleth_config::{
         crate::patch_tenant_guardrails,
         crate::patch_tenant_compression,
         crate::set_tenant_synthetic_handler,
+        crate::set_tenant_tracing_handler,
         crate::patch_weight,
         crate::put_quota,
         crate::patch_tenant_group,
@@ -67,8 +72,11 @@ use obleth_config::{
         crate::create_key,
         crate::list_keys,
         crate::update_key,
+        crate::move_key,
+        crate::get_budget_usage,
         crate::delete_key,
         crate::set_key_disabled,
+        crate::set_key_tracing_handler,
         crate::get_key_usage,
         // usage & costs
         crate::get_usage,
@@ -81,6 +89,9 @@ use obleth_config::{
         crate::get_usage_breakdown,
         crate::get_cache_stats,
         crate::get_usage_logs,
+        crate::get_usage_log_histogram,
+        crate::get_usage_log_facets,
+        crate::get_request_spans,
         crate::get_usage_daily,
         crate::compact_usage,
         crate::get_costs,
@@ -88,6 +99,9 @@ use obleth_config::{
         crate::get_overview_summary,
         // fairshare
         crate::get_fairshare_live,
+        crate::get_capacity_discovery,
+        crate::get_capacity_services,
+        crate::get_fairshare_history,
         crate::list_fairshare_groups,
         crate::create_fairshare_group,
         crate::patch_fairshare_group_weight,
@@ -115,15 +129,18 @@ use obleth_config::{
         crate::get_managed_model,
         crate::put_managed_model,
         crate::delete_managed_model,
+        crate::set_provision_error,
         crate::list_replicas,
         crate::list_all_replicas,
         crate::create_replica,
         crate::patch_replica,
+        crate::restart_replica,
         crate::delete_replica,
         crate::clear_lost_replicas,
         crate::model_health::list_health,
         crate::model_health::get_health,
         crate::model_health::check_one,
+        crate::model_health::activate,
         crate::model_health::check_all,
         crate::model_health::update_config,
         crate::model_health::validate_model,
@@ -135,6 +152,7 @@ use obleth_config::{
         crate::delete_mcp_server,
         // audit & capacity
         crate::get_audit,
+        crate::get_daily_stats,
         crate::get_capacity,
         crate::set_capacity,
         // settings
@@ -190,14 +208,15 @@ use obleth_config::{
         Tenant,
         ApiKey,
         FairshareGroup,
-        ModelRoute,
-        ModelEndpoint,
-        McpServer,
+        ModelRouteView,
+        ModelEndpointView,
+        McpServerView,
         ModelHealthSummary,
         ModelHealthCheck,
         ModelHealthDetail,
         UpdateModelHealthConfig,
         BulkModelHealthResult,
+        ModelActivation,
         ValidateModelRequest,
         ValidateModelResult,
         CreateTenant,
@@ -213,6 +232,11 @@ use obleth_config::{
         CompressionPolicy,
         WeeklyWindow,
         UpdateWeight,
+        crate::MoveKey,
+        crate::DailyStatsView,
+        crate::DailyStatsItem,
+        crate::DailyStat,
+        crate::BudgetUsage,
         UpdateQuota,
         UpdateTenantGroup,
         CreateFairshareGroup,
@@ -238,13 +262,28 @@ use obleth_config::{
         UsageKeyModelBreakdown,
         CacheStats,
         UsageLogRow,
+        UsageLogHistogram,
+        UsageLogFacets,
+        UsageLogFacet,
+        UsageLogFailure,
+        UsageLogBucket,
         UsageDailyRow,
         CostAgg,
         LiveStats,
         OverviewSummaryView,
         FairshareLiveView,
+        CapacityDiscoveryView,
+        CapacityDiscoveryModelView,
+        crate::capacity_discovery::ModelCapacityStatus,
+        crate::CapacityServicesView,
+        crate::capacity_discovery::ServiceSummary,
+        FairshareHistoryView,
+        FairshareHistoryPointView,
+        FairshareHistoryQuery,
         GroupFairshareView,
         TenantFairshareView,
+        KeyFairshareView,
+        ModelPoolView,
         CreateModel,
         UpdateModel,
         SetModelCapacity,
@@ -331,11 +370,15 @@ use obleth_config::{
         ModelImportReport,
         ModelImportEntry,
         crate::VersionInfo,
+        crate::ResyncReport,
+        crate::SetKeyTracing,
+        crate::ProvisionErrorBody,
+        crate::usage::SpanEntry,
         crate::recipes::RecipeView,
         crate::recipes::UpsertRecipeBody,
     )),
     tags(
-        (name = "meta", description = "Gateway build/version identity"),
+        (name = "meta", description = "Gateway build/version identity and resolver-cache reconcile"),
         (name = "tenants", description = "Tenant lifecycle, quotas, and fairshare group assignment"),
         (name = "keys", description = "API key lifecycle and per-key usage summary"),
         (name = "usage", description = "Usage, cost, request logs, and live stats"),
@@ -351,3 +394,28 @@ use obleth_config::{
     )
 )]
 pub struct ApiDoc;
+
+#[cfg(test)]
+mod tests {
+    use super::ApiDoc;
+    use utoipa::OpenApi;
+
+    #[test]
+    fn model_route_view_documents_its_fields() {
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize");
+        let props = &doc["components"]["schemas"]["ModelRouteView"]["properties"];
+        for field in [
+            "model_name",
+            "aliases",
+            "quantization",
+            "route_bias",
+            "auto_eligible",
+        ] {
+            let description = props[field]["description"].as_str().unwrap_or_default();
+            assert!(
+                !description.is_empty(),
+                "ModelRouteView.{field} has no description"
+            );
+        }
+    }
+}

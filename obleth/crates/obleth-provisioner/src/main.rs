@@ -36,8 +36,13 @@ async fn main() -> anyhow::Result<()> {
     let cfg = ProvisionerConfig::from_env()?;
     // slurmrestd and node probes carry the Slurm JWT; never let a redirect carry
     // it to an unvalidated destination.
+    // Bounded by default so one hung admin/slurmrestd call can't stall the
+    // singleton's loop forever. Probe and warmup set their own per-request
+    // timeouts, which override these.
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(30))
+        .connect_timeout(Duration::from_secs(5))
         .build()?;
     let obleth = HttpObleth::new(&cfg, http.clone());
     tracing::info!(interval = cfg.interval_secs, "obleth-provisioner started");
@@ -52,6 +57,11 @@ async fn main() -> anyhow::Result<()> {
     // Long-lived so its success cache survives across ticks: once a node name is
     // resolved (or aliased) the provisioner stops touching DNS for it.
     let resolver = resolve::HostResolver::new(Duration::from_secs(RESOLVE_TTL_SECS));
+    let (shutdown_tx, mut shutdown) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        wait_for_signal().await;
+        let _ = shutdown_tx.send(true);
+    });
     loop {
         match run_once(&cfg, &obleth, &http, &resolver, &mut probe_failures).await {
             Ok(Tick::Ran) => {
@@ -75,7 +85,52 @@ async fn main() -> anyhow::Result<()> {
                 tracing::warn!(error = %e, "tick failed; holding (no destructive action)");
             }
         }
-        tokio::time::sleep(Duration::from_secs(cfg.interval_secs)).await;
+        // The tick above is never interrupted: stopping mid-tick could leave
+        // a submitted job unrecorded. A signal only cuts the idle wait short.
+        if !sleep_unless_shutdown(Duration::from_secs(cfg.interval_secs), &mut shutdown).await {
+            tracing::info!("shutdown signal received; exiting after the completed tick");
+            return Ok(());
+        }
+    }
+}
+
+/// Sleep for `period`; returns `false` as soon as shutdown is requested
+/// (including a request that arrived during the previous tick).
+async fn sleep_unless_shutdown(
+    period: Duration,
+    shutdown: &mut tokio::sync::watch::Receiver<bool>,
+) -> bool {
+    tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|stop| *stop) => false,
+        _ = tokio::time::sleep(period) => true,
+    }
+}
+
+async fn wait_for_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "ctrl-c handler unavailable");
+            std::future::pending::<()>().await;
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SIGTERM handler unavailable");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
     }
 }
 
@@ -114,6 +169,24 @@ async fn run_once(
     Ok(Tick::Ran)
 }
 
+/// Breaker for the job lookups: `Some(n)` when there are at least two distinct
+/// jobs behind live replicas and *none* of them came back. A whole fleet going
+/// missing in one tick is far likelier a wrong cluster/URL/API version than
+/// real deaths, and each miss would otherwise become a MarkLost + resubmit.
+/// Only replicas the planner would mark lost count: `lost`/`draining` rows are
+/// expected to point at purged jobs (and must stay GC-able).
+fn all_live_jobs_vanished(
+    replicas: &[domain::ReplicaView],
+    jobs: &HashMap<String, domain::JobInfo>,
+) -> Option<usize> {
+    let live: HashSet<&str> = replicas
+        .iter()
+        .filter(|r| r.state != "lost" && r.state != "draining" && !r.slurm_job_id.is_empty())
+        .map(|r| r.slurm_job_id.as_str())
+        .collect();
+    (live.len() >= 2 && live.iter().all(|id| !jobs.contains_key(*id))).then_some(live.len())
+}
+
 async fn tick(
     cfg: &ProvisionerConfig,
     slurm: &dyn SlurmClient,
@@ -150,6 +223,14 @@ async fn tick(
             Ok(None) => {} // gone/purged -> absent from map -> planner reconciles it away
             Err(e) => return Err(e.context("slurm job lookup failed; holding tick")),
         }
+    }
+    if let Some(n) = all_live_jobs_vanished(&all_replicas, &jobs) {
+        tracing::error!(
+            jobs = n,
+            "slurmrestd reports every tracked job as not found; holding tick \
+             (check the slurmrestd URL/API version and cluster)"
+        );
+        anyhow::bail!("all {n} tracked slurm jobs reported not found; holding tick");
     }
 
     // Annotate each replica with its live Slurm status so the dashboard shows why
@@ -484,4 +565,213 @@ async fn tick(
     // the Submit executor cancels a job if recording its replica fails. So there
     // is no periodic cluster-wide scan here — we never list the whole controller.
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{ClusterResources, JobInfo, JobState, JobSubmit, ReplicaView};
+    use crate::obleth_client::MockObleth;
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    #[tokio::test]
+    async fn idle_wait_continues_without_a_signal() {
+        let (_tx, mut rx) = tokio::sync::watch::channel(false);
+        assert!(sleep_unless_shutdown(Duration::from_millis(10), &mut rx).await);
+    }
+
+    #[tokio::test]
+    async fn signal_during_idle_wait_stops_the_loop() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let _ = tx.send(true);
+        });
+        let stopped = tokio::time::timeout(
+            Duration::from_secs(5),
+            sleep_unless_shutdown(Duration::from_secs(600), &mut rx),
+        )
+        .await
+        .expect("wait cut short");
+        assert!(!stopped);
+    }
+
+    #[tokio::test]
+    async fn signal_during_a_tick_stops_after_it() {
+        let (tx, mut rx) = tokio::sync::watch::channel(false);
+        tx.send(true).unwrap();
+        assert!(!sleep_unless_shutdown(Duration::from_secs(600), &mut rx).await);
+    }
+
+    /// Slurm fake that answers `get_job` from a fixed map (absent = `Ok(None)`)
+    /// and records cancels/submits so a test can assert nothing destructive ran.
+    #[derive(Default)]
+    struct FakeSlurm {
+        jobs: HashMap<String, JobInfo>,
+        cancelled: Mutex<Vec<String>>,
+        submitted: Mutex<Vec<String>>,
+    }
+    #[async_trait::async_trait]
+    impl SlurmClient for FakeSlurm {
+        async fn submit(&self, job: &JobSubmit) -> anyhow::Result<String> {
+            self.submitted.lock().unwrap().push(job.name.clone());
+            Ok("999".into())
+        }
+        async fn cancel(&self, job_id: &str) -> anyhow::Result<()> {
+            self.cancelled.lock().unwrap().push(job_id.to_string());
+            Ok(())
+        }
+        async fn get_job(&self, job_id: &str) -> anyhow::Result<Option<JobInfo>> {
+            Ok(self.jobs.get(job_id).cloned())
+        }
+        async fn discover_resources(&self) -> anyhow::Result<ClusterResources> {
+            Ok(ClusterResources::default())
+        }
+    }
+
+    fn cfg() -> ProvisionerConfig {
+        ProvisionerConfig {
+            admin_base_url: "http://127.0.0.1:1".into(),
+            admin_token: "t".into(),
+            interval_secs: 15,
+            health_timeout_secs: 1,
+            warmup_timeout_secs: 0,
+            lost_retention_secs: 900,
+            restart_after_failures: 0,
+            port_span: 8,
+            job_name_prefix: "obleth-".into(),
+        }
+    }
+
+    fn replica(job: &str, state: &str) -> ReplicaView {
+        ReplicaView {
+            id: uuid::Uuid::new_v4(),
+            model_id: uuid::Uuid::new_v4(),
+            slurm_job_id: job.into(),
+            state: state.into(),
+            endpoint_id: None,
+            age_secs: 60,
+            port_base: 8000,
+            last_message: None,
+            cancel_requested: false,
+        }
+    }
+
+    fn pending_job(id: &str) -> JobInfo {
+        JobInfo {
+            job_id: id.into(),
+            state: JobState::Pending,
+            nodes: vec![],
+            raw_state: "PENDING".into(),
+            reason: None,
+        }
+    }
+
+    async fn run_tick(slurm: &FakeSlurm, obleth: &MockObleth) -> anyhow::Result<()> {
+        let resolver = resolve::HostResolver::new(Duration::from_secs(300));
+        let mut probe_failures = HashMap::new();
+        tick(
+            &cfg(),
+            slurm,
+            obleth,
+            &reqwest::Client::new(),
+            &resolver,
+            &mut probe_failures,
+        )
+        .await
+    }
+
+    fn nothing_destructive(slurm: &FakeSlurm, obleth: &MockObleth) {
+        assert!(slurm.cancelled.lock().unwrap().is_empty(), "no scancel");
+        assert!(slurm.submitted.lock().unwrap().is_empty(), "no submit");
+        assert!(obleth.patched.lock().unwrap().is_empty(), "no state change");
+        assert!(
+            obleth.deleted_replicas.lock().unwrap().is_empty(),
+            "no delete"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_bails_when_managed_models_read_fails() {
+        let slurm = FakeSlurm::default();
+        let obleth = MockObleth::default();
+        *obleth.replicas.lock().unwrap() = vec![replica("1", "healthy")];
+        obleth.fail_list_managed.store(true, Ordering::SeqCst);
+        assert!(run_tick(&slurm, &obleth).await.is_err());
+        nothing_destructive(&slurm, &obleth);
+    }
+
+    #[tokio::test]
+    async fn tick_bails_when_replica_read_fails() {
+        let slurm = FakeSlurm::default();
+        let obleth = MockObleth::default();
+        obleth.fail_list_replicas.store(true, Ordering::SeqCst);
+        assert!(run_tick(&slurm, &obleth).await.is_err());
+        nothing_destructive(&slurm, &obleth);
+    }
+
+    #[tokio::test]
+    async fn tick_holds_when_every_tracked_job_vanishes() {
+        // Two live replicas, Slurm answers "no such job" for both: far more
+        // likely a wrong cluster/version than a fleet that died in one tick.
+        let slurm = FakeSlurm::default();
+        let obleth = MockObleth::default();
+        *obleth.replicas.lock().unwrap() = vec![replica("1", "healthy"), replica("2", "pending")];
+        let err = run_tick(&slurm, &obleth).await.unwrap_err();
+        assert!(format!("{err:#}").contains("holding tick"), "{err:#}");
+        nothing_destructive(&slurm, &obleth);
+    }
+
+    #[tokio::test]
+    async fn tick_marks_lost_when_only_some_jobs_vanish() {
+        let mut slurm = FakeSlurm::default();
+        slurm.jobs.insert("2".into(), pending_job("2"));
+        let obleth = MockObleth::default();
+        let gone = replica("1", "healthy");
+        let gone_id = gone.id;
+        *obleth.replicas.lock().unwrap() = vec![gone, replica("2", "pending")];
+        run_tick(&slurm, &obleth).await.unwrap();
+        let patched = obleth.patched.lock().unwrap();
+        assert!(
+            patched
+                .iter()
+                .any(|(id, s)| *id == gone_id && s.as_deref() == Some("lost")),
+            "the vanished job's replica is marked lost: {patched:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn breaker_ignores_rows_already_lost_or_draining() {
+        // Purged jobs behind lost/draining rows are expected, not suspicious:
+        // they must not keep the tick held (their GC would never run).
+        let slurm = FakeSlurm::default();
+        let obleth = MockObleth::default();
+        let mut old_lost = replica("1", "lost");
+        old_lost.age_secs = 10_000;
+        let old_lost_id = old_lost.id;
+        *obleth.replicas.lock().unwrap() = vec![old_lost, replica("2", "draining")];
+        run_tick(&slurm, &obleth).await.unwrap();
+        assert!(obleth
+            .deleted_replicas
+            .lock()
+            .unwrap()
+            .contains(&old_lost_id));
+    }
+
+    #[tokio::test]
+    async fn single_vanished_job_is_still_marked_lost() {
+        let slurm = FakeSlurm::default();
+        let obleth = MockObleth::default();
+        let r = replica("1", "healthy");
+        let id = r.id;
+        *obleth.replicas.lock().unwrap() = vec![r];
+        run_tick(&slurm, &obleth).await.unwrap();
+        assert!(obleth
+            .patched
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(i, s)| *i == id && s.as_deref() == Some("lost")));
+    }
 }

@@ -46,11 +46,48 @@ artifact carries the values published with that version. Keep per-deployment
 settings in your own `-f` values file so they apply regardless of source.
 `--wait` blocks until the rolled resources report Ready.
 
-> Values that render into the obleth Secret (`adminToken`, the database URL,
-> `clickhouse.password`, `encryptionKey`, `apiKeyPepper`) update the Secret but
-> do **not** restart running pods on their own. After changing one, force a
-> rollout: `kubectl rollout restart deployment/obleth -n obleth` (and
-> `deployment/obleth-control-plane` if its `DATABASE_URL` changed).
+> When a value that renders into the chart's obleth Secret changes
+> (`adminToken`, the database URL, the Redis URL, `postgres.password`,
+> `redis.password`, `clickhouse.password`, `encryptionKey`, `apiKeyPepper`),
+> the gateway and the bundled Redis roll automatically (`checksum/secret` pod
+> annotation). Other pods do not: after changing `adminToken`, restart
+> `deployment/obleth-control-plane` (and `deployment/obleth-provisioner` if
+> enabled), and restart the control-plane if its `DATABASE_URL` changed. With
+> `obleth.existingSecret`, the chart cannot see Secret changes, so restart the
+> affected deployments yourself, e.g. `kubectl rollout restart
+> deployment/obleth-obleth -n obleth` (the gateway is `<release>-obleth`).
+
+### Upgrading to a release with Redis authentication
+
+The bundled Redis now requires a password, and `redis.password` is a required
+value whenever `redis.enabled=true`. Generate it once and keep it with your
+other deployment secrets, then pass the same value on every upgrade:
+
+```bash
+REDIS_PASSWORD="$(openssl rand -hex 32)"   # store this; reuse it on later upgrades
+helm upgrade --install obleth deploy/k8s/obleth \
+  --namespace obleth \
+  -f my-values.yaml \
+  --set redis.password="$REDIS_PASSWORD" \
+  --wait
+```
+
+The gateway now reads `OBLETH_REDIS_URL` from the obleth Secret (rendered as
+`redis://:<password>@<release>-redis:6379`) instead of a plain environment
+value, and the bundled datastores read their passwords from the same Secret.
+With `obleth.existingSecret`, add these keys to the pre-created Secret before
+upgrading:
+
+- `OBLETH_REDIS_URL` — always; embed the password for the bundled Redis, or
+  use your external Redis URL.
+- `REDIS_PASSWORD` — when `redis.enabled=true`; must match the password in
+  `OBLETH_REDIS_URL`.
+- `POSTGRES_PASSWORD` — when `postgres.enabled=true`.
+- `OBLETH_CLICKHOUSE_PASSWORD` (already required) is also read by the bundled
+  ClickHouse when `clickhouse.enabled=true`.
+
+Use URL-safe characters for the Redis password (hex from `openssl rand -hex`),
+since it is embedded in the connection URL.
 
 ## Pick a storage scenario
 
@@ -72,17 +109,58 @@ hardened and made redundant):
 | --- | --- | --- | --- | --- | --- |
 | Ephemeral | Bundled, emptyDir | None — wiped on restart | 1 | `--set` | Demos, CI |
 | Persistent | Bundled, PVC | Survives restarts; **no backups/HA** | 1 | `--set` | Single-cluster self-host |
-| External | Yours | Whatever you operate | 3, ceiling divided | `--set` | Self-host w/ managed DBs |
-| Production | Yours (operator/managed) | Backups + HA + PITR (your tooling) | 3, ceiling divided + PDB + anti-affinity | **existingSecret** | Redundant production |
+| External | Yours | Whatever you operate | 3, ceiling above pool sum | `--set` | Self-host w/ managed DBs |
+| Production | Yours (operator/managed) | Backups + HA + PITR (your tooling) | 3, ceiling above pool sum + PDB + anti-affinity | **existingSecret** | Redundant production |
 
-> **Replica count is load-bearing.** Fairshare admission state lives in each
-> gateway process, so every replica enforces `obleth.globalMaxInFlight`
-> independently: N replicas admit up to N × the configured ceiling. The chart
-> therefore defaults to one replica. For redundancy, raise `obleth.replicas` and
-> divide `obleth.globalMaxInFlight` by the same number, accepting that replicas
-> cannot lend each other idle capacity. The HPA is off by default for the same
-> reason — an autoscaled replica count moves the aggregate ceiling with no
-> config change.
+> **Replicas share the fairshare limits.** Fairshare runs one scheduling pool
+> per model (default `obleth.defaultModelMaxInFlight` slots, or the model's own
+> `max_in_flight`), and `obleth.globalMaxInFlight` is a total ceiling across
+> those pools — not a fairness input. Every limit you set is cluster-wide:
+> pool sizes, the global ceiling, and per-tenant and per-key max in flight.
+> Weights are ratios and apply as they are.
+>
+> With `obleth.fairshareSharedSlots: true` (the default) and more than one
+> replica live, those limits are slots in Redis that all replicas draw from.
+> Each replica keeps its own fair queue and decides which waiting request goes
+> next; before admitting it, it takes a slot in one Redis script call that
+> checks the model's pool, the global ceiling and the tenant's and key's caps
+> together, and it gives the slot back in one call when the request finishes.
+> So a model with 20 slots behind 3 replicas admits 20 requests on whichever
+> replica they reach — long streams and keep-alive connections piling onto one
+> replica no longer leave it queueing while the others sit on idle slots — and
+> never more than 20 across the fleet. The details:
+>
+> - With a single live replica there is no Redis call on the request path.
+> - Replicas heartbeat into Redis (`obleth.fairshareReplicaHeartbeatSecs`,
+>   default 5 s). A crashed replica's slots return to the others once its
+>   heartbeat expires (`obleth.fairshareReplicaTtlSecs`, default 15 s); until
+>   then they stay taken, so the fleet runs below the limit for up to that
+>   long. A replica that shuts down cleanly gives its slots back once drained.
+>   Each replica also re-asserts what it really holds every heartbeat
+>   interval, which repairs the count after a lost release.
+> - When a slot frees on one replica, Redis notifies the replicas waiting for
+>   that model and each tries once; a short randomized retry (100–250 ms)
+>   covers a lost notification. Fairness is exact within a replica. Across
+>   replicas a freed slot goes to whichever replica claims it first, so a
+>   tenant's weighted share holds only as far as its requests reach the
+>   replicas where others compete with it.
+> - If Redis is unreachable, or answers slower than the gateway's Redis
+>   response timeout (`OBLETH_REDIS_RESPONSE_TIMEOUT_MS`, default 250 ms), a
+>   replica falls back to the split below, logs once, and returns to shared
+>   slots after its holdings are reconciled. It never admits without a limit.
+>
+> The split is what `obleth.fairshareReplicaAware: true` (the default) means:
+> each replica enforces the configured value divided by the live replica
+> count, rounded up and never below 1. It applies whenever shared slots are
+> off or unavailable. Rounding up lets the fleet run up to one slot per
+> replica over a limit, and replicas cannot lend each other idle slots, so one
+> can queue while another has room. Setting both options to `false` restores
+> per-replica limits, where N replicas admit N × every number.
+>
+> The dashboard's fairshare page shows the cluster-wide in-flight count
+> against the configured capacity in shared mode, next to the answering
+> replica's own, and flags fallback. Queues, tenant rows and the history chart
+> (`obleth.fairshareHistorySecs`, in memory) are the answering replica's own.
 
 > The bundled datastores are single plain Deployments with no replication or
 > backups — intentionally. Making them HA is the job of purpose-built operators
@@ -95,6 +173,7 @@ helm install obleth deploy/k8s/obleth -n obleth --create-namespace \
   -f deploy/k8s/obleth/examples/values-persistent.yaml \
   --set obleth.adminToken="$(openssl rand -hex 32)" \
   --set postgres.password="$(openssl rand -hex 16)" \
+  --set redis.password="$(openssl rand -hex 32)" \
   --set clickhouse.password="$(openssl rand -hex 16)" \
   --set controlPlane.dashboardPassword="$(openssl rand -hex 16)" \
   --set controlPlane.dashboardSessionSecret="$(openssl rand -hex 32)"
@@ -143,7 +222,7 @@ postgres:
   external: { url: "postgres://obleth:pass@my-pg:5432/obleth" }
 redis:
   enabled: false
-  external: { url: "redis://my-redis:6379" }
+  external: { url: "redis://:pass@my-redis:6379" }
 clickhouse:
   enabled: false
   user: obleth
@@ -181,19 +260,131 @@ toggles in `values.yaml`, on by sensible defaults.
 - **Pre-created Secrets (`existingSecret`).** Point the chart at a Secret you
   created out-of-band so real credentials never enter values files or
   `--set`/CLI history. `obleth.existingSecret` must carry `OBLETH_ADMIN_TOKEN`,
-  `OBLETH_DATABASE_URL`, `OBLETH_CLICKHOUSE_PASSWORD`, `OBLETH_ENCRYPTION_KEY`,
-  `OBLETH_API_KEY_PEPPER`, `OBLETH_SLACK_WEBHOOK_URL`, and (optional — only if
-  you want the JWT bearer path) `OBLETH_JWT_ISSUERS`;
+  `OBLETH_DATABASE_URL`, `OBLETH_REDIS_URL`, `OBLETH_CLICKHOUSE_PASSWORD`,
+  `OBLETH_ENCRYPTION_KEY`, `OBLETH_API_KEY_PEPPER`, `OBLETH_SLACK_WEBHOOK_URL`,
+  (optional — only if you want the JWT bearer path) `OBLETH_JWT_ISSUERS`, and,
+  for each bundled datastore you keep enabled, `POSTGRES_PASSWORD` /
+  `REDIS_PASSWORD`;
   `controlPlane.existingSecret` must carry `DASHBOARD_PASSWORD`,
   `DASHBOARD_SESSION_SECRET`, `DATABASE_URL`, and (for the break-glass admin and
   SSO) `DASHBOARD_ADMIN_EMAIL`, `BETTER_AUTH_URL`, `OIDC_PROVIDERS`. See
   [`values-production.yaml`](obleth/examples/values-production.yaml).
 - **Spread + disruption protection.** `affinity.antiAffinity` (`soft`/`hard`)
   spreads obleth replicas across nodes; `podDisruptionBudget` keeps a minimum
-  available during drains/upgrades (rendered only when `replicas > 1`).
-- **NetworkPolicy (opt-in).** `networkPolicy.enabled: true` restricts the
-  bundled datastore ports to obleth pods. Requires a CNI that enforces
-  NetworkPolicy; inert otherwise, and a no-op for external datastores.
+  available during drains/upgrades (rendered only when the minimum replica
+  count is above 1: `hpa.minReplicas > 1` with the HPA enabled, otherwise
+  `replicas > 1`; a PDB over a single pod would block node drains).
+- **Private video jobs.** `obleth.videoJobScope: key` (the default) makes each
+  video generation job private to the API key that created it: another key of
+  the same tenant (in practice, another user) gets a 404 on its poll,
+  download and delete, and `GET /v1/videos` lists only the caller's own jobs.
+  Set `tenant` to share jobs across all of a tenant's keys. Another tenant's
+  job is a 404 either way; an invalid value falls back to `key`.
+- **NetworkPolicy (opt-in).** `networkPolicy.enabled: true` restricts bundled
+  Postgres to the obleth and control-plane pods, bundled Redis and ClickHouse
+  to the obleth pods, and the Management API port (9180) to the control-plane
+  and provisioner. The data-plane port (8080) stays open to clients and ingress
+  controllers, and the metrics port (9091) stays open so a Prometheus in
+  another namespace can scrape it. Requires a CNI that enforces NetworkPolicy;
+  inert otherwise. The datastore policies are a no-op for external datastores.
+
+## Capacity discovery
+
+A model's fairshare pool is normally sized by its `max_in_flight`. A model in
+the `discovered` capacity mode instead takes its pool size from its live
+backend, so the gateway's limit follows whatever scales the backend:
+
+```text
+pool size = max(1, ceil(summed concurrency of the ready serving replicas × capacity_headroom))
+```
+
+The summed concurrency is ready replicas × the per-replica concurrency, or,
+for endpoints that set their own `max_in_flight`, each ready endpoint's value
+added up.
+
+Every gateway replica re-reads the backend every
+`obleth.capacityDiscovery.intervalSecs` (default 15) and treats the result as
+the model's configured, cluster-wide pool size, held across the gateway
+replicas like any other (shared slots, or the split when those are off or
+unavailable; see above). A change resizes the pool without cutting in-flight requests, and
+growth admits queued requests at once. Nothing is written to the database.
+
+**Where replicas are counted** (`capacity_source`, per model):
+
+- `endpoints` (the default): the model's enabled, healthy endpoints; under
+  `failover` only the endpoint in use counts, since the others are standbys. A
+  model with no endpoint rows counts its `api_base` while it is healthy. Needs
+  no Kubernetes access and works the same with backends anywhere.
+- `kubernetes`: the ready endpoints of a Service, read from its EndpointSlices.
+  The Service is `capacity_service`, or the
+  `obleth.capacityDiscovery.defaultService` template filled in for the model
+  (`{upstream_model}`, `{model_name}`; for example `"{upstream_model}"` when
+  each Service is named after the model it serves). The namespace is
+  `capacity_namespace`, or, when unset, each namespace in
+  `obleth.capacityDiscovery.namespaces` in order: the first one that has the
+  Service wins. An endpoint counts when it is ready, serving and not
+  terminating; endpoints listed in more than one slice count once. Only
+  replica counts are read: no pod, spec or environment.
+
+Which pods a Service counts is decided by the Service's own selector. For
+multi-node serving where only some pods take requests (for example a leader or
+head pod in front of workers), point the model at a Service whose selector
+matches just those pods.
+
+**Per-replica concurrency** is set by the operator, since it rarely changes:
+the model's `per_replica_max_in_flight` (the requests one replica serves at
+once, e.g. your server's max concurrent sequences, such as vLLM
+`--max-num-seqs`). It is required for the `kubernetes` source, and for
+`endpoints` unless every endpoint sets its own `max_in_flight`; a model write
+without it is refused with a message saying what to set. On the `endpoints`
+source an endpoint's own `max_in_flight` wins for that endpoint, and the
+model's value covers the rest: endpoints at 8 and 2 plus one unset with a
+per-replica value of 4 make a pool of 14.
+
+**Fallbacks:** when the source reports no serving replica or does not answer
+(scale to zero, a rollout, the Service not there, the API server briefly
+away), the last derived value holds, or the static `max_in_flight` (or
+`obleth.defaultModelMaxInFlight`) if nothing was derived yet. A namespace that
+fails to answer is not skipped in favour of a later one. A model that cannot
+be discovered as configured (no Service, a namespace outside the list) uses its
+static value. Each change of state is logged once.
+
+**Autoscalers:** capping the gateway at 100% of ready capacity still lets an
+autoscaler that scales on backend utilization or running requests (for example
+one targeting a fraction of the server's own concurrency limit) see saturation
+and add replicas; the new replicas raise the pool on the next pass. An
+autoscaler that scales on queue depth only sees a queue if requests can wait at
+the backend: give such models a `capacity_headroom` above 1 (1.25 admits a
+quarter more than the ready capacity).
+
+**RBAC (kubernetes source only):** with `obleth.capacityDiscovery.enabled` and
+at least one namespace listed, the chart creates a ServiceAccount for the
+gateway pods and, in each listed namespace, a Role granting only
+`get`/`list`/`watch` on `endpointslices` in the `discovery.k8s.io` API group,
+plus a RoleBinding to that account. Nothing on pods, Services or Secrets is
+granted, and there is no ClusterRole: the permission reveals only Service
+endpoint addresses (pod IPs and names) and readiness. The namespaces must exist
+and the account running `helm` must be allowed to create Roles in them. With no
+namespaces listed nothing is rendered and the gateway keeps its default
+account. A Service with a selector always has at least one EndpointSlice, kept
+by the EndpointSlice controller; a Service without a selector needs slices
+labelled `kubernetes.io/service-name` from whatever manages its endpoints.
+
+A kubernetes-source model with no per-replica value, whose namespace is outside
+the list, or that has no Service and no default template to fall back on (or a
+template that does not give a valid Service name for it), is refused when it is
+saved. The dashboard's model page and `GET /api/v1/capacity/discovery` show,
+per discovered model, the Service and the namespace it was found in, the ready
+replicas, the per-replica value, the derived pool size, the model's
+cluster-wide and this gateway's in-flight counts, the last refresh and the reason when discovery has no answer;
+`obleth_capacity_discovery_models{state}` counts models by state. The model
+page picks the Service from those the gateway can see:
+`GET /api/v1/capacity/services` lists every Service in the allowed namespaces
+with its ready endpoint count, built from the same EndpointSlice reads (no
+extra permission) and cached for 15 seconds, and with `?model=` names the
+Service that model would use by default and where it was found. See
+[`values-capacity-discovery.yaml`](obleth/examples/values-capacity-discovery.yaml)
+for settings and examples.
 
 ## What the chart starts
 
@@ -253,7 +444,7 @@ curl -s -X POST http://localhost:9180/api/v1/models \
   -d '{
     "model_name": "my-model",
     "upstream_model": "meta-llama/Llama-3-8b-instruct",
-    "api_base": "http://aibrix-gateway.aibrix.svc.cluster.local:8080/v1",
+    "api_base": "http://my-inference-gateway.inference.svc.cluster.local:8080/v1",
     "enabled": true
   }'
 ```
@@ -261,7 +452,7 @@ curl -s -X POST http://localhost:9180/api/v1/models \
 | Field | Rule |
 | --- | --- |
 | `api_base` | Provider **base** URL ending in `/v1`, not a full endpoint path |
-| `upstream_model` | Bare model id sent to the upstream (as vLLM/Aibrix expect it) |
+| `upstream_model` | Bare model id sent to the upstream (as the inference server expects it) |
 | `model_name` | Client-facing alias; what callers pass as `"model"` |
 
 You can also import models from the control-plane dashboard (Models → Import).
@@ -325,11 +516,11 @@ better-auth writes onto a user.
 
 **Why you will probably want this.** Institutional IdPs routinely release an
 `email` that is not the identifier the institution keys accounts on. Globus is
-a clear case: for an Arizona State University identity it sends
+a clear case: for an Example University identity it sends
 
 ```
-email               Johnathan.Lee@asu.edu     <- a display alias
-preferred_username  jlee379@asu.edu           <- the canonical institutional id
+email               Jane.Doe@university.example   <- a display alias
+preferred_username  user@university.example       <- the canonical institutional id
 ```
 
 Without a mapping, obleth keys the account on the alias, so the same human
@@ -475,6 +666,7 @@ Do not commit production tokens or passwords. Prefer:
 helm install obleth deploy/k8s/obleth \
   --set obleth.adminToken="$(openssl rand -hex 32)" \
   --set postgres.password="$(openssl rand -hex 16)" \
+  --set redis.password="$(openssl rand -hex 32)" \
   ...
 ```
 

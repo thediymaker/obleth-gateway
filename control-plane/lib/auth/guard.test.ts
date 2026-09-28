@@ -34,3 +34,22 @@ describe("guardAdmin", () => {
     expect(res?.status).toBe(401);
   });
 });
+
+describe("guardAdminSession", () => {
+  it("returns the admin session alongside a null denial", async () => {
+    const admin = { id: "u", email: "a@example.com", role: "admin", status: "active", tenantId: null };
+    mockSession(admin);
+    const { guardAdminSession } = await import("./guard");
+    const { denied, session } = await guardAdminSession();
+    expect(denied).toBeNull();
+    expect(session).toEqual(admin);
+  });
+
+  it("returns a 401 and no session for a non-admin", async () => {
+    mockSession({ id: "u", email: "u", role: "user", status: "active", tenantId: "t" });
+    const { guardAdminSession } = await import("./guard");
+    const { denied, session } = await guardAdminSession();
+    expect(denied?.status).toBe(401);
+    expect(session).toBeNull();
+  });
+});

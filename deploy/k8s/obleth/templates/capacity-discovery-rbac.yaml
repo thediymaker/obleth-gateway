@@ -1,0 +1,45 @@
+{{- /*
+Least-privilege access for the kubernetes capacity source: a ServiceAccount for
+the gateway, and in each namespace listed in obleth.capacityDiscovery.namespaces
+a Role that can only read EndpointSlices (discovery.k8s.io), bound to it. That
+reveals only Service endpoint addresses and readiness: nothing on pods,
+Services or Secrets, and no ClusterRole. Rendered only when discovery is
+enabled and at least one namespace is listed; otherwise the gateway keeps the
+namespace's default ServiceAccount, as before.
+*/}}
+{{- if include "obleth.capacityDiscoveryRbac" . }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "obleth.fullname" . }}
+  labels: {{- include "obleth.labels" . | nindent 4 }}
+automountServiceAccountToken: true
+{{- range $ns := uniq .Values.obleth.capacityDiscovery.namespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "obleth.fullname" $ }}-capacity-discovery
+  namespace: {{ $ns }}
+  labels: {{- include "obleth.labels" $ | nindent 4 }}
+rules:
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "obleth.fullname" $ }}-capacity-discovery
+  namespace: {{ $ns }}
+  labels: {{- include "obleth.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "obleth.fullname" $ }}-capacity-discovery
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "obleth.fullname" $ }}
+    namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- end }}

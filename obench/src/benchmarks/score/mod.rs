@@ -282,7 +282,28 @@ pub async fn run(
                 .map_err(|e| anyhow::anyhow!(e))?;
             let api_base = std::env::var("BENCHMARK_API_BASE")
                 .unwrap_or_else(|_| "http://benchmark-backend:8081".to_string());
-            let seeded = crate::seed::seed_fixture(&admin, &api_base, &scope).await?;
+            // The scorecard measures proxy tax and the capacity ramp, so the
+            // demo pools have to be wide enough that admission never binds
+            // below the ramp's own top; the gateway default of 32 would.
+            let model_cap = args
+                .max_conc
+                .max(overhead::OVERHEAD_CONCS.iter().copied().max().unwrap_or(1));
+            let mut seeded = crate::seed::seed_fixture(
+                &admin,
+                &api_base,
+                &scope,
+                crate::seed::FleetChoice::Standard,
+                Some(model_cap),
+            )
+            .await?;
+            // And the global ceiling has to clear the sum of those pools.
+            // Teardown puts the previous ceiling back.
+            let ceiling = model_cap
+                .saturating_mul(seeded.models.len() as u32)
+                .max(model_cap);
+            admin
+                .raise_capacity_for_run(&mut seeded.teardown, ceiling)
+                .await?;
             (seeded, cli.proxy_base.clone())
         }
         Target::Live => {
@@ -313,11 +334,17 @@ pub async fn run(
     }
     // Capacity/streaming/overhead/resilience drive a single tenant; fairshare
     // (below) uses the whole seeded fleet.
-    let key = seeded
-        .tenants
-        .first()
-        .map(|t| t.key.clone())
-        .unwrap_or_default();
+    let key = match seeded.tenants.first().map(|t| t.first_key()) {
+        Some(Ok(k)) => k.to_string(),
+        _ => {
+            // Nothing can be driven without a secret; tear down what seeding
+            // just created rather than leaking it behind a silent empty key.
+            admin.teardown(&seeded.teardown).await;
+            anyhow::bail!(
+                "no API key to drive the score run — the seeded fleet came back without one"
+            );
+        }
+    };
 
     let gateway_version = match target {
         Target::Demo => admin

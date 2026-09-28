@@ -4,6 +4,7 @@
 import { useMemo, useState, useTransition } from "react";
 import { Search } from "lucide-react";
 import {
+  activateModelsAction,
   applyModelManifestAction,
   listUpstreamModelsAction,
 } from "@/app/actions";
@@ -14,7 +15,6 @@ import {
 import type { ModelImportReport } from "@/lib/obleth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select } from "@/components/ui/select";
@@ -35,6 +35,7 @@ const MODEL_TYPE_OPTIONS = [
   { value: "audio_transcription", label: "Audio transcription (STT)" },
   { value: "audio_speech", label: "Text to speech (TTS)" },
   { value: "image", label: "Image generation" },
+  { value: "video", label: "Video generation" },
 ] as const;
 
 type Step = "connect" | "select" | "review";
@@ -44,6 +45,7 @@ export function ProviderImportWizard({
   onClose,
 }: {
   models: ModelRoute[];
+  /** Called when the import is done and dismissed. */
   onClose: () => void;
 }) {
   const [step, setStep] = useState<Step>("connect");
@@ -61,7 +63,9 @@ export function ProviderImportWizard({
     context_window: 8192,
     input_cost_per_token: 0,
     output_cost_per_token: 0,
-    enabled: true,
+    // Imported switched off; each comes on once its first health check
+    // passes, the same as a model added by hand.
+    enabled: false,
   });
 
   // Select
@@ -73,6 +77,7 @@ export function ProviderImportWizard({
   // Review
   const [plan, setPlan] = useState<ModelImportReport | null>(null);
   const [result, setResult] = useState<ModelImportReport | null>(null);
+  const [activation, setActivation] = useState<{ on: string[]; off: { name: string; error: string }[] } | null>(null);
 
   const newRows = discovered.filter((d) => d.status === "new");
   const existingCount = discovered.length - newRows.length;
@@ -180,34 +185,37 @@ export function ProviderImportWizard({
       setPlan(null);
       if (res.ok) {
         setResult(res.report);
+        const created = res.report.models.filter((m) => m.action === "created").map((m) => m.model_name);
+        if (created.length) setActivation(await activateModelsAction(created));
       } else {
         setError(res.error);
       }
     });
   }
 
-  return (
-    <Card className="overflow-hidden border-primary/25 bg-card/80">
-      <CardHeader className="flex-row items-start justify-between gap-3 border-b border-border/70 bg-background/30">
-        <div>
-          <CardTitle>Import from provider</CardTitle>
-          <CardDescription>
-            Discover an OpenAI-compatible provider&apos;s models and import the ones you don&apos;t have yet.
-          </CardDescription>
-        </div>
-        <Button type="button" size="sm" variant="ghost" disabled={pending} onClick={onClose}>
-          Cancel
-        </Button>
-      </CardHeader>
-
-      <CardContent className="space-y-5 p-5 sm:p-6">
+  const body = (
+    <>
         {error && (
-          <p className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+          <p className="rounded-md border border-foreground/60 px-3 py-2 text-sm">
             {error}
           </p>
         )}
 
         {result && <ManifestResultBanner report={result} onDismiss={onClose} />}
+        {result && pending && !activation && <p className="text-sm text-muted-foreground">Running each new model&apos;s first health check…</p>}
+        {activation && (
+          <div className="space-y-1 rounded-md border border-border p-3 text-sm">
+            <p>
+              {activation.on.length} came on after passing a health check
+              {activation.off.length ? `; ${activation.off.length} stayed off:` : "."}
+            </p>
+            {activation.off.length > 0 && (
+              <ul className="space-y-0.5 text-xs text-muted-foreground">
+                {activation.off.map((m) => <li key={m.name}><span className="font-mono text-foreground">{m.name}</span>: {m.error}</li>)}
+              </ul>
+            )}
+          </div>
+        )}
 
         {!result && step === "connect" && (
           <section className="grid gap-4 md:max-w-xl">
@@ -384,9 +392,10 @@ export function ProviderImportWizard({
             <ManifestPreview report={plan} pending={pending} onConfirm={confirmImport} onCancel={() => setStep("select")} />
           </section>
         )}
-      </CardContent>
-    </Card>
+    </>
   );
+
+  return <div className="space-y-5">{body}</div>;
 }
 
 function NumberField({

@@ -5,11 +5,36 @@ use crate::cli::Scope;
 use crate::config::LiveConfig;
 use crate::engine::fleet;
 
+/// One API key minted under a seeded tenant. The secret lives only in memory
+/// for the duration of the run.
+#[derive(Clone, Debug)]
+pub struct SeededKey {
+    pub name: String,
+    pub secret: String,
+}
+
 #[derive(Clone, Debug)]
 pub struct SeededTenant {
     pub name: String,
     pub traffic_share: u32,
-    pub key: String,
+    pub keys: Vec<SeededKey>,
+}
+
+impl SeededTenant {
+    /// The secret for consumers that drive a single key per tenant.
+    pub fn first_key(&self) -> Result<&str> {
+        self.keys.first().map(|k| k.secret.as_str()).ok_or_else(|| {
+            anyhow::anyhow!("tenant {} has no API key to drive load with", self.name)
+        })
+    }
+}
+
+/// Which fixture fleet to seed. `Fairshare` is the wider many-pool, many-key
+/// fleet the `fairshare` profile needs; everything else uses `Standard`.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum FleetChoice {
+    Standard,
+    Fairshare,
 }
 
 #[derive(Clone, Debug)]
@@ -17,8 +42,8 @@ pub struct SeededRun {
     pub tenants: Vec<SeededTenant>,
     pub models: Vec<String>,
     /// IDs of everything obench created this run, for automatic teardown. API
-    /// key secrets live only in `tenants[].key` (in memory) and are never
-    /// written to disk.
+    /// key secrets live only in `tenants[].keys[].secret` (in memory) and are
+    /// never written to disk.
     pub teardown: Teardown,
 }
 
@@ -37,14 +62,29 @@ fn normalize_api_base_v1(base: &str) -> String {
     format!("{trimmed}/v1")
 }
 
+/// Seed the GPU-free fixture fleet: one model per admission pool, the fairshare
+/// groups, the tenants, and every tenant's keys.
+///
+/// `model_cap` is the per-model pool size pushed onto each seeded model; `None`
+/// leaves the gateway default in force.
 pub async fn seed_fixture(
     admin: &AdminClient,
     fixture_api_base: &str,
     scope: &Scope,
+    fleet_choice: FleetChoice,
+    model_cap: Option<u32>,
 ) -> Result<SeededRun> {
+    let fleet_models: &[&str] = match fleet_choice {
+        FleetChoice::Standard => fleet::FIXTURE_MODELS,
+        FleetChoice::Fairshare => fleet::FAIRSHARE_MODELS,
+    };
+    let fleet_tenants: &[(&str, &str, u32, u32)] = match fleet_choice {
+        FleetChoice::Standard => fleet::FIXTURE_TENANTS,
+        FleetChoice::Fairshare => fleet::FAIRSHARE_TENANTS,
+    };
     let models: Vec<&str> = match scope {
         Scope::Single(name) => vec![name.as_str()],
-        Scope::All => fleet::FIXTURE_MODELS.to_vec(),
+        Scope::All => fleet_models.to_vec(),
     };
     let api_base = normalize_api_base_v1(fixture_api_base);
     let mut teardown = Teardown::default();
@@ -59,6 +99,7 @@ pub async fn seed_fixture(
                 output_cost_per_token: 0.0,
                 context_window: 8192,
                 admission_weight: 100,
+                max_in_flight: model_cap,
             })
             .await?;
         if created {
@@ -69,20 +110,43 @@ pub async fn seed_fixture(
         admin.ensure_group(name, *weight).await?;
     }
     let mut tenants = Vec::new();
-    for (name, group, weight, share) in fleet::FIXTURE_TENANTS {
+    for (i, (name, group, weight, share)) in fleet_tenants.iter().enumerate() {
+        // The first fairshare tenant carries a per-model tenant ceiling so the
+        // run exercises tenant caps as well as weights.
+        let tenant_cap = (fleet_choice == FleetChoice::Fairshare && i == 0).then_some(4);
         // `tokens_per_minute = 0` means unlimited: the demo is a concurrency /
         // fairshare stress test, so we never want the per-minute token bucket to
         // shed traffic (that would mask the in-flight queueing we're measuring).
-        let (id, created) = admin.ensure_tenant(name, *weight, 0, group, true).await?;
+        let (id, created) = admin
+            .ensure_tenant(name, *weight, 0, tenant_cap, group, true)
+            .await?;
         if created {
             teardown.tenant_ids.push(id.clone());
         }
-        let (key_id, secret) = admin.ensure_key(&id, "obench").await?;
-        teardown.key_ids.push(key_id);
+        // 3 to 6 keys per fairshare tenant, so the per-key split is measured
+        // across differently sized key sets.
+        let key_specs: &[(&str, u32, Option<u32>)] = match fleet_choice {
+            FleetChoice::Standard => fleet::FIXTURE_KEYS,
+            FleetChoice::Fairshare => {
+                let n = (3 + (i % 4)).min(fleet::FAIRSHARE_KEYS.len());
+                &fleet::FAIRSHARE_KEYS[..n]
+            }
+        };
+        let mut keys = Vec::new();
+        for (key_name, key_weight, key_cap) in key_specs {
+            let (key_id, secret) = admin
+                .ensure_key(&id, key_name, *key_weight, *key_cap)
+                .await?;
+            teardown.key_ids.push(key_id);
+            keys.push(SeededKey {
+                name: key_name.to_string(),
+                secret,
+            });
+        }
         tenants.push(SeededTenant {
             name: name.to_string(),
             traffic_share: *share,
-            key: secret,
+            keys,
         });
     }
     Ok(SeededRun {
@@ -116,7 +180,10 @@ pub fn live_run_from_config(cfg: &LiveConfig, scope: &Scope) -> Result<SeededRun
                 k.label.clone()
             },
             traffic_share: k.weight.max(1),
-            key: k.secret.clone(),
+            keys: vec![SeededKey {
+                name: "live".to_string(),
+                secret: k.secret.clone(),
+            }],
         })
         .collect();
     Ok(SeededRun {

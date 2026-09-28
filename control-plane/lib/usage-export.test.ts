@@ -67,6 +67,24 @@ describe("csvField", () => {
     expect(csvField('a,"b"')).toBe('"a,""b"""');
     expect(csvField("plain")).toBe("plain");
   });
+
+  it("neutralizes spreadsheet formulas in string fields", () => {
+    expect(csvField('=HYPERLINK("x")')).toBe(`"'=HYPERLINK(""x"")"`);
+    expect(csvField("-5")).toBe(`"'-5"`);
+    expect(csvField("+1")).toBe(`"'+1"`);
+    expect(csvField("@SUM(A1)")).toBe(`"'@SUM(A1)"`);
+    expect(csvField("\tx")).toBe(`"'\tx"`);
+    expect(csvField("\rx")).toBe(`"'\rx"`);
+  });
+
+  it("quotes a bare carriage return", () => {
+    expect(csvField("a\rb")).toBe(`"a\rb"`);
+  });
+
+  it("emits numbers verbatim, including negatives", () => {
+    expect(csvField(-5)).toBe("-5");
+    expect(csvField(1.25)).toBe("1.25");
+  });
 });
 
 describe("buildUsageCsv", () => {
@@ -90,6 +108,12 @@ describe("buildUsageCsv", () => {
     const row = makeRow({ tenant_id: EMPTY, key_id: EMPTY });
     const csv = buildUsageCsv([row], ["tenant_id", "tenant_name", "key_id", "key_name"], makeCtx());
     expect(csv.split("\r\n")[1]).toBe(",,,");
+  });
+
+  it("keeps negative numeric columns unquoted but neutralizes formula-like names", () => {
+    const ctx = makeCtx({ keyNames: new Map([[KEY, "=cmd|' /C calc'!A0"]]) });
+    const csv = buildUsageCsv([makeRow({ cost_usd: -0.5 })], ["key_name", "cost_usd"], ctx);
+    expect(csv.split("\r\n")[1]).toBe(`"'=cmd|' /C calc'!A0",-0.5`);
   });
 
   it("converts energy_wh to energy_kwh", () => {

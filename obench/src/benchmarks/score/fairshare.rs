@@ -181,7 +181,7 @@ async fn scenario(
         let stats = Arc::new(Mutex::new(Stats::default()));
 
         let proxy = proxy_base.to_string();
-        let key = tenant.key.clone();
+        let key = tenant.first_key()?.to_string();
         let model = MODEL.to_string();
         let make_req = move || {
             ProxyRequest::Chat(ChatRequest {

@@ -9,8 +9,9 @@
 //!
 //! What we still block by default is the genuinely dangerous class with no
 //! legitimate "local upstream" use: **link-local / cloud-metadata**
-//! (`169.254.0.0/16`, incl. `169.254.169.254`, `fe80::/10`, and AWS's
-//! IPv6 IMDS endpoint `fd00:ec2::254`), the
+//! (`169.254.0.0/16`, incl. `169.254.169.254`, `fe80::/10`, AWS's
+//! IPv6 IMDS endpoint `fd00:ec2::254`, and Alibaba Cloud's `100.100.100.200`,
+//! which sits inside the otherwise-permitted CGNAT range), the
 //! unspecified address, and broadcast/documentation ranges. Hostnames are
 //! resolved, so a public name that maps to a blocked address is still rejected.
 //!
@@ -21,7 +22,7 @@
 //! `OBLETH_ALLOWED_PRIVATE_CIDRS=10.0.0.0/8,192.168.0.0/16`.
 //! Link-local/cloud-metadata addresses remain blocked even when allowlisted.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use ipnet::IpNet;
 
@@ -37,6 +38,8 @@ pub enum SsrfError {
     Unresolvable(String),
     #[error("host '{host}' resolves to blocked address {ip}. Private upstreams may be allowed with OBLETH_ALLOWED_PRIVATE_CIDRS; link-local/cloud-metadata addresses cannot be allowed")]
     Blocked { host: String, ip: IpAddr },
+    #[error("url template placeholders are not allowed in the scheme or credentials")]
+    TemplatedSchemeOrUserinfo,
 }
 
 /// Policy for which upstream targets are reachable.
@@ -86,7 +89,7 @@ impl SsrfPolicy {
         let ip = unmap(ip);
         // An overly broad allowlist must never reopen metadata endpoints.
         let metadata_or_link_local = match ip {
-            IpAddr::V4(v4) => v4.is_link_local(),
+            IpAddr::V4(v4) => v4.is_link_local() || v4 == ALIBABA_METADATA_V4,
             IpAddr::V6(v6) => {
                 (v6.segments()[0] & 0xffc0) == 0xfe80
                     || v6 == Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254)
@@ -108,7 +111,10 @@ impl SsrfPolicy {
 
     /// Validate a user-supplied upstream URL: must be http/https, must have a
     /// host, and every resolved address must be public or explicitly allowed.
-    pub fn validate(&self, raw_url: &str) -> Result<(), SsrfError> {
+    ///
+    /// Async because hostname resolution goes through `tokio::net::lookup_host`
+    /// instead of blocking a runtime worker on the system resolver.
+    pub async fn validate(&self, raw_url: &str) -> Result<(), SsrfError> {
         let url = reqwest::Url::parse(raw_url).map_err(|e| SsrfError::InvalidUrl(e.to_string()))?;
         match url.scheme() {
             "http" | "https" => {}
@@ -135,8 +141,8 @@ impl SsrfPolicy {
             return Ok(());
         }
 
-        let addrs: Vec<IpAddr> = (host.as_str(), port)
-            .to_socket_addrs()
+        let addrs: Vec<IpAddr> = tokio::net::lookup_host((host.as_str(), port))
+            .await
             .map_err(|_| SsrfError::Unresolvable(host.clone()))?
             .map(|sa| unmap(sa.ip()))
             .collect();
@@ -150,6 +156,59 @@ impl SsrfPolicy {
         }
         Ok(())
     }
+
+    /// Validate a URL template whose `placeholders` (e.g. `{model}`) are filled
+    /// per model at dispatch time (e.g. a per-model Kubernetes Service host).
+    /// Placeholders are replaced with a dummy DNS label and the result is
+    /// validated normally, except that a templated host cannot be resolved
+    /// before its models exist, so only an unresolvable dummy host is
+    /// tolerated. Placeholders in the scheme or credentials are rejected (see
+    /// [`check_template_structure`]); the proxy re-checks each filled host.
+    pub async fn validate_template(
+        &self,
+        template: &str,
+        placeholders: &[&str],
+    ) -> Result<(), SsrfError> {
+        let url = check_template_structure(template, placeholders)?;
+        match self.validate(url.as_str()).await {
+            Err(SsrfError::Unresolvable(host)) if host.contains(TEMPLATE_DUMMY) => Ok(()),
+            other => other,
+        }
+    }
+}
+
+/// Placeholders the speculation verifier fills per model in
+/// `speculation.verify_url_template`.
+pub const VERIFY_TEMPLATE_PLACEHOLDERS: &[&str] = &["{upstream}", "{model}"];
+
+/// Stand-in substituted for placeholders when inspecting a template.
+const TEMPLATE_DUMMY: &str = "obleth-template-placeholder";
+
+/// Parse a URL template with its placeholders substituted and reject it if any
+/// placeholder lands in the scheme or the userinfo (credentials) — positions
+/// with no legitimate per-model use, where a value could redirect the request.
+/// Host and path/query placeholders are allowed; the fill side constrains the
+/// values it puts in each position.
+pub fn check_template_structure(
+    template: &str,
+    placeholders: &[&str],
+) -> Result<reqwest::Url, SsrfError> {
+    let substituted = placeholders.iter().fold(template.to_string(), |acc, p| {
+        acc.replace(p, TEMPLATE_DUMMY)
+    });
+    let url =
+        reqwest::Url::parse(&substituted).map_err(|e| SsrfError::InvalidUrl(e.to_string()))?;
+    let misplaced = [
+        url.scheme(),
+        url.username(),
+        url.password().unwrap_or_default(),
+    ]
+    .iter()
+    .any(|part| part.contains(TEMPLATE_DUMMY));
+    if misplaced {
+        return Err(SsrfError::TemplatedSchemeOrUserinfo);
+    }
+    Ok(url)
 }
 
 /// Registered upstreams must not redirect requests (or their bodies) to an
@@ -158,16 +217,35 @@ pub fn upstream_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder().redirect(reqwest::redirect::Policy::none())
 }
 
-/// Collapse IPv4-mapped IPv6 addresses (`::ffff:a.b.c.d`) to their IPv4 form so
-/// the v4 classification rules apply and can't be bypassed.
+/// Alibaba Cloud's instance-metadata endpoint. It lives inside CGNAT
+/// (`100.64.0.0/10`), which the local-first default permits, so it is listed
+/// explicitly with the always-blocked metadata class.
+const ALIBABA_METADATA_V4: Ipv4Addr = Ipv4Addr::new(100, 100, 100, 200);
+
+/// Collapse IPv6 forms that embed an IPv4 address to that IPv4 address so the
+/// v4 classification rules apply and can't be bypassed: IPv4-mapped
+/// (`::ffff:a.b.c.d`), IPv4-compatible (`::a.b.c.d`) and the NAT64 well-known
+/// prefix (`64:ff9b::a.b.c.d`), all of which a dual-stack host or NAT64
+/// gateway routes to the embedded v4 target.
 fn unmap(ip: IpAddr) -> IpAddr {
-    match ip {
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => IpAddr::V6(v6),
-        },
-        v4 => v4,
+    let IpAddr::V6(v6) = ip else {
+        return ip;
+    };
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return IpAddr::V4(v4);
     }
+    let seg = v6.segments();
+    let [a, b] = seg[6].to_be_bytes();
+    let [c, d] = seg[7].to_be_bytes();
+    let embedded = Ipv4Addr::new(a, b, c, d);
+    let is_compat = seg[..6].iter().all(|s| *s == 0);
+    let is_nat64 = seg[0] == 0x64 && seg[1] == 0xff9b && seg[2..6].iter().all(|s| *s == 0);
+    // `::` and `::1` are the v6 unspecified/loopback addresses, not
+    // v4-compatible forms; keep them v6 so they classify as themselves.
+    if is_nat64 || (is_compat && u32::from(embedded) > 1) {
+        return IpAddr::V4(embedded);
+    }
+    ip
 }
 
 /// Parse a comma-separated list of CIDRs, ignoring blank/invalid entries.
@@ -253,21 +331,25 @@ mod tests {
         }
     }
 
-    #[test]
-    fn blocks_metadata_endpoint_by_default() {
+    #[tokio::test]
+    async fn blocks_metadata_endpoint_by_default() {
         // Cloud metadata (link-local) is dangerous and stays blocked even in the
         // default permissive policy.
         let policy = SsrfPolicy::default();
-        let err = policy.validate("http://169.254.169.254/latest/meta-data/");
+        let err = policy
+            .validate("http://169.254.169.254/latest/meta-data/")
+            .await;
         assert!(matches!(err, Err(SsrfError::Blocked { .. })));
         assert!(matches!(
-            policy.validate("http://[fd00:ec2::254]/latest/meta-data/"),
+            policy
+                .validate("http://[fd00:ec2::254]/latest/meta-data/")
+                .await,
             Err(SsrfError::Blocked { .. })
         ));
     }
 
-    #[test]
-    fn allowlists_cannot_reopen_metadata_addresses() {
+    #[tokio::test]
+    async fn allowlists_cannot_reopen_metadata_addresses() {
         for allow_private in [true, false] {
             let policy = SsrfPolicy {
                 allow: parse_cidrs("0.0.0.0/0,::/0,169.254.0.0/16,fe80::/10"),
@@ -281,11 +363,11 @@ mod tests {
                 "http://[::ffff:169.254.169.254]/",
             ] {
                 assert!(
-                    matches!(policy.validate(url), Err(SsrfError::Blocked { .. })),
+                    matches!(policy.validate(url).await, Err(SsrfError::Blocked { .. })),
                     "{url}"
                 );
             }
-            assert!(policy.validate("http://10.1.2.3:8080").is_ok());
+            assert!(policy.validate("http://10.1.2.3:8080").await.is_ok());
         }
     }
 
@@ -327,25 +409,25 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
-    #[test]
-    fn allows_loopback_and_private_by_default() {
+    #[tokio::test]
+    async fn allows_loopback_and_private_by_default() {
         // Local-first default: the addresses an operator legitimately reaches.
         let policy = SsrfPolicy::default();
-        assert!(policy.validate("http://127.0.0.1:5432").is_ok());
-        assert!(policy.validate("http://10.1.2.3:8080").is_ok());
-        assert!(policy.validate("http://192.168.1.10").is_ok());
-        assert!(policy.validate("http://172.16.5.5:11434/v1").is_ok());
+        assert!(policy.validate("http://127.0.0.1:5432").await.is_ok());
+        assert!(policy.validate("http://10.1.2.3:8080").await.is_ok());
+        assert!(policy.validate("http://192.168.1.10").await.is_ok());
+        assert!(policy.validate("http://172.16.5.5:11434/v1").await.is_ok());
     }
 
-    #[test]
-    fn strict_mode_blocks_private_unless_listed() {
+    #[tokio::test]
+    async fn strict_mode_blocks_private_unless_listed() {
         let policy = strict();
         assert!(matches!(
-            policy.validate("http://127.0.0.1:5432"),
+            policy.validate("http://127.0.0.1:5432").await,
             Err(SsrfError::Blocked { .. })
         ));
         assert!(matches!(
-            policy.validate("http://192.168.1.10"),
+            policy.validate("http://192.168.1.10").await,
             Err(SsrfError::Blocked { .. })
         ));
 
@@ -353,60 +435,148 @@ mod tests {
             allow: parse_cidrs("10.0.0.0/8"),
             allow_private: false,
         };
-        assert!(listed.validate("http://10.1.2.3:8080/mcp").is_ok());
+        assert!(listed.validate("http://10.1.2.3:8080/mcp").await.is_ok());
         // A range outside the explicit list is still blocked in strict mode.
         assert!(matches!(
-            listed.validate("http://192.168.1.10"),
+            listed.validate("http://192.168.1.10").await,
             Err(SsrfError::Blocked { .. })
         ));
     }
 
-    #[test]
-    fn allows_public_address() {
+    #[tokio::test]
+    async fn allows_public_address() {
         let policy = SsrfPolicy::default();
-        assert!(policy.validate("https://1.1.1.1").is_ok());
+        assert!(policy.validate("https://1.1.1.1").await.is_ok());
     }
 
-    #[test]
-    fn rejects_non_http_scheme() {
+    #[tokio::test]
+    async fn rejects_non_http_scheme() {
         let policy = SsrfPolicy::default();
         assert!(matches!(
-            policy.validate("file:///etc/passwd"),
+            policy.validate("file:///etc/passwd").await,
             Err(SsrfError::BadScheme)
         ));
     }
 
-    #[test]
-    fn ipv4_mapped_ipv6_cannot_bypass() {
+    #[tokio::test]
+    async fn ipv4_mapped_ipv6_cannot_bypass() {
         // In strict mode a mapped loopback must classify as loopback and block.
         let policy = strict();
         assert!(matches!(
-            policy.validate("http://[::ffff:127.0.0.1]:80"),
+            policy.validate("http://[::ffff:127.0.0.1]:80").await,
             Err(SsrfError::Blocked { .. })
         ));
     }
 
-    #[test]
-    fn ipv6_loopback_is_blocked_in_strict_mode() {
+    #[tokio::test]
+    async fn ipv6_loopback_is_blocked_in_strict_mode() {
         let policy = strict();
         assert!(matches!(
-            policy.validate("http://[::1]:80"),
+            policy.validate("http://[::1]:80").await,
             Err(SsrfError::Blocked { .. })
         ));
     }
 
-    #[test]
-    fn ipv4_mapped_private_cannot_bypass() {
+    #[tokio::test]
+    async fn ipv4_mapped_private_cannot_bypass() {
         let policy = strict();
         assert!(matches!(
-            policy.validate("http://[::ffff:10.1.2.3]:80"),
+            policy.validate("http://[::ffff:10.1.2.3]:80").await,
             Err(SsrfError::Blocked { .. })
         ));
     }
 
-    #[test]
-    fn public_ipv6_literal_is_allowed() {
+    #[tokio::test]
+    async fn public_ipv6_literal_is_allowed() {
         let policy = SsrfPolicy::default();
-        assert!(policy.validate("http://[2606:4700:4700::1111]:80").is_ok());
+        assert!(policy
+            .validate("http://[2606:4700:4700::1111]:80")
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn embedded_ipv4_metadata_forms_are_blocked() {
+        // IPv4-compatible and NAT64 spellings of 169.254.169.254, plus
+        // Alibaba's CGNAT-range metadata address, in both policies.
+        for policy in [SsrfPolicy::default(), strict()] {
+            for url in [
+                "http://[::a9fe:a9fe]/",
+                "http://[64:ff9b::a9fe:a9fe]/",
+                "http://100.100.100.200/latest/meta-data/",
+            ] {
+                assert!(
+                    matches!(policy.validate(url).await, Err(SsrfError::Blocked { .. })),
+                    "{url}"
+                );
+            }
+        }
+        // The rest of CGNAT stays reachable under the local-first default.
+        assert!(SsrfPolicy::default()
+            .validate("http://100.100.100.201/")
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn unmap_keeps_v6_loopback_and_unspecified() {
+        assert_eq!(
+            unmap("::1".parse().unwrap()),
+            "::1".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            unmap("::".parse().unwrap()),
+            "::".parse::<IpAddr>().unwrap()
+        );
+        assert_eq!(
+            unmap("64:ff9b::a00:1".parse().unwrap()),
+            "10.0.0.1".parse::<IpAddr>().unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn templates_allow_host_and_path_placeholders_but_not_scheme_or_userinfo() {
+        let policy = SsrfPolicy::default();
+        let ph = VERIFY_TEMPLATE_PLACEHOLDERS;
+        for template in [
+            "http://10.0.0.5:8000/{upstream}/v1?m={model}",
+            // Per-model Kubernetes Service: the host can't resolve until the
+            // model exists, so the dummy host's resolution failure is tolerated.
+            "http://{upstream}.serving.svc.cluster.local:8000/v1",
+            "http://{upstream}/v1",
+        ] {
+            assert!(
+                policy.validate_template(template, ph).await.is_ok(),
+                "{template}"
+            );
+        }
+        for template in [
+            "http://{model}@10.0.0.5/v1",
+            "http://user:{model}@10.0.0.5/v1",
+            "{upstream}://10.0.0.5/v1",
+        ] {
+            assert!(
+                matches!(
+                    policy.validate_template(template, ph).await,
+                    Err(SsrfError::TemplatedSchemeOrUserinfo)
+                ),
+                "{template}"
+            );
+        }
+        // A templated port can't even parse, so it is rejected too.
+        assert!(policy
+            .validate_template("http://10.0.0.5:{model}/v1", ph)
+            .await
+            .is_err());
+        assert!(matches!(
+            policy
+                .validate_template("http://169.254.169.254/{model}/v1", ph)
+                .await,
+            Err(SsrfError::Blocked { .. })
+        ));
+        assert!(matches!(
+            policy.validate_template("file:///{model}", ph).await,
+            Err(SsrfError::BadScheme)
+        ));
     }
 }

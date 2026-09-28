@@ -190,9 +190,9 @@ export function CreateTenant({
               </div>
               <div className="space-y-1.5">
                 <div className="flex items-center gap-1.5">
-                  <Label htmlFor="tenant-max-in-flight">Concurrency cap</Label>
+                  <Label htmlFor="tenant-max-in-flight">Max in flight per model</Label>
                   <InfoTip>
-                    Maximum requests for this tenant that may be actively running at the same time. Blank means unlimited at the tenant level; global and model capacity still apply.
+                    Maximum requests this tenant can have running at the same time on any one model. Leave blank for no per-model cap.
                   </InfoTip>
                 </div>
                 <Input

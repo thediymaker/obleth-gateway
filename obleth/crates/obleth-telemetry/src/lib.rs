@@ -2,11 +2,11 @@
 //!
 //! The request hot path calls [`TelemetrySink::record`], which is a non-blocking
 //! channel send — it never awaits ClickHouse. A background task batches rows and
-//! inserts them. If ClickHouse is unavailable and fail-open is set, batches spill
-//! to a local write-ahead log and are replayed once it recovers, so the user's
-//! request is never blocked by the ledger.
+//! inserts them. If ClickHouse is unavailable, batches always spill (regardless of
+//! `OBLETH_FAIL_OPEN`) to a local write-ahead log and are replayed once it recovers,
+//! so the user's request is never blocked by the ledger.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,11 +14,32 @@ use clickhouse::{Client, Row};
 use obleth_config::UsageRecord;
 use serde::{Deserialize, Serialize};
 mod wal;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 const BATCH_MAX: usize = 500;
 const FLUSH_INTERVAL: Duration = Duration::from_millis(1000);
+/// Bound on the reachability probe that precedes schema setup: the ClickHouse
+/// client has no connect timeout, and a blackholed host would otherwise hang
+/// boot (or the flusher) for the OS TCP timeout.
+const SCHEMA_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+/// `usage_meta` key recording that `usage_daily` has been seeded from history.
+const BACKFILL_MARKER: &str = "backfilled_v1";
+/// `usage_meta` key under which booting replicas elect one backfiller.
+const BACKFILL_CLAIM: &str = "backfill_claim_v1";
+/// How long a claimant waits for concurrent claims to become visible.
+const BACKFILL_CLAIM_SETTLE: Duration = Duration::from_secs(2);
+/// Upper bound on `TelemetrySink::shutdown` draining both flushers.
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(20);
+/// A failing schema setup retries on every flush tick (~1s); cap how often
+/// that repeats as a `warn!` so a down/misconfigured ClickHouse doesn't spam
+/// the log, while still keeping it visible at the default log level (before
+/// this it was `debug!`, which production never shows).
+const SCHEMA_WARN_INTERVAL: Duration = Duration::from_secs(60);
+/// Consecutive schema-setup failures after which we escalate once to
+/// `error!`. Failing this persistently is much more likely a configuration
+/// problem (bad grants, DDL the user can't run) than a transient outage.
+const SCHEMA_FAILURE_ALERT_THRESHOLD: u64 = 10;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TelemetryError {
@@ -28,6 +49,8 @@ pub enum TelemetryError {
     InvalidDatabase(String),
     #[error("clickhouse insert timed out")]
     InsertTimeout,
+    #[error("clickhouse did not answer within {0:?}")]
+    Unreachable(Duration),
 }
 
 /// Borrowed ClickHouse row mirror of [`UsageRecord`], so a batch insert
@@ -80,10 +103,10 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             total_ms: r.total_ms,
             status_code: r.status_code,
             cache_status: &r.cache_status,
-            cost_usd: r.cost_usd,
-            energy_wh: r.energy_wh,
-            energy_cost_usd: r.energy_cost_usd,
-            co2_g: r.co2_g,
+            cost_usd: finite_or_zero(r.cost_usd),
+            energy_wh: finite_or_zero(r.energy_wh),
+            energy_cost_usd: finite_or_zero(r.energy_cost_usd),
+            co2_g: finite_or_zero(r.co2_g),
             ts_ms: r.ts_ms,
             session_id: &r.session_id,
             session_id_source: &r.session_id_source,
@@ -91,6 +114,30 @@ impl<'a> From<&'a UsageRecord> for UsageRow<'a> {
             device_id: &r.device_id,
         }
     }
+}
+
+/// One NaN in `usage` turns every `sum()` over it, including the permanent
+/// `usage_daily` rollup, into NaN.
+fn finite_or_zero(value: f64) -> f64 {
+    if value.is_finite() {
+        value
+    } else {
+        0.0
+    }
+}
+
+/// Stable across processes so a batch replayed from the WAL carries the same
+/// `insert_deduplication_token` as the insert that timed out, whether or not
+/// ClickHouse committed it.
+fn dedup_token(batch: &[UsageRecord]) -> String {
+    // FNV-1a: std's hashers are not guaranteed stable across Rust releases.
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for record in batch {
+        for byte in record.request_id.as_bytes() {
+            hash = (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    format!("usage-{}-{hash:016x}", batch.len())
 }
 
 /// Public record type that the proxy constructs for each span.
@@ -150,52 +197,102 @@ pub struct TelemetryStats {
 pub struct TelemetrySink {
     tx: mpsc::Sender<UsageRecord>,
     tx_spans: mpsc::Sender<SpanRecord>,
+    /// Drain requests: each flusher empties its queue, flushes, then acks.
+    drain: mpsc::Sender<oneshot::Sender<()>>,
+    drain_spans: mpsc::Sender<oneshot::Sender<()>>,
     stats: Arc<TelemetryStats>,
+    /// Mirrors the flusher's view of schema readiness so the caller can tell
+    /// "connected, schema applied" from "up in spill mode" right after boot,
+    /// without reaching into the flusher task.
+    schema_ready: Arc<AtomicBool>,
 }
 
 impl TelemetrySink {
     /// Connect, ensure schema exists, and spawn the background flusher.
+    ///
+    /// An unreachable ClickHouse does not fail start: the sink comes up in
+    /// spill mode (usage goes to the WAL, spans are dropped) and the flusher
+    /// retries schema setup with backoff before its first insert. Only an
+    /// invalid database name is an error.
+    ///
+    /// `_fail_open` is ignored: telemetry always spills to the WAL on failure.
+    /// `OBLETH_FAIL_OPEN` governs budget admission only, and a ledger outage
+    /// must never cost accounting data. Kept so callers compile unchanged.
     pub async fn start(
         url: &str,
         database: &str,
         user: &str,
         password: &str,
         wal_path: &str,
-        fail_open: bool,
+        _fail_open: bool,
     ) -> Result<Self, TelemetryError> {
-        let mut client = Client::default().with_url(url).with_user(user);
-        if !password.is_empty() {
-            client = client.with_password(password);
+        if !is_valid_identifier(database) {
+            return Err(TelemetryError::InvalidDatabase(database.to_string()));
         }
-        ensure_schema(&client, database).await?;
-        let client = client.with_database(database);
+        let mut schema_client = Client::default().with_url(url).with_user(user);
+        if !password.is_empty() {
+            schema_client = schema_client.with_password(password);
+        }
+        let schema_ready = match apply_schema(&schema_client, database).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "clickhouse unavailable at boot; spilling usage to the WAL and retrying schema setup"
+                );
+                false
+            }
+        };
+        let schema_ready = Arc::new(AtomicBool::new(schema_ready));
+        // The schema client stays database-less: a `database` URL parameter
+        // naming a database that does not exist yet fails every statement,
+        // including the `CREATE DATABASE` that would fix it.
+        let client = schema_client.clone().with_database(database);
 
         let (tx, rx) = mpsc::channel(10_000);
         let (tx_spans, rx_spans) = mpsc::channel::<SpanRecord>(10_000);
         let stats = Arc::new(TelemetryStats::default());
         let flusher = Flusher {
             client: client.clone(),
+            schema_client,
+            database: database.to_string(),
+            schema_ready: schema_ready.clone(),
             wal: wal::Wal::new(wal_path),
+            wal_path: wal_path.to_string(),
             backoff: Backoff::default(),
             replay_backoff: Backoff::default(),
-            fail_open,
             stats: stats.clone(),
+            schema_failures: 0,
+            last_schema_warn: None,
         };
         let spans_flusher = SpansFlusher {
             client,
+            schema_ready: schema_ready.clone(),
             stats: stats.clone(),
         };
-        tokio::spawn(flusher.run(rx));
-        tokio::spawn(spans_flusher.run(rx_spans));
+        let (drain, drain_rx) = mpsc::channel(4);
+        let (drain_spans, drain_spans_rx) = mpsc::channel(4);
+        tokio::spawn(flusher.run(rx, drain_rx));
+        tokio::spawn(spans_flusher.run(rx_spans, drain_spans_rx));
         Ok(TelemetrySink {
             tx,
             tx_spans,
+            drain,
+            drain_spans,
             stats,
+            schema_ready,
         })
     }
 
     pub fn stats(&self) -> Arc<TelemetryStats> {
         self.stats.clone()
+    }
+
+    /// Whether the ClickHouse schema is applied right now — `false` means
+    /// usage rows are spilling to the WAL, either because setup hasn't
+    /// succeeded since boot or because it is currently down.
+    pub fn schema_ready(&self) -> bool {
+        self.schema_ready.load(Ordering::Acquire)
     }
 
     /// Non-blocking emit. Drops (and counts) the record if the buffer is full so
@@ -216,59 +313,108 @@ impl TelemetrySink {
     pub fn record_span(&self, span: SpanRecord) {
         let _ = self.tx_spans.try_send(span);
     }
+
+    /// Write everything recorded so far before the process exits, bounded so a
+    /// wedged ledger can't hold exit. Each flusher drains its queue and runs a
+    /// final flush (ClickHouse, or the WAL if the insert fails) before acking.
+    /// `record` keeps working afterwards; the flushers keep running.
+    pub async fn shutdown(&self) {
+        let drained = tokio::time::timeout(SHUTDOWN_TIMEOUT, async {
+            let mut acks = Vec::new();
+            for drain in [&self.drain, &self.drain_spans] {
+                let (ack, done) = oneshot::channel();
+                if drain.send(ack).await.is_ok() {
+                    acks.push(done);
+                }
+            }
+            for done in acks {
+                let _ = done.await;
+            }
+        })
+        .await;
+        if drained.is_err() {
+            tracing::warn!(
+                timeout = ?SHUTDOWN_TIMEOUT,
+                "telemetry did not finish flushing before shutdown; queued records may be lost"
+            );
+        }
+    }
 }
 
 struct Flusher {
     client: Client,
+    schema_client: Client,
+    database: String,
+    schema_ready: Arc<AtomicBool>,
     wal: wal::Wal,
+    /// Kept alongside `wal` (which doesn't expose its path) so a persistent
+    /// schema failure can name where usage is spilling to.
+    wal_path: String,
     backoff: Backoff,
     replay_backoff: Backoff,
-    fail_open: bool,
     stats: Arc<TelemetryStats>,
+    /// Consecutive schema-setup failures since the last success; resets on
+    /// the next success. Drives the warn rate limit and the one-time escalation
+    /// to `error!`.
+    schema_failures: u64,
+    last_schema_warn: Option<tokio::time::Instant>,
 }
 
 impl Flusher {
-    async fn run(mut self, mut rx: mpsc::Receiver<UsageRecord>) {
+    async fn run(
+        mut self,
+        mut rx: mpsc::Receiver<UsageRecord>,
+        mut drain: mpsc::Receiver<oneshot::Sender<()>>,
+    ) {
         let mut buf: Vec<UsageRecord> = Vec::with_capacity(BATCH_MAX);
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
+                Some(ack) = drain.recv() => {
+                    // Everything sent before the drain request is already queued.
+                    // Shutdown has a fixed budget: no untimed schema setup
+                    // (claim sleep, backfill) here; spill instead.
+                    while let Ok(rec) = rx.try_recv() {
+                        buf.push(rec);
+                        if buf.len() >= BATCH_MAX {
+                            self.flush(&mut buf, false).await;
+                        }
+                    }
+                    self.flush(&mut buf, false).await;
+                    let _ = ack.send(());
+                }
                 maybe = rx.recv() => {
                     match maybe {
                         Some(rec) => {
                             buf.push(rec);
                             if buf.len() >= BATCH_MAX {
-                                self.flush(&mut buf).await;
+                                self.flush(&mut buf, true).await;
                             }
                         }
                         None => {
-                            self.flush(&mut buf).await;
+                            self.flush(&mut buf, false).await;
                             break;
                         }
                     }
                 }
                 _ = ticker.tick() => {
-                    self.flush(&mut buf).await;
+                    self.flush(&mut buf, true).await;
                     self.replay_wal().await;
                 }
             }
         }
     }
 
-    async fn flush(&mut self, buf: &mut Vec<UsageRecord>) {
+    /// Insert, or spill to the WAL on any failure. Records are dropped only
+    /// when the WAL itself refuses them (disk/segment cap).
+    async fn flush(&mut self, buf: &mut Vec<UsageRecord>, setup_schema: bool) {
         if buf.is_empty() {
             return;
         }
         let mut batch = std::mem::take(buf);
-        if !self.backoff.ready() {
-            if self.fail_open {
-                self.write_wal(&batch).await;
-            } else {
-                self.stats
-                    .dropped
-                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
-            }
+        if !self.clickhouse_ready(setup_schema).await {
+            self.write_wal(&batch).await;
             batch.clear();
             *buf = batch;
             return;
@@ -278,22 +424,75 @@ impl Flusher {
             Err(e) => {
                 self.backoff.fail();
                 tracing::warn!(error = %e, count = batch.len(), "clickhouse insert failed");
-                if self.fail_open {
-                    self.write_wal(&batch).await;
-                } else {
-                    self.stats
-                        .dropped
-                        .fetch_add(batch.len() as u64, Ordering::Relaxed);
-                }
+                self.write_wal(&batch).await;
             }
         }
         batch.clear();
         *buf = batch;
     }
 
+    /// False while backing off, or until schema setup (skipped at boot because
+    /// ClickHouse was down) has succeeded. With `setup_schema` false a missing
+    /// schema is reported as not ready rather than retried.
+    async fn clickhouse_ready(&mut self, setup_schema: bool) -> bool {
+        if !self.backoff.ready() {
+            return false;
+        }
+        if self.schema_ready.load(Ordering::Acquire) {
+            return true;
+        }
+        if !setup_schema {
+            return false;
+        }
+        match apply_schema(&self.schema_client, &self.database).await {
+            Ok(()) => {
+                self.schema_ready.store(true, Ordering::Release);
+                self.schema_failures = 0;
+                self.last_schema_warn = None;
+                tracing::info!("clickhouse schema applied; leaving telemetry spill mode");
+                true
+            }
+            Err(e) => {
+                self.backoff.fail();
+                self.schema_failures += 1;
+                let now = tokio::time::Instant::now();
+                let should_warn = match self.last_schema_warn {
+                    Some(last) => now.saturating_duration_since(last) >= SCHEMA_WARN_INTERVAL,
+                    None => true,
+                };
+                if should_warn {
+                    self.last_schema_warn = Some(now);
+                    tracing::warn!(
+                        error = %e,
+                        attempts = self.schema_failures,
+                        "clickhouse schema setup failing"
+                    );
+                } else {
+                    tracing::debug!(error = %e, attempts = self.schema_failures, "clickhouse schema setup still failing");
+                }
+                if self.schema_failures == SCHEMA_FAILURE_ALERT_THRESHOLD {
+                    tracing::error!(
+                        attempts = self.schema_failures,
+                        wal_path = %self.wal_path,
+                        "clickhouse schema setup failing for {} attempts; usage rows are spilling to {}",
+                        self.schema_failures,
+                        self.wal_path
+                    );
+                }
+                false
+            }
+        }
+    }
+
     async fn insert(&self, batch: &[UsageRecord]) -> Result<(), TelemetryError> {
         tokio::time::timeout(Duration::from_secs(5), async {
-            let mut insert = self.client.insert("usage")?;
+            let mut insert = self
+                .client
+                .insert("usage")?
+                .with_option("insert_deduplication_token", dedup_token(batch))
+                // Without this the rollup view still fires for a block that
+                // `usage` discarded as a duplicate, double-counting usage_daily.
+                .with_option("deduplicate_blocks_in_dependent_materialized_views", "1");
             for rec in batch {
                 insert.write(&UsageRow::from(rec)).await?;
             }
@@ -321,7 +520,7 @@ impl Flusher {
     }
 
     async fn replay_wal(&mut self) {
-        if !self.backoff.ready() || !self.replay_backoff.ready() {
+        if !self.replay_backoff.ready() || !self.clickhouse_ready(true).await {
             return;
         }
         let batch = match self.wal.next_batch().await {
@@ -383,16 +582,31 @@ impl Backoff {
 
 struct SpansFlusher {
     client: Client,
+    schema_ready: Arc<AtomicBool>,
     #[allow(dead_code)]
     stats: Arc<TelemetryStats>,
 }
 
 impl SpansFlusher {
-    async fn run(self, mut rx: mpsc::Receiver<SpanRecord>) {
+    async fn run(
+        self,
+        mut rx: mpsc::Receiver<SpanRecord>,
+        mut drain: mpsc::Receiver<oneshot::Sender<()>>,
+    ) {
         let mut buf: Vec<SpanRecord> = Vec::with_capacity(BATCH_MAX);
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         loop {
             tokio::select! {
+                Some(ack) = drain.recv() => {
+                    while let Ok(rec) = rx.try_recv() {
+                        buf.push(rec);
+                        if buf.len() >= BATCH_MAX {
+                            self.flush(&mut buf).await;
+                        }
+                    }
+                    self.flush(&mut buf).await;
+                    let _ = ack.send(());
+                }
                 maybe = rx.recv() => {
                     match maybe {
                         Some(rec) => {
@@ -420,6 +634,11 @@ impl SpansFlusher {
         }
         let batch = std::mem::take(buf);
         let count = batch.len();
+        // Spans are disposable; without a schema the insert can only fail.
+        if !self.schema_ready.load(Ordering::Acquire) {
+            tracing::debug!(count, "spans dropped; clickhouse schema not ready");
+            return;
+        }
         if let Err(e) = self.insert(&batch).await {
             tracing::warn!(error = %e, count, "spans insert failed");
         } else {
@@ -427,13 +646,17 @@ impl SpansFlusher {
         }
     }
 
-    async fn insert(&self, batch: &[SpanRecord]) -> Result<(), clickhouse::error::Error> {
-        let mut ins = self.client.insert("spans")?;
-        for rec in batch {
-            ins.write(&SpanRow::from(rec)).await?;
-        }
-        ins.end().await?;
-        Ok(())
+    async fn insert(&self, batch: &[SpanRecord]) -> Result<(), TelemetryError> {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut ins = self.client.insert("spans")?;
+            for rec in batch {
+                ins.write(&SpanRow::from(rec)).await?;
+            }
+            ins.end().await?;
+            Ok(())
+        })
+        .await
+        .map_err(|_| TelemetryError::InsertTimeout)?
     }
 }
 
@@ -448,6 +671,15 @@ fn is_valid_identifier(name: &str) -> bool {
             .next()
             .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// Probe reachability under a timeout, then run the (untimed) schema setup:
+/// cancelling it midway could interrupt the one-time rollup backfill.
+async fn apply_schema(client: &Client, database: &str) -> Result<(), TelemetryError> {
+    tokio::time::timeout(SCHEMA_PROBE_TIMEOUT, client.query("SELECT 1").execute())
+        .await
+        .map_err(|_| TelemetryError::Unreachable(SCHEMA_PROBE_TIMEOUT))??;
+    ensure_schema(client, database).await
 }
 
 async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryError> {
@@ -560,6 +792,27 @@ async fn ensure_schema(client: &Client, database: &str) -> Result<(), TelemetryE
         ))
         .execute()
         .await?;
+    // Required for `insert_deduplication_token` on a non-replicated table: an
+    // insert that timed out after committing is replayed from the WAL with the
+    // same token, and ClickHouse discards the duplicate.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage MODIFY SETTING non_replicated_deduplication_window = 10000"
+        ))
+        .execute()
+        .await?;
+    // Small key/value ledger for one-time schema actions shared by replicas.
+    client
+        .query(&format!(
+            "CREATE TABLE IF NOT EXISTS {database}.usage_meta (
+                key String,
+                value String,
+                updated_at DateTime64(3) DEFAULT now64(3)
+            ) ENGINE = ReplacingMergeTree(updated_at)
+            ORDER BY (key, value)"
+        ))
+        .execute()
+        .await?;
     ensure_daily_rollup(client, database).await?;
     client
         .query(&format!(
@@ -650,6 +903,15 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
             .execute()
             .await?;
     }
+    // Dependent-view deduplication (see `Flusher::insert`) needs the window on
+    // the view's target too. View blocks are identified by their source block,
+    // not their content, so identical aggregates from different batches stay.
+    client
+        .query(&format!(
+            "ALTER TABLE {database}.usage_daily MODIFY SETTING non_replicated_deduplication_window = 10000"
+        ))
+        .execute()
+        .await?;
 
     // The aggregation projection shared by the materialized view and the
     // backfill, so both compute identical columns from the raw ledger.
@@ -686,48 +948,325 @@ async fn ensure_daily_rollup(client: &Client, database: &str) -> Result<(), Tele
     // One-time backfill BEFORE the view exists, and only when the rollup is
     // empty, so restarts never double-count (SummingMergeTree would otherwise
     // re-add existing history) and the view below cannot also capture the same
-    // historical rows.
-    let existing = client
-        .query(&format!("SELECT count() FROM {database}.usage_daily"))
-        .fetch_one::<u64>()
-        .await
-        .unwrap_or(0);
-    if existing == 0 {
-        let backfill = format!(
-            "INSERT INTO {database}.usage_daily
-             SELECT {rollup_select}
-             FROM {database}.usage
-             WHERE request_type != '{bench}'
-             GROUP BY day, tenant_id, key_id, model"
-        );
-        if let Err(e) = client.query(&backfill).execute().await {
-            tracing::warn!(error = %e, "usage_daily backfill failed; rollup will fill going forward");
+    // historical rows. A failed count is an error, never "empty".
+    if meta_count(client, database, BACKFILL_MARKER).await? == 0 {
+        let rolled_up = client
+            .query(&format!("SELECT count() FROM {database}.usage_daily"))
+            .fetch_one::<u64>()
+            .await?;
+        let history = client
+            .query(&format!(
+                "SELECT count() FROM {database}.usage WHERE request_type != ?"
+            ))
+            .bind(bench)
+            .fetch_one::<u64>()
+            .await?;
+        if rolled_up > 0 || history == 0 {
+            meta_put(client, database, BACKFILL_MARKER, "1").await?;
+        } else if won_backfill_claim(client, database).await? {
+            let backfill = format!(
+                "INSERT INTO {database}.usage_daily
+                 SELECT {rollup_select}
+                 FROM {database}.usage
+                 WHERE request_type != '{bench}'
+                 GROUP BY day, tenant_id, key_id, model"
+            );
+            // Content-hash dedup must not drop backfill blocks: the marker and
+            // claim above are what prevent a double backfill.
+            match client
+                .query(&backfill)
+                .with_option("insert_deduplicate", "0")
+                .execute()
+                .await
+            {
+                Ok(()) => meta_put(client, database, BACKFILL_MARKER, "1").await?,
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    "usage_daily backfill failed; rollup will fill going forward"
+                ),
+            }
         }
     }
 
-    let mv_ddl = format!(
-        "CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.usage_daily_mv
-         TO {database}.usage_daily AS
-         SELECT {rollup_select}
+    let mv_select = format!(
+        "SELECT {rollup_select}
          FROM {database}.usage
          WHERE request_type != '{bench}'
          GROUP BY day, tenant_id, key_id, model"
     );
-    // Drop-and-recreate so latency-sum semantics (success-only) take effect on
-    // deployments whose view predates this change. Dropping the view leaves the
-    // target `usage_daily` rows untouched — historical aggregates are kept as-is
-    // and only new inserts use the updated projection.
+    // Recreate only when the stored definition differs (e.g. the success-only
+    // latency sums). Every drop opens a window in which rows written by other
+    // replicas never reach `usage_daily`; target rows themselves survive it.
+    let unchanged = match view_matches(client, database, &mv_select).await {
+        Ok(unchanged) => unchanged,
+        Err(e) => {
+            tracing::warn!(error = %e, "could not compare usage_daily_mv definition; recreating it");
+            false
+        }
+    };
+    if !unchanged {
+        client
+            .query(&format!("DROP VIEW IF EXISTS {database}.usage_daily_mv"))
+            .execute()
+            .await?;
+        client
+            .query(&format!(
+                "CREATE MATERIALIZED VIEW IF NOT EXISTS {database}.usage_daily_mv
+                 TO {database}.usage_daily AS {mv_select}"
+            ))
+            .execute()
+            .await?;
+    }
+    Ok(())
+}
+
+/// True when `usage_daily_mv` exists with exactly `select` as its query.
+/// ClickHouse stores views re-formatted (`create_table_query` gains a column
+/// list and parenthesised predicates), so the intended SELECT is formatted by
+/// the server itself and compared with the stored `as_select`.
+async fn view_matches(
+    client: &Client,
+    database: &str,
+    select: &str,
+) -> Result<bool, TelemetryError> {
+    let matches = client
+        .query(
+            "SELECT formatQuerySingleLine(?) = as_select FROM system.tables
+             WHERE database = ? AND name = 'usage_daily_mv'",
+        )
+        .bind(select)
+        .bind(database)
+        .fetch_optional::<u8>()
+        .await?;
+    Ok(matches == Some(1))
+}
+
+async fn meta_count(client: &Client, database: &str, key: &str) -> Result<u64, TelemetryError> {
+    Ok(client
+        .query(&format!(
+            "SELECT count() FROM {database}.usage_meta WHERE key = ?"
+        ))
+        .bind(key)
+        .fetch_one::<u64>()
+        .await?)
+}
+
+async fn meta_put(
+    client: &Client,
+    database: &str,
+    key: &str,
+    value: &str,
+) -> Result<(), TelemetryError> {
     client
-        .query(&format!("DROP VIEW IF EXISTS {database}.usage_daily_mv"))
+        .query(&format!(
+            "INSERT INTO {database}.usage_meta (key, value) VALUES (?, ?)"
+        ))
+        .bind(key)
+        .bind(value)
         .execute()
         .await?;
-    client.query(&mv_ddl).execute().await?;
     Ok(())
+}
+
+/// ClickHouse has no compare-and-set, so replicas booting together elect the
+/// backfiller: each records a random claim, waits for concurrent claims to
+/// land, and only the smallest recent claim proceeds. Claims older than a few
+/// minutes belong to a replica that died before finishing and are ignored.
+///
+/// Trade-offs, accepted because the backfill runs once per deployment:
+/// - A claim from a replica that crashed less than 5 minutes ago can still
+///   win, so nobody backfills on this boot. The rollup then fills going
+///   forward only, which is the same loss as the old "backfill failed" path.
+/// - A replica whose claim becomes visible only after the settle window (a
+///   very slow insert) can also see itself as the smallest claim, so both
+///   backfill and history is counted twice. The window makes this unlikely,
+///   not impossible.
+async fn won_backfill_claim(client: &Client, database: &str) -> Result<bool, TelemetryError> {
+    let claim = Uuid::new_v4().to_string();
+    meta_put(client, database, BACKFILL_CLAIM, &claim).await?;
+    tokio::time::sleep(BACKFILL_CLAIM_SETTLE).await;
+    let winner = client
+        .query(&format!(
+            "SELECT min(value) FROM {database}.usage_meta
+             WHERE key = ? AND updated_at > now64(3) - INTERVAL 5 MINUTE"
+        ))
+        .bind(BACKFILL_CLAIM)
+        .fetch_one::<String>()
+        .await?;
+    Ok(winner == claim)
 }
 
 #[cfg(test)]
 mod conv_tests {
     use super::*;
+
+    fn record() -> UsageRecord {
+        UsageRecord {
+            request_id: uuid::Uuid::new_v4(),
+            tenant_id: uuid::Uuid::nil(),
+            key_id: uuid::Uuid::nil(),
+            model: "m".into(),
+            admission: "ok".into(),
+            weight: 1,
+            input_tokens: 1,
+            output_tokens: 1,
+            estimated_tokens: 2,
+            queue_wait_ms: 0,
+            ttft_ms: 0,
+            total_ms: 1,
+            status_code: 200,
+            cache_status: "off".into(),
+            cost_usd: 0.0,
+            energy_wh: 0.0,
+            energy_cost_usd: 0.0,
+            co2_g: 0.0,
+            ts_ms: 0,
+            session_id: String::new(),
+            session_id_source: String::new(),
+            request_type: "chat".into(),
+            device_id: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn starts_without_clickhouse_and_spills_to_the_wal() {
+        let directory =
+            std::env::temp_dir().join(format!("obleth-sink-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.unwrap();
+        let wal_path = directory.join("usage.jsonl");
+        // Port 1 on loopback refuses connections.
+        let sink = TelemetrySink::start(
+            "http://127.0.0.1:1",
+            "obleth",
+            "default",
+            "",
+            wal_path.to_str().unwrap(),
+            true,
+        )
+        .await
+        .expect("sink must start while ClickHouse is unreachable");
+        sink.record(record());
+        let stats = sink.stats();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while stats.waled.load(Ordering::Relaxed) == 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(stats.waled.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.dropped.load(Ordering::Relaxed), 0);
+        let _ = tokio::fs::remove_dir_all(&directory).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_spills_queued_records_when_clickhouse_is_down() {
+        let directory =
+            std::env::temp_dir().join(format!("obleth-sink-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.unwrap();
+        let wal_path = directory.join("usage.jsonl");
+        let sink = TelemetrySink::start(
+            "http://127.0.0.1:1",
+            "obleth",
+            "default",
+            "",
+            wal_path.to_str().unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        for _ in 0..25 {
+            sink.record(record());
+        }
+        sink.shutdown().await;
+        // Settled by the time shutdown returns, with no waiting on ticks.
+        let stats = sink.stats();
+        assert_eq!(stats.waled.load(Ordering::Relaxed), 25);
+        assert_eq!(stats.dropped.load(Ordering::Relaxed), 0);
+        // Recording after shutdown neither panics nor blocks.
+        sink.record(record());
+        let _ = tokio::fs::remove_dir_all(&directory).await;
+    }
+
+    #[tokio::test]
+    async fn spills_even_when_fail_open_is_false() {
+        let directory =
+            std::env::temp_dir().join(format!("obleth-sink-test-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.unwrap();
+        let wal_path = directory.join("usage.jsonl");
+        let sink = TelemetrySink::start(
+            "http://127.0.0.1:1",
+            "obleth",
+            "default",
+            "",
+            wal_path.to_str().unwrap(),
+            false,
+        )
+        .await
+        .unwrap();
+        for _ in 0..7 {
+            sink.record(record());
+        }
+        sink.shutdown().await;
+        let stats = sink.stats();
+        assert_eq!(stats.waled.load(Ordering::Relaxed), 7);
+        assert_eq!(stats.dropped.load(Ordering::Relaxed), 0);
+        let _ = tokio::fs::remove_dir_all(&directory).await;
+    }
+
+    #[tokio::test]
+    async fn invalid_database_name_still_fails_start() {
+        let result = TelemetrySink::start(
+            "http://127.0.0.1:1",
+            "bad-name;",
+            "default",
+            "",
+            "unused",
+            true,
+        )
+        .await;
+        assert!(matches!(result, Err(TelemetryError::InvalidDatabase(_))));
+    }
+
+    #[tokio::test]
+    async fn schema_ready_reports_spill_mode_at_boot_when_unreachable() {
+        let sink = TelemetrySink::start(
+            "http://127.0.0.1:1",
+            "obleth",
+            "default",
+            "",
+            "unused",
+            true,
+        )
+        .await
+        .unwrap();
+        assert!(!sink.schema_ready());
+    }
+
+    /// A schema setup that keeps failing must count every attempt (drives the
+    /// error-level escalation at `SCHEMA_FAILURE_ALERT_THRESHOLD`) rather than
+    /// silently retrying at `debug` forever. The backoff is reset before each
+    /// call so the test doesn't need to wait it out.
+    #[tokio::test]
+    async fn schema_setup_failures_are_counted() {
+        let client = Client::default().with_url("http://127.0.0.1:1");
+        let mut flusher = Flusher {
+            client: client.clone(),
+            schema_client: client,
+            database: "obleth".to_string(),
+            schema_ready: Arc::new(AtomicBool::new(false)),
+            wal: wal::Wal::new("unused-test-wal"),
+            wal_path: "unused-test-wal".to_string(),
+            backoff: Backoff::default(),
+            replay_backoff: Backoff::default(),
+            stats: Arc::default(),
+            schema_failures: 0,
+            last_schema_warn: None,
+        };
+        for expected in 1..=3u64 {
+            flusher.backoff = Backoff::default();
+            assert!(!flusher.clickhouse_ready(true).await);
+            assert_eq!(flusher.schema_failures, expected);
+        }
+    }
+
     #[test]
     fn replay_backoff_grows_to_one_minute_and_resets() {
         let mut backoff = Backoff::default();
@@ -807,5 +1346,243 @@ mod conv_tests {
         assert_eq!(row.energy_wh, 1.5);
         assert_eq!(row.energy_cost_usd, 0.0002);
         assert_eq!(row.co2_g, 0.6);
+    }
+}
+
+#[cfg(test)]
+mod accounting_tests {
+    use super::*;
+
+    fn with_id(id: u128) -> UsageRecord {
+        let mut rec: UsageRecord = serde_json::from_value(serde_json::json!({
+            "request_id": uuid::Uuid::nil(), "tenant_id": uuid::Uuid::nil(),
+            "key_id": uuid::Uuid::nil(), "model": "m", "admission": "ok", "weight": 1,
+            "input_tokens": 1, "output_tokens": 1, "estimated_tokens": 2,
+            "queue_wait_ms": 0, "ttft_ms": 0, "total_ms": 1, "status_code": 200,
+            "cache_status": "off", "ts_ms": 0
+        }))
+        .unwrap();
+        rec.request_id = uuid::Uuid::from_u128(id);
+        rec
+    }
+
+    #[test]
+    fn dedup_token_is_stable_and_batch_specific() {
+        let batch = [with_id(1), with_id(2)];
+        assert_eq!(dedup_token(&batch), dedup_token(&batch.clone()));
+        // Pinned: a replay after an upgrade must produce the same token.
+        assert_eq!(dedup_token(&batch), "usage-2-bdaaca7fe0b2bbcc");
+        assert_ne!(dedup_token(&batch), dedup_token(&[with_id(2), with_id(1)]));
+        assert_ne!(dedup_token(&batch), dedup_token(&batch[..1]));
+    }
+
+    #[test]
+    fn usage_row_zeroes_non_finite_figures() {
+        let mut rec = with_id(1);
+        rec.cost_usd = f64::NAN;
+        rec.energy_wh = f64::INFINITY;
+        rec.energy_cost_usd = f64::NEG_INFINITY;
+        rec.co2_g = 2.5;
+        let row = UsageRow::from(&rec);
+        assert_eq!(row.cost_usd, 0.0);
+        assert_eq!(row.energy_wh, 0.0);
+        assert_eq!(row.energy_cost_usd, 0.0);
+        assert_eq!(row.co2_g, 2.5);
+    }
+}
+
+/// Run against a real ClickHouse by setting `OBLETH_TEST_CLICKHOUSE_URL`
+/// (e.g. `http://127.0.0.1:18123`); without it these return early. Each test
+/// works in its own uniquely named database and drops only that database.
+#[cfg(test)]
+mod clickhouse_tests {
+    use super::*;
+
+    fn fixture() -> Option<(Client, String)> {
+        let url = std::env::var("OBLETH_TEST_CLICKHOUSE_URL").ok()?;
+        let database = format!("obleth_test_{}", Uuid::new_v4().simple());
+        Some((Client::default().with_url(url), database))
+    }
+
+    async fn scalar(client: &Client, sql: &str) -> u64 {
+        client.query(sql).fetch_one::<u64>().await.unwrap()
+    }
+
+    async fn view_mtime(client: &Client, database: &str) -> String {
+        client
+            .query(
+                "SELECT toString(metadata_modification_time) FROM system.tables
+                 WHERE database = ? AND name = 'usage_daily_mv'",
+            )
+            .bind(database)
+            .fetch_one::<String>()
+            .await
+            .unwrap()
+    }
+
+    fn record(id: u128) -> UsageRecord {
+        let mut rec: UsageRecord = serde_json::from_value(serde_json::json!({
+            "request_id": Uuid::nil(), "tenant_id": Uuid::nil(), "key_id": Uuid::nil(),
+            "model": "m", "admission": "ok", "weight": 1, "input_tokens": 1,
+            "output_tokens": 1, "estimated_tokens": 2, "queue_wait_ms": 0, "ttft_ms": 0,
+            "total_ms": 1, "status_code": 200, "cache_status": "off",
+            "ts_ms": 1_750_000_000_000i64, "request_type": "chat"
+        }))
+        .unwrap();
+        rec.request_id = Uuid::from_u128(id);
+        rec
+    }
+
+    fn flusher(client: &Client, database: &str) -> Flusher {
+        Flusher {
+            client: client.clone().with_database(database),
+            schema_client: client.clone(),
+            database: database.to_string(),
+            schema_ready: Arc::new(AtomicBool::new(true)),
+            wal: wal::Wal::new("unused-test-wal"),
+            wal_path: "unused-test-wal".to_string(),
+            backoff: Backoff::default(),
+            replay_backoff: Backoff::default(),
+            stats: Arc::default(),
+            schema_failures: 0,
+            last_schema_warn: None,
+        }
+    }
+
+    async fn drop_database(client: &Client, database: &str) {
+        client
+            .query(&format!("DROP DATABASE IF EXISTS {database}"))
+            .execute()
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn second_boot_leaves_rollup_view_untouched() {
+        let Some((client, database)) = fixture() else {
+            return;
+        };
+        ensure_schema(&client, &database).await.unwrap();
+        let first = view_mtime(&client, &database).await;
+        // metadata_modification_time has one-second resolution.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        ensure_schema(&client, &database).await.unwrap();
+        assert_eq!(view_mtime(&client, &database).await, first);
+        // A changed definition is still applied.
+        client
+            .query(&format!("DROP VIEW {database}.usage_daily_mv"))
+            .execute()
+            .await
+            .unwrap();
+        client
+            .query(&format!(
+                "CREATE MATERIALIZED VIEW {database}.usage_daily_mv TO {database}.usage_daily AS
+                 SELECT toDate(ts) AS day, tenant_id, key_id, model, count() AS requests
+                 FROM {database}.usage GROUP BY day, tenant_id, key_id, model"
+            ))
+            .execute()
+            .await
+            .unwrap();
+        ensure_schema(&client, &database).await.unwrap();
+        let select: String = client
+            .query(
+                "SELECT as_select FROM system.tables
+                 WHERE database = ? AND name = 'usage_daily_mv'",
+            )
+            .bind(&database)
+            .fetch_one()
+            .await
+            .unwrap();
+        assert!(select.contains("success_requests"), "{select}");
+        drop_database(&client, &database).await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_boots_backfill_history_once() {
+        let Some((client, database)) = fixture() else {
+            return;
+        };
+        ensure_schema(&client, &database).await.unwrap();
+        let flusher = flusher(&client, &database);
+        flusher
+            .insert(&(1..=10).map(record).collect::<Vec<_>>())
+            .await
+            .unwrap();
+        // Recreate the pre-rollup state: history in `usage`, nothing rolled up.
+        for sql in [
+            format!("DROP VIEW {database}.usage_daily_mv"),
+            format!("TRUNCATE TABLE {database}.usage_daily"),
+            format!("TRUNCATE TABLE {database}.usage_meta"),
+        ] {
+            client.query(&sql).execute().await.unwrap();
+        }
+        let (a, b) = tokio::join!(
+            ensure_schema(&client, &database),
+            ensure_schema(&client, &database)
+        );
+        a.unwrap();
+        b.unwrap();
+        let sum = format!("SELECT sum(requests) FROM {database}.usage_daily");
+        assert_eq!(scalar(&client, &sum).await, 10);
+        // Later boots see the marker and never re-aggregate.
+        client
+            .query(&format!("DROP VIEW {database}.usage_daily_mv"))
+            .execute()
+            .await
+            .unwrap();
+        ensure_schema(&client, &database).await.unwrap();
+        assert_eq!(scalar(&client, &sum).await, 10);
+        drop_database(&client, &database).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_inserts_queued_records() {
+        let Some((client, database)) = fixture() else {
+            return;
+        };
+        let url = std::env::var("OBLETH_TEST_CLICKHOUSE_URL").unwrap();
+        let directory = std::env::temp_dir().join(format!("obleth-sink-test-{}", Uuid::new_v4()));
+        tokio::fs::create_dir(&directory).await.unwrap();
+        let wal_path = directory.join("usage.jsonl");
+        let sink = TelemetrySink::start(
+            &url,
+            &database,
+            "default",
+            "",
+            wal_path.to_str().unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
+        for id in 1..=30 {
+            sink.record(record(id));
+        }
+        sink.shutdown().await;
+        let usage = format!("SELECT count() FROM {database}.usage");
+        assert_eq!(scalar(&client, &usage).await, 30);
+        assert_eq!(sink.stats().waled.load(Ordering::Relaxed), 0);
+        drop_database(&client, &database).await;
+        let _ = tokio::fs::remove_dir_all(&directory).await;
+    }
+
+    #[tokio::test]
+    async fn replayed_batch_is_deduplicated() {
+        let Some((client, database)) = fixture() else {
+            return;
+        };
+        ensure_schema(&client, &database).await.unwrap();
+        let flusher = flusher(&client, &database);
+        let batch: Vec<_> = (1..=5).map(record).collect();
+        flusher.insert(&batch).await.unwrap();
+        // The WAL replays a timed-out insert that ClickHouse had committed.
+        flusher.insert(&batch).await.unwrap();
+        let usage = format!("SELECT count() FROM {database}.usage");
+        assert_eq!(scalar(&client, &usage).await, 5);
+        let daily = format!("SELECT sum(requests) FROM {database}.usage_daily");
+        assert_eq!(scalar(&client, &daily).await, 5);
+        // A different batch is not mistaken for a duplicate.
+        flusher.insert(&[record(6)]).await.unwrap();
+        assert_eq!(scalar(&client, &usage).await, 6);
+        drop_database(&client, &database).await;
     }
 }

@@ -64,9 +64,17 @@ pub struct AppState {
     pub energy: crate::energy::EnergyEngine,
     /// JWT bearer authentication. `None` when `OBLETH_JWT_ISSUERS` is unset;
     /// the key path is then byte-identical to a build without this feature.
-    /// This is the only handle on the request path that can reach Postgres
-    /// (single-flight identity provisioning, once per identity).
+    /// Besides `video_jobs`, this is the only handle on the request path that
+    /// can reach Postgres (single-flight identity provisioning, once per
+    /// identity).
     pub jwt: Option<Arc<crate::jwt_auth::JwtAuth>>,
+    /// Video job records: which tenant and key own each Videos API job and
+    /// where it lives, plus the `OBLETH_VIDEO_JOB_SCOPE` that decides whose
+    /// jobs a caller may follow up. Written once per successful create and
+    /// read by each follow-up;
+    /// Postgres because a record must survive a render that takes minutes,
+    /// which a TTL'd Redis key under `volatile-lru` does not promise.
+    pub video_jobs: crate::videos::VideoJobStore,
     /// In-process mirror of the knowledge-base corpus, kept fresh by a
     /// background refresh loop. Starts empty and fills asynchronously; the
     /// request path only ever reads the current snapshot, never Postgres.

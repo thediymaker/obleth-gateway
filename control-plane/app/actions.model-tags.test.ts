@@ -28,13 +28,14 @@ const model = (over: Record<string, unknown> = {}) => ({
   description: "",
   upstream_model: "up",
   api_base: "http://a",
-  api_key: null,
+  api_key_set: false,
   model_type: "chat",
   input_cost_per_token: 0,
   output_cost_per_token: 0,
   cost_per_image: 0,
   cost_per_audio_second: 0,
   cost_per_character: 0,
+  cost_per_video: 0,
   energy_slots_per_node: 1,
   route_bias: 1,
   context_window: 8192,
@@ -63,7 +64,7 @@ const model = (over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
-describe("model tag strength levels round-trip through updateModelCapabilitiesAction", () => {
+describe("model tag strength levels round-trip through the model settings save", () => {
   it("serializes Auto bare, and every explicit level — including 1 — with a suffix", async () => {
     mockAdmin();
     const updateModel = vi.fn().mockResolvedValue({});
@@ -72,9 +73,11 @@ describe("model tag strength levels round-trip through updateModelCapabilitiesAc
       CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
       OblethApiError: class OblethApiError extends Error {},
     }));
-    const { updateModelCapabilitiesAction } = await import("./actions");
+    const { saveModelSettingsAction } = await import("./actions");
     const fd = new FormData();
     fd.set("id", "m-1");
+    fd.set("sections", "model");
+    fd.set("has_tags", "1");
     // Auto (0): saved bare, the level derives from cost rank under hybrid
     // tier sourcing.
     fd.set("tag_coding", "on");
@@ -85,7 +88,7 @@ describe("model tag strength levels round-trip through updateModelCapabilitiesAc
     // different statement from "derive it for me".
     fd.set("tag_general", "on");
     fd.set("tag_level_general", "1");
-    await updateModelCapabilitiesAction(null, fd);
+    await saveModelSettingsAction(fd);
     expect(updateModel).toHaveBeenCalledWith(
       "m-1",
       expect.objectContaining({ tags: expect.arrayContaining(["coding", "math:3", "general:1"]) }),
@@ -103,12 +106,14 @@ describe("model tag strength levels round-trip through updateModelCapabilitiesAc
       CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
       OblethApiError: class OblethApiError extends Error {},
     }));
-    const { updateModelCapabilitiesAction } = await import("./actions");
+    const { saveModelSettingsAction } = await import("./actions");
     const fd = new FormData();
     fd.set("id", "m-1");
+    fd.set("sections", "model");
+    fd.set("has_tags", "1");
     fd.set("tag_vision", "on");
     fd.set("tag_level_vision", "2");
-    await updateModelCapabilitiesAction(null, fd);
+    await saveModelSettingsAction(fd);
     const body = updateModel.mock.calls[0][1];
     expect(body.tags).toEqual(["vision:2"]);
     expect(body.supports_vision).toBe(true);
@@ -122,17 +127,19 @@ describe("model tag strength levels round-trip through updateModelCapabilitiesAc
       CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
       OblethApiError: class OblethApiError extends Error {},
     }));
-    const { updateModelCapabilitiesAction } = await import("./actions");
-    // Field values exactly as ChatCapabilityFields would submit them, loaded
+    const { saveModelSettingsAction } = await import("./actions");
+    // Field values exactly as RoutingTagsField would submit them, loaded
     // from a model with ["coding:3", "math"] and never touched: the bare tag
     // loads as Auto (0) and must save bare again.
     const fd = new FormData();
     fd.set("id", "m-1");
+    fd.set("sections", "model");
+    fd.set("has_tags", "1");
     fd.set("tag_coding", "on");
     fd.set("tag_level_coding", "3");
     fd.set("tag_math", "on");
     fd.set("tag_level_math", "0");
-    await updateModelCapabilitiesAction(null, fd);
+    await saveModelSettingsAction(fd);
     const body = updateModel.mock.calls[0][1];
     expect(body.tags).toEqual(["coding:3", "math"]);
   });
@@ -149,12 +156,14 @@ describe("model tag strength levels round-trip through updateModelCapabilitiesAc
       CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
       OblethApiError: class OblethApiError extends Error {},
     }));
-    const { updateModelCapabilitiesAction } = await import("./actions");
+    const { saveModelSettingsAction } = await import("./actions");
     const fd = new FormData();
     fd.set("id", "m-1");
+    fd.set("sections", "model");
+    fd.set("has_tags", "1");
     fd.set("tag_coding", "on");
     fd.set("tag_level_coding", rawLevel);
-    await updateModelCapabilitiesAction(null, fd);
+    await saveModelSettingsAction(fd);
     const body = updateModel.mock.calls[0][1];
     expect(body.tags).toEqual([expectedTag]);
   });

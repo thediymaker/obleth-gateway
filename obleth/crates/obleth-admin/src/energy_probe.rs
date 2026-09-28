@@ -6,11 +6,18 @@ pub fn parse_prometheus_scalar(body: &serde_json::Value) -> Result<f64, String> 
     let value = body
         .pointer("/data/result/0/value/1")
         .ok_or_else(|| "query returned no data".to_string())?;
-    value
+    let sample = value
         .as_str()
-        .ok_or_else(|| "sample value is not a string".to_string())?
+        .ok_or_else(|| "sample value is not a string".to_string())?;
+    let parsed = sample
         .parse::<f64>()
-        .map_err(|e| format!("sample value did not parse as f64: {e}"))
+        .map_err(|e| format!("sample value did not parse as f64: {e}"))?;
+    // Prometheus emits NaN/±Inf for empty or divergent series; a stored NaN
+    // reading would poison every request's frozen energy figures.
+    if !parsed.is_finite() {
+        return Err(format!("sample value {sample} is not a finite number"));
+    }
+    Ok(parsed)
 }
 
 /// One instant query against `{base}/api/v1/query`.
@@ -49,5 +56,17 @@ mod tests {
             "status": "success", "data": { "resultType": "vector", "result": [] }
         });
         assert!(parse_prometheus_scalar(&empty).is_err());
+    }
+
+    #[test]
+    fn rejects_non_finite_samples() {
+        for sample in ["NaN", "+Inf", "-Inf"] {
+            let body = serde_json::json!({
+                "status": "success",
+                "data": { "resultType": "vector",
+                    "result": [ { "metric": {}, "value": [1719849600.0, sample] } ] }
+            });
+            assert!(parse_prometheus_scalar(&body).is_err(), "{sample}");
+        }
     }
 }

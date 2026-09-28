@@ -34,12 +34,24 @@ impl GuardrailsBlock {
 }
 
 /// Outcome of the tier-2 harm classifier. Kept distinct from a boolean so
-/// callers can honor `fail_open` on scanner error rather than silently passing.
+/// callers can honor `fail_open` on scanner error rather than silently passing,
+/// and carrying the probability so an operator can see how close a call was.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum HarmScan {
-    Safe,
-    Unsafe,
+    Safe { p_unsafe: f64 },
+    Unsafe { p_unsafe: f64 },
     Error,
 }
+
+/// Above this probability the scanner calls the content unsafe.
+const HARM_THRESHOLD: f64 = 0.5;
+
+/// Below this much probability mass on `yes`/`no` the guard model did not
+/// answer the question at all — it hedged, refused, or spent its one token in
+/// a reasoning scratchpad. That is a scanner failure, not a clearance, so it
+/// returns [`HarmScan::Error`] and the policy's `fail_open` decides. Mirrors
+/// `MIN_IN_SET_MASS` in the verdicts engine, which hit the same case live.
+const MIN_LABEL_MASS: f64 = 0.05;
 
 // ---------------------------------------------------------------------------
 // Text extraction
@@ -83,22 +95,101 @@ const OUTPUT_TEXT_POINTERS: &[&str] = &[
     "/choices/0/message/provider_specific_fields/reasoning",
 ];
 
+/// Whether a message with this role is input the tenant's scanners must see:
+/// everything but the model's own turns and tool output, so `user`, `system`,
+/// `developer` (OpenAI SDKs, Codex), and a message with no role at all.
+pub(super) fn is_scanned_role(role: Option<&str>) -> bool {
+    !matches!(role, Some("assistant") | Some("tool") | Some("function"))
+}
+
+/// Top-level request fields that carry caller text on non-chat endpoints:
+/// `prompt` (legacy completions, image generation), `input` (embeddings,
+/// moderations, text-to-speech), `query` and `documents` (rerank).
+const TEXT_FIELDS: &[&str] = &["prompt", "input", "query", "documents"];
+
+/// The strings inside one top-level text field: a string, or an array of
+/// strings and `{"text": ...}` objects. Token-id arrays carry no scannable
+/// text and are skipped here (see [`has_token_id_prompt`]).
+fn field_texts(value: &Value) -> Vec<&str> {
+    match value {
+        Value::String(s) => vec![s.as_str()],
+        Value::Array(items) => items
+            .iter()
+            .filter_map(|v| match v {
+                Value::String(s) => Some(s.as_str()),
+                Value::Object(o) => o.get("text").and_then(|t| t.as_str()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
 pub(super) fn collect_input_text(json: &Value) -> String {
-    let Some(messages) = json.get("messages").and_then(|m| m.as_array()) else {
-        return String::new();
+    let mut texts: Vec<String> = Vec::new();
+    if let Some(messages) = json.get("messages").and_then(|m| m.as_array()) {
+        texts.extend(
+            messages
+                .iter()
+                .filter(|m| is_scanned_role(m.get("role").and_then(|r| r.as_str())))
+                .map(extract_message_text)
+                .filter(|s| !s.is_empty()),
+        );
+    }
+    // Without these, a non-chat endpoint would reach the model unscanned
+    // under a policy that covers chat.
+    for field in TEXT_FIELDS {
+        if let Some(value) = json.get(*field) {
+            texts.extend(
+                field_texts(value)
+                    .into_iter()
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string),
+            );
+        }
+    }
+    texts.join("\n")
+}
+
+/// A completion `prompt` given as token ids (an array of integers, or an
+/// array of such arrays). The scanners read text, so a pre-tokenized prompt
+/// would pass every input scanner unread; an enforcing policy refuses it.
+pub(super) fn has_token_id_prompt(json: &Value) -> bool {
+    json.get("prompt")
+        .and_then(|p| p.as_array())
+        .is_some_and(|items| items.iter().any(|v| v.is_number() || v.is_array()))
+}
+
+/// Redact the top-level text fields (see [`TEXT_FIELDS`]) in place.
+fn redact_fields_in_place(json: &mut Value, scanners: &[String], ban_keywords: &[String]) -> bool {
+    let mut changed = false;
+    let mut redact = |s: &mut String| {
+        let redacted = redact_text(s, scanners, ban_keywords);
+        if redacted != *s {
+            *s = redacted;
+            changed = true;
+        }
     };
-    messages
-        .iter()
-        .filter(|m| {
-            matches!(
-                m.get("role").and_then(|r| r.as_str()),
-                Some("user") | Some("system")
-            )
-        })
-        .map(extract_message_text)
-        .filter(|s| !s.is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    for field in TEXT_FIELDS {
+        match json.get_mut(*field) {
+            Some(Value::String(s)) => redact(s),
+            Some(Value::Array(items)) => {
+                for item in items.iter_mut() {
+                    match item {
+                        Value::String(s) => redact(s),
+                        Value::Object(o) => {
+                            if let Some(Value::String(s)) = o.get_mut("text") {
+                                redact(s);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    changed
 }
 
 /// Concatenate every text-bearing field of the assistant's reply (content plus
@@ -443,41 +534,81 @@ pub(crate) async fn scan_harm(
         tracing::warn!(model = %guard_model_name, "guardrails harm: guard model disabled");
         return HarmScan::Error;
     }
+    // One greedy token, full first-token distribution: the answer is read off
+    // the `yes`/`no` probabilities rather than parsed out of prose. A guard
+    // model cannot then clear content by replying "I cannot analyze that",
+    // which the previous free-text form scored as SAFE.
     let body = serde_json::json!({
         "model": guard_model.upstream_model,
         "messages": [{
             "role": "user",
             "content": format!(
-                "You are a content safety classifier. Analyze the following text and respond with only \"SAFE\" or \"UNSAFE\".\n\nText: {}",
+                "You are a content safety classifier. Answer with exactly one word and \
+                 nothing else.\n\nText: {}\n\nIs this text unsafe — does it contain or \
+                 request harmful, abusive, or dangerous content? Answer \"yes\" or \"no\".",
                 text
             )
         }],
-        "max_tokens": 10,
+        "max_tokens": 1,
         "temperature": 0.0,
+        "logprobs": true,
+        "top_logprobs": 20,
+        "stream": false,
     });
     let timeout = Duration::from_millis(settings.timeout_ms.max(1));
-    match super::chat_call(state, &guard_model, body, timeout).await {
-        Ok(result) => {
-            super::bill_helper_call(
-                state,
-                &guard_model,
-                key,
-                session_id,
-                "guardrails_boon",
-                result.input_tokens,
-                result.output_tokens,
-            );
-            if result.text.trim().to_uppercase().starts_with("UNSAFE") {
-                HarmScan::Unsafe
-            } else {
-                HarmScan::Safe
-            }
-        }
+    let completion = match super::chat_call_completion(state, &guard_model, body, timeout).await {
+        Ok(v) => v,
         Err(e) => {
             tracing::warn!(error = %e, model = %guard_model_name, "guardrails harm: call failed");
+            return HarmScan::Error;
+        }
+    };
+
+    super::bill_helper_call(
+        state,
+        &guard_model,
+        key,
+        session_id,
+        "guardrails_boon",
+        completion
+            .pointer("/usage/prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
+        completion
+            .pointer("/usage/completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as u32,
+    );
+
+    match harm_probability(&completion) {
+        Some(p_unsafe) if p_unsafe > HARM_THRESHOLD => HarmScan::Unsafe { p_unsafe },
+        Some(p_unsafe) => HarmScan::Safe { p_unsafe },
+        None => {
+            tracing::warn!(
+                model = %guard_model_name,
+                "guardrails harm: guard model gave no usable yes/no answer"
+            );
             HarmScan::Error
         }
     }
+}
+
+/// p(unsafe) from a single-token completion, or `None` when the guard model
+/// did not put meaningful probability on either label.
+///
+/// Reuses the verdicts answer parser so the two paths agree on what counts as
+/// a label: mass is summed across bare and space-prefixed spellings and over
+/// case, because a chat template makes the first sampled token ` Yes` as often
+/// as `yes`.
+fn harm_probability(completion: &Value) -> Option<f64> {
+    let entries = crate::verdicts::answers::parse_top_logprobs(completion).ok()?;
+    let labels = ["yes".to_string(), "no".to_string()];
+    let (masses, in_set) = crate::verdicts::answers::label_masses(&entries, &labels, true);
+    // NaN-safe: a non-comparable mass is "no answer", not a clearance.
+    if in_set.partial_cmp(&MIN_LABEL_MASS) == Some(std::cmp::Ordering::Less) || in_set.is_nan() {
+        return None;
+    }
+    Some(masses[0] / in_set)
 }
 
 // ---------------------------------------------------------------------------
@@ -508,7 +639,32 @@ pub(super) async fn apply_input(
     tracer: Option<&mut crate::tracer::SpanRecorder>,
 ) -> GuardrailsInputOutcome {
     let start = crate::tracer::now_ms();
+    let enforcing = !matches!(policy.action, GuardrailsAction::LogOnly);
+    if enforcing && !policy.input_scanners.is_empty() && has_token_id_prompt(json) {
+        record_block(
+            tracer,
+            "boon:guardrails_input",
+            &policy.input_scanners,
+            start,
+            None,
+        );
+        return GuardrailsInputOutcome {
+            blocked: Some(GuardrailsBlock::policy(
+                "token-id prompts cannot be scanned by this tenant's guardrails; send text",
+            )),
+            sanitized: false,
+        };
+    }
     let text = collect_input_text(json);
+    // Nothing to scan (embeddings of token ids, audio uploads, an empty
+    // body): skip, so the harm scanner never spends a guard-model call on an
+    // empty string or fails such a request when the guard model is down.
+    if text.trim().is_empty() {
+        return GuardrailsInputOutcome {
+            blocked: None,
+            sanitized: false,
+        };
+    }
 
     // ---- log_only: observe and alert, never block or rewrite ----
     if matches!(policy.action, GuardrailsAction::LogOnly) {
@@ -569,7 +725,7 @@ pub(super) async fn apply_input(
     if policy.input_scanners.iter().any(|s| s == "harm") {
         if let Some(model) = &policy.guard_model {
             match scan_harm(state, settings, key, session_id, model, &text).await {
-                HarmScan::Unsafe => {
+                HarmScan::Unsafe { .. } => {
                     record_block(
                         tracer,
                         "boon:guardrails_input",
@@ -600,7 +756,7 @@ pub(super) async fn apply_input(
                         "guardrails harm input scan failed; fail_open passing request through"
                     );
                 }
-                HarmScan::Safe => {}
+                HarmScan::Safe { .. } => {}
             }
         } else {
             tracing::warn!(
@@ -614,8 +770,7 @@ pub(super) async fn apply_input(
     if matches!(policy.action, GuardrailsAction::Redact) {
         if let Some(messages) = json.get_mut("messages").and_then(|m| m.as_array_mut()) {
             for msg in messages.iter_mut() {
-                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
-                if role != "user" && role != "system" {
+                if !is_scanned_role(msg.get("role").and_then(|r| r.as_str())) {
                     continue;
                 }
                 if let Some(content) = msg.get_mut("content") {
@@ -628,6 +783,9 @@ pub(super) async fn apply_input(
                     }
                 }
             }
+        }
+        if redact_fields_in_place(json, &policy.input_scanners, &policy.ban_keywords) {
+            sanitized = true;
         }
     }
 
@@ -689,7 +847,7 @@ pub(crate) async fn apply_output(
     if policy.output_scanners.iter().any(|s| s == "harm") {
         if let Some(model) = &policy.guard_model {
             match scan_harm(state, settings, key, session_id, model, &text).await {
-                HarmScan::Unsafe => {
+                HarmScan::Unsafe { .. } => {
                     record_block(
                         tracer,
                         "boon:guardrails_output",
@@ -716,7 +874,7 @@ pub(crate) async fn apply_output(
                         "guardrails harm output scan failed; fail_open passing response through"
                     );
                 }
-                HarmScan::Safe => {}
+                HarmScan::Safe { .. } => {}
             }
         } else {
             tracing::warn!(
@@ -810,14 +968,19 @@ fn spawn_harm_monitor(
     let session_id = session_id.to_string();
     let text = text.to_string();
     tokio::spawn(async move {
-        if matches!(
-            scan_harm(&state, &settings, &key, &session_id, &model, &text).await,
-            HarmScan::Unsafe
-        ) {
+        // log_only is a monitoring posture, so the probability is the useful
+        // part: it says how close the call was and lets an operator pick a
+        // blocking threshold from real traffic before turning enforcement on.
+        if let HarmScan::Unsafe { p_unsafe } =
+            scan_harm(&state, &settings, &key, &session_id, &model, &text).await
+        {
             state.alerts.issue(
                 format!("guardrails_{phase}_harm_{tenant_id}"),
                 "Guardrails harm scanner flagged (log_only)",
-                format!("tenant `{tenant_name}`: harm scan flagged {phase} content"),
+                format!(
+                    "tenant `{tenant_name}`: harm scan flagged {phase} content \
+                     (p_unsafe {p_unsafe:.2})"
+                ),
             );
         }
     });
@@ -883,6 +1046,94 @@ mod tests {
         assert!(text.contains("first question"));
         assert!(text.contains("follow up"));
         assert!(!text.contains("answer"));
+    }
+
+    #[test]
+    fn collect_input_text_reads_a_top_level_prompt() {
+        let single = serde_json::json!({"prompt": "legacy completion text"});
+        assert_eq!(collect_input_text(&single), "legacy completion text");
+
+        let batch = serde_json::json!({"prompt": ["first", "", "second", 7]});
+        assert_eq!(collect_input_text(&batch), "first\nsecond");
+
+        let both = serde_json::json!({
+            "messages": [{"role": "user", "content": "chat turn"}],
+            "prompt": "image prompt"
+        });
+        let text = collect_input_text(&both);
+        assert!(text.contains("chat turn") && text.contains("image prompt"));
+    }
+
+    #[test]
+    fn developer_and_roleless_messages_are_scanned_model_turns_are_not() {
+        let json = serde_json::json!({
+            "messages": [
+                {"role": "developer", "content": "dev instructions"},
+                {"content": "no role given"},
+                {"role": "assistant", "content": "model answer"},
+                {"role": "tool", "content": "tool output"}
+            ]
+        });
+        let text = collect_input_text(&json);
+        assert!(text.contains("dev instructions"));
+        assert!(text.contains("no role given"));
+        assert!(!text.contains("model answer"));
+        assert!(!text.contains("tool output"));
+    }
+
+    #[test]
+    fn non_chat_text_fields_are_scanned() {
+        let embeddings = serde_json::json!({"input": ["doc one", "doc two"]});
+        assert_eq!(collect_input_text(&embeddings), "doc one\ndoc two");
+        let speech = serde_json::json!({"input": "read this aloud"});
+        assert_eq!(collect_input_text(&speech), "read this aloud");
+        let rerank = serde_json::json!({
+            "query": "which one",
+            "documents": ["plain", {"text": "object form"}]
+        });
+        let text = collect_input_text(&rerank);
+        assert!(text.contains("which one"));
+        assert!(text.contains("plain"));
+        assert!(text.contains("object form"));
+        // Token-id embedding input carries no text.
+        let tokens = serde_json::json!({"input": [101, 2023, 102]});
+        assert_eq!(collect_input_text(&tokens), "");
+    }
+
+    #[test]
+    fn token_id_prompts_are_detected() {
+        assert!(has_token_id_prompt(
+            &serde_json::json!({"prompt": [1, 2, 3]})
+        ));
+        assert!(has_token_id_prompt(
+            &serde_json::json!({"prompt": [[1, 2], [3]]})
+        ));
+        assert!(!has_token_id_prompt(&serde_json::json!({"prompt": "text"})));
+        assert!(!has_token_id_prompt(
+            &serde_json::json!({"prompt": ["a", "b"]})
+        ));
+        // Embedding token ids use `input`, which is not refused.
+        assert!(!has_token_id_prompt(&serde_json::json!({"input": [1, 2]})));
+    }
+
+    #[test]
+    fn redact_prompt_rewrites_string_and_array_prompts() {
+        let scanners = vec!["ban_keywords".to_string()];
+        let banned = vec!["secretword".to_string()];
+
+        let mut single = serde_json::json!({"prompt": "say secretword now"});
+        assert!(redact_fields_in_place(&mut single, &scanners, &banned));
+        assert!(!single["prompt"].as_str().unwrap().contains("secretword"));
+
+        let mut batch = serde_json::json!({"prompt": ["clean", "has secretword"]});
+        assert!(redact_fields_in_place(&mut batch, &scanners, &banned));
+        assert_eq!(batch["prompt"][0], "clean");
+        assert!(!batch["prompt"][1].as_str().unwrap().contains("secretword"));
+
+        let mut clean = serde_json::json!({"prompt": "nothing to see"});
+        assert!(!redact_fields_in_place(&mut clean, &scanners, &banned));
+        let mut none = serde_json::json!({"messages": []});
+        assert!(!redact_fields_in_place(&mut none, &scanners, &banned));
     }
 
     // --- prompt injection ---
@@ -1182,5 +1433,94 @@ mod tests {
             "reasoning channels must be redacted: {serialized}"
         );
         assert!(serialized.matches("[REDACTED]").count() >= 3);
+    }
+
+    /// A single-token completion whose first-token distribution is `entries`.
+    fn guard_completion(entries: &[(&str, f64)]) -> Value {
+        serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": entries[0].0},
+                "logprobs": {"content": [{
+                    "token": entries[0].0,
+                    "logprob": entries[0].1,
+                    "top_logprobs": entries.iter()
+                        .map(|(t, l)| serde_json::json!({"token": t, "logprob": l}))
+                        .collect::<Vec<_>>()
+                }]},
+                "finish_reason": "length"
+            }],
+            "usage": {"prompt_tokens": 40, "completion_tokens": 1}
+        })
+    }
+
+    #[test]
+    fn harm_probability_reads_the_yes_no_distribution() {
+        // Confidently unsafe.
+        let p = harm_probability(&guard_completion(&[("yes", -0.01), ("no", -4.6)])).unwrap();
+        assert!(p > 0.95, "p_unsafe = {p}");
+        // Confidently safe.
+        let p = harm_probability(&guard_completion(&[("no", -0.01), ("yes", -4.6)])).unwrap();
+        assert!(p < 0.05, "p_unsafe = {p}");
+    }
+
+    #[test]
+    fn harm_probability_sums_case_and_space_variants() {
+        // Chat templates make the first sampled token " Yes" as often as
+        // "yes"; splitting that mass across spellings would halve the score.
+        let p = harm_probability(&guard_completion(&[
+            (" Yes", -0.7),
+            ("yes", -0.7),
+            ("no", -3.0),
+        ]))
+        .unwrap();
+        assert!(p > 0.9, "variants must be summed, got {p}");
+    }
+
+    #[test]
+    fn a_hedging_guard_model_is_an_error_not_a_clearance() {
+        // The bug this replaced: a guard model answering "I cannot analyze
+        // that" did not start with UNSAFE, so it scored as Safe and the
+        // content passed as though the model had actively cleared it. With
+        // no mass on either label there is no answer, so the policy's
+        // fail_open setting must get to decide.
+        assert_eq!(
+            harm_probability(&guard_completion(&[
+                ("I", -0.2),
+                ("Sorry", -1.1),
+                ("As", -2.0)
+            ])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_trace_of_leaked_label_mass_is_still_no_answer() {
+        // A reasoning model's scratchpad leaks a label token at ~1e-4, which
+        // would otherwise renormalize into a confident-looking verdict.
+        assert_eq!(
+            harm_probability(&guard_completion(&[
+                ("Okay", -0.1),
+                ("Let", -1.0),
+                ("yes", -9.5)
+            ])),
+            None
+        );
+    }
+
+    #[test]
+    fn a_backend_without_logprobs_is_an_error() {
+        let no_logprobs = serde_json::json!({
+            "choices": [{"message": {"role": "assistant", "content": "no"}}],
+            "usage": {"prompt_tokens": 40, "completion_tokens": 1}
+        });
+        assert_eq!(harm_probability(&no_logprobs), None);
+    }
+
+    #[test]
+    fn the_threshold_sits_between_safe_and_unsafe() {
+        // Equal mass is not a reason to block.
+        let p = harm_probability(&guard_completion(&[("yes", -0.7), ("no", -0.7)])).unwrap();
+        assert!((p - 0.5).abs() < 1e-6);
+        assert!(p <= HARM_THRESHOLD, "a coin flip must not block");
     }
 }

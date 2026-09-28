@@ -76,11 +76,12 @@ pub struct ProvisionerBuild {
 impl SlurmSettingsView {
     fn from_settings(s: &SlurmSettings) -> Self {
         let jwt = s.slurm_jwt.trim();
-        let jwt_last4 = if jwt.len() >= 4 {
-            Some(jwt[jwt.len() - 4..].to_string())
-        } else {
-            None
-        };
+        // By chars, not bytes: a byte slice panics on a multibyte suffix.
+        let jwt_last4 = (jwt.chars().count() >= 4).then(|| {
+            let mut tail: Vec<char> = jwt.chars().rev().take(4).collect();
+            tail.reverse();
+            tail.into_iter().collect::<String>()
+        });
         SlurmSettingsView {
             enabled: s.enabled,
             slurmrestd_url: s.slurmrestd_url.clone(),
@@ -435,8 +436,9 @@ pub async fn put_slurm_settings(
             ));
         }
         // The provisioner and status probes send the JWT to this URL; hold it
-        // to the same destination policy as registered upstreams.
-        state.ssrf.validate(&slurmrestd_url)?;
+        // to the same destination policy as registered upstreams. The test
+        // route re-checks before every ping, so a disabled draft is safe.
+        state.ssrf.validate(&slurmrestd_url).await?;
     }
 
     // JWT: replace when a non-empty value is supplied, otherwise keep existing.
@@ -532,6 +534,9 @@ pub async fn test_slurm_settings(State(state): State<AdminState>) -> Result<Json
             "slurmrestd_url is not configured".into(),
         ));
     }
+    // Re-checked here: a URL stored before the policy applied, or restored from
+    // a backup, must not receive the JWT.
+    state.ssrf.validate(settings.slurmrestd_url.trim()).await?;
     let jwt = jwt_health(&settings.slurm_jwt);
     let ping = ping_slurm(&settings).await;
     Ok(Json(SlurmHealthView { jwt, ping }))
@@ -648,6 +653,21 @@ mod tests {
         let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(format!(r#"{{"exp":{exp},"sun":"obleth"}}"#).as_bytes());
         format!("{header}.{payload}.signature")
+    }
+
+    #[test]
+    fn jwt_last4_counts_chars_not_bytes() {
+        let view = |jwt: &str| {
+            SlurmSettingsView::from_settings(&SlurmSettings {
+                slurm_jwt: jwt.into(),
+                ..Default::default()
+            })
+            .jwt_last4
+        };
+        // Four trailing multibyte chars: a byte slice would split one and panic.
+        assert_eq!(view("header.payload.sig-éèêë").as_deref(), Some("éèêë"));
+        assert_eq!(view("abcdef").as_deref(), Some("cdef"));
+        assert_eq!(view("aé").as_deref(), None);
     }
 
     #[test]

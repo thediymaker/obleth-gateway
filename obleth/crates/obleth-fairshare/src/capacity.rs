@@ -1,7 +1,7 @@
 //! Capacity providers decide how many requests may be in flight concurrently.
 //!
 //! v1 ships [`StaticCapacity`] (a runtime-tunable fixed limit). The trait is the
-//! seam the plan calls out: a future `MetricsCapacity` can read vLLM/Aibrix queue
+//! seam the plan calls out: a future `MetricsCapacity` can read a backend's queue
 //! depth or KV-cache utilization, or an `SloCapacity` can react to TTFT, without
 //! any change to the scheduler.
 

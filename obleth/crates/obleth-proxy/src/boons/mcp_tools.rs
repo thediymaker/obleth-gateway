@@ -149,7 +149,7 @@ async fn initialize(state: &AppState, server: &ResolvedMcpServer) -> anyhow::Res
         session.session_id = Some(id.to_string());
     }
     let status = resp.status();
-    let text = resp.text().await?;
+    let text = read_text_capped(resp).await?;
     parse_rpc_result(&text, 1)
         .map_err(|e| anyhow::anyhow!("mcp initialize failed (status {status}): {e}"))?;
 
@@ -173,7 +173,7 @@ async fn rpc(
     if !status.is_success() {
         anyhow::bail!("mcp {method} returned status {status}");
     }
-    let text = resp.text().await?;
+    let text = read_text_capped(resp).await?;
     parse_rpc_result(&text, id).map_err(|e| anyhow::anyhow!("mcp {method} failed: {e}"))
 }
 
@@ -195,6 +195,14 @@ async fn post(
         req = req.header("mcp-session-id", sid);
     }
     Ok(req.send().await?)
+}
+
+/// Read an MCP response body as text, bounded by the helper body cap: a tool
+/// server is an external service and must not be able to stream an unbounded
+/// reply into gateway memory.
+async fn read_text_capped(resp: reqwest::Response) -> anyhow::Result<String> {
+    let bytes = super::read_body_capped(resp, super::HELPER_BODY_MAX_BYTES).await?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Parse a streamable-HTTP response body — plain JSON or SSE-framed JSON-RPC —

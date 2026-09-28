@@ -1,28 +1,31 @@
-import { KeyManager } from "@/components/key-manager";
-import { obleth } from "@/lib/obleth";
+import { KeysList } from "@/components/access/keys-list";
+import { requireAdmin } from "@/lib/auth/roles";
+import { obleth, type ApiKey, type BudgetUsage, type Tenant } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
 
 export const dynamic = "force-dynamic";
 
-// Window for the per-key usage summary (requests/tokens/cost and "last used").
-// 30 days keeps "last used" meaningful for keys that aren't hit daily while
-// still bounding the ClickHouse scan.
+// Per-key use covers 30 days: long enough for "last used" to mean something
+// for keys that aren't hit daily, while bounding the ClickHouse scan.
 const KEY_USAGE_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
-export default async function KeysPage() {
-  const [tenants, keys, keyUsage] = await Promise.all([
-    safe(obleth.listTenants(), []),
-    safe(obleth.listKeys(), []),
+export default async function KeysPage({ searchParams }: { searchParams: Promise<{ tenant?: string; key?: string; new?: string }> }) {
+  await requireAdmin();
+  const params = await searchParams;
+  const [tenants, keys, usage, budgets] = await Promise.all([
+    safe(obleth.listTenants(), [] as Tenant[]),
+    safe(obleth.listKeys(), [] as ApiKey[]),
     safe(obleth.keyUsageForDashboard({ sinceMs: Date.now() - KEY_USAGE_WINDOW_MS, limit: 5000 }), []),
+    safe(obleth.budgetUsage(), [] as BudgetUsage[]),
   ]);
 
   return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-lg font-semibold tracking-tight">API Keys</h1>
-        <p className="text-sm text-muted-foreground">Tenant credentials and per-key usage (last 30 days)</p>
-      </div>
-      <KeyManager tenants={tenants} keys={keys} keyUsage={keyUsage} />
-    </div>
+    <KeysList
+      tenants={tenants}
+      keys={keys}
+      usage={usage}
+      budgets={budgets}
+      initial={{ tenant: params.tenant, key: params.key, newFor: params.new }}
+    />
   );
 }

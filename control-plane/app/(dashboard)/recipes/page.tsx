@@ -1,22 +1,6 @@
-import { loadRecipeCards } from "@/lib/sbatch-recipes";
-import { RecipeList } from "@/components/recipes/recipe-list";
+import { redirect } from "next/navigation";
 
-export const dynamic = "force-dynamic";
-
-export default async function RecipesPage() {
-  const recipes = await loadRecipeCards();
-
-  return (
-    <div className="space-y-6">
-      <div>
-        <h1 className="text-lg font-semibold tracking-tight">Recipes</h1>
-        <p className="text-sm text-muted-foreground">
-          Deploy an admin-authored{" "}
-          <code className="rounded bg-secondary px-1 py-0.5 text-xs">*.recipe</code>{" "}
-          file into a managed model.
-        </p>
-      </div>
-      <RecipeList recipes={recipes} />
-    </div>
-  );
+// Recipes live under Deployments now, as the first step of a launch.
+export default function RecipesPage() {
+  redirect("/deployments?tab=recipes");
 }

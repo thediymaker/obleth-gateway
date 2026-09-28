@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::state::AppState;
 
-const BODY_LIMIT: usize = 64 * 1024 * 1024;
+pub(crate) const BODY_LIMIT: usize = 64 * 1024 * 1024;
 const TAIL_CAP: usize = 16 * 1024;
 /// Upper bound on a response we are willing to cache. Larger responses stream
 /// through uncached so the cache can't be used to balloon Redis memory.
@@ -49,6 +49,61 @@ const NO_BUFFER_HEADER: (&str, &str) = ("x-accel-buffering", "no");
 /// upstream failure (a stale pooled keep-alive socket). Long enough to let a
 /// fresh connection replace the dead one, short enough to stay invisible in TTFT.
 const CONN_RETRY_BACKOFF: Duration = Duration::from_millis(50);
+/// Default bound on a request's wait in the fairshare queue
+/// (`OBLETH_ADMISSION_TIMEOUT_SECS`). Without one, a saturated pool parks
+/// callers indefinitely.
+const DEFAULT_ADMISSION_TIMEOUT: Duration = Duration::from_secs(60);
+/// `Retry-After` sent with an admission timeout. `pub(crate)` so other
+/// admission call sites (e.g. `verdicts`) send the same value.
+pub(crate) const ADMISSION_RETRY_AFTER_SECS: &str = "5";
+
+/// Parse `OBLETH_ADMISSION_TIMEOUT_SECS`; unset, unparseable, or zero falls
+/// back to the default.
+fn parse_admission_timeout(raw: Option<&str>) -> Duration {
+    raw.and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_ADMISSION_TIMEOUT)
+}
+
+pub(crate) fn admission_timeout() -> Duration {
+    static TIMEOUT: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+    *TIMEOUT.get_or_init(|| {
+        parse_admission_timeout(
+            std::env::var("OBLETH_ADMISSION_TIMEOUT_SECS")
+                .ok()
+                .as_deref(),
+        )
+    })
+}
+
+/// The canonical spelling of a POST path, when it differs from the request's.
+///
+/// Repeated and trailing slashes are removed, and the bare `/responses`, `/messages`,
+/// `/messages/count_tokens`, and `/verdicts` spellings map to their `/v1` forms. Without this,
+/// `/v1/responses/` or `/responses` skipped the translation shims and was
+/// forwarded to the upstream's own endpoint, so a tenant's guardrails never saw
+/// it, and `/v1/chat/completions/` lost its chat classification (and with it
+/// output guardrails and every chat-only boon).
+fn canonical_post_path(path: &str) -> Option<String> {
+    // Runs of `/` collapse to one, so `//v1/responses` cannot skip the shim
+    // (the upstream URL builder strips leading slashes and would forward it).
+    let mut collapsed = String::with_capacity(path.len());
+    for c in path.chars() {
+        if !(c == '/' && collapsed.ends_with('/')) {
+            collapsed.push(c);
+        }
+    }
+    let trimmed = collapsed.trim_end_matches('/');
+    let mapped = match trimmed {
+        "/responses" => crate::responses::RESPONSES_PATH,
+        "/messages" => crate::messages::MESSAGES_PATH,
+        "/messages/count_tokens" => crate::messages::COUNT_TOKENS_PATH,
+        "/verdicts" => crate::verdicts::VERDICTS_PATH,
+        other => other,
+    };
+    (!mapped.is_empty() && mapped != path).then(|| mapped.to_string())
+}
 
 pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Response<Body> {
     let request_id = Uuid::new_v4();
@@ -57,10 +112,37 @@ pub async fn proxy_handler(state: State<AppState>, mut req: Request<Body>) -> Re
     // caller cannot stamp a direct chat call as Responses traffic and pollute
     // the adoption metric. The shim re-inserts it after this strip.
     req.headers_mut().remove(crate::responses::SURFACE_HEADER);
+    if req.method() == Method::POST {
+        if let Some(canonical) = canonical_post_path(req.uri().path()) {
+            let pq = match req.uri().query() {
+                Some(q) => format!("{canonical}?{q}"),
+                None => canonical,
+            };
+            if let Ok(uri) = pq.parse() {
+                *req.uri_mut() = uri;
+            }
+        }
+    }
+    // The router serves the exact `/v1/verdicts` path; its other spellings
+    // arrive here and must reach the same handler, never the upstream.
+    if req.method() == Method::POST && req.uri().path() == crate::verdicts::VERDICTS_PATH {
+        return crate::verdicts::handler(state, req).await;
+    }
     // `/v1/responses` is served by translating to chat completions and back,
     // around the unchanged pipeline — see `crate::responses`.
     if req.method() == Method::POST && req.uri().path() == crate::responses::RESPONSES_PATH {
         return responses_shim(state, req, request_id).await;
+    }
+    // `/v1/messages` (Anthropic Messages API) is served the same way — see
+    // `crate::messages`.
+    if req.method() == Method::POST {
+        match req.uri().path() {
+            crate::messages::MESSAGES_PATH => return messages_shim(state, req, request_id).await,
+            crate::messages::COUNT_TOKENS_PATH => {
+                return count_tokens_shim(state, req, request_id).await
+            }
+            _ => {}
+        }
     }
     let mut resp = proxy_handler_inner(state, req, request_id).await;
     // Ensure every response — including error paths that build their own response —
@@ -91,6 +173,20 @@ async fn responses_shim(
     request_id: Uuid,
 ) -> Response<Body> {
     let (mut parts, body) = req.into_parts();
+    // Authenticate before buffering: the body may be up to RESPONSES_BODY_MAX,
+    // and an unauthenticated caller must not get to make us hold that. The
+    // inner pipeline authenticates again (a moka hit) — this is only the door.
+    let Some(secret) = bearer(&parts.headers) else {
+        return error_json(StatusCode::UNAUTHORIZED, "missing bearer token");
+    };
+    match crate::jwt_auth::authenticate_credential(&state, &secret).await {
+        Ok(cred) => {
+            if let Err(resp) = gate_resolved_key(&state, &cred.resolved) {
+                return resp;
+            }
+        }
+        Err(resp) => return resp,
+    }
     let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
         return error_json(
             StatusCode::BAD_REQUEST,
@@ -209,7 +305,14 @@ fn translate_response_stream(
         // the split happens on bytes rather than decoded text.
         let mut buffer: Vec<u8> = Vec::new();
         while let Some(item) = upstream.next().await {
-            let Ok(chunk) = item else { break };
+            let Ok(chunk) = item else {
+                // The pipeline aborts its body when the upstream stream
+                // breaks; say so instead of closing with `completed`.
+                for frame in translator.fail("upstream stream ended before the response finished") {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                }
+                break;
+            };
             buffer.extend_from_slice(&chunk);
             for payload in crate::responses::drain_sse_data_lines(&mut buffer) {
                 if payload == "[DONE]" {
@@ -234,6 +337,568 @@ fn translate_response_stream(
     builder
         .header(header::CONTENT_TYPE, "text/event-stream")
         .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+}
+
+/// Anthropic-shaped error response. Status and `Retry-After` are the
+/// pipeline's; only the body shape changes.
+fn anthropic_error(status: StatusCode, message: &str, retry_after: Option<&str>) -> Response<Body> {
+    let body = crate::messages::error_envelope(crate::messages::error_type_for(status), message);
+    let mut builder = Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(ra) = retry_after {
+        builder = builder.header(header::RETRY_AFTER, ra);
+    }
+    builder
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+}
+
+/// Whether an upstream's 400 message is a context-length rejection in its
+/// own words. This surface's own admission clamp (`clamp_max_tokens`) is
+/// meant to catch this before it ever reaches an upstream, but it can only
+/// clamp against a window it actually knows (`context_window_for` returns
+/// `None` for an unregistered `context_window`, or a served model this
+/// gateway has never learned the window of), so the raw upstream 400 is
+/// still a live path. vLLM, TGI and llama.cpp each phrase it differently,
+/// and none of them use Anthropic's wording, so Claude Code's automatic
+/// context-compaction — keyed on `prompt is too long` — never fires on the
+/// unmodified message. Matched case-insensitively against a short, specific
+/// list rather than any 400: this must not relabel an unrelated bad request.
+fn looks_like_context_length_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    ["context length", "maximum context", "too many tokens"]
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
+/// Re-dress a pipeline error response (OpenAI envelope) as an Anthropic one.
+async fn redress_error(resp: Response<Body>) -> Response<Body> {
+    let (parts, body) = resp.into_parts();
+    let bytes = axum::body::to_bytes(body, 64 * 1024)
+        .await
+        .unwrap_or_default();
+    let message = crate::messages::upstream_error_message(&bytes);
+    let message = if message.is_empty() {
+        // A body over the cap, or one that failed to read at all, yields an
+        // empty message from `upstream_error_message`; the status line still
+        // says something, so fall back to it rather than ship `message: ""`.
+        parts
+            .status
+            .canonical_reason()
+            .unwrap_or("error")
+            .to_string()
+    } else if parts.status == StatusCode::BAD_REQUEST && looks_like_context_length_error(&message) {
+        // See `looks_like_context_length_error`: this is the fallback path
+        // for a context overflow this surface's own clamp did not catch.
+        format!("prompt is too long: {message}")
+    } else {
+        message
+    };
+    let retry_after = parts
+        .headers
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let mut out = anthropic_error(parts.status, &message, retry_after.as_deref());
+    if let Some(id) = parts.headers.get("x-obleth-request-id") {
+        out.headers_mut().insert("x-obleth-request-id", id.clone());
+    }
+    out
+}
+
+/// Run a Messages request as a chat request and translate the answer back —
+/// the same edge-translation shape as [`responses_shim`], see its module doc.
+async fn messages_shim(
+    state: State<AppState>,
+    req: Request<Body>,
+    request_id: Uuid,
+) -> Response<Body> {
+    let front = match messages_front(&state, req, false).await {
+        Ok(f) => f,
+        Err(resp) => return resp,
+    };
+    let MessagesFront {
+        mut parts,
+        chat_body,
+        requested_model,
+        streaming,
+    } = front;
+    let Ok(chat_bytes) = serde_json::to_vec(&chat_body) else {
+        return anthropic_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "request translation failed",
+            None,
+        );
+    };
+    let query = strip_beta_query(parts.uri.query())
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    let Ok(uri) = format!("{}{query}", crate::responses::CHAT_PATH).parse() else {
+        return anthropic_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "request translation failed",
+            None,
+        );
+    };
+    parts.uri = uri;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    // Anthropic-only; the upstream never defined these and forwarding them is
+    // pointless at best (`anthropic-beta` also leaks which client library is
+    // in use to a backend that has no use for the information).
+    parts.headers.remove("anthropic-beta");
+    if let Ok(v) = header::HeaderValue::from_str(crate::messages::SURFACE) {
+        parts.headers.insert(crate::responses::SURFACE_HEADER, v);
+    }
+    let chat_req = Request::from_parts(parts, Body::from(chat_bytes));
+
+    let mut resp = proxy_handler_inner(state, chat_req, request_id).await;
+    if !resp.headers().contains_key("x-obleth-request-id") {
+        if let Ok(value) = header::HeaderValue::from_str(&request_id.to_string()) {
+            resp.headers_mut().insert("x-obleth-request-id", value);
+        }
+    }
+    if !resp.status().is_success() {
+        return redress_error(resp).await;
+    }
+    let ctx = crate::messages::ResponseContext {
+        request_id: request_id.to_string(),
+        model: requested_model,
+    };
+    if should_translate_as_stream(streaming, resp.headers()) {
+        translate_messages_stream(resp, ctx)
+    } else {
+        translate_messages_body(resp, ctx).await
+    }
+}
+
+/// Whether the pipeline's 2xx response should go through the SSE translator.
+/// An upstream that ignores `stream` and answers a plain JSON 200 has to fall
+/// back to the buffered path instead: handing that body to the SSE
+/// translator would find no `data:` lines and emit a well-formed but silently
+/// empty message.
+fn should_translate_as_stream(client_asked_to_stream: bool, headers: &HeaderMap) -> bool {
+    const SSE: &str = "text/event-stream";
+    client_asked_to_stream
+        && headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            // Case-insensitive: a `Content-Type` is not case-sensitive per RFC
+            // 9110, and some upstreams answer `Text/Event-Stream`.
+            .and_then(|ct| ct.get(..SSE.len()))
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(SSE))
+}
+
+/// Drop the Anthropic-only `beta` query parameter before the request goes
+/// upstream — the parallel of the `anthropic-beta` header stripped in
+/// `messages_shim`. An unrecognised query parameter on `/v1/chat/completions`
+/// is harmless to a real upstream, but there is no reason to forward it.
+fn strip_beta_query(query: Option<&str>) -> Option<String> {
+    let kept: Vec<&str> = query?
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| pair.split('=').next() != Some("beta"))
+        .collect();
+    (!kept.is_empty()).then(|| kept.join("&"))
+}
+
+/// The chat-shaped body ready for the pipeline, the request parts to forward
+/// it in, and the model name the client sent — assembled by `messages_front`.
+struct MessagesFront {
+    parts: http::request::Parts,
+    chat_body: serde_json::Value,
+    requested_model: String,
+    streaming: bool,
+}
+
+/// Anthropic's real `count_tokens` endpoint takes no `max_tokens` field, and
+/// no SDK sends one, but `to_chat_request` treats it as mandatory for an
+/// actual chat request. The tokenizer's `input_tokens` estimate never reads
+/// `max_tokens`, so backfilling a placeholder here — only for `count_tokens`,
+/// only when the field is absent — is invisible to the caller and never
+/// reaches an upstream.
+fn backfill_max_tokens_for_count_tokens(incoming: &mut serde_json::Value) {
+    if let Some(obj) = incoming.as_object_mut() {
+        obj.entry("max_tokens").or_insert(serde_json::json!(1));
+    }
+}
+
+/// Auth, gate, body read and translation shared by `messages_shim` and
+/// `count_tokens_shim`. `count_tokens` is true only for the latter — see
+/// `backfill_max_tokens_for_count_tokens`.
+async fn messages_front(
+    state: &AppState,
+    req: Request<Body>,
+    count_tokens: bool,
+) -> Result<MessagesFront, Response<Body>> {
+    let (parts, body) = req.into_parts();
+    // Authenticate before buffering (same reasoning as `responses_shim`).
+    let Some(secret) = bearer(&parts.headers) else {
+        return Err(anthropic_error(
+            StatusCode::UNAUTHORIZED,
+            "missing api key",
+            None,
+        ));
+    };
+    match crate::jwt_auth::authenticate_credential(state, &secret).await {
+        Ok(cred) => {
+            if let Err(resp) = gate_resolved_key(state, &cred.resolved) {
+                return Err(redress_error(resp).await);
+            }
+        }
+        Err(resp) => return Err(redress_error(resp).await),
+    }
+    // `axum::body::to_bytes` fails only past the cap (a malformed transport
+    // read surfaces earlier, from `into_parts`/the connection itself), so
+    // every failure here is the client's body being too large.
+    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
+        return Err(anthropic_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body too large",
+            None,
+        ));
+    };
+    let Ok(mut incoming) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Err(anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "invalid JSON body",
+            None,
+        ));
+    };
+    if count_tokens {
+        backfill_max_tokens_for_count_tokens(&mut incoming);
+    }
+    let requested_model = incoming
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if requested_model.is_empty() {
+        return Err(anthropic_error(
+            StatusCode::BAD_REQUEST,
+            "`model` is required",
+            None,
+        ));
+    }
+    let streaming = incoming.get("stream").and_then(serde_json::Value::as_bool) == Some(true);
+    let mut chat_body = match crate::messages::to_chat_request(&incoming) {
+        Ok(v) => v,
+        Err(e) => return Err(anthropic_error(StatusCode::BAD_REQUEST, &e.message, None)),
+    };
+    let served = match resolve_messages_model(state, &requested_model).await {
+        Some(name) => name,
+        None => {
+            return Err(anthropic_error(
+                StatusCode::NOT_FOUND,
+                &format!("model: {requested_model}"),
+                None,
+            ));
+        }
+    };
+    // Anthropic clients — Claude Code above all — size `max_tokens` for the
+    // model family the client believes it is talking to, not for whatever
+    // this gateway actually routes an alias (or `auto`) to underneath.
+    // Forwarded unclamped, a value sized for a 200k-context model 400s at a
+    // smaller upstream (`prompt + max_tokens > context`) or, on `auto`, gets
+    // every smaller candidate hard-filtered out by the router (503). Skipped
+    // for `count_tokens`: its `max_tokens` is a backfilled placeholder, never
+    // forwarded, and never dispatched to a pipeline that could reject it.
+    if !count_tokens {
+        let text_est = state.tokenizer.estimate_request(&chat_body).input_tokens as u64;
+        let input_est = messages_input_estimate(&chat_body, text_est);
+        let window = context_window_for(state, &served).await;
+        let requested_max_tokens = chat_body
+            .get("max_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(1);
+        match clamp_max_tokens(requested_max_tokens, window, input_est) {
+            Ok(clamped) => {
+                if clamped != requested_max_tokens {
+                    tracing::debug!(
+                        requested = requested_max_tokens,
+                        clamped,
+                        input_est,
+                        window,
+                        "messages surface: clamped max_tokens to the served model's context window"
+                    );
+                    chat_body["max_tokens"] = serde_json::Value::from(clamped);
+                }
+            }
+            Err(too_long) => {
+                return Err(anthropic_error(
+                    StatusCode::BAD_REQUEST,
+                    &too_long.message(),
+                    None,
+                ))
+            }
+        }
+    }
+    chat_body["model"] = serde_json::Value::String(served);
+    Ok(MessagesFront {
+        parts,
+        chat_body,
+        requested_model,
+        streaming,
+    })
+}
+
+/// The context window to clamp `max_tokens` against for the model this
+/// request will be served by: the resolved route's declared window for a
+/// concrete model, or the largest window among the `auto` router's healthy
+/// chat candidates when `served` is `AUTO_MODEL_NAME` (the pipeline still
+/// picks the concrete model itself; this is only an upper bound so the
+/// client's `max_tokens` cannot doom every candidate before routing runs).
+/// `None` when no window is known — the caller leaves `max_tokens` alone
+/// rather than clamp on a guess.
+async fn context_window_for(state: &AppState, served: &str) -> Option<u64> {
+    if served == crate::router::AUTO_MODEL_NAME {
+        return state
+            .model_registry
+            .load()
+            .iter()
+            .filter(|c| c.healthy && c.model.model_type == obleth_config::DEFAULT_MODEL_TYPE)
+            .map(|c| c.model.context_window)
+            .filter(|&w| w > 0)
+            .max()
+            .map(|w| w as u64);
+    }
+    resolve_model(state, served)
+        .await
+        .map(|m| m.context_window)
+        .filter(|&w| w > 0)
+        .map(|w| w as u64)
+}
+
+/// The prompt alone already meets or exceeds the model's context window, so
+/// no `max_tokens` value — clamped or not — would leave room for a reply.
+#[derive(Debug, PartialEq)]
+struct TooLong {
+    input_tokens: u64,
+    window: u64,
+}
+
+impl TooLong {
+    /// Anthropic's own wording (Claude Code's automatic context-compaction
+    /// keys its detection on this exact phrase, so it must not drift).
+    fn message(&self) -> String {
+        format!(
+            "prompt is too long: {} tokens > {} maximum",
+            self.input_tokens, self.window
+        )
+    }
+}
+
+/// `estimate_request` counts message text only. That undercounts badly for a
+/// tool-heavy client: Claude Code's own `tools` array runs 10-20k tokens by
+/// itself, and an image part's few bytes of URL are nothing like its real
+/// cost once decoded. Left uncorrected, the clamp below admits a `max_tokens`
+/// the upstream still rejects on the real (text + tools + images) prompt.
+/// Not used for `count_tokens`'s reported figure: that endpoint's contract is
+/// "what the tokenizer counts", not this surface's own admission math.
+fn messages_input_estimate(chat_body: &serde_json::Value, text_estimate: u64) -> u64 {
+    // `to_string().len() / 3`, not the tokenizer's own chars-per-token-4
+    // heuristic: `tools` is JSON schema (short, punctuation- and
+    // digit-heavy — `{`, `"`, `:`, field names), which tokenizes denser than
+    // prose does, roughly 3 chars/token rather than 4. No finer estimate
+    // exists without a real tokenizer, and this only needs to be in the
+    // right order of magnitude to keep the clamp from admitting an
+    // upstream-rejecting value.
+    let tools_tokens = chat_body
+        .get("tools")
+        .map(|t| t.to_string().len() as u64 / 3)
+        .unwrap_or(0);
+    let image_count = chat_body
+        .get("messages")
+        .and_then(serde_json::Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter_map(|m| m.get("content").and_then(serde_json::Value::as_array))
+                .flatten()
+                .filter(|part| {
+                    part.get("type").and_then(serde_json::Value::as_str) == Some("image_url")
+                })
+                .count() as u64
+        })
+        .unwrap_or(0);
+    // A round number, not a measurement: real per-image cost depends on
+    // resolution and the vision encoder, which this gateway has no way to
+    // know ahead of the upstream. Large enough that a handful of images still
+    // pushes the clamp, small enough not to starve `max_tokens` on a single
+    // screenshot.
+    text_estimate + tools_tokens + image_count * 1500
+}
+
+/// Clamp a client-requested `max_tokens` to what the resolved model's context
+/// window can actually hold. The margin scales with the estimate rather than
+/// staying flat: `estimate_request`'s ~4-chars/token heuristic runs further
+/// behind the true count the longer (and more tool/JSON-heavy) the prompt is,
+/// so a request sized like Claude Code's needs far more slack than a short
+/// chat message does. A window with no room left for even that margin is
+/// treated the same as the prompt alone exceeding it — no `max_tokens` value
+/// would leave real room for a reply, so this is the `too long` error, not a
+/// clamp down to 1.
+fn clamp_max_tokens(
+    requested: u64,
+    window: Option<u64>,
+    input_tokens: u64,
+) -> Result<u64, TooLong> {
+    let Some(window) = window else {
+        // No window known: nothing to clamp against, so leave the client's
+        // value alone rather than guess.
+        return Ok(requested);
+    };
+    if input_tokens >= window {
+        return Err(TooLong {
+            input_tokens,
+            window,
+        });
+    }
+    let margin = (input_tokens / 8).max(256);
+    let remaining = window - input_tokens;
+    if remaining <= margin {
+        return Err(TooLong {
+            input_tokens,
+            window,
+        });
+    }
+    Ok(requested.min(remaining - margin).max(1))
+}
+
+/// The alias the client named if the gateway knows it, else the configured
+/// default for Anthropic clients, else nothing.
+///
+/// `AUTO_MODEL_NAME` ("auto") is never registered in Redis — it is the
+/// router's reserved name, special-cased in `proxy_handler_inner` before any
+/// `resolve_model` lookup — so it is passed through unchanged rather than
+/// looked up, both for a client that asks for it directly and for an operator
+/// who configured it as the surface's default.
+async fn resolve_messages_model(state: &AppState, requested: &str) -> Option<String> {
+    if requested == crate::router::AUTO_MODEL_NAME
+        || resolve_model(state, requested).await.is_some()
+    {
+        return Some(requested.to_string());
+    }
+    let fallback = state.classifier.settings().messages_default_model.clone()?;
+    if fallback == crate::router::AUTO_MODEL_NAME || resolve_model(state, &fallback).await.is_some()
+    {
+        tracing::debug!(requested, fallback = %fallback, "messages surface: unknown model served by the configured default");
+        return Some(fallback);
+    }
+    None
+}
+
+/// Buffer a translated chat reply and hand back the Anthropic `message` object.
+async fn translate_messages_body(
+    resp: Response<Body>,
+    ctx: crate::messages::ResponseContext,
+) -> Response<Body> {
+    let (parts, body) = resp.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, RESPONSES_BODY_MAX).await else {
+        return anthropic_error(StatusCode::BAD_GATEWAY, "upstream response too large", None);
+    };
+    let Ok(chat) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        // Not JSON: hand it back untouched rather than inventing a shape.
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    let translated = crate::messages::from_chat_response(&chat, &ctx);
+    let mut builder = Response::builder().status(parts.status);
+    for (name, value) in parts.headers.iter() {
+        if name != header::CONTENT_LENGTH && name != header::CONTENT_TYPE {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(translated.to_string()))
+        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+}
+
+/// Interval on which an idle Messages stream gets a `ping` frame. This loop
+/// exists only once `proxy_handler_inner` has already returned a streaming
+/// response, so it covers gaps between upstream chunks (e.g. a slow decode)
+/// — it starts nothing early and cannot cover an admission queue wait or
+/// buffered-boon work, which both happen before this function is even called.
+const MESSAGES_PING_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Re-emit a chat SSE stream as Anthropic Messages events, frame by frame,
+/// with a `ping` heartbeat while the upstream is silent.
+fn translate_messages_stream(
+    resp: Response<Body>,
+    ctx: crate::messages::ResponseContext,
+) -> Response<Body> {
+    let (parts, body) = resp.into_parts();
+    let stream = async_stream::stream! {
+        let mut translator = crate::messages::AnthropicStreamTranslator::new(ctx);
+        let mut upstream = body.into_data_stream();
+        let mut buffer: Vec<u8> = Vec::new();
+        loop {
+            let item = match tokio::time::timeout(MESSAGES_PING_INTERVAL, upstream.next()).await {
+                Ok(item) => item,
+                Err(_) => {
+                    // Silence, not failure: a gap between upstream chunks (a
+                    // slow decode step) is not itself an error. Sending a
+                    // `ping` is what keeps the client's own idle timeout from
+                    // firing while the upstream is still working.
+                    for frame in translator.ping() {
+                        yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                    }
+                    continue;
+                }
+            };
+            let Some(item) = item else { break };
+            let Ok(chunk) = item else {
+                for frame in translator.fail("api_error", "upstream stream ended before the response finished") {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                }
+                break;
+            };
+            buffer.extend_from_slice(&chunk);
+            for payload in crate::responses::drain_sse_data_lines(&mut buffer) {
+                if payload == "[DONE]" { continue; }
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else { continue };
+                for frame in translator.on_chunk(&value) {
+                    yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+                }
+            }
+        }
+        // `fail` followed by `finish` is safe on both paths: `finish` is a
+        // no-op once `fail` has set the translator's `done` flag.
+        for frame in translator.finish() {
+            yield Ok::<Bytes, std::io::Error>(Bytes::from(frame));
+        }
+    };
+    // Same header handling as `translate_response_stream`.
+    let mut builder = Response::builder().status(parts.status);
+    for (name, value) in parts.headers.iter() {
+        if name != header::CONTENT_LENGTH && name != header::CONTENT_TYPE {
+            builder = builder.header(name, value);
+        }
+    }
+    builder
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from_stream(stream))
+        .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
+}
+
+/// `POST /v1/messages/count_tokens`: the gateway's own estimate of the prompt
+/// as it would be sent. Not admitted, not budgeted, not recorded.
+async fn count_tokens_shim(
+    state: State<AppState>,
+    req: Request<Body>,
+    _request_id: Uuid,
+) -> Response<Body> {
+    let front = match messages_front(&state, req, true).await {
+        Ok(f) => f,
+        Err(resp) => return resp,
+    };
+    let est = state.tokenizer.estimate_request(&front.chat_body);
+    let body = serde_json::json!({"input_tokens": est.input_tokens});
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
 }
 
@@ -278,36 +943,26 @@ async fn proxy_handler_inner(
             Err(resp) => return resp,
         };
     let auth_duration = (crate::tracer::now_ms() - auth_start) as u32;
-    if resolved.disabled {
-        return error_json(StatusCode::FORBIDDEN, "api key disabled");
+    if let Err(resp) = gate_resolved_key(&state, &resolved) {
+        return resp;
     }
-    // Internal probe keys bypass tenant lifecycle gating.
-    if !resolved.internal && resolved.status != "active" {
-        return error_json(StatusCode::FORBIDDEN, "tenant is not active");
+
+    // ---- Videos API follow-ups (poll, download, delete, list) ----
+    // They carry a job id, never a model, so they are served from the job
+    // record written at create time: routed to the model and endpoint that
+    // made the job, and "not found" for anyone who does not own it (another
+    // tenant, or by default another key of this one). Reads of work the
+    // create already paid for, so no admission, budget, or ledger row (see
+    // `crate::videos`).
+    if let Some(call) = crate::videos::follow_up(&method, &path) {
+        let inbound = crate::videos::Inbound {
+            method: &method,
+            query: &query,
+            headers: &headers,
+        };
+        return crate::videos::handle_follow_up(&state, &resolved, call, inbound, request_id).await;
     }
-    // Schedule gate: activation start, expiry cutoff, and recurring weekly windows.
-    if !resolved.internal {
-        let now = chrono::Utc::now();
-        if let Err(reason) = tenant_active_now(&resolved, now) {
-            return error_json(StatusCode::FORBIDDEN, reason);
-        }
-        // Phase 5: warn operators when a tenant is within 72h of expiry.
-        if let Some(until) = resolved.active_until {
-            let remaining = until - now;
-            if remaining > chrono::Duration::zero() && remaining <= chrono::Duration::hours(72) {
-                state.alerts.issue(
-                    format!("tenant_expiry:{}", resolved.tenant_id),
-                    "Tenant access expiring soon",
-                    format!(
-                        "tenant `{}` expires at {} (~{}h remaining)",
-                        resolved.tenant_name,
-                        until.to_rfc3339(),
-                        remaining.num_hours()
-                    ),
-                );
-            }
-        }
-    }
+    let video_create = crate::videos::is_create(&method, &path);
 
     // ---- request flight-recorder tracer ----
     let mut tracer: Option<crate::tracer::SpanRecorder> = if resolved.tracing_enabled {
@@ -343,10 +998,12 @@ async fn proxy_handler_inner(
     };
     let mut json: serde_json::Value =
         serde_json::from_slice(&body_bytes).unwrap_or(serde_json::Value::Null);
-    // Audio transcription/translation send the model as a `multipart/form-data`
-    // field alongside the uploaded file, not as JSON. Parse the fields once so
-    // we can resolve the model and later rebuild the upstream form with the
-    // model name swapped.
+    // File-upload endpoints (audio transcription/translation, image edits and
+    // variations) send the model as a `multipart/form-data` field alongside
+    // the uploaded file, not as JSON. Parse the fields once so we can resolve
+    // the model and later rebuild the upstream form with the model name
+    // swapped. The text fields stand in for the JSON body from here on, so
+    // the input guardrails scan the prompt and image cost reads `n`.
     let content_type_in = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -364,6 +1021,9 @@ async fn proxy_handler_inner(
         } else {
             None
         };
+    if let Some(fields) = &multipart_fields {
+        json = multipart_text_view(fields);
+    }
 
     let mut model = if let Some(fields) = &multipart_fields {
         fields
@@ -403,7 +1063,7 @@ async fn proxy_handler_inner(
     // which still falls through for an unknown id so a wildcard passthrough
     // keeps working.
     if method == Method::GET && is_models_collection(&path) {
-        return models_list_response(&state).await;
+        return models_list_response(&state, &resolved);
     }
     // ---- model detail (`GET /v1/models/{id}`) ----
     // Answered from the registry for any name the gateway has a route for,
@@ -414,8 +1074,15 @@ async fn proxy_handler_inner(
     // passthrough keeps working.
     if method == Method::GET && !is_models_collection(&path) && path.starts_with("/v1/models/") {
         let id = path.trim_start_matches("/v1/models/");
-        if let Some(entry) = registered_model_entry(&state, id) {
-            return (StatusCode::OK, axum::Json(entry)).into_response();
+        match registered_model_entry(&state, id, allowed_models_for(&resolved)) {
+            Some(Ok(entry)) => return (StatusCode::OK, axum::Json(entry)).into_response(),
+            // A registered model outside the tenant's allowlist answers like a
+            // name the gateway does not have. Falling through would forward the
+            // id to an upstream, which knows nothing of the allowlist.
+            Some(Err(())) => {
+                return error_json(StatusCode::NOT_FOUND, &format!("model '{id}' not found"));
+            }
+            None => {}
         }
     }
     // ---- model detail (`GET /model/info`) ----
@@ -499,6 +1166,10 @@ async fn proxy_handler_inner(
             &available_tags,
             &router_settings,
             effort_header,
+            // The classifier model reads the prompt, and on this path intent is
+            // derived before the tenant input guardrails run: under an input
+            // policy, route on the header and heuristics instead.
+            has_input_guardrails(&resolved),
         )
         .await;
         // Wall-clock around the whole of intent derivation (header parse,
@@ -670,6 +1341,27 @@ async fn proxy_handler_inner(
             (opt_out, force_lossy)
         })
         .unwrap_or((false, false));
+    // Refused before the input scan so a request that cannot be served never
+    // spends a guard-model call first.
+    if method == Method::POST && output_guardrails_unenforceable(&resolved, &path) {
+        if let Some(t) = tracer.take() {
+            t.finish("error");
+        }
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "this tenant's output guardrails read chat responses only; \
+             use /v1/chat/completions, /v1/responses, or /v1/messages",
+        );
+    }
+    if method == Method::POST && input_guardrails_unscannable(&resolved, &path) {
+        if let Some(t) = tracer.take() {
+            t.finish("error");
+        }
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "this tenant's input guardrails cannot scan requests to this path; \n             use /v1/chat/completions, /v1/responses, or /v1/messages",
+        );
+    }
     let boon_outcome = state
         .boons
         .enrich_request(
@@ -691,9 +1383,14 @@ async fn proxy_handler_inner(
         return error_json(block.status, block.reason);
     }
     if boon_outcome.rewritten {
-        match serde_json::to_vec(&json) {
-            Ok(bytes) => body_bytes = Bytes::from(bytes),
-            Err(e) => tracing::warn!(error = %e, "failed to re-serialize boon-rewritten body"),
+        if let Some(fields) = multipart_fields.as_mut() {
+            // The form is rebuilt from its fields at dispatch, not from the body.
+            apply_multipart_text_view(fields, &json);
+        } else {
+            match serde_json::to_vec(&json) {
+                Ok(bytes) => body_bytes = Bytes::from(bytes),
+                Err(e) => tracing::warn!(error = %e, "failed to re-serialize boon-rewritten body"),
+            }
         }
         // The body changed (e.g. images became text descriptions); the
         // admission estimate must reflect what is actually sent upstream.
@@ -749,19 +1446,26 @@ async fn proxy_handler_inner(
     let tool_loop_armed = response_plan
         .as_ref()
         .is_some_and(|p| p.tool_loop.is_some());
-    // The response cache is keyed on (model, body) and shared across tenants. A
-    // tenant with an output guardrails policy (block/redact) must never serve —
-    // or populate — a shared cache entry, or it would bypass its own scanning by
-    // replaying another tenant's un-scanned response. Disable the cache for the
+    // The response cache is keyed on (tenant, model, body), so an entry is only
+    // ever replayed to the tenant that populated it. That alone does not make
+    // it safe under output guardrails: an entry stored before the tenant's
+    // block/redact policy was armed (or while it scanned nothing) would replay
+    // an un-scanned response and bypass the scan. Disable the cache for the
     // request whenever output guardrails are armed.
     let output_guardrails_armed = response_plan
         .as_ref()
         .is_some_and(|p| p.guardrails.is_some());
+    // A video create is never replayed from cache either: an identical body
+    // must start a new job, not hand back an id some earlier call recorded.
     let cache_enabled = route.as_ref().map(|r| r.cache_enabled).unwrap_or(false)
         && !tool_loop_armed
-        && !output_guardrails_armed;
+        && !output_guardrails_armed
+        && !video_create;
     let cache_ttl = route.as_ref().map(|r| r.cache_ttl_secs).unwrap_or(0);
-    let cache_key = cache_enabled.then(|| obleth_config::cache_key(&model, &body_bytes));
+    // TTL <= 0 means "don't cache": nothing is ever written, so a lookup could
+    // never hit and would only cost a Redis round-trip.
+    let cache_key = (cache_enabled && cache_ttl > 0)
+        .then(|| obleth_config::cache_key(&resolved.tenant_id.to_string(), &model, &body_bytes));
     if let Some(ck) = &cache_key {
         let cache_start = crate::tracer::now_ms();
         let cache_result = state
@@ -848,23 +1552,66 @@ async fn proxy_handler_inner(
     // Telemetry label for everything that isn't a cache hit.
     let cache_status_label = if cache_enabled { "miss" } else { "off" };
 
-    // ---- fairshare admission (global concurrency + weighted/hierarchical queue) ----
+    // ---- fairshare admission (per-model pool; group → tenant → key) ----
+    // Admission deliberately precedes the budget reservation below: a request
+    // parked in the queue holds no budget, so a waiter that times out (or
+    // whose client leaves) has nothing to refund, and budgets still fail shut
+    // because nothing is dispatched until the reservation has succeeded.
+    // Requests with no registered route share one pool, so arbitrary model
+    // strings cannot each mint scheduler state.
     let admission_start = crate::tracer::now_ms();
-    let admitted = match state
-        .fairshare
-        .admit(obleth_fairshare::AdmitRequest {
-            tenant: resolved.tenant_id,
-            weight: effective_weight,
-            group: resolved.fairshare_group.clone(),
-            group_weight: resolved.group_weight,
-            model: model.clone(),
-            model_max_in_flight: route.as_ref().and_then(|r| r.max_in_flight),
-            cost: est.total(),
-        })
-        .await
-    {
-        Some(a) => a,
-        None => {
+    let pool = if route.is_some() {
+        obleth_fairshare::PoolKey::Model(model.clone())
+    } else {
+        obleth_fairshare::PoolKey::Unrouted
+    };
+    let admit_wait = admission_timeout();
+    let admit = state.fairshare.admit_to(
+        pool,
+        admit_request_for(
+            &resolved,
+            &model,
+            route.as_deref(),
+            effective_weight,
+            est.total(),
+        ),
+    );
+    let admitted = match timeout(admit_wait, admit).await {
+        Ok(Some(a)) => a,
+        Err(_) => {
+            if let Some(t) = tracer.take() {
+                t.finish("error");
+            }
+            let queued_ms = (crate::tracer::now_ms() - admission_start) as u32;
+            finalize(
+                &state,
+                request_id,
+                &resolved,
+                &req_meta,
+                &model,
+                Admission::Rejected,
+                est,
+                0,
+                0,
+                queued_ms,
+                0,
+                request_start.elapsed().as_millis() as u32,
+                503,
+                cache_status_label,
+                0.0,
+                crate::energy::EnergyFigures::default(),
+            );
+            let mut resp = error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "timed out waiting for model capacity",
+            );
+            resp.headers_mut().insert(
+                header::RETRY_AFTER,
+                header::HeaderValue::from_static(ADMISSION_RETRY_AFTER_SECS),
+            );
+            return resp;
+        }
+        Ok(None) => {
             if let Some(t) = tracer.take() {
                 t.finish("error");
             }
@@ -900,12 +1647,17 @@ async fn proxy_handler_inner(
     let send_bytes = body_bytes;
 
     // ---- token budget reserve + cumulative term gate (atomic, cross-pod) ----
-    // One Redis round trip covers both checks. The term gate (Phase 3: caps on
-    // lifetime/monthly/term usage) runs first inside the script, so a
-    // term-exhausted request never reserves per-minute tokens it has no
-    // completion path to refund.
+    // One Redis round trip per scope covers both checks. The term gate
+    // (Phase 3: caps on lifetime/monthly/term usage) runs first inside the
+    // script, so a term-exhausted request never reserves per-minute tokens it
+    // has no completion path to refund. An admitted request also reserves its
+    // estimated tokens and cost against the term cap, so concurrent requests
+    // cannot all pass the gate on the same headroom; each such reservation is
+    // settled exactly once, through `term_reconcile` at settlement or
+    // `release_term_hold` on a rejection between the two scopes.
     let capacity = resolved.tokens_per_minute.max(0);
     let now = chrono::Utc::now();
+    let est_cost = estimated_cost(est, in_cost_rate, out_cost_rate, modality_cost);
     let term_period = term_period_key(&resolved, now);
     let term_gate = term_period
         .as_deref()
@@ -922,14 +1674,28 @@ async fn proxy_handler_inner(
             budget_tokens: resolved.key_budget_tokens,
             budget_cost_usd: resolved.key_budget_cost_usd,
         });
+    // Whether each scope holds a term reservation that settlement must
+    // reconcile. False on the fail-open path: nothing was reserved, so the
+    // settle commits usage with a plain add instead.
+    let mut key_term_held = false;
+    // Releases the key reservation if the request ends (client drop included)
+    // before settlement takes ownership of it.
+    let mut key_hold: Option<PendingTermHold> = None;
+    let mut tenant_term_held = false;
     if let Some(gate) = key_term_gate {
         match state
             .redis
-            .reserve_budget_with_term(&resolved.key_id, 0, 0, est.total(), Some(gate))
+            .reserve_with_term(&resolved.key_id, 0, 0, est.total(), Some(gate), est_cost)
             .instrument(tracing::info_span!("reserve_key_budget"))
             .await
         {
-            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {}
+            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
+                key_term_held = true;
+                key_hold = key_term_period.clone().map(|period| {
+                    PendingTermHold::new(&state, resolved.key_id, period, est, est_cost)
+                });
+            }
+            // Capacity 0 has no per-minute bucket; nothing was reserved.
             Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {}
             Ok(obleth_redis::ReserveOutcome::TermExhausted {
                 used_tokens,
@@ -1000,23 +1766,30 @@ async fn proxy_handler_inner(
             }
         }
     }
-    let should_check_budget = capacity > 0 || term_gate.is_some();
+    let tenant_gate_armed = term_gate.is_some();
+    let should_check_budget = capacity > 0 || tenant_gate_armed;
     if should_check_budget {
         match state
             .redis
-            .reserve_budget_with_term(
+            .reserve_with_term(
                 &resolved.tenant_id,
                 capacity,
                 resolved.tokens_per_minute,
                 est.total(),
                 term_gate,
+                est_cost,
             )
             .instrument(tracing::info_span!("reserve_budget"))
             .await
         {
-            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {}
+            Ok(obleth_redis::ReserveOutcome::Reserved { .. }) => {
+                tenant_term_held = tenant_gate_armed;
+            }
             Ok(obleth_redis::ReserveOutcome::RateLimited { .. }) => {
                 drop(permit);
+                if let Some(hold) = key_hold.take() {
+                    hold.release().await;
+                }
                 finalize(
                     &state,
                     request_id,
@@ -1045,6 +1818,9 @@ async fn proxy_handler_inner(
                 used_cost,
             }) => {
                 drop(permit);
+                if let Some(hold) = key_hold.take() {
+                    hold.release().await;
+                }
                 state.alerts.issue(
                     format!("term_budget_exhausted:{}", resolved.tenant_id),
                     "Tenant term budget exhausted",
@@ -1081,6 +1857,9 @@ async fn proxy_handler_inner(
             Err(e) => {
                 if !state.fail_open {
                     drop(permit);
+                    if let Some(hold) = key_hold.take() {
+                        hold.release().await;
+                    }
                     state.alerts.issue(
                         "redis_budget_reserve_failed_closed",
                         "Redis budget reserve failed",
@@ -1106,6 +1885,42 @@ async fn proxy_handler_inner(
             }
         }
     }
+
+    if let Some(hold) = key_hold.take() {
+        hold.hand_off();
+    }
+
+    // From here on every exit settles through `settle_guard`, so the
+    // per-minute bucket and any term reservation are reconciled exactly once
+    // on every path — including a client that disconnects before upstream
+    // headers arrive, which settles as nothing generated (zero tokens, 499).
+    // Once an upstream answer starts, `arm_estimate` switches that fallback
+    // to the admission estimate.
+    let accounting = StreamAccounting {
+        state: state.clone(),
+        request_id,
+        resolved: resolved.clone(),
+        meta: req_meta.clone(),
+        model: model.clone(),
+        admission,
+        est,
+        queue_wait_ms,
+        request_start,
+        cache_status: cache_status_label.to_string(),
+        capacity,
+        term_period: term_period.clone(),
+        key_term_period: key_term_period.clone(),
+        in_cost_rate,
+        out_cost_rate,
+        modality_cost,
+        energy_slots,
+        holds: TermHolds {
+            tenant: tenant_term_held,
+            key: key_term_held,
+            est_cost,
+        },
+    };
+    let mut settle_guard = accounting.unbilled_guard();
 
     // ---- proxy upstream ----
     // Resolve the per-request timeout and retry policy. Both default to the
@@ -1159,28 +1974,15 @@ async fn proxy_handler_inner(
                     output_tokens,
                 } => {
                     drop(permit);
-                    let accounting = StreamAccounting {
-                        state: state.clone(),
-                        request_id,
-                        resolved: resolved.clone(),
-                        meta: req_meta.clone(),
-                        model: model.clone(),
-                        admission,
-                        est,
-                        queue_wait_ms,
-                        request_start,
-                        cache_status: cache_status_label.to_string(),
-                        capacity,
-                        term_period: term_period.clone(),
-                        key_term_period: key_term_period.clone(),
-                        in_cost_rate,
-                        out_cost_rate,
-                        modality_cost,
-                        energy_slots,
-                    };
                     let total_ms = request_start.elapsed().as_millis() as u32;
-                    accounting
-                        .settle((input_tokens, output_tokens), total_ms, total_ms, 200, None)
+                    let _ = settle_guard
+                        .complete(accounting.settle(
+                            (input_tokens, output_tokens),
+                            total_ms,
+                            total_ms,
+                            200,
+                            None,
+                        ))
                         .await;
                     if let Some(t) = tracer.take() {
                         t.finish("ok");
@@ -1201,26 +2003,7 @@ async fn proxy_handler_inner(
                         });
                 }
                 crate::boons::speculation::Outcome::Stream(driver) => {
-                    let accounting = StreamAccounting {
-                        state: state.clone(),
-                        request_id,
-                        resolved: resolved.clone(),
-                        meta: req_meta.clone(),
-                        model: model.clone(),
-                        admission,
-                        est,
-                        queue_wait_ms,
-                        request_start,
-                        cache_status: cache_status_label.to_string(),
-                        capacity,
-                        term_period: term_period.clone(),
-                        key_term_period: key_term_period.clone(),
-                        in_cost_rate,
-                        out_cost_rate,
-                        modality_cost,
-                        energy_slots,
-                    };
-                    let completion = accounting.cancellation_guard();
+                    accounting.arm_estimate(&mut settle_guard);
                     let body_stream = async_stream::stream! {
                         futures_util::pin_mut!(driver);
                         while let Some(item) = driver.next().await {
@@ -1237,7 +2020,7 @@ async fn proxy_handler_inner(
                             (s.ttft_ms, toks.0, toks.1)
                         };
                         let total_ms = request_start.elapsed().as_millis() as u32;
-                        let _ = completion.complete(accounting.settle(
+                        let _ = settle_guard.complete(accounting.settle(
                             (input_tokens, output_tokens), ttft_ms, total_ms, 200, None,
                         )).await;
                     };
@@ -1278,13 +2061,29 @@ async fn proxy_handler_inner(
     // Multipart bodies cannot be replayed, so they get a single attempt against
     // the first target only.
     let replayable = multipart_fields.is_none();
+    // Streaming chat/completions always ask the upstream for a final usage
+    // chunk, so billing never depends on whether the client happened to set
+    // `stream_options.include_usage`. A client that did not ask for it never
+    // sees it: the pass-through below strips it again.
+    let force_non_streaming = response_plan.is_some() && !stream_tap;
+    let client_include_usage = json
+        .pointer("/stream_options/include_usage")
+        .and_then(serde_json::Value::as_bool)
+        == Some(true);
+    let inject_usage = replayable
+        && !force_non_streaming
+        && route.is_some()
+        && json.is_object()
+        && json.get("stream").and_then(serde_json::Value::as_bool) == Some(true)
+        && is_stream_usage_path(&path);
+    let strip_usage_chunk = inject_usage && !stream_tap && !client_include_usage;
     let prepared_body: Option<Bytes> = replayable.then(|| {
         prepare_upstream_body(
             route.as_deref(),
             &mut json,
             send_bytes,
-            response_plan.is_some() && !stream_tap,
-            stream_tap,
+            force_non_streaming,
+            stream_tap || inject_usage,
         )
     });
 
@@ -1299,6 +2098,8 @@ async fn proxy_handler_inner(
     let mut last_err: Option<String> = None;
     let mut timed_out = false;
     let total_targets = targets.len();
+    // Which target answered: a video job lives on the backend that accepted it.
+    let mut served_target = 0usize;
 
     'targets: for (ti, target) in targets.iter().enumerate() {
         let url = build_upstream_url(&target.base, &path, &query);
@@ -1321,6 +2122,9 @@ async fn proxy_handler_inner(
             let more_targets = replayable && ti + 1 < total_targets;
 
             let mut fwd_headers = forward_headers(&headers);
+            // The model's own upstream headers go on after the client's, so
+            // the operator's value wins a name both set.
+            fwd_headers.extend(target.headers.clone());
             if let Some(key) = &target.api_key {
                 if let Ok(v) = header::HeaderValue::from_str(&format!("Bearer {key}")) {
                     fwd_headers.insert(header::AUTHORIZATION, v);
@@ -1347,6 +2151,10 @@ async fn proxy_handler_inner(
                 // exactly once; we still handle `None` gracefully instead of
                 // panicking should that invariant ever change.
                 let Some(fields) = multipart_fields.take() else {
+                    let total_ms = request_start.elapsed().as_millis() as u32;
+                    let _ = settle_guard
+                        .complete(accounting.settle_unbilled(0, total_ms, 500))
+                        .await;
                     return error_json(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "multipart request body was already consumed",
@@ -1379,6 +2187,7 @@ async fn proxy_handler_inner(
                     }
                     state.metrics.record_upstream_attempt("success");
                     upstream_resp = Some(resp);
+                    served_target = ti;
                     break 'targets;
                 }
                 Ok(Err(e)) => {
@@ -1486,24 +2295,12 @@ async fn proxy_handler_inner(
             } else {
                 (502u16, StatusCode::BAD_GATEWAY)
             };
-            finalize(
-                &state,
-                request_id,
-                &resolved,
-                &req_meta,
-                &model,
-                admission,
-                est,
-                0,
-                0,
-                queue_wait_ms,
-                0,
-                0,
-                code,
-                cache_status_label,
-                0.0,
-                crate::energy::EnergyFigures::default(),
-            );
+            // Nothing was generated: refund the per-minute reservation and
+            // release any term reservation rather than keeping the estimate.
+            let total_ms = request_start.elapsed().as_millis() as u32;
+            let _ = settle_guard
+                .complete(accounting.settle_unbilled(0, total_ms, code))
+                .await;
             let detail = if timed_out {
                 "upstream request timed out"
             } else {
@@ -1584,37 +2381,18 @@ async fn proxy_handler_inner(
             );
         }
 
-        // Mirror the streaming pass-through's accounting for a non-200: usage is
-        // whatever the (error) body reports, falling back to the admission
-        // estimate. Errors are never cached.
-        let (input_tokens, output_tokens) = extract_usage(&String::from_utf8_lossy(&buf))
-            .unwrap_or((est.input_tokens, est.estimated_output_tokens));
+        // A failed upstream call is billed only for the usage its body reports.
+        // With none reported it is billed nothing: the row keeps the status,
+        // the per-minute reservation is refunded, and any term reservation is
+        // released. Errors are never cached.
         let total_ms = request_start.elapsed().as_millis() as u32;
-        settle_request(
-            &state,
-            request_id,
-            &resolved,
-            &req_meta,
-            &model,
-            admission,
-            est,
-            input_tokens,
-            output_tokens,
-            queue_wait_ms,
-            ttft_ms,
-            total_ms,
-            status_code,
-            cache_status_label,
-            capacity,
-            term_period.as_deref(),
-            key_term_period.as_deref(),
-            in_cost_rate,
-            out_cost_rate,
-            modality_cost,
-            energy_slots,
-            None,
-        )
-        .await;
+        let (tokens, billed) = match extract_usage(&String::from_utf8_lossy(&buf)) {
+            Some(tokens) => (tokens, true),
+            None => ((0, 0), false),
+        };
+        let _ = settle_guard
+            .complete(accounting.settle_with(tokens, ttft_ms, total_ms, status_code, None, billed))
+            .await;
         if let Some(t) = tracer.take() {
             t.finish("error");
         }
@@ -1653,8 +2431,58 @@ async fn proxy_handler_inner(
         );
     }
 
+    // The upstream has answered and is generating: from here a client that
+    // disconnects is billed the estimate, as usage will never be delivered.
+    accounting.arm_estimate(&mut settle_guard);
+
     // Cache only successful responses.
     let store_in_cache = cache_key.clone();
+
+    // ---- video job create: record the job before its id leaves ----
+    // The response is a small JSON video object. It is read whole, its id is
+    // recorded against this tenant, this key and the target that accepted
+    // it, and only then is it returned — an unrecorded id could never be
+    // followed up. The create is billed its flat `cost_per_video` (no
+    // tokens) once recorded, and nothing when it is not. The whole step runs
+    // as its own task so a client that leaves mid-way cannot strand a job it
+    // was charged for.
+    if video_create {
+        if let Some(t) = tracer.take() {
+            t.finish("ok");
+        }
+        let job = crate::videos::CreatedJob {
+            jobs: state.video_jobs.clone(),
+            http: state.http.clone(),
+            model: model.clone(),
+            tenant_id: resolved.tenant_id,
+            key_id: resolved.key_id,
+            target: Target {
+                base: targets[served_target].base.clone(),
+                api_key: targets[served_target].api_key.clone(),
+                headers: targets[served_target].headers.clone(),
+            },
+            started: upstream_start,
+        };
+        let recorded = tokio::spawn(async move {
+            let outcome = crate::videos::record_create(job, upstream).await;
+            drop(permit);
+            let total_ms = request_start.elapsed().as_millis() as u32;
+            let settle = accounting.settle_with(
+                (0, 0),
+                outcome.ttft_ms(),
+                total_ms,
+                outcome.status().as_u16(),
+                None,
+                outcome.billed(),
+            );
+            let _ = settle_guard.complete(settle).await;
+            outcome
+        });
+        return match recorded.await {
+            Ok(outcome) => outcome.into_response(request_id),
+            Err(_) => error_json(StatusCode::INTERNAL_SERVER_ERROR, "video create failed"),
+        };
+    }
 
     // Extract guardrails policy for log_only output scanning (evaluated after stream drains).
     let scan_policy = resolved
@@ -1701,26 +2529,6 @@ async fn proxy_handler_inner(
                     stats.clone(),
                 );
 
-                let accounting = StreamAccounting {
-                    state: state.clone(),
-                    request_id,
-                    resolved: resolved.clone(),
-                    meta: req_meta.clone(),
-                    model: model.clone(),
-                    admission,
-                    est,
-                    queue_wait_ms,
-                    request_start,
-                    cache_status: cache_status_label.to_string(),
-                    capacity,
-                    term_period: term_period.clone(),
-                    key_term_period: key_term_period.clone(),
-                    in_cost_rate,
-                    out_cost_rate,
-                    modality_cost,
-                    energy_slots,
-                };
-                let completion = accounting.cancellation_guard();
                 let body_stream = async_stream::stream! {
                     futures_util::pin_mut!(driver);
                     while let Some(item) = driver.next().await {
@@ -1741,7 +2549,7 @@ async fn proxy_handler_inner(
                     };
                     let total_ms = request_start.elapsed().as_millis() as u32;
                     accounting.monitor(scan_policy.as_ref(), output_monitor);
-                    let _ = completion.complete(accounting.settle(
+                    let _ = settle_guard.complete(accounting.settle(
                         (input_tokens, output_tokens), ttft_ms, total_ms, status_code, None,
                     )).await;
                 };
@@ -1774,7 +2582,11 @@ async fn proxy_handler_inner(
     // stream. Fail-open: a body that can't be buffered or parsed passes
     // through verbatim. Non-200 responses skip transformation entirely and
     // fall through to the normal pass-through path below.
-    if let Some(plan) = response_plan.filter(|_| status_code == 200) {
+    if let Some(mut plan) = response_plan.filter(|_| status_code == 200) {
+        // Follow-up tool turns pin to the endpoint that served turn 0.
+        if let Some(tool_loop) = plan.tool_loop.as_mut() {
+            tool_loop.served_url = Some(upstream.url().to_string());
+        }
         // Buffer the upstream body, recording TTFT at the first byte for
         // metric continuity with the streaming path.
         let mut buf: Vec<u8> = Vec::new();
@@ -1805,6 +2617,9 @@ async fn proxy_handler_inner(
         // through unchanged (fail-open); only well-formed completions are
         // rewritten.
         let mut warning: Option<&'static str> = None;
+        // Usage the main row settles with when the buffered tool loop replaced
+        // the body (the follow-up turns are billed as helper rows).
+        let mut turn0_usage: Option<(u32, u32)> = None;
         let mut completion: Option<serde_json::Value> = (!truncated
             && buf.len() <= BOON_BUFFER_MAX)
             .then(|| serde_json::from_slice::<serde_json::Value>(&buf).ok())
@@ -1827,6 +2642,7 @@ async fn proxy_handler_inner(
                 )
                 .await;
                 warning = outcome.warning;
+                turn0_usage = outcome.turn0_usage;
                 // guardrails output scan (block/redact action)
                 if let Some(guard_plan) = &plan.guardrails {
                     match crate::boons::guardrails::apply_output(
@@ -1842,6 +2658,22 @@ async fn proxy_handler_inner(
                     {
                         crate::boons::guardrails::ApplyOutputResult::Block(block) => {
                             drop(permit);
+                            // The upstream did generate the blocked answer, so
+                            // the request settles with its real usage even
+                            // though the client only sees the block.
+                            let tokens = turn0_usage
+                                .or_else(|| completion_body_usage(body_json))
+                                .unwrap_or((est.input_tokens, est.estimated_output_tokens));
+                            let total_ms = request_start.elapsed().as_millis() as u32;
+                            let _ = settle_guard
+                                .complete(accounting.settle(
+                                    tokens,
+                                    ttft_ms,
+                                    total_ms,
+                                    block.status.as_u16(),
+                                    None,
+                                ))
+                                .await;
                             if let Some(t) = tracer.take() {
                                 t.finish("error");
                             }
@@ -1874,16 +2706,8 @@ async fn proxy_handler_inner(
         };
         drop(permit);
 
-        let (input_tokens, output_tokens) = completion
-            .as_ref()
-            .and_then(|c| {
-                let input = c.pointer("/usage/prompt_tokens")?.as_u64()? as u32;
-                let output = c
-                    .pointer("/usage/completion_tokens")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0) as u32;
-                Some((input, output))
-            })
+        let (input_tokens, output_tokens) = turn0_usage
+            .or_else(|| completion.as_ref().and_then(completion_body_usage))
             .unwrap_or((est.input_tokens, est.estimated_output_tokens));
         let total_ms = request_start.elapsed().as_millis() as u32;
 
@@ -1895,35 +2719,19 @@ async fn proxy_handler_inner(
             .then(|| String::from_utf8_lossy(&final_body).into_owned());
         let cache_put = match (&store_in_cache, cache_body) {
             (Some(ck), Some(body)) => {
-                Some((ck.as_str(), cache_ttl, final_content_type.as_str(), body))
+                Some((ck.clone(), cache_ttl, final_content_type.clone(), body))
             }
             _ => None,
         };
-        settle_request(
-            &state,
-            request_id,
-            &resolved,
-            &req_meta,
-            &model,
-            admission,
-            est,
-            input_tokens,
-            output_tokens,
-            queue_wait_ms,
-            ttft_ms,
-            total_ms,
-            status_code,
-            cache_status_label,
-            capacity,
-            term_period.as_deref(),
-            key_term_period.as_deref(),
-            in_cost_rate,
-            out_cost_rate,
-            modality_cost,
-            energy_slots,
-            cache_put,
-        )
-        .await;
+        let _ = settle_guard
+            .complete(accounting.settle(
+                (input_tokens, output_tokens),
+                ttft_ms,
+                total_ms,
+                status_code,
+                cache_put,
+            ))
+            .await;
 
         let mut builder = Response::builder()
             .status(status_code)
@@ -1954,27 +2762,6 @@ async fn proxy_handler_inner(
     }
 
     // ---- stream back, inspecting for actual usage, then reconcile ----
-
-    let accounting = StreamAccounting {
-        state: state.clone(),
-        request_id,
-        resolved: resolved.clone(),
-        meta: req_meta.clone(),
-        model: model.clone(),
-        admission,
-        est,
-        queue_wait_ms,
-        request_start,
-        cache_status: cache_status_label.to_string(),
-        capacity,
-        term_period: term_period.clone(),
-        key_term_period: key_term_period.clone(),
-        in_cost_rate,
-        out_cost_rate,
-        modality_cost,
-        energy_slots,
-    };
-    let completion = accounting.cancellation_guard();
     let body_stream = async_stream::stream! {
         let mut byte_stream = upstream.bytes_stream();
         let mut first = true;
@@ -1982,6 +2769,11 @@ async fn proxy_handler_inner(
         let mut tail: Vec<u8> = Vec::with_capacity(TAIL_CAP.min(4 * 1024));
         let mut full: Vec<u8> = Vec::new();
         let mut cacheable = store_in_cache.is_some();
+        let mut usage_filter = strip_usage_chunk.then(UsageChunkFilter::default);
+        let mut upstream_error: Option<String> = None;
+        // Characters of generated text delivered so far, for billing a stream
+        // the upstream breaks off before reporting usage.
+        let mut streamed_chars: usize = 0;
 
         while let Some(item) = byte_stream.next().await {
             match item {
@@ -1990,7 +2782,17 @@ async fn proxy_handler_inner(
                         ttft_ms = upstream_start.elapsed().as_millis() as u32;
                         first = false;
                     }
+                    // Usage is read from the raw upstream bytes, before the
+                    // gateway-requested usage chunk is filtered out.
                     append_tail(&mut tail, &chunk);
+                    streamed_chars += delta_text_chars(&chunk);
+                    let chunk = match usage_filter.as_mut() {
+                        Some(filter) => filter.push(chunk),
+                        None => chunk,
+                    };
+                    if chunk.is_empty() {
+                        continue;
+                    }
                     if let Some(monitor) = output_monitor.as_mut() { monitor.push(&chunk); }
                     if cacheable {
                         if full.len() + chunk.len() <= CACHE_MAX_BYTES {
@@ -2013,7 +2815,25 @@ async fn proxy_handler_inner(
                         ),
                     );
                     cacheable = false;
+                    upstream_error = Some(e.to_string());
                     break;
+                }
+            }
+        }
+        if upstream_error.is_none() {
+            // A partial trailing event is passed through as received.
+            if let Some(rest) = usage_filter.take().map(UsageChunkFilter::finish) {
+                if !rest.is_empty() {
+                    if let Some(monitor) = output_monitor.as_mut() { monitor.push(&rest); }
+                    if cacheable {
+                        if full.len() + rest.len() <= CACHE_MAX_BYTES {
+                            full.extend_from_slice(&rest);
+                        } else {
+                            cacheable = false;
+                            full = Vec::new();
+                        }
+                    }
+                    yield Ok::<Bytes, std::io::Error>(rest);
                 }
             }
         }
@@ -2025,28 +2845,43 @@ async fn proxy_handler_inner(
         // shrink effective concurrency whenever Redis is slow.
         drop(permit);
 
-        let (input_tokens, output_tokens) = extract_usage(&String::from_utf8_lossy(&tail))
-            .unwrap_or((est.input_tokens, est.estimated_output_tokens));
+        let usage = extract_usage(&String::from_utf8_lossy(&tail));
         let total_ms = request_start.elapsed().as_millis() as u32;
-
-        // store the full response for identical future requests
-        let cache_put = if cacheable && status_code == 200 {
-            store_in_cache.as_deref().map(|ck| {
-                // Take ownership of the buffer instead of copying it; the
-                // lossy re-encode only runs for invalid UTF-8 (never for the
-                // JSON/SSE bodies this cache is meant for).
-                let body = String::from_utf8(std::mem::take(&mut full))
-                    .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
-                (ck.to_string(), cache_ttl, content_type_str.clone(), body)
-            })
-        } else {
-            None
-        };
-
         accounting.monitor(scan_policy.as_ref(), output_monitor);
-        let _ = completion.complete(accounting.settle(
-            (input_tokens, output_tokens), ttft_ms, total_ms, status_code, cache_put,
-        )).await;
+
+        if let Some(err) = upstream_error {
+            // A stream the upstream broke off is a failed call (502), billed
+            // for what reached the client: reported usage, else the streamed
+            // text's estimated tokens; nothing only when nothing streamed.
+            // Settlement is handed off before the error is yielded: the error
+            // makes hyper drop this body, and the guard would otherwise settle
+            // it as a client disconnect.
+            let (tokens, billed) = truncated_stream_billing(usage, streamed_chars, est);
+            let _ = settle_guard.complete(accounting.settle_with(
+                tokens, ttft_ms, total_ms, 502, None, billed,
+            )).await;
+            // An error item aborts the response instead of ending it cleanly,
+            // so the client cannot mistake the truncated body for a whole one.
+            yield Err(std::io::Error::other(format!("upstream stream failed: {err}")));
+        } else {
+            let tokens = usage.unwrap_or((est.input_tokens, est.estimated_output_tokens));
+            // store the full response for identical future requests
+            let cache_put = if cacheable && status_code == 200 {
+                store_in_cache.as_deref().map(|ck| {
+                    // Take ownership of the buffer instead of copying it; the
+                    // lossy re-encode only runs for invalid UTF-8 (never for the
+                    // JSON/SSE bodies this cache is meant for).
+                    let body = String::from_utf8(std::mem::take(&mut full))
+                        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+                    (ck.to_string(), cache_ttl, content_type_str.clone(), body)
+                })
+            } else {
+                None
+            };
+            let _ = settle_guard.complete(accounting.settle(
+                tokens, ttft_ms, total_ms, status_code, cache_put,
+            )).await;
+        }
     };
 
     let mut builder = Response::builder().status(status_code);
@@ -2065,27 +2900,362 @@ async fn proxy_handler_inner(
         .unwrap_or_else(|_| error_json(StatusCode::INTERNAL_SERVER_ERROR, "response build failed"))
 }
 
+/// Above this much held, unterminated buffer, [`UsageChunkFilter`] gives up
+/// waiting for an SSE blank-line terminator and flushes what it has. An
+/// upstream that never emits one (non-compliant, or a non-SSE error body)
+/// would otherwise hold the whole stream indefinitely.
+const USAGE_FILTER_MAX_PENDING: usize = 64 * 1024;
+
+/// Drops the usage-only SSE event the gateway asked the upstream for on a
+/// client's behalf (see `prepare_upstream_body`), passing every other event
+/// through byte-for-byte. Complete events are released as soon as their
+/// terminating blank line arrives, so it adds no latency to a live stream.
+#[derive(Default)]
+struct UsageChunkFilter {
+    pending: Vec<u8>,
+    /// Set once the cap has been hit, so the fallback is logged only once
+    /// per stream rather than on every subsequent chunk.
+    overflowed: bool,
+}
+
+impl UsageChunkFilter {
+    fn push(&mut self, chunk: Bytes) -> Bytes {
+        // Common case: a chunk of whole events with no usage in it.
+        if self.pending.is_empty()
+            && (chunk.ends_with(b"\n\n") || chunk.ends_with(b"\r\n\r\n"))
+            && find_bytes(&chunk, b"prompt_tokens").is_none()
+        {
+            return chunk;
+        }
+        self.pending.extend_from_slice(&chunk);
+        let mut out = Vec::with_capacity(self.pending.len());
+        while let Some(end) = sse_event_end(&self.pending) {
+            let event: Vec<u8> = self.pending.drain(..end).collect();
+            if !is_usage_only_event(&event) {
+                out.extend_from_slice(&event);
+            }
+        }
+        // No event boundary showed up and the buffer has grown past the cap:
+        // stop holding it hostage. The client may then see the injected usage
+        // chunk verbatim, which is acceptable next to holding the stream.
+        if self.pending.len() > USAGE_FILTER_MAX_PENDING {
+            if !self.overflowed {
+                self.overflowed = true;
+                tracing::debug!(
+                    pending_bytes = self.pending.len(),
+                    "usage-chunk filter buffer exceeded cap; flushing unfiltered"
+                );
+            }
+            out.extend_from_slice(&self.pending);
+            self.pending.clear();
+        }
+        Bytes::from(out)
+    }
+
+    fn finish(self) -> Bytes {
+        Bytes::from(self.pending)
+    }
+}
+
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Index just past the first SSE event terminator (a blank line).
+fn sse_event_end(buf: &[u8]) -> Option<usize> {
+    let lf = find_bytes(buf, b"\n\n").map(|i| i + 2);
+    let crlf = find_bytes(buf, b"\r\n\r\n").map(|i| i + 4);
+    match (lf, crlf) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    }
+}
+
+/// An event carrying only usage: a `usage` object and no choices. Content
+/// chunks that also carry usage (continuous usage stats) are not dropped.
+fn is_usage_only_event(event: &[u8]) -> bool {
+    if find_bytes(event, b"prompt_tokens").is_none() {
+        return false;
+    }
+    let text = String::from_utf8_lossy(event);
+    let payload = text
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("data:"))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&payload) else {
+        return false;
+    };
+    let has_usage = value.get("usage").is_some_and(serde_json::Value::is_object);
+    let no_choices = match value.get("choices") {
+        None => true,
+        Some(c) => c.as_array().is_some_and(|a| a.is_empty()),
+    };
+    has_usage && no_choices
+}
+
+/// Which term reservations a request holds, and the cost estimate they were
+/// made with; settlement must release exactly these.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TermHolds {
+    pub(crate) tenant: bool,
+    pub(crate) key: bool,
+    pub(crate) est_cost: f64,
+}
+
+/// Admission-time cost estimate, priced the same way settlement prices
+/// actual usage, so a term reservation and its reconcile agree.
+pub(crate) fn estimated_cost(
+    est: CostEstimate,
+    in_rate: f64,
+    out_rate: f64,
+    modality_cost: f64,
+) -> f64 {
+    (est.input_tokens as f64) * in_rate
+        + (est.estimated_output_tokens as f64) * out_rate
+        + modality_cost
+}
+
+/// Frozen `(cost_usd, energy)` for a settled request. Energy is wall-time
+/// slot-share, so a request that held a slot is charged it even when it
+/// produced nothing billable; only the token-priced cost is waived then.
+fn settled_figures(
+    energy: &crate::energy::EnergyEngine,
+    billed: bool,
+    tokens: (u32, u32),
+    rates: (f64, f64, f64),
+    energy_slots: i64,
+    total_ms: u32,
+    queue_wait_ms: u32,
+) -> (f64, crate::energy::EnergyFigures) {
+    let (in_rate, out_rate, modality_cost) = rates;
+    let cost_usd = if billed {
+        (tokens.0 as f64) * in_rate + (tokens.1 as f64) * out_rate + modality_cost
+    } else {
+        0.0
+    };
+    (
+        cost_usd,
+        energy.compute(energy_slots, total_ms, queue_wait_ms),
+    )
+}
+
+/// A key-scope term reservation made before the tenant step, not yet owned by
+/// the settlement guard. If the request ends while it is armed (a tenant
+/// rejection that forgot it, or the client leaving mid-await), `Drop` releases
+/// it in the background so it cannot block headroom until the TTL lapses.
+pub(crate) struct PendingTermHold {
+    state: AppState,
+    scope: Uuid,
+    period: String,
+    est: CostEstimate,
+    est_cost: f64,
+    armed: bool,
+}
+
+impl PendingTermHold {
+    pub(crate) fn new(
+        state: &AppState,
+        scope: Uuid,
+        period: String,
+        est: CostEstimate,
+        est_cost: f64,
+    ) -> Self {
+        Self {
+            state: state.clone(),
+            scope,
+            period,
+            est,
+            est_cost,
+            armed: true,
+        }
+    }
+
+    /// Release now. The release runs as its own task, so cancelling this
+    /// await neither loses it nor lets `Drop` run it a second time.
+    pub(crate) async fn release(mut self) {
+        self.armed = false;
+        let _ = tokio::spawn(self.release_task()).await;
+    }
+
+    /// Settlement now owns the reservation.
+    pub(crate) fn hand_off(mut self) {
+        self.armed = false;
+    }
+
+    fn release_task(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let (state, scope, period, est, est_cost) = (
+            self.state.clone(),
+            self.scope,
+            self.period.clone(),
+            self.est,
+            self.est_cost,
+        );
+        async move { release_term_hold(&state, &scope, Some(&period), est, est_cost).await }
+    }
+}
+
+impl Drop for PendingTermHold {
+    fn drop(&mut self) {
+        if self.armed {
+            tokio::spawn(self.release_task());
+        }
+    }
+}
+
+/// Release a term reservation for a request that will never settle (it was
+/// rejected by a later admission step). Best effort: a failure only leaves
+/// the reservation to lapse with its key's TTL.
+async fn release_term_hold(
+    state: &AppState,
+    scope: &Uuid,
+    period: Option<&str>,
+    est: CostEstimate,
+    est_cost: f64,
+) {
+    let Some(period) = period else {
+        return;
+    };
+    if let Err(e) = state
+        .redis
+        .term_reconcile(
+            &scope.to_string(),
+            period,
+            est.total() as i64,
+            est_cost,
+            0,
+            0.0,
+        )
+        .await
+    {
+        tracing::warn!(error = %e, "term reservation release failed");
+    }
+}
+
+/// Tokens and billing for a stream the upstream broke off. Reported usage
+/// wins; otherwise the text already delivered is estimated the way the
+/// admission estimator counts text (`HeuristicTokenizer::count_text`,
+/// ~4 characters per token) on top of the prompt estimate. Nothing streamed
+/// means nothing generated, so it is unbilled.
+fn truncated_stream_billing(
+    usage: Option<(u32, u32)>,
+    streamed_chars: usize,
+    est: CostEstimate,
+) -> ((u32, u32), bool) {
+    if let Some(tokens) = usage {
+        return (tokens, true);
+    }
+    if streamed_chars == 0 {
+        return ((0, 0), false);
+    }
+    let output = u32::try_from(streamed_chars / 4).unwrap_or(u32::MAX).max(1);
+    ((est.input_tokens, output), true)
+}
+
+/// Characters of generated text in one raw response chunk: the string values
+/// of `content`, `reasoning_content`, `reasoning` and `text` fields. A byte
+/// scan rather than a JSON parse so it can run on every streamed chunk; a
+/// string split across two chunks is only partly counted, which errs low.
+///
+/// Some upstreams mirror the same reasoning text under both
+/// `reasoning_content` and `reasoning` in one delta; counting both would
+/// double the estimate, so `reasoning` is only counted when the chunk has no
+/// `reasoning_content` text of its own.
+fn delta_text_chars(chunk: &[u8]) -> usize {
+    let content = field_text_chars(chunk, b"\"content\"");
+    let reasoning_content = field_text_chars(chunk, b"\"reasoning_content\"");
+    let reasoning = if reasoning_content > 0 {
+        0
+    } else {
+        field_text_chars(chunk, b"\"reasoning\"")
+    };
+    let text = field_text_chars(chunk, b"\"text\"");
+    content + reasoning_content + reasoning + text
+}
+
+/// Characters in every string value that follows `key` in the chunk.
+fn field_text_chars(chunk: &[u8], key: &[u8]) -> usize {
+    let skip_spaces = |mut i: usize| {
+        while i < chunk.len() && chunk[i] == b' ' {
+            i += 1;
+        }
+        i
+    };
+    let mut total = 0;
+    let mut from = 0;
+    while let Some(at) = find_bytes(&chunk[from..], key) {
+        let mut i = skip_spaces(from + at + key.len());
+        if i >= chunk.len() || chunk[i] != b':' {
+            from = i;
+            continue;
+        }
+        i = skip_spaces(i + 1);
+        if i >= chunk.len() || chunk[i] != b'"' {
+            // `null` or a non-string value.
+            from = i;
+            continue;
+        }
+        i += 1;
+        while i < chunk.len() {
+            match chunk[i] {
+                b'"' => {
+                    i += 1;
+                    break;
+                }
+                b'\\' => {
+                    total += 1;
+                    i += if chunk.get(i + 1) == Some(&b'u') {
+                        6
+                    } else {
+                        2
+                    };
+                }
+                // UTF-8 continuation bytes belong to the character before.
+                b if b & 0xC0 == 0x80 => i += 1,
+                _ => {
+                    total += 1;
+                    i += 1;
+                }
+            }
+        }
+        from = i.min(chunk.len());
+    }
+    total
+}
+
+/// Usage a buffered chat completion reports, if any.
+fn completion_body_usage(body: &serde_json::Value) -> Option<(u32, u32)> {
+    let input = body.pointer("/usage/prompt_tokens")?.as_u64()? as u32;
+    let output = body
+        .pointer("/usage/completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0) as u32;
+    Some((input, output))
+}
+
 /// Owned admission snapshot: cancellation bookkeeping must not borrow the body
 /// that is being dropped. Prices and periods are the same as normal settlement.
 #[derive(Clone)]
-struct StreamAccounting {
-    state: AppState,
-    request_id: Uuid,
-    resolved: Arc<ResolvedKey>,
-    meta: RequestMeta,
-    model: String,
-    admission: Admission,
-    est: CostEstimate,
-    queue_wait_ms: u32,
-    request_start: Instant,
-    cache_status: String,
-    capacity: i64,
-    term_period: Option<String>,
-    key_term_period: Option<String>,
-    in_cost_rate: f64,
-    out_cost_rate: f64,
-    modality_cost: f64,
-    energy_slots: i64,
+pub(crate) struct StreamAccounting {
+    pub(crate) state: AppState,
+    pub(crate) request_id: Uuid,
+    pub(crate) resolved: Arc<ResolvedKey>,
+    pub(crate) meta: RequestMeta,
+    pub(crate) model: String,
+    pub(crate) admission: Admission,
+    pub(crate) est: CostEstimate,
+    pub(crate) queue_wait_ms: u32,
+    pub(crate) request_start: Instant,
+    pub(crate) cache_status: String,
+    pub(crate) capacity: i64,
+    pub(crate) term_period: Option<String>,
+    pub(crate) key_term_period: Option<String>,
+    pub(crate) in_cost_rate: f64,
+    pub(crate) out_cost_rate: f64,
+    pub(crate) modality_cost: f64,
+    pub(crate) energy_slots: i64,
+    pub(crate) holds: TermHolds,
 }
 
 impl StreamAccounting {
@@ -2112,22 +3282,34 @@ impl StreamAccounting {
         }
     }
 
-    fn cancellation_guard(&self) -> crate::completion::CompletionGuard {
+    /// Cancellation fallback settling as status 499. `tokens` is `None` before
+    /// the upstream has answered (nothing generated, billed nothing) and the
+    /// estimate afterwards. Runtime shutdown remains best-effort, just like
+    /// the asynchronous telemetry sink; a partial answer is never cached.
+    fn on_cancel(&self, tokens: Option<(u32, u32)>) -> impl FnOnce() + Send + 'static {
         let accounting = self.clone();
-        crate::completion::CompletionGuard::new(move || {
-            let tokens = (
-                accounting.est.input_tokens,
-                accounting.est.estimated_output_tokens,
-            );
+        move || {
             let elapsed = accounting.request_start.elapsed().as_millis() as u32;
-            // No final usage was delivered. Keep the estimate explicit through
-            // status 499; never cache a partial answer. Runtime shutdown remains
-            // best-effort, just like the existing asynchronous telemetry sink.
-            tokio::spawn(accounting.settle(tokens, 0, elapsed, 499, None));
-        })
+            let (tokens, billed) = match tokens {
+                Some(tokens) => (tokens, true),
+                None => ((0, 0), false),
+            };
+            tokio::spawn(accounting.settle_with(tokens, 0, elapsed, 499, None, billed));
+        }
     }
 
-    async fn settle(
+    pub(crate) fn unbilled_guard(&self) -> crate::completion::CompletionGuard {
+        crate::completion::CompletionGuard::new(self.on_cancel(None))
+    }
+
+    fn arm_estimate(&self, guard: &mut crate::completion::CompletionGuard) {
+        guard.rearm(self.on_cancel(Some((
+            self.est.input_tokens,
+            self.est.estimated_output_tokens,
+        ))));
+    }
+
+    pub(crate) async fn settle(
         self,
         tokens: (u32, u32),
         ttft_ms: u32,
@@ -2135,9 +3317,29 @@ impl StreamAccounting {
         status_code: u16,
         cache_put: Option<(String, i64, String, String)>,
     ) {
+        self.settle_with(tokens, ttft_ms, total_ms, status_code, cache_put, true)
+            .await;
+    }
+
+    /// Settle a request that produced nothing billable: zero tokens and
+    /// cost, full refund of every reservation (energy is still charged).
+    pub(crate) async fn settle_unbilled(self, ttft_ms: u32, total_ms: u32, status_code: u16) {
+        self.settle_with((0, 0), ttft_ms, total_ms, status_code, None, false)
+            .await;
+    }
+
+    async fn settle_with(
+        self,
+        tokens: (u32, u32),
+        ttft_ms: u32,
+        total_ms: u32,
+        status_code: u16,
+        cache_put: Option<(String, i64, String, String)>,
+        billed: bool,
+    ) {
         let cache_enabled = cache_put.is_some();
         let (key, ttl, content_type, body) = cache_put.unwrap_or_default();
-        settle_request(
+        settle_inner(
             &self.state,
             self.request_id,
             &self.resolved,
@@ -2160,6 +3362,8 @@ impl StreamAccounting {
             self.modality_cost,
             self.energy_slots,
             cache_enabled.then_some((key.as_str(), ttl, content_type.as_str(), body)),
+            self.holds,
+            billed,
         )
         .await;
     }
@@ -2172,8 +3376,14 @@ impl StreamAccounting {
 /// `cache_put` carries `(key, ttl, content_type, body)` when the response
 /// should be stored for identical future requests; callers gate it on a
 /// successful (200) response.
+///
+/// `holds` names the term reservations made at admission, which are
+/// reconciled (released, actual committed) rather than added to. `billed =
+/// false` settles a request that produced nothing billable: tokens and cost
+/// are frozen at zero (energy is still charged) and the reservations are
+/// fully refunded.
 #[allow(clippy::too_many_arguments)]
-async fn settle_request(
+async fn settle_inner(
     state: &AppState,
     request_id: Uuid,
     resolved: &ResolvedKey,
@@ -2196,6 +3406,8 @@ async fn settle_request(
     modality_cost: f64,
     energy_slots: i64,
     cache_put: Option<(&str, i64, &str, String)>,
+    holds: TermHolds,
+    billed: bool,
 ) {
     // Feed the router's per-request cost estimate: one EWMA sample of how
     // long this model's answers actually run. Successful requests only — an
@@ -2257,20 +3469,40 @@ async fn settle_request(
     // Frozen request cost: per-token rates (captured at admission) plus any
     // per-request modality surcharge. Computed once and used for both the
     // term-budget commit and the persisted usage ledger so they agree.
-    let cost_usd = (input_tokens as f64) * in_cost_rate
-        + (output_tokens as f64) * out_cost_rate
-        + modality_cost;
     // Frozen energy figures: slot-share of live cluster power over serving
     // time (queue wait excluded). Zeros when accounting is off. Frozen like
     // `cost_usd` so later settings edits never rewrite history.
-    let energy = state.energy.compute(energy_slots, total_ms, queue_wait_ms);
+    let (cost_usd, energy) = settled_figures(
+        &state.energy,
+        billed,
+        (input_tokens, output_tokens),
+        (in_cost_rate, out_cost_rate, modality_cost),
+        energy_slots,
+        total_ms,
+        queue_wait_ms,
+    );
+    let added = input_tokens.saturating_add(output_tokens) as i64;
+    let est_tokens = est.total() as i64;
     if let Some(period) = term_period {
-        let added = input_tokens.saturating_add(output_tokens) as i64;
-        match state
-            .redis
-            .term_usage_add(&resolved.tenant_id, period, added, cost_usd)
-            .await
-        {
+        let committed = if holds.tenant {
+            state
+                .redis
+                .term_reconcile(
+                    &resolved.tenant_id.to_string(),
+                    period,
+                    est_tokens,
+                    holds.est_cost,
+                    added,
+                    cost_usd,
+                )
+                .await
+        } else {
+            state
+                .redis
+                .term_usage_add(&resolved.tenant_id, period, added, cost_usd)
+                .await
+        };
+        match committed {
             Ok((total_tokens, total_cost)) => {
                 maybe_alert_budget(state, resolved, total_tokens, total_cost);
             }
@@ -2285,12 +3517,25 @@ async fn settle_request(
         }
     }
     if let Some(period) = key_term_period {
-        let added = input_tokens.saturating_add(output_tokens) as i64;
-        match state
-            .redis
-            .term_usage_add(&resolved.key_id, period, added, cost_usd)
-            .await
-        {
+        let committed = if holds.key {
+            state
+                .redis
+                .term_reconcile(
+                    &resolved.key_id.to_string(),
+                    period,
+                    est_tokens,
+                    holds.est_cost,
+                    added,
+                    cost_usd,
+                )
+                .await
+        } else {
+            state
+                .redis
+                .term_usage_add(&resolved.key_id, period, added, cost_usd)
+                .await
+        };
+        match committed {
             Ok((total_tokens, total_cost)) => {
                 maybe_alert_key_budget(state, resolved, total_tokens, total_cost);
             }
@@ -2330,13 +3575,10 @@ async fn settle_request(
 }
 
 /// Resolve a key via moka, falling back to Redis and caching the result.
+/// Distinguishes a Redis error from a miss so callers can fail closed on the
+/// former (503, backend unavailable) rather than reading it as an unknown
+/// credential (401) -- see `jwt_auth::authenticate_credential`.
 #[tracing::instrument(skip_all, name = "auth_resolve")]
-pub(crate) async fn resolve_key(state: &AppState, hash: &str) -> Option<Arc<ResolvedKey>> {
-    try_resolve_key(state, hash).await.unwrap_or(None)
-}
-
-/// Like [`resolve_key`], but distinguishes a Redis error from a miss so callers
-/// that would otherwise treat "unknown" as "first sight" can fail closed instead.
 pub(crate) async fn try_resolve_key(
     state: &AppState,
     hash: &str,
@@ -2365,7 +3607,7 @@ pub(crate) async fn try_resolve_key(
 
 /// Union of routing tags across the candidates the request may actually use.
 /// Restricting the classifier to achievable tags keeps it honest and cheap.
-fn union_candidate_tags(
+pub(crate) fn union_candidate_tags(
     candidates: &[crate::router::Candidate],
     allowed_models: Option<&[String]>,
 ) -> Vec<String> {
@@ -2390,17 +3632,18 @@ fn union_candidate_tags(
 /// `auto`), then cheap heuristics, then a neutral default. Every fallback
 /// lowers difficulty rather than raising it, so a slow or broken brain makes
 /// routing cheaper and never silently more expensive.
-async fn derive_intent(
+pub(crate) async fn derive_intent(
     state: &AppState,
     json: &serde_json::Value,
     est_input_tokens: u64,
     available_tags: &[String],
     settings: &obleth_config::AutoRouterSettings,
     effort_header: Option<&str>,
+    skip_classifier: bool,
 ) -> crate::router::Intent {
     let forced = crate::router::difficulty_from_header(effort_header);
 
-    if settings.classifier_active() && !available_tags.is_empty() {
+    if !skip_classifier && settings.classifier_active() && !available_tags.is_empty() {
         if let Some(name) = settings.classifier_model.as_deref() {
             if name != crate::router::AUTO_MODEL_NAME {
                 if let Some(brain) = resolve_model(state, name).await {
@@ -2528,7 +3771,7 @@ pub(crate) async fn resolve_model(state: &AppState, name: &str) -> Option<Arc<Re
     }
 }
 
-fn effective_admission_weight(tenant_weight: i64, route: Option<&ResolvedModel>) -> i64 {
+pub(crate) fn effective_admission_weight(tenant_weight: i64, route: Option<&ResolvedModel>) -> i64 {
     let Some(route) = route else {
         return tenant_weight.max(1);
     };
@@ -2537,13 +3780,46 @@ fn effective_admission_weight(tenant_weight: i64, route: Option<&ResolvedModel>)
         .max(1.0) as i64
 }
 
+/// Build the scheduler request for one admission. Every admission carries the
+/// caps from the resolved key on every request; the scheduler treats an
+/// omitted cap as "clear the cap for this pool", so callers must never pass
+/// `None` for a tenant or key that has a cap configured. Caps that are unset,
+/// zero, or negative mean "no cap".
+///
+/// The tenant cap is read from the *per-key* cached `ResolvedKey`, so for the
+/// short window after a tenant's quota changes, two keys of the same tenant can
+/// carry different tenant caps and the last admit wins for that pool. It
+/// self-corrects once the cached keys refresh.
+pub(crate) fn admit_request_for(
+    resolved: &ResolvedKey,
+    model: &str,
+    route: Option<&ResolvedModel>,
+    weight: i64,
+    cost: u32,
+) -> obleth_fairshare::AdmitRequest {
+    let positive = |c: Option<i64>| c.and_then(|c| usize::try_from(c).ok()).filter(|c| *c > 0);
+    obleth_fairshare::AdmitRequest {
+        tenant: resolved.tenant_id,
+        key: resolved.key_id,
+        weight,
+        key_weight: resolved.key_weight.max(1),
+        group: resolved.fairshare_group.clone(),
+        group_weight: resolved.group_weight,
+        model: model.to_string(),
+        model_max_in_flight: route.and_then(|r| r.max_in_flight).filter(|c| *c > 0),
+        tenant_max_in_flight: positive(resolved.max_in_flight),
+        key_max_in_flight: positive(resolved.key_max_in_flight),
+        cost,
+    }
+}
+
 /// OpenAI-style endpoints that must resolve to a registered model route.
 /// Unregistered models must not fall through to the default benchmark fixture upstream.
 /// Evaluate a tenant's schedule against the current instant. Returns `Ok(())`
 /// when traffic is permitted, or `Err(reason)` with a client-facing message when
 /// the tenant is outside its activation window, expired, or outside its
 /// recurring weekly windows.
-fn tenant_active_now(
+pub(crate) fn tenant_active_now(
     resolved: &ResolvedKey,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(), &'static str> {
@@ -2580,7 +3856,10 @@ fn tenant_active_now(
 /// `monthly` budgets roll over at each calendar month (in the tenant timezone),
 /// `term` budgets reset whenever `budget_started_at` changes, and `lifetime`
 /// budgets never reset.
-fn term_period_key(resolved: &ResolvedKey, now: chrono::DateTime<chrono::Utc>) -> Option<String> {
+pub(crate) fn term_period_key(
+    resolved: &ResolvedKey,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<String> {
     budget_period_key(
         resolved.budget_tokens,
         resolved.budget_cost_usd,
@@ -2591,7 +3870,7 @@ fn term_period_key(resolved: &ResolvedKey, now: chrono::DateTime<chrono::Utc>) -
     )
 }
 
-fn key_term_period_key(
+pub(crate) fn key_term_period_key(
     resolved: &ResolvedKey,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
@@ -2613,28 +3892,14 @@ fn budget_period_key(
     timezone: &str,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Option<String> {
-    if budget_tokens.is_none() && budget_cost_usd.is_none() {
-        return None;
-    }
-    let period = budget_period.unwrap_or("lifetime");
-    let key = match period {
-        "monthly" => {
-            use chrono::Datelike;
-            let tz: chrono_tz::Tz = timezone.parse().unwrap_or(chrono_tz::UTC);
-            let local = now.with_timezone(&tz);
-            format!("m:{}-{:02}", local.year(), local.month())
-        }
-        "term" => {
-            let anchor = budget_started_at.map(|t| t.timestamp()).unwrap_or(0);
-            format!("t:{anchor}")
-        }
-        // "lifetime" and any unknown value: a single non-rolling bucket.
-        _ => {
-            let anchor = budget_started_at.map(|t| t.timestamp()).unwrap_or(0);
-            format!("l:{anchor}")
-        }
-    };
-    Some(key)
+    obleth_config::budget::period_key(
+        budget_tokens,
+        budget_cost_usd,
+        budget_period,
+        budget_started_at,
+        timezone,
+        now,
+    )
 }
 
 /// Emit warning/exhaustion alerts when a tenant crosses 80% / 100% of either
@@ -2715,72 +3980,79 @@ fn maybe_alert_key_budget(
     }
 }
 
-/// Serve `GET /v1/models` by aggregating what the upstreams actually report.
+/// Serve `GET /v1/models` from the gateway's own registry: one entry per
+/// enabled route, under its client-facing `model_name`, carrying the same
+/// fields as the detail lookup.
 ///
-/// The single default upstream only lists its own models (e.g. the litellm or
-/// aibrix gateway), so Slurm-hosted models on their own endpoints never show up.
-/// We instead ask every distinct upstream that backs a registered model (the
-/// default base plus each model's endpoints) for its own `/v1/models` and union
-/// the entries. Lookups are best-effort and concurrent, so a slow or down
-/// upstream is simply skipped.
+/// The registry is the only honest source for this answer. The listing used to
+/// be the union of every upstream's own `/v1/models`, which listed nothing for
+/// a route whose backend does not serve a catalog (or was unreachable that
+/// second), and advertised whatever else a backend happened to serve, under
+/// its backend id, though a request naming a model the gateway has not
+/// registered is refused. Provisioned models are registry rows too, so nothing
+/// the union found is lost.
 ///
-/// An entry the gateway recognizes is then rewritten onto the gateway's own
-/// name and annotated — see [`canonicalize_models`], which is where the
-/// `glm-5-3-mxfp4` a backend calls itself becomes the registered `glm-5-3`.
-/// Everything else stays as its upstream reported it, `owned_by` included
-/// (litellm `openai`, vLLM `vllm`, llama.cpp `llamacpp`, Ollama `library`, …),
-/// so a wildcard passthrough is never dressed up as a registered route.
-async fn models_list_response(state: &AppState) -> Response<Body> {
+/// Tenants with a model allowlist see only the models they may call, as on
+/// `/model/info`: listing a model the caller would be refused advertises a 403.
+fn models_list_response(state: &AppState, resolved: &ResolvedKey) -> Response<Body> {
     let candidates = state.model_registry.load();
-
-    // Each registered model's effective upstream target(s), paired with the key
-    // needed to reach them. Most upstreams (litellm / aibrix / openai-compatible)
-    // require auth on `/v1/models`, so an unauthenticated probe 401s and the
-    // model silently drops out. Deduped by base; a base that carries a key wins
-    // over one that doesn't. Only models with neither endpoints nor an api_base
-    // fall back to the global default base.
-    let mut by_base: std::collections::HashMap<String, Option<String>> =
-        std::collections::HashMap::new();
-    for c in candidates.iter() {
-        let targets: Vec<(String, Option<String>)> = if !c.model.endpoints.is_empty() {
-            c.model
-                .endpoints
-                .iter()
-                .filter(|e| e.enabled)
-                .map(|e| {
-                    (
-                        e.api_base.clone(),
-                        e.api_key.clone().or_else(|| c.model.api_key.clone()),
-                    )
-                })
-                .collect()
-        } else if !c.model.api_base.is_empty() {
-            vec![(c.model.api_base.clone(), c.model.api_key.clone())]
-        } else {
-            vec![(state.upstream_base.clone(), None)]
-        };
-        for (base, key) in targets {
-            if base.is_empty() {
-                continue;
-            }
-            let slot = by_base.entry(base).or_insert(None);
-            if slot.is_none() {
-                *slot = key;
-            }
-        }
-    }
-
-    // Fan out concurrently (authenticating each probe), then union verbatim.
-    let results = futures_util::future::join_all(
-        by_base
-            .iter()
-            .map(|(base, key)| fetch_upstream_models(state, base, key.as_deref())),
+    (
+        StatusCode::OK,
+        axum::Json(registry_models_list(
+            &candidates,
+            allowed_models_for(resolved),
+        )),
     )
-    .await;
+        .into_response()
+}
 
-    let mut merged = merge_upstream_models(results);
-    canonicalize_models(&mut merged, &model_facts_index(&candidates));
-    (StatusCode::OK, axum::Json(merged)).into_response()
+/// The model allowlist that bounds what a caller is shown, or `None` when it
+/// may see everything (internal callers, and tenants without an allowlist).
+/// Entries are canonical `model_name`s, which is also what the discovery
+/// endpoints advertise.
+fn allowed_models_for(resolved: &ResolvedKey) -> Option<&[String]> {
+    if resolved.internal {
+        None
+    } else {
+        resolved.allowed_models.as_deref()
+    }
+}
+
+/// True when `model_name` is visible under `allowed` (see [`allowed_models_for`]).
+fn model_visible(allowed: Option<&[String]>, model_name: &str) -> bool {
+    allowed.is_none_or(|list| list.iter().any(|m| m == model_name))
+}
+
+/// The OpenAI `{object:"list", data:[…]}` listing for a registry snapshot,
+/// sorted by id and limited to `allowed` when set. Pure, so the shape is
+/// unit-testable without a registry.
+fn registry_models_list(
+    candidates: &[obleth_config::routing::Candidate],
+    allowed: Option<&[String]>,
+) -> serde_json::Value {
+    let mut data: Vec<serde_json::Value> = candidates
+        .iter()
+        .filter(|c| c.model.enabled)
+        .filter(|c| model_visible(allowed, &c.model.model_name))
+        .map(|c| model_entry(&ModelFacts::of(&c.model)))
+        .collect();
+    data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    data.dedup_by(|a, b| a["id"] == b["id"]);
+    serde_json::json!({ "object": "list", "data": data })
+}
+
+/// One discovery entry (`/v1/models` and `/v1/models/{id}`).
+fn model_entry(facts: &ModelFacts) -> serde_json::Value {
+    serde_json::json!({
+        "id": facts.model_name,
+        "object": "model",
+        "owned_by": "obleth",
+        "model_type": facts.model_type,
+        "mode": mode_for_model_type(&facts.model_type),
+        "quantization": facts.quantization,
+        "tags": facts.tags,
+        "aliases": facts.aliases,
+    })
 }
 
 /// What the gateway knows about one registered route, as the discovery
@@ -2795,15 +4067,27 @@ struct ModelFacts {
     tags: Vec<String>,
 }
 
+impl ModelFacts {
+    fn of(model: &ResolvedModel) -> Self {
+        ModelFacts {
+            model_name: model.model_name.clone(),
+            model_type: model.model_type.clone(),
+            quantization: model.quantization.clone(),
+            aliases: model.aliases.clone(),
+            tags: model.tags.clone(),
+        }
+    }
+}
+
 /// Index every name a registered route can be recognized by — its
 /// `model_name`, its aliases, and the `upstream_model` its backend reports —
 /// onto the facts the gateway advertises for it.
 ///
-/// The `upstream_model` key is what lets a listing come back clean: a backend
-/// serving `glm-5-3-mxfp4` reports that id in its own catalog, and this index
-/// is how the aggregate recognizes it as the registered `glm-5-3`. Insertion
-/// order sets precedence deliberately — `model_name` is written last and wins,
-/// because it is the name request resolution matches on.
+/// The `upstream_model` key lets a detail lookup by a backend's own id (a
+/// client that learned `glm-5-3-mxfp4` from the backend) answer with the
+/// registered `glm-5-3`. Insertion order sets precedence deliberately —
+/// `model_name` is written last and wins, because it is the name request
+/// resolution matches on.
 fn model_facts_index(
     candidates: &[obleth_config::routing::Candidate],
 ) -> std::collections::HashMap<String, std::sync::Arc<ModelFacts>> {
@@ -2811,15 +4095,7 @@ fn model_facts_index(
         std::collections::HashMap::new();
     let facts: Vec<std::sync::Arc<ModelFacts>> = candidates
         .iter()
-        .map(|c| {
-            std::sync::Arc::new(ModelFacts {
-                model_name: c.model.model_name.clone(),
-                model_type: c.model.model_type.clone(),
-                quantization: c.model.quantization.clone(),
-                aliases: c.model.aliases.clone(),
-                tags: c.model.tags.clone(),
-            })
-        })
+        .map(|c| std::sync::Arc::new(ModelFacts::of(&c.model)))
         .collect();
     for (c, f) in candidates.iter().zip(facts.iter()) {
         if !c.model.upstream_model.is_empty() {
@@ -2839,152 +4115,16 @@ fn model_facts_index(
     by_name
 }
 
-/// Rewrite aggregated `/v1/models` entries onto the gateway's own names, and
-/// annotate them with what the gateway knows.
-///
-/// Two jobs, one pass:
-///
-/// * **Canonicalize.** An entry a registered route claims is re-`id`'d to that
-///   route's `model_name`. This is what keeps deployment detail out of the
-///   advertised catalog: a backend that serves `glm-5-3-mxfp4` (or a client
-///   pinned to that old spelling as an alias) is listed once, as `glm-5-3`.
-///   Two upstream ids collapsing onto one route therefore de-dupe here, after
-///   the rewrite, which [`merge_upstream_models`] could not have seen.
-/// * **Annotate.** Each matched entry gains `model_type` (obleth's
-///   [`MODEL_TYPES`](obleth_config::MODEL_TYPES) vocabulary), `mode` (the
-///   LiteLLM-convention alias many clients already read, where `image` is
-///   spelled `image_generation`), `quantization`, `tags`, and the `aliases`
-///   that still resolve to it — so a client that had pinned an old name can
-///   see where it went.
-///
-/// Entries no route claims — wildcard passthroughs — stay verbatim, with no
-/// guessed fields.
-fn canonicalize_models(
-    list: &mut serde_json::Value,
-    facts_by_name: &std::collections::HashMap<String, std::sync::Arc<ModelFacts>>,
-) {
-    let Some(data) = list.get_mut("data").and_then(|d| d.as_array_mut()) else {
-        return;
-    };
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut out: Vec<serde_json::Value> = Vec::with_capacity(data.len());
-    for mut entry in data.drain(..) {
-        let id = entry
-            .get("id")
-            .and_then(|i| i.as_str())
-            .unwrap_or_default()
-            .to_string();
-        match facts_by_name.get(&id) {
-            Some(f) => {
-                if !seen.insert(f.model_name.clone()) {
-                    continue;
-                }
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.insert("id".into(), f.model_name.clone().into());
-                    obj.insert("model_type".into(), f.model_type.clone().into());
-                    obj.insert("mode".into(), mode_for_model_type(&f.model_type).into());
-                    obj.insert("quantization".into(), f.quantization.clone().into());
-                    obj.insert("tags".into(), serde_json::json!(f.tags));
-                    obj.insert("aliases".into(), serde_json::json!(f.aliases));
-                }
-                out.push(entry);
-            }
-            None => {
-                if !seen.insert(id) {
-                    continue;
-                }
-                out.push(entry);
-            }
-        }
-    }
-    // Re-sorted because the rewrite above moves ids.
-    out.sort_by(|a, b| {
-        a.get("id")
-            .and_then(|i| i.as_str())
-            .cmp(&b.get("id").and_then(|i| i.as_str()))
-    });
-    *data = out;
-}
-
 /// The LiteLLM-convention spelling of a modality, which many OpenAI-compatible
 /// clients read instead of obleth's own `model_type`. Identical to the obleth
-/// vocabulary except that `image` is spelled `image_generation`.
+/// vocabulary except that `image` and `video` are spelled `image_generation`
+/// and `video_generation`.
 fn mode_for_model_type(model_type: &str) -> &str {
     match model_type {
         "image" => "image_generation",
+        "video" => "video_generation",
         other => other,
     }
-}
-
-/// Union upstream `/v1/models` entries into one OpenAI `{object:"list", data:[…]}`
-/// payload, keeping each entry exactly as its upstream reported it (real `id`,
-/// real `owned_by`) and de-duping by `id` — the first upstream to report an id
-/// wins. Sorted by id for stable output. Pure so it can be unit-tested without
-/// the network fan-out.
-fn merge_upstream_models(
-    lists: impl IntoIterator<Item = Vec<serde_json::Value>>,
-) -> serde_json::Value {
-    let mut seen = std::collections::HashSet::new();
-    let mut data: Vec<serde_json::Value> = Vec::new();
-    for entry in lists.into_iter().flatten() {
-        let Some(id) = entry.get("id").and_then(|i| i.as_str()) else {
-            continue;
-        };
-        if seen.insert(id.to_string()) {
-            data.push(entry);
-        }
-    }
-    data.sort_by(|a, b| {
-        a.get("id")
-            .and_then(|i| i.as_str())
-            .cmp(&b.get("id").and_then(|i| i.as_str()))
-    });
-    serde_json::json!({ "object": "list", "data": data })
-}
-
-/// Best-effort `GET {base}/v1/models`, returning the upstream's `data` entries
-/// verbatim. Any timeout/error/parse failure yields an empty list so one bad
-/// upstream never breaks or stalls the aggregate listing.
-///
-/// Both spellings of the path are tried, canonical first — see
-/// [`obleth_config::catalog_urls`]. Without the fallback an AIBrix gateway
-/// answers the canonical path with a 404 and every model behind it drops
-/// silently out of the listing: measured here as 6 of 45 routes advertised,
-/// with the 40 behind one such gateway all missing.
-async fn fetch_upstream_models(
-    state: &AppState,
-    base: &str,
-    api_key: Option<&str>,
-) -> Vec<serde_json::Value> {
-    async fn fetch_one(
-        state: &AppState,
-        url: &str,
-        api_key: Option<&str>,
-    ) -> Option<Vec<serde_json::Value>> {
-        let mut req = state.http.get(url);
-        if let Some(key) = api_key {
-            req = req.bearer_auth(key);
-        }
-        let resp = timeout(Duration::from_secs(4), req.send())
-            .await
-            .ok()?
-            .ok()?;
-        if !resp.status().is_success() {
-            return None;
-        }
-        let v: serde_json::Value = resp.json().await.ok()?;
-        Some(v.get("data")?.as_array()?.clone())
-    }
-    // `build_upstream_url` first, so the base's own quirks (an api_base already
-    // ending in `/v1`, or one pasted as a full endpoint URL) are handled where
-    // every other upstream call handles them.
-    let url = build_upstream_url(base, "/v1/models", "");
-    for candidate in obleth_config::catalog_url_variants(&url) {
-        if let Some(entries) = fetch_one(state, &candidate, api_key).await {
-            return entries;
-        }
-    }
-    Vec::new()
 }
 
 /// True for the model-listing collection itself, in either spelling. The
@@ -2995,45 +4135,39 @@ fn is_models_collection(path: &str) -> bool {
 }
 
 /// One OpenAI model object for a name the gateway has a route for — canonical
-/// or alias — carrying the same annotations [`canonicalize_models`] adds to the
-/// listing. `None` for a name no route claims, which lets the caller fall
-/// through to the upstream passthrough.
+/// or alias — identical to that route's entry in the listing. `None` for a
+/// name no route claims, which lets the caller fall through to the upstream
+/// passthrough.
 ///
-/// `owned_by` is reported as `obleth` rather than guessed: unlike the
-/// aggregated listing, which repeats what an upstream said about itself, this
-/// answer is the gateway's own. `created` is omitted rather than fabricated —
-/// the hot-path view of a route does not carry a registration timestamp.
+/// `owned_by` is `obleth`: the answer is the gateway's own. `created` is
+/// omitted rather than fabricated — the hot-path view of a route does not
+/// carry a registration timestamp.
 ///
-/// Deliberately not filtered by the tenant's model allowlist, matching
-/// `GET /v1/models`: these are the OpenAI-compatible discovery endpoints, and a
-/// model name is not a secret — calling it is what the allowlist gates. The
-/// gateway-native `/model/info` does filter, because its semantics are ours to
-/// choose.
-fn registered_model_entry(state: &AppState, id: &str) -> Option<serde_json::Value> {
+/// `Some(Err(()))` when a route claims the name but it is outside `allowed`:
+/// the caller answers that like an unknown model, without forwarding the id,
+/// so the detail lookup reveals no more than the filtered listing does.
+fn registered_model_entry(
+    state: &AppState,
+    id: &str,
+    allowed: Option<&[String]>,
+) -> Option<Result<serde_json::Value, ()>> {
     if id.is_empty() {
         return None;
     }
     let candidates = state.model_registry.load();
     let facts = model_facts_index(&candidates).get(id)?.clone();
-    Some(serde_json::json!({
-        "id": facts.model_name,
-        "object": "model",
-        "owned_by": "obleth",
-        "model_type": facts.model_type,
-        "mode": mode_for_model_type(&facts.model_type),
-        "quantization": facts.quantization,
-        "tags": facts.tags,
-        "aliases": facts.aliases,
-    }))
+    if !model_visible(allowed, &facts.model_name) {
+        return Some(Err(()));
+    }
+    Some(Ok(model_entry(&facts)))
 }
 
 /// Serve `GET /model/info` from the gateway's own registry.
 ///
-/// Where `/v1/models` answers "what can I call right now" by asking the
-/// backends, this answers "what has this gateway been told about each model" —
-/// so it lists every registered, enabled route whether or not its backend is
-/// reachable this second, and reports the configured facts a client cannot
-/// infer from a name: the serving format, the routing tags, the context
+/// Where `/v1/models` answers "which names can I call" in the OpenAI shape,
+/// this answers "what has this gateway been told about each model" — every
+/// registered, enabled route with its health, and the configured facts a
+/// client cannot infer from a name: the serving format, the routing tags, the context
 /// window, the per-token prices, the capability flags, the aliases that still
 /// resolve here.
 ///
@@ -3056,18 +4190,11 @@ fn registered_model_entry(state: &AppState, id: &str) -> Option<serde_json::Valu
 /// model a caller would be refused would be advertising a 403.
 fn model_info_response(state: &AppState, resolved: &ResolvedKey) -> Response<Body> {
     let candidates = state.model_registry.load();
-    let allowed = if resolved.internal {
-        None
-    } else {
-        resolved.allowed_models.as_deref()
-    };
+    let allowed = allowed_models_for(resolved);
     let data: Vec<serde_json::Value> = candidates
         .iter()
         .filter(|c| c.model.enabled)
-        .filter(|c| match allowed {
-            Some(list) => list.iter().any(|m| m == &c.model.model_name),
-            None => true,
-        })
+        .filter(|c| model_visible(allowed, &c.model.model_name))
         .map(|c| model_info_entry(&c.model, c.healthy))
         .collect();
     (
@@ -3110,6 +4237,7 @@ fn model_info_entry(model: &ResolvedModel, healthy: bool) -> serde_json::Value {
             "cost_per_image": model.cost_per_image,
             "cost_per_audio_second": model.cost_per_audio_second,
             "cost_per_character": model.cost_per_character,
+            "cost_per_video": model.cost_per_video,
             // Health as the gateway last observed it. False means the model is
             // registered and addressable but currently failing its probe or
             // held in a maintenance window.
@@ -3134,26 +4262,39 @@ fn is_model_info_endpoint(path: &str) -> bool {
     path == "/model/info" || path == "/v1/model/info"
 }
 
+/// OpenAI endpoints that must name a registered model.
+const REGISTERED_MODEL_PATHS: &[&str] = &[
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/responses",
+    "/v1/audio/transcriptions",
+    "/v1/audio/translations",
+    "/v1/audio/speech",
+    "/v1/images/generations",
+    "/v1/images/edits",
+    "/v1/images/variations",
+    crate::videos::VIDEOS_PATH,
+];
+
 fn requires_registered_model(path: &str) -> bool {
-    matches!(
-        path,
-        "/v1/chat/completions"
-            | "/v1/completions"
-            | "/v1/embeddings"
-            | "/v1/responses"
-            | "/v1/audio/transcriptions"
-            | "/v1/audio/translations"
-            | "/v1/audio/speech"
-            | "/v1/images/generations"
-            | "/v1/images/edits"
-            | "/v1/images/variations"
-    )
+    REGISTERED_MODEL_PATHS.contains(&path)
 }
 
-/// True when the endpoint carries the model name in a multipart/form-data body
-/// (audio transcription/translation file uploads) rather than JSON.
+/// True when the endpoint takes a file upload, so the OpenAI spec sends it as
+/// `multipart/form-data` with the model as a form field rather than JSON:
+/// audio transcription/translation, the two image endpoints that take a
+/// source image (edits and variations), and the video create, whose optional
+/// reference frame is an upload (it accepts JSON too).
 fn is_multipart_endpoint(path: &str) -> bool {
-    matches!(path, "/v1/audio/transcriptions" | "/v1/audio/translations")
+    matches!(
+        path,
+        "/v1/audio/transcriptions"
+            | "/v1/audio/translations"
+            | "/v1/images/edits"
+            | "/v1/images/variations"
+            | crate::videos::VIDEOS_PATH
+    )
 }
 
 /// A single parsed `multipart/form-data` field, held in memory so it can be
@@ -3189,6 +4330,47 @@ async fn parse_multipart(
         });
     }
     Ok(fields)
+}
+
+/// The form's text fields as a JSON object, so the stages that read the
+/// request body (the token estimate, the input guardrails, the per-image
+/// cost) see a multipart request the way they see a JSON one. File parts are
+/// left out. Values stay strings, as the form sent them; a name that repeats
+/// becomes an array, so every occurrence is scanned.
+fn multipart_text_view(fields: &[MultipartField]) -> serde_json::Value {
+    let mut obj = serde_json::Map::new();
+    for f in fields.iter().filter(|f| f.file_name.is_none()) {
+        let text = serde_json::Value::String(String::from_utf8_lossy(&f.data).into_owned());
+        match obj.get_mut(&f.name) {
+            None => {
+                obj.insert(f.name.clone(), text);
+            }
+            Some(serde_json::Value::Array(items)) => items.push(text),
+            Some(first) => *first = serde_json::Value::Array(vec![first.take(), text]),
+        }
+    }
+    serde_json::Value::Object(obj)
+}
+
+/// Copy text fields rewritten in the JSON view (a redacting input policy)
+/// back into the form, so what is forwarded is what was scanned. The inverse
+/// of [`multipart_text_view`]: a repeated name maps onto its array by position.
+fn apply_multipart_text_view(fields: &mut [MultipartField], view: &serde_json::Value) {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for f in fields.iter_mut().filter(|f| f.file_name.is_none()) {
+        let index = seen.entry(f.name.clone()).or_insert(0);
+        let value = match view.get(&f.name) {
+            Some(serde_json::Value::Array(items)) => items.get(*index),
+            other if *index == 0 => other,
+            _ => None,
+        };
+        *index += 1;
+        if let Some(text) = value.and_then(|v| v.as_str()) {
+            if text.as_bytes() != f.data.as_ref() {
+                f.data = Bytes::from(text.to_string());
+            }
+        }
+    }
 }
 
 /// Rebuild a reqwest multipart form from parsed fields, replacing the client
@@ -3229,15 +4411,25 @@ fn build_multipart_form(
 }
 
 /// Per-request surcharge for non-token-billed modalities: image generations are
-/// billed per image, text-to-speech per input character. Returns `0.0` for
-/// token-billed modalities (chat, embeddings) and audio transcription.
+/// billed per image, text-to-speech per input character, and a video job at a
+/// flat price per created job. Returns `0.0` for token-billed modalities
+/// (chat, embeddings) and audio transcription.
 fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value) -> f64 {
     let Some(route) = route else {
         return 0.0;
     };
     match route.model_type.as_str() {
         "image" => {
-            let n = json.get("n").and_then(|v| v.as_u64()).unwrap_or(1).max(1);
+            // `n` is a number in a JSON body and a string in a multipart form
+            // (edits and variations).
+            let n = json
+                .get("n")
+                .and_then(|v| {
+                    v.as_u64()
+                        .or_else(|| v.as_str().and_then(|s| s.trim().parse().ok()))
+                })
+                .unwrap_or(1)
+                .max(1);
             n as f64 * route.cost_per_image
         }
         "audio_speech" => {
@@ -3248,6 +4440,9 @@ fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value
                 .unwrap_or(0);
             chars as f64 * route.cost_per_character
         }
+        // Frozen at the create, the only video call that reaches settlement:
+        // the polls and the download are served outside the pipeline.
+        "video" => route.cost_per_video,
         _ => 0.0,
     }
 }
@@ -3265,10 +4460,11 @@ fn compute_modality_cost(route: Option<&ResolvedModel>, json: &serde_json::Value
 /// client body — so streaming and non-streaming clients keep distinct cache
 /// entries holding the representation each actually receives (JSON vs SSE).
 ///
-/// `stream_with_usage` is set for the streaming tool loop's turn-0 dispatch:
-/// the upstream stays streaming but is asked to include a final usage chunk so
-/// turn-0 tokens are billed exactly instead of estimated. (`tool_stream`
-/// captures that usage but never forwards it to the client unless the client
+/// `stream_with_usage` is set for every streaming chat/completions dispatch
+/// (including the streaming tool loop's turn 0): the upstream stays streaming
+/// but is asked to include a final usage chunk so tokens are billed exactly
+/// instead of estimated. Other `stream_options` the client sent are kept.
+/// (`tool_stream` and the pass-through strip that chunk unless the client
 /// itself asked for usage.) The two flags are mutually exclusive.
 fn prepare_upstream_body(
     route: Option<&ResolvedModel>,
@@ -3292,18 +4488,23 @@ fn prepare_upstream_body(
         obj.remove("stream_options");
     } else if stream_with_usage {
         obj.insert("stream".into(), serde_json::Value::Bool(true));
-        obj.insert(
-            "stream_options".into(),
-            serde_json::json!({ "include_usage": true }),
-        );
+        let options = obj
+            .entry("stream_options")
+            .or_insert_with(|| serde_json::json!({}));
+        if !options.is_object() {
+            *options = serde_json::json!({});
+        }
+        options["include_usage"] = serde_json::Value::Bool(true);
     }
     serde_json::to_vec(&*json).map(Bytes::from).unwrap_or(body)
 }
 
-/// One resolved upstream target: a base URL plus an optional bearer key.
-struct Target {
-    base: String,
-    api_key: Option<String>,
+/// One resolved upstream target: a base URL plus an optional bearer key, and
+/// the model's operator-configured upstream headers.
+pub(crate) struct Target {
+    pub(crate) base: String,
+    pub(crate) api_key: Option<String>,
+    pub(crate) headers: HeaderMap,
 }
 
 /// Build the ordered list of upstream targets for a request.
@@ -3316,13 +4517,16 @@ struct Target {
 /// with the rest following for failover. When no usable endpoints exist we fall
 /// back to the model's own `api_base`/`api_key` (or the global default base),
 /// preserving the legacy single-upstream path.
-fn build_targets(
+pub(crate) fn build_targets(
     route: Option<&ResolvedModel>,
     default_base: &str,
     selection_mode: &str,
     session_key: &str,
 ) -> Vec<Target> {
     let mut targets: Vec<Target> = Vec::new();
+    let headers = route
+        .map(|r| obleth_admin::upstream_header_map(&r.upstream_headers))
+        .unwrap_or_default();
     if let Some(r) = route {
         let mut eligible: Vec<&ResolvedEndpoint> = r
             .endpoints
@@ -3339,6 +4543,7 @@ fn build_targets(
                 targets.push(Target {
                     base: e.api_base.clone(),
                     api_key: e.api_key.clone().or_else(|| r.api_key.clone()),
+                    headers: headers.clone(),
                 });
             }
             return targets;
@@ -3349,6 +4554,7 @@ fn build_targets(
             .map(|r| r.api_base.clone())
             .unwrap_or_else(|| default_base.to_string()),
         api_key: route.and_then(|r| r.api_key.clone()),
+        headers,
     });
     targets
 }
@@ -3488,7 +4694,7 @@ pub(crate) fn has_path_traversal(path: &str) -> bool {
     path.split(['/', '\\']).any(|seg| seg == "..")
 }
 
-fn build_upstream_url(base: &str, path: &str, query: &str) -> String {
+pub(crate) fn build_upstream_url(base: &str, path: &str, query: &str) -> String {
     let base = base.trim_end_matches('/');
     let rel_raw = path.trim_start_matches('/');
     // Defensive: operators sometimes paste the full endpoint URL as api_base
@@ -3592,17 +4798,17 @@ fn find_int_after(haystack: &str, key: &str) -> Option<u32> {
 /// of where the request terminates (cache hit, rejection, upstream error, or
 /// streamed success). Cheap to clone for the response-stream closure.
 #[derive(Clone)]
-struct RequestMeta {
+pub(crate) struct RequestMeta {
     /// Conversation grouping id (client-supplied or derived), or empty.
-    session_id: String,
+    pub(crate) session_id: String,
     /// How `session_id` was obtained: "client" | "derived" | "none".
-    session_id_source: &'static str,
+    pub(crate) session_id_source: &'static str,
     /// Coarse request class derived from the request path, except synthetic
     /// tenants' requests are stamped `benchmark` instead (see
     /// [`effective_request_type`]).
-    request_type: &'static str,
+    pub(crate) request_type: &'static str,
     /// Device id from the bearer token (identity-key requests), else empty.
-    device_id: String,
+    pub(crate) device_id: String,
 }
 
 /// Classify a request by its OpenAI-style path suffix. Matching the suffix (not
@@ -3613,6 +4819,8 @@ fn request_type_for_path(path: &str) -> &'static str {
         "chat"
     } else if path.ends_with("/responses") {
         "responses"
+    } else if path.ends_with("/verdicts") {
+        "verdict"
     } else if path.ends_with("/completions") {
         "completion"
     } else if path.ends_with("/embeddings") {
@@ -3621,6 +4829,8 @@ fn request_type_for_path(path: &str) -> &'static str {
         "audio"
     } else if path.contains("/images/") {
         "image"
+    } else if path.ends_with("/videos") {
+        "video"
     } else if path.ends_with("/rerank") || path.ends_with("/reranking") {
         "rerank"
     } else if path.ends_with("/moderations") {
@@ -3644,25 +4854,32 @@ fn effective_request_type(resolved: &ResolvedKey, path: &str) -> &'static str {
     }
 }
 
-/// [`effective_request_type`], except a request the Responses shim translated
-/// is recorded as `responses`. It runs down the chat path by design, so the
-/// path alone would report the caller's surface as chat and make adoption of
-/// the new API invisible in the ledger.
-fn surfaced_request_type(resolved: &ResolvedKey, path: &str, headers: &HeaderMap) -> &'static str {
-    if !resolved.synthetic && is_responses_surface(headers) {
-        return "responses";
+/// [`effective_request_type`], except a request either shim translated is
+/// recorded by its own surface (`responses`, `messages`). Both run down the
+/// chat path by design, so the path alone would report the caller's surface
+/// as chat and make adoption of the new APIs invisible in the ledger.
+pub(crate) fn surfaced_request_type(
+    resolved: &ResolvedKey,
+    path: &str,
+    headers: &HeaderMap,
+) -> &'static str {
+    if !resolved.synthetic {
+        match surface(headers) {
+            Some("responses") => return "responses",
+            Some(crate::messages::SURFACE) => return "messages",
+            _ => {}
+        }
     }
     effective_request_type(resolved, path)
 }
 
-/// True when the Responses shim translated this request. The header is set by
-/// the shim itself, never by a caller: `proxy_handler` strips it from every
-/// incoming request before dispatch, and only the shim re-inserts it.
-fn is_responses_surface(headers: &HeaderMap) -> bool {
+/// The API surface a shim translated this request from, if any. The header
+/// is set by the shims only: `proxy_handler` strips it from every incoming
+/// request before dispatch.
+fn surface(headers: &HeaderMap) -> Option<&str> {
     headers
         .get(crate::responses::SURFACE_HEADER)
         .and_then(|v| v.to_str().ok())
-        == Some("responses")
 }
 
 /// Whether chat-only boons (knowledge, compression, tools, structured output,
@@ -3677,16 +4894,65 @@ fn is_chat_path(path: &str) -> bool {
     request_type_for_path(path) == "chat"
 }
 
+/// A block/redact output policy scans chat-completion message content only
+/// (which `/v1/responses` and `/v1/messages` are translated into). Other
+/// endpoints that return model-generated text (legacy completions,
+/// transcription and translation, and unrecognized paths forwarded as-is)
+/// would reach the client unscanned, so under such a policy they are refused.
+/// Endpoints that return no text (embeddings, images, speech, rerank scores,
+/// moderation flags) are unaffected.
+fn output_guardrails_unenforceable(key: &ResolvedKey, path: &str) -> bool {
+    let text_output = match request_type_for_path(path) {
+        "completion" | "other" | "responses" => true,
+        "audio" => path.ends_with("/transcriptions") || path.ends_with("/translations"),
+        _ => false,
+    };
+    text_output
+        && !key.internal
+        && key.guardrails_policy.as_ref().is_some_and(|p| {
+            !p.output_scanners.is_empty()
+                && !matches!(p.action, obleth_config::GuardrailsAction::LogOnly)
+        })
+}
+
+/// Paths whose request bodies the input scanner cannot read: a Responses-shaped
+/// path that did not reach the translation shim (after canonicalization only
+/// an odd spelling or prefix can), and unrecognized paths forwarded as-is.
+/// Under an enforcing (block/redact) input policy these are refused rather
+/// than forwarded unscanned. `log_only` policies observe and never refuse.
+fn input_guardrails_unscannable(key: &ResolvedKey, path: &str) -> bool {
+    matches!(request_type_for_path(path), "responses" | "other")
+        && !key.internal
+        && key.guardrails_policy.as_ref().is_some_and(|p| {
+            !p.input_scanners.is_empty()
+                && !matches!(p.action, obleth_config::GuardrailsAction::LogOnly)
+        })
+}
+
+/// A non-internal key whose tenant has input scanners configured.
+fn has_input_guardrails(key: &ResolvedKey) -> bool {
+    !key.internal
+        && key
+            .guardrails_policy
+            .as_ref()
+            .is_some_and(|p| !p.input_scanners.is_empty())
+}
+
+/// Endpoints whose streams honour `stream_options.include_usage`.
+fn is_stream_usage_path(path: &str) -> bool {
+    matches!(request_type_for_path(path), "chat" | "completion")
+}
+
 /// Provenance of a resolved conversation id.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SessionSource {
+pub(crate) enum SessionSource {
     Client,
     Derived,
     None,
 }
 
 impl SessionSource {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             SessionSource::Client => "client",
             SessionSource::Derived => "derived",
@@ -3696,16 +4962,16 @@ impl SessionSource {
 }
 
 /// A resolved conversation grouping key plus how it was obtained.
-struct Conversation {
-    value: String,
-    source: SessionSource,
+pub(crate) struct Conversation {
+    pub(crate) value: String,
+    pub(crate) source: SessionSource,
 }
 
 /// Resolve a conversation id. Precedence: explicit client signal (header or
 /// body) > deterministic hash of the conversation seed > none. Total: never
 /// errors. The OpenAI `user` field is intentionally NOT a session source (it
 /// identifies an end-user, not a conversation).
-fn resolve_conversation(
+pub(crate) fn resolve_conversation(
     headers: &HeaderMap,
     json: &serde_json::Value,
     tenant_id: Uuid,
@@ -3826,7 +5092,7 @@ fn fnv1a_continue(mut hash: u64, bytes: &[u8]) -> u64 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn finalize(
+pub(crate) fn finalize(
     state: &AppState,
     request_id: Uuid,
     resolved: &ResolvedKey,
@@ -3900,6 +5166,53 @@ fn cached_response(cached: obleth_config::CachedResponse, request_id: Uuid) -> R
         })
 }
 
+/// Post-auth key/tenant gates shared by the passthrough pipeline and native
+/// endpoints (e.g. `/v1/verdicts`): key disabled, tenant lifecycle status,
+/// the activation/expiry/weekly schedule window, and the near-expiry operator
+/// alert. Internal probe keys bypass tenant lifecycle gating.
+// The error is the finished response every caller returns as-is
+// (`return resp`); boxing it would push a deref into each call site for a
+// rejection path that is cold anyway.
+#[allow(clippy::result_large_err)]
+pub(crate) fn gate_resolved_key(
+    state: &AppState,
+    resolved: &ResolvedKey,
+) -> Result<(), Response<Body>> {
+    if resolved.disabled {
+        return Err(error_json(StatusCode::FORBIDDEN, "api key disabled"));
+    }
+    if !resolved.internal && resolved.status != "active" {
+        return Err(error_json(StatusCode::FORBIDDEN, "tenant is not active"));
+    }
+    // Schedule gate: activation start, expiry cutoff, and recurring weekly windows.
+    if !resolved.internal {
+        let now = chrono::Utc::now();
+        if let Err(reason) = tenant_active_now(resolved, now) {
+            return Err(error_json(StatusCode::FORBIDDEN, reason));
+        }
+        // Phase 5: warn operators when a tenant is within 72h of expiry. This
+        // runs on every request in that window, so the alert text is only
+        // formatted when a channel could deliver it; repeats are then
+        // deduplicated by the dispatcher's per-key cooldown.
+        if let Some(until) = resolved.active_until.filter(|_| state.alerts.enabled()) {
+            let remaining = until - now;
+            if remaining > chrono::Duration::zero() && remaining <= chrono::Duration::hours(72) {
+                state.alerts.issue(
+                    format!("tenant_expiry:{}", resolved.tenant_id),
+                    "Tenant access expiring soon",
+                    format!(
+                        "tenant `{}` expires at {} (~{}h remaining)",
+                        resolved.tenant_name,
+                        until.to_rfc3339(),
+                        remaining.num_hours()
+                    ),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn error_json(status: StatusCode, msg: &str) -> Response<Body> {
     let body = serde_json::json!({ "error": { "message": msg, "type": "obleth_gateway_error" } });
     (status, axum::Json(body)).into_response()
@@ -3916,13 +5229,21 @@ fn now_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        backoff_for, build_targets, build_upstream_url, effective_request_type, has_path_traversal,
-        is_chat_path, is_models_collection, is_models_endpoint, is_responses_surface,
-        is_retryable_status, prepare_upstream_body, request_type_for_path, resolve_conversation,
-        session_hash_order, tenant_active_now, weighted_order, RequestMeta,
+        admit_request_for, anthropic_error, apply_multipart_text_view,
+        backfill_max_tokens_for_count_tokens, backoff_for, build_targets, build_upstream_url,
+        canonical_post_path, clamp_max_tokens, compute_modality_cost, effective_request_type,
+        forward_headers, has_input_guardrails, has_path_traversal, input_guardrails_unscannable,
+        is_chat_path, is_models_collection, is_models_endpoint, is_multipart_endpoint,
+        is_retryable_status, looks_like_context_length_error, messages_input_estimate,
+        multipart_text_view, output_guardrails_unenforceable, parse_multipart,
+        prepare_upstream_body, redress_error, request_type_for_path, requires_registered_model,
+        resolve_conversation, session_hash_order, should_translate_as_stream, strip_beta_query,
+        surface, tenant_active_now, weighted_order, MultipartField, RequestMeta, TooLong,
+        REGISTERED_MODEL_PATHS,
     };
     use crate::router::{BoonGrants, Candidate, Intent, RequestFeatures, RouterWeights};
-    use axum::http::HeaderMap;
+    use axum::body::{Body, Bytes};
+    use axum::http::{header, HeaderMap, Response, StatusCode};
     use chrono::{DateTime, TimeZone, Utc};
     use obleth_config::{ResolvedEndpoint, ResolvedKey, ResolvedModel, WeeklyWindow};
     use std::collections::HashMap;
@@ -3945,6 +5266,7 @@ mod tests {
             weight,
             enabled,
             healthy,
+            max_in_flight: None,
         }
     }
 
@@ -3977,6 +5299,8 @@ mod tests {
             key_budget_cost_usd: None,
             key_budget_period: None,
             key_budget_started_at: None,
+            key_weight: 100,
+            key_max_in_flight: None,
             allowed_models: None,
             internal: false,
             tracing_enabled: false,
@@ -3984,6 +5308,176 @@ mod tests {
             compression_policy: None,
             synthetic: false,
         }
+    }
+
+    #[test]
+    fn legacy_completions_are_refused_only_under_an_enforcing_output_policy() {
+        let policy = |action, output: &[&str]| obleth_config::GuardrailsPolicy {
+            action,
+            input_scanners: vec![],
+            output_scanners: output.iter().map(|s| s.to_string()).collect(),
+            guard_model: None,
+            ban_keywords: vec![],
+            fail_open: true,
+        };
+        let mut key = key_with_schedule("UTC", None, None, None);
+        assert!(!output_guardrails_unenforceable(&key, "/v1/completions"));
+
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::Block, &["pii"]));
+        assert!(output_guardrails_unenforceable(&key, "/v1/completions"));
+        assert!(!output_guardrails_unenforceable(
+            &key,
+            "/v1/chat/completions"
+        ));
+
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::Redact, &["pii"]));
+        assert!(output_guardrails_unenforceable(&key, "/v1/completions"));
+
+        // log_only is observed after the stream, never enforced: not refused.
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::LogOnly, &["pii"]));
+        assert!(!output_guardrails_unenforceable(&key, "/v1/completions"));
+
+        // No output scanners: nothing to enforce on the response.
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::Block, &[]));
+        assert!(!output_guardrails_unenforceable(&key, "/v1/completions"));
+
+        // Other endpoints that return generated text are refused too; those
+        // that return no text are not.
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::Block, &["pii"]));
+        for path in [
+            "/v1/audio/transcriptions",
+            "/v1/audio/translations",
+            "/v1/some/unknown/path",
+        ] {
+            assert!(output_guardrails_unenforceable(&key, path), "{path}");
+        }
+        for path in [
+            "/v1/embeddings",
+            "/v1/audio/speech",
+            "/v1/images/generations",
+            "/v1/rerank",
+            "/v1/moderations",
+        ] {
+            assert!(!output_guardrails_unenforceable(&key, path), "{path}");
+        }
+
+        // Internal probe keys are exempt from guardrails.
+        key.internal = true;
+        assert!(!output_guardrails_unenforceable(&key, "/v1/completions"));
+    }
+
+    #[test]
+    fn output_guardrails_refusal_runs_before_the_input_scan() {
+        let src = include_str!("proxy.rs");
+        let refuse = src
+            .find("if method == Method::POST && output_guardrails_unenforceable(&resolved, &path)")
+            .expect("output guardrails refusal");
+        let enrich = src.find(".enrich_request(").expect("enrich_request call");
+        assert!(refuse < enrich);
+    }
+
+    #[test]
+    fn post_paths_are_canonicalized_before_surface_dispatch() {
+        assert_eq!(
+            canonical_post_path("/responses").as_deref(),
+            Some("/v1/responses")
+        );
+        assert_eq!(
+            canonical_post_path("/v1/responses/").as_deref(),
+            Some("/v1/responses")
+        );
+        assert_eq!(
+            canonical_post_path("/messages").as_deref(),
+            Some("/v1/messages")
+        );
+        assert_eq!(
+            canonical_post_path("/messages/count_tokens/").as_deref(),
+            Some("/v1/messages/count_tokens")
+        );
+        assert_eq!(
+            canonical_post_path("/verdicts").as_deref(),
+            Some("/v1/verdicts")
+        );
+        assert_eq!(
+            canonical_post_path("/v1/chat/completions//").as_deref(),
+            Some("/v1/chat/completions")
+        );
+        // Repeated slashes collapse, so a doubled prefix cannot skip a shim.
+        assert_eq!(
+            canonical_post_path("//v1/responses").as_deref(),
+            Some("/v1/responses")
+        );
+        assert_eq!(
+            canonical_post_path("/v1//messages").as_deref(),
+            Some("/v1/messages")
+        );
+        // Already canonical, or nothing to trim: untouched.
+        assert_eq!(canonical_post_path("/v1/chat/completions"), None);
+        assert_eq!(canonical_post_path("/"), None);
+        // Normalization runs before the shim dispatch in `proxy_handler`.
+        let src = include_str!("proxy.rs");
+        let handler = src
+            .find("pub async fn proxy_handler(")
+            .expect("proxy_handler");
+        let canon = handler
+            + src[handler..]
+                .find("canonical_post_path(req.uri().path())")
+                .expect("normalization");
+        let shim = handler
+            + src[handler..]
+                .find("return responses_shim(")
+                .expect("responses dispatch");
+        assert!(canon < shim);
+    }
+
+    #[test]
+    fn unscannable_paths_are_refused_only_under_an_enforcing_input_policy() {
+        let policy = |action| obleth_config::GuardrailsPolicy {
+            action,
+            input_scanners: vec!["pii".into()],
+            output_scanners: vec![],
+            guard_model: None,
+            ban_keywords: vec![],
+            fail_open: true,
+        };
+        let mut key = key_with_schedule("UTC", None, None, None);
+        assert!(!input_guardrails_unscannable(&key, "/v2/responses"));
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::Block));
+        for path in [
+            "/v2/responses",
+            "/openai/v1/responses",
+            "/v1/some/unknown/path",
+        ] {
+            assert!(input_guardrails_unscannable(&key, path), "{path}");
+        }
+        for path in ["/v1/chat/completions", "/v1/completions", "/v1/embeddings"] {
+            assert!(!input_guardrails_unscannable(&key, path), "{path}");
+        }
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::LogOnly));
+        assert!(!input_guardrails_unscannable(&key, "/v2/responses"));
+        key.guardrails_policy = Some(policy(obleth_config::GuardrailsAction::Redact));
+        key.internal = true;
+        assert!(!input_guardrails_unscannable(&key, "/v2/responses"));
+    }
+
+    #[test]
+    fn the_classifier_is_skipped_under_an_input_policy() {
+        let mut key = key_with_schedule("UTC", None, None, None);
+        assert!(!has_input_guardrails(&key));
+        key.guardrails_policy = Some(obleth_config::GuardrailsPolicy {
+            action: obleth_config::GuardrailsAction::LogOnly,
+            input_scanners: vec!["pii".into()],
+            output_scanners: vec![],
+            guard_model: None,
+            ban_keywords: vec![],
+            fail_open: true,
+        });
+        assert!(has_input_guardrails(&key));
+        key.internal = true;
+        assert!(!has_input_guardrails(&key));
+        let src = include_str!("proxy.rs");
+        assert!(src
+            .contains("            has_input_guardrails(&resolved),\n        )\n        .await;"));
     }
 
     #[test]
@@ -4062,21 +5556,30 @@ mod tests {
         // The shim runs the request down the chat path on purpose, so the path
         // alone cannot tell the two surfaces apart — the header does.
         let mut headers = HeaderMap::new();
-        assert!(!is_responses_surface(&headers));
+        assert_eq!(surface(&headers), None);
         assert_eq!(request_type_for_path("/v1/chat/completions"), "chat");
 
         headers.insert(
             crate::responses::SURFACE_HEADER,
             "responses".parse().unwrap(),
         );
-        assert!(is_responses_surface(&headers));
+        assert_eq!(surface(&headers), Some("responses"));
 
         let mut other = HeaderMap::new();
         other.insert(
             crate::responses::SURFACE_HEADER,
             "something-else".parse().unwrap(),
         );
-        assert!(!is_responses_surface(&other));
+        assert_eq!(surface(&other), Some("something-else"));
+    }
+
+    #[test]
+    fn verdict_requests_are_classified_by_path() {
+        // `/v1/verdicts` is served by its own route (see main.rs), but the
+        // ledger label still derives from the path like every other class.
+        assert_eq!(request_type_for_path("/v1/verdicts"), "verdict");
+        // Not confused with the legacy completions suffix match.
+        assert_eq!(request_type_for_path("/v1/completions"), "completion");
     }
 
     #[test]
@@ -4250,38 +5753,6 @@ mod tests {
         assert!(tenant_active_now(&key, now).is_ok());
     }
 
-    #[test]
-    fn merge_models_unions_upstreams_verbatim_and_dedups() {
-        use super::merge_upstream_models;
-        // litellm front (its models reported as "openai") and a Slurm/Ollama
-        // endpoint (reported as "library"); ids overlap on gemma.
-        let litellm = vec![
-            serde_json::json!({"id": "gemma4-31b-it", "object": "model", "owned_by": "openai"}),
-            serde_json::json!({"id": "minimax-m2-7-fast", "object": "model", "owned_by": "openai"}),
-        ];
-        let ollama = vec![
-            serde_json::json!({"id": "glm-5.2", "object": "model", "owned_by": "library"}),
-            // duplicate id already seen from litellm — first upstream wins.
-            serde_json::json!({"id": "gemma4-31b-it", "object": "model", "owned_by": "library"}),
-        ];
-
-        let payload = merge_upstream_models(vec![litellm, ollama]);
-        assert_eq!(payload["object"], "list");
-        let data = payload["data"].as_array().unwrap();
-        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
-        // Sorted union, deduped by id.
-        assert_eq!(ids, vec!["gemma4-31b-it", "glm-5.2", "minimax-m2-7-fast"]);
-        let owner_of = |id: &str| {
-            data.iter().find(|m| m["id"] == id).unwrap()["owned_by"]
-                .as_str()
-                .unwrap()
-        };
-        // Owners are verbatim from upstream; nothing synthesized.
-        assert_eq!(owner_of("gemma4-31b-it"), "openai"); // first upstream wins over the dup
-        assert_eq!(owner_of("glm-5.2"), "library");
-        assert_eq!(owner_of("minimax-m2-7-fast"), "openai");
-    }
-
     /// A registered route as the discovery endpoints see it, with only the
     /// fields those endpoints read set to anything interesting.
     fn candidate(
@@ -4307,90 +5778,125 @@ mod tests {
     }
 
     #[test]
-    fn models_listing_annotates_registered_modalities() {
-        use super::{canonicalize_models, model_facts_index};
-        let mut list = serde_json::json!({
-            "object": "list",
-            "data": [
-                {"id": "flux-2-dev", "object": "model", "owned_by": "vllm"},
-                {"id": "gemma4-31b-it", "object": "model", "owned_by": "openai"},
-                {"id": "wildcard-passthrough", "object": "model", "owned_by": "library"},
-            ]
-        });
+    fn models_listing_is_the_registry_under_client_facing_names() {
+        use super::registry_models_list;
+        let mut disabled = candidate("retired", "retired", "chat", "none", &[], &[]);
+        disabled.model.enabled = false;
         let candidates = vec![
+            // A backend that knows itself only by its quantized name, with an
+            // old spelling kept as an alias. Whether or not that backend
+            // serves a catalog, the route is listed once, as `glm-5-3`.
             candidate(
-                "flux-2-dev",
-                "flux-2-dev",
+                "glm-5-3",
+                "glm-5-3-mxfp4",
+                "chat",
+                "mxfp4",
+                &["glm-5-3-fp8"],
+                &["coding"],
+            ),
+            candidate(
+                "image-model",
+                "vendor/image-model",
                 "image",
                 "bf16",
                 &[],
                 &["creative"],
             ),
-            candidate("gemma4-31b-it", "gemma4-31b-it", "chat", "fp8", &[], &[]),
+            disabled,
         ];
-        canonicalize_models(&mut list, &model_facts_index(&candidates));
+        let list = registry_models_list(&candidates, None);
+        assert_eq!(list["object"], "list");
+        let data = list["data"].as_array().unwrap();
+        let ids: Vec<&str> = data.iter().map(|m| m["id"].as_str().unwrap()).collect();
+        // Sorted, enabled routes only, and never a backend id.
+        assert_eq!(ids, vec!["glm-5-3", "image-model"]);
 
-        let field = |id: &str, key: &str| {
-            list["data"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|m| m["id"] == id)
-                .unwrap()[key]
-                .clone()
-        };
-        // Registered models gain both the obleth vocabulary and the
-        // LiteLLM-convention alias (`image` is spelled `image_generation`).
-        assert_eq!(field("flux-2-dev", "model_type"), "image");
-        assert_eq!(field("flux-2-dev", "mode"), "image_generation");
-        assert_eq!(field("gemma4-31b-it", "model_type"), "chat");
-        assert_eq!(field("gemma4-31b-it", "mode"), "chat");
-        // The serving format is reported as a field, which is the whole point
-        // of keeping it out of the name.
-        assert_eq!(field("flux-2-dev", "quantization"), "bf16");
-        assert_eq!(field("gemma4-31b-it", "quantization"), "fp8");
-        assert_eq!(field("flux-2-dev", "tags"), serde_json::json!(["creative"]));
-        // An id no route claims stays verbatim — no guessed fields.
-        assert!(field("wildcard-passthrough", "model_type").is_null());
-        assert!(field("wildcard-passthrough", "mode").is_null());
-        assert!(field("wildcard-passthrough", "quantization").is_null());
+        let glm = &data[0];
+        assert_eq!(glm["object"], "model");
+        assert_eq!(glm["owned_by"], "obleth");
+        assert_eq!(glm["quantization"], "mxfp4");
+        assert_eq!(glm["tags"], serde_json::json!(["coding"]));
+        // The old name is advertised as an alias, so a client that had pinned
+        // it can see where it went instead of finding it simply gone.
+        assert_eq!(glm["aliases"], serde_json::json!(["glm-5-3-fp8"]));
+        // Both the obleth vocabulary and the LiteLLM-convention alias.
+        assert_eq!(data[1]["model_type"], "image");
+        assert_eq!(data[1]["mode"], "image_generation");
+        assert_eq!(glm["mode"], "chat");
+        assert!(!list.to_string().contains("glm-5-3-mxfp4"));
     }
 
     #[test]
-    fn models_listing_reports_the_clean_name_not_the_upstream_spelling() {
-        use super::{canonicalize_models, merge_upstream_models, model_facts_index};
-        // The backend knows itself only by its quantized name, and a second
-        // upstream reports the same route under the old name a client pinned.
-        let payload = vec![
-            vec![serde_json::json!({
-                "id": "glm-5-3-mxfp4", "object": "model", "owned_by": "vllm"
-            })],
-            vec![serde_json::json!({
-                "id": "glm-5-3-fp8", "object": "model", "owned_by": "vllm"
-            })],
-        ];
-        let mut list = merge_upstream_models(payload);
+    fn a_listing_entry_and_the_detail_lookup_agree() {
+        use super::{model_entry, model_facts_index, registry_models_list};
         let candidates = vec![candidate(
             "glm-5-3",
             "glm-5-3-mxfp4",
             "chat",
             "mxfp4",
             &["glm-5-3-fp8"],
-            &["coding"],
+            &[],
         )];
-        canonicalize_models(&mut list, &model_facts_index(&candidates));
+        let listed = registry_models_list(&candidates, None)["data"][0].clone();
+        let detail = model_entry(&model_facts_index(&candidates)["glm-5-3-fp8"]);
+        assert_eq!(listed, detail);
+    }
 
-        let data = list["data"].as_array().unwrap();
-        // One entry, under the gateway's clean name — the two upstream
-        // spellings collapse onto the single route they both name.
-        assert_eq!(data.len(), 1);
-        assert_eq!(data[0]["id"], "glm-5-3");
-        assert_eq!(data[0]["quantization"], "mxfp4");
-        // The old name is advertised as an alias, so a client that had pinned
-        // it can see where it went instead of finding it simply gone.
-        assert_eq!(data[0]["aliases"], serde_json::json!(["glm-5-3-fp8"]));
-        // `owned_by` is still whatever the upstream said; only the id is ours.
-        assert_eq!(data[0]["owned_by"], "vllm");
+    #[test]
+    fn the_models_listing_shows_a_tenant_only_its_allowed_models() {
+        use super::{model_visible, registry_models_list};
+        let candidates = vec![
+            candidate(
+                "glm-5-3",
+                "glm-5-3-mxfp4",
+                "chat",
+                "mxfp4",
+                &["glm-5-3-fp8"],
+                &[],
+            ),
+            candidate(
+                "image-model",
+                "vendor/image-model",
+                "image",
+                "bf16",
+                &[],
+                &[],
+            ),
+        ];
+        let allowed = vec!["glm-5-3".to_string()];
+        let list = registry_models_list(&candidates, Some(&allowed));
+        let ids: Vec<&str> = list["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["glm-5-3"]);
+        // No allowlist, or an internal caller, sees every enabled route.
+        assert_eq!(
+            registry_models_list(&candidates, None)["data"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        // Visibility is decided on the canonical name an alias resolves to.
+        assert!(model_visible(Some(&allowed), "glm-5-3"));
+        assert!(!model_visible(Some(&allowed), "image-model"));
+        assert!(!model_visible(Some(&[]), "glm-5-3"));
+    }
+
+    #[test]
+    fn the_models_listing_makes_no_upstream_calls() {
+        // Served from the registry snapshot: no per-upstream fan-out, so an
+        // upstream without a catalog (or one that is down) cannot shrink it.
+        let src = include_str!("proxy.rs");
+        let src = &src[..src.find("\nmod tests {").expect("the test module")];
+        let start = src.find("fn models_list_response(").unwrap();
+        let end = start + src[start..].find("\n}\n").unwrap();
+        let body = &src[start..end];
+        assert!(!body.contains("http"), "{body}");
+        assert!(!body.contains(".await"), "{body}");
     }
 
     #[test]
@@ -4470,7 +5976,7 @@ mod tests {
         }
         // An unclaimed id still has no entry, so the request falls through to
         // the upstream passthrough rather than being answered with a guess.
-        assert!(index.get("wildcard-passthrough").is_none());
+        assert!(!index.contains_key("wildcard-passthrough"));
     }
 
     #[test]
@@ -4494,9 +6000,16 @@ mod tests {
             upstream_model: "m".into(),
             api_base: "http://primary/v1".into(),
             api_key: Some("model-key".into()),
+            upstream_headers: Default::default(),
             model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
             admission_weight: 100,
             max_in_flight: None,
+            capacity_mode: "static".into(),
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_service: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             enabled: true,
             cache_enabled: false,
             cache_ttl_secs: 0,
@@ -4505,6 +6018,7 @@ mod tests {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: 128_000,
             supports_function_calling: true,
             supports_system_messages: true,
@@ -4622,6 +6136,43 @@ mod tests {
     }
 
     #[test]
+    fn every_target_carries_the_models_upstream_headers_over_the_clients() {
+        let mut model = model_with(vec![
+            endpoint("a", "http://a", 10, 100, true, true),
+            endpoint("b", "http://b", 20, 100, true, true),
+        ]);
+        model.upstream_headers = [
+            ("x-routing-hint".to_string(), "sticky".to_string()),
+            ("x-team".to_string(), "ops".to_string()),
+        ]
+        .into();
+        let targets = build_targets(Some(&model), "http://global/v1", "failover", "");
+        assert_eq!(targets.len(), 2);
+        for t in &targets {
+            assert_eq!(t.headers["x-routing-hint"], "sticky");
+        }
+        // The legacy single-upstream fallback carries them too.
+        model.endpoints.clear();
+        let fallback = build_targets(Some(&model), "http://global/v1", "failover", "");
+        assert_eq!(fallback[0].headers["x-team"], "ops");
+        // An unrouted request has no model headers to add.
+        assert!(build_targets(None, "http://global/v1", "failover", "")[0]
+            .headers
+            .is_empty());
+
+        // Applied the way dispatch applies them: after the client's
+        // forwarded headers, so the operator's value wins a shared name.
+        let mut client = HeaderMap::new();
+        client.insert("x-team", "client".parse().unwrap());
+        client.insert("x-trace", "t1".parse().unwrap());
+        let mut fwd = forward_headers(&client);
+        fwd.extend(fallback[0].headers.clone());
+        assert_eq!(fwd["x-team"], "ops");
+        assert_eq!(fwd.get_all("x-team").iter().count(), 1);
+        assert_eq!(fwd["x-trace"], "t1");
+    }
+
+    #[test]
     fn prepare_upstream_body_forces_non_streaming() {
         let model = model_with(Vec::new());
         let mut json = serde_json::json!({
@@ -4667,6 +6218,30 @@ mod tests {
     }
 
     #[test]
+    fn prepare_upstream_body_requests_usage_and_keeps_client_stream_options() {
+        // Every streaming chat call asks for usage, so billing never depends
+        // on the client's `include_usage`; the client's other options survive.
+        let model = model_with(Vec::new());
+        let mut json = serde_json::json!({
+            "model": "client-name",
+            "stream": true,
+            "stream_options": { "continuous_usage_stats": false },
+            "messages": []
+        });
+        let body = prepare_upstream_body(
+            Some(&model),
+            &mut json,
+            axum::body::Bytes::new(),
+            false,
+            true,
+        );
+        let sent: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["stream_options"]["include_usage"], true);
+        assert_eq!(sent["stream_options"]["continuous_usage_stats"], false);
+    }
+
+    #[test]
     fn prepare_upstream_body_preserves_stream_without_force() {
         let model = model_with(Vec::new());
         let mut json = serde_json::json!({
@@ -4701,8 +6276,492 @@ mod tests {
         )
         .unwrap();
         assert_ne!(
-            obleth_config::cache_key("m", &streaming),
-            obleth_config::cache_key("m", &plain)
+            obleth_config::cache_key("t", "m", &streaming),
+            obleth_config::cache_key("t", "m", &plain)
+        );
+    }
+
+    /// Non-test source of this file, so pins below never match their own text.
+    fn handler_source() -> &'static str {
+        let src = include_str!("proxy.rs");
+        let end = src.find("\nmod tests {").expect("the test module");
+        &src[..end]
+    }
+
+    #[test]
+    fn responses_shim_authenticates_before_reading_the_body() {
+        // The shim buffers up to RESPONSES_BODY_MAX before the pipeline runs.
+        // An unauthenticated caller must be turned away before that buffer is
+        // filled, so the bearer check and key gate have to precede `to_bytes`.
+        // There is no AppState harness in this crate (it needs live Redis and
+        // ClickHouse), so the order is pinned at the source level.
+        let src = handler_source();
+        let start = src
+            .find("async fn responses_shim(")
+            .expect("responses_shim");
+        let end = start
+            + src[start..]
+                .find("async fn translate_response_body(")
+                .expect("end of responses_shim");
+        let shim = &src[start..end];
+        let read = shim.find("to_bytes(").expect("body read");
+        for step in [
+            "bearer(",
+            "UNAUTHORIZED",
+            "authenticate_credential(",
+            "gate_resolved_key(",
+        ] {
+            let at = shim
+                .find(step)
+                .unwrap_or_else(|| panic!("`{step}` missing from responses_shim"));
+            assert!(at < read, "`{step}` must run before the body is read");
+        }
+    }
+
+    #[test]
+    fn messages_front_authenticates_before_reading_the_body() {
+        // Pinned on `messages_front` itself rather than on `messages_shim`:
+        // both shims' auth ordering runs through the shared front half, and
+        // a previous version of this pin only held because of where
+        // `messages_front` happened to sit in the file relative to
+        // `messages_shim`. See `each_shim_calls_messages_front_before_anything_else`
+        // for the part that ties the shims to this function.
+        let src = include_str!("proxy.rs");
+        let start = src
+            .find("async fn messages_front(")
+            .expect("messages_front present");
+        let body = &src[start..];
+        let end = body
+            .find("\nasync fn resolve_messages_model(")
+            .unwrap_or(body.len());
+        let body = &body[..end];
+        let pos = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{needle} in messages_front"))
+        };
+        let read = pos("to_bytes(");
+        assert!(pos("bearer(") < read);
+        assert!(pos("authenticate_credential(") < read);
+        assert!(pos("gate_resolved_key(") < read);
+    }
+
+    #[test]
+    fn each_shim_calls_messages_front_before_anything_else() {
+        // `messages_shim` must authenticate before it ever reaches the
+        // pipeline; `count_tokens_shim` must authenticate before it estimates
+        // tokens. Both route auth through `messages_front`, so pinning that
+        // call ahead of each shim's next meaningful step is what makes
+        // `messages_front_authenticates_before_reading_the_body` binding for
+        // callers, not just for the function in isolation.
+        let src = include_str!("proxy.rs");
+
+        let shim_start = src
+            .find("async fn messages_shim(")
+            .expect("messages_shim present");
+        let shim_end = shim_start
+            + src[shim_start..]
+                .find("\nasync fn messages_front(")
+                .expect("end of messages_shim");
+        let shim = &src[shim_start..shim_end];
+        let front = shim
+            .find("messages_front(")
+            .expect("messages_shim calls messages_front");
+        let dispatch = shim
+            .find("proxy_handler_inner(")
+            .expect("messages_shim dispatches to the pipeline");
+        assert!(
+            front < dispatch,
+            "messages_shim must authenticate via messages_front before running the pipeline"
+        );
+        assert!(
+            !shim[..front].contains("to_bytes("),
+            "messages_shim must not read the body itself; only messages_front does"
+        );
+
+        let ct_start = src
+            .find("async fn count_tokens_shim(")
+            .expect("count_tokens_shim present");
+        let ct_end = ct_start
+            + src[ct_start..]
+                .find("\n#[tracing::instrument(")
+                .expect("end of count_tokens_shim");
+        let ct = &src[ct_start..ct_end];
+        let front = ct
+            .find("messages_front(")
+            .expect("count_tokens_shim calls messages_front");
+        let estimate = ct
+            .find("estimate_request(")
+            .expect("count_tokens_shim estimates tokens");
+        assert!(
+            front < estimate,
+            "count_tokens_shim must authenticate via messages_front before estimating tokens"
+        );
+        assert!(
+            !ct[..front].contains("to_bytes("),
+            "count_tokens_shim must not read the body itself; only messages_front does"
+        );
+    }
+
+    #[test]
+    fn surface_recognises_both_shims() {
+        let mut h = HeaderMap::new();
+        assert_eq!(surface(&h), None);
+        h.insert(
+            crate::responses::SURFACE_HEADER,
+            header::HeaderValue::from_static("responses"),
+        );
+        assert_eq!(surface(&h), Some("responses"));
+        h.insert(
+            crate::responses::SURFACE_HEADER,
+            header::HeaderValue::from_static("messages"),
+        );
+        assert_eq!(surface(&h), Some("messages"));
+    }
+
+    #[test]
+    fn stream_translation_falls_back_to_buffered_when_upstream_ignored_stream() {
+        // A `stream: true` request whose upstream answered plain JSON (no
+        // `text/event-stream`) must not be handed to the SSE translator: it
+        // would find no `data:` lines and emit a well-formed but empty
+        // message. Same for a non-streaming request, trivially.
+        let mut sse = HeaderMap::new();
+        sse.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("text/event-stream"),
+        );
+        assert!(should_translate_as_stream(true, &sse));
+        assert!(!should_translate_as_stream(false, &sse));
+
+        let mut json = HeaderMap::new();
+        json.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/json"),
+        );
+        assert!(!should_translate_as_stream(true, &json));
+
+        assert!(!should_translate_as_stream(true, &HeaderMap::new()));
+    }
+
+    #[test]
+    fn should_translate_as_stream_compares_content_type_case_insensitively() {
+        let mut mixed_case = HeaderMap::new();
+        mixed_case.insert(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("Text/Event-Stream; charset=utf-8"),
+        );
+        assert!(should_translate_as_stream(true, &mixed_case));
+    }
+
+    #[test]
+    fn anthropic_error_response_uses_envelope_and_keeps_status() {
+        let resp = anthropic_error(StatusCode::TOO_MANY_REQUESTS, "slow down", Some("5"));
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(resp.headers().get(header::RETRY_AFTER).unwrap(), "5");
+        assert_eq!(
+            resp.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn count_tokens_backfills_max_tokens_so_to_chat_request_accepts_it() {
+        // Real `count_tokens` callers (Claude Code, the Python/TS SDKs) never
+        // send `max_tokens` — the field only exists for an actual chat
+        // request. Without the backfill, `to_chat_request` rejects the body.
+        let mut body = serde_json::json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        assert!(crate::messages::to_chat_request(&body).is_err());
+        backfill_max_tokens_for_count_tokens(&mut body);
+        assert_eq!(body["max_tokens"], 1);
+        assert!(crate::messages::to_chat_request(&body).is_ok());
+    }
+
+    #[test]
+    fn count_tokens_backfill_does_not_override_an_explicit_max_tokens() {
+        let mut body = serde_json::json!({
+            "model": "m",
+            "max_tokens": 42,
+            "messages": []
+        });
+        backfill_max_tokens_for_count_tokens(&mut body);
+        assert_eq!(body["max_tokens"], 42);
+    }
+
+    #[test]
+    fn resolve_messages_model_passes_auto_through_without_a_registry_lookup() {
+        // `auto` is the router's reserved name, special-cased in
+        // `proxy_handler_inner` before any `resolve_model` call, and it is
+        // never registered in Redis, so this surface must recognise it
+        // directly instead of 404ing it — for both a client that asks for it
+        // and an operator who configured it as the surface's default. Pinned
+        // at the source level: there is no AppState harness in this crate.
+        let src = include_str!("proxy.rs");
+        let start = src
+            .find("async fn resolve_messages_model(")
+            .expect("resolve_messages_model present");
+        let end = start
+            + src[start..]
+                .find("\nasync fn translate_messages_body(")
+                .expect("end of resolve_messages_model");
+        let body = &src[start..end];
+
+        let requested_auto = body
+            .find("requested == crate::router::AUTO_MODEL_NAME")
+            .expect("the requested model is checked against AUTO_MODEL_NAME");
+        let requested_lookup = body
+            .find("resolve_model(state, requested)")
+            .expect("the requested model is still looked up when it is not auto");
+        assert!(requested_auto < requested_lookup);
+
+        let fallback_auto = body
+            .find("fallback == crate::router::AUTO_MODEL_NAME")
+            .expect("the configured default is checked against AUTO_MODEL_NAME");
+        let fallback_lookup = body
+            .find("resolve_model(state, &fallback)")
+            .expect("the configured default is still looked up when it is not auto");
+        assert!(fallback_auto < fallback_lookup);
+    }
+
+    #[test]
+    fn clamp_max_tokens_cases() {
+        // No window known: nothing to clamp against, so the client's value
+        // survives untouched, however large.
+        assert_eq!(clamp_max_tokens(99_999, None, 500), Ok(99_999));
+
+        // Fits comfortably: margin is `max(256, input/8)` = 256 here, well
+        // inside the remaining room, so the request is unchanged.
+        assert_eq!(clamp_max_tokens(50, Some(1_000), 100), Ok(50));
+
+        // Requested more than the window leaves room for: clamped to what's
+        // left after the prompt and the scaled margin (`max(256, 100/8)` =
+        // 256 here, so budget = 1_000 - 100 - 256 = 644).
+        assert_eq!(clamp_max_tokens(2_000, Some(1_000), 100), Ok(644));
+
+        // A longer prompt scales the margin up past the 256 floor
+        // (`8_000 / 8` = 1_000), so the same nominal headroom clamps harder
+        // than a short prompt would.
+        assert_eq!(clamp_max_tokens(5_000, Some(10_000), 8_000), Ok(1_000));
+
+        // The prompt alone already meets or exceeds the window: no amount of
+        // clamping leaves room for a reply, so this is an error, not a clamp
+        // to 1.
+        assert_eq!(
+            clamp_max_tokens(50, Some(1_000), 1_000),
+            Err(TooLong {
+                input_tokens: 1_000,
+                window: 1_000
+            })
+        );
+        assert_eq!(
+            clamp_max_tokens(50, Some(1_000), 1_500),
+            Err(TooLong {
+                input_tokens: 1_500,
+                window: 1_000
+            })
+        );
+
+        // The prompt fits, but leaves no room even for the margin
+        // (input 800 -> margin 256; window 1_056 -> remaining exactly 256):
+        // this is also the `too long` error, not a clamp down to 1.
+        assert_eq!(
+            clamp_max_tokens(10, Some(1_056), 800),
+            Err(TooLong {
+                input_tokens: 800,
+                window: 1_056
+            })
+        );
+
+        // One token more of remaining room than the margin needs: the budget
+        // is exactly 1 and it is not an error.
+        assert_eq!(clamp_max_tokens(10, Some(1_057), 800), Ok(1));
+    }
+
+    #[test]
+    fn messages_input_estimate_adds_serialized_tools_length_over_three() {
+        let chat_body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {"name": "f", "parameters": {"type": "object"}}}]
+        });
+        let tools_len = chat_body["tools"].to_string().len() as u64;
+        assert_eq!(messages_input_estimate(&chat_body, 10), 10 + tools_len / 3);
+
+        // No `tools` at all: the estimate is the text estimate alone.
+        let no_tools = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+        assert_eq!(messages_input_estimate(&no_tools, 10), 10);
+    }
+
+    #[test]
+    fn messages_input_estimate_adds_a_flat_cost_per_image_part() {
+        let chat_body = serde_json::json!({
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "text", "text": "what is this"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}
+                ]},
+                {"role": "assistant", "content": "it's a cat"},
+                {"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
+                ]}
+            ]
+        });
+        assert_eq!(messages_input_estimate(&chat_body, 100), 100 + 1500 * 2);
+    }
+
+    #[test]
+    fn messages_input_estimate_causes_clamping_that_the_text_only_estimate_would_miss() {
+        // Reproduces the failure mode this fix targets: a 40,960-token
+        // window, a small text prompt, and a ~60 KiB `tools` array (Claude
+        // Code sends its full tool list on every turn). The text-only
+        // tokenizer estimate alone leaves `max_tokens` unclamped; folding in
+        // the tools payload clamps it to what the window can actually hold.
+        let window = Some(40_960u64);
+        let text_estimate = 500u64;
+        let requested = 32_000u64;
+
+        let chat_body = serde_json::json!({
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "f",
+                    "description": "x".repeat(60 * 1024),
+                    "parameters": {"type": "object"}
+                }
+            }]
+        });
+
+        // Text-only: nothing is clamped.
+        assert_eq!(
+            clamp_max_tokens(requested, window, text_estimate),
+            Ok(requested)
+        );
+
+        // With the tools payload folded in: clamped to less than requested.
+        let combined = messages_input_estimate(&chat_body, text_estimate);
+        let clamped = clamp_max_tokens(requested, window, combined).expect("still fits");
+        assert!(clamped < requested, "expected clamping, got {clamped}");
+    }
+
+    #[test]
+    fn too_long_message_wording_matches_anthropics_exact_phrase() {
+        // Claude Code's automatic context-compaction keys its detection on
+        // this exact string; any drift here silently breaks that recovery.
+        let err = TooLong {
+            input_tokens: 205_000,
+            window: 200_000,
+        };
+        assert_eq!(
+            err.message(),
+            "prompt is too long: 205000 tokens > 200000 maximum"
+        );
+    }
+
+    #[test]
+    fn strip_beta_query_drops_only_the_beta_parameter() {
+        assert_eq!(strip_beta_query(None), None);
+        assert_eq!(strip_beta_query(Some("beta=true")), None);
+        assert_eq!(
+            strip_beta_query(Some("beta=true&x=1")),
+            Some("x=1".to_string())
+        );
+        assert_eq!(
+            strip_beta_query(Some("x=1&beta=true&y=2")),
+            Some("x=1&y=2".to_string())
+        );
+        assert_eq!(strip_beta_query(Some("x=1")), Some("x=1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn redress_error_falls_back_to_the_canonical_reason_when_the_body_is_empty() {
+        let resp = Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .body(Body::empty())
+            .unwrap();
+        let out = redress_error(resp).await;
+        assert_eq!(out.status(), StatusCode::BAD_GATEWAY);
+        let bytes = axum::body::to_bytes(out.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["message"], "Bad Gateway");
+    }
+
+    #[test]
+    fn looks_like_context_length_error_matches_known_phrasings_case_insensitively() {
+        assert!(looks_like_context_length_error(
+            "This model's maximum context length is 4096 tokens. However, you requested 5000 tokens."
+        ));
+        assert!(looks_like_context_length_error("CONTEXT LENGTH exceeded"));
+        assert!(looks_like_context_length_error(
+            "too many tokens in the messages"
+        ));
+        assert!(!looks_like_context_length_error("`model` is required"));
+        assert!(!looks_like_context_length_error("rate limit exceeded"));
+    }
+
+    #[tokio::test]
+    async fn redress_error_rewrites_a_context_length_400_to_anthropics_wording() {
+        // vLLM's own wording ("maximum context length"), not Anthropic's —
+        // Claude Code's auto-compaction only fires on `prompt is too long`.
+        let upstream_message =
+            "This model's maximum context length is 4096 tokens. However, you requested 5000 tokens.";
+        let body = serde_json::json!({"error": {"message": upstream_message}});
+        let resp = Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let out = redress_error(resp).await;
+        assert_eq!(out.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(out.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(
+            v["error"]["message"],
+            format!("prompt is too long: {upstream_message}")
+        );
+    }
+
+    #[tokio::test]
+    async fn redress_error_leaves_an_unrelated_400_message_untouched() {
+        let body = serde_json::json!({"error": {"message": "`model` is required"}});
+        let resp = Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let out = redress_error(resp).await;
+        assert_eq!(out.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(out.into_body(), 1024).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["error"]["message"], "`model` is required");
+    }
+
+    #[test]
+    fn response_cache_key_includes_the_tenant() {
+        let src = handler_source();
+        let call = src
+            .find("obleth_config::cache_key(")
+            .expect("the cache_key call site");
+        assert_eq!(
+            src.matches("obleth_config::cache_key(").count(),
+            1,
+            "a single response-cache call site"
+        );
+        let args = &src[call..(call + 200).min(src.len())];
+        assert!(
+            args.contains("resolved.tenant_id"),
+            "the response cache key must be scoped to the caller's tenant"
+        );
+    }
+
+    #[test]
+    fn response_cache_lookup_is_skipped_when_ttl_disables_caching() {
+        let src = handler_source();
+        let call = src
+            .find("obleth_config::cache_key(")
+            .expect("the cache_key call site");
+        let gate = &src[call.saturating_sub(120)..call];
+        assert!(
+            gate.contains("cache_enabled && cache_ttl > 0"),
+            "no cache key (and so no cache_get) when TTL <= 0"
         );
     }
 
@@ -4943,9 +7002,16 @@ mod tests {
             upstream_model: name.to_string(),
             api_base: "http://upstream".to_string(),
             api_key: None,
+            upstream_headers: Default::default(),
             model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
             admission_weight: 100,
             max_in_flight: None,
+            capacity_mode: "static".into(),
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_service: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             enabled: true,
             cache_enabled: false,
             cache_ttl_secs: 0,
@@ -4954,6 +7020,7 @@ mod tests {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: 128_000,
             supports_function_calling: true,
             supports_system_messages: true,
@@ -5017,5 +7084,519 @@ mod tests {
         assert!(obj.contains_key("scored"), "missing `scored`: {obj:?}");
         assert!(obj.contains_key("rejected"), "missing `rejected`: {obj:?}");
         assert_eq!(value["classifier_ms"], serde_json::json!(7));
+    }
+
+    #[test]
+    fn admit_request_carries_key_identity_and_per_model_caps() {
+        let mut resolved = key_with_schedule("UTC", None, None, None);
+        resolved.key_id = Uuid::new_v4();
+        resolved.tenant_id = Uuid::new_v4();
+        resolved.fairshare_group = "grp".into();
+        resolved.group_weight = 7;
+        resolved.key_weight = 250;
+        resolved.key_max_in_flight = Some(2);
+        resolved.max_in_flight = Some(5);
+        let mut route = minimal_model("m");
+        route.max_in_flight = Some(9);
+        let req = admit_request_for(&resolved, "m", Some(&route), 77, 123);
+        assert_eq!(req.tenant, resolved.tenant_id);
+        assert_eq!(req.key, resolved.key_id);
+        assert_eq!(req.weight, 77);
+        assert_eq!(req.key_weight, 250);
+        assert_eq!(req.group, resolved.fairshare_group);
+        assert_eq!(req.group_weight, resolved.group_weight);
+        assert_eq!(req.model, "m");
+        assert_eq!(req.model_max_in_flight, Some(9));
+        assert_eq!(req.tenant_max_in_flight, Some(5));
+        assert_eq!(req.key_max_in_flight, Some(2));
+        assert_eq!(req.cost, 123);
+
+        // Zero and negative caps mean "no cap".
+        resolved.max_in_flight = Some(0);
+        resolved.key_max_in_flight = Some(-1);
+        let req = admit_request_for(&resolved, "m", None, 1, 1);
+        assert_eq!(req.tenant_max_in_flight, None);
+        assert_eq!(req.key_max_in_flight, None);
+        assert_eq!(req.model_max_in_flight, None);
+    }
+    /// Endpoints whose OpenAI spec sends `multipart/form-data` (they take a
+    /// file upload). The video create's upload is its optional
+    /// `input_reference` frame; it also accepts JSON.
+    const SPEC_MULTIPART_PATHS: &[&str] = &[
+        "/v1/audio/transcriptions",
+        "/v1/audio/translations",
+        "/v1/images/edits",
+        "/v1/images/variations",
+        "/v1/videos",
+    ];
+
+    #[test]
+    fn every_registered_multipart_endpoint_parses_its_form() {
+        // The two lists drifted once: the image upload endpoints required a
+        // model but their form was never parsed, so the model field was never
+        // seen and every request failed "model is required".
+        for path in REGISTERED_MODEL_PATHS {
+            assert_eq!(
+                is_multipart_endpoint(path),
+                SPEC_MULTIPART_PATHS.contains(path),
+                "{path}"
+            );
+        }
+        for path in SPEC_MULTIPART_PATHS {
+            assert!(requires_registered_model(path), "{path}");
+        }
+    }
+
+    fn image_edit_form() -> (String, Bytes) {
+        let boundary = "XBOUNDARYX".to_string();
+        let body = format!(
+            "--{b}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nimage-model\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nadd a hat\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"n\"\r\n\r\n3\r\n\
+             --{b}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"cat.png\"\r\n\
+             Content-Type: image/png\r\n\r\nPNGDATA\r\n\
+             --{b}--\r\n",
+            b = boundary
+        );
+        (boundary, Bytes::from(body))
+    }
+
+    #[tokio::test]
+    async fn an_image_edit_form_reads_like_a_json_body() {
+        let (boundary, body) = image_edit_form();
+        let fields = parse_multipart(&body, &boundary)
+            .await
+            .expect("form parses");
+        let view = multipart_text_view(&fields);
+        // The file is not text the scanners or the estimate should read.
+        assert_eq!(
+            view,
+            serde_json::json!({"model": "image-model", "prompt": "add a hat", "n": "3"})
+        );
+
+        // Priced per image from the form's `n`, like a JSON generation.
+        let mut route = minimal_model("image-model");
+        route.model_type = "image".into();
+        route.cost_per_image = 0.04;
+        assert!((compute_modality_cost(Some(&route), &view) - 0.12).abs() < 1e-9);
+        let json_body = serde_json::json!({"prompt": "x", "n": 2});
+        assert!((compute_modality_cost(Some(&route), &json_body) - 0.08).abs() < 1e-9);
+        let unset = serde_json::json!({"prompt": "x"});
+        assert!((compute_modality_cost(Some(&route), &unset) - 0.04).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_video_model_is_its_own_modality() {
+        use super::{
+            input_guardrails_unscannable, mode_for_model_type, model_info_entry,
+            output_guardrails_unenforceable,
+        };
+        let mut route = minimal_model("video-model");
+        route.model_type = "video".into();
+        route.cost_per_video = 0.3;
+        // One flat price per created job, whatever the body asks for.
+        let body = serde_json::json!({"prompt": "a fox", "n": 4, "seconds": "5"});
+        assert!((compute_modality_cost(Some(&route), &body) - 0.3).abs() < 1e-9);
+        assert_eq!(mode_for_model_type("video"), "video_generation");
+        let info = model_info_entry(&route, true);
+        assert_eq!(info["model_info"]["mode"], "video_generation");
+        assert_eq!(info["model_info"]["cost_per_video"], 0.3);
+
+        // The create takes JSON or a form, must name a registered model, and
+        // is its own request class, which the input scanner reads and an
+        // output policy does not refuse (a video object is not model text).
+        assert!(is_multipart_endpoint("/v1/videos"));
+        assert!(requires_registered_model("/v1/videos"));
+        assert_eq!(request_type_for_path("/v1/videos"), "video");
+        let mut key = crate::boons::test_support::test_key();
+        key.guardrails_policy = Some(obleth_config::GuardrailsPolicy {
+            action: obleth_config::GuardrailsAction::Block,
+            input_scanners: vec!["pii".into()],
+            output_scanners: vec!["pii".into()],
+            guard_model: None,
+            ban_keywords: vec![],
+            fail_open: true,
+        });
+        assert!(!input_guardrails_unscannable(&key, "/v1/videos"));
+        assert!(!output_guardrails_unenforceable(&key, "/v1/videos"));
+        // Follow-ups never reach the pipeline; were one to, it is unmapped.
+        assert_eq!(request_type_for_path("/v1/videos/video_1/content"), "other");
+    }
+
+    #[tokio::test]
+    async fn a_redacted_prompt_is_what_the_form_forwards() {
+        let (boundary, body) = image_edit_form();
+        let mut fields = parse_multipart(&body, &boundary)
+            .await
+            .expect("form parses");
+        let mut view = multipart_text_view(&fields);
+        view["prompt"] = serde_json::json!("add a [REDACTED]");
+        apply_multipart_text_view(&mut fields, &view);
+
+        let prompt = fields.iter().find(|f| f.name == "prompt").unwrap();
+        assert_eq!(prompt.data.as_ref(), b"add a [REDACTED]");
+        // The file part and the untouched fields keep their bytes.
+        let image = fields.iter().find(|f| f.name == "image").unwrap();
+        assert_eq!(image.data.as_ref(), b"PNGDATA");
+        assert_eq!(image.file_name.as_deref(), Some("cat.png"));
+        let n = fields.iter().find(|f| f.name == "n").unwrap();
+        assert_eq!(n.data.as_ref(), b"3");
+    }
+
+    #[test]
+    fn a_repeated_text_field_is_scanned_and_redacted_in_every_occurrence() {
+        let text = |name: &str, data: &str| MultipartField {
+            name: name.into(),
+            file_name: None,
+            content_type: None,
+            data: Bytes::from(data.to_string()),
+        };
+        let mut fields = vec![text("prompt", "first"), text("prompt", "second")];
+        let mut view = multipart_text_view(&fields);
+        assert_eq!(view["prompt"], serde_json::json!(["first", "second"]));
+        view["prompt"][1] = serde_json::json!("[REDACTED]");
+        apply_multipart_text_view(&mut fields, &view);
+        assert_eq!(fields[0].data.as_ref(), b"first");
+        assert_eq!(fields[1].data.as_ref(), b"[REDACTED]");
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_tests {
+    use super::*;
+
+    /// Source with all whitespace removed, so pins survive reformatting.
+    fn squash(s: &str) -> String {
+        s.chars().filter(|c| !c.is_whitespace()).collect()
+    }
+
+    /// `proxy_handler_inner`'s source, for ordering pins (there is no
+    /// AppState harness in this crate: it needs live Redis and ClickHouse).
+    fn handler() -> &'static str {
+        let src = include_str!("proxy.rs");
+        let src = &src[..src.find("\nmod tests {").expect("the test module")];
+        let start = src
+            .find("async fn proxy_handler_inner(")
+            .expect("proxy_handler_inner");
+        let end = start
+            + src[start..]
+                .find("\n/// Drops the usage-only SSE event")
+                .expect("end of the handler");
+        &src[start..end]
+    }
+
+    #[test]
+    fn admission_precedes_the_budget_reservation() {
+        let h = handler();
+        let admit = h.find(".admit_to(").expect("admission");
+        let reserve = h.find(".reserve_with_term(").expect("reservation");
+        assert!(admit < reserve, "a queued request must hold no budget");
+        assert!(h[admit..reserve].contains("timeout(admit_wait"));
+    }
+
+    #[test]
+    fn every_exit_after_the_reservation_settles_through_the_guard() {
+        let h = handler();
+        let guard = h
+            .find("let mut settle_guard = accounting.unbilled_guard();")
+            .expect("guard");
+        let dispatch = h.find("// ---- proxy upstream ----").expect("dispatch");
+        assert!(guard < dispatch, "the guard must exist before dispatch");
+        let after = &h[guard..];
+        for bypass in ["finalize(", "settle_request(", "cancellation_guard("] {
+            assert!(
+                !after.contains(bypass),
+                "`{bypass}` after the reservation skips the guarded settlement"
+            );
+        }
+        // The fallback switches to the estimate only once the upstream answered
+        // successfully, i.e. after the error branch returned.
+        let flat = squash(after);
+        let error_branch = flat.find("ifstatus_code>=400{").expect("error branch");
+        let armed = flat.find("accounting.arm_estimate(&mutsettle_guard);//Cacheonly");
+        assert!(armed.is_some_and(|a| a > error_branch));
+    }
+
+    #[test]
+    fn a_rejection_between_the_two_scopes_releases_the_key_hold() {
+        let flat = squash(handler());
+        let key = flat
+            .find(".reserve_with_term(&resolved.key_id,")
+            .expect("key reserve");
+        let tenant = flat
+            .find(".reserve_with_term(&resolved.tenant_id,")
+            .expect("tenant reserve");
+        let proceed = flat
+            .find("letaccounting=StreamAccounting{")
+            .expect("accounting");
+        assert!(key < tenant);
+        let releases = flat[tenant..proceed]
+            .matches("hold.release().await")
+            .count();
+        // Rate limited, term exhausted, and fail-closed error.
+        assert_eq!(releases, 3);
+        // Success hands the hold to settlement before the guard exists.
+        assert!(flat[tenant..proceed].contains("hold.hand_off()"));
+    }
+
+    #[test]
+    fn a_dropped_pending_hold_is_released_but_a_handed_off_one_is_not() {
+        let full = include_str!("proxy.rs");
+        let src = squash(&full[..full.find("\nmod tests {").expect("the test module")]);
+        let drop_impl = src
+            .find("implDropforPendingTermHold{fndrop(&mutself){ifself.armed{tokio::spawn(self.release_task());")
+            .is_some();
+        assert!(drop_impl, "an armed hold must release itself on drop");
+        assert!(src.contains("fnhand_off(mutself){self.armed=false;}"));
+    }
+
+    #[test]
+    fn admission_timeout_defaults_and_parses() {
+        assert_eq!(parse_admission_timeout(None), DEFAULT_ADMISSION_TIMEOUT);
+        assert_eq!(
+            parse_admission_timeout(Some("abc")),
+            DEFAULT_ADMISSION_TIMEOUT
+        );
+        assert_eq!(
+            parse_admission_timeout(Some("0")),
+            DEFAULT_ADMISSION_TIMEOUT
+        );
+        assert_eq!(
+            parse_admission_timeout(Some(" 12 ")),
+            Duration::from_secs(12)
+        );
+    }
+
+    #[test]
+    fn estimated_cost_prices_the_estimate_like_settlement_prices_usage() {
+        let est = CostEstimate {
+            input_tokens: 100,
+            estimated_output_tokens: 50,
+        };
+        let cost = estimated_cost(est, 0.01, 0.02, 0.5);
+        assert!((cost - (1.0 + 1.0 + 0.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stream_usage_is_requested_only_where_upstreams_honour_it() {
+        assert!(is_stream_usage_path("/v1/chat/completions"));
+        assert!(is_stream_usage_path("/v1/completions"));
+        assert!(!is_stream_usage_path("/v1/embeddings"));
+        assert!(!is_stream_usage_path("/v1/audio/transcriptions"));
+    }
+
+    fn sse(v: serde_json::Value) -> String {
+        format!("data: {v}\n\n")
+    }
+
+    fn content_event(text: &str) -> String {
+        sse(serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "content": text } }],
+            "usage": null,
+        }))
+    }
+
+    fn usage_event() -> String {
+        sse(serde_json::json!({
+            "choices": [],
+            "usage": { "prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10 },
+        }))
+    }
+
+    fn run_filter(chunks: &[&[u8]]) -> String {
+        let mut filter = UsageChunkFilter::default();
+        let mut out = Vec::new();
+        for c in chunks {
+            out.extend_from_slice(&filter.push(Bytes::copy_from_slice(c)));
+        }
+        out.extend_from_slice(&filter.finish());
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn the_injected_usage_chunk_is_stripped_and_content_passes_verbatim() {
+        let a = content_event("Hel");
+        let b = content_event("lo");
+        let u = usage_event();
+        let done = "data: [DONE]\n\n";
+        let out = run_filter(&[a.as_bytes(), b.as_bytes(), u.as_bytes(), done.as_bytes()]);
+        assert_eq!(out, format!("{a}{b}{done}"));
+    }
+
+    #[test]
+    fn usage_split_across_chunks_is_still_stripped() {
+        let a = content_event("hi");
+        let u = usage_event();
+        let done = "data: [DONE]\n\n";
+        let joined = format!("{a}{u}{done}");
+        let bytes = joined.as_bytes();
+        // Split inside the usage event and inside the blank-line terminator.
+        let cut1 = a.len() + 20;
+        let cut2 = a.len() + u.len() - 1;
+        let out = run_filter(&[&bytes[..cut1], &bytes[cut1..cut2], &bytes[cut2..]]);
+        assert_eq!(out, format!("{a}{done}"));
+        // CRLF-framed streams too.
+        let crlf = joined.replace("\n\n", "\r\n\r\n");
+        assert_eq!(
+            run_filter(&[crlf.as_bytes()]),
+            format!("{a}{done}").replace("\n\n", "\r\n\r\n")
+        );
+    }
+
+    #[test]
+    fn a_body_past_the_cap_with_no_event_boundary_is_flushed_unfiltered() {
+        // A non-SSE (or non-compliant) body that never sends a blank-line
+        // terminator must not be held for the life of the stream once it
+        // exceeds the cap.
+        let body = vec![b'x'; USAGE_FILTER_MAX_PENDING + 1];
+        let mut filter = UsageChunkFilter::default();
+        let out = filter.push(Bytes::copy_from_slice(&body));
+        assert_eq!(out.as_ref(), body.as_slice());
+        assert!(filter.pending.is_empty());
+        // The filter keeps working on whatever follows the flush (it does not
+        // latch into a permanently-disabled state); a later complete event
+        // is still filtered normally.
+        let done = "data: [DONE]\n\n";
+        let mut tail = Vec::new();
+        tail.extend_from_slice(&filter.push(Bytes::from_static(done.as_bytes())));
+        tail.extend_from_slice(&filter.finish());
+        assert_eq!(tail, done.as_bytes());
+    }
+
+    #[test]
+    fn usage_riding_on_a_content_chunk_is_not_dropped() {
+        let e = sse(serde_json::json!({
+            "choices": [{ "index": 0, "delta": { "content": "x" } }],
+            "usage": { "prompt_tokens": 1, "completion_tokens": 1 },
+        }));
+        assert_eq!(run_filter(&[e.as_bytes()]), e);
+    }
+
+    #[test]
+    fn a_stream_cut_off_after_two_deltas_bills_the_delivered_text() {
+        let est = CostEstimate {
+            input_tokens: 30,
+            estimated_output_tokens: 500,
+        };
+        // Two content deltas reach the client, then the upstream errors with
+        // no usage chunk ever sent.
+        let chunks = [content_event("Hello, wor"), content_event("ld and more")];
+        let streamed: usize = chunks.iter().map(|c| delta_text_chars(c.as_bytes())).sum();
+        assert_eq!(streamed, "Hello, world and more".chars().count());
+        let usage = extract_usage(&chunks.concat());
+        assert_eq!(usage, None);
+        let (tokens, billed) = truncated_stream_billing(usage, streamed, est);
+        assert!(billed, "delivered text must be billed");
+        assert_eq!(tokens, (30, 5), "prompt estimate + ~4 chars per token");
+
+        // Reported usage wins; nothing streamed is nothing billed.
+        assert_eq!(
+            truncated_stream_billing(Some((7, 3)), streamed, est),
+            ((7, 3), true)
+        );
+        assert_eq!(truncated_stream_billing(None, 0, est), ((0, 0), false));
+    }
+
+    #[test]
+    fn delta_text_counting_handles_escapes_multibyte_and_null() {
+        let e = sse(serde_json::json!({
+            "choices": [{ "delta": { "content": "a\"b\né", "reasoning_content": "hm" } }],
+        }));
+        // a " b \n é = 5, plus "hm" = 2.
+        assert_eq!(delta_text_chars(e.as_bytes()), 7);
+        let null = content_event("");
+        assert_eq!(delta_text_chars(null.as_bytes()), 0);
+        assert_eq!(delta_text_chars(br#"{"content": null}"#), 0);
+    }
+
+    #[test]
+    fn delta_text_counting_does_not_double_count_mirrored_reasoning() {
+        // Some upstreams echo the same reasoning text under both
+        // `reasoning_content` and `reasoning` in one delta. Only
+        // `reasoning_content` should count.
+        let e = sse(serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "content": "hi",
+                    "reasoning_content": "thinking",
+                    "reasoning": "thinking",
+                },
+            }],
+        }));
+        // "hi" = 2, plus "thinking" once = 8.
+        assert_eq!(delta_text_chars(e.as_bytes()), 10);
+
+        // Without `reasoning_content`, `reasoning` still counts on its own.
+        let fallback = sse(serde_json::json!({
+            "choices": [{ "delta": { "reasoning": "thinking" } }],
+        }));
+        assert_eq!(delta_text_chars(fallback.as_bytes()), 8);
+    }
+
+    #[test]
+    fn unbilled_settlement_still_charges_slot_energy() {
+        let energy = crate::energy::EnergyEngine::new(obleth_config::EnergySettings {
+            enabled: true,
+            prometheus_url: "http://prom".into(),
+            power_query: "watts".into(),
+            poll_interval_secs: 60,
+            energy_cost_per_kwh: 0.10,
+            carbon_g_per_kwh: 400.0,
+            pue: 1.0,
+        });
+        energy.store_reading(crate::energy::PowerReading {
+            cluster_watts: 409_000.0,
+            node_count: 178,
+            at_ms: 0,
+        });
+        // A 503 that produced nothing but held a slot for 2 s.
+        let (cost, figures) =
+            settled_figures(&energy, false, (0, 0), (0.01, 0.02, 0.5), 8, 2_000, 0);
+        assert_eq!(cost, 0.0, "no billable output, no cost");
+        assert!(figures.energy_wh > 0.0, "slot time is still energy");
+        let (billed_cost, _) =
+            settled_figures(&energy, true, (100, 50), (0.01, 0.02, 0.5), 8, 2_000, 0);
+        assert!((billed_cost - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn completion_body_usage_reads_openai_usage() {
+        let body = serde_json::json!({ "usage": { "prompt_tokens": 4, "completion_tokens": 9 } });
+        assert_eq!(completion_body_usage(&body), Some((4, 9)));
+        assert_eq!(completion_body_usage(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn upstream_headers_go_on_after_the_forwarded_ones_and_before_auth() {
+        let src = squash(handler());
+        let fwd = src
+            .find("letmutfwd_headers=forward_headers(&headers);")
+            .unwrap();
+        let ext = src
+            .find("fwd_headers.extend(target.headers.clone());")
+            .unwrap();
+        let auth = src
+            .find("fwd_headers.insert(header::AUTHORIZATION,v);")
+            .unwrap();
+        assert!(fwd < ext && ext < auth);
+    }
+
+    #[test]
+    fn the_form_stands_in_for_the_body_before_guardrails_and_pricing() {
+        let src = squash(handler());
+        let view = src
+            .find("json=multipart_text_view(fields);")
+            .expect("the form's text fields replace the JSON body");
+        let scan = src
+            .find(".enrich_request(")
+            .expect("the boon/guardrail pass");
+        let price = src
+            .find("compute_modality_cost(route.as_deref(),&json)")
+            .expect("the modality price");
+        assert!(view < scan && view < price);
+        let write_back = src
+            .find("apply_multipart_text_view(fields,&json);")
+            .expect("a redaction reaches the forwarded form");
+        assert!(scan < write_back);
     }
 }

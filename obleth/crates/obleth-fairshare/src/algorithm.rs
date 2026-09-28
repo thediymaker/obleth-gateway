@@ -46,16 +46,25 @@ where
 
     let mut used: usize = alloc.iter().map(|(_, c, _)| c).sum();
     if used > max {
-        let mut indices: Vec<usize> = (0..alloc.len()).collect();
-        indices.sort_by(|&a, &b| alloc[b].1.cmp(&alloc[a].1));
-        for idx in indices {
-            if used <= max {
+        // Pay for the min-one raises from items above one, largest first, so
+        // no item is pushed back to zero. Overflow only happens after raises
+        // (`max >= n`), so items above one always exist while `used > max`.
+        while used > max {
+            let Some(idx) = (0..alloc.len())
+                .filter(|&i| alloc[i].1 > 1)
+                .max_by(|&a, &b| {
+                    alloc[a].1.cmp(&alloc[b].1).then(
+                        alloc[b]
+                            .2
+                            .partial_cmp(&alloc[a].2)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
+                })
+            else {
                 break;
-            }
-            if alloc[idx].1 > 0 {
-                alloc[idx].1 -= 1;
-                used -= 1;
-            }
+            };
+            alloc[idx].1 -= 1;
+            used -= 1;
         }
     } else if used < max {
         let mut remaining = max - used;
@@ -150,6 +159,44 @@ mod tests {
                 n - cap
             );
             assert_eq!(got.iter().sum::<usize>(), cap, "caps must sum to the pool");
+        }
+    }
+
+    /// Paying for the min-one raises must not take a slot back from an item
+    /// that was just raised to one.
+    #[test]
+    fn min_one_raise_is_never_undone_by_the_trim() {
+        let tenants = vec![(1u32, 1000), (2u32, 1), (3u32, 1), (4u32, 1)];
+        let caps = weighted_caps(4, &tenants);
+        for t in 1..=4u32 {
+            assert_eq!(caps.get(&t).copied(), Some(1), "tenant {t}: {caps:?}");
+        }
+    }
+
+    #[test]
+    fn every_item_keeps_a_slot_whenever_max_covers_them() {
+        let weight_sets: [&[i64]; 5] = [
+            &[1000, 1, 1, 1],
+            &[1000, 1000, 1, 1, 1],
+            &[5000, 10, 1],
+            &[1, 1, 1, 1, 1, 1],
+            &[10_000, 1, 1, 1, 1, 1, 1, 1],
+        ];
+        for weights in weight_sets {
+            let items: Vec<(usize, i64)> = weights.iter().copied().enumerate().collect();
+            for max in weights.len()..weights.len() + 6 {
+                let caps = weighted_caps(max, &items);
+                let got: Vec<usize> = (0..items.len()).map(|i| caps[&i]).collect();
+                assert!(
+                    got.iter().all(|c| *c >= 1),
+                    "weights={weights:?} max={max}: {got:?}"
+                );
+                assert_eq!(
+                    got.iter().sum::<usize>(),
+                    max,
+                    "weights={weights:?} max={max}"
+                );
+            }
         }
     }
 

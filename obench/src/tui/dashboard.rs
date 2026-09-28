@@ -372,7 +372,7 @@ fn draw_footer(f: &mut Frame, area: Rect, ui_base: &str, complete: bool) {
         Line::from(vec![
             Span::styled("  accounting  ", Style::default().fg(theme::MUTED)),
             Span::styled(
-                format!("{ui_base}/usage"),
+                format!("{ui_base}/reports"),
                 Style::default().fg(theme::ACCENT),
             ),
         ]),

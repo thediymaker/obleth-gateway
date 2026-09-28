@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { gatewayChat, gatewayImages, getControlPlaneKey, __resetKeyCache } from "./gateway";
+import { gatewayChat, gatewayImages, gatewayVerdicts, getControlPlaneKey, __resetKeyCache } from "./gateway";
 
 describe("gatewayChat", () => {
   beforeEach(() => {
@@ -45,6 +45,32 @@ describe("gatewayChat", () => {
     vi.stubGlobal("fetch", fetchMock);
 
     const res = await gatewayImages({ model: "img", prompt: "a cat" });
+    expect(res.status).toBe(200);
+  });
+
+  it("posts verdict requests to /v1/verdicts with state and questions intact", async () => {
+    const fetchMock = vi.fn(async (url: string | URL, init?: RequestInit) => {
+      const u = String(url);
+      if (u.includes("/system/control-plane-key")) {
+        return new Response(JSON.stringify({ secret: "sk-test" }), { status: 200 });
+      }
+      expect(u).toBe("http://localhost:8080/v1/verdicts");
+      const headers = init?.headers as Record<string, string>;
+      expect(headers.Authorization).toBe("Bearer sk-test");
+      expect(JSON.parse(String(init?.body))).toMatchObject({
+        model: "glm-5-3",
+        state: { ticket: "duplicate charge" },
+        questions: { is_urgent: { type: "boolean", instructions: "Urgent?" } },
+      });
+      return new Response("{}", { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await gatewayVerdicts({
+      model: "glm-5-3",
+      state: { ticket: "duplicate charge" },
+      questions: { is_urgent: { type: "boolean", instructions: "Urgent?" } },
+    });
     expect(res.status).toBe(200);
   });
 

@@ -92,7 +92,8 @@ pub struct UsageDailyQuery {
     pub key_id: Option<String>,
     pub model: Option<String>,
     /// Aggregate dimension: `day` (default), `tenant`, `key`, `model`,
-    /// or `key_model` (one row per key+model across the whole range).
+    /// `key_model` (one row per key+model across the whole range), or one of
+    /// the per-day splits `day_tenant`, `day_model` and `day_key_model`.
     pub group_by: Option<String>,
 }
 
@@ -129,6 +130,8 @@ pub struct UsageLogQuery {
     pub device_id: Option<String>,
     /// Status filter: `success` (2xx/3xx), `error` (>=400), or all (default).
     pub status: Option<String>,
+    /// One exact HTTP status, e.g. `502`. Combines with `status`.
+    pub status_code: Option<u16>,
     /// Case-insensitive prefix match on the request id, for the search box.
     pub request_id: Option<String>,
     /// Inclusive lower bound, unix epoch millis. Defaults to the last 24h.
@@ -148,6 +151,10 @@ pub struct UsageLogQuery {
     /// When true, include internal traffic (health probes, benchmark runs)
     /// that is hidden from the request log by default.
     pub include_internal: Option<bool>,
+    /// Histogram only (`/usage/logs/histogram`): bucket width in
+    /// milliseconds. Default 60_000; widened so the window fits in 400
+    /// buckets. The cursor and `limit` do not apply there.
+    pub bucket_ms: Option<i64>,
 }
 
 /// A single request as stored in the `usage` ledger, returned newest-first for
@@ -185,44 +192,46 @@ pub struct UsageLogRow {
     pub co2_g: f64,
 }
 
-/// Read individual `usage` rows newest-first, honoring the supplied filters and
-/// keyset cursor. Bind order below must track the `?` placeholders exactly,
-/// since the ClickHouse client binds positionally.
-pub async fn query_usage_logs(
-    client: &clickhouse::Client,
-    q: UsageLogQuery,
-) -> Result<Vec<UsageLogRow>, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+/// A bind value for the request-log filters, in placeholder order.
+#[derive(Clone)]
+enum LogBind {
+    Int(i64),
+    Text(String),
+}
 
-    let mut sql = String::from(
-        "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, session_id_source, device_id, \
-         admission, status_code, input_tokens, output_tokens, \
-         toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
-         queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
-         energy_wh, energy_cost_usd, co2_g \
-         from usage where ts_ms >= ?",
-    );
-    if q.until_ms.is_some() {
+/// The `where` clause the request log and its histogram share: every filter
+/// the log offers, with its bind values in placeholder order (the ClickHouse
+/// client binds positionally). The keyset cursor is the log's alone.
+fn log_filter_sql(q: &UsageLogQuery, since: i64) -> (String, Vec<LogBind>) {
+    let mut sql = String::from(" where ts_ms >= ?");
+    let mut binds = vec![LogBind::Int(since)];
+    if let Some(until) = q.until_ms {
         sql.push_str(" and ts_ms <= ?");
+        binds.push(LogBind::Int(until));
     }
-    if q.tenant_id.is_some() {
+    if let Some(tid) = q.tenant_id {
         sql.push_str(" and tenant_id = toUUID(?)");
+        binds.push(LogBind::Text(tid.to_string()));
     }
-    if q.key_id.is_some() {
+    if let Some(kid) = q.key_id {
         sql.push_str(" and key_id = toUUID(?)");
+        binds.push(LogBind::Text(kid.to_string()));
     }
-    if q.model.is_some() {
+    if let Some(model) = &q.model {
         sql.push_str(" and model = ?");
+        binds.push(LogBind::Text(model.clone()));
     }
-    if q.request_type.is_some() {
+    if let Some(rt) = &q.request_type {
         sql.push_str(" and request_type = ?");
+        binds.push(LogBind::Text(rt.clone()));
     }
-    if q.session_id.is_some() {
+    if let Some(sid) = &q.session_id {
         sql.push_str(" and session_id = ?");
+        binds.push(LogBind::Text(sid.clone()));
     }
-    if q.device_id.is_some() {
+    if let Some(d) = &q.device_id {
         sql.push_str(" and device_id = ?");
+        binds.push(LogBind::Text(d.clone()));
     }
     sql.push_str(&internal_filter(q.include_internal));
     match q.status.as_deref() {
@@ -230,22 +239,52 @@ pub async fn query_usage_logs(
         Some("error") => sql.push_str(" and status_code >= 400"),
         _ => {}
     }
-    if q.request_id.is_some() {
+    if let Some(code) = q.status_code {
+        // A u16 prints as digits only, so it is safe to inline.
+        sql.push_str(&format!(" and status_code = {code}"));
+    }
+    if let Some(rid) = &q.request_id {
         sql.push_str(" and startsWith(lower(toString(request_id)), lower(?))");
+        binds.push(LogBind::Text(rid.clone()));
     }
     if q.traced_only == Some(true) {
-        let since = q.since_ms.unwrap_or(0);
-        let until = q.until_ms.unwrap_or(i64::MAX);
-        // Safety: `since` and `until` are `i64` — `Display` emits only ASCII
-        // digits (and an optional leading `-`), so there is no SQL-injection
-        // surface. The clickhouse crate (v0.13) scopes bind parameters to the
-        // top-level query string and does not propagate them into subqueries,
-        // making `format!` the correct approach for subquery literals.
-        sql.push_str(&format!(
-            " AND request_id IN (SELECT DISTINCT request_id FROM spans \
-              WHERE start_ms >= {since} AND start_ms <= {until})"
-        ));
+        sql.push_str(&traced_only_filter(since, q.until_ms));
     }
+    (sql, binds)
+}
+
+fn bind_log_filters(
+    mut query: clickhouse::query::Query,
+    binds: Vec<LogBind>,
+) -> clickhouse::query::Query {
+    for b in binds {
+        query = match b {
+            LogBind::Int(v) => query.bind(v),
+            LogBind::Text(v) => query.bind(v),
+        };
+    }
+    query
+}
+
+/// Read individual `usage` rows newest-first, honoring the supplied filters and
+/// keyset cursor.
+pub async fn query_usage_logs(
+    client: &clickhouse::Client,
+    q: UsageLogQuery,
+) -> Result<Vec<UsageLogRow>, clickhouse::error::Error> {
+    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let (filter, binds) = log_filter_sql(&q, since);
+
+    let mut sql = String::from(
+        "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, session_id_source, device_id, \
+         admission, status_code, input_tokens, output_tokens, \
+         toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
+         queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
+         energy_wh, energy_cost_usd, co2_g \
+         from usage",
+    );
+    sql.push_str(&filter);
     // Keyset cursor: (ts_ms, request_id) tuple strictly less than the cursor.
     // Tuple comparison matches the `order by` below for stable paging.
     if q.before_ms.is_some() && q.before_request_id.is_some() {
@@ -260,31 +299,7 @@ pub async fn query_usage_logs(
         " order by ts_ms desc, toString(request_id) desc limit {limit}"
     ));
 
-    let mut query = client.query(&sql).bind(since);
-    if let Some(until) = q.until_ms {
-        query = query.bind(until);
-    }
-    if let Some(tid) = q.tenant_id {
-        query = query.bind(tid.to_string());
-    }
-    if let Some(kid) = q.key_id {
-        query = query.bind(kid.to_string());
-    }
-    if let Some(model) = &q.model {
-        query = query.bind(model.clone());
-    }
-    if let Some(rt) = &q.request_type {
-        query = query.bind(rt.clone());
-    }
-    if let Some(sid) = &q.session_id {
-        query = query.bind(sid.clone());
-    }
-    if let Some(d) = &q.device_id {
-        query = query.bind(d.clone());
-    }
-    if let Some(rid) = &q.request_id {
-        query = query.bind(rid.clone());
-    }
+    let mut query = bind_log_filters(client.query(&sql), binds);
     if let (Some(before_ms), Some(before_id)) = (q.before_ms, q.before_request_id) {
         query = query.bind(before_ms).bind(before_id.to_string());
     } else if let Some(before_ms) = q.before_ms {
@@ -292,6 +307,194 @@ pub async fn query_usage_logs(
     }
 
     query.fetch_all::<UsageLogRow>().await
+}
+
+/// The request log's histogram: the bucket width used, and each non-empty bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UsageLogHistogram {
+    pub bucket_ms: i64,
+    pub buckets: Vec<UsageLogBucket>,
+}
+
+/// One bucket of the request log's histogram.
+#[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
+pub struct UsageLogBucket {
+    /// Bucket start, unix epoch millis (epoch-aligned).
+    pub bucket_ms: i64,
+    pub requests: u64,
+    /// Requests in the bucket that ended with an HTTP status of 400 or above.
+    pub errors: u64,
+}
+
+/// Most buckets a histogram returns: a strip a few hundred pixels wide needs
+/// no more.
+const MAX_LOG_HISTOGRAM_BUCKETS: i64 = 400;
+
+/// The requested width (default a minute, at least a second), widened until
+/// `[since, until]` fits in [`MAX_LOG_HISTOGRAM_BUCKETS`].
+fn log_histogram_bucket_ms(since: i64, until: i64, requested: Option<i64>) -> i64 {
+    let span = until.saturating_sub(since).max(0);
+    let widths = MAX_LOG_HISTOGRAM_BUCKETS - 1;
+    let min_for_cap = span / widths + i64::from(span % widths != 0);
+    requested.unwrap_or(60_000).max(1_000).max(min_for_cap)
+}
+
+fn usage_log_histogram_sql(bucket: i64, filter: &str) -> String {
+    format!(
+        "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
+         count() as requests, \
+         countIf(status_code >= 400) as errors \
+         from usage{filter} group by bucket_ms order by bucket_ms"
+    )
+}
+
+/// Requests and failures per bucket over the log's window, with the log's
+/// filters. Empty buckets are left out; the caller fills the gaps.
+pub async fn query_usage_log_histogram(
+    client: &clickhouse::Client,
+    q: UsageLogQuery,
+) -> Result<(i64, Vec<UsageLogBucket>), clickhouse::error::Error> {
+    let now = now_ms();
+    let since = q.since_ms.unwrap_or(now - 86_400_000);
+    let until = q.until_ms.unwrap_or(now);
+    let bucket = log_histogram_bucket_ms(since, until, q.bucket_ms);
+    let (filter, binds) = log_filter_sql(&q, since);
+    let sql = usage_log_histogram_sql(bucket, &filter);
+    let rows = bind_log_filters(client.query(&sql), binds)
+        .fetch_all::<UsageLogBucket>()
+        .await?;
+    Ok((bucket, rows))
+}
+
+/// Most values a facet lists.
+const LOG_FACET_LIMIT: u64 = 12;
+
+/// What one facet of the log counts: the dimension's value, how many requests
+/// had it, and how many of those failed.
+#[derive(Debug, Clone, Row, Serialize, Deserialize)]
+pub struct UsageLogFacetRow {
+    pub facet: String,
+    pub requests: u64,
+    pub errors: u64,
+}
+
+/// One value of a facet. `label` is the tenant's or key's name, resolved by
+/// the handler; the other facets leave it empty.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UsageLogFacet {
+    pub value: String,
+    pub label: String,
+    pub requests: u64,
+    pub errors: u64,
+}
+
+/// A status code and model that failed together, the most common first.
+#[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
+pub struct UsageLogFailure {
+    pub status_code: u16,
+    pub model: String,
+    pub requests: u64,
+}
+
+/// `GET /usage/logs/facets`: what the requests matching the log's filters
+/// are made of, each dimension's busiest values first.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UsageLogFacets {
+    pub status_codes: Vec<UsageLogFacet>,
+    pub models: Vec<UsageLogFacet>,
+    pub tenants: Vec<UsageLogFacet>,
+    pub keys: Vec<UsageLogFacet>,
+    pub request_types: Vec<UsageLogFacet>,
+    pub failures: Vec<UsageLogFailure>,
+}
+
+/// The dimensions a facet can count, and the expression that reads each.
+pub const LOG_FACET_DIMENSIONS: &[(&str, &str)] = &[
+    ("status_codes", "toString(status_code)"),
+    ("models", "model"),
+    ("tenants", "toString(tenant_id)"),
+    ("keys", "toString(key_id)"),
+    ("request_types", "request_type"),
+];
+
+fn usage_log_facet_sql(expr: &str, filter: &str) -> String {
+    format!(
+        "select {expr} as facet, \
+         count() as requests, \
+         countIf(status_code >= 400) as errors \
+         from usage{filter} group by facet order by requests desc, facet limit {LOG_FACET_LIMIT}"
+    )
+}
+
+fn usage_log_failures_sql(filter: &str) -> String {
+    format!(
+        "select status_code, model, count() as requests \
+         from usage{filter} and status_code >= 400 \
+         group by status_code, model order by requests desc, model limit {LOG_FACET_LIMIT}"
+    )
+}
+
+/// Each facet of the requests matching the log's filters, and the most common
+/// failures. The reads run together; labels are left to the handler.
+pub async fn query_usage_log_facets(
+    client: &clickhouse::Client,
+    q: UsageLogQuery,
+) -> Result<UsageLogFacets, clickhouse::error::Error> {
+    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let (filter, binds) = log_filter_sql(&q, since);
+    let facet = |expr: &str| {
+        let sql = usage_log_facet_sql(expr, &filter);
+        let query = bind_log_filters(client.query(&sql), binds.clone());
+        async move {
+            let rows = query.fetch_all::<UsageLogFacetRow>().await?;
+            Ok::<_, clickhouse::error::Error>(
+                rows.into_iter()
+                    .map(|r| UsageLogFacet {
+                        value: r.facet,
+                        label: String::new(),
+                        requests: r.requests,
+                        errors: r.errors,
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        }
+    };
+    let failures_sql = usage_log_failures_sql(&filter);
+    let failures =
+        bind_log_filters(client.query(&failures_sql), binds.clone()).fetch_all::<UsageLogFailure>();
+    let dims = LOG_FACET_DIMENSIONS;
+    let (status_codes, models, tenants, keys, request_types, failures) = tokio::try_join!(
+        facet(dims[0].1),
+        facet(dims[1].1),
+        facet(dims[2].1),
+        facet(dims[3].1),
+        facet(dims[4].1),
+        failures,
+    )?;
+    Ok(UsageLogFacets {
+        status_codes,
+        models,
+        tenants,
+        keys,
+        request_types,
+        failures,
+    })
+}
+
+/// `traced_only` subquery. It takes the outer query's resolved `since` so the
+/// span scan is bounded by the same window as the log read rather than the
+/// whole retained `spans` table.
+fn traced_only_filter(since: i64, until_ms: Option<i64>) -> String {
+    let until = until_ms.unwrap_or(i64::MAX);
+    // Safety: `since` and `until` are `i64` — `Display` emits only ASCII
+    // digits (and an optional leading `-`), so there is no SQL-injection
+    // surface. The clickhouse crate (v0.13) scopes bind parameters to the
+    // top-level query string and does not propagate them into subqueries,
+    // making `format!` the correct approach for subquery literals.
+    format!(
+        " AND request_id IN (SELECT DISTINCT request_id FROM spans \
+          WHERE start_ms >= {since} AND start_ms <= {until})"
+    )
 }
 
 /// One row of the daily rollup, shaped by the requested `group_by`. Identity
@@ -342,6 +545,36 @@ pub struct UsageTotals {
     pub cost_usd: f64,
     /// Distinct tenants with at least one request in the window.
     pub active_tenants: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Requests that ended with an HTTP status of 400 or above.
+    pub errors: u64,
+    /// Median time to first token over requests that produced one; 0 when none did.
+    pub p50_ttft_ms: f64,
+    pub avg_ttft_ms: f64,
+    pub energy_wh: f64,
+    pub energy_cost_usd: f64,
+    pub co2_g: f64,
+}
+
+/// Columns are read positionally into [`UsageTotals`], so aliases need not
+/// match field names, and must not: ClickHouse resolves an alias anywhere in
+/// the query, so `sum(input_tokens) as input_tokens` would turn the
+/// `total_tokens` expression into an aggregate of an aggregate and fail the
+/// whole read (which the summary then reports as zeros).
+fn usage_totals_sql(filter: &str) -> String {
+    format!(
+        "select count() as requests, \
+         sum(input_tokens) + sum(output_tokens) as total_tokens, \
+         sum(cost_usd) as cost_usd, \
+         uniqExact(tenant_id) as active_tenants, \
+         sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
+         countIf(status_code >= 400) as errors, \
+         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft_ms, \
+         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms, \
+         sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
+         from usage where ts_ms >= ?{filter}"
+    )
 }
 
 pub async fn query_usage_totals(
@@ -350,14 +583,7 @@ pub async fn query_usage_totals(
     include_internal: Option<bool>,
 ) -> Result<UsageTotals, clickhouse::error::Error> {
     let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let filter = internal_filter(include_internal);
-    let sql = format!(
-        "select count() as requests, \
-         sum(input_tokens) + sum(output_tokens) as total_tokens, \
-         sum(cost_usd) as cost_usd, \
-         uniqExact(tenant_id) as active_tenants \
-         from usage where ts_ms >= ?{filter}"
-    );
+    let sql = usage_totals_sql(&internal_filter(include_internal));
     client
         .query(&sql)
         .bind(since)
@@ -378,6 +604,8 @@ pub struct UsageAgg {
     pub energy_wh: f64,
     pub energy_cost_usd: f64,
     pub co2_g: f64,
+    /// Sum of each request's frozen `cost_usd`.
+    pub cost_usd: f64,
 }
 
 /// Per-key usage aggregate.
@@ -442,6 +670,13 @@ pub struct UsageTimePoint {
     pub output_tokens: u64,
     pub total_tokens: u64,
     pub energy_wh: f64,
+    /// Requests in the bucket that ended with an HTTP status of 400 or above.
+    pub errors: u64,
+    /// Sum of each request's frozen `cost_usd`.
+    pub cost_usd: f64,
+    /// Median time to first token in the bucket; 0 when no request produced one.
+    pub p50_ttft_ms: f64,
+    pub avg_ttft_ms: f64,
 }
 
 #[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
@@ -532,18 +767,11 @@ pub async fn query_usage(
                 "select tenant_id, count() as requests, \
                  sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
                  sum(input_tokens) + sum(output_tokens) as total_tok, \
-                 sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
+                 sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g, \
+                 sum(cost_usd) as cost_usd \
                  from usage where ts_ms >= ?",
             );
-            if q.tenant_id.is_some() {
-                sql.push_str(" and tenant_id = toUUID(?)");
-            }
-            if q.key_id.is_some() {
-                sql.push_str(" and key_id = toUUID(?)");
-            }
-            if q.model.is_some() {
-                sql.push_str(" and model = ?");
-            }
+            sql.push_str(&usage_filter_sql(&q));
             sql.push_str(&internal_filter(q.include_internal));
             sql.push_str(" group by tenant_id");
             bind_usage_filters(client.query(&sql).bind(since), &q)
@@ -558,6 +786,12 @@ pub async fn query_usage_by_key(
     q: UsageQuery,
 ) -> Result<Vec<UsageKeyAgg>, clickhouse::error::Error> {
     let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    bind_usage_filters(client.query(&usage_by_key_sql(&q)).bind(since), &q)
+        .fetch_all::<UsageKeyAgg>()
+        .await
+}
+
+fn usage_by_key_sql(q: &UsageQuery) -> String {
     let mut sql = String::from(
         "select key_id, tenant_id, count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
@@ -565,20 +799,13 @@ pub async fn query_usage_by_key(
          sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
          from usage where ts_ms >= ?",
     );
-    if q.tenant_id.is_some() {
-        sql.push_str(" and tenant_id = toUUID(?)");
-    }
-    if q.key_id.is_some() {
-        sql.push_str(" and key_id = toUUID(?)");
-    }
+    sql.push_str(&usage_filter_sql(q));
     sql.push_str(&internal_filter(q.include_internal));
     sql.push_str(" group by key_id, tenant_id order by total_tok desc");
     if let Some(limit) = q.limit {
         sql.push_str(&format!(" limit {}", limit.min(10_000)));
     }
-    bind_usage_filters(client.query(&sql).bind(since), &q)
-        .fetch_all::<UsageKeyAgg>()
-        .await
+    sql
 }
 
 /// Filters for the per-key usage summary feeds (`/keys/{id}/usage` and
@@ -676,17 +903,40 @@ pub struct KeyUsageSummary {
 }
 
 /// Summary for one key. `last_used_ms` / `last_model` / `last_status_code` are
-/// computed over the full retained ledger for that key (cheap — one key is a
-/// narrow scan), while the request/token/cost columns are limited to the
-/// rolling window. Returns `None` when the key has never appeared in the ledger.
+/// computed over the full retained ledger for that key, while the
+/// request/token/cost columns are limited to the rolling window. Returns `None`
+/// when the key has never appeared in the ledger.
 pub async fn query_key_usage_summary(
     client: &clickhouse::Client,
+    tenant_id: Uuid,
     key_id: Uuid,
     since_ms: Option<i64>,
     include_internal: Option<bool>,
 ) -> Result<Option<KeyUsageSummary>, clickhouse::error::Error> {
     let since = since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let sql = format!(
+    let sql = key_usage_summary_sql(include_internal);
+    let rows = client
+        .query(&sql)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(since)
+        .bind(tenant_id.to_string())
+        .bind(key_id.to_string())
+        .fetch_all::<KeyUsageSummaryRow>()
+        .await?;
+    Ok(rows.into_iter().next().map(KeyUsageSummary::from))
+}
+
+/// The ledger's sort key is `(tenant_id, ts_ms)`, so the tenant predicate is
+/// what lets ClickHouse skip granules; `key_id` alone scans every retained row.
+/// The raw column is qualified so the `tenant_id` SELECT alias cannot shadow it.
+fn key_usage_summary_sql(include_internal: Option<bool>) -> String {
+    format!(
         "select \
          key_id, \
          any(tenant_id) as tenant_id, \
@@ -701,23 +951,10 @@ pub async fn query_key_usage_summary(
          sumIf(energy_wh, ts_ms >= ?) as e_wh, \
          sumIf(energy_cost_usd, ts_ms >= ?) as e_cost_usd, \
          sumIf(co2_g, ts_ms >= ?) as e_co2_g \
-         from usage where key_id = toUUID(?){} group by key_id",
+         from usage where usage.tenant_id = toUUID(?) and key_id = toUUID(?){} \
+         group by key_id",
         internal_filter(include_internal)
-    );
-    let rows = client
-        .query(&sql)
-        .bind(since)
-        .bind(since)
-        .bind(since)
-        .bind(since)
-        .bind(since)
-        .bind(since)
-        .bind(since)
-        .bind(since)
-        .bind(key_id.to_string())
-        .fetch_all::<KeyUsageSummaryRow>()
-        .await?;
-    Ok(rows.into_iter().next().map(KeyUsageSummary::from))
+    )
 }
 
 /// Bulk per-key summary for the dashboard. The window (`since_ms`) bounds the
@@ -767,6 +1004,12 @@ pub async fn query_usage_by_model(
     q: UsageQuery,
 ) -> Result<Vec<UsageModelAgg>, clickhouse::error::Error> {
     let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    bind_usage_filters(client.query(&usage_by_model_sql(&q)).bind(since), &q)
+        .fetch_all::<UsageModelAgg>()
+        .await
+}
+
+fn usage_by_model_sql(q: &UsageQuery) -> String {
     let mut sql = String::from(
         "select model, count() as requests, \
          sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
@@ -786,17 +1029,26 @@ pub async fn query_usage_by_model(
          sum(energy_wh) as energy_wh, sum(energy_cost_usd) as energy_cost_usd, sum(co2_g) as co2_g \
          from usage where ts_ms >= ?",
     );
-    if q.tenant_id.is_some() {
-        sql.push_str(" and tenant_id = toUUID(?)");
-    }
-    if q.model.is_some() {
-        sql.push_str(" and model = ?");
-    }
+    sql.push_str(&usage_filter_sql(q));
     sql.push_str(&internal_filter(q.include_internal));
     sql.push_str(" group by model order by total_tok desc");
-    bind_usage_filters(client.query(&sql).bind(since), &q)
-        .fetch_all::<UsageModelAgg>()
-        .await
+    sql
+}
+
+/// Aliases stay clear of the column names the query reads; see [`usage_totals_sql`].
+fn usage_series_sql(bucket: i64) -> String {
+    format!(
+        "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
+         count() as requests, \
+         sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
+         sum(input_tokens) + sum(output_tokens) as total_tok, \
+         sum(energy_wh) as energy_wh, \
+         countIf(status_code >= 400) as errors, \
+         sum(cost_usd) as cost_usd, \
+         round(if(countIf(ttft_ms > 0) > 0, quantileIf(0.5)(ttft_ms, ttft_ms > 0), 0), 1) as p50_ttft_ms, \
+         round(if(countIf(ttft_ms > 0) > 0, avgIf(ttft_ms, ttft_ms > 0), 0), 1) as avg_ttft_ms \
+         from usage where ts_ms >= ?"
+    )
 }
 
 pub async fn query_usage_series(
@@ -804,15 +1056,8 @@ pub async fn query_usage_series(
     q: UsageSeriesQuery,
 ) -> Result<Vec<UsageTimePoint>, clickhouse::error::Error> {
     let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let bucket = q.bucket_ms.unwrap_or(300_000).max(60_000);
-    let mut sql = format!(
-        "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
-         count() as requests, \
-         sum(input_tokens) as in_tok, sum(output_tokens) as out_tok, \
-         sum(input_tokens) + sum(output_tokens) as total_tok, \
-         sum(energy_wh) as energy_wh \
-         from usage where ts_ms >= ?"
-    );
+    let bucket = series_bucket_ms(since, q.bucket_ms, 60_000, now_ms());
+    let mut sql = usage_series_sql(bucket);
     if q.tenant_id.is_some() {
         sql.push_str(" and tenant_id = toUUID(?)");
     }
@@ -830,7 +1075,7 @@ pub async fn query_usage_series_by_tenant(
     q: UsageSeriesQuery,
 ) -> Result<Vec<TenantUsageTimePoint>, clickhouse::error::Error> {
     let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let bucket = q.bucket_ms.unwrap_or(300_000).max(10_000);
+    let bucket = series_bucket_ms(since, q.bucket_ms, 10_000, now_ms());
     let filter = internal_filter(q.include_internal);
     let sql = format!(
         "select tenant_id, intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
@@ -857,7 +1102,7 @@ pub async fn query_usage_series_by_model(
     q: UsageSeriesQuery,
 ) -> Result<Vec<ModelUsageTimePoint>, clickhouse::error::Error> {
     let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let bucket = q.bucket_ms.unwrap_or(300_000).max(10_000);
+    let bucket = series_bucket_ms(since, q.bucket_ms, 10_000, now_ms());
     let filter = internal_filter(q.include_internal);
     // Per-stream engine rates, NOT volume-over-wall-clock. `gen_tps` is the
     // median decode rate (output tokens over the decode window = total - ttft,
@@ -1050,6 +1295,27 @@ pub async fn query_usage_daily(
             "model",
             "group by tenant_id, key_id, model order by total_tokens desc",
         ),
+        "day_tenant" => (
+            "toString(day)",
+            "tenant_id",
+            "toUUID('00000000-0000-0000-0000-000000000000') as key_id",
+            "'' as model",
+            "group by day, tenant_id order by day, total_tokens desc",
+        ),
+        "day_model" => (
+            "toString(day)",
+            "toUUID('00000000-0000-0000-0000-000000000000') as tenant_id",
+            "toUUID('00000000-0000-0000-0000-000000000000') as key_id",
+            "model",
+            "group by day, model order by day, total_tokens desc",
+        ),
+        "day_key_model" => (
+            "toString(day)",
+            "tenant_id",
+            "key_id",
+            "model",
+            "group by day, tenant_id, key_id, model order by day, total_tokens desc",
+        ),
         _ => (
             "toString(day)",
             "toUUID('00000000-0000-0000-0000-000000000000') as tenant_id",
@@ -1159,6 +1425,24 @@ fn today_day() -> String {
     chrono::Utc::now().format("%Y-%m-%d").to_string()
 }
 
+/// The `where` fragment for the optional [`UsageQuery`] filters. Paired with
+/// [`bind_usage_filters`]: both walk tenant → key → model in the same order, so
+/// every query that uses one must use the other or the placeholder and bind
+/// counts diverge (ClickHouse rejects the query).
+fn usage_filter_sql(q: &UsageQuery) -> String {
+    let mut sql = String::new();
+    if q.tenant_id.is_some() {
+        sql.push_str(" and tenant_id = toUUID(?)");
+    }
+    if q.key_id.is_some() {
+        sql.push_str(" and key_id = toUUID(?)");
+    }
+    if q.model.is_some() {
+        sql.push_str(" and model = ?");
+    }
+    sql
+}
+
 fn bind_usage_filters(
     mut query: clickhouse::query::Query,
     q: &UsageQuery,
@@ -1175,6 +1459,30 @@ fn bind_usage_filters(
     query
 }
 
+/// How many values [`bind_usage_filters`] binds for `q`.
+#[cfg(test)]
+fn usage_filter_bind_count(q: &UsageQuery) -> usize {
+    usize::from(q.tenant_id.is_some())
+        + usize::from(q.key_id.is_some())
+        + usize::from(q.model.is_some())
+}
+
+/// Most buckets a series read may return per series. A wide window with a fine
+/// bucket (or `since_ms=0`) would otherwise return millions of rows.
+pub const MAX_SERIES_BUCKETS: i64 = 5_000;
+
+/// Bucket width for a series read: the requested width (default 5 minutes),
+/// raised to `floor_ms`, then widened until `[since, now]` fits in
+/// [`MAX_SERIES_BUCKETS`].
+fn series_bucket_ms(since: i64, requested: Option<i64>, floor_ms: i64, now: i64) -> i64 {
+    let span = now.saturating_sub(since).max(0);
+    // Buckets are epoch-aligned (`intDiv(ts_ms, b) * b`), so a span covers up
+    // to `span / b + 1` of them; size `b` for `MAX - 1` whole widths.
+    let widths = MAX_SERIES_BUCKETS - 1;
+    let min_for_cap = span / widths + i64::from(span % widths != 0);
+    requested.unwrap_or(300_000).max(floor_ms).max(min_for_cap)
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1184,7 +1492,7 @@ fn now_ms() -> i64 {
 }
 
 /// One row from the `spans` table, returned by the per-request trace endpoint.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, clickhouse::Row)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, clickhouse::Row, ToSchema)]
 pub struct SpanEntry {
     #[serde(with = "clickhouse::serde::uuid")]
     pub request_id: Uuid,
@@ -1257,5 +1565,254 @@ mod internal_filter_tests {
     #[test]
     fn opt_in_disables_the_filter() {
         assert!(internal_filter(Some(true)).is_empty());
+    }
+
+    #[test]
+    fn key_usage_summary_filters_on_the_sort_key_prefix() {
+        let sql = key_usage_summary_sql(None);
+        assert!(
+            sql.contains("where usage.tenant_id = toUUID(?) and key_id = toUUID(?)"),
+            "{sql}"
+        );
+        // 8 window binds + tenant + key.
+        assert_eq!(sql.matches('?').count(), 10, "{sql}");
+    }
+
+    #[test]
+    fn traced_only_subquery_uses_the_outer_window() {
+        let sql = traced_only_filter(1_700_000_000_000, None);
+        assert!(sql.contains("start_ms >= 1700000000000"), "{sql}");
+        assert!(!sql.contains("start_ms >= 0 "), "{sql}");
+        let bounded = traced_only_filter(5, Some(9));
+        assert!(
+            bounded.contains("start_ms >= 5 AND start_ms <= 9"),
+            "{bounded}"
+        );
+    }
+
+    #[test]
+    fn series_bucket_honours_request_and_floor_in_short_windows() {
+        let now = 1_700_000_000_000;
+        let day = 86_400_000;
+        assert_eq!(series_bucket_ms(now - day, None, 60_000, now), 300_000);
+        assert_eq!(
+            series_bucket_ms(now - day, Some(1_000), 60_000, now),
+            60_000
+        );
+        assert_eq!(
+            series_bucket_ms(now - day, Some(3_600_000), 10_000, now),
+            3_600_000
+        );
+        // Future `since` is an empty window, not a negative width.
+        assert_eq!(series_bucket_ms(now + day, None, 10_000, now), 300_000);
+    }
+
+    #[test]
+    fn series_bucket_widens_so_wide_windows_stay_under_the_cap() {
+        let now = 1_700_000_000_123;
+        for (since, requested, floor) in [
+            (0, Some(10_000), 10_000),
+            (0, None, 60_000),
+            (now - 365 * 86_400_000, Some(10_000), 10_000),
+            (now - 30 * 86_400_000, Some(60_000), 60_000),
+        ] {
+            let b = series_bucket_ms(since, requested, floor, now);
+            let first = since.max(0) / b;
+            let last = now / b;
+            assert!(
+                last - first < MAX_SERIES_BUCKETS,
+                "since={since} bucket={b}: {} buckets",
+                last - first + 1
+            );
+        }
+    }
+
+    #[test]
+    fn usage_by_key_and_model_placeholders_match_binds() {
+        let query = |tenant: bool, key: bool, model: bool| UsageQuery {
+            tenant_id: tenant.then(Uuid::new_v4),
+            key_id: key.then(Uuid::new_v4),
+            model: model.then(|| "m".to_string()),
+            since_ms: None,
+            group_by: None,
+            limit: Some(10),
+            include_internal: None,
+        };
+        for tenant in [false, true] {
+            for key in [false, true] {
+                for model in [false, true] {
+                    let q = query(tenant, key, model);
+                    // +1 for `since`, bound ahead of the filters.
+                    let binds = 1 + usage_filter_bind_count(&q);
+                    for sql in [usage_by_key_sql(&q), usage_by_model_sql(&q)] {
+                        assert_eq!(
+                            sql.matches('?').count(),
+                            binds,
+                            "tenant={tenant} key={key} model={model}: {sql}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+
+    /// The select list's top-level expressions, each with its alias.
+    fn select_items(sql: &str) -> Vec<(String, String)> {
+        let body = sql.split_once("select ").unwrap().1;
+        let body = body.split(" from ").next().unwrap();
+        let (mut items, mut depth, mut cur) = (Vec::new(), 0i32, String::new());
+        for c in body.chars() {
+            match c {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                ',' if depth == 0 => {
+                    items.push(std::mem::take(&mut cur));
+                    continue;
+                }
+                _ => {}
+            }
+            cur.push(c);
+        }
+        items.push(cur);
+        items
+            .into_iter()
+            .map(|item| {
+                let (expr, alias) = item.rsplit_once(" as ").expect("every column is aliased");
+                (expr.trim().to_string(), alias.trim().to_string())
+            })
+            .collect()
+    }
+
+    fn reads(expr: &str, column: &str) -> bool {
+        expr.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .any(|word| word == column)
+    }
+
+    /// ClickHouse resolves an alias anywhere in the query, so an alias that
+    /// names a column another expression reads turns that expression into an
+    /// aggregate of an aggregate and fails the read.
+    fn assert_no_shadowing(sql: &str) {
+        let items = select_items(sql);
+        for (i, (_, alias)) in items.iter().enumerate() {
+            for (j, (expr, other)) in items.iter().enumerate() {
+                assert!(
+                    i == j || !reads(expr, alias),
+                    "alias `{alias}` shadows a column that `{other}` reads: {expr}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn totals_aliases_do_not_shadow_columns() {
+        assert_no_shadowing(&usage_totals_sql(""));
+        assert_eq!(select_items(&usage_totals_sql("")).len(), 12);
+    }
+
+    #[test]
+    fn series_aliases_do_not_shadow_columns() {
+        assert_no_shadowing(&usage_series_sql(60_000));
+        assert_eq!(select_items(&usage_series_sql(60_000)).len(), 10);
+    }
+
+    #[test]
+    fn log_histogram_aliases_do_not_shadow_columns() {
+        let sql = usage_log_histogram_sql(60_000, " where ts_ms >= ?");
+        assert_no_shadowing(&sql);
+        assert_eq!(select_items(&sql).len(), 3);
+    }
+
+    fn log_query() -> UsageLogQuery {
+        UsageLogQuery {
+            tenant_id: None,
+            key_id: None,
+            model: None,
+            request_type: None,
+            session_id: None,
+            device_id: None,
+            status: None,
+            status_code: None,
+            request_id: None,
+            since_ms: None,
+            until_ms: None,
+            before_ms: None,
+            before_request_id: None,
+            limit: None,
+            traced_only: None,
+            include_internal: None,
+            bucket_ms: None,
+        }
+    }
+
+    #[test]
+    fn log_filters_bind_one_value_per_placeholder() {
+        let (sql, binds) = log_filter_sql(&log_query(), 0);
+        assert_eq!(sql.matches('?').count(), binds.len());
+        let full = UsageLogQuery {
+            tenant_id: Some(Uuid::nil()),
+            key_id: Some(Uuid::nil()),
+            model: Some("m".into()),
+            request_type: Some("chat".into()),
+            session_id: Some("s".into()),
+            device_id: Some("d".into()),
+            status: Some("error".into()),
+            status_code: Some(502),
+            request_id: Some("7c1e".into()),
+            until_ms: Some(10),
+            traced_only: Some(true),
+            ..log_query()
+        };
+        let (sql, binds) = log_filter_sql(&full, 0);
+        assert_eq!(sql.matches('?').count(), binds.len());
+        assert_eq!(binds.len(), 9);
+        assert!(sql.contains("status_code >= 400"));
+        assert!(sql.contains("status_code = 502"));
+        assert!(sql.contains("FROM spans"));
+    }
+
+    #[test]
+    fn log_facet_aliases_do_not_shadow_columns() {
+        for (_, expr) in LOG_FACET_DIMENSIONS {
+            let sql = usage_log_facet_sql(expr, " where ts_ms >= ?");
+            assert_no_shadowing(&sql);
+            assert_eq!(select_items(&sql).len(), 3);
+        }
+    }
+
+    #[test]
+    fn log_failures_count_only_failures_and_keep_the_filters() {
+        let (filter, binds) = log_filter_sql(
+            &UsageLogQuery {
+                model: Some("m".into()),
+                ..log_query()
+            },
+            0,
+        );
+        let sql = usage_log_failures_sql(&filter);
+        assert!(sql.contains(" and model = ?"));
+        assert!(sql.contains(" and status_code >= 400 group by"));
+        assert_eq!(sql.matches('?').count(), binds.len());
+    }
+
+    #[test]
+    fn log_histogram_buckets_stay_bounded() {
+        // The default minute, raised to a second at least.
+        assert_eq!(log_histogram_bucket_ms(0, 3_600_000, None), 60_000);
+        assert_eq!(log_histogram_bucket_ms(0, 60_000, Some(10)), 1_000);
+        // Ninety days of minutes would be 129,600 buckets: widened to fit 400.
+        let wide = log_histogram_bucket_ms(0, 90 * 86_400_000, None);
+        assert!((90 * 86_400_000) / wide < MAX_LOG_HISTOGRAM_BUCKETS);
+    }
+
+    #[test]
+    fn the_check_catches_the_bug_it_exists_for() {
+        let bad = "select sum(input_tokens) + sum(output_tokens) as total_tokens, \
+                   sum(input_tokens) as input_tokens from usage";
+        assert!(std::panic::catch_unwind(|| assert_no_shadowing(bad)).is_err());
     }
 }

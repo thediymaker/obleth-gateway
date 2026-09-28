@@ -87,6 +87,8 @@ export interface ApiKey {
   /** Contract field: external account systems join on it. */
   identity_subject: string | null;
   identity_claims: Record<string, unknown> | null;
+  weight: number;
+  max_in_flight: number | null;
   budget_tokens: number | null;
   budget_cost_usd: number | null;
   budget_period: string | null;
@@ -114,7 +116,14 @@ export interface ModelRoute {
   description: string;
   upstream_model: string;
   api_base: string;
-  api_key: string | null;
+  /** Whether an upstream key is stored. The key itself is write-only and never returned. */
+  api_key_set: boolean;
+  /**
+   * Names of the headers the gateway adds to every upstream request for this
+   * model. Values are write-only and never returned. Absent from gateways
+   * older than the field.
+   */
+  upstream_header_names?: string[];
   model_type: string;
   /**
    * Weight/activation format this deployment serves, from the gateway's fixed
@@ -127,6 +136,8 @@ export interface ModelRoute {
   cost_per_image: number;
   cost_per_audio_second: number;
   cost_per_character: number;
+  /** Flat USD price of one created job (`video` models). */
+  cost_per_video: number;
   energy_slots_per_node: number;
   /** Multiplier on this model's auto-routing score. 1.0 is neutral. */
   route_bias: number;
@@ -147,8 +158,30 @@ export interface ModelRoute {
   context_window: number;
   admission_weight: number;
   max_in_flight: number | null;
+  /**
+   * `static`, `tuned` or `discovered`. In `discovered` mode the pool size
+   * follows the live backend and `max_in_flight` is only the fallback.
+   */
   capacity_mode: string;
   capacity_tuned_at: string | null;
+  /**
+   * Discovered mode: where serving replicas are counted, `endpoints` (the
+   * model's enabled, healthy endpoints) or `kubernetes` (the ready endpoints
+   * of a Service). The discovery fields are absent from gateways older than
+   * the mode.
+   */
+  capacity_source?: string;
+  /** Kubernetes source: namespace of the Service; null takes the first allowed namespace that has it. */
+  capacity_namespace?: string | null;
+  /** Kubernetes source: Service name; null uses the gateway's default Service template. */
+  capacity_service?: string | null;
+  /**
+   * Requests one replica serves at once. Required in discovered mode on the
+   * kubernetes source, and on endpoints unless every endpoint sets its own.
+   */
+  per_replica_max_in_flight?: number | null;
+  /** Multiplier on the derived pool size; 1 is exactly the ready capacity. */
+  capacity_headroom?: number;
   supports_function_calling: boolean;
   supports_system_messages: boolean;
   supports_response_schema: boolean;
@@ -169,15 +202,35 @@ export interface ModelRoute {
   updated_at: string;
 }
 
+/**
+ * Model fields accepted by create/update. `api_key` is write-only: omit it to
+ * keep the stored key; responses only report `api_key_set`. `upstream_headers`
+ * replaces the model's headers when present (a `null` value keeps the stored
+ * value for that name); omit it to leave them unchanged. Responses only report
+ * `upstream_header_names`.
+ */
+export type ModelWriteFields = Partial<
+  Omit<ModelRoute, "api_key_set" | "upstream_header_names">
+> & {
+  api_key?: string | null;
+  upstream_headers?: Record<string, string | null>;
+};
+
 export interface ModelEndpoint {
   id: string;
   model_id: string;
   name: string;
   api_base: string;
-  api_key: string | null;
+  /** Whether an endpoint key is stored. The key itself is write-only and never returned. */
+  api_key_set: boolean;
   priority: number;
   weight: number;
   enabled: boolean;
+  /**
+   * Requests this endpoint takes at once, counted by a discovered model on the
+   * `endpoints` source. Null uses the model's per-replica value.
+   */
+  max_in_flight?: number | null;
   health_status: string;
   consecutive_failures: number;
   alert_state: string;
@@ -187,6 +240,93 @@ export interface ModelEndpoint {
   last_message: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** The discovered-mode fields sent with a capacity-mode change. */
+export interface CapacityDiscoveryFields {
+  capacity_source: string;
+  capacity_namespace: string | null;
+  capacity_service: string | null;
+  per_replica_max_in_flight: number | null;
+  capacity_headroom: number;
+}
+
+/** What one gateway replica's discovery knows about a discovered model. */
+export interface ModelCapacityStatus {
+  model_name: string;
+  source: string;
+  /** Kubernetes source: the namespaces the Service is looked up in, in order. */
+  namespaces: string[];
+  /** Kubernetes source: the namespace the Service was found in. */
+  namespace: string | null;
+  /** Kubernetes source: the Service whose ready endpoints are counted. */
+  service: string | null;
+  ready_replicas: number | null;
+  /** The value every ready replica shares; null when they differ. */
+  per_replica_max_in_flight: number | null;
+  /** `configured`, `endpoint`, or `endpoint and configured`. */
+  per_replica_source: string | null;
+  /** The ready replicas' concurrency summed: ready × per replica, or each
+   *  endpoint's own value added up. */
+  replica_capacity?: number | null;
+  headroom: number;
+  /** Last value derived from the source: the cluster-wide pool size. */
+  derived_max_in_flight: number | null;
+  /** The cluster-wide pool size in force (derived, last kept, or static). */
+  effective_max_in_flight: number;
+  /** `discovered`, `stale` or `fallback`. */
+  state: string;
+  last_refresh: string | null;
+  last_success: string | null;
+  reason: string | null;
+}
+
+export interface CapacityDiscoveryModelView {
+  model_id: string;
+  model_name: string;
+  enabled: boolean;
+  static_max_in_flight: number | null;
+  /** Pool size the answering gateway enforces: the effective size in shared
+   *  and local mode, its share of it in split and fallback mode. */
+  enforced_max_in_flight: number;
+  /** In-flight requests across every gateway (shared mode only). */
+  cluster_in_flight: number | null;
+  /** The answering gateway's own in-flight requests. */
+  in_flight: number;
+  status: ModelCapacityStatus;
+}
+
+export interface CapacityDiscoveryView {
+  enabled: boolean;
+  interval_secs: number;
+  namespaces: string[];
+  /** Service name template for kubernetes models that name no Service. */
+  default_service: string;
+  replicas: number;
+  /** How the answering gateway enforces pool sizes. */
+  mode?: FairshareSlotMode;
+  models: CapacityDiscoveryModelView[];
+}
+
+/** A Service the kubernetes capacity source can see, from its EndpointSlices. */
+export interface CapacityServiceSummary {
+  service: string;
+  namespace: string;
+  /** Ready, serving, non-terminating endpoints, counted as discovery counts them. */
+  ready: number;
+}
+
+/** GET /capacity/services: the Services in the allowed namespaces. */
+export interface CapacityServicesView {
+  services: CapacityServiceSummary[];
+  /** Why `services` is empty or incomplete, when it is. */
+  reason: string | null;
+  /** Namespaces that could not be listed. */
+  errors: string[];
+  /** With `model`: the Service name that model uses by default, found or not. */
+  default_service: string | null;
+  /** With `model`: that Service, in the first allowed namespace that has it. */
+  default_match: CapacityServiceSummary | null;
 }
 
 export interface ManagedModelSpec {
@@ -258,6 +398,10 @@ export type ClusterResources = {
     cpus: number | null;
     real_memory_mb: number | null;
     features: string[];
+    /** Slurm's state flags, e.g. ["IDLE"] or ["MIXED", "DRAIN"]; absent from older gateways. */
+    state?: string[];
+    alloc_cpus?: number | null;
+    alloc_memory_mb?: number | null;
   }[];
   accounts: string[];
   qos: string[];
@@ -346,6 +490,15 @@ export interface ModelHealthDetail {
   checks: ModelHealthCheck[];
 }
 
+/** What `POST /models/{id}/health/activate` did. */
+export interface ModelActivation {
+  /** Whether the route is on after the call. */
+  enabled: boolean;
+  /** Whether this call is what turned it on. */
+  activated: boolean;
+  detail: ModelHealthDetail;
+}
+
 export interface BulkModelHealthResult {
   checked: ModelHealthDetail[];
   skipped: number;
@@ -384,7 +537,8 @@ export interface McpServer {
   id: string;
   name: string;
   upstream_url: string;
-  auth_header: string | null;
+  /** Whether an upstream Authorization header is stored. The value itself is write-only and never returned. */
+  auth_header_set: boolean;
   enabled: boolean;
   created_at: string;
   updated_at: string;
@@ -396,6 +550,8 @@ export interface UsageAgg {
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
+  /** Absent from gateways older than the field. */
+  cost_usd?: number;
 }
 
 export interface UsageKeyAgg {
@@ -409,6 +565,21 @@ export interface UsageKeyAgg {
 
 /// Per-key activity summary: last-used metadata plus rolling usage totals.
 /// `last_used_ms` is `0` when the key has no requests in the queried range.
+/** `GET /budgets/usage`: one capped budget and how much of its current period is used. */
+export interface BudgetUsage {
+  scope: "tenant" | "key";
+  id: string;
+  tenant_id: string;
+  period: "monthly" | "term" | "lifetime" | string;
+  budget_tokens: number | null;
+  budget_cost_usd: number | null;
+  used_tokens: number;
+  used_cost_usd: number;
+  period_start: string | null;
+  /** When a monthly budget next resets; null for term and lifetime. */
+  resets_at: string | null;
+}
+
 export interface KeyUsageSummary {
   key_id: string;
   tenant_id: string;
@@ -451,6 +622,14 @@ export interface UsageTimePoint {
   input_tokens: number;
   output_tokens: number;
   total_tokens: number;
+  // Absent from gateways older than the fields.
+  energy_wh?: number;
+  /** Requests in the bucket that ended with an HTTP status of 400 or above. */
+  errors?: number;
+  cost_usd?: number;
+  /** Median time to first token in the bucket; 0 when no request produced one. */
+  p50_ttft_ms?: number;
+  avg_ttft_ms?: number;
 }
 
 /// One row of the permanent daily rollup (`usage_daily`).
@@ -528,6 +707,8 @@ export interface UsageLogParams {
   sessionId?: string;
   deviceId?: string;
   status?: UsageLogStatus;
+  /** One exact HTTP status, e.g. 502. */
+  statusCode?: number;
   requestId?: string;
   sinceMs?: number;
   untilMs?: number;
@@ -541,6 +722,31 @@ export interface UsageLogParams {
   includeInternal?: boolean;
 }
 
+/** One value of a log facet; `label` is a tenant's or key's name. */
+export interface UsageLogFacet {
+  value: string;
+  label: string;
+  requests: number;
+  errors: number;
+}
+
+/** `GET /usage/logs/facets`. */
+export interface UsageLogFacets {
+  status_codes: UsageLogFacet[];
+  models: UsageLogFacet[];
+  tenants: UsageLogFacet[];
+  keys: UsageLogFacet[];
+  request_types: UsageLogFacet[];
+  /** Status code and model pairs among the failures, most common first. */
+  failures: { status_code: number; model: string; requests: number }[];
+}
+
+/** `GET /usage/logs/histogram`: the width used, and each non-empty bucket. */
+export interface UsageLogHistogram {
+  bucket_ms: number;
+  buckets: { bucket_ms: number; requests: number; errors: number }[];
+}
+
 export interface UsageRetentionView {
   days: number;
   configured: boolean;
@@ -551,12 +757,25 @@ export interface CompactUsageResult {
   partitions_dropped: number;
 }
 
+/** Counts from `POST /api/v1/resync`: entries republished and evicted. */
+export interface ResyncReport {
+  keys: number;
+  keys_pruned: number;
+  models: number;
+  model_names_pruned: number;
+  mcp_servers: number;
+  mcp_servers_pruned: number;
+}
+
 export type UsageDailyGroupBy =
   | "day"
   | "tenant"
   | "key"
   | "model"
-  | "key_model";
+  | "key_model"
+  | "day_tenant"
+  | "day_model"
+  | "day_key_model";
 
 export interface UsageDailyParams {
   startDay: string;
@@ -578,10 +797,25 @@ export interface CostAgg {
 }
 
 export interface LiveStats {
+  /** The answering gateway's own in-flight requests. */
   in_flight: number;
   queued: number;
+  /** Enabled models' pool sizes as the answering gateway enforces them. */
   max_in_flight: number;
+  /** Live gateway replicas. */
+  replicas?: number;
+  mode?: FairshareSlotMode;
+  /** In-flight requests across every gateway (shared mode only). */
+  cluster_in_flight?: number | null;
 }
+
+/**
+ * How a gateway enforces the fairshare limits: `shared` (cluster-wide slots
+ * in Redis), `split` (each gateway enforces ceil(configured / gateways),
+ * shared slots off), `fallback` (shared slots unavailable, so the split
+ * applies) or `local` (one gateway enforcing the configured values).
+ */
+export type FairshareSlotMode = "local" | "split" | "shared" | "fallback";
 
 /** Wire shape of GET /overview/summary (config counts + windowed usage totals). */
 export interface OverviewSummaryView {
@@ -594,6 +828,25 @@ export interface OverviewSummaryView {
   model_count: number;
   enabled_models: number;
   key_count: number;
+  // Window detail; absent from gateways older than the field.
+  input_tokens?: number;
+  output_tokens?: number;
+  /** Requests that ended with an HTTP status of 400 or above. */
+  errors?: number;
+  /** Median time to first token; 0 when no request produced one. */
+  p50_ttft_ms?: number;
+  avg_ttft_ms?: number;
+  energy_wh?: number;
+  energy_cost_usd?: number;
+  co2_g?: number;
+}
+
+/** A fairshare group: tenants in it split the group's share by tenant weight. */
+export interface FairshareGroup {
+  name: string;
+  weight: number;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface TenantFairshareView {
@@ -607,6 +860,7 @@ export interface TenantFairshareView {
   share_score: number;
   weight_share: number;
   expected_slots: number;
+  max_in_flight?: number | null;
 }
 
 export interface GroupFairshareView {
@@ -621,17 +875,89 @@ export interface GroupFairshareView {
   expected_slots: number;
 }
 
+export interface KeyFairshareView {
+  key_id: string;
+  tenant_id: string;
+  name: string;
+  weight: number;
+  max_in_flight: number | null;
+  in_flight: number;
+  queued: number;
+  served_tokens: number;
+  share_score: number;
+  weight_share: number;
+  expected_slots: number;
+}
+
+export interface ModelPoolView {
+  model: string;
+  /** Slots the answering gateway enforces: `configured_cap`, or its share
+   *  of it in split and fallback mode. */
+  cap: number;
+  /** Pool size as configured: the cluster-wide size. */
+  configured_cap?: number;
+  /** The answering gateway's own in-flight requests. */
+  in_flight: number;
+  /** In-flight requests across every gateway (shared mode only). */
+  cluster_in_flight?: number | null;
+  queued: number;
+  borrowed: number;
+  groups: GroupFairshareView[];
+  tenants: TenantFairshareView[];
+  keys: KeyFairshareView[];
+}
+
 export interface FairshareLiveView {
   algorithm: string;
   max_in_flight: number;
   global_in_flight: number;
   global_queued: number;
+  /** Global in-flight above apportioned caps, borrowed from idle capacity. */
+  global_borrowed?: number;
   groups: GroupFairshareView[];
   tenants: TenantFairshareView[];
   /** Live in-flight request count keyed by model name. */
   model_in_flight?: Record<string, number>;
   /** Live queued request count keyed by model name. */
   model_queued?: Record<string, number>;
+  /** Hard ceiling on global in-flight admission, independent of pool sums,
+   *  as the answering gateway enforces it. */
+  hard_ceiling?: number;
+  /** OBLETH_GLOBAL_MAX_IN_FLIGHT as configured. */
+  configured_hard_ceiling?: number;
+  /** Enabled models' pool sizes as configured, summed: the cluster-wide
+   *  capacity. */
+  configured_max_in_flight?: number;
+  /** Default per-model in-flight cap applied when a model has none configured. */
+  default_model_max_in_flight?: number;
+  /** Live gateway replicas. */
+  replicas?: number;
+  /** How the answering gateway enforces the limits. */
+  mode?: FairshareSlotMode;
+  /** Whether shared slots are configured (OBLETH_FAIRSHARE_SHARED_SLOTS). */
+  shared_slots?: boolean;
+  /** Whether the split applies when shared slots are off or unavailable
+   *  (OBLETH_FAIRSHARE_REPLICA_AWARE). */
+  replica_aware?: boolean;
+  /** In-flight requests across every gateway (shared mode only). Every other
+   *  count in the view is the answering gateway's own. */
+  cluster_in_flight?: number | null;
+  keys?: KeyFairshareView[];
+  pools?: ModelPoolView[];
+}
+
+export interface FairshareHistoryPoint {
+  ts_ms: number;
+  in_flight: number;
+  queued: number;
+  /** Group name to in-flight slots. */
+  groups: Record<string, number>;
+}
+export interface FairshareHistoryView {
+  interval_ms: number;
+  retention_ms: number;
+  oldest_ts_ms: number | null;
+  points: FairshareHistoryPoint[];
 }
 
 export interface TenantUsageTimePoint {
@@ -666,6 +992,28 @@ export interface UsageBreakdownEntry {
   fairshare_group: string;
   key_name: string;
   key_prefix: string;
+}
+
+export interface AuditParams {
+  limit?: number;
+  actor?: string;
+  entityType?: string;
+  entityId?: string;
+  /** One action or several, comma-separated. */
+  action?: string;
+  /** RFC 3339. */
+  since?: string;
+  until?: string;
+  beforeId?: number;
+  q?: string;
+}
+
+/** `GET /stats/daily`: each MCP server's or collection's counters per day (UTC). */
+export interface DailyStatsView {
+  kind: "mcp" | "knowledge";
+  /** The days covered, oldest first. */
+  days: string[];
+  items: { id: string; days: { day: string; counts: Record<string, number> }[] }[];
 }
 
 export interface AuditEntry {
@@ -796,6 +1144,7 @@ export interface AutoRouterSettingsView {
   temperature: number;
   difficulty_enabled: boolean;
   tier_source: "hybrid" | "derived" | "declared";
+  messages_default_model: string | null;
 }
 
 export interface UpdateAutoRouterSettings {
@@ -809,6 +1158,7 @@ export interface UpdateAutoRouterSettings {
   temperature?: number;
   difficulty_enabled?: boolean;
   tier_source?: "hybrid" | "derived" | "declared";
+  messages_default_model?: string | null;
 }
 
 /// Where a request's routing intent came from. `classifier` never appears in a
@@ -937,6 +1287,8 @@ export interface BoonSettingsView {
   tool_loop_max_turns: number;
   tool_loop_tool_timeout_ms: number;
   tool_loop_nudge: string;
+  /** Wall-clock budget for a whole tool-loop request, in seconds. */
+  tool_loop_deadline_secs: number;
   compression_enabled: boolean;
   compression_min_tokens: number;
   compression_max_segments: number;
@@ -996,6 +1348,7 @@ export interface UpdateBoonSettings {
   tool_loop_max_turns?: number;
   tool_loop_tool_timeout_ms?: number;
   tool_loop_nudge?: string;
+  tool_loop_deadline_secs?: number;
   compression_enabled?: boolean;
   compression_min_tokens?: number;
   compression_max_segments?: number;
@@ -1391,6 +1744,19 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify({ weight }),
     }),
+  listFairshareGroups: () => api<FairshareGroup[]>("/fairshare/groups"),
+  createFairshareGroup: (name: string, weight = 100, options?: AuditOptions) =>
+    api<FairshareGroup>("/fairshare/groups", {
+      method: "POST",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ name, weight }),
+    }),
+  setFairshareGroupWeight: (name: string, weight: number, options?: AuditOptions) =>
+    api<FairshareGroup>(`/fairshare/groups/${encodeURIComponent(name)}/weight`, {
+      method: "PATCH",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ weight }),
+    }),
   setQuota: (
     id: string,
     tokens_per_minute: number,
@@ -1483,6 +1849,13 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify({ policy }),
     }),
+  /** Move a tenant into another fairshare group (one with no weight shares at the default). */
+  setTenantGroup: (id: string, fairshare_group: string, options?: AuditOptions) =>
+    api<Tenant>(`/tenants/${id}/group`, {
+      method: "PATCH",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ fairshare_group }),
+    }),
   deleteTenant: (id: string, options?: AuditOptions) =>
     api<void>(`/tenants/${id}`, {
       method: "DELETE",
@@ -1497,6 +1870,8 @@ export const obleth = {
     body: {
       name: string;
       description?: string;
+      weight?: number;
+      max_in_flight?: number | null;
       budget_tokens?: number | null;
       budget_cost_usd?: number | null;
       budget_period?: string | null;
@@ -1514,6 +1889,8 @@ export const obleth = {
     body: {
       name: string;
       description?: string;
+      weight?: number;
+      max_in_flight?: number | null;
       budget_tokens?: number | null;
       budget_cost_usd?: number | null;
       budget_period?: string | null;
@@ -1526,6 +1903,15 @@ export const obleth = {
       headers: auditActorHeaders(options),
       body: JSON.stringify(body),
     }),
+  /** Move a key to another tenant, keeping its secret and settings. */
+  moveKey: (id: string, tenant_id: string, options?: AuditOptions) =>
+    api<ApiKey>(`/keys/${id}/tenant`, {
+      method: "PUT",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ tenant_id }),
+    }),
+  /** Every capped tenant and key budget, with its current period's use from the enforcement counters. */
+  budgetUsage: () => api<BudgetUsage[]>("/budgets/usage"),
   setKeyDisabled: (id: string, disabled: boolean, options?: AuditOptions) =>
     api<void>(`/keys/${id}/disabled`, {
       method: "PUT",
@@ -1568,7 +1954,7 @@ export const obleth = {
       next: { revalidate: LIST_REVALIDATE_SECS, tags: [CACHE_TAGS.models] },
     }),
   createModel: (
-    body: Partial<ModelRoute> & {
+    body: ModelWriteFields & {
       model_name: string;
       upstream_model: string;
       api_base: string;
@@ -1582,7 +1968,7 @@ export const obleth = {
     }),
   updateModel: (
     id: string,
-    body: Partial<ModelRoute> & { upstream_model: string; api_base: string },
+    body: ModelWriteFields & { upstream_model: string; api_base: string },
     options?: AuditOptions,
   ) =>
     api<ModelRoute>(`/models/${id}`, {
@@ -1605,6 +1991,12 @@ export const obleth = {
     api<ModelHealthDetail>(`/models/${id}/health`),
   checkModelHealth: (id: string) =>
     api<ModelHealthDetail>(`/models/${id}/health/check`, { method: "POST" }),
+  /** Probe a switched-off model and turn it on if the probe comes back healthy. */
+  activateModel: (id: string, options?: AuditOptions) =>
+    api<ModelActivation>(`/models/${id}/health/activate`, {
+      method: "POST",
+      headers: auditActorHeaders(options),
+    }),
   checkAllModelHealth: () =>
     api<BulkModelHealthResult>("/models/health/check", { method: "POST" }),
   setModelHealthConfig: (
@@ -1640,13 +2032,17 @@ export const obleth = {
   setModelCapacityMode: (
     id: string,
     capacity_mode: string,
+    fields?: CapacityDiscoveryFields,
     options?: AuditOptions,
   ) =>
     api<ModelRoute>(`/models/${id}/capacity-mode`, {
       method: "PUT",
       headers: auditActorHeaders(options),
-      body: JSON.stringify({ capacity_mode }),
+      body: JSON.stringify({ capacity_mode, ...(fields ?? {}) }),
     }),
+  capacityDiscovery: () => api<CapacityDiscoveryView>("/capacity/discovery"),
+  capacityServices: (model?: string) =>
+    api<CapacityServicesView>(`/capacity/services${model ? `?model=${encodeURIComponent(model)}` : ""}`),
   autotuneModel: (
     id: string,
     opts?: {
@@ -1750,6 +2146,8 @@ export const obleth = {
       method: "DELETE",
       headers: auditActorHeaders(options),
     }),
+  /** Every replica of every managed model. */
+  listAllReplicas: () => api<ModelReplica[]>("/replicas"),
   listReplicas: (id: string) =>
     api<ModelReplica[]>(`/models/${id}/replicas`),
   clearLostReplicas: (id: string, options?: AuditOptions) =>
@@ -1771,6 +2169,7 @@ export const obleth = {
       priority?: number;
       weight?: number;
       enabled?: boolean;
+      max_in_flight?: number | null;
     },
     options?: AuditOptions,
   ) =>
@@ -1789,6 +2188,7 @@ export const obleth = {
       priority?: number;
       weight?: number;
       enabled?: boolean;
+      max_in_flight?: number | null;
     },
     options?: AuditOptions,
   ) =>
@@ -1820,7 +2220,7 @@ export const obleth = {
     }),
   updateMcpServer: (
     id: string,
-    body: { upstream_url: string; auth_header?: string; enabled?: boolean },
+    body: { upstream_url: string; auth_header?: string; clear_auth?: boolean; enabled?: boolean; name?: string },
     options?: AuditOptions,
   ) =>
     api<McpServer>(`/mcp-servers/${id}`, {
@@ -1923,12 +2323,52 @@ export const obleth = {
         session_id: params.sessionId,
         device_id: params.deviceId,
         status: params.status,
+        status_code: params.statusCode,
         request_id: params.requestId,
         since_ms: params.sinceMs,
         until_ms: params.untilMs,
         before_ms: params.beforeMs,
         before_request_id: params.beforeRequestId,
         limit: params.limit,
+        traced_only: params.tracedOnly ? "true" : undefined,
+        include_internal: params.includeInternal ? "true" : undefined,
+      })}`,
+    ),
+  /** Requests and failures per bucket, counted with the log's own filters. */
+  usageLogHistogram: (params: UsageLogParams & { bucketMs?: number } = {}) =>
+    api<UsageLogHistogram>(
+      `/usage/logs/histogram${qs({
+        tenant_id: params.tenantId,
+        key_id: params.keyId,
+        model: params.model,
+        request_type: params.requestType,
+        session_id: params.sessionId,
+        device_id: params.deviceId,
+        status: params.status,
+        status_code: params.statusCode,
+        request_id: params.requestId,
+        since_ms: params.sinceMs,
+        until_ms: params.untilMs,
+        traced_only: params.tracedOnly ? "true" : undefined,
+        include_internal: params.includeInternal ? "true" : undefined,
+        bucket_ms: params.bucketMs,
+      })}`,
+    ),
+  /** What the requests matching the log's filters are made of, busiest first. */
+  usageLogFacets: (params: UsageLogParams = {}) =>
+    api<UsageLogFacets>(
+      `/usage/logs/facets${qs({
+        tenant_id: params.tenantId,
+        key_id: params.keyId,
+        model: params.model,
+        request_type: params.requestType,
+        session_id: params.sessionId,
+        device_id: params.deviceId,
+        status: params.status,
+        status_code: params.statusCode,
+        request_id: params.requestId,
+        since_ms: params.sinceMs,
+        until_ms: params.untilMs,
         traced_only: params.tracedOnly ? "true" : undefined,
         include_internal: params.includeInternal ? "true" : undefined,
       })}`,
@@ -1951,11 +2391,37 @@ export const obleth = {
       method: "POST",
       headers: auditActorHeaders(options),
     }),
+  resync: (options?: AuditOptions) =>
+    api<ResyncReport>("/resync", {
+      method: "POST",
+      headers: auditActorHeaders(options),
+    }),
   stats: () => api<LiveStats>("/stats"),
   overviewSummary: (sinceMs?: number) =>
     api<OverviewSummaryView>(`/overview/summary${qs({ since_ms: sinceMs })}`),
   fairshareLive: () => api<FairshareLiveView>("/fairshare/live"),
+  fairshareHistory: (params: { since_ms?: number; model?: string } = {}) =>
+    api<FairshareHistoryView>(
+      `/fairshare/history${qs({ since_ms: params.since_ms, model: params.model })}`,
+    ),
   audit: (limit = 100) => api<AuditEntry[]>(`/audit?limit=${limit}`),
+  /** The audit log narrowed by who, what and when; page back with `before_id`. */
+  auditQuery: (params: AuditParams = {}) =>
+    api<AuditEntry[]>(
+      `/audit${qs({
+        limit: params.limit,
+        actor: params.actor,
+        entity_type: params.entityType,
+        entity_id: params.entityId,
+        action: params.action,
+        since: params.since,
+        until: params.until,
+        before_id: params.beforeId,
+        q: params.q,
+      })}`,
+    ),
+  /** Daily counters the proxy keeps: MCP calls per server, knowledge searches per collection. */
+  dailyStats: (kind: "mcp" | "knowledge", days = 7) => api<DailyStatsView>(`/stats/daily${qs({ kind, days })}`),
   getCapacity: () => api<{ max_in_flight: number }>("/capacity"),
   setCapacity: (max_in_flight: number, options?: AuditOptions) =>
     api<{ max_in_flight: number }>("/capacity", {

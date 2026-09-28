@@ -20,6 +20,16 @@ git tag v0.3.0
 git push origin main v0.3.0
 ```
 
+```bash
+# 3. Once the tag pipeline is green, move every running deployment to the
+#    release. The chart's empty image tags resolve to v{appVersion}, so one
+#    chart upgrade carries the compressor and every other component along;
+#    --reuse-values keeps any deliberate per-environment overrides (such as
+#    edge :dev tags) intact. A release is not done until this has run.
+helm upgrade obleth oci://ghcr.io/thediymaker/charts/obleth \
+  --version 0.3.0 --namespace obleth --reuse-values
+```
+
 Pushing the tag triggers `.github/workflows/release.yml`, which:
 
 1. **verify** — fails fast if the tag doesn't match the version in the files
@@ -41,7 +51,7 @@ before the first stable tag of a version.
 ## Version surfaces
 
 - Gateway: `GET /api/v1/version` (public) — version, git SHA, build timestamp.
-- Dashboard: Settings → Version card (also compares against the latest GitHub
+- Dashboard: Settings → About (also compares against the latest GitHub
   release) and the user menu footer.
 - CI guard: the `versions` job in `ci.yml` fails any PR where the five version
   declarations drift apart.
@@ -63,4 +73,4 @@ toward a release.
       private and unauthenticated pulls 403 until flipped.
 - [ ] Verify `docker pull ghcr.io/thediymaker/obleth-gateway/obleth:latest`
       works logged out.
-- [ ] Verify the dashboard Settings → Version card reports "Up to date".
+- [ ] Verify the dashboard Settings → About shows the gateway as "Latest".

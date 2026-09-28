@@ -16,6 +16,7 @@
 #     -f deploy/k8s/obleth/examples/values-ephemeral.yaml \
 #     --set obleth.adminToken="$(openssl rand -hex 32)" \
 #     --set postgres.password=devpassword \
+#     --set redis.password=devpassword \
 #     --set clickhouse.password=devpassword \
 #     --set controlPlane.dashboardPassword=devpassword \
 #     --set controlPlane.dashboardSessionSecret=dev-session-secret-at-least-32-chars

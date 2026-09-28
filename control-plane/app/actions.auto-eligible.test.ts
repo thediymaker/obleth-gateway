@@ -26,13 +26,14 @@ const model = (over: Record<string, unknown> = {}) => ({
   description: "",
   upstream_model: "up",
   api_base: "http://a",
-  api_key: null,
+  api_key_set: false,
   model_type: "chat",
   input_cost_per_token: 0,
   output_cost_per_token: 0,
   cost_per_image: 0,
   cost_per_audio_second: 0,
   cost_per_character: 0,
+  cost_per_video: 0,
   energy_slots_per_node: 1,
   route_bias: 1,
   auto_eligible: true,
@@ -74,14 +75,16 @@ async function connectionUpdate(current: Record<string, unknown>, fd: FormData) 
     CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
     OblethApiError: class OblethApiError extends Error {},
   }));
-  const { updateModelConnectionAction } = await import("./actions");
-  await updateModelConnectionAction(null, fd);
+  const { saveModelSettingsAction } = await import("./actions");
+  await saveModelSettingsAction(fd);
   return updateModel;
 }
 
 function connectionForm(over: Record<string, string> = {}) {
   const fd = new FormData();
   fd.set("id", "m-1");
+  fd.set("sections", "model");
+  fd.set("has_routing", "1");
   fd.set("upstream_model", "up");
   fd.set("api_base", "http://a");
   for (const [k, v] of Object.entries(over)) fd.set(k, v);
@@ -115,10 +118,10 @@ describe("auto-router eligibility round-trips through the model form", () => {
     expect(updateModel.mock.calls[0][1].auto_eligible).toBe(true);
   });
 
-  it("leaves eligibility untouched when saving an unrelated tab", async () => {
-    // The Capabilities tab never renders the eligibility control, so its save
-    // must carry the stored value through instead of reading an absent field
-    // as an exclusion.
+  it("leaves eligibility untouched when the form has no Routing section", async () => {
+    // A form without the Routing section (a non-chat model's page) never
+    // renders the eligibility control, so its save must carry the stored
+    // value through instead of reading an absent field as an exclusion.
     mockAdmin();
     const updateModel = vi.fn().mockResolvedValue({});
     vi.doMock("@/lib/obleth", () => ({
@@ -129,12 +132,14 @@ describe("auto-router eligibility round-trips through the model form", () => {
       CACHE_TAGS: new Proxy({}, { get: () => "tag" }),
       OblethApiError: class OblethApiError extends Error {},
     }));
-    const { updateModelCapabilitiesAction } = await import("./actions");
+    const { saveModelSettingsAction } = await import("./actions");
     const fd = new FormData();
     fd.set("id", "m-1");
+    fd.set("sections", "model");
+    fd.set("has_tags", "1");
     fd.set("tag_coding", "on");
     fd.set("tag_level_coding", "1");
-    await updateModelCapabilitiesAction(null, fd);
+    await saveModelSettingsAction(fd);
     expect(updateModel.mock.calls[0][1].auto_eligible).toBe(false);
   });
 });

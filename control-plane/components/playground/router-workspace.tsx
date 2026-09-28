@@ -1,14 +1,16 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Loader2, Wand2 } from "lucide-react";
+import { Check, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Label } from "@/components/ui/label";
+import { Input } from "@/components/ui/input";
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { setAutoRouterSettingsAction } from "@/app/actions";
 import type { RouteExplainView, SimulateRouteRequest } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
-import { RouteExplainPanel } from "./route-explain";
-import { ROUTER_PROMPT_MAX_LENGTH, type PlaygroundSession } from "./playground";
+import { RouteDecision } from "./route-decision";
+import { ROUTER_PROMPT_MAX_LENGTH, type PendingAction, type PlaygroundSession } from "./playground";
+import { Pill, SectionLabel, Segmented, SettingsPanel, SliderField, Switch } from "./ui";
 
 const DEBOUNCE_MS = 300;
 const EPSILON = 1e-6;
@@ -27,31 +29,17 @@ async function postSimulate(body: SimulateRouteRequest, signal: AbortSignal): Pr
   return (await res.json()) as RouteExplainView;
 }
 
-function WeightSlider({ id, label, hint, value, onChange, min, max, step, valueLabel }: {
-  id: string; label: string; hint: string; value: number; onChange: (value: number) => void;
-  min: number; max: number; step: number; valueLabel?: string;
-}) {
-  return (
-    <div className="space-y-1.5">
-      <div className="flex items-center justify-between gap-2">
-        <Label htmlFor={id}>{label}</Label>
-        <span className="text-xs font-medium tabular-nums text-foreground">{valueLabel ?? value.toFixed(2)}</span>
-      </div>
-      <input id={id} type="range" min={min} max={max} step={step} value={value} onChange={(e) => onChange(Number(e.target.value))}
-        className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-muted accent-foreground" />
-      <p className="text-[11px] text-muted-foreground">{hint}</p>
-    </div>
-  );
-}
-
 /**
  * The Router mode of the Playground: paste a prompt, tune the auto-router's
  * weights, and see a live A/B between what the *saved* (live) weights would
  * pick and what the *edited* weights on screen would pick. Sliders only
- * simulate — `Apply to gateway` is the sole path that writes settings.
+ * simulate — `Apply to gateway`, behind a confirmation that lists every
+ * change, is the sole path that writes settings.
  */
-export function RouterWorkspace({ session, update }: {
+export function RouterWorkspace({ session, update, settingsOpen = true, onOpenSession }: {
   session: PlaygroundSession; update: (patch: Partial<PlaygroundSession>) => void;
+  settingsOpen?: boolean;
+  onOpenSession?: (seed: Partial<PlaygroundSession>, action?: PendingAction) => void;
 }) {
   // Kept on the session, not local state, so the form survives switching to
   // Chat mode and back — that toggle remounts this component. (Weights are
@@ -83,6 +71,7 @@ export function RouterWorkspace({ session, update }: {
   const [error, setError] = useState<string | null>(null);
   const [applying, setApplying] = useState(false);
   const [applyStatus, setApplyStatus] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState(false);
 
   // Seed the sliders from the saved weights the first time a baseline
   // response arrives, so the panel opens showing the fleet's real settings
@@ -206,75 +195,152 @@ export function RouterWorkspace({ session, update }: {
     update(patch);
   }
 
+  function resetToLive() {
+    if (!baseline) return;
+    setCapacityWeight(baseline.weights.capacity);
+    setCostWeight(baseline.weights.cost);
+    setTagWeight(baseline.weights.tag);
+    setSoftCap(baseline.weights.soft_cap);
+    setTemperature(baseline.temperature);
+    setDifficultyEnabled(baseline.weights.difficulty_enabled);
+  }
+
   const current = edited ?? baseline;
+  // What Apply would change, spelled out for the confirmation.
+  const changes = !baseline ? [] : [
+    { label: "Capacity weight", from: baseline.weights.capacity.toFixed(2), to: capacityWeight.toFixed(2) },
+    { label: "Cost weight", from: baseline.weights.cost.toFixed(2), to: costWeight.toFixed(2) },
+    { label: "Tag weight", from: baseline.weights.tag.toFixed(2), to: tagWeight.toFixed(2) },
+    { label: "Temperature", from: baseline.temperature.toFixed(2), to: temperature.toFixed(2) },
+    { label: "Default soft cap", from: String(baseline.weights.soft_cap), to: String(Math.round(softCap)) },
+    { label: "Difficulty tiering", from: baseline.weights.difficulty_enabled ? "on" : "off", to: difficultyEnabled ? "on" : "off" },
+  ].filter((c) => c.from !== c.to);
+  /** The live value to strike through beside a slider, only when the draft differs. */
+  const liveOf = (live: number | undefined, edited: number, digits = 2) =>
+    live !== undefined && Math.abs(live - edited) > EPSILON ? live.toFixed(digits) : undefined;
+  const needs = [
+    { label: "Function calling", on: needsFunctionCalling, key: "routerNeedsFunctionCalling" as const },
+    { label: "Forced tool choice", on: needsToolChoice, key: "routerNeedsToolChoice" as const },
+    { label: "Response schema", on: needsResponseSchema, key: "routerNeedsResponseSchema" as const },
+  ];
+  const openInChat = (model: string) => onOpenSession?.({ title: prompt.trim().slice(0, 60) || "Routed chat", mode: "compare", models: [model], chatDraft: prompt });
 
   return (
-    <div className="flex h-full min-h-0 flex-col overflow-y-auto">
-      <div className="space-y-3 border-b border-border p-4">
-        <label className="block text-xs font-medium">
-          Prompt
-          <textarea
-            aria-label="Prompt"
-            rows={3}
-            maxLength={ROUTER_PROMPT_MAX_LENGTH}
-            value={prompt}
-            onChange={(e) => onPromptChange(e.target.value)}
-            placeholder="Paste or write the request you want to see routed…"
-            className="mt-1 w-full resize-y rounded-md border border-border bg-background p-2 text-sm outline-none focus:ring-1 focus:ring-ring"
-          />
-        </label>
-      </div>
-
-      <div className="space-y-3 border-b border-border bg-secondary/10 p-4">
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
-            <Wand2 className="h-4 w-4 text-violet-500" aria-hidden="true" />
-            <span className="text-sm font-medium">Weights</span>
-            <span
-              className={cn(
-                "rounded-full px-2 py-0.5 text-xs font-medium",
-                weightStatus === "edited" && "bg-amber-500/15 text-amber-600 dark:text-amber-400",
-                weightStatus === "matches" && "bg-emerald-500/15 text-emerald-600 dark:text-emerald-400",
-                weightStatus === "unavailable" && "bg-muted text-muted-foreground",
-              )}
-            >
-              {weightStatus === "edited" ? "✎ edited" : weightStatus === "matches" ? "matches live" : "live weights unavailable"}
-            </span>
-            {busy && <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" aria-hidden="true" />}
+    <div className="relative flex h-full min-h-0">
+      <section aria-label="Routing simulation" className="min-w-0 flex-1 overflow-y-auto px-4 py-5 md:px-6">
+        <div className="mx-auto max-w-4xl space-y-4">
+          <div className="rounded-2xl border border-border bg-card focus-within:border-muted-foreground/50">
+            <SectionLabel htmlFor="router-prompt" className="block px-4 pt-3">Prompt to route</SectionLabel>
+            <textarea
+              id="router-prompt"
+              aria-label="Prompt"
+              rows={3}
+              maxLength={ROUTER_PROMPT_MAX_LENGTH}
+              value={prompt}
+              onChange={(e) => onPromptChange(e.target.value)}
+              placeholder="Paste or write the request you want to see routed…"
+              className="block w-full resize-y bg-transparent px-4 pb-2 pt-1.5 text-sm leading-relaxed outline-none placeholder:text-muted-foreground"
+            />
+            <div className="flex flex-wrap items-center gap-1.5 border-t border-border px-3 pb-3 pt-2.5">
+              <span className="mr-1 text-xs text-muted-foreground">Request needs</span>
+              {needs.map((n) => (
+                <button key={n.key} type="button" aria-pressed={n.on} onClick={() => update({ [n.key]: !n.on })}
+                  className={cn("inline-flex h-[30px] items-center gap-1.5 rounded-lg border px-2.5 text-[12.5px]", n.on ? "border-muted-foreground/40 bg-secondary text-foreground" : "border-border text-muted-foreground hover:text-foreground")}>
+                  <span className={cn("flex h-3.5 w-3.5 items-center justify-center rounded", n.on ? "bg-foreground text-background" : "border-[1.5px] border-muted-foreground/60")}>{n.on && <Check className="h-2.5 w-2.5" strokeWidth={3} />}</span>
+                  {n.label}
+                </button>
+              ))}
+              <span className="ml-auto flex items-center gap-1.5 text-xs text-muted-foreground">
+                {busy && <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />}
+                {busy ? "Simulating…" : "Updates as you type"}
+              </span>
+            </div>
           </div>
-          <Button size="sm" onClick={() => void applyToGateway()} disabled={applying || !dirty}>
-            {applying ? "Applying…" : "Apply to gateway"}
-          </Button>
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-          <WeightSlider id="router-capacity-weight" label="Capacity" hint="Idle capacity's influence on the ranking." value={capacityWeight} onChange={setCapacityWeight} min={0} max={1} step={0.05} />
-          <WeightSlider id="router-cost-weight" label="Cost" hint="Price's influence on the ranking." value={costWeight} onChange={setCostWeight} min={0} max={1} step={0.05} />
-          <WeightSlider id="router-tag-weight" label="Tag" hint="Topic match's influence on the ranking." value={tagWeight} onChange={setTagWeight} min={0} max={1} step={0.05} />
-        </div>
-        <div className="grid gap-4 sm:grid-cols-2">
-          <WeightSlider id="router-temperature" label="Temperature" hint="0 always picks the top scorer; higher spreads traffic across close scorers." value={temperature} onChange={setTemperature} min={0} max={2} step={0.1} valueLabel={temperature === 0 ? "Deterministic" : temperature.toFixed(1)} />
-          <WeightSlider id="router-soft-cap" label="Default soft cap" hint="Assumed concurrency ceiling for models with no explicit limit." value={softCap} onChange={setSoftCap} min={1} max={64} step={1} valueLabel={String(Math.round(softCap))} />
-        </div>
-        <div className="flex flex-wrap items-center gap-4">
-          <label className="flex items-center gap-2 text-xs">
-            <input type="checkbox" checked={difficultyEnabled} onChange={(e) => setDifficultyEnabled(e.target.checked)} className="h-3.5 w-3.5" />
-            Difficulty tiering
-          </label>
-          <label className="flex items-center gap-2 text-xs" title="Derive tags and difficulty with the live classifier model (one small model call per simulation), exactly as serving does. Unchecked, a keyword heuristic guesses instead — its tags can differ from what a real request would get.">
-            <input type="checkbox" checked={classifyLive} onChange={(e) => setClassifyLive(e.target.checked)} className="h-3.5 w-3.5" />
-            Live classifier
-          </label>
-        </div>
-        {applyStatus && <p role="status" className="text-xs text-muted-foreground">{applyStatus}</p>}
-      </div>
 
-      <div className="flex-1 p-4">
-        {error && <p role="alert" className="mb-3 text-xs text-destructive">{error}</p>}
-        {!current && !busy && !error && (
-          <p className="text-sm text-muted-foreground">Enter a prompt above to see how the auto-router would score it.</p>
-        )}
-        {current && <RouteExplainPanel explain={current} baseline={baseline ?? undefined} />}
-      </div>
+          {error && <p role="alert" className="rounded-xl border border-border bg-secondary/50 px-3.5 py-2.5 text-sm">{error}</p>}
+          {!current && !busy && !error && (
+            <p className="rounded-xl border border-dashed border-border p-6 text-center text-sm text-muted-foreground">Enter a prompt above to see how the auto-router would score it.</p>
+          )}
+          {current && <RouteDecision explain={current} baseline={dirty ? baseline ?? undefined : undefined} onOpenInChat={onOpenSession && prompt.trim() ? openInChat : undefined} />}
+        </div>
+      </section>
+
+      {settingsOpen && (
+        <SettingsPanel
+          title="Router weights"
+          label="Router settings"
+          action={weightStatus === "edited" ? <Pill inverted>Draft</Pill> : <span className="text-xs text-muted-foreground">{weightStatus === "matches" ? "Matches live" : "Live weights unavailable"}</span>}
+          footer={
+            <>
+              <div className="flex gap-2">
+                <Button variant="outline" className="flex-1" disabled={!dirty || applying} onClick={resetToLive}>Reset to live</Button>
+                <Button className="flex-1" disabled={applying || !dirty} onClick={() => setConfirming(true)}>{applying ? "Applying…" : "Apply to gateway…"}</Button>
+              </div>
+              {applyStatus
+                ? <p role="status" className="text-[11.5px] text-secondary-foreground">{applyStatus}</p>
+                : <p className="text-[11.5px] leading-snug text-muted-foreground">Try weights here without touching live traffic. Applying changes routing for everything sent to auto.</p>}
+            </>
+          }
+        >
+          <section className="space-y-4">
+            <SliderField id="router-capacity-weight" label="Capacity" value={capacityWeight} onChange={setCapacityWeight} min={0} max={1} step={0.05} live={liveOf(baseline?.weights.capacity, capacityWeight)} hint="Idle capacity's influence on the ranking." />
+            <SliderField id="router-cost-weight" label="Cost" value={costWeight} onChange={setCostWeight} min={0} max={1} step={0.05} live={liveOf(baseline?.weights.cost, costWeight)} hint="Price's influence on the ranking." />
+            <SliderField id="router-tag-weight" label="Tag match" value={tagWeight} onChange={setTagWeight} min={0} max={1} step={0.05} live={liveOf(baseline?.weights.tag, tagWeight)} hint="Topic match's influence on the ranking." />
+            <SliderField id="router-temperature" label="Temperature" value={temperature} onChange={setTemperature} min={0} max={2} step={0.05} live={liveOf(baseline?.temperature, temperature)} hint="0 always picks the top scorer; higher spreads traffic across close scorers." />
+            <SliderField id="router-soft-cap" label="Default soft cap" value={softCap} display={String(Math.round(softCap))} onChange={setSoftCap} min={1} max={64} step={1} live={liveOf(baseline?.weights.soft_cap, softCap, 0)} hint="Assumed concurrency ceiling for models with no explicit limit." />
+          </section>
+
+          <section className="space-y-3 border-t border-border pt-4">
+            <div className="flex items-center justify-between gap-3 text-[13px]">
+              <span>Difficulty tiering{baseline && difficultyEnabled !== baseline.weights.difficulty_enabled && <span className="ml-1.5 text-[11.5px] text-muted-foreground">live: {baseline.weights.difficulty_enabled ? "on" : "off"}</span>}</span>
+              <Switch label="Difficulty tiering" checked={difficultyEnabled} onChange={setDifficultyEnabled} />
+            </div>
+            <div className="flex items-center justify-between gap-3 text-[13px]">
+              <span title="Derive tags and difficulty with the live classifier model (one small model call per simulation), exactly as serving does. Off, a keyword heuristic is used.">
+                Live classifier <span className="block text-[11.5px] text-muted-foreground">One small model call per simulation</span>
+              </span>
+              <Switch label="Live classifier" checked={classifyLive} onChange={setClassifyLive} />
+            </div>
+          </section>
+
+          <section className="space-y-3 border-t border-border pt-4">
+            <SectionLabel>Request</SectionLabel>
+            <Segmented
+              label="Effort"
+              value={effort || "default"}
+              onChange={(v) => update({ routerEffort: v === "default" ? undefined : v })}
+              options={[{ value: "default", label: "Default" }, { value: "low", label: "Low" }, { value: "medium", label: "Medium" }, { value: "high", label: "High" }]}
+            />
+            <div className="grid grid-cols-2 gap-2">
+              <Input aria-label="Max output tokens" type="number" min={1} max={131072} placeholder="Max tokens" value={maxTokens ?? ""}
+                onChange={(e) => { const n = e.target.valueAsNumber; if (!e.target.value || (Number.isInteger(n) && n >= 1 && n <= 131072)) update({ routerMaxTokens: e.target.value ? n : undefined }); }} />
+              <Input aria-label="Tenant ID" maxLength={200} placeholder="Tenant (optional)" value={tenantId} onChange={(e) => update({ routerTenantId: e.target.value })} />
+            </div>
+            <p className="text-[11.5px] text-muted-foreground">A tenant applies its own route rules to the simulation.</p>
+          </section>
+        </SettingsPanel>
+      )}
+
+      <Dialog open={confirming} onOpenChange={setConfirming}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Apply these weights to the gateway?</DialogTitle>
+            <DialogDescription>Every request sent to auto is routed with the new weights as soon as you apply them.</DialogDescription>
+          </DialogHeader>
+          <div className="overflow-hidden rounded-lg border border-border text-sm">
+            {changes.map((c) => (
+              <div key={c.label} className="flex items-center justify-between gap-3 border-b border-border px-3 py-2 last:border-b-0">
+                <span>{c.label}</span>
+                <span className="font-mono text-xs"><span className="text-muted-foreground line-through">{c.from}</span> → {c.to}</span>
+              </div>
+            ))}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setConfirming(false)}>Cancel</Button>
+            <Button onClick={() => { setConfirming(false); void applyToGateway(); }}>Apply to gateway</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -18,6 +18,15 @@ use crate::state::AppState;
 /// via the `x-obleth-boons-warning` header.
 pub struct TransformResult {
     pub warning: Option<&'static str>,
+    /// `(input_tokens, output_tokens)` the MAIN request row must settle with,
+    /// set by the buffered tool loop. Once the loop has run, the body holds
+    /// the last follow-up turn's completion, whose usage was already billed as
+    /// a `tool_loop` helper row; settling from the body would drop turn 0 and
+    /// charge the last turn twice. Turn 0's reported usage, or an estimate of
+    /// it when the upstream reported none and the body was replaced. `None`
+    /// means the body is still turn 0's own completion: settle from it as
+    /// usual.
+    pub turn0_usage: Option<(u32, u32)>,
 }
 
 /// Apply the structured-output boon to a buffered chat completion.
@@ -38,7 +47,10 @@ pub async fn transform_completion(
         }
         None => None,
     };
-    TransformResult { warning }
+    TransformResult {
+        warning,
+        turn0_usage: None,
+    }
 }
 
 /// Validate (and repair) the completion's JSON against the armed schema,

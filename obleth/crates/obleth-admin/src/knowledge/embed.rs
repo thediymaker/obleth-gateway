@@ -14,6 +14,8 @@ use serde_json::Value;
 pub struct EmbedTarget {
     pub api_base: String,
     pub api_key: Option<String>,
+    /// The embedding model's operator-configured upstream headers.
+    pub headers: reqwest::header::HeaderMap,
     pub upstream_model: String,
 }
 
@@ -41,10 +43,14 @@ pub async fn embed_batch(
         return Ok(Vec::new());
     }
     let url = join_embeddings_url(&target.api_base)?;
-    let mut req = client.post(&url).timeout(timeout).json(&serde_json::json!({
-        "model": target.upstream_model,
-        "input": inputs,
-    }));
+    let mut req = client
+        .post(&url)
+        .timeout(timeout)
+        .headers(target.headers.clone())
+        .json(&serde_json::json!({
+            "model": target.upstream_model,
+            "input": inputs,
+        }));
     if let Some(key) = target.api_key.as_deref().filter(|k| !k.is_empty()) {
         req = req.bearer_auth(key);
     }

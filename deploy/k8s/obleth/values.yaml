@@ -9,17 +9,40 @@ image:
   pullPolicy: IfNotPresent
 
 obleth:
-  # Fairshare admission state is per-process: each replica runs its own
-  # scheduler and enforces globalMaxInFlight on its own, so N replicas admit up
-  # to N x globalMaxInFlight concurrently. The default is a single replica so
-  # the configured ceiling is the ceiling that reaches your upstream.
-  #
-  # For redundancy, set replicas: N and divide globalMaxInFlight by N. Replicas
-  # cannot lend each other idle capacity, so a quiet pod's share goes unused:
-  # the aggregate ceiling holds, but utilization is lower than one pod at the
-  # full ceiling. Keep hpa.enabled false when you do this — see below.
+  # Fairshare runs one scheduling pool per model, sized by the model's
+  # max_in_flight or defaultModelMaxInFlight. globalMaxInFlight is a total
+  # in-flight ceiling across all pools, not a fairness input; keep it above
+  # the sum of the pool sizes you expect. These are cluster-wide numbers:
+  # with fairshareSharedSlots (the default) and more than one replica live,
+  # every pool, tenant and key cap and the ceiling is a set of slots in Redis
+  # that all replicas draw from, so any one replica can use a model's whole
+  # pool while the others are idle and the fleet never exceeds it. Any
+  # replica count (or the HPA) admits the configured concurrency.
   replicas: 1
-  globalMaxInFlight: 256
+  globalMaxInFlight: 4096
+  defaultModelMaxInFlight: 32
+  # Enforce the limits above as cluster-wide slots in Redis whenever more
+  # than one replica is live: one Redis script call when a request is
+  # admitted and one when it finishes. With a single replica there is no
+  # Redis call on the request path. Fairness (which waiting request goes
+  # next) is decided on each replica; across replicas a freed slot goes to
+  # whichever replica claims it first.
+  fairshareSharedSlots: true
+  # When shared slots are off, or Redis is unreachable, divide the limits
+  # across the live replicas instead: each enforces ceil(value / replicas),
+  # which rounds the fleet up to one slot per replica over a limit and keeps
+  # a busy replica from borrowing an idle one's share. false: each replica
+  # enforces the full numbers in that case, and N replicas admit N x them.
+  fairshareReplicaAware: true
+  # How often each replica refreshes its heartbeat (and re-asserts the slots
+  # it holds), and how long one counts it as live. A crashed replica's slots
+  # return to the survivors within about the TTL (raised to at least twice
+  # the interval).
+  fairshareReplicaHeartbeatSecs: 5
+  fairshareReplicaTtlSecs: 15
+  # Seconds of scheduler history each replica keeps in memory for the
+  # dashboard's activity chart (sampled every 2 s). 0 disables it.
+  fairshareHistorySecs: 3600
   failOpen: true
   # REQUIRED. No default is shipped — supply via `--set obleth.adminToken=...`,
   # a values override, or (preferred) an external Secret. `openssl rand -hex 32`.
@@ -39,9 +62,14 @@ obleth:
   # build one from the values above (so real secrets never touch values files or
   # --set/CLI history). When set, the chart does NOT render its own Secret and
   # the named Secret MUST provide every key the chart would have: OBLETH_ADMIN_TOKEN,
-  # OBLETH_DATABASE_URL, OBLETH_CLICKHOUSE_PASSWORD, OBLETH_ENCRYPTION_KEY,
-  # OBLETH_API_KEY_PEPPER, OBLETH_SLACK_WEBHOOK_URL, and (optional — only if you
-  # want the JWT path) OBLETH_JWT_ISSUERS. See examples/values-production.yaml.
+  # OBLETH_DATABASE_URL, OBLETH_REDIS_URL, OBLETH_CLICKHOUSE_PASSWORD,
+  # OBLETH_ENCRYPTION_KEY, OBLETH_API_KEY_PEPPER, OBLETH_SLACK_WEBHOOK_URL, and
+  # (optional — only if you want the JWT path) OBLETH_JWT_ISSUERS. When a bundled
+  # datastore is enabled, the Secret must also carry the password its container
+  # reads: POSTGRES_PASSWORD (postgres.enabled), REDIS_PASSWORD (redis.enabled;
+  # OBLETH_REDIS_URL must embed the same value as
+  # redis://:<password>@<release>-redis:6379), and OBLETH_CLICKHOUSE_PASSWORD
+  # (clickhouse.enabled). See examples/values-production.yaml.
   existingSecret: ""
   # SSRF allowlist for admin-registered upstream URLs (comma-separated CIDRs).
   # Default SSRF policy permits private/LAN targets (RFC1918, loopback, etc.) so
@@ -61,16 +89,85 @@ obleth:
   modelHealthTimeoutSecs: 30
   modelHealthRetentionDays: 30
   usageRetentionDays: 180
+  # On shutdown the gateway stops accepting and waits this long for in-flight
+  # requests (including streams). Keep it below the pod's
+  # terminationGracePeriodSeconds (345) minus the 5s preStop delay, the 20s
+  # telemetry drain and the 10s OTLP shutdown flush: if you raise this value,
+  # raise terminationGracePeriodSeconds (templates/obleth.yaml) by the same
+  # amount, or the kubelet SIGKILLs mid-flush instead of a clean exit.
+  shutdownGraceSecs: 300
+  # Seconds between re-pushes of keys/models/MCP servers from Postgres into
+  # Redis (also runs after every Redis reconnect). 0 disables the timer.
+  redisRewarmSecs: 300
+  # Longest wait for an upstream to return response headers before the
+  # attempt fails (the body is bounded by upstreamReadTimeoutSecs below).
+  upstreamTimeoutSecs: 300
+  # Longest upstream silence (header wait or gap between body chunks) before
+  # the request fails. Empty = the upstream request timeout (floored at 120s);
+  # a lower value also cuts slow non-streaming requests. 0 disables.
+  upstreamReadTimeoutSecs: ""
+  # Redis client timeouts (milliseconds). A command that gets no reply within
+  # the response timeout errors instead of hanging the request, so an
+  # unreachable Redis is handled by the failOpen policy above. The connect
+  # timeout bounds each (re)connect attempt. 0 or invalid values fall back to
+  # these same defaults.
+  redisResponseTimeoutMs: 250
+  redisConnectTimeoutMs: 2000
+  # Longest a request waits in the fairshare queue before a 503 with
+  # Retry-After: 5. 0 or invalid falls back to this default.
+  admissionTimeoutSecs: 60
+  # How long a video job's record (which tenant owns it, which endpoint holds
+  # it) is kept, in hours. Follow-ups for an older job answer 404. The backend
+  # usually forgets finished jobs within an hour or two, so the default leaves
+  # ample room. 0 or invalid falls back to this default.
+  videoJobRetentionHours: 24
+  # Who may poll, download, delete and list a video job (/v1/videos).
+  # `key` (the default): only the API key that created it, so each user sees
+  # only their own videos (a JWT/SSO caller's identity key is one per user).
+  # `tenant`: any key of the tenant that created it, for tenants whose users
+  # share their renders. Another tenant's job is a 404 either way. Any other
+  # value falls back to `key` with a warning in the gateway log.
+  videoJobScope: key
   resources:
     requests: { cpu: "250m", memory: "256Mi" }
     limits: { cpu: "2", memory: "1Gi" }
+  # Pool sizes that follow the backend, for models in the `discovered`
+  # capacity mode: the ready serving replicas' concurrency summed (ready x
+  # per-replica concurrency, or each endpoint's own max in flight added up)
+  # x the model's capacity_headroom, re-read by every gateway replica each interval
+  # and enforced cluster-wide like any configured pool size.
+  # Off by default; while off, a discovered model uses its static
+  # max_in_flight. See the README's "Capacity discovery" section and
+  # examples/values-capacity-discovery.yaml.
+  capacityDiscovery:
+    enabled: false
+    intervalSecs: 15
+    # Namespaces the `kubernetes` capacity source may read in (models on the
+    # `endpoints` source need none). A kubernetes-source model counts the
+    # ready endpoints of a Service; one that names no namespace is looked up
+    # in these in order, and the first namespace that has its Service wins.
+    # For each, the chart renders a Role granting only get/list/watch on
+    # endpointslices (discovery.k8s.io) and a RoleBinding to a gateway
+    # ServiceAccount it creates; nothing on pods, Services or Secrets, and
+    # nothing cluster-wide. The permission reveals only Service endpoint
+    # addresses and readiness. Empty renders no RBAC and leaves the kubernetes
+    # source unavailable. The namespaces must exist, and whoever runs helm
+    # must be allowed to create Roles in them.
+    namespaces: []
+    # Service name template for kubernetes-source models that set no
+    # capacity_service, with {upstream_model} and {model_name} placeholders,
+    # e.g. "{upstream_model}" when each model's Service is named after the
+    # model it serves. The result must be a valid Service name as is. Empty:
+    # such a model is refused until it names its own Service.
+    defaultService: ""
 
-# Off by default. obleth.globalMaxInFlight is enforced per replica, so an
-# autoscaled replica count moves the aggregate concurrency limit reaching your
-# upstream with no config change: scaling 2 -> 8 pods raises it fourfold. If you
-# enable this, divide globalMaxInFlight by maxReplicas so the ceiling still
-# holds at full scale-out, and accept that the upstream is under-subscribed
-# below that.
+# Off by default. With obleth.fairshareSharedSlots (or fairshareReplicaAware)
+# on, the fairshare limits hold across every replica, so scaling moves CPU
+# capacity, not the concurrency reaching your upstream. A pod that joins
+# starts drawing on the shared slots within one heartbeat, and a pod that
+# disappears returns its slots within about the heartbeat TTL. With both
+# off, each replica enforces the full limits and scaling 2 -> 8 pods raises
+# the aggregate fourfold; size for maxReplicas in that case.
 hpa:
   enabled: false
   minReplicas: 1
@@ -86,11 +183,11 @@ hpa:
 nodeResolution:
   # Static /etc/hosts entries — a node->IP map. Example:
   #   - ip: "10.0.0.25"
-  #     hostnames: ["scgh001", "scgh001.example.edu"]
+  #     hostnames: ["node001", "node001.cluster.example.edu"]
   hostAliases: []
   # Custom resolver injected into the pods. Example:
   #   nameservers: ["10.0.0.10"]
-  #   searches: ["sol.rc.example.edu"]
+  #   searches: ["cluster.example.edu"]
   #   options: [{ name: ndots, value: "2" }]
   dnsConfig: {}
   # Override dnsPolicy (e.g. "None" when you fully specify nameservers above).
@@ -131,9 +228,17 @@ podDisruptionBudget:
   enabled: true
   minAvailable: 1
 
-# Optional NetworkPolicy that restricts the bundled datastore ports to obleth
-# pods only. Off by default (requires a CNI that enforces NetworkPolicy). Has no
-# effect on external datastores.
+# Optional NetworkPolicies. Off by default (requires a CNI that enforces
+# NetworkPolicy). When enabled:
+#   - bundled Postgres admits the obleth data plane and the control-plane
+#     (dashboard auth tables); bundled Redis and ClickHouse admit the data
+#     plane only;
+#   - on the obleth pods, the Management API port (9180) admits only the
+#     control-plane and the provisioner; the data-plane port (8080) stays open
+#     to clients and ingress controllers;
+#   - the metrics port (9091) is left unrestricted so a Prometheus running in
+#     another namespace can scrape it. Add your own policy to narrow it.
+# The datastore policies have no effect on external datastores.
 networkPolicy:
   enabled: false
 
@@ -169,6 +274,10 @@ postgres:
   # REQUIRED when postgres.enabled=true. Supply via --set or an external Secret.
   password: ""
   db: obleth
+  # Container resources for the bundled Postgres. Override to size for load.
+  resources:
+    requests: { cpu: "250m", memory: "512Mi" }
+    limits: { cpu: "500m", memory: "1Gi" }
   # PVC-backed storage for the bundled Postgres. Disable for ephemeral test envs
   # (data is lost on restart). Postgres is the config source of truth — keep this
   # enabled for anything you care about.
@@ -186,6 +295,25 @@ postgres:
 redis:
   enabled: true
   image: redis:7
+  # REQUIRED when redis.enabled=true. The request path reads API keys from
+  # Redis, so the bundled instance always requires AUTH. Supply via --set or
+  # obleth.existingSecret (keys REDIS_PASSWORD and a matching OBLETH_REDIS_URL).
+  # The value is embedded in the connection URL, so use URL-safe characters
+  # (`openssl rand -hex 32`).
+  password: ""
+  # Container resources for the bundled Redis. Override to size for load.
+  resources:
+    requests: { cpu: "100m", memory: "128Mi" }
+    limits: { cpu: "200m", memory: "512Mi" }
+  # Redis's own memory ceiling (--maxmemory). Keep it at about 80% of
+  # resources.limits.memory so Redis evicts before the kernel OOM-kills it.
+  # Eviction is volatile-lru: only entries with a TTL are evicted (response
+  # cache, compression originals, rate-limit windows, in-flight budget
+  # reservations); API keys, model routes, and committed term-budget usage have
+  # no TTL and are never evicted. When the ceiling is reached with nothing left
+  # to evict, Redis rejects writes with an out-of-memory error until memory is
+  # freed, which the gateway handles as a Redis failure (see failOpen).
+  maxmemory: 400mb
   # PVC-backed AOF persistence. Redis is a rebuildable hot cache, so this is
   # optional — disable for ephemeral test envs. obleth re-warms from Postgres if
   # Redis data is lost.
@@ -195,7 +323,8 @@ redis:
     storageClass: ""
     accessMode: ReadWriteOnce
   external:
-    # e.g. redis://my-redis-host:6379
+    # e.g. redis://:PASSWORD@my-redis-host:6379. Rendered into the obleth
+    # Secret, so it may carry credentials.
     url: ""
 
 clickhouse:
@@ -205,6 +334,10 @@ clickhouse:
   user: obleth
   # REQUIRED when clickhouse.enabled=true. Supply via --set or an external Secret.
   password: ""
+  # Container resources for the bundled ClickHouse. Override to size for load.
+  resources:
+    requests: { cpu: "500m", memory: "2Gi" }
+    limits: { cpu: "1", memory: "4Gi" }
   # PVC-backed storage for the usage ledger. Disable for ephemeral test envs
   # (usage history is lost on restart).
   persistence:

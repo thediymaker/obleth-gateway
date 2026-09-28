@@ -9,6 +9,7 @@
 pub mod alerts;
 pub mod autotune;
 mod backup;
+pub mod capacity_discovery;
 pub mod energy_probe;
 mod error;
 pub mod knowledge;
@@ -43,9 +44,11 @@ use obleth_config::{
 use obleth_config::{
     AlertSettings, AutoRouterSettings, BoonSettings, EmailSettings, StructuredOutputBoonSettings,
     ToolLoopSettings, VisionBoonSettings, STRUCTURED_OUTPUT_MAX_REPAIR_ATTEMPTS,
-    TOOL_LOOP_MAX_TURNS,
+    TOOL_LOOP_MAX_DEADLINE_SECS, TOOL_LOOP_MAX_TURNS,
 };
-use obleth_fairshare::{FairShare, StaticCapacity, Stats};
+use obleth_fairshare::{
+    replica_share, FairShare, FairshareHistory, PoolKey, SlotMode, StaticCapacity, Stats,
+};
 use obleth_redis::RedisStore;
 use obleth_store::{AuditEntry, Store};
 use obleth_tokenizer::Tokenizer;
@@ -73,6 +76,17 @@ pub(crate) fn audit_actor(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| "admin".to_string())
 }
 
+/// Serde helper for a patch field that tells "absent" (keep) from `null`
+/// (clear): use with `#[serde(default, deserialize_with = "nullable")]` on an
+/// `Option<Option<T>>`.
+fn nullable<'de, D, T>(d: D) -> std::result::Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(d).map(Some)
+}
+
 /// Shared state for the Management API. All fields are cheap-clone handles.
 #[derive(Clone)]
 pub struct AdminState {
@@ -80,6 +94,19 @@ pub struct AdminState {
     pub redis: RedisStore,
     pub capacity: Arc<StaticCapacity>,
     pub fairshare: FairShare,
+    /// Per-model in-flight cap used for models that don't set their own
+    /// `max_in_flight`, sourced from `cfg.default_model_max_in_flight`.
+    pub default_model_max_in_flight: usize,
+    /// Sampled scheduler history for `/api/v1/fairshare/history`.
+    pub fairshare_history: Arc<FairshareHistory>,
+    /// Configured retention in seconds; `0` means the sampler is off.
+    pub fairshare_history_secs: u64,
+    /// Whether fairshare divides its limits across the live replicas when
+    /// shared slots are off or unavailable (`OBLETH_FAIRSHARE_REPLICA_AWARE`).
+    pub fairshare_replica_aware: bool,
+    /// Whether fairshare limits are cluster-wide slots in Redis
+    /// (`OBLETH_FAIRSHARE_SHARED_SLOTS`). Reported by the live view.
+    pub fairshare_shared_slots: bool,
     pub fairshare_stats: Arc<Stats>,
     pub clickhouse: clickhouse::Client,
     pub admin_token: String,
@@ -105,6 +132,9 @@ pub struct AdminState {
     /// proxy; `None` (a standalone admin process) means simulate stays
     /// heuristic-only and says so.
     pub classify: Option<ClassifyFn>,
+    /// The gateway's capacity discovery: its settings, which model writes are
+    /// checked against.
+    pub capacity_discovery: capacity_discovery::CapacityDiscovery,
 }
 
 /// A boxed call into the data plane's classifier: `(prompt, available_tags)`
@@ -162,8 +192,11 @@ pub fn router(state: AdminState) -> Router {
             put(set_tenant_synthetic_handler),
         )
         .route("/api/v1/keys", get(list_keys))
+        .route("/api/v1/budgets/usage", get(get_budget_usage))
+        .route("/api/v1/resync", post(resync_resolver_cache))
         .route("/api/v1/keys/:id", put(update_key).delete(delete_key))
         .route("/api/v1/keys/:id/disabled", put(set_key_disabled))
+        .route("/api/v1/keys/:id/tenant", put(move_key))
         .route("/api/v1/keys/:id/tracing", put(set_key_tracing_handler))
         .route("/api/v1/keys/:id/usage", get(get_key_usage))
         .route("/api/v1/usage", get(get_usage))
@@ -179,6 +212,8 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/usage/breakdown", get(get_usage_breakdown))
         .route("/api/v1/usage/cache", get(get_cache_stats))
         .route("/api/v1/usage/logs", get(get_usage_logs))
+        .route("/api/v1/usage/logs/histogram", get(get_usage_log_histogram))
+        .route("/api/v1/usage/logs/facets", get(get_usage_log_facets))
         .route(
             "/api/v1/usage/logs/:request_id/spans",
             get(get_request_spans),
@@ -189,6 +224,9 @@ pub fn router(state: AdminState) -> Router {
         .route("/api/v1/stats", get(get_stats))
         .route("/api/v1/overview/summary", get(get_overview_summary))
         .route("/api/v1/fairshare/live", get(get_fairshare_live))
+        .route("/api/v1/capacity/discovery", get(get_capacity_discovery))
+        .route("/api/v1/capacity/services", get(get_capacity_services))
+        .route("/api/v1/fairshare/history", get(get_fairshare_history))
         .route(
             "/api/v1/fairshare/groups",
             post(create_fairshare_group).get(list_fairshare_groups),
@@ -219,6 +257,10 @@ pub fn router(state: AdminState) -> Router {
         .route(
             "/api/v1/models/:id/health/check",
             post(model_health::check_one),
+        )
+        .route(
+            "/api/v1/models/:id/health/activate",
+            post(model_health::activate),
         )
         .route(
             "/api/v1/models/:id/health/config",
@@ -253,7 +295,13 @@ pub fn router(state: AdminState) -> Router {
         )
         .route(
             "/api/v1/knowledge/collections/:id/documents",
-            get(knowledge::list_documents).post(knowledge::upload_document),
+            // Documents arrive base64-encoded in JSON, well past axum's 2 MB
+            // default; size the limit for the largest permitted upload.
+            get(knowledge::list_documents)
+                .post(knowledge::upload_document)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    knowledge::UPLOAD_BODY_LIMIT_BYTES,
+                )),
         )
         .route(
             "/api/v1/knowledge/collections/:id/reindex",
@@ -323,6 +371,7 @@ pub fn router(state: AdminState) -> Router {
                 .delete(delete_mcp_server),
         )
         .route("/api/v1/audit", get(get_audit))
+        .route("/api/v1/stats/daily", get(get_daily_stats))
         .route("/api/v1/capacity", get(get_capacity).put(set_capacity))
         .route(
             "/api/v1/settings/alerts",
@@ -520,6 +569,13 @@ pub struct UpdateWeight {
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
+pub struct MoveKey {
+    /// The tenant the key moves to.
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateQuota {
     pub tokens_per_minute: i64,
     pub max_in_flight: Option<i64>,
@@ -542,6 +598,12 @@ pub struct CreateKey {
     /// When the current key term began.
     #[serde(default)]
     pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fairshare weight among the tenant's keys. Default 100, minimum 1.
+    #[serde(default = "obleth_config::default_key_weight")]
+    pub weight: i64,
+    /// Per-model in-flight ceiling for this key. `null` clears the cap.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -561,6 +623,12 @@ pub struct UpdateKey {
     /// When the current key term began.
     #[serde(default)]
     pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fairshare weight among the tenant's keys. Default 100, minimum 1.
+    #[serde(default = "obleth_config::default_key_weight")]
+    pub weight: i64,
+    /// Per-model in-flight ceiling for this key. `null` clears the cap.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -575,9 +643,9 @@ pub struct SetDisabled {
     pub disabled: bool,
 }
 
-#[derive(Debug, Deserialize)]
-struct SetKeyTracing {
-    tracing_enabled: bool,
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SetKeyTracing {
+    pub tracing_enabled: bool,
 }
 
 fn normalize_budget_fields(
@@ -620,21 +688,36 @@ fn normalize_budget_fields(
     Ok((period, started_at))
 }
 
+/// Total in-flight ceiling across all model pools, not a fairness budget.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetCapacity {
     pub max_in_flight: usize,
 }
 
+/// Total in-flight ceiling across all model pools, not a fairness budget.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct CapacityView {
     pub max_in_flight: usize,
 }
 
+/// Live counters of the answering gateway replica.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LiveStats {
+    /// This replica's in-flight requests.
     pub in_flight: usize,
     pub queued: i64,
+    /// The enabled models' pool sizes, summed, as this replica enforces
+    /// them: the configured (cluster-wide) sizes in `shared` and `local`
+    /// mode, this replica's share of each in `split` and `fallback` mode.
     pub max_in_flight: usize,
+    /// Live gateway replicas.
+    pub replicas: usize,
+    /// How this replica enforces the limits: `local`, `split`, `shared` or
+    /// `fallback`.
+    pub mode: String,
+    /// In-flight requests across every replica, from the shared slots.
+    /// `null` outside `shared` mode.
+    pub cluster_in_flight: Option<usize>,
 }
 
 /// At-a-glance dashboard summary: config counts from Postgres plus usage
@@ -651,9 +734,19 @@ pub struct OverviewSummaryView {
     pub model_count: i64,
     pub enabled_models: i64,
     pub key_count: i64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    /// Requests in the window that ended with an HTTP status of 400 or above.
+    pub errors: u64,
+    /// Median time to first token over the window; 0 when no request produced one.
+    pub p50_ttft_ms: f64,
+    pub avg_ttft_ms: f64,
+    pub energy_wh: f64,
+    pub energy_cost_usd: f64,
+    pub co2_g: f64,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct GroupFairshareView {
     pub name: String,
     pub weight: i64,
@@ -669,13 +762,14 @@ pub struct GroupFairshareView {
     pub expected_slots: f64,
 }
 
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct TenantFairshareView {
     #[schema(value_type = String)]
     pub tenant_id: Uuid,
     pub name: String,
     pub fairshare_group: String,
     pub weight: i64,
+    pub max_in_flight: Option<usize>,
     pub in_flight: usize,
     pub queued: usize,
     pub served_tokens: f64,
@@ -685,16 +779,90 @@ pub struct TenantFairshareView {
     pub expected_slots: f64,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct KeyFairshareView {
+    #[schema(value_type = String)]
+    pub key_id: Uuid,
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    pub name: String,
+    pub weight: i64,
+    pub max_in_flight: Option<usize>,
+    pub in_flight: usize,
+    pub queued: usize,
+    pub served_tokens: f64,
+    pub share_score: f64,
+    pub weight_share: f64,
+    pub expected_slots: f64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ModelPoolView {
+    pub model: String,
+    /// Slots this replica enforces: `configured_cap` in `shared` and `local`
+    /// mode, its share of it in `split` and `fallback` mode.
+    pub cap: usize,
+    /// The pool size as configured: the cluster-wide size.
+    pub configured_cap: usize,
+    /// This replica's in-flight requests in the pool.
+    pub in_flight: usize,
+    /// In-flight requests in the pool across every replica, from the shared
+    /// slots. `null` outside `shared` mode.
+    pub cluster_in_flight: Option<usize>,
+    pub queued: usize,
+    pub borrowed: usize,
+    pub groups: Vec<GroupFairshareView>,
+    pub tenants: Vec<TenantFairshareView>,
+    pub keys: Vec<KeyFairshareView>,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FairshareLiveView {
     pub algorithm: String,
+    /// Slots this replica can run: each enabled model's pool size as this
+    /// replica enforces it (see `mode`), summed, taken from the database
+    /// rather than from the snapshot, so a model that has had no traffic yet
+    /// still counts. The aggregated `weight_share` below is normalized
+    /// against the sum of the caps of the pools that are *present in the
+    /// snapshot*, so the two can differ until every enabled model has been
+    /// used at least once.
     pub max_in_flight: usize,
+    /// The enabled models' pool sizes as configured, summed: the
+    /// cluster-wide capacity.
+    pub configured_max_in_flight: usize,
+    /// Total in-flight ceiling across all pools as this replica enforces it:
+    /// `OBLETH_GLOBAL_MAX_IN_FLIGHT` in `shared` and `local` mode, this
+    /// replica's share of it in `split` and `fallback` mode.
+    pub hard_ceiling: usize,
+    /// `OBLETH_GLOBAL_MAX_IN_FLIGHT` as configured.
+    pub configured_hard_ceiling: usize,
+    pub default_model_max_in_flight: usize,
+    /// Live gateway replicas.
+    pub replicas: usize,
+    /// How this replica enforces the limits: `shared` (cluster-wide slots
+    /// in Redis), `split` (each replica enforces `ceil(configured /
+    /// replicas)`, shared slots off), `fallback` (shared slots on but
+    /// unavailable, so the split applies) or `local` (this replica alone
+    /// enforces the configured values).
+    pub mode: String,
+    /// Whether shared slots are configured (`OBLETH_FAIRSHARE_SHARED_SLOTS`).
+    pub shared_slots: bool,
+    /// Whether the split applies when shared slots are off or unavailable
+    /// (`OBLETH_FAIRSHARE_REPLICA_AWARE`).
+    pub replica_aware: bool,
+    /// In-flight requests across every replica, from the shared slots.
+    /// `null` outside `shared` mode. Every other count in this view is the
+    /// answering replica's own.
+    pub cluster_in_flight: Option<usize>,
     pub global_in_flight: usize,
     pub global_queued: i64,
     /// Total occupancy above the apportioned group caps.
     pub global_borrowed: usize,
+    /// Aggregated across pools (see `aggregate_pools`).
     pub groups: Vec<GroupFairshareView>,
     pub tenants: Vec<TenantFairshareView>,
+    pub keys: Vec<KeyFairshareView>,
+    pub pools: Vec<ModelPoolView>,
     /// Live in-flight request count per model name.
     #[serde(default)]
     pub model_in_flight: std::collections::HashMap<String, usize>,
@@ -715,6 +883,16 @@ pub struct CreateModel {
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
+    /// Extra headers sent on every request to this model's upstream, after the
+    /// client's forwarded headers so these win (e.g. a routing hint an
+    /// inference gateway reads, or a tenant or organization header a provider
+    /// requires). Names are case-insensitive. Hop-by-hop headers,
+    /// `authorization` (use `api_key`), `host`, `content-length`,
+    /// `content-type`, and `accept-encoding` are refused. Values are
+    /// write-only: responses list only `upstream_header_names`.
+    #[serde(default)]
+    #[schema(value_type = Option<std::collections::BTreeMap<String, String>>)]
+    pub upstream_headers: Option<obleth_config::UpstreamHeadersWrite>,
     #[serde(default)]
     pub model_type: Option<String>,
     /// Serving format from the fixed `QUANTIZATIONS` vocabulary. Omitted means
@@ -729,9 +907,37 @@ pub struct CreateModel {
     pub cost_per_audio_second: Option<f64>,
     #[serde(default)]
     pub cost_per_character: Option<f64>,
+    /// Flat USD price of one created job (`video` models).
+    #[serde(default)]
+    pub cost_per_video: Option<f64>,
     pub context_window: Option<i64>,
     pub admission_weight: Option<i64>,
     pub max_in_flight: Option<i64>,
+    /// `static` (default), `tuned` or `discovered`. In `discovered` mode the
+    /// pool size follows the live backend and `max_in_flight` is the fallback.
+    #[serde(default)]
+    pub capacity_mode: Option<String>,
+    /// `discovered` mode: `endpoints` (default) or `kubernetes`.
+    #[serde(default)]
+    pub capacity_source: Option<String>,
+    /// `kubernetes` source: namespace of the Service. Omitted looks it up in
+    /// the gateway's `OBLETH_CAPACITY_DISCOVERY_NAMESPACES`, in order; the
+    /// first namespace that has it wins.
+    #[serde(default)]
+    pub capacity_namespace: Option<String>,
+    /// `kubernetes` source: name of the Service whose ready endpoints count
+    /// the serving replicas. Omitted uses the gateway's
+    /// `OBLETH_CAPACITY_DEFAULT_SERVICE` template.
+    #[serde(default)]
+    pub capacity_service: Option<String>,
+    /// Requests one serving replica takes (e.g. the server's max concurrent
+    /// sequences). Required in `discovered` mode on the `kubernetes` source,
+    /// and on `endpoints` unless every endpoint sets its own `max_in_flight`.
+    #[serde(default)]
+    pub per_replica_max_in_flight: Option<i64>,
+    /// Multiplier on the derived pool size (default 1.0).
+    #[serde(default)]
+    pub capacity_headroom: Option<f64>,
     pub supports_function_calling: Option<bool>,
     pub supports_system_messages: Option<bool>,
     pub supports_response_schema: Option<bool>,
@@ -768,6 +974,11 @@ pub struct CreateModel {
     /// Name that scoring backend serves, if not this model's `upstream_model`.
     #[serde(default)]
     pub verify_upstream_model: Option<String>,
+    /// `false` creates the route switched off, so it serves nothing until it is
+    /// turned on — for example by `POST /models/{id}/health/activate` once a
+    /// health check passes. Omitted = on.
+    #[serde(default)]
+    pub enabled: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -780,6 +991,13 @@ pub struct UpdateModel {
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
+    /// Replaces the model's upstream headers; omitted leaves them unchanged
+    /// and `{}` removes them all. A `null` value keeps the value stored under
+    /// that name, so a client that only knows the names (values are
+    /// write-only) can add or drop one header without re-sending the others.
+    #[serde(default)]
+    #[schema(value_type = Option<std::collections::BTreeMap<String, Option<String>>>)]
+    pub upstream_headers: Option<obleth_config::UpstreamHeadersWrite>,
     #[serde(default)]
     pub model_type: Option<String>,
     /// Serving format from the fixed `QUANTIZATIONS` vocabulary; omitted
@@ -794,9 +1012,33 @@ pub struct UpdateModel {
     pub cost_per_audio_second: Option<f64>,
     #[serde(default)]
     pub cost_per_character: Option<f64>,
+    /// Flat USD price of one created job (`video` models).
+    #[serde(default)]
+    pub cost_per_video: Option<f64>,
     pub context_window: Option<i64>,
     pub admission_weight: Option<i64>,
     pub max_in_flight: Option<i64>,
+    /// `static`, `tuned` or `discovered`; omitted leaves it unchanged.
+    #[serde(default)]
+    pub capacity_mode: Option<String>,
+    /// `endpoints` or `kubernetes`; omitted leaves it unchanged.
+    #[serde(default)]
+    pub capacity_source: Option<String>,
+    /// Omitted leaves it unchanged; `null` or `""` clears it.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<String>)]
+    pub capacity_namespace: Option<Option<String>>,
+    /// Omitted leaves it unchanged; `null` or `""` clears it.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<String>)]
+    pub capacity_service: Option<Option<String>>,
+    /// Omitted leaves it unchanged; `null` clears it.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub per_replica_max_in_flight: Option<Option<i64>>,
+    /// Omitted leaves it unchanged.
+    #[serde(default)]
+    pub capacity_headroom: Option<f64>,
     pub supports_function_calling: Option<bool>,
     pub supports_system_messages: Option<bool>,
     pub supports_response_schema: Option<bool>,
@@ -840,6 +1082,8 @@ pub struct UpdateModel {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetModelCache {
     pub cache_enabled: bool,
+    /// Response-cache lifetime in seconds (default 300). 0 disables the cache:
+    /// responses are not written.
     pub cache_ttl_secs: Option<i64>,
 }
 
@@ -879,6 +1123,11 @@ pub struct CreateModelEndpoint {
     pub weight: i64,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Requests this endpoint takes at once, for a `discovered` model using
+    /// the `endpoints` source. Omitted uses the model's
+    /// `per_replica_max_in_flight`.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -894,6 +1143,10 @@ pub struct UpdateModelEndpoint {
     pub weight: i64,
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// Omitted keeps the stored value; `null` clears it.
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub max_in_flight: Option<Option<i64>>,
 }
 
 fn default_endpoint_priority() -> i64 {
@@ -982,6 +1235,21 @@ pub struct SetModelCapacity {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SetModelCapacityMode {
     pub capacity_mode: String,
+    /// The `discovered`-mode fields, with the same rules as on
+    /// `PUT /api/v1/models/{id}`: omitted leaves a field unchanged.
+    #[serde(default)]
+    pub capacity_source: Option<String>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<String>)]
+    pub capacity_namespace: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<String>)]
+    pub capacity_service: Option<Option<String>>,
+    #[serde(default, deserialize_with = "nullable")]
+    #[schema(value_type = Option<i64>)]
+    pub per_replica_max_in_flight: Option<Option<i64>>,
+    #[serde(default)]
+    pub capacity_headroom: Option<f64>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -1004,8 +1272,35 @@ pub struct CreateMcpServer {
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateMcpServer {
     pub upstream_url: String,
+    /// A new Authorization header; omit to keep the stored one.
     pub auth_header: Option<String>,
+    /// Remove the stored Authorization header (ignored when `auth_header` is set).
+    #[serde(default)]
+    pub clear_auth: bool,
     pub enabled: Option<bool>,
+    /// A new name; the server's `/mcp/<name>` path and every model grant follow it.
+    pub name: Option<String>,
+}
+
+/// A server's name is the `/mcp/<name>` path segment and the key models grant
+/// it by: letters, digits, `.`, `_` and `-`, up to 64, starting with a letter or digit.
+fn validate_mcp_server_name(name: &str) -> Result<()> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(AdminError::BadRequest(
+            "server name must be 1-64 letters, digits, '.', '_' or '-', starting with a letter or digit".into(),
+        ))
+    }
 }
 
 #[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
@@ -1017,6 +1312,19 @@ pub struct ListKeysQuery {
 #[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
 pub struct AuditQuery {
     pub limit: Option<i64>,
+    /// Exact actor (an email, `admin`, …).
+    pub actor: Option<String>,
+    pub entity_type: Option<String>,
+    pub entity_id: Option<String>,
+    /// One action or several, comma-separated.
+    pub action: Option<String>,
+    /// RFC 3339; `since` inclusive, `until` exclusive.
+    pub since: Option<String>,
+    pub until: Option<String>,
+    /// Page back from this row id (exclusive).
+    pub before_id: Option<i64>,
+    /// Free text over actor, action, entity id and detail.
+    pub q: Option<String>,
 }
 
 /// OpenAPI shape for audit-log rows (`GET /api/v1/audit`).
@@ -1410,6 +1718,410 @@ async fn patch_tenant_compression(
     Ok(Json(tenant))
 }
 
+// ---- secret-redacted response views ----
+//
+// The store decrypts upstream secrets on every read, so the config structs
+// carry plaintext keys. Every Management API response (and audit detail) for
+// models, endpoints, and MCP servers goes through these views instead: secrets
+// are write-only and only their presence is reported. The `From` impls
+// destructure exhaustively so a new config field fails to compile here rather
+// than silently going missing from the API.
+
+/// A registered model route as returned by the Management API. Identical to
+/// the stored route except the upstream `api_key` is never returned.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ModelRouteView {
+    pub id: Uuid,
+    /// Name clients pass in `model` (e.g. `qwen3-vl-32b-instruct`). Kept free
+    /// of deployment detail — the serving format belongs in `quantization`,
+    /// not in the name — so re-quantizing does not break every caller.
+    pub model_name: String,
+    /// Additional client-facing names that resolve to this same route. Exists
+    /// so a name can be cleaned up without breaking pinned clients: register
+    /// the old `…-fp8` spelling as an alias and it keeps working, while only
+    /// `model_name` is advertised by the discovery endpoints.
+    pub aliases: Vec<String>,
+    /// Human-facing summary for operators and dashboards.
+    pub description: String,
+    /// Value sent to the upstream in the `model` field.
+    pub upstream_model: String,
+    /// Base URL including `/v1` suffix when required.
+    pub api_base: String,
+    /// Whether an upstream API key is stored. The key itself is write-only.
+    pub api_key_set: bool,
+    /// Names of the headers added to every upstream request. The values are
+    /// write-only, like `api_key`, because an operator may put a credential
+    /// in one.
+    pub upstream_header_names: Vec<String>,
+    /// Modality from the fixed `MODEL_TYPES` vocabulary. Determines which
+    /// OpenAI endpoint this model serves (`chat`, `embedding`,
+    /// `audio_transcription`, `audio_speech`, `image`, `video`). Defaults to
+    /// `chat`.
+    pub model_type: String,
+    /// Weight/activation format this deployment serves, from the fixed
+    /// `QUANTIZATIONS` vocabulary. Descriptive only — it never affects
+    /// routing; it is reported so clients can tell a `fp8` deployment from a
+    /// `bf16` one without reading it out of the model's name.
+    pub quantization: String,
+    pub input_cost_per_token: f64,
+    pub output_cost_per_token: f64,
+    /// Per-generated-image cost in USD (`image` models).
+    pub cost_per_image: f64,
+    /// Per-second-of-audio cost in USD (`audio_transcription` models).
+    pub cost_per_audio_second: f64,
+    /// Per-input-character cost in USD (`audio_speech` models).
+    pub cost_per_character: f64,
+    /// Per-created-job cost in USD (`video` models), charged once when the
+    /// create call succeeds.
+    pub cost_per_video: f64,
+    pub context_window: i64,
+    /// Multiplier applied to tenant weight at admission when this model is used.
+    pub admission_weight: i64,
+    /// Optional per-model in-flight cap. `None` means only the global scheduler
+    /// cap and tenant/group fairshare limits apply.
+    pub max_in_flight: Option<i64>,
+    /// How `max_in_flight` is decided. `static` (default) keeps the
+    /// operator-set value; `tuned` means it was found by the auto-tune ramp
+    /// probe against the upstream.
+    pub capacity_mode: String,
+    /// When the tuned `max_in_flight` was last written by auto-tune. `None`
+    /// until the model has been tuned.
+    pub capacity_tuned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `discovered` mode: where serving replicas are counted, `endpoints`
+    /// (the model's enabled, healthy endpoints) or `kubernetes` (the ready
+    /// endpoints of a Service).
+    pub capacity_source: String,
+    /// `kubernetes` source: namespace of the Service. `None` looks it up in
+    /// the gateway's `OBLETH_CAPACITY_DISCOVERY_NAMESPACES`, in order.
+    pub capacity_namespace: Option<String>,
+    /// `kubernetes` source: name of the Service. `None` uses the gateway's
+    /// `OBLETH_CAPACITY_DEFAULT_SERVICE` template.
+    pub capacity_service: Option<String>,
+    /// Requests one serving replica takes. `None` only for the `endpoints`
+    /// source when every endpoint sets its own `max_in_flight`, or outside
+    /// the `discovered` mode.
+    pub per_replica_max_in_flight: Option<i64>,
+    /// Multiplier on the derived pool size; `1.0` is exactly the ready
+    /// capacity.
+    pub capacity_headroom: f64,
+    pub supports_function_calling: bool,
+    pub supports_system_messages: bool,
+    pub supports_response_schema: bool,
+    pub supports_tool_choice: bool,
+    /// Native image-input capability. When false, the gateway's vision boon can
+    /// relay images to a designated vision model and inject text descriptions
+    /// before forwarding the request to this model.
+    pub supports_vision: bool,
+    pub enabled: bool,
+    /// When true, identical requests to this model are served from the response
+    /// cache (exact-match on tenant + model + request body) instead of the
+    /// upstream. Entries are never shared across tenants.
+    pub cache_enabled: bool,
+    /// Time-to-live for cached responses, in seconds. `0` disables caching:
+    /// nothing is stored (never "store without expiry").
+    pub cache_ttl_secs: i64,
+    /// Routing tags from the fixed `MODEL_TAGS` vocabulary. The `auto` router
+    /// prefers models whose tags match the request's classified intent.
+    pub tags: Vec<String>,
+    /// Gateway boons enabled for this model from the fixed `MODEL_BOONS`
+    /// vocabulary. Boons grant capabilities the model lacks natively (e.g. the
+    /// `vision` boon relays images to a describer). Empty by default.
+    pub boons: Vec<String>,
+    /// Registered MCP servers whose tools this model may use. Distinct from
+    /// capabilities: a capability is what the model can do natively (e.g.
+    /// function calling); a tool server is something the gateway grants access
+    /// to. When non-empty, plain chat requests get the servers' tools injected
+    /// and the gateway runs the tool loop itself. Empty by default (off).
+    pub tool_servers: Vec<String>,
+    /// Per-request upstream timeout in seconds. `None` falls back to the global
+    /// `OBLETH_UPSTREAM_TIMEOUT_SECS` default.
+    pub request_timeout_secs: Option<i64>,
+    /// Extra attempts against the same endpoint on retryable failures (network
+    /// errors, timeouts, 408/429/5xx). `0` disables retries.
+    pub max_retries: i64,
+    /// Base delay in milliseconds for exponential backoff between retries.
+    pub retry_backoff_ms: i64,
+    /// How obleth chooses among this model's registered endpoints: `failover`
+    /// (priority order) or `load_balance` (weighted).
+    pub endpoint_selection_mode: String,
+    /// When true, a terminal 502/504 against this model triggers read-only
+    /// upstream diagnostics (DNS resolve + TCP connect) recorded as a trace
+    /// span. Opt-in; off by default. Diagnose-only — never changes routing.
+    pub debug_diagnostics: bool,
+    /// Declared saturation for energy accounting: how many concurrent
+    /// sequences of this model saturate one node (instances per node x
+    /// sequences per instance). Each request is charged
+    /// `node_watts / energy_slots_per_node` for its serving time.
+    /// `0` (default) disables energy accounting for this model.
+    pub energy_slots_per_node: i64,
+    /// Per-model multiplier on the `auto` router's final score. `1.0` is
+    /// neutral; above 1.0 prefers the model, below 1.0 de-prioritizes it.
+    pub route_bias: f64,
+    /// Whether the `auto` router may select this model. `false` removes it from
+    /// auto's candidate pool while leaving it addressable by name — the
+    /// distinction from `enabled = false`, which removes it everywhere.
+    pub auto_eligible: bool,
+    /// Which small model writes this model's speculation drafts. Empty falls
+    /// back to the fleet default in the boon settings.
+    pub draft_model: String,
+    /// Direct (non-gateway) URL of a deployment of THIS model whose backend
+    /// supports `prompt_logprobs`; it scores every draft token. Empty means
+    /// this model cannot speculate.
+    pub verify_api_base: String,
+    /// The model name that scoring backend serves, when it differs from this
+    /// model's own `upstream_model` (a canary serving its own name). Empty =
+    /// same as `upstream_model`.
+    pub verify_upstream_model: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// A model's operator-configured upstream headers as a header map, for every
+/// outbound call to that model (the proxied request, helper calls, health
+/// probes). Entries were validated when they were written; one that still
+/// fails to parse is skipped rather than failing the request.
+pub fn upstream_header_map(headers: &obleth_config::UpstreamHeaders) -> reqwest::header::HeaderMap {
+    let mut out = reqwest::header::HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers {
+        if let (Ok(name), Ok(value)) = (
+            reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+            reqwest::header::HeaderValue::from_str(value),
+        ) {
+            out.insert(name, value);
+        }
+    }
+    out
+}
+
+fn secret_set(s: &Option<String>) -> bool {
+    s.as_ref().is_some_and(|v| !v.is_empty())
+}
+
+fn views<T, V: From<T>>(items: Vec<T>) -> Vec<V> {
+    items.into_iter().map(V::from).collect()
+}
+
+impl From<ModelRoute> for ModelRouteView {
+    fn from(m: ModelRoute) -> Self {
+        let ModelRoute {
+            id,
+            model_name,
+            aliases,
+            description,
+            upstream_model,
+            api_base,
+            api_key,
+            upstream_headers,
+            model_type,
+            quantization,
+            input_cost_per_token,
+            output_cost_per_token,
+            cost_per_image,
+            cost_per_audio_second,
+            cost_per_character,
+            cost_per_video,
+            context_window,
+            admission_weight,
+            max_in_flight,
+            capacity_mode,
+            capacity_tuned_at,
+            capacity_source,
+            capacity_namespace,
+            capacity_service,
+            per_replica_max_in_flight,
+            capacity_headroom,
+            supports_function_calling,
+            supports_system_messages,
+            supports_response_schema,
+            supports_tool_choice,
+            supports_vision,
+            enabled,
+            cache_enabled,
+            cache_ttl_secs,
+            tags,
+            boons,
+            tool_servers,
+            request_timeout_secs,
+            max_retries,
+            retry_backoff_ms,
+            endpoint_selection_mode,
+            debug_diagnostics,
+            energy_slots_per_node,
+            route_bias,
+            auto_eligible,
+            draft_model,
+            verify_api_base,
+            verify_upstream_model,
+            created_at,
+            updated_at,
+        } = m;
+        ModelRouteView {
+            id,
+            model_name,
+            aliases,
+            description,
+            upstream_model,
+            api_base,
+            api_key_set: secret_set(&api_key),
+            upstream_header_names: obleth_config::upstream_header_names(&upstream_headers),
+            model_type,
+            quantization,
+            input_cost_per_token,
+            output_cost_per_token,
+            cost_per_image,
+            cost_per_audio_second,
+            cost_per_character,
+            cost_per_video,
+            context_window,
+            admission_weight,
+            max_in_flight,
+            capacity_mode,
+            capacity_tuned_at,
+            capacity_source,
+            capacity_namespace,
+            capacity_service,
+            per_replica_max_in_flight,
+            capacity_headroom,
+            supports_function_calling,
+            supports_system_messages,
+            supports_response_schema,
+            supports_tool_choice,
+            supports_vision,
+            enabled,
+            cache_enabled,
+            cache_ttl_secs,
+            tags,
+            boons,
+            tool_servers,
+            request_timeout_secs,
+            max_retries,
+            retry_backoff_ms,
+            endpoint_selection_mode,
+            debug_diagnostics,
+            energy_slots_per_node,
+            route_bias,
+            auto_eligible,
+            draft_model,
+            verify_api_base,
+            verify_upstream_model,
+            created_at,
+            updated_at,
+        }
+    }
+}
+
+/// A model's upstream endpoint as returned by the Management API. The
+/// endpoint `api_key` is never returned.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ModelEndpointView {
+    pub id: Uuid,
+    #[schema(value_type = String)]
+    pub model_id: Uuid,
+    pub name: String,
+    pub api_base: String,
+    /// Whether an endpoint API key is stored. The key itself is write-only.
+    pub api_key_set: bool,
+    pub priority: i64,
+    pub weight: i64,
+    pub enabled: bool,
+    /// Requests this endpoint takes at once, counted by a `discovered` model
+    /// using the `endpoints` source. `None` uses the model's
+    /// `per_replica_max_in_flight`.
+    pub max_in_flight: Option<i64>,
+    pub health_status: String,
+    pub consecutive_failures: i64,
+    pub alert_state: String,
+    pub last_checked_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_latency_ms: Option<i64>,
+    pub last_http_status: Option<i64>,
+    pub last_message: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<ModelEndpoint> for ModelEndpointView {
+    fn from(e: ModelEndpoint) -> Self {
+        let ModelEndpoint {
+            id,
+            model_id,
+            name,
+            api_base,
+            api_key,
+            priority,
+            weight,
+            enabled,
+            max_in_flight,
+            health_status,
+            consecutive_failures,
+            alert_state,
+            last_checked_at,
+            last_latency_ms,
+            last_http_status,
+            last_message,
+            created_at,
+            updated_at,
+        } = e;
+        ModelEndpointView {
+            id,
+            model_id,
+            name,
+            api_base,
+            api_key_set: secret_set(&api_key),
+            priority,
+            weight,
+            enabled,
+            max_in_flight,
+            health_status,
+            consecutive_failures,
+            alert_state,
+            last_checked_at,
+            last_latency_ms,
+            last_http_status,
+            last_message,
+            created_at,
+            updated_at,
+        }
+    }
+}
+
+/// A registered MCP server as returned by the Management API. The upstream
+/// `auth_header` is never returned.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct McpServerView {
+    pub id: Uuid,
+    pub name: String,
+    pub upstream_url: String,
+    /// Whether an upstream Authorization header is stored. The value itself is
+    /// write-only.
+    pub auth_header_set: bool,
+    pub enabled: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl From<McpServer> for McpServerView {
+    fn from(s: McpServer) -> Self {
+        let McpServer {
+            id,
+            name,
+            upstream_url,
+            auth_header,
+            enabled,
+            created_at,
+            updated_at,
+        } = s;
+        McpServerView {
+            id,
+            name,
+            upstream_url,
+            auth_header_set: secret_set(&auth_header),
+            enabled,
+            created_at,
+            updated_at,
+        }
+    }
+}
+
 // ---- alert settings ----
 
 /// Read-only view of the saved alert settings. Secrets (webhook URL, SMTP
@@ -1519,7 +2231,7 @@ async fn put_alert_settings(
         Some(url) if !url.is_empty() => {
             // Alert dispatch POSTs to this URL from the gateway; hold it to the
             // same destination policy as registered upstreams.
-            state.ssrf.validate(url)?;
+            state.ssrf.validate(url).await?;
             Some(url.to_string())
         }
         _ if body.clear_slack_webhook => None,
@@ -1629,6 +2341,9 @@ pub struct AutoRouterSettingsView {
     pub difficulty_enabled: bool,
     /// `"hybrid" | "derived" | "declared"`.
     pub tier_source: String,
+    /// Model or alias served for unknown model names on `/v1/messages`;
+    /// `None` means such requests get `not_found_error`.
+    pub messages_default_model: Option<String>,
 }
 
 impl AutoRouterSettingsView {
@@ -1648,6 +2363,7 @@ impl AutoRouterSettingsView {
             temperature: s.temperature,
             difficulty_enabled: s.difficulty_enabled,
             tier_source: tier_source_as_str(s.tier_source).to_string(),
+            messages_default_model: s.messages_default_model.clone(),
         }
     }
 }
@@ -1677,6 +2393,10 @@ pub struct UpdateAutoRouterSettings {
     /// leave the persisted `tier_source` untouched.
     #[serde(default)]
     pub tier_source: Option<String>,
+    /// Model or alias served for unknown model names on `/v1/messages`.
+    /// Empty string clears it.
+    #[serde(default)]
+    pub messages_default_model: Option<String>,
 }
 
 /// Merge an update over the persisted settings, clamping out-of-range values.
@@ -1692,6 +2412,11 @@ fn merge_auto_router(
         Some("") => None,
         Some(m) => Some(m.to_string()),
         None => existing.classifier_model.clone(),
+    };
+    let messages_default_model = match body.messages_default_model.as_deref().map(str::trim) {
+        Some("") => None,
+        Some(m) => Some(m.to_string()),
+        None => existing.messages_default_model.clone(),
     };
     AutoRouterSettings {
         classifier_enabled: body
@@ -1721,6 +2446,7 @@ fn merge_auto_router(
             .as_deref()
             .and_then(parse_tier_source)
             .unwrap_or(existing.tier_source),
+        messages_default_model,
     }
 }
 
@@ -1776,6 +2502,7 @@ async fn put_auto_router_settings(
                 "temperature": settings.temperature,
                 "difficulty_enabled": settings.difficulty_enabled,
                 "tier_source": tier_source_as_str(settings.tier_source),
+                "messages_default_model": settings.messages_default_model,
             }),
         )
         .await?;
@@ -2090,6 +2817,8 @@ pub struct BoonSettingsView {
     pub tool_loop_enabled: bool,
     pub tool_loop_max_turns: u32,
     pub tool_loop_tool_timeout_ms: u64,
+    /// Wall-clock budget for one request's whole tool loop, in seconds.
+    pub tool_loop_deadline_secs: u64,
     pub tool_loop_nudge: String,
     pub compression_enabled: bool,
     pub compression_min_tokens: u32,
@@ -2146,6 +2875,7 @@ impl BoonSettingsView {
             tool_loop_enabled: s.tool_loop.enabled,
             tool_loop_max_turns: s.tool_loop.max_turns,
             tool_loop_tool_timeout_ms: s.tool_loop.tool_timeout_ms,
+            tool_loop_deadline_secs: s.tool_loop.deadline_secs,
             tool_loop_nudge: s.tool_loop.nudge.clone(),
             compression_enabled: s.compression.enabled,
             compression_min_tokens: s.compression.min_tokens,
@@ -2218,6 +2948,11 @@ pub struct UpdateBoonSettings {
     pub tool_loop_max_turns: Option<u32>,
     #[serde(default)]
     pub tool_loop_tool_timeout_ms: Option<u64>,
+    /// Wall-clock budget for one request's whole tool loop, in seconds.
+    /// Clamped to `1..=3600` (`TOOL_LOOP_MAX_DEADLINE_SECS`); omit (or send 0)
+    /// to leave unchanged.
+    #[serde(default)]
+    pub tool_loop_deadline_secs: Option<u64>,
     /// System nudge injected with granted tools. Empty string resets it to the
     /// built-in default; omit the field to leave it unchanged.
     #[serde(default)]
@@ -2375,6 +3110,16 @@ fn clamp_image_count(n: u32) -> u32 {
     n.clamp(1, obleth_config::IMAGE_GENERATION_MAX_PER_REQUEST)
 }
 
+/// Apply a `tool_loop_deadline_secs` update: `None`/0 keeps `existing`, and any
+/// other value is clamped to `1..=TOOL_LOOP_MAX_DEADLINE_SECS`. Unbounded, a huge
+/// value overflows the loop's deadline arithmetic on the request path.
+fn merge_tool_loop_deadline(update: Option<u64>, existing: u64) -> u64 {
+    update
+        .filter(|s| *s > 0)
+        .map(|s| s.min(TOOL_LOOP_MAX_DEADLINE_SECS))
+        .unwrap_or(existing)
+}
+
 #[utoipa::path(
     put, path = "/api/v1/settings/boons", tag = "settings",
     request_body = UpdateBoonSettings,
@@ -2386,6 +3131,7 @@ async fn put_boon_settings(
     Json(body): Json<UpdateBoonSettings>,
 ) -> Result<Json<BoonSettingsView>> {
     let existing = state.store.get_boon_settings().await?.unwrap_or_default();
+    let verify_template_supplied = body.speculation_verify_url_template.is_some();
 
     let fallback_model = match body.vision_fallback_model.as_deref().map(str::trim) {
         Some("") => None,
@@ -2574,6 +3320,10 @@ async fn put_boon_settings(
                 Some(n) => n.to_string(),
                 None => existing.tool_loop.nudge.clone(),
             },
+            deadline_secs: merge_tool_loop_deadline(
+                body.tool_loop_deadline_secs,
+                existing.tool_loop.deadline_secs,
+            ),
         },
         guardrails: existing.guardrails.clone(),
         compression: obleth_config::CompressionBoonSettings {
@@ -2692,6 +3442,19 @@ async fn put_boon_settings(
         },
     };
 
+    // The speculation verifier sends each model's upstream key to this URL, so
+    // hold it to the upstream destination policy (placeholders are refused in
+    // the scheme/credentials; a filled host is re-checked by the proxy). Only
+    // a newly supplied value is checked, so an unrelated save isn't blocked by
+    // DNS for a stored one.
+    let template = settings.speculation.verify_url_template.as_str();
+    if verify_template_supplied && !template.is_empty() {
+        state
+            .ssrf
+            .validate_template(template, ssrf::VERIFY_TEMPLATE_PLACEHOLDERS)
+            .await
+            .map_err(|e| AdminError::BadRequest(format!("speculation_verify_url_template: {e}")))?;
+    }
     state.store.put_boon_settings(&settings).await?;
     state
         .store
@@ -2712,6 +3475,7 @@ async fn put_boon_settings(
                 "tool_loop_enabled": settings.tool_loop.enabled,
                 "tool_loop_max_turns": settings.tool_loop.max_turns,
                 "tool_loop_tool_timeout_ms": settings.tool_loop.tool_timeout_ms,
+                "tool_loop_deadline_secs": settings.tool_loop.deadline_secs,
                 "tool_loop_nudge_len": settings.tool_loop.nudge.len(),
                 "image_generation_enabled": settings.image_generation.enabled,
                 "image_generation_model": settings.image_generation.image_model,
@@ -2839,7 +3603,7 @@ async fn put_energy_settings(
     // policy the test route enforces so a save can't bypass it.
     if let Some(url) = body.prometheus_url.as_deref().map(str::trim) {
         if !url.is_empty() {
-            state.ssrf.validate(url)?;
+            state.ssrf.validate(url).await?;
         }
     }
     let settings = merge_energy_settings(&existing, &body);
@@ -2886,7 +3650,7 @@ async fn test_energy_query(
     State(state): State<AdminState>,
     Json(body): Json<TestEnergyQuery>,
 ) -> Result<Json<EnergyTestResult>> {
-    state.ssrf.validate(&body.prometheus_url)?;
+    state.ssrf.validate(&body.prometheus_url).await?;
     let q = body.power_query.trim();
     let base = body.prometheus_url.trim();
     let http = ssrf::upstream_client_builder()
@@ -3108,10 +3872,9 @@ async fn delete_tenant(
 ) -> Result<StatusCode> {
     let hashes = state.store.delete_tenant(id).await?;
     // Evict every cascaded key from the data-plane cache.
-    for hash in &hashes {
-        let _ = state.redis.delete_resolved_key(hash).await;
-        let _ = state.redis.publish_invalidation(hash).await;
-    }
+    let evicted = evict_keys(&state, &hashes, "the tenant and its keys").await;
+    // The Postgres delete stands either way, so it is audited before an
+    // eviction failure is reported.
     state
         .store
         .record_audit(
@@ -3119,9 +3882,10 @@ async fn delete_tenant(
             "delete_tenant",
             "tenant",
             &id.to_string(),
-            serde_json::json!({ "keys_removed": hashes.len() }),
+            serde_json::json!({ "keys_removed": hashes.len(), "cache_evicted": evicted.is_ok() }),
         )
         .await?;
+    evicted?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3205,6 +3969,12 @@ async fn create_key(
     if name.is_empty() {
         return Err(AdminError::BadRequest("key name is required".into()));
     }
+    if body.weight < 1 {
+        return Err(AdminError::BadRequest("weight must be >= 1".into()));
+    }
+    if matches!(body.max_in_flight, Some(c) if c < 1) {
+        return Err(AdminError::BadRequest("max_in_flight must be >= 1".into()));
+    }
     let description = body.description.trim().to_string();
     let (period, started_at) = normalize_budget_fields(
         body.budget_tokens,
@@ -3225,6 +3995,8 @@ async fn create_key(
             body.budget_cost_usd,
             period.as_deref(),
             started_at,
+            body.weight,
+            body.max_in_flight,
         )
         .await?;
     let hash = hash_api_key(&secret);
@@ -3245,10 +4017,129 @@ async fn create_key(
                 "budget_cost_usd": key.budget_cost_usd,
                 "budget_period": key.budget_period,
                 "budget_started_at": key.budget_started_at,
+                "weight": key.weight,
+                "max_in_flight": key.max_in_flight,
             }),
         )
         .await?;
     Ok(Json(CreatedKey { key, secret }))
+}
+
+/// How much of one budget cap its current period has used, from the same
+/// counters the gateway enforces the cap with.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BudgetUsage {
+    /// `tenant` or `key`.
+    pub scope: String,
+    #[schema(value_type = String)]
+    pub id: Uuid,
+    #[schema(value_type = String)]
+    pub tenant_id: Uuid,
+    /// `monthly`, `term` or `lifetime`.
+    pub period: String,
+    pub budget_tokens: Option<i64>,
+    pub budget_cost_usd: Option<f64>,
+    pub used_tokens: i64,
+    pub used_cost_usd: f64,
+    /// When the current period began (a month's first day in the tenant's
+    /// time zone; a term's or lifetime's start, when set).
+    pub period_start: Option<chrono::DateTime<chrono::Utc>>,
+    /// When a monthly budget next resets; none for term and lifetime.
+    pub resets_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Every tenant and key budget with a cap, and how much of its current period
+/// it has used. Reads the enforcement counters without changing them, so a
+/// period that has rolled over reads as zero until its first request.
+#[utoipa::path(
+    get, path = "/api/v1/budgets/usage", tag = "keys",
+    responses((status = 200, body = [BudgetUsage]))
+)]
+async fn get_budget_usage(State(state): State<AdminState>) -> Result<Json<Vec<BudgetUsage>>> {
+    let now = chrono::Utc::now();
+    let tenants = state.store.list_tenants().await?;
+    let zones: std::collections::HashMap<Uuid, String> =
+        tenants.iter().map(|t| (t.id, t.timezone.clone())).collect();
+    let mut wanted = Vec::new();
+    for t in &tenants {
+        if t.id == Store::CONTROL_PLANE_TENANT_ID {
+            continue;
+        }
+        if let Some(period) = obleth_config::budget::period_key(
+            t.budget_tokens,
+            t.budget_cost_usd,
+            t.budget_period.as_deref(),
+            t.budget_started_at,
+            &t.timezone,
+            now,
+        ) {
+            wanted.push((
+                "tenant",
+                t.id,
+                t.id,
+                period,
+                t.budget_period.clone(),
+                t.budget_tokens,
+                t.budget_cost_usd,
+                t.budget_started_at,
+                t.timezone.clone(),
+            ));
+        }
+    }
+    for k in state.store.list_keys(None).await? {
+        if k.tenant_id == Store::CONTROL_PLANE_TENANT_ID {
+            continue;
+        }
+        let tz = zones
+            .get(&k.tenant_id)
+            .cloned()
+            .unwrap_or_else(|| "UTC".into());
+        if let Some(period) = obleth_config::budget::period_key(
+            k.budget_tokens,
+            k.budget_cost_usd,
+            k.budget_period.as_deref(),
+            k.budget_started_at,
+            &tz,
+            now,
+        ) {
+            wanted.push((
+                "key",
+                k.id,
+                k.tenant_id,
+                period,
+                k.budget_period.clone(),
+                k.budget_tokens,
+                k.budget_cost_usd,
+                k.budget_started_at,
+                tz,
+            ));
+        }
+    }
+    let mut out = Vec::with_capacity(wanted.len());
+    for chunk in wanted.chunks(32) {
+        let reads = chunk
+            .iter()
+            .map(|w| state.redis.term_usage_peek(&w.1, &w.3));
+        let used = futures::future::join_all(reads).await;
+        for (w, u) in chunk.iter().zip(used) {
+            let (used_tokens, used_cost_usd) = u?;
+            let (period_start, resets_at) =
+                obleth_config::budget::period_bounds(w.4.as_deref(), w.7, &w.8, now);
+            out.push(BudgetUsage {
+                scope: w.0.to_string(),
+                id: w.1,
+                tenant_id: w.2,
+                period: w.4.clone().unwrap_or_else(|| "lifetime".into()),
+                budget_tokens: w.5,
+                budget_cost_usd: w.6,
+                used_tokens,
+                used_cost_usd,
+                period_start,
+                resets_at,
+            });
+        }
+    }
+    Ok(Json(out))
 }
 
 #[utoipa::path(
@@ -3301,6 +4192,12 @@ async fn update_key(
     if name.is_empty() {
         return Err(AdminError::BadRequest("key name is required".into()));
     }
+    if body.weight < 1 {
+        return Err(AdminError::BadRequest("weight must be >= 1".into()));
+    }
+    if matches!(body.max_in_flight, Some(c) if c < 1) {
+        return Err(AdminError::BadRequest("max_in_flight must be >= 1".into()));
+    }
     let description = body.description.trim().to_string();
     let (period, started_at) = normalize_budget_fields(
         body.budget_tokens,
@@ -3321,6 +4218,8 @@ async fn update_key(
             body.budget_cost_usd,
             period.as_deref(),
             started_at,
+            body.weight,
+            body.max_in_flight,
         )
         .await?;
     push_key(&state, &hash, &resolved).await?;
@@ -3338,6 +4237,8 @@ async fn update_key(
                 "budget_cost_usd": key.budget_cost_usd,
                 "budget_period": key.budget_period,
                 "budget_started_at": key.budget_started_at,
+                "weight": key.weight,
+                "max_in_flight": key.max_in_flight,
             }),
         )
         .await?;
@@ -3355,8 +4256,8 @@ async fn delete_key(
     headers: HeaderMap,
 ) -> Result<StatusCode> {
     let hash = state.store.delete_key(id).await?;
-    let _ = state.redis.delete_resolved_key(&hash).await;
-    let _ = state.redis.publish_invalidation(&hash).await;
+    let evicted = evict_keys(&state, std::slice::from_ref(&hash), "the key").await;
+    // Audited before an eviction failure is reported: the row is gone.
     state
         .store
         .record_audit(
@@ -3364,9 +4265,10 @@ async fn delete_key(
             "delete_key",
             "api_key",
             &id.to_string(),
-            serde_json::json!({}),
+            serde_json::json!({ "cache_evicted": evicted.is_ok() }),
         )
         .await?;
+    evicted?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3401,6 +4303,42 @@ async fn set_key_disabled(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// Move a key to another tenant, keeping its secret and settings. From now
+/// on its requests count against the new tenant's limits, budget and share;
+/// past usage stays recorded under the tenant it was made in.
+#[utoipa::path(
+    put, path = "/api/v1/keys/{id}/tenant", tag = "keys",
+    params(("id" = Uuid, Path, description = "Key id")),
+    request_body = MoveKey,
+    responses((status = 200, body = ApiKey), (status = 404, description = "No such key or tenant"))
+)]
+async fn move_key(
+    State(state): State<AdminState>,
+    Path(id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<MoveKey>,
+) -> Result<Json<ApiKey>> {
+    let (hash, key, resolved, from) = state.store.move_api_key(id, body.tenant_id).await?;
+    push_key(&state, &hash, &resolved).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "move_key",
+            "api_key",
+            &id.to_string(),
+            serde_json::json!({ "prefix": key.key_prefix, "from": from, "tenant_id": key.tenant_id }),
+        )
+        .await?;
+    Ok(Json(key))
+}
+
+#[utoipa::path(
+    put, path = "/api/v1/keys/{id}/tracing", tag = "keys",
+    params(("id" = Uuid, Path, description = "API key id")),
+    request_body = SetKeyTracing,
+    responses((status = 204), (status = 404))
+)]
 async fn set_key_tracing_handler(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -3429,6 +4367,12 @@ async fn set_key_tracing_handler(
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[utoipa::path(
+    put, path = "/api/v1/tenants/{id}/tracing", tag = "tenants",
+    params(("id" = Uuid, Path, description = "Tenant id")),
+    request_body = SetKeyTracing,
+    responses((status = 204), (status = 404))
+)]
 async fn set_tenant_tracing_handler(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
@@ -3536,24 +4480,29 @@ async fn get_key_usage(
         .next()
         .ok_or(AdminError::NotFound)?;
 
-    let summary =
-        usage::query_key_usage_summary(&state.clickhouse, id, q.since_ms, q.include_internal)
-            .await?
-            .unwrap_or(usage::KeyUsageSummary {
-                key_id: id,
-                tenant_id: key.tenant_id,
-                last_used_ms: 0,
-                last_model: String::new(),
-                last_status_code: 0,
-                requests: 0,
-                input_tokens: 0,
-                output_tokens: 0,
-                total_tokens: 0,
-                cost_usd: 0.0,
-                energy_wh: 0.0,
-                energy_cost_usd: 0.0,
-                co2_g: 0.0,
-            });
+    let summary = usage::query_key_usage_summary(
+        &state.clickhouse,
+        key.tenant_id,
+        id,
+        q.since_ms,
+        q.include_internal,
+    )
+    .await?
+    .unwrap_or(usage::KeyUsageSummary {
+        key_id: id,
+        tenant_id: key.tenant_id,
+        last_used_ms: 0,
+        last_model: String::new(),
+        last_status_code: 0,
+        requests: 0,
+        input_tokens: 0,
+        output_tokens: 0,
+        total_tokens: 0,
+        cost_usd: 0.0,
+        energy_wh: 0.0,
+        energy_cost_usd: 0.0,
+        co2_g: 0.0,
+    });
     Ok(Json(summary))
 }
 
@@ -3743,6 +4692,76 @@ async fn get_usage_logs(
     Ok(Json(entries))
 }
 
+/// What the requests matching the log's filters are made of: the busiest
+/// status codes, models, tenants, keys and request types, each with its
+/// failures, and the status code and model pairs that fail most. Tenant and
+/// key ids come back with their names.
+#[utoipa::path(
+    get, path = "/api/v1/usage/logs/facets", tag = "usage",
+    params(usage::UsageLogQuery),
+    responses((status = 200, body = usage::UsageLogFacets))
+)]
+async fn get_usage_log_facets(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::UsageLogQuery>,
+) -> Result<Json<usage::UsageLogFacets>> {
+    let mut facets = usage::query_usage_log_facets(&state.clickhouse, q).await?;
+    let tenant_names: std::collections::HashMap<String, String> = state
+        .store
+        .list_tenants()
+        .await?
+        .into_iter()
+        .map(|t| (t.id.to_string(), t.name))
+        .collect();
+    for t in &mut facets.tenants {
+        t.label = tenant_names.get(&t.value).cloned().unwrap_or_default();
+    }
+    let key_ids: Vec<Uuid> = facets
+        .keys
+        .iter()
+        .filter_map(|k| Uuid::parse_str(&k.value).ok())
+        .collect();
+    let key_names: std::collections::HashMap<String, String> = state
+        .store
+        .keys_by_ids(&key_ids)
+        .await?
+        .into_iter()
+        .map(|k| {
+            let label = if k.name.is_empty() {
+                k.key_prefix
+            } else {
+                format!("{} · {}", k.name, k.key_prefix)
+            };
+            (k.id.to_string(), label)
+        })
+        .collect();
+    for k in &mut facets.keys {
+        k.label = key_names.get(&k.value).cloned().unwrap_or_default();
+    }
+    Ok(Json(facets))
+}
+
+/// Requests and failures over time for the request log's window, counted with
+/// the log's own filters so the chart and the list always agree. Only
+/// non-empty buckets come back.
+#[utoipa::path(
+    get, path = "/api/v1/usage/logs/histogram", tag = "usage",
+    params(usage::UsageLogQuery),
+    responses((status = 200, body = usage::UsageLogHistogram))
+)]
+async fn get_usage_log_histogram(
+    State(state): State<AdminState>,
+    Query(q): Query<usage::UsageLogQuery>,
+) -> Result<Json<usage::UsageLogHistogram>> {
+    let (bucket_ms, buckets) = usage::query_usage_log_histogram(&state.clickhouse, q).await?;
+    Ok(Json(usage::UsageLogHistogram { bucket_ms, buckets }))
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/usage/logs/{request_id}/spans", tag = "usage",
+    params(("request_id" = Uuid, Path, description = "Request id")),
+    responses((status = 200, body = [usage::SpanEntry]))
+)]
 async fn get_request_spans(
     State(state): State<AdminState>,
     Path(request_id): Path<Uuid>,
@@ -3892,6 +4911,12 @@ async fn put_usage_retention(
             "retention days must be at least 1".into(),
         ));
     }
+    if body.days > usage_retention::MAX_RETENTION_DAYS {
+        return Err(AdminError::BadRequest(format!(
+            "retention days must be at most {}",
+            usage_retention::MAX_RETENTION_DAYS
+        )));
+    }
     let settings = obleth_config::UsageRetentionSettings { days: body.days };
     state.store.put_usage_retention_settings(&settings).await?;
     state
@@ -3974,7 +4999,257 @@ async fn get_overview_summary(
         model_count: counts.model_count,
         enabled_models: counts.enabled_models,
         key_count: counts.key_count,
+        input_tokens: totals.input_tokens,
+        output_tokens: totals.output_tokens,
+        errors: totals.errors,
+        p50_ttft_ms: totals.p50_ttft_ms,
+        avg_ttft_ms: totals.avg_ttft_ms,
+        energy_wh: totals.energy_wh,
+        energy_cost_usd: totals.energy_cost_usd,
+        co2_g: totals.co2_g,
     }))
+}
+
+/// Slots the gateway can actually run: the sum of the enabled models' pool
+/// sizes, each model's `max_in_flight` or the gateway default.
+pub fn enabled_pool_capacity(models: &[ModelRoute], default_cap: usize) -> usize {
+    enabled_pool_share(models, default_cap, 1)
+}
+
+/// Slots one of `replicas` live replicas can run: its share of each enabled
+/// model's pool size, summed. Each share rounds up on its own, so this can
+/// exceed `enabled_pool_capacity / replicas` by up to one slot per model.
+pub fn enabled_pool_share(models: &[ModelRoute], default_cap: usize, replicas: usize) -> usize {
+    enabled_pool_share_with(models, default_cap, replicas, &Default::default())
+}
+
+/// [`enabled_pool_share`] with the pool sizes discovery set for some models
+/// (see [`capacity_discovery`]) in place of their `max_in_flight`.
+pub fn enabled_pool_share_with(
+    models: &[ModelRoute],
+    default_cap: usize,
+    replicas: usize,
+    discovered: &std::collections::HashMap<String, usize>,
+) -> usize {
+    models
+        .iter()
+        .filter(|m| m.enabled)
+        .map(|m| {
+            let configured = discovered.get(&m.model_name).copied().unwrap_or_else(|| {
+                m.max_in_flight
+                    .and_then(|c| usize::try_from(c).ok())
+                    .filter(|c| *c > 0)
+                    .unwrap_or(default_cap)
+            });
+            replica_share(configured, replicas)
+        })
+        .sum()
+}
+
+/// How the answering replica enforces the limits right now: its mode, the
+/// live replica count, and what configured limits are divided by in that
+/// mode (1 unless the split applies).
+fn enforcement(state: &AdminState) -> (SlotMode, usize, usize) {
+    use std::sync::atomic::Ordering;
+    let stats = &state.fairshare_stats;
+    let replicas = stats.replicas.load(Ordering::Relaxed).max(1);
+    let mode = stats.mode();
+    let divisor = match mode {
+        SlotMode::Shared | SlotMode::Local => 1,
+        SlotMode::Split => replicas,
+        SlotMode::Fallback if state.fairshare_replica_aware => replicas,
+        SlotMode::Fallback => 1,
+    };
+    (mode, replicas, divisor)
+}
+
+/// Cluster-wide in-flight requests, every pool together and each of `pools`,
+/// read from the shared slots. In `shared` mode only; when Redis does not
+/// answer, the global count this replica last heard stands in and the
+/// per-pool counts are left out.
+async fn cluster_in_flight(
+    state: &AdminState,
+    mode: SlotMode,
+    pools: &[PoolKey],
+) -> Option<(usize, Vec<Option<usize>>)> {
+    use std::sync::atomic::Ordering;
+    if mode != SlotMode::Shared {
+        return None;
+    }
+    match state.fairshare.cluster_in_flight(pools).await {
+        Some((global, per)) => Some((global, per.into_iter().map(Some).collect())),
+        None => Some((
+            state
+                .fairshare_stats
+                .cluster_in_flight
+                .load(Ordering::Relaxed),
+            vec![None; pools.len()],
+        )),
+    }
+}
+
+/// Why the global ceiling would bind before the pools do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CeilingWarning {
+    /// The ceiling compared, configured or per replica to match `pool_sum`.
+    pub ceiling: usize,
+    pub pool_sum: usize,
+    pub message: &'static str,
+}
+
+/// Start-up check that the global ceiling sits above the pools, comparing like
+/// with like. Configured ceiling against configured pool sum first: that is
+/// the operator's fleet-wide intent. Then this replica's share of each at the
+/// live count, since the shares round up per pool and many small pools can
+/// push their sum past the ceiling's share even when the configured numbers
+/// fit. With one replica the two checks are the same.
+pub fn ceiling_check(
+    models: &[ModelRoute],
+    default_cap: usize,
+    ceiling: usize,
+    replicas: usize,
+) -> Option<CeilingWarning> {
+    let pool_sum = enabled_pool_capacity(models, default_cap);
+    if ceiling < pool_sum {
+        return Some(CeilingWarning {
+            ceiling,
+            pool_sum,
+            message: "OBLETH_GLOBAL_MAX_IN_FLIGHT is below the sum of the enabled models' pool \
+                      sizes; the ceiling will bind first and pools will be served round-robin \
+                      — raise it above the pool sum",
+        });
+    }
+    let share_sum = enabled_pool_share(models, default_cap, replicas);
+    let ceiling_share = replica_share(ceiling, replicas);
+    if ceiling_share < share_sum {
+        return Some(CeilingWarning {
+            ceiling: ceiling_share,
+            pool_sum: share_sum,
+            message: "each replica's share of OBLETH_GLOBAL_MAX_IN_FLIGHT is below the sum of \
+                      its pool shares, which round up per model; the ceiling will bind first \
+                      on every replica — raise it by at least one slot per enabled model per \
+                      replica above the pool sum",
+        });
+    }
+    None
+}
+
+/// Fold per-pool views into one all-models view. Occupancy, backlog, served
+/// tokens and expected slots add; `weight_share` becomes expected slots over
+/// total pool capacity so it stays in [0, 1].
+pub(crate) fn aggregate_pools(
+    pools: &[ModelPoolView],
+) -> (
+    Vec<GroupFairshareView>,
+    Vec<TenantFairshareView>,
+    Vec<KeyFairshareView>,
+) {
+    use std::collections::BTreeMap;
+    let total_cap: usize = pools.iter().map(|p| p.cap).sum();
+    let share = |expected: f64| {
+        if total_cap > 0 {
+            expected / total_cap as f64
+        } else {
+            0.0
+        }
+    };
+
+    let mut groups: BTreeMap<String, GroupFairshareView> = BTreeMap::new();
+    let mut tenants: BTreeMap<Uuid, TenantFairshareView> = BTreeMap::new();
+    let mut keys: BTreeMap<Uuid, KeyFairshareView> = BTreeMap::new();
+    for pool in pools {
+        for g in &pool.groups {
+            let e = groups
+                .entry(g.name.clone())
+                .or_insert_with(|| GroupFairshareView {
+                    name: g.name.clone(),
+                    weight: g.weight,
+                    in_flight: 0,
+                    queued: 0,
+                    slot_cap: 0,
+                    borrowed: 0,
+                    served_tokens: 0.0,
+                    share_score: 0.0,
+                    weight_share: 0.0,
+                    expected_slots: 0.0,
+                });
+            e.in_flight += g.in_flight;
+            e.queued += g.queued;
+            e.slot_cap += g.slot_cap;
+            e.borrowed += g.borrowed;
+            e.served_tokens += g.served_tokens;
+            e.expected_slots += g.expected_slots;
+        }
+        for t in &pool.tenants {
+            let e = tenants
+                .entry(t.tenant_id)
+                .or_insert_with(|| TenantFairshareView {
+                    tenant_id: t.tenant_id,
+                    name: t.name.clone(),
+                    fairshare_group: t.fairshare_group.clone(),
+                    weight: t.weight,
+                    max_in_flight: t.max_in_flight,
+                    in_flight: 0,
+                    queued: 0,
+                    served_tokens: 0.0,
+                    share_score: 0.0,
+                    weight_share: 0.0,
+                    expected_slots: 0.0,
+                });
+            e.in_flight += t.in_flight;
+            e.queued += t.queued;
+            e.served_tokens += t.served_tokens;
+            e.expected_slots += t.expected_slots;
+        }
+        for k in &pool.keys {
+            let e = keys.entry(k.key_id).or_insert_with(|| KeyFairshareView {
+                key_id: k.key_id,
+                tenant_id: k.tenant_id,
+                name: k.name.clone(),
+                weight: k.weight,
+                max_in_flight: k.max_in_flight,
+                in_flight: 0,
+                queued: 0,
+                served_tokens: 0.0,
+                share_score: 0.0,
+                weight_share: 0.0,
+                expected_slots: 0.0,
+            });
+            e.in_flight += k.in_flight;
+            e.queued += k.queued;
+            e.served_tokens += k.served_tokens;
+            e.expected_slots += k.expected_slots;
+        }
+    }
+    let by_score = |a: f64, b: f64| a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal);
+    let mut groups: Vec<_> = groups
+        .into_values()
+        .map(|mut g| {
+            g.share_score = g.served_tokens / g.weight.max(1) as f64;
+            g.weight_share = share(g.expected_slots);
+            g
+        })
+        .collect();
+    groups.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut tenants: Vec<_> = tenants
+        .into_values()
+        .map(|mut t| {
+            t.share_score = t.served_tokens / t.weight.max(1) as f64;
+            t.weight_share = share(t.expected_slots);
+            t
+        })
+        .collect();
+    tenants.sort_by(|a, b| by_score(a.share_score, b.share_score));
+    let mut keys: Vec<_> = keys
+        .into_values()
+        .map(|mut k| {
+            k.share_score = k.served_tokens / k.weight.max(1) as f64;
+            k.weight_share = share(k.expected_slots);
+            k
+        })
+        .collect();
+    keys.sort_by(|a, b| by_score(a.share_score, b.share_score));
+    (groups, tenants, keys)
 }
 
 #[utoipa::path(
@@ -3984,11 +5259,226 @@ async fn get_overview_summary(
 async fn get_stats(State(state): State<AdminState>) -> Json<LiveStats> {
     use obleth_fairshare::CapacityProvider;
     use std::sync::atomic::Ordering;
+    // The live counters are the point of this endpoint; a database hiccup
+    // should degrade the capacity number, not fail the poll.
+    let (mode, replicas, divisor) = enforcement(&state);
+    let discovered = state.capacity_discovery.effective_caps();
+    let capacity = state
+        .store
+        .list_models()
+        .await
+        .map(|m| {
+            enabled_pool_share_with(&m, state.default_model_max_in_flight, divisor, &discovered)
+        })
+        .unwrap_or(0);
     Json(LiveStats {
         in_flight: state.fairshare_stats.in_flight.load(Ordering::Relaxed),
         queued: state.fairshare_stats.queued.load(Ordering::Relaxed),
-        max_in_flight: state.capacity.max_in_flight(),
+        max_in_flight: if capacity > 0 {
+            capacity
+        } else {
+            replica_share(state.capacity.max_in_flight(), divisor)
+        },
+        replicas,
+        mode: mode.as_str().into(),
+        cluster_in_flight: cluster_in_flight(&state, mode, &[]).await.map(|(g, _)| g),
     })
+}
+
+/// This replica's capacity discovery: its settings and every `discovered`
+/// model's state.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CapacityDiscoveryView {
+    /// `OBLETH_CAPACITY_DISCOVERY_ENABLED` on this replica.
+    pub enabled: bool,
+    pub interval_secs: u64,
+    /// Namespaces the `kubernetes` source may read. Empty: that source is
+    /// unavailable.
+    pub namespaces: Vec<String>,
+    /// Service name template for `kubernetes` models that set no
+    /// `capacity_service`.
+    pub default_service: String,
+    /// Live gateway replicas.
+    pub replicas: usize,
+    /// How the answering replica enforces pool sizes: `shared`, `split`,
+    /// `fallback` or `local` (see `FairshareLiveView::mode`).
+    pub mode: String,
+    pub models: Vec<CapacityDiscoveryModelView>,
+}
+
+/// One `discovered` model.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CapacityDiscoveryModelView {
+    pub model_id: Uuid,
+    pub model_name: String,
+    pub enabled: bool,
+    /// The model's own `max_in_flight`: the fallback.
+    pub static_max_in_flight: Option<i64>,
+    /// The pool size the answering replica enforces:
+    /// `status.effective_max_in_flight` in `shared` and `local` mode, its
+    /// share of it in `split` and `fallback` mode.
+    pub enforced_max_in_flight: usize,
+    /// In-flight requests for the model across every replica, from the
+    /// shared slots. `null` outside `shared` mode.
+    pub cluster_in_flight: Option<usize>,
+    /// The answering replica's own in-flight requests for the model.
+    pub in_flight: usize,
+    pub status: capacity_discovery::ModelCapacityStatus,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/capacity/discovery", tag = "models",
+    responses((status = 200, body = CapacityDiscoveryView))
+)]
+async fn get_capacity_discovery(
+    State(state): State<AdminState>,
+) -> Result<Json<CapacityDiscoveryView>> {
+    let settings = state.capacity_discovery.settings().clone();
+    let (mode, replicas, divisor) = enforcement(&state);
+    let local_in_flight = state.fairshare.model_load();
+    let statuses: std::collections::HashMap<String, capacity_discovery::ModelCapacityStatus> =
+        state
+            .capacity_discovery
+            .statuses()
+            .into_iter()
+            .map(|s| (s.model_name.clone(), s))
+            .collect();
+    let discovered: Vec<obleth_config::ModelRoute> = state
+        .store
+        .list_models()
+        .await?
+        .into_iter()
+        .filter(|m| m.capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE)
+        .collect();
+    let pool_keys: Vec<PoolKey> = discovered
+        .iter()
+        .map(|m| PoolKey::Model(m.model_name.clone()))
+        .collect();
+    let cluster = cluster_in_flight(&state, mode, &pool_keys)
+        .await
+        .map(|(_, per)| per)
+        .unwrap_or_else(|| vec![None; pool_keys.len()]);
+    let models = discovered
+        .into_iter()
+        .zip(cluster)
+        .map(|(m, cluster_in_flight)| {
+            let status = statuses.get(&m.model_name).cloned().unwrap_or_else(|| {
+                // Not evaluated by this replica (yet): say why, with the value
+                // fairshare is using meanwhile.
+                let reason = if !settings.enabled {
+                    "capacity discovery is off on this gateway \
+                     (OBLETH_CAPACITY_DISCOVERY_ENABLED)"
+                } else if !m.enabled {
+                    "the model is disabled"
+                } else {
+                    "waiting for the next discovery pass"
+                };
+                capacity_discovery::ModelCapacityStatus {
+                    model_name: m.model_name.clone(),
+                    source: m.capacity_source.clone(),
+                    namespaces: Vec::new(),
+                    namespace: m.capacity_namespace.clone(),
+                    service: m.capacity_service.clone(),
+                    ready_replicas: None,
+                    per_replica_max_in_flight: None,
+                    per_replica_source: None,
+                    replica_capacity: None,
+                    headroom: m.capacity_headroom,
+                    derived_max_in_flight: None,
+                    effective_max_in_flight: m
+                        .max_in_flight
+                        .and_then(|c| usize::try_from(c).ok())
+                        .filter(|c| *c > 0)
+                        .unwrap_or(state.default_model_max_in_flight),
+                    state: capacity_discovery::STATE_FALLBACK.into(),
+                    last_refresh: None,
+                    last_success: None,
+                    reason: Some(format!("{reason}; using the static max_in_flight")),
+                }
+            });
+            CapacityDiscoveryModelView {
+                model_id: m.id,
+                enabled: m.enabled,
+                static_max_in_flight: m.max_in_flight,
+                enforced_max_in_flight: replica_share(status.effective_max_in_flight, divisor),
+                cluster_in_flight,
+                in_flight: local_in_flight.get(&m.model_name).copied().unwrap_or(0),
+                model_name: m.model_name,
+                status,
+            }
+        })
+        .collect();
+    Ok(Json(CapacityDiscoveryView {
+        enabled: settings.enabled,
+        interval_secs: settings.interval.as_secs(),
+        namespaces: settings.namespaces,
+        default_service: settings.default_service,
+        replicas,
+        mode: mode.as_str().into(),
+        models,
+    }))
+}
+
+/// The Services the `kubernetes` capacity source can see, for choosing a
+/// model's Service. Built from EndpointSlices in the allowed namespaces
+/// only, and cached briefly.
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct CapacityServicesView {
+    /// Every Service with endpoints in the allowed namespaces.
+    pub services: Vec<capacity_discovery::ServiceSummary>,
+    /// Why `services` is empty or incomplete, when it is.
+    pub reason: Option<String>,
+    /// Namespaces that could not be listed, with why.
+    pub errors: Vec<String>,
+    /// With `model`: the Service name that model would use by default
+    /// (`OBLETH_CAPACITY_DEFAULT_SERVICE` rendered for it), whether or not it
+    /// exists. `null` when there is no default.
+    pub default_service: Option<String>,
+    /// With `model`: that default Service, in the first allowed namespace
+    /// that has it, as discovery would find it. `null` when none has it.
+    pub default_match: Option<capacity_discovery::ServiceSummary>,
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams)]
+pub struct CapacityServicesQuery {
+    /// A model's name or id, to resolve its default Service.
+    pub model: Option<String>,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/capacity/services", tag = "models",
+    params(CapacityServicesQuery),
+    responses((status = 200, body = CapacityServicesView))
+)]
+async fn get_capacity_services(
+    State(state): State<AdminState>,
+    Query(q): Query<CapacityServicesQuery>,
+) -> Result<Json<CapacityServicesView>> {
+    let listing = state.capacity_discovery.list_services().await;
+    let (default_service, default_match) = match q.model.as_deref().filter(|m| !m.is_empty()) {
+        Some(wanted) => {
+            let model = state
+                .store
+                .list_models()
+                .await?
+                .into_iter()
+                .find(|m| m.model_name == wanted || m.id.to_string() == wanted)
+                .ok_or(AdminError::NotFound)?;
+            state.capacity_discovery.default_match(
+                &listing,
+                &model.upstream_model,
+                &model.model_name,
+            )
+        }
+        None => (None, None),
+    };
+    Ok(Json(CapacityServicesView {
+        services: listing.services,
+        reason: listing.reason,
+        errors: listing.errors,
+        default_service,
+        default_match,
+    }))
 }
 
 #[utoipa::path(
@@ -4002,66 +5492,248 @@ async fn get_fairshare_live(State(state): State<AdminState>) -> Result<Json<Fair
         .await
         .ok_or(AdminError::Internal("fairshare unavailable".into()))?;
     let tenants = state.store.list_tenants().await?;
-    let names: std::collections::HashMap<Uuid, String> =
+    let tenant_names: std::collections::HashMap<Uuid, String> =
         tenants.into_iter().map(|t| (t.id, t.name)).collect();
-    let hidden_group = snap
-        .groups
+    let key_ids: Vec<Uuid> = snap
+        .pools
         .iter()
-        .find(|g| g.name == model_health::HEALTH_GROUP)
-        .cloned();
-    let hidden_in_flight = hidden_group.as_ref().map(|g| g.in_flight).unwrap_or(0);
-    let hidden_queued = hidden_group.as_ref().map(|g| g.queued).unwrap_or(0);
-    let model_in_flight = snap.model_in_flight.clone();
-    let model_queued = snap.model_queued.clone();
+        .flat_map(|p| p.keys.iter().map(|k| k.key_id))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    let key_names: std::collections::HashMap<Uuid, String> = state
+        .store
+        .keys_by_ids(&key_ids)
+        .await?
+        .into_iter()
+        .map(|k| (k.id, k.name))
+        .collect();
+    let models = state.store.list_models().await?;
+    let discovered = state.capacity_discovery.effective_caps();
+    let (mode, _, divisor) = enforcement(&state);
+    let configured_capacity =
+        enabled_pool_share_with(&models, state.default_model_max_in_flight, 1, &discovered);
+    let capacity = enabled_pool_share_with(
+        &models,
+        state.default_model_max_in_flight,
+        divisor,
+        &discovered,
+    );
+    let pool_keys: Vec<PoolKey> = snap
+        .pools
+        .iter()
+        .map(|p| {
+            if p.model == obleth_fairshare::UNROUTED_POOL {
+                PoolKey::Unrouted
+            } else {
+                PoolKey::Model(p.model.clone())
+            }
+        })
+        .collect();
+    let (cluster_global, cluster_pools) = match cluster_in_flight(&state, mode, &pool_keys).await {
+        Some((global, per)) => (Some(global), per),
+        None => (None, vec![None; pool_keys.len()]),
+    };
+
+    // Pools outlive their model: a renamed, deleted or disabled model keeps an
+    // empty pool in the scheduler until restart. Every pool with visible
+    // traffic is kept; the idle ones are dropped unless an enabled model still
+    // answers to that name or one of its aliases.
+    let live_names: std::collections::HashSet<&str> = models
+        .iter()
+        .filter(|m| m.enabled)
+        .flat_map(|m| {
+            std::iter::once(m.model_name.as_str()).chain(m.aliases.iter().map(String::as_str))
+        })
+        .collect();
+
+    let health_tenant = model_health::health_tenant_id();
+    let mut hidden_in_flight = 0usize;
+    let mut hidden_queued = 0usize;
+    let mut pools: Vec<ModelPoolView> = snap
+        .pools
+        .iter()
+        .zip(cluster_pools)
+        .map(|(p, cluster_pool)| {
+            let cap = p.cap;
+            let hidden = p
+                .groups
+                .iter()
+                .find(|g| g.name == model_health::HEALTH_GROUP);
+            let h_in = hidden.map(|g| g.in_flight).unwrap_or(0);
+            let h_q = hidden.map(|g| g.queued).unwrap_or(0);
+            hidden_in_flight += h_in;
+            hidden_queued += h_q;
+            ModelPoolView {
+                model: p.model.clone(),
+                cap,
+                configured_cap: p.configured_cap,
+                in_flight: p.in_flight.saturating_sub(h_in),
+                // Cluster-wide counts include every replica's health probes,
+                // which are not told apart from traffic there.
+                cluster_in_flight: cluster_pool.or(p.cluster_in_flight),
+                queued: p.queued.saturating_sub(h_q),
+                borrowed: p.borrowed,
+                groups: p
+                    .groups
+                    .iter()
+                    .filter(|g| g.name != model_health::HEALTH_GROUP)
+                    .map(|g| GroupFairshareView {
+                        name: g.name.clone(),
+                        weight: g.weight,
+                        in_flight: g.in_flight,
+                        queued: g.queued,
+                        slot_cap: g.slot_cap,
+                        borrowed: g.borrowed,
+                        served_tokens: g.served_tokens,
+                        share_score: g.share_score,
+                        weight_share: g.weight_share,
+                        expected_slots: g.weight_share * cap as f64,
+                    })
+                    .collect(),
+                tenants: p
+                    .tenants
+                    .iter()
+                    .filter(|t| {
+                        t.tenant_id != health_tenant
+                            && t.fairshare_group != model_health::HEALTH_GROUP
+                    })
+                    .map(|t| TenantFairshareView {
+                        tenant_id: t.tenant_id,
+                        name: tenant_names
+                            .get(&t.tenant_id)
+                            .cloned()
+                            .unwrap_or_else(|| t.tenant_id.to_string()),
+                        fairshare_group: t.fairshare_group.clone(),
+                        weight: t.weight,
+                        max_in_flight: t.max_in_flight,
+                        in_flight: t.in_flight,
+                        queued: t.queued,
+                        served_tokens: t.served_tokens,
+                        share_score: t.share_score,
+                        weight_share: t.weight_share,
+                        expected_slots: t.weight_share * cap as f64,
+                    })
+                    .collect(),
+                keys: p
+                    .keys
+                    .iter()
+                    .filter(|k| k.tenant_id != health_tenant)
+                    .map(|k| KeyFairshareView {
+                        key_id: k.key_id,
+                        tenant_id: k.tenant_id,
+                        name: key_names
+                            .get(&k.key_id)
+                            .cloned()
+                            .unwrap_or_else(|| k.key_id.to_string()),
+                        weight: k.weight,
+                        max_in_flight: k.max_in_flight,
+                        in_flight: k.in_flight,
+                        queued: k.queued,
+                        served_tokens: k.served_tokens,
+                        share_score: k.share_score,
+                        weight_share: k.weight_share,
+                        expected_slots: k.weight_share * cap as f64,
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    pools.retain(|p| p.in_flight > 0 || p.queued > 0 || live_names.contains(p.model.as_str()));
+    let (groups, tenants, keys) = aggregate_pools(&pools);
     Ok(Json(FairshareLiveView {
         algorithm: snap.algorithm,
-        max_in_flight: snap.max_in_flight,
+        max_in_flight: if capacity > 0 {
+            capacity
+        } else {
+            snap.max_in_flight
+        },
+        configured_max_in_flight: if configured_capacity > 0 {
+            configured_capacity
+        } else {
+            snap.configured_max_in_flight
+        },
+        hard_ceiling: snap.max_in_flight,
+        configured_hard_ceiling: snap.configured_max_in_flight,
+        default_model_max_in_flight: snap.default_model_max_in_flight,
+        replicas: snap.replicas,
+        mode: mode.as_str().into(),
+        shared_slots: state.fairshare_shared_slots,
+        replica_aware: state.fairshare_replica_aware,
+        cluster_in_flight: cluster_global,
         global_in_flight: snap.global_in_flight.saturating_sub(hidden_in_flight),
         global_queued: snap.global_queued.saturating_sub(hidden_queued) as i64,
         global_borrowed: snap.global_borrowed,
-        groups: snap
-            .groups
-            .into_iter()
-            .filter(|g| g.name != model_health::HEALTH_GROUP)
-            .map(|g| GroupFairshareView {
-                name: g.name,
-                weight: g.weight,
-                in_flight: g.in_flight,
-                queued: g.queued,
-                slot_cap: g.slot_cap,
-                borrowed: g.borrowed,
-                served_tokens: g.served_tokens,
-                share_score: g.share_score,
-                weight_share: g.weight_share,
-                expected_slots: g.weight_share * snap.max_in_flight as f64,
-            })
-            .collect(),
-        tenants: snap
-            .tenants
-            .into_iter()
-            .filter(|t| {
-                t.tenant_id != model_health::health_tenant_id()
-                    && t.fairshare_group != model_health::HEALTH_GROUP
-            })
-            .map(|t| TenantFairshareView {
-                name: names
-                    .get(&t.tenant_id)
-                    .cloned()
-                    .unwrap_or_else(|| t.tenant_id.to_string()),
-                fairshare_group: t.fairshare_group,
-                expected_slots: t.weight_share * snap.max_in_flight as f64,
-                tenant_id: t.tenant_id,
-                weight: t.weight,
-                in_flight: t.in_flight,
-                queued: t.queued,
-                served_tokens: t.served_tokens,
-                share_score: t.share_score,
-                weight_share: t.weight_share,
-            })
-            .collect(),
-        model_in_flight,
-        model_queued,
+        groups,
+        tenants,
+        keys,
+        pools,
+        model_in_flight: snap.model_in_flight,
+        model_queued: snap.model_queued,
     }))
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
+pub struct FairshareHistoryQuery {
+    /// Return points at or after this Unix time in ms. Default: now minus retention.
+    pub since_ms: Option<i64>,
+    /// Scope to one model's pool. Absent or empty: aggregate across pools.
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct FairshareHistoryPointView {
+    pub ts_ms: i64,
+    pub in_flight: usize,
+    pub queued: usize,
+    /// Group name to in-flight slots.
+    pub groups: std::collections::BTreeMap<String, usize>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct FairshareHistoryView {
+    pub interval_ms: u64,
+    pub retention_ms: u64,
+    /// Time of the oldest retained sample; null when nothing is retained yet.
+    pub oldest_ts_ms: Option<i64>,
+    pub points: Vec<FairshareHistoryPointView>,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/fairshare/history", tag = "fairshare",
+    params(FairshareHistoryQuery),
+    responses((status = 200, body = FairshareHistoryView))
+)]
+async fn get_fairshare_history(
+    State(state): State<AdminState>,
+    Query(q): Query<FairshareHistoryQuery>,
+) -> Json<FairshareHistoryView> {
+    let retention_ms = state.fairshare_history_secs.saturating_mul(1000);
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let since_ms = q
+        .since_ms
+        .unwrap_or_else(|| now_ms.saturating_sub(retention_ms as i64));
+    let model = q.model.as_deref().filter(|m| !m.is_empty());
+    let points = state
+        .fairshare_history
+        .points(since_ms, model, Some(model_health::HEALTH_GROUP))
+        .into_iter()
+        .map(|p| FairshareHistoryPointView {
+            ts_ms: p.ts_ms,
+            in_flight: p.in_flight,
+            queued: p.queued,
+            groups: p.groups,
+        })
+        .collect();
+    Json(FairshareHistoryView {
+        interval_ms: obleth_fairshare::FAIRSHARE_HISTORY_INTERVAL_MS,
+        retention_ms,
+        oldest_ts_ms: state.fairshare_history.oldest_ts_ms(),
+        points,
+    })
 }
 
 #[utoipa::path(
@@ -4117,7 +5789,7 @@ async fn patch_fairshare_group_weight(
         .store
         .update_fairshare_group_weight(&name, body.weight)
         .await?;
-    resync_all_keys(&state).await?;
+    sync_group_keys(&state, &name).await?;
     state
         .store
         .record_audit(
@@ -4161,12 +5833,184 @@ async fn patch_tenant_group(
     Ok(Json(tenant))
 }
 
-async fn resync_all_keys(state: &AdminState) -> Result<()> {
+/// Republish every key from Postgres and evict Redis entries with no backing
+/// row (e.g. a delete whose eviction failed). Returns (pushed, pruned).
+async fn resync_all_keys(state: &AdminState) -> Result<(usize, usize)> {
     let keys = state.store.all_resolved_keys().await?;
-    for (hash, resolved) in keys {
-        push_key(state, &hash, &resolved).await?;
+    push_keys_bulk(state, &keys, BulkInvalidation::All).await?;
+    let known: std::collections::HashSet<String> = keys.iter().map(|(h, _)| h.clone()).collect();
+    let pruned: std::collections::HashSet<String> = state
+        .redis
+        .prune_stale_resolved_keys(&known)
+        .await?
+        .into_iter()
+        .collect();
+    // Re-read after the prune: a key inserted after the snapshot but pushed
+    // before the SCAN was pruned wrongly and is restored here, and a key deleted
+    // after the snapshot (and so re-pushed above) is evicted again.
+    let fresh = state.store.all_resolved_keys().await?;
+    let fresh_hashes: std::collections::HashSet<&str> =
+        fresh.iter().map(|(h, _)| h.as_str()).collect();
+    for (hash, resolved) in fresh.iter().filter(|(h, _)| pruned.contains(h)) {
+        push_key(state, hash, resolved).await?;
     }
-    Ok(())
+    let gone: Vec<String> = pruned
+        .iter()
+        .chain(known.iter())
+        .filter(|h| !fresh_hashes.contains(h.as_str()))
+        .cloned()
+        .collect();
+    for hash in &gone {
+        evict_key(state, hash).await?;
+    }
+    Ok((fresh.len(), gone.len()))
+}
+
+/// Republish every model and MCP server from Postgres and evict resolver
+/// entries no enabled row answers to. Returns (models, pruned names, mcp
+/// servers, pruned servers).
+async fn resync_models_and_mcp(state: &AdminState) -> Result<(usize, usize, usize, usize)> {
+    use std::collections::HashSet;
+    fn model_names(models: &[ModelRoute]) -> HashSet<String> {
+        models
+            .iter()
+            .filter(|m| m.enabled)
+            .flat_map(|m| std::iter::once(&m.model_name).chain(m.aliases.iter()))
+            .cloned()
+            .collect()
+    }
+    fn server_names(servers: &[McpServer]) -> HashSet<String> {
+        servers
+            .iter()
+            .filter(|s| s.enabled)
+            .map(|s| s.name.clone())
+            .collect()
+    }
+
+    let models = state.store.list_models().await?;
+    for model in &models {
+        sync_model(state, model).await?;
+    }
+    let pruned_models = state
+        .redis
+        .prune_stale_resolved_models(&model_names(&models))
+        .await?;
+    // Same re-read as `resync_all_keys`: restore anything created mid-prune.
+    let fresh_models = state.store.list_models().await?;
+    let fresh_names = model_names(&fresh_models);
+    for model in &fresh_models {
+        if model.enabled
+            && std::iter::once(&model.model_name)
+                .chain(model.aliases.iter())
+                .any(|n| pruned_models.contains(n))
+        {
+            sync_model(state, model).await?;
+        }
+    }
+    for name in pruned_models.iter().filter(|n| !fresh_names.contains(*n)) {
+        state
+            .redis
+            .publish_invalidation(&format!("model:{name}"))
+            .await?;
+    }
+
+    let servers = state.store.list_mcp_servers().await?;
+    for server in &servers {
+        sync_mcp_server(state, server).await?;
+    }
+    let pruned_servers = state
+        .redis
+        .prune_stale_resolved_mcp_servers(&server_names(&servers))
+        .await?;
+    let fresh_servers = state.store.list_mcp_servers().await?;
+    let fresh_server_names = server_names(&fresh_servers);
+    for server in fresh_servers
+        .iter()
+        .filter(|s| pruned_servers.contains(&s.name))
+    {
+        sync_mcp_server(state, server).await?;
+    }
+    for name in pruned_servers
+        .iter()
+        .filter(|n| !fresh_server_names.contains(*n))
+    {
+        state
+            .redis
+            .publish_invalidation(&format!("mcp:{name}"))
+            .await?;
+    }
+
+    Ok((
+        fresh_models.len(),
+        pruned_models.len(),
+        fresh_servers.len(),
+        pruned_servers.len(),
+    ))
+}
+
+/// Outcome of a resolver-cache reconcile.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ResyncReport {
+    /// Keys republished from Postgres.
+    pub keys: usize,
+    /// Key entries evicted because no key row backs them.
+    pub keys_pruned: usize,
+    /// Models republished from Postgres.
+    pub models: usize,
+    /// Model/alias entries evicted because no enabled model answers to them.
+    pub model_names_pruned: usize,
+    /// MCP servers republished from Postgres.
+    pub mcp_servers: usize,
+    /// MCP entries evicted because no enabled server backs them.
+    pub mcp_servers_pruned: usize,
+}
+
+/// Rebuild the data plane's resolver cache (keys, models, MCP servers) from
+/// Postgres. This is the retry for a delete that reported a failed eviction.
+#[utoipa::path(
+    post, path = "/api/v1/resync", tag = "meta",
+    responses((status = 200, body = ResyncReport), (status = 502))
+)]
+async fn resync_resolver_cache(
+    State(state): State<AdminState>,
+    headers: HeaderMap,
+) -> Result<Json<ResyncReport>> {
+    let (keys, keys_pruned) = resync_all_keys(&state).await?;
+    let (models, model_names_pruned, mcp_servers, mcp_servers_pruned) =
+        resync_models_and_mcp(&state).await?;
+    let report = ResyncReport {
+        keys,
+        keys_pruned,
+        models,
+        model_names_pruned,
+        mcp_servers,
+        mcp_servers_pruned,
+    };
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "resync_resolver_cache",
+            "gateway",
+            "resolver_cache",
+            serde_json::to_value(&report).unwrap_or_default(),
+        )
+        .await?;
+    Ok(Json(report))
+}
+
+/// The speculation boon sends the model's upstream key to its scoring endpoint,
+/// so a non-empty `verify_api_base` gets the same destination policy as
+/// `api_base`.
+async fn validate_verify_api_base(state: &AdminState, raw: Option<&str>) -> Result<()> {
+    match raw.map(str::trim) {
+        Some(url) if !url.is_empty() => state
+            .ssrf
+            .validate(url)
+            .await
+            .map_err(|e| AdminError::BadRequest(format!("verify_api_base: {e}"))),
+        _ => Ok(()),
+    }
 }
 
 /// Validate a declared serving format against the fixed vocabulary.
@@ -4227,22 +6071,135 @@ async fn validate_aliases(
     Ok(aliases)
 }
 
+/// Validate a capacity mode against the fixed vocabulary, returning its
+/// canonical form. Rejected rather than normalized: a typo must not quietly
+/// turn a model back to `static`.
+fn validate_capacity_mode(raw: &str) -> Result<String> {
+    let m = raw.trim().to_ascii_lowercase();
+    if !obleth_config::is_valid_capacity_mode(&m) {
+        return Err(AdminError::BadRequest(format!(
+            "invalid capacity_mode `{raw}` (expected one of: {})",
+            obleth_config::CAPACITY_MODES.join(", ")
+        )));
+    }
+    Ok(m)
+}
+
+/// The stored discovery fields with a patch applied: an omitted field keeps
+/// its value, a `null` (or blank text) clears it.
+fn patch_discovery_fields(
+    existing: &ModelRoute,
+    source: Option<&str>,
+    namespace: Option<&Option<String>>,
+    service: Option<&Option<String>>,
+    per_replica_max_in_flight: Option<Option<i64>>,
+    headroom: Option<f64>,
+) -> obleth_config::capacity::DiscoveryFields {
+    let current = obleth_config::capacity::DiscoveryFields::of(existing);
+    obleth_config::capacity::DiscoveryFields {
+        source: source.map(str::to_string).unwrap_or(current.source),
+        namespace: namespace.cloned().unwrap_or(current.namespace),
+        service: service.cloned().unwrap_or(current.service),
+        per_replica_max_in_flight: per_replica_max_in_flight
+            .unwrap_or(current.per_replica_max_in_flight),
+        headroom: headroom.unwrap_or(current.headroom),
+    }
+    .normalized()
+}
+
+/// Check a model's capacity fields, and for a `discovered` model on the
+/// `kubernetes` source that this gateway can read it (see
+/// [`obleth_config::capacity::validate_discovery_fields`]).
+///
+/// `endpoint_max_in_flight` is each of the model's endpoints' own
+/// `max_in_flight` (see [`endpoint_concurrency`]), which decides whether an
+/// `endpoints`-source model needs its own per-replica value.
+fn validate_capacity_fields(
+    state: &AdminState,
+    capacity_mode: &str,
+    model_name: &str,
+    upstream_model: &str,
+    fields: &obleth_config::capacity::DiscoveryFields,
+    endpoint_max_in_flight: &[Option<i64>],
+) -> Result<()> {
+    obleth_config::capacity::validate_discovery_fields(
+        model_name,
+        upstream_model,
+        fields,
+        capacity_mode == obleth_config::DISCOVERED_CAPACITY_MODE,
+        state.capacity_discovery.policy(),
+        endpoint_max_in_flight,
+    )
+    .map_err(AdminError::BadRequest)
+}
+
+/// The own `max_in_flight` of each of a model's endpoints.
+async fn endpoint_concurrency(state: &AdminState, model_id: Uuid) -> Result<Vec<Option<i64>>> {
+    Ok(state
+        .store
+        .list_model_endpoints(model_id)
+        .await?
+        .into_iter()
+        .map(|e| e.max_in_flight)
+        .collect())
+}
+
+/// Refuse an endpoint write that would leave a `discovered` model on the
+/// `endpoints` source with an endpoint it cannot count: one with no
+/// `max_in_flight` while the model has no `per_replica_max_in_flight`.
+/// `endpoint_id` is the endpoint being written (`None` for a new one) and
+/// `max_in_flight` its value after the write.
+async fn validate_endpoint_write(
+    state: &AdminState,
+    model: &ModelRoute,
+    endpoint_id: Option<Uuid>,
+    max_in_flight: Option<i64>,
+) -> Result<()> {
+    if model.capacity_mode != obleth_config::DISCOVERED_CAPACITY_MODE {
+        return Ok(());
+    }
+    let mut values: Vec<Option<i64>> = state
+        .store
+        .list_model_endpoints(model.id)
+        .await?
+        .into_iter()
+        .filter(|e| Some(e.id) != endpoint_id)
+        .map(|e| e.max_in_flight)
+        .collect();
+    values.push(max_in_flight);
+    validate_capacity_fields(
+        state,
+        &model.capacity_mode,
+        &model.model_name,
+        &model.upstream_model,
+        &obleth_config::capacity::DiscoveryFields::of(model),
+        &values,
+    )
+    .map_err(|e| match e {
+        AdminError::BadRequest(msg) => {
+            AdminError::BadRequest(format!("this endpoint needs its own max_in_flight: {msg}"))
+        }
+        other => other,
+    })
+}
+
 #[utoipa::path(
     post, path = "/api/v1/models", tag = "models",
     request_body = CreateModel,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn create_model(
     State(state): State<AdminState>,
     headers: HeaderMap,
     Json(body): Json<CreateModel>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     // A blank api_base is allowed: Slurm-provisioned models have no static
     // upstream until a replica is promoted into the endpoint rotation. Only
     // validate a non-empty URL.
     if !body.api_base.trim().is_empty() {
-        state.ssrf.validate(&body.api_base)?;
+        state.ssrf.validate(&body.api_base).await?;
     }
+    validate_verify_api_base(&state, body.verify_api_base.as_deref()).await?;
     let quantization = validate_quantization(body.quantization.as_deref().unwrap_or_default())?;
     let aliases = validate_aliases(
         &state,
@@ -4251,6 +6208,36 @@ async fn create_model(
         body.model_name.trim(),
     )
     .await?;
+    let upstream_headers = match &body.upstream_headers {
+        Some(write) => obleth_config::merge_upstream_headers(&Default::default(), write)
+            .map_err(AdminError::BadRequest)?,
+        None => Default::default(),
+    };
+    let capacity_mode = validate_capacity_mode(
+        body.capacity_mode
+            .as_deref()
+            .unwrap_or(obleth_config::DEFAULT_CAPACITY_MODE),
+    )?;
+    let discovery = obleth_config::capacity::DiscoveryFields {
+        source: body
+            .capacity_source
+            .clone()
+            .unwrap_or_else(|| obleth_config::DEFAULT_CAPACITY_SOURCE.to_string()),
+        namespace: body.capacity_namespace.clone(),
+        service: body.capacity_service.clone(),
+        per_replica_max_in_flight: body.per_replica_max_in_flight,
+        headroom: body.capacity_headroom.unwrap_or(1.0),
+    }
+    .normalized();
+    // A new model has no endpoint rows yet.
+    validate_capacity_fields(
+        &state,
+        &capacity_mode,
+        body.model_name.trim(),
+        &body.upstream_model,
+        &discovery,
+        &[],
+    )?;
     let model = state
         .store
         .create_model(
@@ -4284,8 +6271,19 @@ async fn create_model(
             body.verify_upstream_model.as_deref().unwrap_or(""),
             &aliases,
             &quantization,
+            &upstream_headers,
+            body.cost_per_video.unwrap_or(0.0),
+            &capacity_mode,
+            &discovery,
         )
         .await?;
+    // Switched off before the first publish below, so the data plane never
+    // sees the route on.
+    let model = if body.enabled == Some(false) {
+        state.store.set_model_enabled(model.id, false).await?
+    } else {
+        model
+    };
     if state.health.default_interval_secs != 900 {
         let _ = state
             .store
@@ -4310,48 +6308,49 @@ async fn create_model(
             "create_model",
             "model",
             &model.id.to_string(),
-            serde_json::to_value(&model).unwrap_or_default(),
+            serde_json::to_value(ModelRouteView::from(model.clone())).unwrap_or_default(),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 #[utoipa::path(
     get, path = "/api/v1/models", tag = "models",
-    responses((status = 200, body = [ModelRoute]))
+    responses((status = 200, body = [ModelRouteView]))
 )]
-async fn list_models(State(state): State<AdminState>) -> Result<Json<Vec<ModelRoute>>> {
-    Ok(Json(state.store.list_models().await?))
+async fn list_models(State(state): State<AdminState>) -> Result<Json<Vec<ModelRouteView>>> {
+    Ok(Json(views(state.store.list_models().await?)))
 }
 
 #[utoipa::path(
     get, path = "/api/v1/models/{id}", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
-    responses((status = 200, body = ModelRoute), (status = 404))
+    responses((status = 200, body = ModelRouteView), (status = 404))
 )]
 async fn get_model(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<ModelRoute>> {
-    Ok(Json(state.store.get_model(id).await?))
+) -> Result<Json<ModelRouteView>> {
+    Ok(Json(state.store.get_model(id).await?.into()))
 }
 
 #[utoipa::path(
     put, path = "/api/v1/models/{id}", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
     request_body = UpdateModel,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn update_model(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<UpdateModel>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     // Blank api_base allowed for provisioned-only (Slurm) models — see create_model.
     if !body.api_base.trim().is_empty() {
-        state.ssrf.validate(&body.api_base)?;
+        state.ssrf.validate(&body.api_base).await?;
     }
+    validate_verify_api_base(&state, body.verify_api_base.as_deref()).await?;
     let existing = state.store.get_model(id).await?;
     let api_key = body.api_key.as_deref().or(existing.api_key.as_deref());
     let quantization = match body.quantization.as_deref() {
@@ -4362,6 +6361,31 @@ async fn update_model(
         Some(list) => validate_aliases(&state, list, Some(id), &existing.model_name).await?,
         None => existing.aliases.clone(),
     };
+    let upstream_headers = match &body.upstream_headers {
+        Some(write) => obleth_config::merge_upstream_headers(&existing.upstream_headers, write)
+            .map_err(AdminError::BadRequest)?,
+        None => existing.upstream_headers.clone(),
+    };
+    let capacity_mode = match body.capacity_mode.as_deref() {
+        Some(m) => validate_capacity_mode(m)?,
+        None => existing.capacity_mode.clone(),
+    };
+    let discovery = patch_discovery_fields(
+        &existing,
+        body.capacity_source.as_deref(),
+        body.capacity_namespace.as_ref(),
+        body.capacity_service.as_ref(),
+        body.per_replica_max_in_flight,
+        body.capacity_headroom,
+    );
+    validate_capacity_fields(
+        &state,
+        &capacity_mode,
+        &existing.model_name,
+        &body.upstream_model,
+        &discovery,
+        &endpoint_concurrency(&state, existing.id).await?,
+    )?;
     let model = state
         .store
         .update_model(
@@ -4412,6 +6436,10 @@ async fn update_model(
                 .unwrap_or(&existing.verify_upstream_model),
             &aliases,
             &quantization,
+            &upstream_headers,
+            body.cost_per_video.unwrap_or(existing.cost_per_video),
+            &capacity_mode,
+            &discovery,
         )
         .await?;
     if model_health::probe_config_changed(&existing, &model) {
@@ -4430,21 +6458,21 @@ async fn update_model(
             serde_json::json!({ "model_name": model.model_name }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 #[utoipa::path(
     put, path = "/api/v1/models/{id}/capacity", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
     request_body = SetModelCapacity,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn set_model_capacity(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetModelCapacity>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     let model = state
         .store
         .update_model_capacity(id, body.max_in_flight)
@@ -4460,7 +6488,7 @@ async fn set_model_capacity(
             serde_json::json!({ "max_in_flight": model.max_in_flight }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 #[utoipa::path(
@@ -4468,23 +6496,35 @@ async fn set_model_capacity(
     path = "/api/v1/models/{id}/capacity-mode",
     tag = "models",
     request_body = SetModelCapacityMode,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn set_model_capacity_mode(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetModelCapacityMode>,
-) -> Result<Json<ModelRoute>> {
-    if !obleth_config::is_valid_capacity_mode(body.capacity_mode.trim()) {
-        return Err(AdminError::BadRequest(format!(
-            "invalid capacity_mode `{}` (expected `static` or `tuned`)",
-            body.capacity_mode
-        )));
-    }
+) -> Result<Json<ModelRouteView>> {
+    let capacity_mode = validate_capacity_mode(&body.capacity_mode)?;
+    let existing = state.store.get_model(id).await?;
+    let discovery = patch_discovery_fields(
+        &existing,
+        body.capacity_source.as_deref(),
+        body.capacity_namespace.as_ref(),
+        body.capacity_service.as_ref(),
+        body.per_replica_max_in_flight,
+        body.capacity_headroom,
+    );
+    validate_capacity_fields(
+        &state,
+        &capacity_mode,
+        &existing.model_name,
+        &existing.upstream_model,
+        &discovery,
+        &endpoint_concurrency(&state, existing.id).await?,
+    )?;
     let model = state
         .store
-        .update_model_capacity_mode(id, &body.capacity_mode)
+        .update_model_capacity_mode(id, &capacity_mode, Some(&discovery))
         .await?;
     sync_model(&state, &model).await?;
     state
@@ -4494,10 +6534,17 @@ async fn set_model_capacity_mode(
             "set_model_capacity_mode",
             "model",
             &id.to_string(),
-            serde_json::json!({ "capacity_mode": model.capacity_mode }),
+            serde_json::json!({
+                "capacity_mode": model.capacity_mode,
+                "capacity_source": model.capacity_source,
+                "capacity_namespace": model.capacity_namespace,
+                "capacity_service": model.capacity_service,
+                "per_replica_max_in_flight": model.per_replica_max_in_flight,
+                "capacity_headroom": model.capacity_headroom,
+            }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 /// Run an auto-tune ramp probe against the model's upstream and return a
@@ -4548,14 +6595,14 @@ async fn autotune_model(
     path = "/api/v1/models/{id}/autotune/apply",
     tag = "models",
     request_body = ApplyAutotuneCapacity,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn apply_autotune_capacity(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<ApplyAutotuneCapacity>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     if body.max_in_flight < 1 {
         return Err(AdminError::BadRequest(
             "max_in_flight must be >= 1".to_string(),
@@ -4579,21 +6626,21 @@ async fn apply_autotune_capacity(
             }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 #[utoipa::path(
     put, path = "/api/v1/models/{id}/weight", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
     request_body = SetModelWeight,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn set_model_weight(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetModelWeight>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     let model = state
         .store
         .update_model_admission_weight(id, body.admission_weight)
@@ -4609,21 +6656,21 @@ async fn set_model_weight(
             serde_json::json!({ "admission_weight": model.admission_weight }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 #[utoipa::path(
     put, path = "/api/v1/models/{id}/cache", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
     request_body = SetModelCache,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn set_model_cache(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetModelCache>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     let model = state
         .store
         .update_model_cache(id, body.cache_enabled, body.cache_ttl_secs.unwrap_or(300))
@@ -4642,21 +6689,21 @@ async fn set_model_cache(
             }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 #[utoipa::path(
     put, path = "/api/v1/models/{id}/reliability", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
     request_body = SetModelReliability,
-    responses((status = 200, body = ModelRoute))
+    responses((status = 200, body = ModelRouteView))
 )]
 async fn set_model_reliability(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<SetModelReliability>,
-) -> Result<Json<ModelRoute>> {
+) -> Result<Json<ModelRouteView>> {
     let model = state
         .store
         .update_model_reliability(
@@ -4684,7 +6731,7 @@ async fn set_model_reliability(
             }),
         )
         .await?;
-    Ok(Json(model))
+    Ok(Json(model.into()))
 }
 
 // ---- model endpoints -----------------------------------------------------
@@ -4692,32 +6739,45 @@ async fn set_model_reliability(
 #[utoipa::path(
     get, path = "/api/v1/models/{id}/endpoints", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
-    responses((status = 200, body = [ModelEndpoint]))
+    responses((status = 200, body = [ModelEndpointView]))
 )]
 async fn list_model_endpoints(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Vec<ModelEndpoint>>> {
+) -> Result<Json<Vec<ModelEndpointView>>> {
     // Confirm the model exists so callers get 404 (not an empty list) for a
     // bad id.
     state.store.get_model(id).await?;
-    Ok(Json(state.store.list_model_endpoints(id).await?))
+    Ok(Json(views(state.store.list_model_endpoints(id).await?)))
+}
+
+/// An endpoint's own concurrency, when given, has the same bounds as a
+/// model's `per_replica_max_in_flight`.
+fn validate_endpoint_max_in_flight(value: Option<i64>) -> Result<()> {
+    obleth_config::capacity::validate_per_replica_max_in_flight(value).map_err(|_| {
+        AdminError::BadRequest(format!(
+            "max_in_flight must be between 1 and {}",
+            obleth_config::capacity::MAX_PER_REPLICA_MAX_IN_FLIGHT
+        ))
+    })
 }
 
 #[utoipa::path(
     post, path = "/api/v1/models/{id}/endpoints", tag = "models",
     params(("id" = Uuid, Path, description = "Model id")),
     request_body = CreateModelEndpoint,
-    responses((status = 200, body = ModelEndpoint))
+    responses((status = 200, body = ModelEndpointView))
 )]
 async fn create_model_endpoint(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<CreateModelEndpoint>,
-) -> Result<Json<ModelEndpoint>> {
-    state.ssrf.validate(&body.api_base)?;
+) -> Result<Json<ModelEndpointView>> {
+    state.ssrf.validate(&body.api_base).await?;
+    validate_endpoint_max_in_flight(body.max_in_flight)?;
     let model = state.store.get_model(id).await?;
+    validate_endpoint_write(&state, &model, None, body.max_in_flight).await?;
     let endpoint = state
         .store
         .create_model_endpoint(
@@ -4728,6 +6788,7 @@ async fn create_model_endpoint(
             body.priority,
             body.weight,
             body.enabled,
+            body.max_in_flight,
         )
         .await?;
     sync_model(&state, &model).await?;
@@ -4745,7 +6806,7 @@ async fn create_model_endpoint(
             }),
         )
         .await?;
-    Ok(Json(endpoint))
+    Ok(Json(endpoint.into()))
 }
 
 #[utoipa::path(
@@ -4755,19 +6816,35 @@ async fn create_model_endpoint(
         ("endpoint_id" = Uuid, Path, description = "Endpoint id")
     ),
     request_body = UpdateModelEndpoint,
-    responses((status = 200, body = ModelEndpoint))
+    responses((status = 200, body = ModelEndpointView), (status = 404))
 )]
 async fn update_model_endpoint(
     State(state): State<AdminState>,
     Path((id, endpoint_id)): Path<(Uuid, Uuid)>,
     headers: HeaderMap,
     Json(body): Json<UpdateModelEndpoint>,
-) -> Result<Json<ModelEndpoint>> {
-    state.ssrf.validate(&body.api_base)?;
+) -> Result<Json<ModelEndpointView>> {
+    state.ssrf.validate(&body.api_base).await?;
     let model = state.store.get_model(id).await?;
+    let max_in_flight = match body.max_in_flight {
+        Some(v) => v,
+        // Omitted keeps the stored value. An id outside this model finds
+        // nothing here and is refused by the scoped update below.
+        None => state
+            .store
+            .list_model_endpoints(model.id)
+            .await?
+            .into_iter()
+            .find(|e| e.id == endpoint_id)
+            .and_then(|e| e.max_in_flight),
+    };
+    validate_endpoint_max_in_flight(max_in_flight)?;
+    validate_endpoint_write(&state, &model, Some(endpoint_id), max_in_flight).await?;
     let endpoint = state
         .store
+        // Scoped to the path model: another model's endpoint id is a 404.
         .update_model_endpoint(
+            model.id,
             endpoint_id,
             &body.name,
             &body.api_base,
@@ -4775,6 +6852,7 @@ async fn update_model_endpoint(
             body.priority,
             body.weight,
             body.enabled,
+            max_in_flight,
         )
         .await?;
     sync_model(&state, &model).await?;
@@ -4793,7 +6871,7 @@ async fn update_model_endpoint(
             }),
         )
         .await?;
-    Ok(Json(endpoint))
+    Ok(Json(endpoint.into()))
 }
 
 #[utoipa::path(
@@ -4810,7 +6888,11 @@ async fn delete_model_endpoint(
     headers: HeaderMap,
 ) -> Result<StatusCode> {
     let model = state.store.get_model(id).await?;
-    state.store.delete_model_endpoint(endpoint_id).await?;
+    // Scoped to the path model: another model's endpoint id is a 404.
+    state
+        .store
+        .delete_model_endpoint(model.id, endpoint_id)
+        .await?;
     sync_model(&state, &model).await?;
     state
         .store
@@ -4930,23 +7012,49 @@ async fn delete_managed_model(
     Ok(Json(serde_json::json!({"deleted": true})))
 }
 
-#[derive(serde::Deserialize)]
-struct ProvisionErrorBody {
+#[derive(serde::Deserialize, ToSchema)]
+pub struct ProvisionErrorBody {
     #[serde(default)]
-    error: Option<String>,
+    pub error: Option<String>,
 }
 
 #[utoipa::path(patch, path = "/api/v1/models/{id}/managed/provision-error",
+    request_body = ProvisionErrorBody,
     responses((status = 200)))]
 async fn set_provision_error(
     State(state): State<AdminState>,
     Path(id): Path<uuid::Uuid>,
+    headers: HeaderMap,
     Json(body): Json<ProvisionErrorBody>,
 ) -> Result<Json<serde_json::Value>> {
+    // Only a clear is an operator-visible change worth auditing: the
+    // provisioner records an error on every failed submit and clears on every
+    // successful one, so the audit row is written only when a clear actually
+    // removed a recorded error.
+    let cleared = match body.error {
+        None => state
+            .store
+            .get_managed_model(id)
+            .await?
+            .and_then(|m| m.last_provision_error),
+        Some(_) => None,
+    };
     state
         .store
         .set_provision_error(id, body.error.as_deref())
         .await?;
+    if let Some(previous) = cleared {
+        state
+            .store
+            .record_audit(
+                &audit_actor(&headers),
+                "clear_provision_error",
+                "managed_model",
+                &id.to_string(),
+                serde_json::json!({ "cleared_error": previous }),
+            )
+            .await?;
+    }
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -5093,8 +7201,19 @@ async fn delete_replica(
 pub async fn clear_lost_replicas(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>> {
     let n = state.store.delete_lost_replicas(id).await?;
+    state
+        .store
+        .record_audit(
+            &audit_actor(&headers),
+            "clear_lost_replicas",
+            "model",
+            &id.to_string(),
+            serde_json::json!({ "deleted": n }),
+        )
+        .await?;
     Ok(Json(serde_json::json!({ "deleted": n })))
 }
 
@@ -5112,15 +7231,23 @@ async fn delete_model(
     state.store.delete_model(id).await?;
     // Aliases are resolver keys of their own, so a delete has to clear all of
     // them or the model stays reachable under its old names.
+    let mut evict_err = None;
     for name in
         std::iter::once(model.model_name.as_str()).chain(model.aliases.iter().map(String::as_str))
     {
-        let _ = state.redis.delete_resolved_model(name).await;
-        let _ = state
-            .redis
-            .publish_invalidation(&format!("model:{name}"))
-            .await;
+        let evicted = async {
+            state.redis.delete_resolved_model(name).await?;
+            state
+                .redis
+                .publish_invalidation(&format!("model:{name}"))
+                .await
+        }
+        .await;
+        if let Err(e) = evicted {
+            evict_err.get_or_insert(e);
+        }
     }
+    // Audited before an eviction failure is reported: the row is gone.
     state
         .store
         .record_audit(
@@ -5128,9 +7255,15 @@ async fn delete_model(
             "delete_model",
             "model",
             &id.to_string(),
-            serde_json::json!({ "model_name": model.model_name }),
+            serde_json::json!({
+                "model_name": model.model_name,
+                "cache_evicted": evict_err.is_none(),
+            }),
         )
         .await?;
+    if let Some(e) = evict_err {
+        return Err(eviction_failed("the model", e));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -5139,14 +7272,15 @@ async fn delete_model(
 #[utoipa::path(
     post, path = "/api/v1/mcp-servers", tag = "mcp",
     request_body = CreateMcpServer,
-    responses((status = 200, body = McpServer))
+    responses((status = 200, body = McpServerView))
 )]
 async fn create_mcp_server(
     State(state): State<AdminState>,
     headers: HeaderMap,
     Json(body): Json<CreateMcpServer>,
-) -> Result<Json<McpServer>> {
-    state.ssrf.validate(&body.upstream_url)?;
+) -> Result<Json<McpServerView>> {
+    validate_mcp_server_name(&body.name)?;
+    state.ssrf.validate(&body.upstream_url).await?;
     let server = state
         .store
         .create_mcp_server(&body.name, &body.upstream_url, body.auth_header.as_deref())
@@ -5162,48 +7296,63 @@ async fn create_mcp_server(
             serde_json::json!({ "name": server.name, "upstream_url": server.upstream_url }),
         )
         .await?;
-    Ok(Json(server))
+    Ok(Json(server.into()))
 }
 
 #[utoipa::path(
     get, path = "/api/v1/mcp-servers", tag = "mcp",
-    responses((status = 200, body = [McpServer]))
+    responses((status = 200, body = [McpServerView]))
 )]
-async fn list_mcp_servers(State(state): State<AdminState>) -> Result<Json<Vec<McpServer>>> {
-    Ok(Json(state.store.list_mcp_servers().await?))
+async fn list_mcp_servers(State(state): State<AdminState>) -> Result<Json<Vec<McpServerView>>> {
+    Ok(Json(views(state.store.list_mcp_servers().await?)))
 }
 
 #[utoipa::path(
     get, path = "/api/v1/mcp-servers/{id}", tag = "mcp",
     params(("id" = Uuid, Path, description = "MCP server id")),
-    responses((status = 200, body = McpServer), (status = 404))
+    responses((status = 200, body = McpServerView), (status = 404))
 )]
 async fn get_mcp_server(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<McpServer>> {
-    Ok(Json(state.store.get_mcp_server(id).await?))
+) -> Result<Json<McpServerView>> {
+    Ok(Json(state.store.get_mcp_server(id).await?.into()))
 }
 
 #[utoipa::path(
     put, path = "/api/v1/mcp-servers/{id}", tag = "mcp",
     params(("id" = Uuid, Path, description = "MCP server id")),
     request_body = UpdateMcpServer,
-    responses((status = 200, body = McpServer))
+    responses((status = 200, body = McpServerView))
 )]
 async fn update_mcp_server(
     State(state): State<AdminState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<UpdateMcpServer>,
-) -> Result<Json<McpServer>> {
-    state.ssrf.validate(&body.upstream_url)?;
+) -> Result<Json<McpServerView>> {
+    state.ssrf.validate(&body.upstream_url).await?;
     let existing = state.store.get_mcp_server(id).await?;
-    let auth = body
+    let rename = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| *n != existing.name)
+        .map(str::to_string);
+    if let Some(name) = &rename {
+        validate_mcp_server_name(name)?;
+    }
+    let auth = match body
         .auth_header
         .as_deref()
-        .or(existing.auth_header.as_deref());
-    let server = state
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        Some(new) => Some(new),
+        None if body.clear_auth => None,
+        None => existing.auth_header.as_deref(),
+    };
+    let mut server = state
         .store
         .update_mcp_server(
             id,
@@ -5212,6 +7361,26 @@ async fn update_mcp_server(
             body.enabled.unwrap_or(existing.enabled),
         )
         .await?;
+    let mut regranted: Vec<String> = Vec::new();
+    if let Some(name) = &rename {
+        let (renamed, models) = state.store.rename_mcp_server(id, name).await?;
+        server = renamed;
+        // The old name leaves the data-plane cache; the new one is published below.
+        state
+            .redis
+            .delete_resolved_mcp_server(&existing.name)
+            .await
+            .map_err(|e| eviction_failed("the MCP server's old name", e))?;
+        state
+            .redis
+            .publish_invalidation(&format!("mcp:{}", existing.name))
+            .await
+            .map_err(|e| eviction_failed("the MCP server's old name", e))?;
+        for model in &models {
+            sync_model(&state, model).await?;
+        }
+        regranted = models.into_iter().map(|m| m.model_name).collect();
+    }
     sync_mcp_server(&state, &server).await?;
     state
         .store
@@ -5220,10 +7389,18 @@ async fn update_mcp_server(
             "update_mcp_server",
             "mcp_server",
             &id.to_string(),
-            serde_json::json!({ "name": server.name }),
+            serde_json::json!({
+                "name": server.name,
+                "renamed_from": rename.as_ref().map(|_| existing.name.clone()),
+                "upstream_url": server.upstream_url,
+                "enabled": server.enabled,
+                "auth_header_set": server.auth_header.is_some(),
+                "auth_changed": body.auth_header.as_deref().is_some_and(|a| !a.trim().is_empty()) || (body.clear_auth && existing.auth_header.is_some()),
+                "models_regranted": regranted,
+            }),
         )
         .await?;
-    Ok(Json(server))
+    Ok(Json(server.into()))
 }
 
 #[utoipa::path(
@@ -5238,18 +7415,33 @@ async fn delete_mcp_server(
 ) -> Result<StatusCode> {
     let server = state.store.get_mcp_server(id).await?;
     state.store.delete_mcp_server(id).await?;
-    let _ = state.redis.delete_resolved_mcp_server(&server.name).await;
-    let _ = state
-        .redis
-        .publish_invalidation(&format!("mcp:{}", server.name))
-        .await;
+    let evicted = async {
+        state.redis.delete_resolved_mcp_server(&server.name).await?;
+        state
+            .redis
+            .publish_invalidation(&format!("mcp:{}", server.name))
+            .await
+    }
+    .await
+    .map_err(|e| eviction_failed("the MCP server", e));
     // Cascade: drop the deleted server from every model's tool grants. A stale
     // grant fails tool discovery on every request, and the dashboard can no
-    // longer display or clear it once the server's checkbox is gone.
+    // longer display or clear it once the server's checkbox is gone. The
+    // Postgres cascade runs even when the eviction above failed.
     let stripped = state.store.strip_tool_server_grants(&server.name).await?;
+    let mut synced = Ok(());
     for model in &stripped {
-        sync_model(&state, model).await?;
+        if let Err(e) = sync_model(&state, model).await {
+            if synced.is_ok() {
+                synced = Err(AdminError::CacheSync(format!(
+                    "the MCP server was deleted, but republishing model '{}' without its \
+                     grant failed ({e}); reconcile the data-plane cache with {RESYNC_ROUTE}",
+                    model.model_name
+                )));
+            }
+        }
     }
+    // Audited before a cache failure is reported: the rows are gone.
     state
         .store
         .record_audit(
@@ -5263,10 +7455,115 @@ async fn delete_mcp_server(
                     .iter()
                     .map(|m| m.model_name.as_str())
                     .collect::<Vec<_>>(),
+                "cache_evicted": evicted.is_ok() && synced.is_ok(),
             }),
         )
         .await?;
+    evicted?;
+    synced?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize, utoipa::IntoParams, ToSchema)]
+pub struct DailyStatsQuery {
+    /// `mcp` (per server: `direct`, `tool_calls`, `errors`, `ms`) or
+    /// `knowledge` (per collection: `searches`, `hits`, `chunks`).
+    pub kind: String,
+    /// Days back from today, UTC; 1 to 40, default 7.
+    pub days: Option<u32>,
+}
+
+/// One thing's counters on one day.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DailyStat {
+    pub day: String,
+    pub counts: std::collections::HashMap<String, i64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DailyStatsItem {
+    /// The MCP server's name, or the collection's id.
+    pub id: String,
+    pub days: Vec<DailyStat>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DailyStatsView {
+    pub kind: String,
+    /// The days covered, oldest first.
+    pub days: Vec<String>,
+    pub items: Vec<DailyStatsItem>,
+}
+
+/// Daily usage counters the proxy keeps in Redis: MCP calls per server and
+/// knowledge searches per collection. Best-effort and about 40 days deep.
+#[utoipa::path(
+    get, path = "/api/v1/stats/daily", tag = "stats",
+    params(DailyStatsQuery),
+    responses((status = 200, body = DailyStatsView))
+)]
+async fn get_daily_stats(
+    State(state): State<AdminState>,
+    Query(q): Query<DailyStatsQuery>,
+) -> Result<Json<DailyStatsView>> {
+    let ids: Vec<String> = match q.kind.as_str() {
+        "mcp" => state
+            .store
+            .list_mcp_servers()
+            .await?
+            .into_iter()
+            .map(|s| s.name)
+            .collect(),
+        "knowledge" => state
+            .store
+            .list_collections()
+            .await?
+            .into_iter()
+            .map(|c| c.id.to_string())
+            .collect(),
+        _ => {
+            return Err(AdminError::BadRequest(
+                "kind must be mcp or knowledge".into(),
+            ))
+        }
+    };
+    let n = q.days.unwrap_or(7).clamp(1, 40);
+    let today = chrono::Utc::now().date_naive();
+    let days: Vec<String> = (0..n)
+        .rev()
+        .map(|back| {
+            (today - chrono::Duration::days(i64::from(back)))
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .collect();
+    let read = state
+        .redis
+        .read_daily(&q.kind, &ids, &days)
+        .await
+        .map_err(|e| AdminError::Internal(format!("daily stats unavailable: {e}")))?;
+    let items = ids
+        .into_iter()
+        .map(|id| DailyStatsItem {
+            days: read
+                .get(&id)
+                .map(|rows| {
+                    rows.iter()
+                        .map(|(day, counts)| DailyStat {
+                            day: day.clone(),
+                            counts: counts.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+            id,
+        })
+        .collect();
+    Ok(Json(DailyStatsView {
+        kind: q.kind,
+        days,
+        items,
+    }))
 }
 
 #[utoipa::path(
@@ -5278,7 +7575,34 @@ async fn get_audit(
     State(state): State<AdminState>,
     Query(q): Query<AuditQuery>,
 ) -> Result<Json<Vec<AuditEntry>>> {
-    Ok(Json(state.store.list_audit(q.limit.unwrap_or(100)).await?))
+    let time = |v: &Option<String>, name: &str| -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+        v.as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| {
+                chrono::DateTime::parse_from_rfc3339(s.trim())
+                    .map(|t| t.with_timezone(&chrono::Utc))
+                    .map_err(|_| AdminError::BadRequest(format!("{name} must be an RFC 3339 time")))
+            })
+            .transpose()
+    };
+    let text = |v: Option<String>| v.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let filter = obleth_store::AuditFilter {
+        since: time(&q.since, "since")?,
+        until: time(&q.until, "until")?,
+        actor: text(q.actor),
+        entity_type: text(q.entity_type),
+        entity_id: text(q.entity_id),
+        actions: text(q.action).map(|a| {
+            a.split(',')
+                .map(|x| x.trim().to_string())
+                .filter(|x| !x.is_empty())
+                .collect()
+        }),
+        before_id: q.before_id,
+        q: text(q.q),
+        limit: q.limit.unwrap_or(100),
+    };
+    Ok(Json(state.store.list_audit_filtered(&filter).await?))
 }
 
 #[utoipa::path(
@@ -5319,6 +7643,61 @@ async fn set_capacity(
 }
 
 // ---- sync helpers --------------------------------------------------------
+
+/// Route that rebuilds the resolver cache from Postgres; named in every
+/// eviction-failure error so the operator has a concrete retry.
+const RESYNC_ROUTE: &str = "POST /api/v1/resync";
+
+/// Resolver entries have no TTL, so a missed eviction would keep a deleted key,
+/// model or MCP server resolving indefinitely. Surface it as a 502 naming the
+/// reconcile route instead of reporting success.
+fn eviction_failed(what: &str, e: obleth_redis::RedisError) -> AdminError {
+    AdminError::CacheSync(format!(
+        "{what} was deleted, but evicting it from the data-plane cache failed ({e}); \
+         it may keep resolving until the cache is reconciled with {RESYNC_ROUTE}"
+    ))
+}
+
+/// Like [`eviction_failed`] for a saved change (disable, alias removal) whose
+/// stale resolver entry could not be removed.
+fn cache_removal_failed(what: &str, e: obleth_redis::RedisError) -> AdminError {
+    AdminError::CacheSync(format!(
+        "the change was saved, but removing {what} from the data-plane cache failed ({e}); \
+         it may keep resolving until the cache is reconciled with {RESYNC_ROUTE}"
+    ))
+}
+
+/// Evict a deleted key from Redis and every gateway's in-process cache.
+async fn evict_key(
+    state: &AdminState,
+    hash: &str,
+) -> std::result::Result<(), obleth_redis::RedisError> {
+    let result = async {
+        state.redis.delete_resolved_key(hash).await?;
+        state.redis.publish_invalidation(hash).await
+    }
+    .await;
+    // Always drop the local copy: even if the publish failed, this replica
+    // must not keep serving the key from moka for the TTL backstop.
+    if let Some(tx) = &state.local_cache_tx {
+        let _ = tx.send(hash.to_string());
+    }
+    result
+}
+
+/// Evict every hash, attempting all of them before reporting the first failure.
+async fn evict_keys(state: &AdminState, hashes: &[String], what: &str) -> Result<()> {
+    let mut first_err = None;
+    for hash in hashes {
+        if let Err(e) = evict_key(state, hash).await {
+            first_err.get_or_insert(e);
+        }
+    }
+    match first_err {
+        Some(e) => Err(eviction_failed(what, e)),
+        None => Ok(()),
+    }
+}
 
 async fn push_key(state: &AdminState, hash: &str, resolved: &ResolvedKey) -> Result<()> {
     state.redis.put_resolved_key(hash, resolved).await?;
@@ -5364,10 +7743,20 @@ async fn sync_model_from(
         upstream_model: model.upstream_model.clone(),
         api_base: model.api_base.clone(),
         api_key: model.api_key.clone(),
+        upstream_headers: model.upstream_headers.clone(),
         model_type: model.model_type.clone(),
         quantization: model.quantization.clone(),
         admission_weight: model.admission_weight,
         max_in_flight: model.max_in_flight.and_then(|n| usize::try_from(n).ok()),
+        capacity_mode: model.capacity_mode.clone(),
+        capacity_source: model.capacity_source.clone(),
+        capacity_namespace: model.capacity_namespace.clone(),
+        capacity_service: model.capacity_service.clone(),
+        per_replica_max_in_flight: model
+            .per_replica_max_in_flight
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > 0),
+        capacity_headroom: model.capacity_headroom,
         enabled: model.enabled,
         cache_enabled: model.cache_enabled,
         cache_ttl_secs: model.cache_ttl_secs,
@@ -5376,6 +7765,7 @@ async fn sync_model_from(
         cost_per_image: model.cost_per_image,
         cost_per_audio_second: model.cost_per_audio_second,
         cost_per_character: model.cost_per_character,
+        cost_per_video: model.cost_per_video,
         context_window: model.context_window,
         supports_function_calling: model.supports_function_calling,
         supports_system_messages: model.supports_system_messages,
@@ -5413,11 +7803,16 @@ async fn sync_model_from(
             .iter()
             .filter(|a| !model.aliases.contains(a))
         {
-            let _ = state.redis.delete_resolved_model(stale).await;
-            let _ = state
+            state
+                .redis
+                .delete_resolved_model(stale)
+                .await
+                .map_err(|e| cache_removal_failed("a removed alias", e))?;
+            state
                 .redis
                 .publish_invalidation(&format!("model:{stale}"))
-                .await;
+                .await
+                .map_err(|e| cache_removal_failed("a removed alias", e))?;
         }
     }
     // Every name the model answers to gets its own resolver key, so the data
@@ -5427,7 +7822,11 @@ async fn sync_model_from(
         if model.enabled {
             state.redis.put_resolved_model(name, &resolved).await?;
         } else {
-            let _ = state.redis.delete_resolved_model(name).await;
+            state
+                .redis
+                .delete_resolved_model(name)
+                .await
+                .map_err(|e| cache_removal_failed("the disabled model", e))?;
         }
         state
             .redis
@@ -5450,7 +7849,11 @@ async fn sync_mcp_server(state: &AdminState, server: &McpServer) -> Result<()> {
             .put_resolved_mcp_server(&server.name, &resolved)
             .await?;
     } else {
-        let _ = state.redis.delete_resolved_mcp_server(&server.name).await;
+        state
+            .redis
+            .delete_resolved_mcp_server(&server.name)
+            .await
+            .map_err(|e| cache_removal_failed("the disabled MCP server", e))?;
     }
     state
         .redis
@@ -5463,6 +7866,78 @@ async fn sync_mcp_server(state: &AdminState, server: &McpServer) -> Result<()> {
 async fn sync_tenant_keys(state: &AdminState, tenant_id: Uuid) -> Result<()> {
     for (hash, resolved) in state.store.resolved_keys_for_tenant(tenant_id).await? {
         push_key(state, &hash, &resolved).await?;
+    }
+    Ok(())
+}
+
+/// In-flight Redis writes for a bulk key push. The connection is multiplexed,
+/// so concurrent SETs pipeline instead of paying one round trip each.
+const BULK_PUSH_CONCURRENCY: usize = 32;
+
+/// How a bulk key push tells the gateways to drop their in-process copies.
+#[derive(Clone, Copy)]
+enum BulkInvalidation {
+    /// One message per pushed hash. Used for scoped pushes (a group weight
+    /// change) so gateways keep every unrelated key, model, and MCP entry.
+    PerKey,
+    /// A single `*`, which clears every gateway's key, model, and MCP caches.
+    /// Used only by the full reconcile, which rewrites all of them anyway.
+    All,
+}
+
+/// Re-push the keys of every tenant in a fairshare group after its weight
+/// changed. Keys outside the group carry a different `group_weight` and are
+/// untouched; no SCAN or prune runs here (that is `POST /api/v1/resync`).
+async fn sync_group_keys(state: &AdminState, group: &str) -> Result<usize> {
+    let keys = group_keys(state.store.all_resolved_keys().await?, group);
+    push_keys_bulk(state, &keys, BulkInvalidation::PerKey).await?;
+    Ok(keys.len())
+}
+
+fn group_keys(keys: Vec<(String, ResolvedKey)>, group: &str) -> Vec<(String, ResolvedKey)> {
+    keys.into_iter()
+        .filter(|(_, k)| k.fairshare_group == group)
+        .collect()
+}
+
+/// Write many resolved keys to Redis with bounded concurrency, then invalidate
+/// the gateways' in-process copies. Every SET completes before any invalidation
+/// is published, so a gateway that refetches on the message reads the new row.
+async fn push_keys_bulk(
+    state: &AdminState,
+    keys: &[(String, ResolvedKey)],
+    invalidation: BulkInvalidation,
+) -> Result<()> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    if keys.is_empty() {
+        return Ok(());
+    }
+    // Indexing (rather than mapping over `keys.iter()`) keeps the closure's
+    // argument free of a borrowed lifetime; otherwise the stream is not provably
+    // `Send` for every lifetime and the axum handlers calling this fail to build.
+    let redis = &state.redis;
+    stream::iter(0..keys.len())
+        .map(move |i| {
+            let (hash, resolved) = &keys[i];
+            redis.put_resolved_key(hash, resolved)
+        })
+        .buffer_unordered(BULK_PUSH_CONCURRENCY)
+        .try_for_each(|()| async { Ok(()) })
+        .await?;
+    match invalidation {
+        BulkInvalidation::All => state.redis.publish_invalidation("*").await?,
+        BulkInvalidation::PerKey => {
+            stream::iter(0..keys.len())
+                .map(move |i| redis.publish_invalidation(&keys[i].0))
+                .buffer_unordered(BULK_PUSH_CONCURRENCY)
+                .try_for_each(|()| async { Ok(()) })
+                .await?
+        }
+    }
+    if let Some(tx) = &state.local_cache_tx {
+        for (hash, _) in keys {
+            let _ = tx.send(hash.clone());
+        }
     }
     Ok(())
 }
@@ -5556,6 +8031,10 @@ mod tests {
                     "",
                     &[],
                     "",
+                    &Default::default(),
+                    0.0,
+                    "static",
+                    &Default::default(),
                 )
                 .await
                 .expect("create fixture model")
@@ -5569,6 +8048,9 @@ mod tests {
             /// Same instance the router's `AdminState` holds, so admitting a
             /// request here is visible to a handler as real fleet load.
             pub(super) fairshare: FairShare,
+            /// Same ring the router's `AdminState` holds, so a test can seed
+            /// samples and read them back through the handler.
+            pub(super) fairshare_history: Arc<FairshareHistory>,
             /// Keeps this test's exclusive claim on the shared test database
             /// alive for the test's full duration (see `serial()`).
             _serial: tokio::sync::MutexGuard<'static, ()>,
@@ -5577,23 +8059,56 @@ mod tests {
         /// The real `/api/v1` router, wired to the integration datastores.
         /// Returns `None` (test skips) when either is unconfigured.
         pub(super) async fn test_admin_app() -> Option<TestApp> {
-            let db_url = test_db_url()?;
             let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
+            test_admin_app_on(&redis_url).await
+        }
+
+        /// [`test_admin_app`] against an explicit Redis URL (e.g. a
+        /// restricted ACL user, to inject cache failures).
+        pub(super) async fn test_admin_app_on(redis_url: &str) -> Option<TestApp> {
+            test_admin_app_with(redis_url, capacity_discovery::CapacityDiscovery::disabled()).await
+        }
+
+        /// [`test_admin_app`] with the gateway's capacity discovery settings.
+        pub(super) async fn test_admin_app_discovering(
+            discovery: obleth_config::CapacityDiscoveryConfig,
+        ) -> Option<TestApp> {
+            let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
+            test_admin_app_with(
+                &redis_url,
+                capacity_discovery::CapacityDiscovery::new(discovery),
+            )
+            .await
+        }
+
+        /// [`test_admin_app`] with a given capacity discovery handle.
+        pub(super) async fn test_admin_app_with_discovery(
+            discovery: capacity_discovery::CapacityDiscovery,
+        ) -> Option<TestApp> {
+            let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").ok()?;
+            test_admin_app_with(&redis_url, discovery).await
+        }
+
+        async fn test_admin_app_with(
+            redis_url: &str,
+            capacity_discovery: capacity_discovery::CapacityDiscovery,
+        ) -> Option<TestApp> {
+            let db_url = test_db_url()?;
 
             // Taken before the first database touch (`migrate()` runs DDL) and
             // held until the test drops its `TestApp`.
             let guard = serial().lock().await;
             let store = Store::connect(&db_url).await.expect("connect postgres");
             store.migrate().await.expect("migrate");
-            let redis = RedisStore::connect(&redis_url)
-                .await
-                .expect("connect redis");
+            let redis = RedisStore::connect(redis_url).await.expect("connect redis");
 
             let capacity = Arc::new(StaticCapacity::new(64));
             let fairshare = FairShare::start(
                 capacity.clone(),
                 obleth_config::FairshareAlgorithm::default(),
+                32,
             );
+            let fairshare_history = Arc::new(FairshareHistory::new(1800));
             let http = reqwest::Client::new();
             let alerts = AlertDispatcher::new(http.clone(), AlertSettings::default());
             let state = AdminState {
@@ -5602,11 +8117,17 @@ mod tests {
                 capacity,
                 fairshare: fairshare.clone(),
                 fairshare_stats: fairshare.stats(),
+                default_model_max_in_flight: 32,
+                fairshare_history: fairshare_history.clone(),
+                fairshare_history_secs: 3600,
+                fairshare_replica_aware: true,
+                fairshare_shared_slots: false,
                 // Never dialled: no route under test reads ClickHouse.
                 clickhouse: clickhouse::Client::default(),
                 admin_token: TEST_ADMIN_TOKEN.to_string(),
                 output_stats: Default::default(),
                 classify: None,
+                capacity_discovery,
                 health: ModelHealthRuntime {
                     scheduled_enabled: false,
                     default_interval_secs: 60,
@@ -5626,6 +8147,7 @@ mod tests {
                 app: router(state),
                 store,
                 fairshare,
+                fairshare_history,
                 _serial: guard,
             })
         }
@@ -5657,7 +8179,324 @@ mod tests {
         }
     }
 
-    use harness::{fixture_model, send, simulate_request, test_admin_app, TEST_ADMIN_TOKEN};
+    use harness::{
+        fixture_model, send, simulate_request, test_admin_app, test_admin_app_discovering,
+        test_admin_app_on, test_admin_app_with_discovery, TEST_ADMIN_TOKEN,
+    };
+
+    fn json_request(
+        method: &str,
+        path: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("build request")
+    }
+
+    /// The discovered mode's fields go through create, update and the
+    /// capacity-mode endpoint with their patch rules, and a `kubernetes`
+    /// source this gateway cannot read is refused when the model is written.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn discovered_capacity_fields_are_validated_and_patched() {
+        let Some(t) = test_admin_app_discovering(obleth_config::CapacityDiscoveryConfig {
+            enabled: true,
+            interval: std::time::Duration::from_secs(15),
+            namespaces: vec!["inference".into()],
+            default_service: "{upstream_model}".into(),
+        })
+        .await
+        else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let name = format!("disc-{}", Uuid::new_v4());
+        let base = serde_json::json!({
+            "model_name": name,
+            "upstream_model": "served-model",
+            "api_base": "http://127.0.0.1:9/v1",
+        });
+        let with = |extra: serde_json::Value| {
+            let mut b = base.clone();
+            for (k, v) in extra.as_object().unwrap() {
+                b[k] = v.clone();
+            }
+            b
+        };
+
+        // Refused: a namespace outside the allowlist, a bad Service name, no
+        // per-replica value where the mode needs one, an unknown source or
+        // mode, a zero per-replica value.
+        for (bad, why) in [
+            (
+                serde_json::json!({"capacity_mode": "discovered", "capacity_source": "kubernetes",
+                                   "capacity_namespace": "kube-system",
+                                   "per_replica_max_in_flight": 8}),
+                "OBLETH_CAPACITY_DISCOVERY_NAMESPACES",
+            ),
+            (
+                serde_json::json!({"capacity_mode": "discovered", "capacity_source": "kubernetes",
+                                   "capacity_service": "app=served-model",
+                                   "per_replica_max_in_flight": 8}),
+                "capacity_service",
+            ),
+            (
+                serde_json::json!({"capacity_mode": "discovered", "capacity_source": "kubernetes"}),
+                "per_replica_max_in_flight is required",
+            ),
+            (
+                // A new model has no endpoint rows: its api_base is counted
+                // at the model's value.
+                serde_json::json!({"capacity_mode": "discovered"}),
+                "per_replica_max_in_flight is required",
+            ),
+            (
+                serde_json::json!({"capacity_mode": "discovered", "capacity_source": "prometheus"}),
+                "capacity_source",
+            ),
+            (
+                serde_json::json!({"capacity_mode": "automatic"}),
+                "capacity_mode",
+            ),
+            (
+                serde_json::json!({"per_replica_max_in_flight": 0}),
+                "per_replica_max_in_flight",
+            ),
+            (
+                serde_json::json!({"capacity_headroom": 50.0}),
+                "capacity_headroom",
+            ),
+        ] {
+            let (status, body) =
+                send(&t.app, json_request("POST", "/api/v1/models", with(bad))).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            assert!(body.to_string().contains(why), "{why}: {body}");
+        }
+
+        // Accepted: the default Service template renders for this model.
+        let (status, created) = send(
+            &t.app,
+            json_request(
+                "POST",
+                "/api/v1/models",
+                with(serde_json::json!({
+                    "capacity_mode": "discovered",
+                    "capacity_source": "kubernetes",
+                    "capacity_namespace": " inference ",
+                    "per_replica_max_in_flight": 8,
+                    "capacity_headroom": 1.25,
+                })),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{created}");
+        assert_eq!(created["capacity_mode"], "discovered");
+        assert_eq!(created["capacity_source"], "kubernetes");
+        assert_eq!(created["capacity_namespace"], "inference");
+        assert_eq!(created["capacity_service"], serde_json::Value::Null);
+        assert_eq!(created["per_replica_max_in_flight"], 8);
+        assert_eq!(created["capacity_headroom"], 1.25);
+        let id = created["id"].as_str().unwrap().to_string();
+
+        // Update: omitted fields are kept, "" clears text.
+        let (status, updated) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}"),
+                serde_json::json!({
+                    "upstream_model": "served-model",
+                    "api_base": "http://127.0.0.1:9/v1",
+                    "capacity_service": "served-model-head",
+                    "capacity_namespace": "",
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{updated}");
+        assert_eq!(updated["capacity_mode"], "discovered", "kept");
+        assert_eq!(updated["capacity_headroom"], 1.25, "kept");
+        assert_eq!(updated["per_replica_max_in_flight"], 8, "kept");
+        assert_eq!(updated["capacity_service"], "served-model-head");
+        assert_eq!(updated["capacity_namespace"], serde_json::Value::Null);
+
+        // Clearing the per-replica value of a kubernetes model is refused.
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}"),
+                serde_json::json!({
+                    "upstream_model": "served-model",
+                    "api_base": "http://127.0.0.1:9/v1",
+                    "per_replica_max_in_flight": null,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.to_string().contains("--max-num-seqs"),
+            "the error says what to set: {body}"
+        );
+
+        // An upstream name the template cannot use needs its own Service.
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}"),
+                serde_json::json!({
+                    "upstream_model": "org/served-model",
+                    "api_base": "http://127.0.0.1:9/v1",
+                    "capacity_service": null,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(body.to_string().contains("set capacity_service"), "{body}");
+
+        // The capacity-mode endpoint switches mode and source together.
+        let (status, switched) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}/capacity-mode"),
+                serde_json::json!({
+                    "capacity_mode": "discovered",
+                    "capacity_source": "endpoints",
+                    "per_replica_max_in_flight": 4,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{switched}");
+        assert_eq!(switched["capacity_source"], "endpoints");
+        assert_eq!(switched["per_replica_max_in_flight"], 4);
+        assert_eq!(
+            switched["capacity_service"], "served-model-head",
+            "omitted fields are kept"
+        );
+
+        // An endpoint carries its own concurrency; omitted on update keeps it.
+        let (status, ep) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &format!("/api/v1/models/{id}/endpoints"),
+                serde_json::json!({"name": "a", "api_base": "http://127.0.0.1:9/v1",
+                                   "max_in_flight": 16}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ep}");
+        assert_eq!(ep["max_in_flight"], 16);
+        let ep_id = ep["id"].as_str().unwrap().to_string();
+        let (status, ep) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}/endpoints/{ep_id}"),
+                serde_json::json!({"name": "a", "api_base": "http://127.0.0.1:9/v1",
+                                   "weight": 50}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{ep}");
+        assert_eq!(ep["max_in_flight"], 16, "kept");
+        let (status, ep) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}/endpoints/{ep_id}"),
+                serde_json::json!({"name": "a", "api_base": "http://127.0.0.1:9/v1",
+                                   "max_in_flight": 0}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{ep}");
+
+        // Every endpoint has its own value, so the model's may be cleared...
+        let (status, switched) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}/capacity-mode"),
+                serde_json::json!({
+                    "capacity_mode": "discovered",
+                    "per_replica_max_in_flight": null,
+                }),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{switched}");
+        assert_eq!(
+            switched["per_replica_max_in_flight"],
+            serde_json::Value::Null
+        );
+        // ...and then an endpoint without one, new or cleared, is refused.
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "POST",
+                &format!("/api/v1/models/{id}/endpoints"),
+                serde_json::json!({"name": "b", "api_base": "http://127.0.0.1:9/v1"}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(
+            body.to_string()
+                .contains("this endpoint needs its own max_in_flight"),
+            "{body}"
+        );
+        let (status, body) = send(
+            &t.app,
+            json_request(
+                "PUT",
+                &format!("/api/v1/models/{id}/endpoints/{ep_id}"),
+                serde_json::json!({"name": "a", "api_base": "http://127.0.0.1:9/v1",
+                                   "max_in_flight": null}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+        // The discovery view lists the model with the value in force: no loop
+        // runs in this test, so the static fallback, and says why.
+        let req = axum::http::Request::get("/api/v1/capacity/discovery")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (status, view) = send(&t.app, req).await;
+        assert_eq!(status, StatusCode::OK, "{view}");
+        assert_eq!(view["enabled"], true);
+        assert_eq!(view["namespaces"], serde_json::json!(["inference"]));
+        assert_eq!(view["default_service"], "{upstream_model}");
+        let entry = view["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["model_id"] == serde_json::json!(id))
+            .expect("listed");
+        assert_eq!(entry["status"]["state"], "fallback");
+        assert_eq!(entry["status"]["effective_max_in_flight"], 32);
+        assert_eq!(view["mode"], "local");
+        assert_eq!(entry["enforced_max_in_flight"], 32);
+        assert_eq!(entry["in_flight"], 0);
+        assert_eq!(entry["cluster_in_flight"], serde_json::Value::Null);
+        assert!(entry["status"]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("waiting for the next discovery pass"));
+
+        let _ = t.store.delete_model(Uuid::parse_str(&id).unwrap()).await;
+    }
 
     /// The simulator sits behind the same bearer gate as every other write-side
     /// route: it reads the whole model fleet and every tenant's allowlist.
@@ -5850,15 +8689,12 @@ mod tests {
         for _ in 0..2 {
             let admitted = t
                 .fairshare
-                .admit(obleth_fairshare::AdmitRequest {
-                    tenant,
-                    weight: 100,
-                    group: "default".to_string(),
-                    group_weight: 100,
-                    model: name.clone(),
-                    model_max_in_flight: Some(4),
-                    cost: 1,
-                })
+                .admit(
+                    obleth_fairshare::AdmitRequest::new(tenant, name.clone(), 1)
+                        .weight(100)
+                        .group("default", 100)
+                        .model_cap(4),
+                )
                 .await
                 .expect("admitted");
             permits.push(admitted);
@@ -6068,6 +8904,920 @@ mod tests {
         assert_eq!(body["vision_enabled"], serde_json::json!(true));
     }
 
+    /// The speculation verifier receives each model's upstream key, so its
+    /// URL template is policy-checked on save: per-model Service hosts are
+    /// fine, placeholders in the credentials and blocked literal hosts are not.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn put_boon_settings_validates_the_verify_url_template() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let restore = t
+            .store
+            .get_boon_settings()
+            .await
+            .expect("read boon settings")
+            .unwrap_or_default();
+        let put = |template: &str| {
+            axum::http::Request::put("/api/v1/settings/boons")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "speculation_verify_url_template": template }).to_string(),
+                ))
+                .expect("build request")
+        };
+        let mut results = Vec::new();
+        for template in [
+            "http://{upstream}.serving.svc.cluster.local:8000/v1",
+            "http://{model}@10.0.0.5:8000/v1",
+            "http://169.254.169.254/{model}/v1",
+        ] {
+            results.push((template, send(&t.app, put(template)).await));
+        }
+
+        let _ = t.store.put_boon_settings(&restore).await;
+
+        let status = |i: usize| (results[i].1).0;
+        assert_eq!(status(0), StatusCode::OK, "{:?}", results[0]);
+        assert_eq!(status(1), StatusCode::BAD_REQUEST, "{:?}", results[1]);
+        assert_eq!(status(2), StatusCode::BAD_REQUEST, "{:?}", results[2]);
+    }
+
+    /// Slurm URL policy: a disabled draft may hold a URL that doesn't resolve
+    /// yet, enabling it (or testing it) holds the URL to the SSRF policy.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn slurm_url_is_validated_when_enabled_and_on_test() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let original = t
+            .store
+            .get_slurm_settings()
+            .await
+            .expect("read slurm settings")
+            .unwrap_or_default();
+        let put = |body: serde_json::Value| {
+            axum::http::Request::put("/api/v1/settings/slurm")
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("build request")
+        };
+        // `.invalid` is reserved and never resolves (RFC 6761).
+        let unresolvable = "http://slurm.obleth-test.invalid:6820";
+
+        let (disabled, disabled_body) = send(
+            &t.app,
+            put(serde_json::json!({
+                "enabled": false, "slurmrestd_url": unresolvable, "slurm_user": "obleth"
+            })),
+        )
+        .await;
+        let (enabled_unresolvable, _) = send(
+            &t.app,
+            put(serde_json::json!({
+                "enabled": true, "slurmrestd_url": unresolvable, "slurm_user": "obleth"
+            })),
+        )
+        .await;
+        let (enabled_blocked, _) = send(
+            &t.app,
+            put(serde_json::json!({
+                "enabled": true, "slurmrestd_url": "http://169.254.169.254:6820",
+                "slurm_user": "obleth"
+            })),
+        )
+        .await;
+        // A blocked URL stored directly (legacy row / restore) must not be pinged.
+        let mut blocked = original.clone();
+        blocked.slurmrestd_url = "http://169.254.169.254:6820".into();
+        t.store
+            .put_slurm_settings(&blocked)
+            .await
+            .expect("seed blocked url");
+        let test_req = axum::http::Request::post("/api/v1/settings/slurm/test")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (tested, _) = send(&t.app, test_req).await;
+
+        let _ = t.store.put_slurm_settings(&original).await;
+
+        assert_eq!(disabled, StatusCode::OK, "{disabled_body}");
+        assert_eq!(enabled_unresolvable, StatusCode::BAD_REQUEST);
+        assert_eq!(enabled_blocked, StatusCode::BAD_REQUEST);
+        assert_eq!(tested, StatusCode::BAD_REQUEST);
+    }
+
+    /// A key delete whose Redis eviction fails must not report success: the
+    /// resolver entry has no TTL, so a silent failure leaves the revoked key
+    /// working. Failure is injected with a Redis ACL user denied `DEL`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn delete_key_is_a_502_when_the_eviction_fails() {
+        let Ok(redis_url) = std::env::var("OBLETH_TEST_REDIS_URL") else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        if redis_url.contains('@') || !redis_url.starts_with("redis://") {
+            eprintln!("skipping: needs a credential-free redis:// OBLETH_TEST_REDIS_URL");
+            return;
+        }
+        let user = format!("obleth-test-nodel-{}", Uuid::new_v4().simple());
+        let client = ::redis::Client::open(redis_url.as_str()).expect("redis client");
+        let mut conn = client
+            .get_multiplexed_async_connection()
+            .await
+            .expect("redis connect");
+        let _: () = ::redis::cmd("ACL")
+            .arg("SETUSER")
+            .arg(&user)
+            .arg("on")
+            .arg("nopass")
+            .arg("~*")
+            .arg("&*")
+            .arg("+@all")
+            .arg("-del")
+            .query_async(&mut conn)
+            .await
+            .expect("create restricted ACL user");
+        let restricted = redis_url.replacen("redis://", &format!("redis://{user}:x@"), 1);
+        let Some(t) = test_admin_app_on(&restricted).await else {
+            let _: ::redis::RedisResult<()> = ::redis::cmd("ACL")
+                .arg("DELUSER")
+                .arg(&user)
+                .query_async(&mut conn)
+                .await;
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL to run");
+            return;
+        };
+
+        let tenant = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        let create = axum::http::Request::post(format!("/api/v1/tenants/{}/keys", tenant.id))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::from(
+                serde_json::json!({ "name": "k" }).to_string(),
+            ))
+            .expect("build request");
+        let (created_status, created) = send(&t.app, create).await;
+        let key_id = created["key"]["id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let delete = axum::http::Request::delete(format!("/api/v1/keys/{key_id}"))
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (deleted_status, deleted) = send(&t.app, delete).await;
+
+        let _ = t.store.delete_tenant(tenant.id).await;
+        // The failed eviction left the entry behind; remove it as the admin.
+        if let Some(secret) = created["secret"].as_str() {
+            let hash = obleth_config::hash_api_key(secret);
+            let _: ::redis::RedisResult<()> = ::redis::cmd("DEL")
+                .arg(format!("obleth:key:{hash}"))
+                .query_async(&mut conn)
+                .await;
+        }
+        let _: ::redis::RedisResult<()> = ::redis::cmd("ACL")
+            .arg("DELUSER")
+            .arg(&user)
+            .query_async(&mut conn)
+            .await;
+
+        assert_eq!(created_status, StatusCode::OK, "{created}");
+        assert_eq!(deleted_status, StatusCode::BAD_GATEWAY, "{deleted}");
+        assert!(
+            deleted["error"]
+                .as_str()
+                .is_some_and(|e| e.contains(RESYNC_ROUTE)),
+            "{deleted}"
+        );
+    }
+
+    /// Removes the group test's tenants and fairshare group on drop, including
+    /// on a failed assertion. The store has no group delete, so the group row
+    /// goes through the pool; tenants go first because they reference it.
+    struct GroupFixture {
+        store: Store,
+        group: String,
+        tenants: Vec<Uuid>,
+    }
+
+    impl Drop for GroupFixture {
+        fn drop(&mut self) {
+            let store = self.store.clone();
+            let group = std::mem::take(&mut self.group);
+            let tenants = std::mem::take(&mut self.tenants);
+            // block_in_place needs the multi-thread test flavor.
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
+                    for id in tenants {
+                        let _ = store.delete_tenant(id).await;
+                    }
+                    let _ = sqlx::query("delete from fairshare_groups where name = $1")
+                        .bind(&group)
+                        .execute(store.pool())
+                        .await;
+                });
+            });
+        }
+    }
+
+    /// A group weight change republishes only that group's keys and never
+    /// prunes: a key in another group keeps its (sentinel) cache entry, and an
+    /// orphan entry with no backing row is left for `POST /resync`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn group_weight_patch_pushes_only_the_groups_keys() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let redis_url = std::env::var("OBLETH_TEST_REDIS_URL").expect("checked above");
+        let redis = RedisStore::connect(&redis_url)
+            .await
+            .expect("connect redis");
+        let group = format!("g-{}", Uuid::new_v4().simple());
+        t.store
+            .create_fairshare_group(&group, 100)
+            .await
+            .expect("create group");
+        let mut fixture = GroupFixture {
+            store: t.store.clone(),
+            group: group.clone(),
+            tenants: Vec::new(),
+        };
+        let inside = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        fixture.tenants.push(inside.id);
+        t.store
+            .update_tenant_fairshare_group(inside.id, &group)
+            .await
+            .expect("move tenant");
+        let outside = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        fixture.tenants.push(outside.id);
+        let create_key = |tenant: Uuid| {
+            axum::http::Request::post(format!("/api/v1/tenants/{tenant}/keys"))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "name": "k" }).to_string(),
+                ))
+                .expect("build request")
+        };
+        let (_, a) = send(&t.app, create_key(inside.id)).await;
+        let (_, b) = send(&t.app, create_key(outside.id)).await;
+        let hash_of = |v: &serde_json::Value| {
+            obleth_config::hash_api_key(v["secret"].as_str().unwrap_or_default())
+        };
+        let (hash_a, hash_b) = (hash_of(&a), hash_of(&b));
+
+        let mut sentinel = redis
+            .get_resolved_key(&hash_b)
+            .await
+            .expect("read b")
+            .expect("b cached on create");
+        sentinel.tenant_name = "sentinel".to_string();
+        redis
+            .put_resolved_key(&hash_b, &sentinel)
+            .await
+            .expect("write sentinel");
+        let orphan = format!("orphan-{}", Uuid::new_v4().simple());
+        redis
+            .put_resolved_key(&orphan, &sentinel)
+            .await
+            .expect("write orphan");
+
+        let patch = axum::http::Request::patch(format!("/api/v1/fairshare/groups/{group}/weight"))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::from(
+                serde_json::json!({ "weight": 777 }).to_string(),
+            ))
+            .expect("build request");
+        let mut pubsub = ::redis::Client::open(redis_url.as_str())
+            .expect("redis client")
+            .get_async_pubsub()
+            .await
+            .expect("pubsub connect");
+        pubsub
+            .subscribe("obleth:invalidate")
+            .await
+            .expect("subscribe");
+        let (status, body) = send(&t.app, patch).await;
+        let mut published = Vec::new();
+        {
+            use futures::StreamExt;
+            let mut messages = pubsub.on_message();
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(std::time::Duration::from_millis(300), messages.next()).await
+            {
+                published.push(msg.get_payload::<String>().unwrap_or_default());
+            }
+        }
+        let cached_a = redis.get_resolved_key(&hash_a).await.expect("read a");
+        let cached_b = redis.get_resolved_key(&hash_b).await.expect("read b");
+        let cached_orphan = redis.get_resolved_key(&orphan).await.expect("read orphan");
+
+        let _ = redis.delete_resolved_key(&orphan).await;
+        for hash in [&hash_a, &hash_b] {
+            let _ = redis.delete_resolved_key(hash).await;
+        }
+        drop(fixture);
+        let group_left: Option<(String,)> =
+            sqlx::query_as("select name from fairshare_groups where name = $1")
+                .bind(&group)
+                .fetch_optional(t.store.pool())
+                .await
+                .expect("look up group");
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(cached_a.map(|k| k.group_weight), Some(777));
+        assert_eq!(
+            cached_b.map(|k| k.tenant_name),
+            Some("sentinel".to_string()),
+            "a key outside the group was re-pushed"
+        );
+        assert!(cached_orphan.is_some(), "a weight patch must not prune");
+        assert_eq!(
+            published,
+            vec![hash_a.clone()],
+            "a weight patch invalidates exactly the group's keys, never `*`"
+        );
+        assert!(group_left.is_none(), "fixture group was not cleaned up");
+    }
+
+    #[test]
+    fn group_keys_keeps_only_the_named_group() {
+        let key = |group: &str| {
+            let k: ResolvedKey = serde_json::from_value(serde_json::json!({
+                "key_id": Uuid::nil(),
+                "tenant_id": Uuid::nil(),
+                "tenant_name": "t",
+                "fairshare_group": group,
+                "group_weight": 1,
+                "weight": 1,
+                "tokens_per_minute": 1,
+                "disabled": false,
+            }))
+            .expect("resolved key");
+            k
+        };
+        let keys = vec![
+            ("a".to_string(), key("research")),
+            ("b".to_string(), key("default")),
+            ("c".to_string(), key("research")),
+        ];
+        let hashes: Vec<String> = group_keys(keys, "research")
+            .into_iter()
+            .map(|(h, _)| h)
+            .collect();
+        assert_eq!(hashes, ["a", "c"]);
+    }
+
+    /// Fairshare weight and per-model cap are set on a key at creation and
+    /// edited afterwards, so both have to survive the round trip through the
+    /// store and come back on the response the dashboard renders.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn key_create_and_update_carry_fairshare_weight_and_cap() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let tenant = t
+            .store
+            .create_tenant(&format!("t-{}", Uuid::new_v4()), 100, 1000, None, None)
+            .await
+            .expect("create tenant");
+        let post = |body: serde_json::Value| {
+            axum::http::Request::post(format!("/api/v1/tenants/{}/keys", tenant.id))
+                .header("content-type", "application/json")
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("build request")
+        };
+
+        let (status, created) = send(
+            &t.app,
+            post(serde_json::json!({ "name": "k", "weight": 250, "max_in_flight": 3 })),
+        )
+        .await;
+        let key_id = created["key"]["id"].as_str().map(|s| s.to_string());
+        let put = |body: serde_json::Value| {
+            axum::http::Request::put(format!(
+                "/api/v1/keys/{}",
+                key_id.clone().unwrap_or_default()
+            ))
+            .header("content-type", "application/json")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("build request")
+        };
+        let updated = send(
+            &t.app,
+            put(serde_json::json!({ "name": "k", "weight": 100, "max_in_flight": null })),
+        )
+        .await;
+        let zero_weight = send(
+            &t.app,
+            post(serde_json::json!({ "name": "k2", "weight": 0 })),
+        )
+        .await;
+        let zero_cap = send(
+            &t.app,
+            post(serde_json::json!({ "name": "k3", "max_in_flight": 0 })),
+        )
+        .await;
+
+        let _ = t.store.delete_tenant(tenant.id).await;
+
+        assert_eq!(status, StatusCode::OK, "body: {created}");
+        assert_eq!(created["key"]["weight"], serde_json::json!(250));
+        assert_eq!(created["key"]["max_in_flight"], serde_json::json!(3));
+        assert_eq!(updated.0, StatusCode::OK, "body: {}", updated.1);
+        assert_eq!(updated.1["weight"], serde_json::json!(100));
+        assert_eq!(
+            updated.1["max_in_flight"],
+            serde_json::Value::Null,
+            "a null cap clears the per-model ceiling"
+        );
+        assert_eq!(zero_weight.0, StatusCode::BAD_REQUEST);
+        assert_eq!(zero_cap.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// The health prober admits through the same scheduler as real traffic, so
+    /// its hidden tenant and group have to be filtered out of every level of
+    /// the live view -- and the pool it created on its own must not show up as
+    /// a model either.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn fairshare_live_hides_the_health_prober() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let health_tenant = model_health::health_tenant_id();
+        let probe = t
+            .fairshare
+            .admit(
+                obleth_fairshare::AdmitRequest::new(health_tenant, "probe-model", 1)
+                    .group(model_health::HEALTH_GROUP, 100),
+            )
+            .await
+            .expect("probe admitted");
+        let tenant = Uuid::new_v4();
+        let real = t
+            .fairshare
+            .admit(obleth_fairshare::AdmitRequest::new(tenant, "m", 1))
+            .await
+            .expect("tenant admitted");
+
+        let req = axum::http::Request::get("/api/v1/fairshare/live")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (status, body) = send(&t.app, req).await;
+
+        drop(probe);
+        drop(real);
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let pools = body["pools"].as_array().expect("pools is an array");
+        assert!(
+            pools
+                .iter()
+                .any(|p| p["model"] == serde_json::json!("m") && p["in_flight"] == 1),
+            "the tenant's pool is reported: {body}"
+        );
+        assert!(
+            !pools
+                .iter()
+                .any(|p| p["model"] == serde_json::json!("probe-model")),
+            "the prober's own pool is not a model an operator can act on: {body}"
+        );
+        let health_tenant = serde_json::json!(health_tenant.to_string());
+        let health_group = serde_json::json!(model_health::HEALTH_GROUP);
+        let rows = |level: &str| -> Vec<serde_json::Value> {
+            pools
+                .iter()
+                .flat_map(|p| p[level].as_array().cloned().unwrap_or_default())
+                .chain(body[level].as_array().cloned().unwrap_or_default())
+                .collect()
+        };
+        assert!(
+            rows("groups").iter().all(|g| g["name"] != health_group),
+            "the health group is filtered at every level: {body}"
+        );
+        assert!(
+            rows("tenants")
+                .iter()
+                .all(|t| t["tenant_id"] != health_tenant && t["fairshare_group"] != health_group),
+            "the health tenant is filtered at every level: {body}"
+        );
+        assert!(
+            rows("keys").iter().all(|k| k["tenant_id"] != health_tenant),
+            "the health tenant's key is filtered at every level: {body}"
+        );
+        assert_eq!(
+            body["global_in_flight"],
+            serde_json::json!(1),
+            "only the real request counts"
+        );
+        assert!(
+            body["hard_ceiling"].as_u64().unwrap_or(0) > 0,
+            "the total ceiling is reported: {body}"
+        );
+        assert_eq!(body["default_model_max_in_flight"], serde_json::json!(32));
+    }
+
+    /// With several replicas live, the view reports this replica's share of
+    /// each limit next to the configured value, and the count it divides by.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn fairshare_live_reports_per_replica_shares() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        t.fairshare.set_replicas(2);
+        let admitted = t
+            .fairshare
+            .admit(obleth_fairshare::AdmitRequest::new(Uuid::new_v4(), "split", 1).model_cap(9))
+            .await
+            .expect("admitted");
+        let get = |path: &str| {
+            axum::http::Request::get(path)
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::empty())
+                .expect("build request")
+        };
+        let (status, body) = send(&t.app, get("/api/v1/fairshare/live")).await;
+        let (stats_status, stats) = send(&t.app, get("/api/v1/stats")).await;
+        drop(admitted);
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["replicas"], serde_json::json!(2));
+        assert_eq!(body["mode"], "split");
+        assert_eq!(body["replica_aware"], serde_json::json!(true));
+        assert_eq!(body["cluster_in_flight"], serde_json::Value::Null);
+        assert_eq!(body["hard_ceiling"], serde_json::json!(32), "ceil(64 / 2)");
+        assert_eq!(body["configured_hard_ceiling"], serde_json::json!(64));
+        assert!(
+            body["configured_max_in_flight"].as_u64() >= body["max_in_flight"].as_u64(),
+            "the share never exceeds the configured sum: {body}"
+        );
+        let pool = body["pools"]
+            .as_array()
+            .expect("pools")
+            .iter()
+            .find(|p| p["model"] == serde_json::json!("split"))
+            .cloned()
+            .expect("the split pool is reported");
+        assert_eq!(pool["cap"], serde_json::json!(5), "ceil(9 / 2)");
+        assert_eq!(pool["configured_cap"], serde_json::json!(9));
+        assert_eq!(stats_status, StatusCode::OK, "body: {stats}");
+        assert_eq!(stats["replicas"], serde_json::json!(2));
+        assert_eq!(stats["mode"], "split");
+    }
+
+    /// The Service picker's listing: Services from the allowed namespaces'
+    /// EndpointSlices, and the model's default Service when it exists.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn capacity_services_lists_services_and_the_models_default() {
+        use axum::routing::get as get_route;
+        let app = axum::Router::new().route(
+            "/apis/discovery.k8s.io/v1/namespaces/:ns/endpointslices",
+            get_route(|Path(ns): Path<String>| async move {
+                let items = if ns == "inference" {
+                    serde_json::json!([
+                        {"metadata": {"labels": {"kubernetes.io/service-name": "svc-picker-a"}},
+                         "endpoints": [
+                            {"addresses": ["10.0.0.1"], "conditions": {"ready": true}, "targetRef": {"uid": "a"}},
+                            {"addresses": ["10.0.0.2"], "conditions": {"ready": true}, "targetRef": {"uid": "b"}},
+                            {"addresses": ["10.0.0.3"], "conditions": {"ready": false}, "targetRef": {"uid": "c"}}
+                         ]},
+                        {"metadata": {"labels": {"kubernetes.io/service-name": "svc-picker-other"}},
+                         "endpoints": null}
+                    ])
+                } else {
+                    serde_json::json!([])
+                };
+                Json(serde_json::json!({"kind": "EndpointSliceList", "metadata": {}, "items": items}))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let discovery = capacity_discovery::CapacityDiscovery::with_kube(
+            obleth_config::CapacityDiscoveryConfig {
+                enabled: true,
+                interval: std::time::Duration::from_secs(15),
+                namespaces: vec!["batch".into(), "inference".into()],
+                default_service: "{upstream_model}".into(),
+            },
+            capacity_discovery::KubeClient::with_base(format!("http://{addr}"), None),
+        );
+        let Some(t) = test_admin_app_with_discovery(discovery).await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let model = fixture_model(&t.store, "svc-picker-a", 0.0).await;
+        let get = |path: String| {
+            axum::http::Request::get(path)
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::empty())
+                .expect("build request")
+        };
+        let (status, body) = send(&t.app, get("/api/v1/capacity/services".into())).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            body["services"],
+            serde_json::json!([
+                {"service": "svc-picker-a", "namespace": "inference", "ready": 2},
+                {"service": "svc-picker-other", "namespace": "inference", "ready": 0}
+            ])
+        );
+        assert_eq!(body["reason"], serde_json::Value::Null);
+        assert_eq!(body["default_match"], serde_json::Value::Null);
+
+        let (status, body) = send(
+            &t.app,
+            get(format!(
+                "/api/v1/capacity/services?model={}",
+                model.model_name
+            )),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["default_service"], "svc-picker-a");
+        assert_eq!(
+            body["default_match"],
+            serde_json::json!({"service": "svc-picker-a", "namespace": "inference", "ready": 2})
+        );
+        let (status, _) = send(
+            &t.app,
+            get("/api/v1/capacity/services?model=no-such-model".into()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let _ = t.store.delete_model(model.id).await;
+    }
+
+    /// Discovery off: an empty listing that says why.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn capacity_services_says_why_when_discovery_is_off() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let req = axum::http::Request::get("/api/v1/capacity/services")
+            .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+            .body(axum::body::Body::empty())
+            .expect("build request");
+        let (status, body) = send(&t.app, req).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["services"], serde_json::json!([]));
+        assert!(body["reason"]
+            .as_str()
+            .unwrap()
+            .contains("OBLETH_CAPACITY_DISCOVERY_ENABLED"));
+    }
+
+    /// With shared slots, the view reports the configured sizes as this
+    /// replica's caps and the cluster-wide occupancy next to its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn fairshare_live_reports_cluster_wide_counts_in_shared_mode() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        let cluster = obleth_fairshare::InMemoryCluster::new();
+        t.fairshare.enable_shared_slots(
+            Arc::new(cluster.gateway("this")),
+            obleth_fairshare::SharedSlotsConfig::default(),
+        );
+        t.fairshare.set_replicas(3);
+        let stats = t.fairshare.stats();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while stats.mode() != SlotMode::Shared {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("shared mode");
+        // Another gateway holds two of the pool's slots.
+        let other = cluster.gateway("other");
+        for _ in 0..2 {
+            let claim = obleth_fairshare::SlotClaim {
+                pool: PoolKey::Model("shared".into()).slot_id(),
+                tenant: Uuid::new_v4(),
+                key: Uuid::new_v4(),
+                pool_cap: 9,
+                global_cap: 64,
+                tenant_cap: None,
+                key_cap: None,
+            };
+            use obleth_fairshare::SharedSlots;
+            other.acquire(claim).await.expect("claimed");
+        }
+        let admitted = t
+            .fairshare
+            .admit(obleth_fairshare::AdmitRequest::new(Uuid::new_v4(), "shared", 1).model_cap(9))
+            .await
+            .expect("admitted");
+        let get = |path: &str| {
+            axum::http::Request::get(path)
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::empty())
+                .expect("build request")
+        };
+        let (status, body) = send(&t.app, get("/api/v1/fairshare/live")).await;
+        let (_, stats) = send(&t.app, get("/api/v1/stats")).await;
+        drop(admitted);
+
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["mode"], "shared");
+        assert_eq!(body["replicas"], 3);
+        assert_eq!(body["hard_ceiling"], 64, "the ceiling is not divided");
+        assert_eq!(body["cluster_in_flight"], 3);
+        let pool = body["pools"]
+            .as_array()
+            .expect("pools")
+            .iter()
+            .find(|p| p["model"] == serde_json::json!("shared"))
+            .cloned()
+            .expect("the pool is reported");
+        assert_eq!(pool["cap"], 9, "the whole pool is usable here");
+        assert_eq!(pool["configured_cap"], 9);
+        assert_eq!(pool["in_flight"], 1);
+        assert_eq!(pool["cluster_in_flight"], 3);
+        assert_eq!(stats["mode"], "shared");
+        assert_eq!(stats["cluster_in_flight"], 3);
+        assert_eq!(stats["in_flight"], 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+    async fn fairshare_history_scopes_to_a_pool_or_the_aggregate() {
+        let Some(t) = test_admin_app().await else {
+            eprintln!("skipping: set OBLETH_TEST_DATABASE_URL and OBLETH_TEST_REDIS_URL to run");
+            return;
+        };
+        use obleth_fairshare::{FairshareSample, GroupSample, PoolSample};
+        let pool =
+            |model: &str, in_flight: usize, queued: usize, group_in_flight: usize| PoolSample {
+                model: model.into(),
+                cap: 8,
+                in_flight,
+                queued,
+                groups: vec![
+                    GroupSample {
+                        name: "research".into(),
+                        in_flight: group_in_flight,
+                        queued,
+                    },
+                    GroupSample {
+                        name: model_health::HEALTH_GROUP.into(),
+                        in_flight: 1,
+                        queued: 0,
+                    },
+                ],
+            };
+        t.fairshare_history.push(FairshareSample {
+            ts_ms: 1_000,
+            global_in_flight: 4,
+            global_queued: 2,
+            pools: vec![pool("m", 3, 1, 3), pool("n", 1, 1, 1)],
+        });
+        t.fairshare_history.push(FairshareSample {
+            ts_ms: 3_000,
+            global_in_flight: 6,
+            global_queued: 0,
+            pools: vec![pool("m", 6, 0, 6)],
+        });
+
+        let get = |path: &str| {
+            axum::http::Request::get(path)
+                .header("authorization", format!("Bearer {TEST_ADMIN_TOKEN}"))
+                .body(axum::body::Body::empty())
+                .expect("build request")
+        };
+
+        let (status, body) = send(&t.app, get("/api/v1/fairshare/history?since_ms=0")).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert_eq!(body["interval_ms"], 2000);
+        assert_eq!(body["retention_ms"], 3_600_000);
+        assert_eq!(body["oldest_ts_ms"], 1_000);
+        let points = body["points"].as_array().expect("points");
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0]["in_flight"], 2, "global 4 minus 2 prober: {body}");
+        assert_eq!(points[0]["groups"]["research"], 4);
+        assert!(
+            points[0]["groups"]
+                .get(model_health::HEALTH_GROUP)
+                .is_none(),
+            "prober group hidden: {body}"
+        );
+
+        let (status, body) = send(
+            &t.app,
+            get("/api/v1/fairshare/history?since_ms=2000&model=m"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let points = body["points"].as_array().expect("points");
+        assert_eq!(points.len(), 1);
+        assert_eq!(points[0]["ts_ms"], 3_000);
+        assert_eq!(
+            points[0]["in_flight"], 5,
+            "model m: 6 minus 1 prober: {body}"
+        );
+        assert_eq!(points[0]["groups"]["research"], 6);
+
+        let (status, body) =
+            send(&t.app, get("/api/v1/fairshare/history?since_ms=0&model=n")).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        let points = body["points"].as_array().expect("points");
+        assert_eq!(
+            points.len(),
+            2,
+            "a sample without the pool still yields a zero point"
+        );
+        assert_eq!(points[1]["in_flight"], 0);
+        assert!(points[1]["groups"].as_object().expect("groups").is_empty());
+    }
+
+    #[test]
+    fn cache_sync_errors_are_single_line_and_name_the_resync_route() {
+        let redis_err =
+            || obleth_redis::RedisError::from(serde_json::from_str::<u8>("x").unwrap_err());
+        for err in [
+            eviction_failed("the key", redis_err()),
+            cache_removal_failed("the disabled model", redis_err()),
+        ] {
+            let AdminError::CacheSync(msg) = err else {
+                panic!("expected CacheSync");
+            };
+            assert!(!msg.contains('\n'), "{msg:?}");
+            assert!(!msg.contains("  "), "{msg:?}");
+            assert!(msg.contains(RESYNC_ROUTE), "{msg:?}");
+        }
+    }
+
+    /// Handlers that once carried `#[utoipa::path]` (or none) without being
+    /// listed in `paths(...)`, plus the schemas their annotations reference.
+    #[test]
+    fn openapi_doc_exposes_previously_unregistered_handlers() {
+        use utoipa::OpenApi;
+        let doc = serde_json::to_value(ApiDoc::openapi()).expect("serialize the openapi doc");
+        for (path, method) in [
+            ("/api/v1/resync", "post"),
+            ("/api/v1/replicas/{id}/restart", "post"),
+            ("/api/v1/keys/{id}/tracing", "put"),
+            ("/api/v1/tenants/{id}/tracing", "put"),
+            ("/api/v1/usage/logs/{request_id}/spans", "get"),
+            ("/api/v1/models/{id}/managed/provision-error", "patch"),
+        ] {
+            assert!(
+                doc["paths"][path][method].is_object(),
+                "{method} {path} is missing from paths(...)"
+            );
+        }
+        let schemas = &doc["components"]["schemas"];
+        for name in [
+            "ResyncReport",
+            "SetKeyTracing",
+            "ProvisionErrorBody",
+            "SpanEntry",
+        ] {
+            assert!(
+                schemas.get(name).is_some(),
+                "{name} is not registered in components(...)"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_eviction_is_a_502_naming_the_resync_route() {
+        // Any RedisError will do; a serde one is constructible without a server.
+        let cause = serde_json::from_str::<i32>("x").unwrap_err();
+        let err = eviction_failed("the key", obleth_redis::RedisError::Serde(cause));
+        assert!(err.to_string().contains(RESYNC_ROUTE), "{err}");
+        let resp = axum::response::IntoResponse::into_response(err);
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
     /// A handler can carry `#[utoipa::path]` and still be missing from the
     /// document, and an unregistered schema leaves a dangling `$ref` rather
     /// than a compile error. Pin both halves.
@@ -6187,6 +9937,30 @@ mod tests {
     }
 
     #[test]
+    fn merge_auto_router_sets_and_clears_messages_default_model() {
+        use obleth_config::AutoRouterSettings;
+        let existing = AutoRouterSettings::default();
+        let set = merge_auto_router(
+            &existing,
+            &UpdateAutoRouterSettings {
+                messages_default_model: Some("local-llama".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(set.messages_default_model.as_deref(), Some("local-llama"));
+        let cleared = merge_auto_router(
+            &set,
+            &UpdateAutoRouterSettings {
+                messages_default_model: Some("".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(cleared.messages_default_model, None);
+        let kept = merge_auto_router(&set, &UpdateAutoRouterSettings::default());
+        assert_eq!(kept.messages_default_model.as_deref(), Some("local-llama"));
+    }
+
+    #[test]
     fn boon_view_round_trips_compression() {
         use obleth_config::{BoonSettings, CompressionBoonSettings};
         let s = BoonSettings {
@@ -6240,6 +10014,42 @@ mod tests {
         };
         let view = BoonSettingsView::from_settings(&s);
         assert!(view.compression_code_compaction);
+    }
+
+    #[test]
+    fn boon_view_update_clamps_the_tool_loop_deadline() {
+        assert_eq!(merge_tool_loop_deadline(None, 300), 300);
+        assert_eq!(
+            merge_tool_loop_deadline(Some(0), 300),
+            300,
+            "0 means unchanged"
+        );
+        assert_eq!(merge_tool_loop_deadline(Some(120), 300), 120);
+        assert_eq!(
+            merge_tool_loop_deadline(Some(u64::MAX), 300),
+            TOOL_LOOP_MAX_DEADLINE_SECS
+        );
+        assert_eq!(
+            merge_tool_loop_deadline(Some(TOOL_LOOP_MAX_DEADLINE_SECS + 1), 300),
+            TOOL_LOOP_MAX_DEADLINE_SECS
+        );
+    }
+
+    #[test]
+    fn boon_view_exposes_the_tool_loop_deadline() {
+        let mut s = BoonSettings::default();
+        assert_eq!(
+            BoonSettingsView::from_settings(&s).tool_loop_deadline_secs,
+            300
+        );
+        s.tool_loop.deadline_secs = 90;
+        assert_eq!(
+            BoonSettingsView::from_settings(&s).tool_loop_deadline_secs,
+            90
+        );
+        let update: UpdateBoonSettings =
+            serde_json::from_value(serde_json::json!({ "tool_loop_deadline_secs": 120 })).unwrap();
+        assert_eq!(update.tool_loop_deadline_secs, Some(120));
     }
 
     #[test]
@@ -6319,7 +10129,7 @@ mod tests {
         let s = obleth_config::EnergySettings {
             enabled: true,
             prometheus_url: "http://prom:9090".into(),
-            power_query: "habana_device_power_watts".into(),
+            power_query: "node_power_watts".into(),
             poll_interval_secs: 30,
             energy_cost_per_kwh: 0.12,
             carbon_g_per_kwh: 400.0,
@@ -6348,5 +10158,347 @@ mod tests {
         assert_eq!(merged.poll_interval_secs, 60); // untouched default
         assert_eq!(merged.energy_cost_per_kwh, 0.15);
         assert_eq!(merged.pue, 1.0);
+    }
+
+    /// A model route with every field filled with sane defaults, for tests
+    /// that only care about a couple of fields (e.g. `enabled`/`max_in_flight`).
+    fn fixture_model_route(name: &str) -> ModelRoute {
+        let now = chrono::Utc::now();
+        ModelRoute {
+            id: Uuid::new_v4(),
+            model_name: name.to_string(),
+            aliases: Vec::new(),
+            description: String::new(),
+            upstream_model: name.to_string(),
+            api_base: "http://upstream.invalid".to_string(),
+            api_key: None,
+            upstream_headers: Default::default(),
+            model_type: obleth_config::DEFAULT_MODEL_TYPE.to_string(),
+            quantization: obleth_config::DEFAULT_QUANTIZATION.to_string(),
+            input_cost_per_token: 0.0,
+            output_cost_per_token: 0.0,
+            cost_per_image: 0.0,
+            cost_per_audio_second: 0.0,
+            cost_per_character: 0.0,
+            cost_per_video: 0.0,
+            context_window: 128_000,
+            admission_weight: 100,
+            max_in_flight: None,
+            capacity_mode: obleth_config::DEFAULT_CAPACITY_MODE.to_string(),
+            capacity_tuned_at: None,
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_service: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
+            supports_function_calling: false,
+            supports_system_messages: false,
+            supports_response_schema: false,
+            supports_tool_choice: false,
+            supports_vision: false,
+            enabled: true,
+            cache_enabled: false,
+            cache_ttl_secs: 0,
+            tags: Vec::new(),
+            boons: Vec::new(),
+            tool_servers: Vec::new(),
+            request_timeout_secs: None,
+            max_retries: 0,
+            retry_backoff_ms: obleth_config::DEFAULT_RETRY_BACKOFF_MS,
+            endpoint_selection_mode: obleth_config::DEFAULT_ENDPOINT_SELECTION_MODE.to_string(),
+            debug_diagnostics: false,
+            energy_slots_per_node: 0,
+            route_bias: obleth_config::DEFAULT_ROUTE_BIAS,
+            auto_eligible: obleth_config::DEFAULT_AUTO_ELIGIBLE,
+            draft_model: String::new(),
+            verify_api_base: String::new(),
+            verify_upstream_model: String::new(),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn model_route_view_redacts_api_key() {
+        let mut route = fixture_model_route("m");
+        route.api_key = Some("sk-upstream-secret".into());
+        let v = serde_json::to_value(ModelRouteView::from(route.clone())).unwrap();
+        assert_eq!(v["api_key_set"], serde_json::json!(true));
+        assert!(v.get("api_key").is_none(), "view leaked api_key: {v}");
+        assert!(!v.to_string().contains("sk-upstream-secret"));
+        assert_eq!(v["model_name"], "m");
+
+        route.api_key = None;
+        let v = serde_json::to_value(ModelRouteView::from(route.clone())).unwrap();
+        assert_eq!(v["api_key_set"], serde_json::json!(false));
+        // An empty stored key is "no key" — the proxy sends no auth for it.
+        route.api_key = Some(String::new());
+        let v = serde_json::to_value(ModelRouteView::from(route)).unwrap();
+        assert_eq!(v["api_key_set"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn model_route_view_lists_upstream_header_names_but_never_values() {
+        let mut route = fixture_model_route("m");
+        route.upstream_headers = [
+            ("x-routing-hint".to_string(), "sticky".to_string()),
+            (
+                "x-upstream-token".to_string(),
+                "tok-upstream-secret".to_string(),
+            ),
+        ]
+        .into();
+        let v = serde_json::to_value(ModelRouteView::from(route)).unwrap();
+        assert_eq!(
+            v["upstream_header_names"],
+            serde_json::json!(["x-routing-hint", "x-upstream-token"])
+        );
+        assert!(
+            v.get("upstream_headers").is_none(),
+            "view leaked values: {v}"
+        );
+        assert!(!v.to_string().contains("tok-upstream-secret"));
+        assert!(!v.to_string().contains("sticky"));
+    }
+
+    #[test]
+    fn model_writes_take_upstream_headers_with_null_meaning_keep() {
+        let create: CreateModel = serde_json::from_value(serde_json::json!({
+            "model_name": "m", "upstream_model": "m", "api_base": "",
+            "upstream_headers": {"X-Routing-Hint": "sticky"}
+        }))
+        .unwrap();
+        let write = create.upstream_headers.unwrap();
+        assert_eq!(write["X-Routing-Hint"].as_deref(), Some("sticky"));
+
+        let update: UpdateModel = serde_json::from_value(serde_json::json!({
+            "upstream_model": "m", "api_base": "",
+            "upstream_headers": {"x-upstream-token": null}
+        }))
+        .unwrap();
+        assert_eq!(update.upstream_headers.unwrap()["x-upstream-token"], None);
+        let omitted: UpdateModel =
+            serde_json::from_value(serde_json::json!({"upstream_model": "m", "api_base": ""}))
+                .unwrap();
+        assert!(
+            omitted.upstream_headers.is_none(),
+            "absent means keep them all"
+        );
+    }
+
+    #[test]
+    fn upstream_header_map_holds_the_validated_headers() {
+        let headers: obleth_config::UpstreamHeaders =
+            [("x-routing-hint".to_string(), "sticky".to_string())].into();
+        let map = upstream_header_map(&headers);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map["x-routing-hint"], "sticky");
+    }
+
+    #[test]
+    fn model_endpoint_view_redacts_api_key() {
+        let now = chrono::Utc::now();
+        let ep = ModelEndpoint {
+            id: Uuid::new_v4(),
+            model_id: Uuid::new_v4(),
+            name: "primary".into(),
+            api_base: "http://upstream.invalid/v1".into(),
+            api_key: Some("sk-endpoint-secret".into()),
+            priority: 0,
+            weight: 100,
+            enabled: true,
+            max_in_flight: None,
+            health_status: "unknown".into(),
+            consecutive_failures: 0,
+            alert_state: "ok".into(),
+            last_checked_at: None,
+            last_latency_ms: None,
+            last_http_status: None,
+            last_message: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let v = serde_json::to_value(ModelEndpointView::from(ep.clone())).unwrap();
+        assert_eq!(v["api_key_set"], serde_json::json!(true));
+        assert!(v.get("api_key").is_none(), "view leaked api_key: {v}");
+        assert!(!v.to_string().contains("sk-endpoint-secret"));
+        assert_eq!(v["name"], "primary");
+
+        let v = serde_json::to_value(ModelEndpointView::from(ModelEndpoint {
+            api_key: None,
+            ..ep
+        }))
+        .unwrap();
+        assert_eq!(v["api_key_set"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn mcp_server_names_are_path_safe() {
+        for ok in ["github", "rc-docs", "jira.v2", "a_b", "x1"] {
+            assert!(
+                validate_mcp_server_name(ok).is_ok(),
+                "{ok} should be allowed"
+            );
+        }
+        for bad in [
+            "",
+            "-lead",
+            "has space",
+            "a/b",
+            "../up",
+            "ünï",
+            &"x".repeat(65),
+        ] {
+            assert!(
+                validate_mcp_server_name(bad).is_err(),
+                "{bad:?} should be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_server_view_redacts_auth_header() {
+        let now = chrono::Utc::now();
+        let server = McpServer {
+            id: Uuid::new_v4(),
+            name: "files".into(),
+            upstream_url: "http://mcp.invalid/mcp".into(),
+            auth_header: Some("Bearer mcp-secret".into()),
+            enabled: true,
+            created_at: now,
+            updated_at: now,
+        };
+        let v = serde_json::to_value(McpServerView::from(server.clone())).unwrap();
+        assert_eq!(v["auth_header_set"], serde_json::json!(true));
+        assert!(
+            v.get("auth_header").is_none(),
+            "view leaked auth_header: {v}"
+        );
+        assert!(!v.to_string().contains("mcp-secret"));
+        assert_eq!(v["name"], "files");
+
+        let v = serde_json::to_value(McpServerView::from(McpServer {
+            auth_header: None,
+            ..server
+        }))
+        .unwrap();
+        assert_eq!(v["auth_header_set"], serde_json::json!(false));
+    }
+
+    fn pool(model: &str, cap: usize, tenants: Vec<TenantFairshareView>) -> ModelPoolView {
+        let in_flight = tenants.iter().map(|t| t.in_flight).sum();
+        ModelPoolView {
+            model: model.into(),
+            cap,
+            configured_cap: cap,
+            in_flight,
+            cluster_in_flight: None,
+            queued: 0,
+            borrowed: 0,
+            groups: vec![GroupFairshareView {
+                name: "g".into(),
+                weight: 100,
+                in_flight,
+                queued: 0,
+                slot_cap: cap,
+                borrowed: 0,
+                served_tokens: 0.0,
+                share_score: 0.0,
+                weight_share: 1.0,
+                expected_slots: cap as f64,
+            }],
+            tenants,
+            keys: vec![],
+        }
+    }
+    fn tv(
+        id: Uuid,
+        in_flight: usize,
+        served: f64,
+        share: f64,
+        expected: f64,
+    ) -> TenantFairshareView {
+        TenantFairshareView {
+            tenant_id: id,
+            name: "t".into(),
+            fairshare_group: "g".into(),
+            weight: 100,
+            max_in_flight: None,
+            in_flight,
+            queued: 0,
+            served_tokens: served,
+            share_score: served / 100.0,
+            weight_share: share,
+            expected_slots: expected,
+        }
+    }
+
+    #[test]
+    fn aggregate_pools_sums_occupancy_and_shares_by_pool_capacity() {
+        let t = Uuid::new_v4();
+        let pools = vec![
+            pool("a", 8, vec![tv(t, 2, 100.0, 0.5, 4.0)]),
+            pool("b", 2, vec![tv(t, 1, 50.0, 1.0, 2.0)]),
+        ];
+        let (groups, tenants, _) = aggregate_pools(&pools);
+        assert_eq!(tenants.len(), 1);
+        assert_eq!(tenants[0].in_flight, 3);
+        assert_eq!(tenants[0].served_tokens, 150.0);
+        assert_eq!(tenants[0].expected_slots, 6.0);
+        assert!((tenants[0].weight_share - 0.6).abs() < 1e-9); // 6 of 10 slots
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].slot_cap, 10);
+    }
+
+    #[test]
+    fn enabled_pool_capacity_uses_model_cap_or_default() {
+        let mut a = fixture_model_route("a");
+        a.max_in_flight = Some(4);
+        let mut b = fixture_model_route("b");
+        b.max_in_flight = None;
+        let mut c = fixture_model_route("c");
+        c.enabled = false;
+        c.max_in_flight = Some(100);
+        assert_eq!(enabled_pool_capacity(&[a, b, c], 32), 36);
+    }
+
+    fn routes_with_caps(caps: &[Option<i64>]) -> Vec<ModelRoute> {
+        caps.iter()
+            .enumerate()
+            .map(|(i, cap)| {
+                let mut m = fixture_model_route(&format!("m{i}"));
+                m.max_in_flight = *cap;
+                m
+            })
+            .collect()
+    }
+
+    #[test]
+    fn enabled_pool_share_rounds_each_pool_up() {
+        let models = routes_with_caps(&[Some(4), None, Some(1)]);
+        assert_eq!(enabled_pool_share(&models, 32, 1), 37);
+        // ceil(4/3) + ceil(32/3) + ceil(1/3) = 2 + 11 + 1
+        assert_eq!(enabled_pool_share(&models, 32, 3), 14);
+    }
+
+    #[test]
+    fn ceiling_check_compares_like_with_like() {
+        let models = routes_with_caps(&[Some(8), Some(8)]);
+        // Configured ceiling under the configured pool sum.
+        let w = ceiling_check(&models, 32, 12, 1).expect("warns");
+        assert_eq!((w.ceiling, w.pool_sum), (12, 16));
+        assert!(w.message.contains("OBLETH_GLOBAL_MAX_IN_FLIGHT is below"));
+        // Covered, and still covered per replica: 3 replicas hold 3 + 3
+        // slots of pools against a 6-slot share of the ceiling.
+        assert_eq!(ceiling_check(&models, 32, 16, 3), None);
+        assert_eq!(ceiling_check(&models, 32, 64, 5), None);
+
+        // 64 one-slot pools under a 64 ceiling fit configured, but over 2
+        // replicas every pool rounds up to 1 while the ceiling halves.
+        let tiny = routes_with_caps(&[Some(1); 64]);
+        assert_eq!(ceiling_check(&tiny, 32, 64, 1), None);
+        let w = ceiling_check(&tiny, 32, 64, 2).expect("warns per replica");
+        assert_eq!((w.ceiling, w.pool_sum), (32, 64));
+        assert!(w.message.contains("round up per model"));
     }
 }

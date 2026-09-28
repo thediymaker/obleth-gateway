@@ -70,11 +70,15 @@ pub fn hash_api_key(secret: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Exact-match response cache key: SHA-256 over the client-facing model name
-/// and the raw request body. Identical requests for the same model collide
-/// (a cache hit); anything different misses.
-pub fn cache_key(model: &str, body: &[u8]) -> String {
+/// Exact-match response cache key: SHA-256 over the tenant id, the
+/// client-facing model name and the raw request body. Identical requests from
+/// the same tenant for the same model collide (a cache hit); anything
+/// different misses. The tenant is part of the key so one tenant's cached
+/// answer is never replayed to another.
+pub fn cache_key(tenant_id: &str, model: &str, body: &[u8]) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(tenant_id.as_bytes());
+    hasher.update([0u8]);
     hasher.update(model.as_bytes());
     hasher.update([0u8]);
     hasher.update(body);
@@ -113,5 +117,27 @@ mod tests {
         assert_eq!(content_hash("hello"), content_hash("hello"));
         assert_ne!(content_hash("hello"), content_hash("world"));
         assert_eq!(content_hash("hello").len(), 64); // SHA-256 hex
+    }
+
+    #[test]
+    fn cache_key_is_scoped_to_the_tenant() {
+        let body = br#"{"model":"m","messages":[]}"#;
+        assert_eq!(
+            cache_key("tenant-a", "m", body),
+            cache_key("tenant-a", "m", body)
+        );
+        assert_ne!(
+            cache_key("tenant-a", "m", body),
+            cache_key("tenant-b", "m", body),
+            "identical requests from two tenants must never share an entry"
+        );
+        assert_ne!(cache_key("t", "m", body), cache_key("t", "n", body));
+    }
+
+    #[test]
+    fn cache_key_fields_cannot_bleed_into_each_other() {
+        // The NUL separators keep ("ab", "c") and ("a", "bc") distinct.
+        assert_ne!(cache_key("ab", "c", b"x"), cache_key("a", "bc", b"x"));
+        assert_ne!(cache_key("t", "mx", b""), cache_key("t", "m", b"x"));
     }
 }

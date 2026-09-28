@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { obleth } from "@/lib/obleth";
-import { guardAdmin } from "@/lib/auth/guard";
+import { guardAdmin, guardAdminSession } from "@/lib/auth/guard";
 
 // Wraps GET/POST /api/v1/knowledge/collections.
 
@@ -15,11 +15,11 @@ export async function GET() {
 }
 
 export async function POST(req: NextRequest) {
-  const denied = await guardAdmin();
+  const { denied, session } = await guardAdminSession();
   if (denied) return denied;
   try {
     const body = await req.json();
-    return NextResponse.json(await obleth.createCollection(body));
+    return NextResponse.json(await obleth.createCollection(body, { auditActor: session.email }));
   } catch (e) {
     return NextResponse.json({ error: String(e) }, { status: 502 });
   }

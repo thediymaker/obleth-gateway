@@ -6,13 +6,6 @@ import { Download, Upload } from "lucide-react";
 import { restoreBackupAction } from "@/app/actions";
 import type { ConfigBackup, RestoreCounts, RestoreReport } from "@/lib/obleth";
 import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { DestructiveConfirm } from "@/components/ui/destructive-confirm";
 
 const ENTITIES = [
@@ -98,38 +91,29 @@ export function BackupRestore() {
     : [];
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Config backup</CardTitle>
-        <CardDescription>
-          Export a JSON snapshot of all gateway configuration&mdash;fairshare groups, tenants, API
-          keys, models, endpoints, MCP servers, and settings&mdash;or restore one. Usage history is
-          not included. Provider secrets are carried as encrypted ciphertext, so restoring requires
-          the same <code className="font-mono text-xs">OBLETH_ENCRYPTION_KEY</code>; alert
-          credentials (Slack webhook, SMTP password) are included as stored.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-4">
+    <div className="flex flex-col gap-3">
         <div className="flex flex-wrap items-center gap-2">
           <Button
             type="button"
             variant="outline"
+            size="sm"
             onClick={() => {
               setReport(null);
               setError(null);
               window.location.href = "/api/live/backup/export";
             }}
           >
-            <Download className="mr-2 h-4 w-4" />
+            <Download className="h-4 w-4" />
             Download backup
           </Button>
           <Button
             type="button"
             variant="outline"
+            size="sm"
             disabled={pending}
             onClick={() => fileInputRef.current?.click()}
           >
-            <Upload className="mr-2 h-4 w-4" />
+            <Upload className="h-4 w-4" />
             Restore from backup&hellip;
           </Button>
           <input
@@ -140,20 +124,20 @@ export function BackupRestore() {
             onChange={onRestoreFile}
           />
         </div>
-        <p className="text-xs text-muted-foreground">
+        <p className="text-[11.5px] text-muted-foreground">
           Restore merges: entities in the backup are created or updated by id; anything that exists
           only on this instance is left untouched. Existing client API keys keep working after a
           restore.
         </p>
 
         {error ? (
-          <p className="text-sm text-destructive" role="alert">
+          <p className="text-[12.5px] font-medium" role="alert">
             {error}
           </p>
         ) : null}
 
         {report ? (
-          <div className="space-y-2 rounded-md border border-border bg-muted/30 p-3 text-sm">
+          <div role="status" className="space-y-2 rounded-lg border border-border px-3 py-2.5 text-[12.5px]">
             <p className="font-medium">Restore complete.</p>
             <ul className="grid grid-cols-1 gap-x-6 gap-y-0.5 sm:grid-cols-2">
               {ENTITIES.map(([key, label]) => {
@@ -167,7 +151,7 @@ export function BackupRestore() {
               })}
             </ul>
             {report.warnings?.length ? (
-              <ul className="space-y-1 text-amber-600 dark:text-amber-500">
+              <ul className="space-y-1 font-medium">
                 {report.warnings.map((w) => (
                   <li key={w}>{w}</li>
                 ))}
@@ -204,7 +188,6 @@ export function BackupRestore() {
             ) : null
           }
         />
-      </CardContent>
-    </Card>
+    </div>
   );
 }

@@ -1,4 +1,5 @@
 import { PortalModels } from "@/components/portal/portal-models";
+import { toPortalModelSummary } from "@/components/portal/portal-model-summary";
 import { requireUser } from "@/lib/auth/roles";
 import { obleth, type ModelRoute, type Tenant } from "@/lib/obleth";
 import { safe } from "@/lib/safe";
@@ -16,7 +17,9 @@ export default async function PortalModelsPage() {
   const visible = models
     .filter((model) => model.enabled)
     .filter((model) => allowed.length === 0 || allowed.includes(model.model_name))
-    .sort((a, b) => a.model_name.localeCompare(b.model_name));
+    .sort((a, b) => a.model_name.localeCompare(b.model_name))
+    // Allowlisted DTO: the full route carries upstream URLs and secrets.
+    .map(toPortalModelSummary);
 
   return (
     <PortalModels

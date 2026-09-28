@@ -38,6 +38,51 @@ pub const FIXTURE_TENANTS: &[(&str, &str, u32, u32)] = &[
     ("obench-embeddings", "obench-api", 50, 5),
 ];
 
+/// (key name, weight, per-model cap) minted under every fixture tenant.
+pub const FIXTURE_KEYS: &[(&str, u32, Option<u32>)] = &[
+    ("user-a", 100, None),
+    ("user-b", 100, None),
+    ("user-c", 200, None),
+];
+
+/// Larger fleet for the `fairshare` profile. Names carry the fixture's latency
+/// keywords so one backend stands in for fast, default, heavy, and embedding
+/// models.
+pub const FAIRSHARE_MODELS: &[&str] = &[
+    "obench-turbo",
+    "obench-fast-chat",
+    "obench-base",
+    "obench-code",
+    "obench-large",
+    "obench-heavy-reasoner",
+    "obench-mini",
+    "obench-embed",
+];
+
+/// (tenant, group, weight, traffic share) for the `fairshare` profile.
+pub const FAIRSHARE_TENANTS: &[(&str, &str, u32, u32)] = &[
+    ("obench-course-a", "obench-chatbot", 500, 10),
+    ("obench-course-b", "obench-chatbot", 300, 10),
+    ("obench-course-c", "obench-chatbot", 100, 10),
+    ("obench-lab-1", "obench-analytics", 200, 10),
+    ("obench-lab-2", "obench-analytics", 100, 10),
+    ("obench-lab-3", "obench-analytics", 100, 10),
+    ("obench-svc-1", "obench-api", 100, 10),
+    ("obench-svc-2", "obench-api", 50, 10),
+    ("obench-svc-3", "obench-api", 50, 10),
+    ("obench-svc-4", "obench-api", 25, 10),
+];
+
+/// Keys for the `fairshare` profile: three to six per tenant, one capped.
+pub const FAIRSHARE_KEYS: &[(&str, u32, Option<u32>)] = &[
+    ("user-a", 100, None),
+    ("user-b", 100, None),
+    ("user-c", 200, None),
+    ("user-d", 50, None),
+    ("user-e", 100, Some(1)),
+    ("user-f", 300, None),
+];
+
 pub const FIXTURE_TRAFFIC: &[TrafficType] = &[
     TrafficType {
         model: "obench-turbo",
@@ -68,6 +113,67 @@ pub const FIXTURE_TRAFFIC: &[TrafficType] = &[
         kind: TrafficKind::ChatStream,
         output_tokens: 200,
         weight: 10,
+    },
+    TrafficType {
+        model: "obench-embed",
+        kind: TrafficKind::Embed,
+        output_tokens: 0,
+        weight: 25,
+    },
+];
+
+/// Traffic catalog for the `fairshare` profile. Every entry in
+/// [`FAIRSHARE_MODELS`] appears here: a pool that receives no requests holds no
+/// slots and queues nothing, so it would contribute an empty row to the
+/// convergence table instead of the contention the profile exists to measure.
+pub const FAIRSHARE_TRAFFIC: &[TrafficType] = &[
+    TrafficType {
+        model: "obench-turbo",
+        kind: TrafficKind::ChatStream,
+        output_tokens: 64,
+        weight: 25,
+    },
+    TrafficType {
+        model: "obench-fast-chat",
+        kind: TrafficKind::ChatStream,
+        output_tokens: 64,
+        weight: 15,
+    },
+    TrafficType {
+        model: "obench-base",
+        kind: TrafficKind::ChatStream,
+        output_tokens: 128,
+        weight: 20,
+    },
+    TrafficType {
+        model: "obench-base",
+        kind: TrafficKind::ChatBuffered,
+        output_tokens: 96,
+        weight: 10,
+    },
+    TrafficType {
+        model: "obench-code",
+        kind: TrafficKind::ChatStream,
+        output_tokens: 200,
+        weight: 10,
+    },
+    TrafficType {
+        model: "obench-large",
+        kind: TrafficKind::ChatStream,
+        output_tokens: 256,
+        weight: 10,
+    },
+    TrafficType {
+        model: "obench-heavy-reasoner",
+        kind: TrafficKind::ChatStream,
+        output_tokens: 256,
+        weight: 10,
+    },
+    TrafficType {
+        model: "obench-mini",
+        kind: TrafficKind::ChatBuffered,
+        output_tokens: 48,
+        weight: 15,
     },
     TrafficType {
         model: "obench-embed",
@@ -217,5 +323,43 @@ mod tests {
     fn fixture_catalog_is_nonempty() {
         assert_eq!(FIXTURE_MODELS.len(), 5);
         assert!(FIXTURE_TRAFFIC.iter().any(|t| t.kind == TrafficKind::Embed));
+    }
+
+    #[test]
+    fn fairshare_key_table_covers_the_widest_tenant() {
+        // seed_fixture hands tenant `i` the first `3 + (i % 4)` keys, so the
+        // table must hold at least six or the widest tenants silently shrink.
+        assert!(FAIRSHARE_KEYS.len() >= 6);
+        assert!(
+            FAIRSHARE_KEYS.iter().any(|k| k.2.is_some()),
+            "one capped key"
+        );
+        // Every fairshare tenant's group must exist, or its weight is orphaned.
+        for (name, group, _, _) in FAIRSHARE_TENANTS {
+            assert!(
+                FIXTURE_GROUPS.iter().any(|g| g.0 == *group),
+                "{name} references unknown group {group}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_fairshare_model_receives_traffic() {
+        // A seeded model with no traffic entry still gets a pool and still
+        // counts toward the ceiling, but reports an all-zero convergence row.
+        for model in FAIRSHARE_MODELS {
+            assert!(
+                FAIRSHARE_TRAFFIC.iter().any(|t| t.model == *model),
+                "{model} is seeded by the fairshare fleet but never driven"
+            );
+        }
+        // And nothing in the catalog points at a model that is never seeded.
+        for t in FAIRSHARE_TRAFFIC {
+            assert!(
+                FAIRSHARE_MODELS.contains(&t.model),
+                "{} is driven but never seeded",
+                t.model
+            );
+        }
     }
 }

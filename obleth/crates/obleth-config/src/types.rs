@@ -32,6 +32,41 @@ impl FairshareAlgorithm {
     }
 }
 
+/// Who may follow up a video job (poll, download, delete, list):
+/// `OBLETH_VIDEO_JOB_SCOPE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoJobScope {
+    /// Only the API key that created the job. With secret keys and with the
+    /// per-(issuer, subject) identity keys of JWT callers alike, a key is one
+    /// user, so a job is private to the user who made it.
+    #[default]
+    Key,
+    /// Any key of the tenant that created the job.
+    Tenant,
+}
+
+impl VideoJobScope {
+    /// The scope an `OBLETH_VIDEO_JOB_SCOPE` value names. Unset or blank is
+    /// the default, [`VideoJobScope::Key`]; any other value that is not `key`
+    /// or `tenant` (case-insensitive) is `Err` with the value, so the caller
+    /// can warn and fall back to the default rather than widen access on a
+    /// typo.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        match raw.map(|v| v.trim().to_ascii_lowercase()).as_deref() {
+            None | Some("") | Some("key") => Ok(Self::Key),
+            Some("tenant") => Ok(Self::Tenant),
+            Some(_) => Err(raw.unwrap_or_default().to_string()),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Key => "key",
+            Self::Tenant => "tenant",
+        }
+    }
+}
+
 /// Fairshare group — capacity is partitioned by group weight under the hierarchical algorithm.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FairshareGroup {
@@ -144,6 +179,11 @@ fn default_key_kind() -> String {
     API_KEY_KIND_SECRET.to_string()
 }
 
+/// Default fairshare weight for a key when unset (legacy records, defaults).
+pub fn default_key_weight() -> i64 {
+    100
+}
+
 /// An API key. The raw secret is never stored; only its hash + a display prefix.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ApiKey {
@@ -184,6 +224,12 @@ pub struct ApiKey {
     /// When this key's current budget term began.
     #[serde(default)]
     pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fairshare weight among this tenant's keys. Default 100.
+    #[serde(default = "default_key_weight")]
+    pub weight: i64,
+    /// Per-model in-flight ceiling for this key. `None` = no cap.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
     pub disabled: bool,
     pub tracing_enabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
@@ -262,6 +308,12 @@ pub struct ResolvedKey {
     /// When the key's current budget term began.
     #[serde(default)]
     pub key_budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fairshare weight among the tenant's keys (see `ApiKey::weight`).
+    #[serde(default = "default_key_weight")]
+    pub key_weight: i64,
+    /// Per-model in-flight ceiling for the key. `None` = no cap.
+    #[serde(default)]
+    pub key_max_in_flight: Option<i64>,
     /// Optional per-tenant model allowlist. Empty/`None` = all models permitted.
     #[serde(default)]
     pub allowed_models: Option<Vec<String>>,
@@ -310,7 +362,7 @@ impl Admission {
 }
 
 /// Registered model route. Client-facing `model_name` maps to an upstream
-/// OpenAI-compatible endpoint (Aibrix envoy, vLLM service, or external API).
+/// OpenAI-compatible endpoint (an inference gateway, a model server, or an external API).
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ModelRoute {
     pub id: Uuid,
@@ -332,9 +384,15 @@ pub struct ModelRoute {
     pub api_base: String,
     /// Optional bearer/api key for the upstream (stored encrypted-at-rest in prod).
     pub api_key: Option<String>,
+    /// Extra headers sent on every request to this model's upstream, after
+    /// the client's forwarded headers so the operator's value wins. Values
+    /// are stored encrypted at rest and never returned by the Management API.
+    #[serde(default)]
+    pub upstream_headers: UpstreamHeaders,
     /// Modality from the fixed [`MODEL_TYPES`] vocabulary. Determines which
     /// OpenAI endpoint this model serves (`chat`, `embedding`,
-    /// `audio_transcription`, `audio_speech`, `image`). Defaults to `chat`.
+    /// `audio_transcription`, `audio_speech`, `image`, `video`). Defaults to
+    /// `chat`.
     #[serde(default = "default_model_type")]
     pub model_type: String,
     /// Weight/activation format this deployment serves, from the fixed
@@ -354,6 +412,10 @@ pub struct ModelRoute {
     /// Per-input-character cost in USD (`audio_speech` models).
     #[serde(default)]
     pub cost_per_character: f64,
+    /// Per-created-job cost in USD (`video` models), charged once when the
+    /// create call succeeds.
+    #[serde(default)]
+    pub cost_per_video: f64,
     pub context_window: i64,
     /// Multiplier applied to tenant weight at admission when this model is used.
     pub admission_weight: i64,
@@ -369,6 +431,32 @@ pub struct ModelRoute {
     /// until the model has been tuned.
     #[serde(default)]
     pub capacity_tuned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `discovered` mode: where serving replicas are counted, from the fixed
+    /// [`CAPACITY_SOURCES`] vocabulary. `endpoints` (default) counts the
+    /// model's own enabled, healthy endpoints; `kubernetes` counts the ready
+    /// endpoints of the Service `capacity_service`.
+    #[serde(default = "default_capacity_source")]
+    pub capacity_source: String,
+    /// `kubernetes` source: namespace of the Service. `None` looks it up in
+    /// `OBLETH_CAPACITY_DISCOVERY_NAMESPACES` in order; the first namespace
+    /// that has it wins.
+    #[serde(default)]
+    pub capacity_namespace: Option<String>,
+    /// `kubernetes` source: name of the Service whose ready endpoints are the
+    /// serving replicas. `None` uses the gateway's
+    /// `OBLETH_CAPACITY_DEFAULT_SERVICE` template.
+    #[serde(default)]
+    pub capacity_service: Option<String>,
+    /// `discovered` mode: concurrent requests one serving replica takes.
+    /// Required on the `kubernetes` source, and on `endpoints` unless every
+    /// endpoint sets its own `max_in_flight`.
+    #[serde(default)]
+    pub per_replica_max_in_flight: Option<i64>,
+    /// `discovered` mode: multiplier on the derived pool size. `1.0` admits
+    /// exactly the ready capacity; above it lets requests queue at the
+    /// backend, which an autoscaler scaling on queue depth needs to see.
+    #[serde(default = "default_capacity_headroom")]
+    pub capacity_headroom: f64,
     pub supports_function_calling: bool,
     pub supports_system_messages: bool,
     pub supports_response_schema: bool,
@@ -380,9 +468,11 @@ pub struct ModelRoute {
     pub supports_vision: bool,
     pub enabled: bool,
     /// When true, identical requests to this model are served from the response
-    /// cache (exact-match on model + request body) instead of the upstream.
+    /// cache (exact-match on tenant + model + request body) instead of the
+    /// upstream. Entries are never shared across tenants.
     pub cache_enabled: bool,
-    /// Time-to-live for cached responses, in seconds.
+    /// Time-to-live for cached responses, in seconds. `0` disables caching:
+    /// nothing is stored (never "store without expiry").
     pub cache_ttl_secs: i64,
     /// Routing tags from the fixed [`MODEL_TAGS`] vocabulary. The `auto` router
     /// prefers models whose tags match the request's classified intent.
@@ -515,6 +605,11 @@ pub struct ResolvedModel {
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
+    /// Operator-configured headers for every upstream request (see
+    /// [`ModelRoute::upstream_headers`]). `#[serde(default)]` keeps older
+    /// cached payloads deserializable as "none".
+    #[serde(default)]
+    pub upstream_headers: UpstreamHeaders,
     /// Modality from the fixed [`MODEL_TYPES`] vocabulary. `#[serde(default)]`
     /// keeps older cached payloads (without this field) deserializable as
     /// `chat`.
@@ -527,6 +622,23 @@ pub struct ResolvedModel {
     pub quantization: String,
     pub admission_weight: i64,
     pub max_in_flight: Option<usize>,
+    /// How the pool size is decided (see [`ModelRoute::capacity_mode`]). The
+    /// data plane only acts on `discovered`. `#[serde(default …)]` keeps
+    /// older cached payloads deserializable as `static`.
+    #[serde(default = "default_capacity_mode")]
+    pub capacity_mode: String,
+    /// `discovered` mode inputs (see [`ModelRoute::capacity_source`] and
+    /// its siblings). The defaults keep older cached payloads readable.
+    #[serde(default = "default_capacity_source")]
+    pub capacity_source: String,
+    #[serde(default)]
+    pub capacity_namespace: Option<String>,
+    #[serde(default)]
+    pub capacity_service: Option<String>,
+    #[serde(default)]
+    pub per_replica_max_in_flight: Option<usize>,
+    #[serde(default = "default_capacity_headroom")]
+    pub capacity_headroom: f64,
     pub enabled: bool,
     pub cache_enabled: bool,
     pub cache_ttl_secs: i64,
@@ -542,6 +654,8 @@ pub struct ResolvedModel {
     pub cost_per_audio_second: f64,
     #[serde(default)]
     pub cost_per_character: f64,
+    #[serde(default)]
+    pub cost_per_video: f64,
     /// Maximum context window in tokens. Used by the `auto` router to filter
     /// out models that cannot fit the request. `#[serde(default)]` keeps older
     /// cached payloads (without this field) deserializable.
@@ -668,6 +782,11 @@ pub struct ResolvedEndpoint {
     /// Last observed health. Unhealthy endpoints are skipped during selection.
     #[serde(default)]
     pub healthy: bool,
+    /// Requests this endpoint takes at once, for a `discovered` model using
+    /// the `endpoints` source. `None` uses the model's
+    /// `per_replica_max_in_flight`.
+    #[serde(default)]
+    pub max_in_flight: Option<usize>,
 }
 
 /// Persisted upstream endpoint of a model (control-plane/API view). Several
@@ -688,6 +807,11 @@ pub struct ModelEndpoint {
     /// Relative share in `load_balance` mode.
     pub weight: i64,
     pub enabled: bool,
+    /// Requests this endpoint takes at once, counted by a `discovered` model
+    /// using the `endpoints` source. `None` uses the model's
+    /// `per_replica_max_in_flight`.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
     pub health_status: String,
     pub consecutive_failures: i64,
     pub alert_state: String,
@@ -969,7 +1093,7 @@ pub struct SlurmSettings {
     #[serde(default)]
     pub slurm_jwt: String,
     /// Operator-supplied compute-node hostname → IP overrides. When the pods
-    /// running obleth resolve Slurm node names (`scgh001`, …) unreliably, these
+    /// running obleth resolve Slurm node names (`node001`, …) unreliably, these
     /// take DNS out of the loop: the provisioner registers replica endpoints by
     /// IP and probes by IP, so neither the health checker nor the data-plane
     /// proxy depends on per-request name resolution. Empty = pure DNS (the
@@ -981,7 +1105,7 @@ pub struct SlurmSettings {
 /// One compute-node hostname → IP override for `SlurmSettings::node_aliases`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
 pub struct NodeAlias {
-    /// Slurm node hostname as it appears in job allocations (e.g. `scgh001`).
+    /// Slurm node hostname as it appears in job allocations (e.g. `node001`).
     pub host: String,
     /// The address to use instead — normally an IPv4/IPv6 literal.
     pub ip: String,
@@ -1239,6 +1363,7 @@ pub const MODEL_TYPES: &[&str] = &[
     "audio_transcription",
     "audio_speech",
     "image",
+    "video",
 ];
 
 /// The default modality assigned to a model when none is specified.
@@ -1249,8 +1374,36 @@ fn default_model_type() -> String {
 }
 
 /// Fixed vocabulary of capacity-tuning modes. `static` keeps the operator-set
-/// `max_in_flight`; `tuned` lets auto-tune set it from a ramp probe.
-pub const CAPACITY_MODES: &[&str] = &["static", "tuned"];
+/// `max_in_flight`; `tuned` lets auto-tune set it from a ramp probe;
+/// `discovered` derives the pool size from the live backend (ready serving
+/// replicas x per-replica concurrency), with `max_in_flight`
+/// kept as the fallback when discovery has no answer.
+pub const CAPACITY_MODES: &[&str] = &["static", "tuned", "discovered"];
+
+/// The capacity mode whose pool size the gateway discovers from the backend.
+pub const DISCOVERED_CAPACITY_MODE: &str = "discovered";
+
+/// Fixed vocabulary of capacity sources for the `discovered` mode.
+/// `endpoints` counts the model's own enabled, healthy endpoints and needs
+/// nothing outside the gateway; `kubernetes` counts the ready endpoints of a
+/// Service, read from its EndpointSlices through the Kubernetes API.
+pub const CAPACITY_SOURCES: &[&str] = &["endpoints", "kubernetes"];
+
+/// The capacity source assigned to a model when none is specified.
+pub const DEFAULT_CAPACITY_SOURCE: &str = "endpoints";
+
+fn default_capacity_source() -> String {
+    DEFAULT_CAPACITY_SOURCE.to_string()
+}
+
+fn default_capacity_headroom() -> f64 {
+    1.0
+}
+
+/// True when `source` is part of the fixed [`CAPACITY_SOURCES`] vocabulary.
+pub fn is_valid_capacity_source(source: &str) -> bool {
+    CAPACITY_SOURCES.contains(&source)
+}
 
 /// The default capacity mode assigned to a model when none is specified.
 pub const DEFAULT_CAPACITY_MODE: &str = "static";
@@ -1330,13 +1483,12 @@ pub fn normalize_endpoint_selection_mode(mode: &str) -> String {
 /// Both spellings of an already-built model-catalog URL, canonical first:
 /// `…/models`, then `…/models/`.
 ///
-/// The canonical spelling has no trailing slash, but AIBrix's metadata service
-/// mounts its list at `/v1/models/` and builds FastAPI with `redirect_slashes`
-/// off, so the canonical path 404s there with no redirect to follow. A caller
-/// that stops at the first 404 silently loses every model behind such a
-/// gateway — which made obleth's own `/v1/models` advertise 6 of 45 routes,
-/// and separately made model health report an unreachable catalog. The rule
-/// lives here so a third caller cannot miss it.
+/// The canonical spelling has no trailing slash, but some gateways mount
+/// their list only at `/v1/models/` with trailing-slash redirects off, so the
+/// canonical path 404s there with no redirect to follow. A caller that stops
+/// at the first 404 silently loses every model behind such a gateway, and
+/// model health reports an unreachable catalog. The rule lives here so a
+/// third caller cannot miss it.
 pub fn catalog_url_variants(models_url: &str) -> [String; 2] {
     let trimmed = models_url.trim_end_matches('/');
     [trimmed.to_string(), format!("{trimmed}/")]
@@ -1448,6 +1600,120 @@ where
         }
     }
     out
+}
+
+/// Operator-configured headers added to every request sent to a model's
+/// upstream. Keyed by lowercase header name; a `BTreeMap` so the stored,
+/// cached, and compared forms are order-stable.
+pub type UpstreamHeaders = std::collections::BTreeMap<String, String>;
+
+/// A write to a model's upstream headers: the full set of names the model
+/// should carry. A string sets that header's value; `null` keeps the value
+/// already stored under that name, so a client that was only ever shown the
+/// names (values are write-only) can add or drop one header without
+/// re-sending the others. A stored name missing from the write is removed.
+pub type UpstreamHeadersWrite = std::collections::BTreeMap<String, Option<String>>;
+
+/// Maximum upstream headers per model.
+pub const MAX_UPSTREAM_HEADERS: usize = 32;
+/// Maximum length of one upstream header value, in bytes.
+pub const MAX_UPSTREAM_HEADER_VALUE_LEN: usize = 4096;
+
+/// Header names an operator may not set on a model. Hop-by-hop headers belong
+/// to one connection, not to the request. `authorization` is owned by the
+/// model's `api_key`. `host`, `content-length`, and `content-type` describe
+/// the body the gateway itself rebuilds (a re-serialized JSON body, or a
+/// multipart form with a fresh boundary), and `accept-encoding` is stripped so
+/// the gateway can read the response it meters.
+pub const DENIED_UPSTREAM_HEADERS: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "proxy-connection",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+    "authorization",
+    "host",
+    "content-length",
+    "content-type",
+    "accept-encoding",
+];
+
+/// RFC 9110 token characters, the only ones a header name may contain.
+fn is_header_token_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b)
+}
+
+/// Validate one upstream header and return its canonical (lowercase) name.
+/// Values must be visible ASCII, space, or tab: no line breaks, so a value
+/// can never smuggle a second header.
+pub fn validate_upstream_header(name: &str, value: &str) -> Result<String, String> {
+    let name = name.trim().to_ascii_lowercase();
+    if name.is_empty() || !name.bytes().all(is_header_token_byte) {
+        return Err(format!(
+            "upstream header name '{name}' is not a valid header name"
+        ));
+    }
+    if DENIED_UPSTREAM_HEADERS.contains(&name.as_str()) {
+        return Err(format!(
+            "upstream header '{name}' cannot be set per model (the gateway owns it; \
+             use api_key for upstream auth)"
+        ));
+    }
+    if value.len() > MAX_UPSTREAM_HEADER_VALUE_LEN {
+        return Err(format!(
+            "upstream header '{name}' is longer than {MAX_UPSTREAM_HEADER_VALUE_LEN} bytes"
+        ));
+    }
+    if !value
+        .bytes()
+        .all(|b| b == b'\t' || (b' '..=b'~').contains(&b))
+    {
+        return Err(format!(
+            "upstream header '{name}' has a value with characters a header cannot carry"
+        ));
+    }
+    Ok(name)
+}
+
+/// Apply an [`UpstreamHeadersWrite`] to the headers stored today, validating
+/// every entry. Names are case-insensitive: two spellings of one name in a
+/// single write are rejected rather than one silently winning.
+pub fn merge_upstream_headers(
+    stored: &UpstreamHeaders,
+    write: &UpstreamHeadersWrite,
+) -> Result<UpstreamHeaders, String> {
+    if write.len() > MAX_UPSTREAM_HEADERS {
+        return Err(format!(
+            "at most {MAX_UPSTREAM_HEADERS} upstream headers may be set per model"
+        ));
+    }
+    let mut out = UpstreamHeaders::new();
+    for (raw_name, value) in write {
+        let value = match value {
+            Some(v) => v.trim().to_string(),
+            None => {
+                let key = raw_name.trim().to_ascii_lowercase();
+                stored.get(&key).cloned().ok_or_else(|| {
+                    format!("upstream header '{key}' has no stored value to keep; send a value")
+                })?
+            }
+        };
+        let name = validate_upstream_header(raw_name, &value)?;
+        if out.insert(name.clone(), value).is_some() {
+            return Err(format!("upstream header '{name}' is given more than once"));
+        }
+    }
+    Ok(out)
+}
+
+/// Header names only, for API responses: values are write-only because an
+/// operator may put a credential in one.
+pub fn upstream_header_names(headers: &UpstreamHeaders) -> Vec<String> {
+    headers.keys().cloned().collect()
 }
 
 /// Normalize an arbitrary list of tag strings to the canonical form used for
@@ -1603,6 +1869,11 @@ pub struct AutoRouterSettings {
     pub difficulty_enabled: bool,
     #[serde(default)]
     pub tier_source: TierSource,
+    /// Model or alias served when a request on the Anthropic Messages surface
+    /// names a model the gateway does not know (Claude Code sends Anthropic
+    /// model ids). `None` means such requests get `not_found_error`.
+    #[serde(default)]
+    pub messages_default_model: Option<String>,
 }
 
 fn default_classifier_timeout_ms() -> u64 {
@@ -1634,6 +1905,7 @@ impl Default for AutoRouterSettings {
             temperature: 0.0,
             difficulty_enabled: false,
             tier_source: TierSource::default(),
+            messages_default_model: None,
         }
     }
 }
@@ -2102,6 +2374,10 @@ fn default_tool_loop_timeout_ms() -> u64 {
     30_000
 }
 
+fn default_tool_loop_deadline_secs() -> u64 {
+    300
+}
+
 /// Default system nudge injected alongside granted tools so under-eager models
 /// reach for them. Names the capability explicitly ("you can call tools") and
 /// the situations that warrant a call, without forcing tool use on every turn.
@@ -2117,6 +2393,16 @@ your own knowledge directly for everything else."
 
 /// Maximum tool-loop turns an operator may configure (cost/latency guard).
 pub const TOOL_LOOP_MAX_TURNS: u32 = 8;
+
+/// Largest `ToolLoopSettings::deadline_secs` an operator may configure (one
+/// hour). Also the fallback budget when a stored value cannot be represented
+/// as a deadline.
+pub const TOOL_LOOP_MAX_DEADLINE_SECS: u64 = 3_600;
+
+/// Maximum gateway tool calls executed from one model turn. Each excess call
+/// gets an error tool result instead, so a single reply cannot fan out an
+/// unbounded number of MCP or image calls.
+pub const TOOL_LOOP_MAX_CALLS_PER_TURN: usize = 16;
 
 /// Configuration for the gateway tool loop: when a model is granted access to
 /// registered MCP servers (`ModelRoute::tool_servers`), the gateway injects
@@ -2143,6 +2429,12 @@ pub struct ToolLoopSettings {
     /// untouched). An empty string disables the nudge.
     #[serde(default = "default_tool_loop_nudge")]
     pub nudge: String,
+    /// Wall-clock budget for the whole loop of one request (every tool call
+    /// and follow-up turn), in seconds. Per-call timeouts alone stack up to
+    /// `max_turns` x calls x timeout of held upstream capacity; once this
+    /// elapses the loop dispatches nothing further.
+    #[serde(default = "default_tool_loop_deadline_secs")]
+    pub deadline_secs: u64,
 }
 
 impl Default for ToolLoopSettings {
@@ -2152,6 +2444,7 @@ impl Default for ToolLoopSettings {
             max_turns: default_tool_loop_max_turns(),
             tool_timeout_ms: default_tool_loop_timeout_ms(),
             nudge: default_tool_loop_nudge(),
+            deadline_secs: default_tool_loop_deadline_secs(),
         }
     }
 }
@@ -2607,6 +2900,12 @@ pub struct ApiKeyBackup {
     pub budget_period: Option<String>,
     #[serde(default)]
     pub budget_started_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Fairshare weight among this tenant's keys. Default 100.
+    #[serde(default = "default_key_weight")]
+    pub weight: i64,
+    /// Per-model in-flight ceiling for this key. `None` = no cap.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
     pub disabled: bool,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
@@ -2629,6 +2928,10 @@ pub struct ModelBackup {
     pub upstream_model: String,
     pub api_base: String,
     pub api_key: Option<String>,
+    /// Upstream header values as stored (ciphertext on encrypted instances),
+    /// like `api_key`. Absent in backups taken before the column existed.
+    #[serde(default)]
+    pub upstream_headers: UpstreamHeaders,
     #[serde(default = "default_model_type")]
     pub model_type: String,
     /// Declared serving format. Defaulted so backups taken before the column
@@ -2643,6 +2946,9 @@ pub struct ModelBackup {
     pub cost_per_audio_second: f64,
     #[serde(default)]
     pub cost_per_character: f64,
+    /// Absent in backups taken before the column existed.
+    #[serde(default)]
+    pub cost_per_video: f64,
     pub context_window: i64,
     pub admission_weight: i64,
     pub max_in_flight: Option<i64>,
@@ -2650,6 +2956,18 @@ pub struct ModelBackup {
     pub capacity_mode: String,
     #[serde(default)]
     pub capacity_tuned_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// `discovered` mode inputs. Absent in backups taken before the columns
+    /// existed.
+    #[serde(default = "default_capacity_source")]
+    pub capacity_source: String,
+    #[serde(default)]
+    pub capacity_namespace: Option<String>,
+    #[serde(default)]
+    pub capacity_service: Option<String>,
+    #[serde(default)]
+    pub per_replica_max_in_flight: Option<i64>,
+    #[serde(default = "default_capacity_headroom")]
+    pub capacity_headroom: f64,
     pub supports_function_calling: bool,
     pub supports_system_messages: bool,
     pub supports_response_schema: bool,
@@ -2728,6 +3046,9 @@ pub struct ModelEndpointBackup {
     pub priority: i64,
     pub weight: i64,
     pub enabled: bool,
+    /// Absent in backups taken before the column existed.
+    #[serde(default)]
+    pub max_in_flight: Option<i64>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -2889,7 +3210,7 @@ mod tests {
         let s = SlurmSettings {
             node_aliases: vec![
                 NodeAlias {
-                    host: " scgh001 ".into(),
+                    host: " node001 ".into(),
                     ip: " 10.0.0.1 ".into(),
                 }, // trimmed
                 NodeAlias {
@@ -2897,11 +3218,11 @@ mod tests {
                     ip: "10.0.0.9".into(),
                 }, // blank host → drop
                 NodeAlias {
-                    host: "scgh002".into(),
+                    host: "node002".into(),
                     ip: "".into(),
                 }, // blank ip → drop
                 NodeAlias {
-                    host: "scgh001".into(),
+                    host: "node001".into(),
                     ip: "10.0.0.2".into(),
                 }, // dupe → wins
             ],
@@ -2909,7 +3230,7 @@ mod tests {
         };
         let map = s.node_alias_map();
         assert_eq!(map.len(), 1);
-        assert_eq!(map.get("scgh001").map(String::as_str), Some("10.0.0.2"));
+        assert_eq!(map.get("node001").map(String::as_str), Some("10.0.0.2"));
     }
 
     #[test]
@@ -3171,7 +3492,7 @@ mod tests {
         let active = EnergySettings {
             enabled: true,
             prometheus_url: "http://prom:9090".into(),
-            power_query: "habana_device_power_watts".into(),
+            power_query: "node_power_watts".into(),
             ..Default::default()
         };
         assert!(active.active());
@@ -3352,6 +3673,58 @@ mod tests {
     }
 
     #[test]
+    fn upstream_headers_are_validated_lowercased_and_merged() {
+        let stored: UpstreamHeaders = [("x-token".to_string(), "old".to_string())].into();
+
+        // Names fold to lowercase; `null` keeps the stored value; the rest is replaced.
+        let write: UpstreamHeadersWrite = [
+            ("X-Token".to_string(), None),
+            ("X-Routing-Hint".to_string(), Some(" sticky ".into())),
+        ]
+        .into();
+        let merged = merge_upstream_headers(&stored, &write).unwrap();
+        assert_eq!(merged["x-token"], "old");
+        assert_eq!(merged["x-routing-hint"], "sticky");
+        assert_eq!(
+            upstream_header_names(&merged),
+            vec!["x-routing-hint".to_string(), "x-token".to_string()]
+        );
+        assert!(
+            merge_upstream_headers(&stored, &UpstreamHeadersWrite::new())
+                .unwrap()
+                .is_empty()
+        );
+
+        // The gateway owns auth, framing, and connection headers.
+        for denied in DENIED_UPSTREAM_HEADERS {
+            let w: UpstreamHeadersWrite = [(denied.to_uppercase(), Some("v".into()))].into();
+            assert!(merge_upstream_headers(&stored, &w).is_err(), "{denied}");
+        }
+        let bad = |name: &str, value: Option<&str>| {
+            let w: UpstreamHeadersWrite = [(name.to_string(), value.map(str::to_string))].into();
+            merge_upstream_headers(&stored, &w).is_err()
+        };
+        assert!(bad("x-new", None), "nothing stored to keep");
+        assert!(bad("bad name", Some("v")));
+        assert!(bad("", Some("v")));
+        assert!(bad("x-split", Some("a\r\nx-injected: 1")));
+        assert!(bad(
+            "x-long",
+            Some(&"v".repeat(MAX_UPSTREAM_HEADER_VALUE_LEN + 1))
+        ));
+        let dup: UpstreamHeadersWrite = [
+            ("x-a".to_string(), Some("1".into())),
+            ("X-A".to_string(), Some("2".into())),
+        ]
+        .into();
+        assert!(merge_upstream_headers(&stored, &dup).is_err());
+        let many: UpstreamHeadersWrite = (0..=MAX_UPSTREAM_HEADERS)
+            .map(|i| (format!("x-{i}"), Some("v".to_string())))
+            .collect();
+        assert!(merge_upstream_headers(&stored, &many).is_err());
+    }
+
+    #[test]
     fn normalize_aliases_trims_dedupes_and_caps() {
         assert_eq!(
             normalize_aliases(["glm-5-3-fp8", "  glm-5-3-mxfp4  ", "", "glm-5-3-fp8"]),
@@ -3378,10 +3751,17 @@ mod tests {
             upstream_model: "glm-5-3-mxfp4".into(),
             api_base: "http://upstream/v1".into(),
             api_key: None,
+            upstream_headers: Default::default(),
             model_type: DEFAULT_MODEL_TYPE.to_string(),
             quantization: "mxfp4".into(),
             admission_weight: 100,
             max_in_flight: None,
+            capacity_mode: "static".into(),
+            capacity_source: "endpoints".into(),
+            capacity_namespace: None,
+            capacity_service: None,
+            per_replica_max_in_flight: None,
+            capacity_headroom: 1.0,
             enabled: true,
             cache_enabled: false,
             cache_ttl_secs: 0,
@@ -3390,6 +3770,7 @@ mod tests {
             cost_per_image: 0.0,
             cost_per_audio_second: 0.0,
             cost_per_character: 0.0,
+            cost_per_video: 0.0,
             context_window: 0,
             supports_function_calling: false,
             supports_system_messages: true,
@@ -3425,5 +3806,12 @@ mod tests {
             model.addressable_names().collect::<Vec<_>>(),
             vec!["glm-5-3"]
         );
+    }
+
+    #[test]
+    fn auto_router_row_without_messages_default_model_still_parses() {
+        let v: AutoRouterSettings =
+            serde_json::from_str(r#"{"classifier_enabled":false}"#).unwrap();
+        assert_eq!(v.messages_default_model, None);
     }
 }

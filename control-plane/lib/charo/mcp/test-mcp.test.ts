@@ -21,7 +21,7 @@ import { testMcpTool } from "./test-mcp";
 import type { ToolCtx } from "@/lib/charo/tools/types";
 
 const server = (name: string, enabled = true) =>
-  ({ id: name, name, upstream_url: "http://up", auth_header: null, enabled }) as never;
+  ({ id: name, name, upstream_url: "http://up", auth_header_set: false, enabled }) as never;
 
 const ctx = (): ToolCtx =>
   ({ settings: {} as never, gatewayChat: (() => {}) as never, signal: new AbortController().signal });

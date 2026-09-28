@@ -12,5 +12,6 @@ uuid.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 obleth-config.workspace = true
+obleth-fairshare.workspace = true
 tokio.workspace = true
 futures-util.workspace = true

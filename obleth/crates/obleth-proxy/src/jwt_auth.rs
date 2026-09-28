@@ -368,12 +368,17 @@ pub struct Authenticated {
 }
 
 pub enum AuthFailure {
-    /// Any verification failure, an unknown identity with `jit_provision:
-    /// false`, or a cache error. Disabled keys are rejected by the handler
-    /// after resolution, exactly as for secret keys.
+    /// Any verification failure, or an unknown identity with `jit_provision:
+    /// false`. Disabled keys are rejected by the handler after resolution,
+    /// exactly as for secret keys.
     Unauthorized,
     /// Verified identity, first sight, and Postgres is unavailable: 503.
     ProvisioningUnavailable,
+    /// Redis errored (not a miss) while resolving the credential: 503, not
+    /// 401 -- the credential may be perfectly valid, the backend just could
+    /// not answer. Still fails closed (the request is denied either way),
+    /// but the status now says so honestly.
+    BackendUnavailable,
 }
 
 /// A resolved bearer credential, shared by the data-plane proxy and the MCP
@@ -405,7 +410,7 @@ pub(crate) fn credential_route(jwt_enabled: bool, secret: &str) -> Route {
 
 /// Resolve the bearer credential exactly as `proxy_request` does: JWT path when
 /// the feature is on and the credential looks like a JWT, else the secret-key
-/// path (`hash_api_key` -> `resolve_key`, byte-for-byte unchanged). Every
+/// path (`hash_api_key` -> `try_resolve_key`, byte-for-byte unchanged). Every
 /// failure returns the same response the caller would have built inline.
 pub(crate) async fn authenticate_credential(
     state: &AppState,
@@ -431,19 +436,30 @@ pub(crate) async fn authenticate_credential(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "identity provisioning unavailable",
                 )),
+                Err(AuthFailure::BackendUnavailable) => Err(crate::proxy::error_json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication backend unavailable",
+                )),
             }
         }
         Route::Key => {
             let hash = obleth_config::hash_api_key(secret);
-            match crate::proxy::resolve_key(state, &hash).await {
-                Some(r) => Ok(Credential {
+            match crate::proxy::try_resolve_key(state, &hash).await {
+                Ok(Some(r)) => Ok(Credential {
                     resolved: r,
                     device_id: String::new(),
                     auth_kind: "key",
                 }),
-                None => Err(crate::proxy::error_json(
+                Ok(None) => Err(crate::proxy::error_json(
                     StatusCode::UNAUTHORIZED,
                     "invalid api key",
+                )),
+                // Redis errored, not a miss: a latency spike or transport
+                // error must not read as "unknown key" (see AuthFailure::
+                // BackendUnavailable above). Still denies the request.
+                Err(()) => Err(crate::proxy::error_json(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "authentication backend unavailable",
                 )),
             }
         }
@@ -524,8 +540,10 @@ impl JwtAuth {
                 // fail closed instead of treating a cache error as first
                 // sight, which would otherwise hit Postgres on every request
                 // for an already-provisioned identity during a Redis outage.
+                // 503, not 401: the identity may well be provisioned already,
+                // the backend just could not answer.
                 tracing::debug!("jwt path failed closed on a cache error");
-                return Err(AuthFailure::Unauthorized);
+                return Err(AuthFailure::BackendUnavailable);
             }
         }
 
@@ -567,7 +585,7 @@ impl JwtAuth {
                 Ok(None) => {}
                 Err(()) => {
                     tracing::debug!("jwt path failed closed on a cache error");
-                    return Err(AuthFailure::Unauthorized);
+                    return Err(AuthFailure::BackendUnavailable);
                 }
             }
             let provisioned = self
@@ -1096,6 +1114,52 @@ mod tests {
                 .await
                 .unwrap_err(),
             "unknown_kid"
+        );
+    }
+
+    /// A Redis transport/timeout error during key resolution must answer 503
+    /// ("backend unavailable"), never 401 -- the credential may be perfectly
+    /// valid, Redis just could not answer. Only an actual miss (`Ok(None)`)
+    /// is 401. There is no AppState harness here (it needs live Redis), so
+    /// this is pinned at the source level, like the MCP gate test, matched
+    /// with whitespace stripped so reformatting can't break it.
+    #[test]
+    fn a_redis_error_during_key_resolution_is_503_not_401() {
+        let full = include_str!("jwt_auth.rs");
+        let src = &full[..full.find("\nmod tests {").expect("the test module")];
+        let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+
+        assert!(
+            !flat.contains("crate::proxy::resolve_key("),
+            "the lossy Option-returning resolve_key must not come back"
+        );
+
+        // authenticate_credential's secret-key path: hit / miss / error must
+        // appear in that order, ending in the right status codes.
+        let key_route = &flat[flat.find("Route::Key=>").expect("the key route")..];
+        let hit = key_route
+            .find("Ok(Some(r))=>Ok(Credential{")
+            .expect("the hit arm");
+        let miss = key_route
+            .find("Ok(None)=>Err(crate::proxy::error_json(StatusCode::UNAUTHORIZED,")
+            .expect("a miss stays 401");
+        let err = key_route
+            .find("Err(())=>Err(crate::proxy::error_json(StatusCode::SERVICE_UNAVAILABLE,")
+            .expect("a Redis error must be 503, not 401");
+        assert!(hit < miss && miss < err);
+
+        // JwtAuth::authenticate's two `try_resolve_key` call sites (first
+        // sight, and the single-flight re-check after provisioning) must
+        // both map a cache error to `BackendUnavailable`, not `Unauthorized`.
+        assert_eq!(
+            flat.matches("Err(())=>{").count(),
+            2,
+            "both try_resolve_key call sites in authenticate()"
+        );
+        assert_eq!(
+            flat.matches("returnErr(AuthFailure::BackendUnavailable);")
+                .count(),
+            2
         );
     }
 }

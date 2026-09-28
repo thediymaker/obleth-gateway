@@ -1,7 +1,6 @@
-// Pure (no fs) splitter for `---`-fenced recipe documents, shared by the
-// server-side loader (sbatch-recipes.ts) and the client recipe gallery
-// (recipes/recipe-list.tsx). Kept in its own module so the client can import it
-// without pulling in the fs-touching loader.
+// Pure (no fs) splitter for `---`-fenced recipe documents, used by the
+// server-side loader (sbatch-recipes.ts). Kept in its own module so client
+// code can import it without pulling in the fs-touching loader.
 
 /** Split a Jekyll-style `---`\n header \n`---`\n body document. Returns null
  *  when the opening/closing fence is missing. */

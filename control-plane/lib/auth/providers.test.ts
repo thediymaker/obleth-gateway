@@ -131,7 +131,7 @@ describe("oidcProviders", () => {
   });
 
   it("maps email from a configured claim, so an IdP alias does not become the account key", async () => {
-    // Globus for an ASU identity: `email` is a display alias, and
+    // Globus for an Example University identity: `email` is a display alias, and
     // `preferred_username` is the canonical institutional id.
     process.env.OIDC_PROVIDERS = JSON.stringify([{
       providerId: "globus",
@@ -144,9 +144,9 @@ describe("oidcProviders", () => {
     const { oidcProviders } = await import("./providers");
     const map = oidcProviders()[0].mapProfileToUser!;
     expect(map({
-      email: "Johnathan.Lee@asu.edu",
-      preferred_username: "jlee379@asu.edu",
-    })).toEqual({ email: "jlee379@asu.edu" });
+      email: "Jane.Doe@university.example",
+      preferred_username: "user@university.example",
+    })).toEqual({ email: "user@university.example" });
   });
 
   it("falls back to the standard claim when the mapped claim is absent or not a string", async () => {

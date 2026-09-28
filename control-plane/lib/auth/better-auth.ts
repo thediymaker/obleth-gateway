@@ -1,8 +1,98 @@
-import { betterAuth } from "better-auth";
+import { betterAuth, type BetterAuthOptions } from "better-auth";
+import {
+  APIError,
+  createAuthMiddleware,
+  getAuthoritativeSessionFromCtx,
+} from "better-auth/api";
 import { admin, genericOAuth } from "better-auth/plugins";
 import { getDb } from "@/lib/db";
 import { oidcProviders } from "@/lib/auth/providers";
 import { requireActiveAccountForAdminApi } from "@/lib/auth/admin-access";
+
+export const SELF_ADMIN_REMOVAL_ERROR = "You cannot remove admin access from your own account";
+export const LAST_ADMIN_REMOVAL_ERROR = "Cannot remove the last active admin";
+
+type UserRow = { id: string; role?: string | null; status?: string | null; banned?: unknown };
+
+// Request bodies arrive as JSON or form data, so a ban flag may be a string.
+function isBanned(value: unknown): boolean {
+  return value === true || value === "true";
+}
+
+function hasAdminRole(role: unknown): boolean {
+  const roles = Array.isArray(role) ? role : String(role ?? "").split(",");
+  return roles.some((r) => String(r).trim() === "admin");
+}
+
+function isActiveAdmin(user: UserRow): boolean {
+  return hasAdminRole(user.role) && user.status === "active" && !isBanned(user.banned);
+}
+
+/**
+ * Whether a built-in admin-plugin call would leave `userId` without admin
+ * access, or `null` when the path cannot. `update-user` passes its `data`
+ * straight to the adapter, so a role, status, or ban field there counts too.
+ */
+function strippedUserId(path: string, body: unknown): string | null {
+  const b = (body ?? {}) as { userId?: unknown; role?: unknown; data?: Record<string, unknown> };
+  const userId = b.userId == null ? null : String(b.userId);
+  switch (path) {
+    case "/admin/set-role":
+      return hasAdminRole(b.role) ? null : userId;
+    case "/admin/ban-user":
+    case "/admin/remove-user":
+      return userId;
+    case "/admin/update-user": {
+      const data = b.data ?? {};
+      const has = (k: string) => Object.prototype.hasOwnProperty.call(data, k);
+      const strips =
+        (has("role") && !hasAdminRole(data.role)) ||
+        (has("status") && data.status !== "active") ||
+        isBanned(data.banned);
+      return strips ? userId : null;
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * The dashboard's user actions refuse to strip admin access from the caller or
+ * from the last active admin (`lib/auth/users.ts`), but better-auth also serves
+ * its own `/api/auth/admin/*` endpoints, which would otherwise bypass that rule
+ * and could lock every administrator out. The same two refusals apply here.
+ */
+async function guardAdminAccessChanges(ctx: Parameters<typeof getAuthoritativeSessionFromCtx>[0]) {
+  const target = strippedUserId(ctx.path, ctx.body);
+  if (!target) return;
+  const session = await getAuthoritativeSessionFromCtx(ctx);
+  if (session?.user.id === target) {
+    throw new APIError("FORBIDDEN", { message: SELF_ADMIN_REMOVAL_ERROR });
+  }
+  const adapter = ctx.context.adapter;
+  const row = await adapter.findOne<UserRow>({ model: "user", where: [{ field: "id", value: target }] });
+  if (!row || !isActiveAdmin(row)) return;
+  // Filter to the other active admins in the query itself: `findMany` returns
+  // one capped page, so scanning every active user could miss the admins.
+  // `role` is exactly "admin" or "user" (see lib/auth/users.ts), so an exact
+  // match is both correct and narrower than a substring/comma-list `contains`.
+  const others = await adapter.findMany<UserRow>({
+    model: "user",
+    where: [
+      { field: "role", value: "admin" },
+      { field: "status", value: "active" },
+      { field: "id", operator: "ne", value: target },
+    ],
+  });
+  if (!others.some(isActiveAdmin)) {
+    throw new APIError("FORBIDDEN", { message: LAST_ADMIN_REMOVAL_ERROR });
+  }
+}
+
+const adminApiBeforeHook = createAuthMiddleware(async (ctx) => {
+  await requireActiveAccountForAdminApi(ctx);
+  await guardAdminAccessChanges(ctx);
+});
 
 function secret(): string {
   const s = process.env.BETTER_AUTH_SECRET ?? process.env.DASHBOARD_SESSION_SECRET;
@@ -45,15 +135,23 @@ function trustedOrigins(): string[] {
  *
  * A `pg.Pool` does not connect on construction, so `getDb()` here only risks its
  * explicit "DATABASE_URL unset" guard, not actual DB connectivity.
+ *
+ * Exported with injectable storage so tests can run the real configuration
+ * (hooks, plugins, sign-up policy) against an in-memory adapter.
  */
-function createAuth() {
+export function createAuth(
+  database: BetterAuthOptions["database"] = getDb(),
+  authSecret: string = secret(),
+) {
   return betterAuth({
-    database: getDb(),
-    secret: secret(),
+    database,
+    secret: authSecret,
     baseURL: process.env.BETTER_AUTH_URL ?? "http://localhost:3000",
     trustedOrigins: trustedOrigins(),
-    emailAndPassword: { enabled: true },
-    hooks: { before: requireActiveAccountForAdminApi },
+    // Accounts come from OIDC or the seeded break-glass admin; an open
+    // email sign-up endpoint would let anyone mint a (pending) account.
+    emailAndPassword: { enabled: true, disableSignUp: true },
+    hooks: { before: adminApiBeforeHook },
     user: {
       additionalFields: {
         role: { type: "string", defaultValue: "user", input: false },

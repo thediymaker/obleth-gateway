@@ -106,7 +106,9 @@ fn estimate_output_tokens(body: &Value, input_tokens: u32) -> u32 {
         .or_else(|| body.get("max_completion_tokens"))
         .and_then(Value::as_u64)
     {
-        return (max as u32).min(MAX_OUTPUT_CEILING);
+        // Clamp in u64 first: casting a value above u32::MAX truncates it
+        // (u32::MAX + 1 would become a zero-token reservation).
+        return max.min(MAX_OUTPUT_CEILING as u64) as u32;
     }
     // No explicit cap: assume output proportional to input, bounded.
     input_tokens.clamp(DEFAULT_OUTPUT_CEILING, MAX_OUTPUT_CEILING)
@@ -142,6 +144,15 @@ mod tests {
     fn caps_unbounded_output() {
         let tk = HeuristicTokenizer::new();
         let body = json!({"prompt": "x", "max_tokens": 999999});
+        let est = tk.estimate_request(&body);
+        assert_eq!(est.estimated_output_tokens, MAX_OUTPUT_CEILING);
+    }
+
+    #[test]
+    fn max_tokens_above_u32_clamps_instead_of_wrapping() {
+        let tk = HeuristicTokenizer::new();
+        // u32::MAX + 1 truncates to 0 if cast before clamping.
+        let body = json!({"prompt": "x", "max_tokens": u32::MAX as u64 + 1});
         let est = tk.estimate_request(&body);
         assert_eq!(est.estimated_output_tokens, MAX_OUTPUT_CEILING);
     }

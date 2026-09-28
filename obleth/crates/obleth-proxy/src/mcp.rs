@@ -23,6 +23,25 @@ use crate::state::AppState;
 
 const MCP_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
+/// Count one call to an MCP server in its daily stats: `tool` for a model's
+/// tool call in the gateway's tool loop, otherwise a client's direct request
+/// through `/mcp/<name>`. Fire and forget: stats never slow or fail a request.
+pub fn record_call(state: &AppState, server: &str, tool: bool, ok: bool, ms: u64) {
+    let redis = state.redis.clone();
+    let server = server.to_string();
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    tokio::spawn(async move {
+        let fields = [
+            (if tool { "tool_calls" } else { "direct" }, 1),
+            ("errors", i64::from(!ok)),
+            ("ms", ms as i64),
+        ];
+        if let Err(e) = redis.bump_daily("mcp", &server, &day, &fields).await {
+            tracing::debug!(error = %e, "mcp daily stats not recorded");
+        }
+    });
+}
+
 /// Handle `/mcp/{server}` and `/mcp/{server}/{*rest}`.
 #[tracing::instrument(skip_all, name = "mcp_request", fields(server = %params.server))]
 pub async fn mcp_handler(
@@ -49,8 +68,9 @@ pub async fn mcp_handler(
         Ok(cred) => cred.resolved,
         Err(resp) => return resp,
     };
-    if resolved.disabled {
-        return error_json(StatusCode::FORBIDDEN, "api key disabled");
+    // Same gate as the data plane: disabled key, inactive tenant, schedule.
+    if let Err(resp) = crate::proxy::gate_resolved_key(&state, &resolved) {
+        return resp;
     }
 
     // ---- resolve the registered MCP server ----
@@ -81,6 +101,7 @@ pub async fn mcp_handler(
         }
     }
 
+    let started = std::time::Instant::now();
     let upstream = state
         .http
         .request(parts.method, &url)
@@ -101,6 +122,13 @@ pub async fn mcp_handler(
                 ),
             );
             state.metrics.record_mcp(&server.name, 502);
+            record_call(
+                &state,
+                &server.name,
+                false,
+                false,
+                started.elapsed().as_millis() as u64,
+            );
             return error_json(StatusCode::BAD_GATEWAY, "mcp upstream request failed");
         }
     };
@@ -117,6 +145,13 @@ pub async fn mcp_handler(
         );
     }
     state.metrics.record_mcp(&server.name, status.as_u16());
+    record_call(
+        &state,
+        &server.name,
+        false,
+        !status.is_server_error(),
+        started.elapsed().as_millis() as u64,
+    );
 
     // Forward the upstream response headers, dropping only what the re-stream
     // invalidates. MCP streamable-HTTP servers carry protocol state in
@@ -201,6 +236,34 @@ fn build_mcp_url(base: &str, rest: Option<&str>, query: Option<&str>) -> String 
 #[cfg(test)]
 mod tests {
     use super::build_mcp_url;
+
+    #[test]
+    fn mcp_handler_applies_the_full_key_gate() {
+        // `/mcp/{server}` must refuse exactly what the data plane refuses: a
+        // disabled key, a suspended/pending tenant, or a tenant outside its
+        // schedule. A bare `disabled` check let suspended tenants through.
+        // There is no AppState harness in this crate (it needs live Redis and
+        // ClickHouse), so the wiring is pinned at the source level.
+        let src = include_str!("mcp.rs");
+        let handler = &src[..src.find("\nmod tests {").expect("the test module")];
+        let auth = handler
+            .find("authenticate_credential(")
+            .expect("the auth call");
+        let gate = handler
+            .find("crate::proxy::gate_resolved_key(&state, &resolved)")
+            .expect("the MCP handler must call gate_resolved_key");
+        let upstream = handler
+            .find("resolve_mcp(&state")
+            .expect("the server lookup");
+        assert!(
+            auth < gate && gate < upstream,
+            "gate after auth, before any upstream work"
+        );
+        assert!(
+            !handler.contains("if resolved.disabled"),
+            "the partial disabled-only check must not come back"
+        );
+    }
 
     #[test]
     fn appends_rest_and_query() {
