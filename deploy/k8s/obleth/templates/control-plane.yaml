@@ -28,7 +28,14 @@ spec:
   replicas: {{ .Values.controlPlane.replicas }}
   selector: { matchLabels: { app: {{ .Release.Name }}-control-plane } }
   template:
-    metadata: { labels: { app: {{ .Release.Name }}-control-plane } }
+    metadata:
+      labels: { app: {{ .Release.Name }}-control-plane }
+      {{- if not .Values.controlPlane.existingSecret }}
+      annotations:
+        # The dashboard's Secret is rendered from controlPlane values, so a
+        # change to any of them rolls the pods (they read it only at start).
+        checksum/secret: {{ .Values.controlPlane | toJson | sha256sum }}
+      {{- end }}
     spec:
       securityContext: {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
