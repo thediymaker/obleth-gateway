@@ -6,6 +6,7 @@ import { useRouter } from "next/navigation";
 import { useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, RefreshCw } from "lucide-react";
 import { Select } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
 import { isWaitingBelowShare } from "@/lib/fairshare";
 import {
   buildPoolRows,
@@ -143,7 +144,9 @@ export function FairshareDashboard({ tenantNames, initialPool = "all" }: { tenan
       </div>
 
       {!raw ? (
-        <p className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">{live.isError ? "The scheduler did not answer." : "Loading scheduler state…"}</p>
+        live.isError
+          ? <p className="rounded-xl border border-dashed border-border p-10 text-center text-sm text-muted-foreground">The scheduler did not answer.</p>
+          : <div aria-hidden="true" className="flex flex-col gap-5"><div className="grid grid-cols-2 gap-3 xl:grid-cols-4">{Array.from({ length: 4 }, (_, i) => <Skeleton key={i} className="h-[104px] rounded-xl" />)}</div><Skeleton className="h-[420px] rounded-xl" /></div>
       ) : inPool && pool && view ? (
         <PoolView view={view} raw={raw} poolRow={poolRow} shared={shared} onOpen={setSelected} />
       ) : scoped ? (
