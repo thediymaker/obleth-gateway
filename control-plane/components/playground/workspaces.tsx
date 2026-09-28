@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { CharoPanel } from "@/components/charo/charo-panel";
 import { useCharoStream, type ChatTurn } from "@/components/charo/use-charo-stream";
+import { uuid } from "@/lib/uuid";
 import type { ModelRoute } from "@/lib/obleth";
 import { formatDurationMs } from "@/lib/format";
 import { cn } from "@/lib/utils";
@@ -140,7 +141,7 @@ export function UnifiedWorkspace({ storageKey, session, update, models, loading,
   const send = (override?: string) => {
     const body = override ?? text;
     if (!ready || busy || (!body.trim() && !image)) return;
-    const promptId = `2:${Date.now()}:${crypto.randomUUID()}`;
+    const promptId = `2:${Date.now()}:${uuid()}`;
     recipients.forEach((i) => { void streams[i].send(body, image, undefined, promptId); });
     update(session.title === "Untitled session" ? { title: body.trim().slice(0, 60) || "Image conversation" } : {});
     setText(""); setImage(undefined);
