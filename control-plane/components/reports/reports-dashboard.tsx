@@ -1,6 +1,8 @@
 "use client";
 
 import { useMemo, useState } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useQuery } from "@tanstack/react-query";
 import type { DateRange } from "react-day-picker";
 import { Bar, CartesianGrid, ComposedChart, Line, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
@@ -14,6 +16,7 @@ import { Calendar } from "@/components/ui/calendar";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Select } from "@/components/ui/select";
 import type { ApiKey, Tenant, UsageDailyGroupBy, UsageDailyRow } from "@/lib/obleth";
+import { linkTime, logsHref, type LogsLink } from "@/lib/log-links";
 import { compact, formatMs } from "@/lib/overview-model";
 import {
   buildChart,
@@ -111,6 +114,7 @@ export function ReportsDashboard({ tenants, keys, models }: { tenants: Tenant[];
   const [rowFilter, setRowFilter] = useState("");
   const [exporting, setExporting] = useState(false);
 
+  const router = useRouter();
   const range: DayRange | null = preset === "custom"
     ? custom?.from ? { start: isoDay(custom.from), end: isoDay(custom.to ?? custom.from) } : null
     : presetRange(preset);
@@ -154,6 +158,25 @@ export function ReportsDashboard({ tenants, keys, models }: { tenants: Tenant[];
   const filterLine = [tenantId ? names.tenantNames.get(tenantId) : "every team", keyId ? `key ${names.keyNames.get(keyId) || names.keyPrefixes.get(keyId)}` : null, model || null].filter(Boolean).join(" · ");
   const groupInfo = TABLE_GROUPS.find((g) => g.value === group)!;
 
+  // The requests behind any number here, on the Request logs page, for the
+  // same days and filters. Days become the reader's own midnights.
+  const logsFor = (extra: LogsLink = {}, days: DayRange | null = range) =>
+    logsHref({
+      since: days ? linkTime(days.start, false) : undefined,
+      until: days ? linkTime(days.end, true) : undefined,
+      team: tenantId || undefined,
+      key: keyId || undefined,
+      model: model || undefined,
+      ...extra,
+    });
+  const rowLink = (r: UsageDailyRow): LogsLink =>
+    group === "day" ? {}
+    : group === "tenant" ? { team: r.tenant_id }
+    : group === "key" ? { team: r.tenant_id, key: r.key_id }
+    : group === "model" ? { model: r.model }
+    : { team: r.tenant_id, key: r.key_id, model: r.model };
+  const rowDays = (r: UsageDailyRow) => (group === "day" ? { start: r.day, end: r.day } : range);
+
   const drill = (r: UsageDailyRow) => {
     if (group === "tenant") { setTenantId(r.tenant_id); setKeyId(""); setGroup("key"); }
     else if (group === "key") { setTenantId(r.tenant_id); setKeyId(r.key_id); setGroup("model"); }
@@ -195,13 +218,14 @@ export function ReportsDashboard({ tenants, keys, models }: { tenants: Tenant[];
       </Dialog>
 
       <div className="grid grid-cols-2 gap-3 md:grid-cols-3 xl:grid-cols-5">
-        <Tile label="Requests" value={days.data ? compact(cur.requests) : "—"} detail={change(cur.requests, before?.requests, against)} />
+        <Tile label="Requests" href={cur.requests ? logsFor() : undefined} value={days.data ? compact(cur.requests) : "—"} detail={change(cur.requests, before?.requests, against)} />
         <Tile label="Tokens" value={days.data ? compact(cur.tokens) : "—"} detail={cur.tokens ? `${Math.round((cur.inputTokens / cur.tokens) * 100)}% in · ${change(cur.tokens, before?.tokens, "before") ?? ""}` : null} />
         <Tile label="Spend" value={days.data ? money(cur.cost) : "—"} detail={range && cur.cost ? `${money(cur.cost / daysBetween(range))} a day · ${change(cur.cost, before?.cost, "before") ?? ""}` : null} />
         <Tile
+          href={cur.failed ? logsFor({ status: "error" }) : undefined}
           label="Succeeded"
           value={cur.requests ? `${successRate.toFixed(1)}%` : "—"}
-          detail={cur.requests ? `${compact(cur.failed)} failed${prevSuccess !== null ? ` · ${successRate - prevSuccess >= 0 ? "▲" : "▼"} ${Math.abs(successRate - prevSuccess).toFixed(1)} pts` : ""}` : null}
+          detail={cur.requests ? `${compact(cur.failed)} failed${cur.failed ? " · see them" : ""}${prevSuccess !== null ? ` · ${successRate - prevSuccess >= 0 ? "▲" : "▼"} ${Math.abs(successRate - prevSuccess).toFixed(1)} pts` : ""}` : null}
           emphasis={cur.requests > 0 && successRate < 95}
         />
         <Tile label="Cache hits" value={lookups ? `${((cur.cacheHits / lookups) * 100).toFixed(1)}%` : "—"} detail={lookups ? `${compact(cur.cacheHits)} of ${compact(lookups)} lookups` : "No cached lookups"} />
@@ -215,7 +239,7 @@ export function ReportsDashboard({ tenants, keys, models }: { tenants: Tenant[];
       <Panel
         label="Usage over time"
         title={`${MEASURES.find((m) => m.value === measure)!.label} per day`}
-        subtitle={chart.series.length ? `Split by ${split === "tenant" ? "team" : "model"}: the four largest, then the rest` : measure === "ttft" ? "Average per day; the dashed line is the same day in the previous period" : "Bars are this period; the dashed line is the same day in the previous period"}
+        subtitle={`${chart.series.length ? `Split by ${split === "tenant" ? "team" : "model"}: the four largest, then the rest` : measure === "ttft" ? "Average per day; the dashed line is the same day in the previous period" : "Bars are this period; the dashed line is the same day in the previous period"} · click a day for its requests`}
         action={
           <div className="flex flex-wrap items-center gap-2">
             <Segmented<Measure> label="Measure" value={measure} onChange={setMeasure} options={MEASURES} />
@@ -231,7 +255,16 @@ export function ReportsDashboard({ tenants, keys, models }: { tenants: Tenant[];
           ) : (
             <div className="h-[260px]">
               <ResponsiveContainer width="100%" height="100%">
-                <ComposedChart data={chartRows} margin={{ top: 8, right: 4, left: 0, bottom: 0 }} barCategoryGap="18%">
+                <ComposedChart
+                  data={chartRows}
+                  margin={{ top: 8, right: 4, left: 0, bottom: 0 }}
+                  barCategoryGap="18%"
+                  className="cursor-pointer"
+                  onClick={(e: { activeTooltipIndex?: number | string }) => {
+                    const d = chart.days[Number(e?.activeTooltipIndex)];
+                    if (d) router.push(logsFor({}, { start: d.day, end: d.day }));
+                  }}
+                >
                   <CartesianGrid {...chartGrid} vertical={false} />
                   <XAxis dataKey="label" tick={axisTick} axisLine={false} tickLine={false} minTickGap={24} height={20} />
                   <YAxis tick={axisTick} axisLine={false} tickLine={false} width={52} tickFormatter={(v: number) => (measure === "spend" ? `$${compactAxis(v)}` : measure === "ttft" ? formatMs(v) : compactAxis(v))} />
@@ -337,8 +370,14 @@ export function ReportsDashboard({ tenants, keys, models }: { tenants: Tenant[];
                       <span className={cn("truncate", (group === "day" || group === "model" || group === "key_model") && "font-mono text-[12.5px]")}>{r.label}</span>
                       {r.sublabel && <span className="ml-2 font-mono text-[11.5px] text-muted-foreground">{r.sublabel}</span>}
                     </td>
-                    <td className="py-2.5 pr-3 text-right font-mono text-[12px]">{r.requests.toLocaleString()}</td>
-                    <td className="py-2.5 pr-3 text-right font-mono text-[12px] text-muted-foreground">{r.error_requests.toLocaleString()}</td>
+                    <td className="py-2.5 pr-3 text-right font-mono text-[12px]">
+                      <Link href={logsFor(rowLink(r), rowDays(r))} onClick={(e) => e.stopPropagation()} className="underline-offset-2 hover:underline" title="See these requests">{r.requests.toLocaleString()}</Link>
+                    </td>
+                    <td className="py-2.5 pr-3 text-right font-mono text-[12px] text-muted-foreground">
+                      {r.error_requests > 0 ? (
+                        <Link href={logsFor({ ...rowLink(r), status: "error" }, rowDays(r))} onClick={(e) => e.stopPropagation()} className="text-foreground underline-offset-2 hover:underline" title="See the failed requests">{r.error_requests.toLocaleString()}</Link>
+                      ) : "0"}
+                    </td>
                     <td className="py-2.5 pr-3 text-right font-mono text-[12px]">{compact(r.input_tokens)}</td>
                     <td className="py-2.5 pr-3 text-right font-mono text-[12px]">{compact(r.output_tokens)}</td>
                     <td className="py-2.5 pr-3 text-right font-mono text-[12px]">{money(r.cost_usd)}</td>

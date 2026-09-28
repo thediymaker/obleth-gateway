@@ -49,6 +49,10 @@ describe("the search box", () => {
     expect(parseSearch("model:nope colour:red status:ok", lookups)).toEqual({ patch: { status: "success" }, unknown: ["model:nope", "colour:red"] });
   });
 
+  it("reads a status code as that exact status", () => {
+    expect(parseSearch("status:502", lookups).patch).toEqual({ statusCode: "502" });
+  });
+
   it("takes a session as given", () => {
     expect(parseSearch("session:sess_8f2c", lookups).patch).toEqual({ sessionId: "sess_8f2c" });
   });

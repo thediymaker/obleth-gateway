@@ -3,6 +3,9 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { ReportsDashboard } from "./reports-dashboard";
+
+vi.mock("next/navigation", () => ({ useRouter: () => ({ push: vi.fn() }) }));
+vi.mock("next/link", () => ({ default: ({ href, children, ...rest }: { href: string; children: React.ReactNode }) => <a href={href} {...rest}>{children}</a> }));
 import type { ApiKey, Tenant, UsageDailyRow } from "@/lib/obleth";
 
 const EMPTY = "00000000-0000-0000-0000-000000000000";
@@ -68,6 +71,19 @@ describe("the Reports page", () => {
     expect(host.textContent).toContain("Sep 1 – Sep 27, 2026 · every team · compared with Aug 1 – Aug 27, 2026");
     expect(calls.some((c) => c.includes("start_day=2026-08-01") && c.includes("end_day=2026-08-27"))).toBe(true);
     expect(host.textContent).toContain("▲ 18% vs the same days last month");
+  });
+
+  it("links the failures, and each row's counts, to those requests", async () => {
+    await render();
+    const failed = [...host.querySelectorAll("a")].find((a) => a.textContent?.includes("see them"))!;
+    const url = new URL(failed.getAttribute("href")!, "http://x");
+    expect(url.pathname).toBe("/logs");
+    expect(url.searchParams.get("status")).toBe("error");
+    expect(new Date(Number(url.searchParams.get("since"))).getDate()).toBe(1);
+    expect(new Date(Number(url.searchParams.get("until"))).getDate()).toBe(27);
+    const row = [...host.querySelectorAll("tbody a")].find((a) => a.getAttribute("title") === "See the failed requests")!;
+    expect(row.getAttribute("href")).toContain("team=t1");
+    expect(row.getAttribute("href")).toContain("status=error");
   });
 
   it("splits the chart by team from the per-day rows", async () => {
