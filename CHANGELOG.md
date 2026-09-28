@@ -4,6 +4,24 @@ The release workflow uses the matching `## vX.Y.Z` section below as the GitHub
 Release notes. Add a section here when cutting a release; if none exists, the
 workflow falls back to auto-generated notes.
 
+## v2.0.1
+
+Fixes found while rewriting the documentation for v2.0.0: a Playground crash, a chart gap, and dashboard hints that described the wrong behaviour.
+
+- **The Playground works over plain HTTP.** Opening the dashboard at a plain-HTTP address other than localhost (a Compose stack at `http://server:3002`, for example) crashed the Playground with "This page failed to load", because `crypto.randomUUID` exists only in secure contexts. Session ids now fall back to `crypto.getRandomValues`. Dashboards served over HTTPS were not affected.
+- **The dashboard restarts when its settings change.** The Helm chart now rolls the control-plane pods when the `controlPlane` values behind its Secret change (for example `trustedOrigins` or `betterAuthUrl`). Before, the Secret changed but the running pods kept the old values until restarted by hand. With `controlPlane.existingSecret` nothing changes.
+- **Compose passes `OBLETH_FAIL_OPEN` through.** The Compose file hardcoded it to `true`, so the value in `.env` had no effect. It now reads `.env`, defaulting to `true`.
+- **Dashboard hints say what the gateway does.**
+  - A model's blank pool size uses the gateway default (`OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT`, 32), not "no cap".
+  - A blank speculation category floor uses 0.5 agreement and −1.0 confidence, not the global bar.
+  - Lossy compression keeps a prose segment's most relevant sentences; it is not a model summary. Only fetching an original back needs function calling and the tool loop.
+  - Without a reachable compressor, lossy compression scores sentences with the built-in heuristic.
+  - Retrieval settings are on the Knowledge page.
+  - A watched Kubernetes Service with no ready endpoints keeps its last pool size, or the model's own max in flight if it has none yet.
+  - "Stop after failed launches" counts failed jobs on record, each forgotten 15 minutes after it ends, not failures in a row.
+  - The assistant's "May run benchmarks" switch now shows the server's default (on) when the setting was never saved.
+- **Documentation fixes in the repository.** The chart's OTLP example is OTLP/HTTP on port 4318. RELEASE.md upgrades with `--reset-then-reuse-values`, so defaults a new chart changes take effect. The README states how budgets behave: an exhausted budget is refused with `403`, and a Redis failure during the check follows `OBLETH_FAIL_OPEN`.
+
 ## v2.0.0
 
 A redesigned dashboard, fairshare per model and across replicas, pool sizes that follow the backend, and the Anthropic Messages, Videos and Verdicts APIs. Read the breaking changes before upgrading.
