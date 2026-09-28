@@ -246,7 +246,7 @@ export function needsYou(input: {
     out.push({ key: "provisioner", title: "Slurm is on, but the provisioner isn't running", detail: "Nothing is launched or replaced until it checks in.", href: "/deployments?slurm=1", action: "Slurm connection" });
   }
   if (input.compressor?.configured && !input.compressor.reachable) {
-    out.push({ key: "compressor", title: "The compressor service doesn't answer", detail: input.compressor.error ?? "Lossy compression falls back to lossless.", href: "#about", action: "About" });
+    out.push({ key: "compressor", title: "The compressor service doesn't answer", detail: input.compressor.error ?? "Lossy compression scores sentences with the built-in heuristic instead.", href: "#about", action: "About" });
   }
   return out;
 }

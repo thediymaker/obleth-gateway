@@ -416,7 +416,7 @@ export function ModelSettings({
           <Setting
             id="set-max-slots"
             label={mode === "discovered" ? "Fallback slots" : "Max slots"}
-            hint={mode === "discovered" ? "Used while discovery has no answer." : "Requests sent to the upstream at once. Blank for no cap."}
+            hint={mode === "discovered" ? "Used while discovery has no answer." : "Requests sent to the upstream at once. Blank uses the gateway default (OBLETH_DEFAULT_MODEL_MAX_IN_FLIGHT, 32 unless set)."}
             fields={["max_in_flight"]}
             was={{ field: "max_in_flight" }}
           >

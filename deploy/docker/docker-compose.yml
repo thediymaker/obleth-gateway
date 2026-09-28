@@ -166,7 +166,7 @@ services:
       OBLETH_CAPACITY_DISCOVERY_NAMESPACES: ""
       OBLETH_CAPACITY_DEFAULT_SERVICE: ""
       OBLETH_FAIRSHARE_ALGORITHM: hierarchical
-      OBLETH_FAIL_OPEN: "true"
+      OBLETH_FAIL_OPEN: ${OBLETH_FAIL_OPEN:-true}
       # Fail-open telemetry WAL: usage batches spill here while ClickHouse is
       # unreachable and replay on recovery. Must be writable by the non-root
       # runtime user (uid 10001); the image's working directory

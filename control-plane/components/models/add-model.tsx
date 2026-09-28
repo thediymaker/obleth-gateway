@@ -306,7 +306,7 @@ function ConnectForm({ models, onClose }: { models: ModelRoute[]; onClose: () =>
         action={<HelpTip label="What else can be set" align="right">Router tags, capabilities, boons, health checks, discovered capacity and extra endpoints are set on the model&apos;s page once it exists.</HelpTip>}
       >
         <div className="grid gap-3 sm:grid-cols-3">
-          <Field label="Concurrent requests" name="max_in_flight" type="number" min={1} placeholder="No cap" hint="Blank for no cap. Discovered capacity is set on the model's page." />
+          <Field label="Concurrent requests" name="max_in_flight" type="number" min={1} placeholder="Gateway default" hint="Blank uses the gateway default pool size (32 unless set). Discovered capacity is set on the model's page." />
           {textual && <Field label="Context window" name="context_window" type="number" min={1} defaultValue="131072" />}
           {priceFields.map((f) => (
             <Field key={f.name} label={`${f.label} ($)`} name={`${f.name}_input`} inputMode="decimal" value={prices[f.name] ?? ""} onChange={(e) => setPrices((p) => ({ ...p, [f.name]: e.target.value }))} placeholder="0" />

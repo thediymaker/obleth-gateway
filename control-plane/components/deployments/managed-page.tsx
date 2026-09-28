@@ -359,7 +359,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
             <p className="max-w-3xl text-[13px] text-secondary-foreground">Slurm refused the job when it was submitted: <span className="font-mono text-[12px] text-foreground">{spec.last_provision_error}</span></p>
           ) : (
             <p className="max-w-3xl text-[13px] text-secondary-foreground">
-              The last {counts.lost} job{counts.lost === 1 ? "" : "s"} ended without becoming healthy, so it stopped submitting new ones (the limit is {spec.max_job_failures} in a row).
+              The last {counts.lost} job{counts.lost === 1 ? "" : "s"} ended without becoming healthy, so it stopped submitting new ones (the limit is {spec.max_job_failures} failed jobs on record; each is forgotten 15 minutes after it ends).
               {counts.healthy ? ` ${counts.healthy} replica${counts.healthy === 1 ? " is" : "s are"} still serving.` : " Nothing is serving; requests get 503 until a replica is healthy."}
             </p>
           )}
@@ -467,7 +467,7 @@ export function ManagedPage({ modelId, initial, changes }: { modelId: string; in
               <Setting id="set-min" label="Serve from" hint={`Healthy replicas needed before it counts as up. The replica count (${spec.target_replicas}) is set at the top.`} fields={["slurm_min_replicas"]} was={{ field: "slurm_min_replicas" }}>
                 <TextField name="slurm_min_replicas" label="Serve from" inputMode="numeric" required defaultValue={spec.min_replicas} mono className="w-20" />
               </Setting>
-              <Setting id="set-failures" label="Stop after failed launches" hint="In a row; then it waits for you. 0 never stops." fields={["slurm_max_job_failures"]} was={{ field: "slurm_max_job_failures" }}>
+              <Setting id="set-failures" label="Stop after failed launches" hint="Failed jobs on record (each is forgotten 15 minutes after it ends); then it waits for you. 0 never stops." fields={["slurm_max_job_failures"]} was={{ field: "slurm_max_job_failures" }}>
                 <TextField name="slurm_max_job_failures" label="Stop after failed launches" inputMode="numeric" required defaultValue={spec.max_job_failures} mono className="w-20" />
               </Setting>
             </SettingsCard>

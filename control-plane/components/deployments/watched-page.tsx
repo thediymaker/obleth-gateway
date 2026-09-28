@@ -70,7 +70,7 @@ export function WatchedPage({ modelId, initial, changes }: { modelId: string; in
         <section className="rounded-xl border-[1.5px] border-foreground bg-card px-5 py-4">
           <p className="text-[15px] font-semibold">No replicas are ready</p>
           <p className="mt-1 max-w-3xl text-[13px] text-secondary-foreground">
-            The Service {status?.service ? <span className="font-mono">{status.service}</span> : null} has no ready endpoints, so the pool is empty: requests wait for a slot, then fail with 503. Check the pods in {status?.namespace ?? "the cluster"}; obleth picks them up as soon as they&apos;re ready.
+            The Service {status?.service ? <span className="font-mono">{status.service}</span> : null} has no ready endpoints. The pool keeps its last size (or the model's own max in flight if it has none yet), so requests still go to the Service and fail until a replica is ready. Check the pods in {status?.namespace ?? "the cluster"}; obleth picks them up as soon as they&apos;re ready.
           </p>
         </section>
       )}
@@ -105,7 +105,7 @@ export function WatchedPage({ modelId, initial, changes }: { modelId: string; in
             <Row label="Pool"><b className="font-medium text-foreground">{status?.ready_replicas != null && status.per_replica_max_in_flight != null ? `${status.ready_replicas} × ${status.per_replica_max_in_flight}${status.headroom !== 1 ? ` × ${status.headroom}` : ""} = ` : ""}{cap} slots</b></Row>
             {status?.reason && <Row label="Note">{status.reason}</Row>}
           </div>
-          <p className="border-t border-border px-[18px] py-2.5 text-xs text-muted-foreground">If the Service has no ready endpoints the pool drops to 0 and requests wait, then fail with 503.</p>
+          <p className="border-t border-border px-[18px] py-2.5 text-xs text-muted-foreground">If the Service has no ready endpoints, the pool keeps its last size (or the model's own max in flight) and requests fail until a replica is ready.</p>
         </Panel>
       </div>
 
