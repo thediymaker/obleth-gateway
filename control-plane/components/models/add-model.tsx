@@ -1,5 +1,6 @@
 "use client";
 
+import Link from "next/link";
 import { useMemo, useRef, useState, useTransition, type ChangeEvent } from "react";
 import { useRouter } from "next/navigation";
 import { ChevronDown, Upload } from "lucide-react";
@@ -9,8 +10,6 @@ import { Field, fromPerMillion, MODEL_TYPE_OPTIONS, SelectField, TextArea, UPSTR
 import { Notice, Sheet } from "@/components/models/ui";
 import { Segmented } from "@/components/overview/ui";
 import { ProviderImportWizard } from "@/components/provider-import-wizard";
-import { RecipeList } from "@/components/recipes/recipe-list";
-import type { RecipeCard } from "@/components/recipes/recipe-card";
 import { HelpTip } from "@/components/fairshare/help";
 import { Button } from "@/components/ui/button";
 import { modelHref } from "@/lib/models-model";
@@ -19,7 +18,7 @@ import type { ModelImportReport, ModelRoute } from "@/lib/obleth";
 import type { UpstreamModel } from "@/lib/provider-import";
 import { cn } from "@/lib/utils";
 
-export type AddMode = "connect" | "provider" | "file" | "slurm";
+export type AddMode = "connect" | "provider" | "file";
 
 /** A first guess at the type from the upstream's name; only a default, shown for the admin to confirm. */
 export function guessModelType(upstream: string): string {
@@ -42,21 +41,18 @@ export function AddModelSheet({
   onModeChange,
   onClose,
   slurmEnabled,
-  recipeCards,
   models,
 }: {
   mode: AddMode | null;
   onModeChange: (mode: AddMode) => void;
   onClose: () => void;
   slurmEnabled: boolean;
-  recipeCards: RecipeCard[];
   models: ModelRoute[];
 }) {
   const modes: { value: AddMode; label: string }[] = [
     { value: "connect", label: "Connect an endpoint" },
     { value: "provider", label: "From a provider" },
     { value: "file", label: "Import a file" },
-    ...(slurmEnabled ? [{ value: "slurm" as const, label: "Launch on Slurm" }] : []),
   ];
   return (
     <Sheet
@@ -64,10 +60,13 @@ export function AddModelSheet({
       onClose={onClose}
       title="Add a model"
       description="Point obleth at something that already serves a model. Everything else can wait for the model's own page."
-      width={mode === "provider" || mode === "slurm" ? "w-[min(920px,100vw)]" : undefined}
+      width={mode === "provider" ? "w-[min(920px,100vw)]" : undefined}
     >
       <div className="px-6 pb-4">
         <Segmented<AddMode> label="How to add" value={mode ?? "connect"} options={modes} onChange={onModeChange} />
+        <p className="mt-2.5 text-xs text-muted-foreground">
+          To run a model on your own cluster instead, {slurmEnabled ? <Link href="/deployments/new" className="text-secondary-foreground underline underline-offset-2 hover:text-foreground">launch it from Deployments</Link> : <>launch it from <Link href="/deployments" className="text-secondary-foreground underline underline-offset-2 hover:text-foreground">Deployments</Link> once Slurm is set up</>}.
+        </p>
       </div>
       {mode === "connect" && <ConnectForm models={models} onClose={onClose} />}
       {mode === "provider" && (
@@ -76,14 +75,6 @@ export function AddModelSheet({
         </div>
       )}
       {mode === "file" && <ImportFile />}
-      {mode === "slurm" && (
-        <div className="border-t border-border px-6 py-5">
-          <p className="mb-4 max-w-2xl text-[13px] text-muted-foreground">
-            Pick an admin-authored <code className="font-mono">*.recipe</code> file to launch replicas on the cluster. Launching moves to Deployments once that page exists.
-          </p>
-          <RecipeList recipes={recipeCards} onDeployed={onClose} />
-        </div>
-      )}
     </Sheet>
   );
 }

@@ -10,7 +10,6 @@ import { useCapacityDiscovery, useFairshareLive } from "@/components/fairshare/h
 import { AddModelSheet, type AddMode } from "@/components/models/add-model";
 import { Notice, ProviderMark, StatusMark, Tile } from "@/components/models/ui";
 import { Meter, Segmented } from "@/components/overview/ui";
-import type { RecipeCard } from "@/components/recipes/recipe-card";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuLabel, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
@@ -54,7 +53,6 @@ export function ModelsList({
   managed,
   cacheStats,
   slurmEnabled,
-  recipeCards,
   initialAdd,
 }: {
   models: ModelRoute[];
@@ -62,7 +60,6 @@ export function ModelsList({
   managed: Record<string, boolean>;
   cacheStats?: CacheStats;
   slurmEnabled: boolean;
-  recipeCards: RecipeCard[];
   initialAdd?: AddMode | null;
 }) {
   const router = useRouter();
@@ -342,7 +339,6 @@ export function ModelsList({
         onModeChange={setAdding}
         onClose={closeAdd}
         slurmEnabled={slurmEnabled}
-        recipeCards={recipeCards}
         models={models}
       />
     </div>

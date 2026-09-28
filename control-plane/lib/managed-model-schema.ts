@@ -1,5 +1,5 @@
-// Client-side validation + inline help for the Provisioning settings form
-// (components/managed-model-config.tsx). The schema mirrors what the obleth
+// Validation for a Slurm deployment's launch settings (its page's form and
+// saveDeploymentSettingsAction). The schema mirrors what the obleth
 // admin API (`PUT /models/:id/managed`) and Slurm will accept, so obvious
 // mistakes (bad `time_limit` format, out-of-range port, empty partition) are
 // caught before submit instead of surfacing as an opaque slurmrestd 500.
@@ -98,22 +98,3 @@ export function validateManagedModelForm(values: Record<string, string>): Record
   }
   return errors;
 }
-
-/** Inline help shown under each field label, keyed by form field name. */
-export const MANAGED_FIELD_HINTS: Record<string, string> = {
-  slurm_partition: "Slurm partition to submit to, e.g. gpu or arm.",
-  slurm_gres: "Generic resources per node, e.g. gpu:1 or gpu:h100:2.",
-  slurm_cpus_per_task: "--cpus-per-task. Blank uses the cluster default.",
-  slurm_mem: "--mem per node, e.g. 560G. Blank uses the cluster default.",
-  slurm_nodes: "Nodes per replica job. Usually 1.",
-  slurm_qos: "Quality-of-service name. Blank uses the partition default.",
-  slurm_account: "Slurm account to charge. Blank uses your default association.",
-  slurm_time_limit: "Walltime as D-HH:MM:SS, HH:MM:SS, or minutes, e.g. 0-04:00:00.",
-  slurm_constraints: "--constraint node feature expression, e.g. h200&nvlink.",
-  slurm_exclude: "Nodes to keep off, e.g. node[01-04].",
-  slurm_serving_port: "Port your server listens on inside the job, e.g. 8000.",
-  slurm_health_path: "HTTP path probed for readiness, e.g. /health.",
-  slurm_min_replicas: "Healthy replicas required before the model serves traffic.",
-  slurm_target_replicas: "Replicas the provisioner keeps running.",
-  slurm_max_job_failures: "Stop resubmitting after this many failed launches. 0 = no limit.",
-};

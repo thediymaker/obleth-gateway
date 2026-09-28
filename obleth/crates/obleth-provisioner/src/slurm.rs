@@ -645,10 +645,13 @@ pub fn parse_nodes(v: &serde_json::Value) -> Vec<NodeInfo> {
             arr.iter()
                 .filter_map(|n| {
                     let name = n.get("name").and_then(|x| x.as_str())?.to_string();
-                    let real_memory_mb = n.get("real_memory").and_then(|m| {
-                        m.as_i64()
-                            .or_else(|| m.get("number").and_then(|x| x.as_i64()))
-                    });
+                    let number = |key: &str| {
+                        n.get(key).and_then(|m| {
+                            m.as_i64()
+                                .or_else(|| m.get("number").and_then(|x| x.as_i64()))
+                        })
+                    };
+                    let real_memory_mb = number("real_memory");
                     Some(NodeInfo {
                         name,
                         partitions: str_list(n.get("partitions")),
@@ -663,6 +666,12 @@ pub fn parse_nodes(v: &serde_json::Value) -> Vec<NodeInfo> {
                         }),
                         real_memory_mb,
                         features: str_list(n.get("features")),
+                        state: str_list(n.get("state"))
+                            .into_iter()
+                            .map(|s| s.to_ascii_uppercase())
+                            .collect(),
+                        alloc_cpus: number("alloc_cpus"),
+                        alloc_memory_mb: number("alloc_memory"),
                     })
                 })
                 .collect()
@@ -1088,6 +1097,23 @@ mod tests {
         assert_eq!(n[0].cpus, Some(72));
         assert_eq!(n[0].real_memory_mb, Some(577536));
         assert!(n[0].features.contains(&"gh200".to_string()));
+        assert!(n[0].state.is_empty());
+        assert_eq!(n[0].alloc_cpus, None);
+    }
+
+    #[test]
+    fn parse_nodes_reads_state_and_allocation() {
+        let v = serde_json::json!({"nodes":[
+            {"name":"gpu02","partitions":["arm"],"gres":"gpu:gh200:1","cpus":72,
+             "real_memory":577536,"state":["MIXED","DRAIN"],"alloc_cpus":36,
+             "alloc_memory":{"set":true,"number":262144}},
+            {"name":"gpu03","state":"idle"}
+        ]});
+        let n = parse_nodes(&v);
+        assert_eq!(n[0].state, vec!["MIXED", "DRAIN"]);
+        assert_eq!(n[0].alloc_cpus, Some(36));
+        assert_eq!(n[0].alloc_memory_mb, Some(262144));
+        assert_eq!(n[1].state, vec!["IDLE"]);
     }
 
     #[test]

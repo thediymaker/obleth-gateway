@@ -120,6 +120,12 @@ pub struct NodeInfo {
     pub cpus: Option<i64>,
     pub real_memory_mb: Option<i64>,
     pub features: Vec<String>,
+    /// Slurm's state flags, e.g. `["IDLE"]` or `["MIXED", "DRAIN"]`. Empty
+    /// when slurmrestd does not report them.
+    pub state: Vec<String>,
+    /// CPUs and memory already allocated to running jobs, when reported.
+    pub alloc_cpus: Option<i64>,
+    pub alloc_memory_mb: Option<i64>,
 }
 
 /// Actions the executor applies. The planner emits these; it performs no I/O.

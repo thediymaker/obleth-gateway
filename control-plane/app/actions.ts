@@ -8,6 +8,8 @@ import { z } from "zod";
 import { CACHE_TAGS, obleth, OblethApiError } from "@/lib/obleth";
 import type {
   ApiKey,
+  ManagedModelSpec,
+  PutManagedModel,
   AutotuneReport,
   AutotuneWorkload,
   ConfigBackup,
@@ -29,6 +31,7 @@ import type {
   SlurmHealthView,
 } from "@/lib/obleth";
 import { requireAdmin } from "@/lib/auth/roles";
+import { validateManagedModelForm } from "@/lib/managed-model-schema";
 import { parseUpstreamHeaders } from "@/lib/upstream-headers";
 import { resolveRecipeById, buildManagedFromRecipe, parseRecipe, type DeployOverrides } from "@/lib/sbatch-recipes";
 import { parseUpstreamModelList, normalizeBase, type UpstreamModel } from "@/lib/provider-import";
@@ -2138,8 +2141,7 @@ export async function clearLostReplicasAction(modelId: string): Promise<ActionRe
   const session = await requireAdmin();
   try { await obleth.clearLostReplicas(modelId, { auditActor: session.email }); }
   catch (e) { return actionError(e); }
-  updateTag(CACHE_TAGS.models);
-  revalidatePath("/models");
+  refreshDeployments();
   return { ok: true };
 }
 
@@ -2147,6 +2149,7 @@ export async function restartReplicaAction(replicaId: string): Promise<ActionRes
   const session = await requireAdmin();
   try { await obleth.restartReplica(replicaId, { auditActor: session.email }); }
   catch (e) { return actionError(e); }
+  revalidatePath("/deployments");
   return { ok: true };
 }
 
@@ -2162,7 +2165,7 @@ export async function saveTemplateAction(
   } catch (e) {
     return actionError(e);
   }
-  revalidatePath("/recipes");
+  revalidatePath("/deployments");
   return { ok: true };
 }
 
@@ -2173,8 +2176,157 @@ export async function deleteTemplateAction(id: string): Promise<ActionResult> {
   } catch (e) {
     return actionError(e);
   }
-  revalidatePath("/recipes");
+  revalidatePath("/deployments");
   return { ok: true };
+}
+
+// ----------------------------------------------------------------------------
+// Deployments
+//
+// A Slurm deployment is a model plus its managed spec. The spec is written
+// whole, so every change here reads the stored spec, changes what was asked,
+// and puts it back.
+// ----------------------------------------------------------------------------
+
+function refreshDeployments() {
+  updateTag(CACHE_TAGS.models);
+  revalidatePath("/deployments");
+  revalidatePath("/models");
+  revalidatePath("/fairshare");
+}
+
+function specToPut(s: ManagedModelSpec): PutManagedModel {
+  return {
+    enabled: s.enabled,
+    partition: s.partition,
+    gres: s.gres,
+    nodes: s.nodes,
+    constraints: s.constraints,
+    exclude: s.exclude,
+    account: s.account,
+    qos: s.qos,
+    time_limit: s.time_limit,
+    cpus_per_task: s.cpus_per_task,
+    mem: s.mem,
+    image: s.image,
+    preamble: s.preamble,
+    log_output_dir: s.log_output_dir,
+    launch_command: s.launch_command,
+    script_body: s.script_body,
+    serving_port: s.serving_port,
+    health_path: s.health_path,
+    min_replicas: s.min_replicas,
+    target_replicas: s.target_replicas,
+    max_job_failures: s.max_job_failures,
+    launcher_spec: s.launcher_spec ?? null,
+  };
+}
+
+async function changeSpec(modelId: string, change: (body: PutManagedModel) => PutManagedModel | string): Promise<ActionResult> {
+  const session = await requireAdmin();
+  try {
+    const spec = await obleth.getManagedModel(modelId);
+    if (!spec) return { ok: false, error: "This model isn't launched by obleth." };
+    const body = change(specToPut(spec));
+    if (typeof body === "string") return { ok: false, error: body };
+    await obleth.putManagedModel(modelId, body, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  refreshDeployments();
+  return { ok: true };
+}
+
+/** Pause (the provisioner stops its jobs) or resume a Slurm deployment. */
+export async function setDeploymentEnabledAction(modelId: string, enabled: boolean): Promise<ActionResult> {
+  return changeSpec(modelId, (b) => ({ ...b, enabled }));
+}
+
+/** Keep this many replicas running; the minimum follows it down. */
+export async function setDeploymentReplicasAction(modelId: string, target: number): Promise<ActionResult> {
+  if (!Number.isInteger(target) || target < 1 || target > 1000) return { ok: false, error: "Keep between 1 and 1000 replicas." };
+  return changeSpec(modelId, (b) => ({ ...b, target_replicas: target, min_replicas: Math.min(b.min_replicas ?? 1, target) }));
+}
+
+/** Save a deployment's script, placement and service, from its page's form (`slurm_*` fields). */
+export async function saveDeploymentSettingsAction(formData: FormData): Promise<SettingsSaveResult<"spec">> {
+  const id = trimmed(formData.get("id"));
+  const values: Record<string, string> = {};
+  for (const [k, v] of formData.entries()) if (typeof v === "string" && k.startsWith("slurm_")) values[k] = v;
+  const errors = validateManagedModelForm(values);
+  const first = Object.values(errors)[0];
+  if (first) return { ok: false, error: first, saved: [] };
+  const text = (k: string) => (values[`slurm_${k}`] ?? "").trim();
+  const nullable = (k: string) => text(k) || null;
+  const int = (k: string) => Number(text(k));
+  const res = await changeSpec(id, (b) => {
+    const script = values.slurm_script_body ?? b.script_body ?? "";
+    if (!script.trim() && !(b.launch_command ?? "").trim()) return "The script can't be empty.";
+    return {
+      ...b,
+      script_body: script,
+      partition: text("partition"),
+      gres: text("gres"),
+      nodes: int("nodes"),
+      cpus_per_task: text("cpus_per_task") ? int("cpus_per_task") : null,
+      mem: nullable("mem"),
+      account: nullable("account"),
+      qos: nullable("qos"),
+      time_limit: nullable("time_limit"),
+      constraints: nullable("constraints"),
+      exclude: nullable("exclude"),
+      serving_port: int("serving_port"),
+      health_path: text("health_path") || "/health",
+      target_replicas: int("target_replicas"),
+      min_replicas: int("min_replicas"),
+      max_job_failures: int("max_job_failures"),
+    };
+  });
+  return res.ok ? { ok: true } : { ok: false, error: res.error, saved: [] };
+}
+
+/** Stop launching a model. With `deleteModel`, the model goes too; otherwise it stays in Models with no replicas. */
+export async function removeDeploymentAction(modelId: string, deleteModel: boolean): Promise<ActionResult> {
+  const session = await requireAdmin();
+  try {
+    await obleth.deleteManagedModel(modelId, { auditActor: session.email });
+    if (deleteModel) await obleth.deleteModel(modelId, { auditActor: session.email });
+  } catch (e) {
+    return actionError(e);
+  }
+  refreshDeployments();
+  return { ok: true };
+}
+
+/**
+ * Launch a recipe as a new deployment. The API model name is the caller's to
+ * choose (a recipe can be launched more than once); placement overrides win
+ * over the recipe's. Returns the new model's name, for its page.
+ */
+export async function launchRecipeAction(recipeId: string, overrides: DeployOverrides): Promise<{ ok: true; name: string } | { ok: false; error: string }> {
+  const session = await requireAdmin();
+  const recipe = await resolveRecipeById(recipeId);
+  if (!recipe) return { ok: false, error: "That recipe no longer exists." };
+  if (!recipe.valid) return { ok: false, error: recipe.error ?? "The recipe can't be read." };
+  try {
+    const { createBody, managedBody } = buildManagedFromRecipe(recipe, overrides);
+    const models = await obleth.listModels();
+    if (models.some((m) => m.model_name === createBody.model_name || m.aliases?.includes(createBody.model_name))) {
+      return { ok: false, error: `A model called ${createBody.model_name} already exists. Pick another name.` };
+    }
+    if (!managedBody.partition) return { ok: false, error: "Pick a partition." };
+    const created = await obleth.createModel({
+      model_name: createBody.model_name,
+      upstream_model: createBody.upstream_model,
+      api_base: createBody.api_base,
+      model_type: createBody.model_type,
+    }, { auditActor: session.email });
+    await obleth.putManagedModel(created.id, managedBody, { auditActor: session.email });
+    refreshDeployments();
+    return { ok: true, name: created.model_name };
+  } catch (e) {
+    return actionError(e);
+  }
 }
 
 export async function deployRecipeAction(

@@ -7,19 +7,17 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { MoreHorizontal, Search } from "lucide-react";
 import { activateModelAction, checkModelHealthAction, deleteModelAction, setModelEnabledAction } from "@/app/actions";
 import { useCapacityDiscovery, useFairshareLive } from "@/components/fairshare/hooks";
-import { ManagedModelConfig } from "@/components/managed-model-config";
 import { EndpointsSection } from "@/components/models/endpoints";
 import { Switch } from "@/components/models/fields";
 import { ModelOverview } from "@/components/models/model-overview";
 import { ModelSettings, type SettingsState } from "@/components/models/model-settings";
 import { Notice, ProviderMark, StatusMark } from "@/components/models/ui";
 import { Pill } from "@/components/overview/ui";
-import { ProvisionErrorBanner } from "@/components/provision-error-banner";
-import { ReplicaPanel } from "@/components/replica-panel";
 import { Button } from "@/components/ui/button";
 import { useConfirm } from "@/components/ui/confirm-dialog";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
 import type { BoonBlockers } from "@/lib/boon-availability";
+import { deploymentHref } from "@/lib/deployments-model";
 import {
   awaitingFirstPass,
   contextLabel,
@@ -379,40 +377,37 @@ export function ModelPage({
             onStateChange={onSettings}
           />
           <EndpointsSection model={model} endpoints={endpoints} onChanged={() => router.refresh()} />
-          <DeploymentSection model={model} managed={managed} runs={runs} healthStatus={summary.status} />
+          <DeploymentSection model={model} managed={managed} runs={runs} />
         </div>
       </div>
     </div>
   );
 }
 
-function DeploymentSection({ model, managed, runs, healthStatus }: { model: ModelRoute; managed: boolean; runs: ReturnType<typeof runsOn>; healthStatus: string }) {
-  const queryClient = useQueryClient();
+function DeploymentSection({ model, managed, runs }: { model: ModelRoute; managed: boolean; runs: ReturnType<typeof runsOn> }) {
+  const watched = runs === "kubernetes";
   return (
     <section id="deployment" data-section="deployment" aria-label="Deployment" className="scroll-mt-24 rounded-xl border border-border bg-card">
-      <header className="px-[18px] pb-3 pt-4">
-        <h2 className="text-sm font-semibold">Deployment</h2>
-        <p className="mt-0.5 text-xs text-muted-foreground">
-          {managed ? "obleth launches this model's replicas on Slurm. Launching moves to Deployments once that page exists." : "Where the replicas come from. Launching on a cluster will live under Deployments."}
-        </p>
+      <header className="flex flex-wrap items-start justify-between gap-3 px-[18px] pb-3 pt-4">
+        <div className="min-w-0">
+          <h2 className="text-sm font-semibold">Deployment</h2>
+          <p className="mt-0.5 text-xs text-muted-foreground">Where the replicas come from.</p>
+        </div>
+        {(managed || watched) && (
+          <Button asChild variant="outline" size="sm"><Link href={deploymentHref(model.model_name)}>Open its deployment ›</Link></Button>
+        )}
       </header>
       <div className="border-t border-border px-[18px] py-4">
         {managed ? (
-          <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_minmax(250px,310px)]">
-            <div className="min-w-0"><ManagedModelConfig modelId={model.id} onSaved={() => queryClient.invalidateQueries({ queryKey: ["model-endpoints", model.id] })} /></div>
-            <aside className="min-w-0 space-y-3 xl:self-start">
-              <ProvisionErrorBanner modelId={model.id} />
-              <ReplicaPanel modelId={model.id} healthStatus={healthStatus} />
-            </aside>
-          </div>
-        ) : runs === "kubernetes" ? (
+          <p className="text-[13px] text-secondary-foreground">obleth launches this model as jobs on Slurm and keeps it at its replica count. Its replicas, script and placement are on its deployment page.</p>
+        ) : watched ? (
           <p className="text-[13px] text-secondary-foreground">
             Runs on Kubernetes. The cluster starts and scales the replicas; obleth counts the ready ones behind{" "}
             <span className="font-mono text-[12px]">{model.capacity_service || "the default Service"}</span> and sizes the pool to match (see <a href="#set-discovery" className="underline underline-offset-2">Capacity</a>).
           </p>
         ) : (
           <p className="text-[13px] text-secondary-foreground">
-            An endpoint obleth connects to. It doesn&apos;t start or stop the server: requests go to <span className="font-mono text-[12px]">{model.api_base || "its endpoints"}</span>.
+            An endpoint obleth connects to. It doesn&apos;t start or stop the server: requests go to <span className="font-mono text-[12px]">{model.api_base || "its endpoints"}</span>. To run a model on your own cluster, <Link href="/deployments/new" className="underline underline-offset-2">launch it from Deployments</Link>.
           </p>
         )}
       </div>

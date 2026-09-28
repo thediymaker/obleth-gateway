@@ -241,6 +241,12 @@ export interface DeployOverrides {
   qos?: string;
   time_limit?: string;
   partition?: string;
+  account?: string;
+  gres?: string;
+  mem?: string;
+  cpus_per_task?: number | null;
+  min_replicas?: number;
+  max_job_failures?: number;
   variables?: Record<string, string>;
   /** When set, replaces the recipe's script body before variable substitution.
    *  Carries a deploy-time edit (e.g. a fixed image path) through the normal
@@ -326,12 +332,12 @@ export function buildManagedFromRecipe(
   const managedBody: PutManagedModel = {
     enabled: true,
     partition: overrideString(overrides.partition, placement(h.partition, d.partition)) ?? "",
-    gres: placement(h.gres, d.gres),
+    gres: overrideString(overrides.gres, placement(h.gres, d.gres)),
     nodes: placement(h.nodes, d.nodes),
-    cpus_per_task: placement(h.cpus_per_task, d.cpus_per_task) ?? null,
-    mem: placement(h.mem, d.mem) ?? null,
+    cpus_per_task: overrides.cpus_per_task !== undefined ? overrides.cpus_per_task : placement(h.cpus_per_task, d.cpus_per_task) ?? null,
+    mem: overrideString(overrides.mem, placement(h.mem, d.mem)) ?? null,
     time_limit: overrideString(overrides.time_limit, placement(h.time_limit, d.time_limit)) ?? null,
-    account: placement(h.account, d.account) ?? null,
+    account: overrideString(overrides.account, placement(h.account, d.account)) ?? null,
     qos: overrideString(overrides.qos, placement(h.qos, d.qos)) ?? null,
     constraints: placement(h.constraints, d.constraints) ?? null,
     exclude: placement(h.exclude, d.exclude) ?? null,
@@ -345,9 +351,9 @@ export function buildManagedFromRecipe(
     ),
     serving_port: h.port,
     health_path: h.health_path?.trim() || defaultHealthPath(h.engine),
-    min_replicas: h.min_replicas ?? 1,
+    min_replicas: overrides.min_replicas ?? h.min_replicas ?? 1,
     target_replicas: targetReplicas,
-    max_job_failures: h.max_job_failures ?? 3,
+    max_job_failures: overrides.max_job_failures ?? h.max_job_failures ?? 3,
     launcher_spec: {
       source: "recipe",
       recipe_id: recipe.id,
