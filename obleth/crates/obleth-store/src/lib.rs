@@ -6420,13 +6420,19 @@ mod tests {
             .await
             .expect("from");
         fixtures.track_tenant(from.id);
+        // A tenant's group must exist first (tenants_fairshare_group_fkey).
+        let group = format!("heavy-{}", Uuid::new_v4().simple());
+        store
+            .create_fairshare_group(&group, 100)
+            .await
+            .expect("group");
         let to = store
             .create_tenant(
                 &format!("to-{}", Uuid::new_v4()),
                 300,
                 5000,
                 Some(2),
-                Some("heavy"),
+                Some(&group),
             )
             .await
             .expect("to");
@@ -6455,7 +6461,7 @@ mod tests {
         assert_eq!(moved.weight, 150);
         assert_eq!(moved.budget_cost_usd, Some(25.0));
         assert_eq!(resolved.tenant_id, to.id);
-        assert_eq!(resolved.fairshare_group, "heavy");
+        assert_eq!(resolved.fairshare_group, group);
         assert_eq!(resolved.tokens_per_minute, 5000);
 
         assert!(matches!(
@@ -6481,6 +6487,13 @@ mod tests {
                 .tenant_id,
             to.id
         );
+
+        // The group outlives the fixture guard's tenant cleanup otherwise.
+        let _ = store.delete_tenant(to.id).await;
+        let _ = sqlx::query("delete from fairshare_groups where name = $1")
+            .bind(&group)
+            .execute(&store.pool)
+            .await;
     }
 
     /// Integration test; runs only when `OBLETH_TEST_DATABASE_URL` is set.

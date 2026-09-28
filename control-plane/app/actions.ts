@@ -625,6 +625,9 @@ export async function saveTenantSettingsAction(formData: FormData): Promise<Sett
       } else if (section === "group") {
         const group = trimmed(formData.get("fairshare_group"));
         if (!group || group.length > 64) return fail(section, "Name the group (up to 64 characters).");
+        // A group must exist before a tenant can join it; a new name starts one at weight 100.
+        const groups = await obleth.listFairshareGroups();
+        if (!groups.some((g) => g.name === group)) await obleth.createFairshareGroup(group, 100, audit);
         await obleth.setTenantGroup(id, group, audit);
       } else if (section === "weight") {
         const weight = Number(trimmed(formData.get("weight")));

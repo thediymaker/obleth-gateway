@@ -289,7 +289,7 @@ export function TenantSettings({
             <TextField name="fairshare_group" label="Fairshare group" required maxLength={64} list="fairshare-groups" value={group} onChange={(e) => setGroup(e.target.value.trim() || e.target.value)} mono className="w-56" />
             <datalist id="fairshare-groups">{groups.map((g) => <option key={g} value={g} />)}</datalist>
             <span className="text-xs text-muted-foreground">
-              {groups.includes(group) ? `${tenants.filter((t) => t.fairshare_group === group).length} tenants` : "a new group"} · type a new name to start one
+              {groups.includes(group) ? `${tenants.filter((t) => t.fairshare_group === group).length} tenants · type a new name to start a group` : "a new group, made at weight 100 when you save"}
             </span>
           </div>
         </Setting>

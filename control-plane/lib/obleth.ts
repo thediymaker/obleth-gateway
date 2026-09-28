@@ -1716,6 +1716,12 @@ export const obleth = {
       body: JSON.stringify({ weight }),
     }),
   listFairshareGroups: () => api<FairshareGroup[]>("/fairshare/groups"),
+  createFairshareGroup: (name: string, weight = 100, options?: AuditOptions) =>
+    api<FairshareGroup>("/fairshare/groups", {
+      method: "POST",
+      headers: auditActorHeaders(options),
+      body: JSON.stringify({ name, weight }),
+    }),
   setFairshareGroupWeight: (name: string, weight: number, options?: AuditOptions) =>
     api<FairshareGroup>(`/fairshare/groups/${encodeURIComponent(name)}/weight`, {
       method: "PATCH",
