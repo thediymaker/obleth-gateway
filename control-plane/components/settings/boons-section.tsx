@@ -82,8 +82,8 @@ function GatesEditor({ gates, onChange }: { gates: SpeculationCategoryGate[]; on
         <div key={i} className="grid grid-cols-[minmax(0,1fr)_100px_90px_90px_28px] items-center gap-2 border-t border-border py-1.5">
           <input value={g.tag} onChange={(e) => patch(i, { tag: e.target.value })} aria-label="Category" className="h-8 rounded-md border border-input bg-background px-2 font-mono text-[12px]" />
           <label className="flex items-center gap-1.5 text-[12.5px]"><input type="checkbox" checked={!!g.speculate} onChange={(e) => patch(i, { speculate: e.target.checked })} className="accent-foreground" />{g.speculate ? "yes" : "no"}</label>
-          <input value={g.agree_min ?? ""} onChange={(e) => patch(i, { agree_min: num(e.target.value) })} inputMode="decimal" placeholder="global" aria-label="Agreement" className="h-8 rounded-md border border-input bg-background px-2 font-mono text-[12px]" />
-          <input value={g.lp_min ?? ""} onChange={(e) => patch(i, { lp_min: num(e.target.value) })} inputMode="decimal" placeholder="global" aria-label="Confidence" className="h-8 rounded-md border border-input bg-background px-2 font-mono text-[12px]" />
+          <input value={g.agree_min ?? ""} onChange={(e) => patch(i, { agree_min: num(e.target.value) })} inputMode="decimal" placeholder="0.5" aria-label="Agreement" className="h-8 rounded-md border border-input bg-background px-2 font-mono text-[12px]" />
+          <input value={g.lp_min ?? ""} onChange={(e) => patch(i, { lp_min: num(e.target.value) })} inputMode="decimal" placeholder="-1.0" aria-label="Confidence" className="h-8 rounded-md border border-input bg-background px-2 font-mono text-[12px]" />
           <button type="button" aria-label={`Remove ${g.tag || "this category"}`} onClick={() => onChange(gates.filter((_, j) => j !== i))} className="text-muted-foreground hover:text-foreground"><X className="h-4 w-4" /></button>
         </div>
       ))}
@@ -202,7 +202,7 @@ export function BoonsSection({ settings: b, models, knowledge, compressor }: { s
             <div className="w-60"><SelectField name="boons.speculation_classify_model" label="Classifier" value={picks.speculation_classify_model} onChange={pick("speculation_classify_model")} options={modelOptions(models, chat, "None", b.speculation_classify_model)} /></div>
           </div>
         </Setting>
-        <Setting label="Categories" hint="Where a draft is tried, and how sure the model must be to ship it. Blank uses the bar below." fields={["boons.speculation_gates", "boons.speculation_unlisted"]}>
+        <Setting label="Categories" hint="Where a draft is tried, and how sure the model must be to ship it. A blank floor uses 0.5 agreement and −1.0 confidence." fields={["boons.speculation_gates", "boons.speculation_unlisted"]}>
           <GatesEditor gates={spec.gates} onChange={(gates) => setSpec((x) => ({ ...x, gates }))} />
           <Switch name="boons.speculation_unlisted" label="Draft for categories not listed" checked={spec.unlisted} onChange={(unlisted) => setSpec((x) => ({ ...x, unlisted }))}>Try a draft for categories not listed</Switch>
         </Setting>

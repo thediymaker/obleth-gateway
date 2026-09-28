@@ -78,7 +78,7 @@ obleth:
   # e.g. "10.0.0.0/8".
   allowedPrivateCidrs: ""
   upstreamBaseUrl: ""   # empty -> defaults to the in-chart benchmark fixture backend
-  # OTLP trace export endpoint (e.g. http://my-collector:4317). Empty disables.
+  # OTLP/HTTP trace export endpoint (e.g. http://my-collector:4318). Empty disables.
   otelEndpoint: ""
   # Slack incoming-webhook alerts. Keep the webhook URL in an external Secret
   # for production chart values.

@@ -84,7 +84,7 @@ No new model and no external service: the gateway answers each question with its
 
 **Frozen-at-completion accounting.** Cost is computed once when a request settles and stored on the usage row. Changing prices later never rewrites history — reports stay consistent with what tenants were actually charged.
 
-**Budgets and rate limits.** Per-tenant and per-key budgets are reserved at admission, before dispatch, and reconciled to actual usage at completion. Budget enforcement is the one deliberately fail-closed decision in the gateway.
+**Budgets and rate limits.** Per-tenant and per-key budgets are reserved at admission, before dispatch, and reconciled to actual usage at completion. An exhausted budget is refused with `403`. If Redis cannot run the check, `OBLETH_FAIL_OPEN` decides: the default admits the request and raises an alert, `false` refuses it with `503`.
 
 **Energy and carbon per request.** Point the gateway at your Prometheus with any PromQL expression returning per-node power — Habana, DCGM, and IPMI exporters all work — and each request is charged its wall-time share of a serving slot's draw: watt-hours, electricity cost, and CO₂, recorded next to token cost. Queue time is never charged and idle power is never attributed, so totals understate rather than overstate. Off by default; if Prometheus is unreachable, requests are never delayed.
 

@@ -47,7 +47,7 @@ export function boonBlockers(
   }
   // Knowledge is the one boon configured on its own page, not the Boons tab.
   if (knowledge && !knowledge.enabled) {
-    blockers.knowledge = "retrieval is switched off in Settings → Knowledge.";
+    blockers.knowledge = "retrieval is switched off in Knowledge › Retrieval settings.";
   }
   return blockers;
 }

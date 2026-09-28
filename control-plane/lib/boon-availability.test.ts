@@ -40,7 +40,7 @@ describe("boonBlockers", () => {
   });
 
   it("reads knowledge from its own settings page", () => {
-    expect(boonBlockers(boons(), knowledge(false)).knowledge).toContain("Settings → Knowledge");
+    expect(boonBlockers(boons(), knowledge(false)).knowledge).toContain("Knowledge › Retrieval settings");
   });
 
   it("fails open when the settings could not be loaded", () => {

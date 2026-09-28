@@ -77,7 +77,7 @@ export function AssistantSection({ settings, models }: { settings: CharoSettings
         <div className="w-72"><SelectField name="assistant.brain_model" label="Assistant model" value={brain} onChange={setBrain} options={[{ value: "", label: "None: a plain model tester" }, ...brains.map((n) => ({ value: n, label: n }))]} /></div>
       </Setting>
       <Setting label="Benchmarks" hint="Whether it may run load tests, and their limits." fields={["assistant.tool_run_benchmark", "assistant.bench_max_concurrency", "assistant.bench_max_duration_s", "assistant.bench_max_requests"]}>
-        <Switch name="assistant.tool_run_benchmark" label="May run benchmarks" defaultChecked={settings.tools_enabled?.run_benchmark ?? false}>May run benchmarks</Switch>
+        <Switch name="assistant.tool_run_benchmark" label="May run benchmarks" defaultChecked={settings.tools_enabled?.run_benchmark ?? true}>May run benchmarks</Switch>
         <div className="flex flex-wrap items-center gap-3">
           <span className="inline-flex items-center gap-1.5"><TextField name="assistant.bench_max_concurrency" label="Most at once" inputMode="numeric" defaultValue={settings.bench_max_concurrency} mono className="w-20" /><span className="text-xs text-muted-foreground">at once</span></span>
           <span className="inline-flex items-center gap-1.5"><TextField name="assistant.bench_max_duration_s" label="Longest run" inputMode="numeric" defaultValue={settings.bench_max_duration_s} mono className="w-20" /><span className="text-xs text-muted-foreground">s</span></span>
