@@ -92,7 +92,8 @@ pub struct UsageDailyQuery {
     pub key_id: Option<String>,
     pub model: Option<String>,
     /// Aggregate dimension: `day` (default), `tenant`, `key`, `model`,
-    /// or `key_model` (one row per key+model across the whole range).
+    /// `key_model` (one row per key+model across the whole range), or one of
+    /// the per-day splits `day_tenant`, `day_model` and `day_key_model`.
     pub group_by: Option<String>,
 }
 
@@ -148,6 +149,10 @@ pub struct UsageLogQuery {
     /// When true, include internal traffic (health probes, benchmark runs)
     /// that is hidden from the request log by default.
     pub include_internal: Option<bool>,
+    /// Histogram only (`/usage/logs/histogram`): bucket width in
+    /// milliseconds. Default 60_000; widened so the window fits in 400
+    /// buckets. The cursor and `limit` do not apply there.
+    pub bucket_ms: Option<i64>,
 }
 
 /// A single request as stored in the `usage` ledger, returned newest-first for
@@ -185,44 +190,45 @@ pub struct UsageLogRow {
     pub co2_g: f64,
 }
 
-/// Read individual `usage` rows newest-first, honoring the supplied filters and
-/// keyset cursor. Bind order below must track the `?` placeholders exactly,
-/// since the ClickHouse client binds positionally.
-pub async fn query_usage_logs(
-    client: &clickhouse::Client,
-    q: UsageLogQuery,
-) -> Result<Vec<UsageLogRow>, clickhouse::error::Error> {
-    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
-    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+/// A bind value for the request-log filters, in placeholder order.
+enum LogBind {
+    Int(i64),
+    Text(String),
+}
 
-    let mut sql = String::from(
-        "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, session_id_source, device_id, \
-         admission, status_code, input_tokens, output_tokens, \
-         toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
-         queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
-         energy_wh, energy_cost_usd, co2_g \
-         from usage where ts_ms >= ?",
-    );
-    if q.until_ms.is_some() {
+/// The `where` clause the request log and its histogram share: every filter
+/// the log offers, with its bind values in placeholder order (the ClickHouse
+/// client binds positionally). The keyset cursor is the log's alone.
+fn log_filter_sql(q: &UsageLogQuery, since: i64) -> (String, Vec<LogBind>) {
+    let mut sql = String::from(" where ts_ms >= ?");
+    let mut binds = vec![LogBind::Int(since)];
+    if let Some(until) = q.until_ms {
         sql.push_str(" and ts_ms <= ?");
+        binds.push(LogBind::Int(until));
     }
-    if q.tenant_id.is_some() {
+    if let Some(tid) = q.tenant_id {
         sql.push_str(" and tenant_id = toUUID(?)");
+        binds.push(LogBind::Text(tid.to_string()));
     }
-    if q.key_id.is_some() {
+    if let Some(kid) = q.key_id {
         sql.push_str(" and key_id = toUUID(?)");
+        binds.push(LogBind::Text(kid.to_string()));
     }
-    if q.model.is_some() {
+    if let Some(model) = &q.model {
         sql.push_str(" and model = ?");
+        binds.push(LogBind::Text(model.clone()));
     }
-    if q.request_type.is_some() {
+    if let Some(rt) = &q.request_type {
         sql.push_str(" and request_type = ?");
+        binds.push(LogBind::Text(rt.clone()));
     }
-    if q.session_id.is_some() {
+    if let Some(sid) = &q.session_id {
         sql.push_str(" and session_id = ?");
+        binds.push(LogBind::Text(sid.clone()));
     }
-    if q.device_id.is_some() {
+    if let Some(d) = &q.device_id {
         sql.push_str(" and device_id = ?");
+        binds.push(LogBind::Text(d.clone()));
     }
     sql.push_str(&internal_filter(q.include_internal));
     match q.status.as_deref() {
@@ -230,12 +236,48 @@ pub async fn query_usage_logs(
         Some("error") => sql.push_str(" and status_code >= 400"),
         _ => {}
     }
-    if q.request_id.is_some() {
+    if let Some(rid) = &q.request_id {
         sql.push_str(" and startsWith(lower(toString(request_id)), lower(?))");
+        binds.push(LogBind::Text(rid.clone()));
     }
     if q.traced_only == Some(true) {
         sql.push_str(&traced_only_filter(since, q.until_ms));
     }
+    (sql, binds)
+}
+
+fn bind_log_filters(
+    mut query: clickhouse::query::Query,
+    binds: Vec<LogBind>,
+) -> clickhouse::query::Query {
+    for b in binds {
+        query = match b {
+            LogBind::Int(v) => query.bind(v),
+            LogBind::Text(v) => query.bind(v),
+        };
+    }
+    query
+}
+
+/// Read individual `usage` rows newest-first, honoring the supplied filters and
+/// keyset cursor.
+pub async fn query_usage_logs(
+    client: &clickhouse::Client,
+    q: UsageLogQuery,
+) -> Result<Vec<UsageLogRow>, clickhouse::error::Error> {
+    let since = q.since_ms.unwrap_or_else(|| now_ms() - 86_400_000);
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let (filter, binds) = log_filter_sql(&q, since);
+
+    let mut sql = String::from(
+        "select request_id, ts_ms, tenant_id, key_id, model, request_type, session_id, session_id_source, device_id, \
+         admission, status_code, input_tokens, output_tokens, \
+         toUInt64(input_tokens) + toUInt64(output_tokens) as total_tokens, \
+         queue_wait_ms, ttft_ms, total_ms, cache_status, cost_usd, \
+         energy_wh, energy_cost_usd, co2_g \
+         from usage",
+    );
+    sql.push_str(&filter);
     // Keyset cursor: (ts_ms, request_id) tuple strictly less than the cursor.
     // Tuple comparison matches the `order by` below for stable paging.
     if q.before_ms.is_some() && q.before_request_id.is_some() {
@@ -250,31 +292,7 @@ pub async fn query_usage_logs(
         " order by ts_ms desc, toString(request_id) desc limit {limit}"
     ));
 
-    let mut query = client.query(&sql).bind(since);
-    if let Some(until) = q.until_ms {
-        query = query.bind(until);
-    }
-    if let Some(tid) = q.tenant_id {
-        query = query.bind(tid.to_string());
-    }
-    if let Some(kid) = q.key_id {
-        query = query.bind(kid.to_string());
-    }
-    if let Some(model) = &q.model {
-        query = query.bind(model.clone());
-    }
-    if let Some(rt) = &q.request_type {
-        query = query.bind(rt.clone());
-    }
-    if let Some(sid) = &q.session_id {
-        query = query.bind(sid.clone());
-    }
-    if let Some(d) = &q.device_id {
-        query = query.bind(d.clone());
-    }
-    if let Some(rid) = &q.request_id {
-        query = query.bind(rid.clone());
-    }
+    let mut query = bind_log_filters(client.query(&sql), binds);
     if let (Some(before_ms), Some(before_id)) = (q.before_ms, q.before_request_id) {
         query = query.bind(before_ms).bind(before_id.to_string());
     } else if let Some(before_ms) = q.before_ms {
@@ -282,6 +300,63 @@ pub async fn query_usage_logs(
     }
 
     query.fetch_all::<UsageLogRow>().await
+}
+
+/// The request log's histogram: the bucket width used, and each non-empty bucket.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct UsageLogHistogram {
+    pub bucket_ms: i64,
+    pub buckets: Vec<UsageLogBucket>,
+}
+
+/// One bucket of the request log's histogram.
+#[derive(Debug, Clone, Row, Serialize, Deserialize, ToSchema)]
+pub struct UsageLogBucket {
+    /// Bucket start, unix epoch millis (epoch-aligned).
+    pub bucket_ms: i64,
+    pub requests: u64,
+    /// Requests in the bucket that ended with an HTTP status of 400 or above.
+    pub errors: u64,
+}
+
+/// Most buckets a histogram returns: a strip a few hundred pixels wide needs
+/// no more.
+const MAX_LOG_HISTOGRAM_BUCKETS: i64 = 400;
+
+/// The requested width (default a minute, at least a second), widened until
+/// `[since, until]` fits in [`MAX_LOG_HISTOGRAM_BUCKETS`].
+fn log_histogram_bucket_ms(since: i64, until: i64, requested: Option<i64>) -> i64 {
+    let span = until.saturating_sub(since).max(0);
+    let widths = MAX_LOG_HISTOGRAM_BUCKETS - 1;
+    let min_for_cap = span / widths + i64::from(span % widths != 0);
+    requested.unwrap_or(60_000).max(1_000).max(min_for_cap)
+}
+
+fn usage_log_histogram_sql(bucket: i64, filter: &str) -> String {
+    format!(
+        "select intDiv(ts_ms, {bucket}) * {bucket} as bucket_ms, \
+         count() as requests, \
+         countIf(status_code >= 400) as errors \
+         from usage{filter} group by bucket_ms order by bucket_ms"
+    )
+}
+
+/// Requests and failures per bucket over the log's window, with the log's
+/// filters. Empty buckets are left out; the caller fills the gaps.
+pub async fn query_usage_log_histogram(
+    client: &clickhouse::Client,
+    q: UsageLogQuery,
+) -> Result<(i64, Vec<UsageLogBucket>), clickhouse::error::Error> {
+    let now = now_ms();
+    let since = q.since_ms.unwrap_or(now - 86_400_000);
+    let until = q.until_ms.unwrap_or(now);
+    let bucket = log_histogram_bucket_ms(since, until, q.bucket_ms);
+    let (filter, binds) = log_filter_sql(&q, since);
+    let sql = usage_log_histogram_sql(bucket, &filter);
+    let rows = bind_log_filters(client.query(&sql), binds)
+        .fetch_all::<UsageLogBucket>()
+        .await?;
+    Ok((bucket, rows))
 }
 
 /// `traced_only` subquery. It takes the outer query's resolved `since` so the
@@ -1098,6 +1173,27 @@ pub async fn query_usage_daily(
             "model",
             "group by tenant_id, key_id, model order by total_tokens desc",
         ),
+        "day_tenant" => (
+            "toString(day)",
+            "tenant_id",
+            "toUUID('00000000-0000-0000-0000-000000000000') as key_id",
+            "'' as model",
+            "group by day, tenant_id order by day, total_tokens desc",
+        ),
+        "day_model" => (
+            "toString(day)",
+            "toUUID('00000000-0000-0000-0000-000000000000') as tenant_id",
+            "toUUID('00000000-0000-0000-0000-000000000000') as key_id",
+            "model",
+            "group by day, model order by day, total_tokens desc",
+        ),
+        "day_key_model" => (
+            "toString(day)",
+            "tenant_id",
+            "key_id",
+            "model",
+            "group by day, tenant_id, key_id, model order by day, total_tokens desc",
+        ),
         _ => (
             "toString(day)",
             "toUUID('00000000-0000-0000-0000-000000000000') as tenant_id",
@@ -1500,6 +1596,68 @@ mod alias_tests {
     fn series_aliases_do_not_shadow_columns() {
         assert_no_shadowing(&usage_series_sql(60_000));
         assert_eq!(select_items(&usage_series_sql(60_000)).len(), 10);
+    }
+
+    #[test]
+    fn log_histogram_aliases_do_not_shadow_columns() {
+        let sql = usage_log_histogram_sql(60_000, " where ts_ms >= ?");
+        assert_no_shadowing(&sql);
+        assert_eq!(select_items(&sql).len(), 3);
+    }
+
+    fn log_query() -> UsageLogQuery {
+        UsageLogQuery {
+            tenant_id: None,
+            key_id: None,
+            model: None,
+            request_type: None,
+            session_id: None,
+            device_id: None,
+            status: None,
+            request_id: None,
+            since_ms: None,
+            until_ms: None,
+            before_ms: None,
+            before_request_id: None,
+            limit: None,
+            traced_only: None,
+            include_internal: None,
+            bucket_ms: None,
+        }
+    }
+
+    #[test]
+    fn log_filters_bind_one_value_per_placeholder() {
+        let (sql, binds) = log_filter_sql(&log_query(), 0);
+        assert_eq!(sql.matches('?').count(), binds.len());
+        let full = UsageLogQuery {
+            tenant_id: Some(Uuid::nil()),
+            key_id: Some(Uuid::nil()),
+            model: Some("m".into()),
+            request_type: Some("chat".into()),
+            session_id: Some("s".into()),
+            device_id: Some("d".into()),
+            status: Some("error".into()),
+            request_id: Some("7c1e".into()),
+            until_ms: Some(10),
+            traced_only: Some(true),
+            ..log_query()
+        };
+        let (sql, binds) = log_filter_sql(&full, 0);
+        assert_eq!(sql.matches('?').count(), binds.len());
+        assert_eq!(binds.len(), 9);
+        assert!(sql.contains("status_code >= 400"));
+        assert!(sql.contains("FROM spans"));
+    }
+
+    #[test]
+    fn log_histogram_buckets_stay_bounded() {
+        // The default minute, raised to a second at least.
+        assert_eq!(log_histogram_bucket_ms(0, 3_600_000, None), 60_000);
+        assert_eq!(log_histogram_bucket_ms(0, 60_000, Some(10)), 1_000);
+        // Ninety days of minutes would be 129,600 buckets: widened to fit 400.
+        let wide = log_histogram_bucket_ms(0, 90 * 86_400_000, None);
+        assert!((90 * 86_400_000) / wide < MAX_LOG_HISTOGRAM_BUCKETS);
     }
 
     #[test]

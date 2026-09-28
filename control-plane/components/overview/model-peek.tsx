@@ -79,7 +79,7 @@ export function ModelPeek({ tile, model, usage, audit, range, onClose }: {
                 <div className="flex flex-wrap gap-2">
                   <Link href={modelHref(name)} className="inline-flex h-8 items-center rounded-lg border border-foreground bg-foreground px-3 text-[12.5px] font-medium text-background hover:bg-foreground/90">Open model</Link>
                   <Link href="/playground" className="inline-flex h-8 items-center rounded-lg border border-border px-3 text-[12.5px] font-medium hover:bg-accent">Try in Playground</Link>
-                  <Link href="/logs" className="inline-flex h-8 items-center rounded-lg border border-border px-3 text-[12.5px] font-medium hover:bg-accent">Request logs</Link>
+                  <Link href={`/logs?model=${encodeURIComponent(name)}`} className="inline-flex h-8 items-center rounded-lg border border-border px-3 text-[12.5px] font-medium hover:bg-accent">Request logs</Link>
                 </div>
               </div>
 

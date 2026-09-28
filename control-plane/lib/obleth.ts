@@ -701,6 +701,12 @@ export interface UsageLogParams {
   includeInternal?: boolean;
 }
 
+/** `GET /usage/logs/histogram`: the width used, and each non-empty bucket. */
+export interface UsageLogHistogram {
+  bucket_ms: number;
+  buckets: { bucket_ms: number; requests: number; errors: number }[];
+}
+
 export interface UsageRetentionView {
   days: number;
   configured: boolean;
@@ -726,7 +732,10 @@ export type UsageDailyGroupBy =
   | "tenant"
   | "key"
   | "model"
-  | "key_model";
+  | "key_model"
+  | "day_tenant"
+  | "day_model"
+  | "day_key_model";
 
 export interface UsageDailyParams {
   startDay: string;
@@ -2233,6 +2242,25 @@ export const obleth = {
         limit: params.limit,
         traced_only: params.tracedOnly ? "true" : undefined,
         include_internal: params.includeInternal ? "true" : undefined,
+      })}`,
+    ),
+  /** Requests and failures per bucket, counted with the log's own filters. */
+  usageLogHistogram: (params: UsageLogParams & { bucketMs?: number } = {}) =>
+    api<UsageLogHistogram>(
+      `/usage/logs/histogram${qs({
+        tenant_id: params.tenantId,
+        key_id: params.keyId,
+        model: params.model,
+        request_type: params.requestType,
+        session_id: params.sessionId,
+        device_id: params.deviceId,
+        status: params.status,
+        request_id: params.requestId,
+        since_ms: params.sinceMs,
+        until_ms: params.untilMs,
+        traced_only: params.tracedOnly ? "true" : undefined,
+        include_internal: params.includeInternal ? "true" : undefined,
+        bucket_ms: params.bucketMs,
       })}`,
     ),
   getRequestSpans: (requestId: string) =>

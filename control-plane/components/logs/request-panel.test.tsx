@@ -1,7 +1,8 @@
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { SpanExpandDetail, type SpanNode } from "./request-detail";
+import { StepDetail } from "./request-panel";
+import type { SpanNode } from "@/lib/trace-model";
 import type { SpanEntry } from "@/lib/obleth";
 
 // Forward-computed from the gateway's own formula, same as Task 13's fixture:
@@ -57,7 +58,7 @@ let host: HTMLDivElement;
 
 async function render(n: SpanNode) {
   await act(async () => {
-    root.render(<SpanExpandDetail node={n} onClose={() => {}} />);
+    root.render(<StepDetail node={n} onClose={() => {}} />);
   });
 }
 
@@ -105,12 +106,14 @@ describe("auto_route span rendering", () => {
 
   it("does not crash on unparseable attributes", async () => {
     await render(node({ attributes: "not json {{{" }));
-    expect(host.querySelector(".rounded-md")).not.toBeNull();
+    expect(host.querySelector("section")).not.toBeNull();
+    expect(host.textContent).toContain("No attributes recorded.");
   });
 
   it("does not crash on empty attributes", async () => {
     await render(node({ attributes: "{}" }));
-    expect(host.querySelector(".rounded-md")).not.toBeNull();
+    expect(host.querySelector("section")).not.toBeNull();
+    expect(host.textContent).toContain("No attributes recorded.");
   });
 
   it("leaves non-auto_route spans on the raw renderer even with a scored-shaped payload", async () => {

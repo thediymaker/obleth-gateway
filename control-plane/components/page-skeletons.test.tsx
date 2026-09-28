@@ -1,7 +1,7 @@
 import { act } from "react";
 import { createRoot } from "react-dom/client";
 import { describe, expect, it } from "vitest";
-import { DashboardSkeleton, FairshareSkeleton, GroupsSkeleton, ModelSkeleton, ModelsSkeleton, OverviewSkeleton, PlaygroundSkeleton } from "./page-skeletons";
+import { DashboardSkeleton, FairshareSkeleton, GroupsSkeleton, LogsSkeleton, ModelSkeleton, ModelsSkeleton, OverviewSkeleton, PlaygroundSkeleton, ReportsSkeleton } from "./page-skeletons";
 
 describe("page skeletons", () => {
   it.each([
@@ -11,6 +11,8 @@ describe("page skeletons", () => {
     ["Loading the playground", PlaygroundSkeleton],
     ["Loading models", ModelsSkeleton],
     ["Loading the model", ModelSkeleton],
+    ["Loading request logs", LogsSkeleton],
+    ["Loading reports", ReportsSkeleton],
     ["Loading page", DashboardSkeleton],
   ])("announces %s once, and hides the placeholder blocks from assistive tech", (label, Component) => {
     Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });

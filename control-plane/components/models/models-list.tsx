@@ -110,8 +110,7 @@ export function ModelsList({
   // "/" jumps to the search box, as it does in most lists.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
-      const t = e.target as HTMLElement;
-      if (e.key !== "/" || t.closest("input, textarea, select, [contenteditable=true]")) return;
+      if (e.key !== "/" || (e.target instanceof Element && e.target.closest("input, textarea, select, [contenteditable=true]"))) return;
       e.preventDefault();
       search.current?.focus();
     };

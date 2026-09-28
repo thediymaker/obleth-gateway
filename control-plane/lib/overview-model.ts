@@ -248,7 +248,7 @@ export function buildAttention(fleet: FleetTile[], fairshare: FairshareLiveView 
       urgent: true,
       title: `${t.name} is failing health checks`,
       detail: parts.join(" · "),
-      actions: [{ label: "Open model", href: modelHref(t.name), primary: true }, { label: "Request logs", href: "/logs" }],
+      actions: [{ label: "Open model", href: modelHref(t.name), primary: true }, { label: "Request logs", href: `/logs?model=${encodeURIComponent(t.name)}&status=error` }],
     });
   }
   const full = fleet.filter((f) => f.attention === "full");
