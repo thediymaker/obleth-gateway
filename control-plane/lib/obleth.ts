@@ -994,6 +994,28 @@ export interface UsageBreakdownEntry {
   key_prefix: string;
 }
 
+export interface AuditParams {
+  limit?: number;
+  actor?: string;
+  entityType?: string;
+  entityId?: string;
+  /** One action or several, comma-separated. */
+  action?: string;
+  /** RFC 3339. */
+  since?: string;
+  until?: string;
+  beforeId?: number;
+  q?: string;
+}
+
+/** `GET /stats/daily`: each MCP server's or collection's counters per day (UTC). */
+export interface DailyStatsView {
+  kind: "mcp" | "knowledge";
+  /** The days covered, oldest first. */
+  days: string[];
+  items: { id: string; days: { day: string; counts: Record<string, number> }[] }[];
+}
+
 export interface AuditEntry {
   id: number;
   ts: string;
@@ -2195,7 +2217,7 @@ export const obleth = {
     }),
   updateMcpServer: (
     id: string,
-    body: { upstream_url: string; auth_header?: string; enabled?: boolean },
+    body: { upstream_url: string; auth_header?: string; clear_auth?: boolean; enabled?: boolean; name?: string },
     options?: AuditOptions,
   ) =>
     api<McpServer>(`/mcp-servers/${id}`, {
@@ -2380,6 +2402,23 @@ export const obleth = {
       `/fairshare/history${qs({ since_ms: params.since_ms, model: params.model })}`,
     ),
   audit: (limit = 100) => api<AuditEntry[]>(`/audit?limit=${limit}`),
+  /** The audit log narrowed by who, what and when; page back with `before_id`. */
+  auditQuery: (params: AuditParams = {}) =>
+    api<AuditEntry[]>(
+      `/audit${qs({
+        limit: params.limit,
+        actor: params.actor,
+        entity_type: params.entityType,
+        entity_id: params.entityId,
+        action: params.action,
+        since: params.since,
+        until: params.until,
+        before_id: params.beforeId,
+        q: params.q,
+      })}`,
+    ),
+  /** Daily counters the proxy keeps: MCP calls per server, knowledge searches per collection. */
+  dailyStats: (kind: "mcp" | "knowledge", days = 7) => api<DailyStatsView>(`/stats/daily${qs({ kind, days })}`),
   getCapacity: () => api<{ max_in_flight: number }>("/capacity"),
   setCapacity: (max_in_flight: number, options?: AuditOptions) =>
     api<{ max_in_flight: number }>("/capacity", {

@@ -23,6 +23,25 @@ use crate::state::AppState;
 
 const MCP_BODY_LIMIT: usize = 16 * 1024 * 1024;
 
+/// Count one call to an MCP server in its daily stats: `tool` for a model's
+/// tool call in the gateway's tool loop, otherwise a client's direct request
+/// through `/mcp/<name>`. Fire and forget: stats never slow or fail a request.
+pub fn record_call(state: &AppState, server: &str, tool: bool, ok: bool, ms: u64) {
+    let redis = state.redis.clone();
+    let server = server.to_string();
+    let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    tokio::spawn(async move {
+        let fields = [
+            (if tool { "tool_calls" } else { "direct" }, 1),
+            ("errors", i64::from(!ok)),
+            ("ms", ms as i64),
+        ];
+        if let Err(e) = redis.bump_daily("mcp", &server, &day, &fields).await {
+            tracing::debug!(error = %e, "mcp daily stats not recorded");
+        }
+    });
+}
+
 /// Handle `/mcp/{server}` and `/mcp/{server}/{*rest}`.
 #[tracing::instrument(skip_all, name = "mcp_request", fields(server = %params.server))]
 pub async fn mcp_handler(
@@ -82,6 +101,7 @@ pub async fn mcp_handler(
         }
     }
 
+    let started = std::time::Instant::now();
     let upstream = state
         .http
         .request(parts.method, &url)
@@ -102,6 +122,13 @@ pub async fn mcp_handler(
                 ),
             );
             state.metrics.record_mcp(&server.name, 502);
+            record_call(
+                &state,
+                &server.name,
+                false,
+                false,
+                started.elapsed().as_millis() as u64,
+            );
             return error_json(StatusCode::BAD_GATEWAY, "mcp upstream request failed");
         }
     };
@@ -118,6 +145,13 @@ pub async fn mcp_handler(
         );
     }
     state.metrics.record_mcp(&server.name, status.as_u16());
+    record_call(
+        &state,
+        &server.name,
+        false,
+        !status.is_server_error(),
+        started.elapsed().as_millis() as u64,
+    );
 
     // Forward the upstream response headers, dropping only what the re-stream
     // invalidates. MCP streamable-HTTP servers carry protocol state in

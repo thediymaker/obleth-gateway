@@ -56,3 +56,28 @@ export function distinctEmbeddingModelCount(
 ): number {
   return new Set(collections.map((c) => c.indexed_embedding_model)).size;
 }
+
+/** A collection's page address: by name, which is what people say. */
+export function collectionHref(name: string, section?: string): string {
+  return `/knowledge/${encodeURIComponent(name)}${section ? `#${section}` : ""}`;
+}
+
+/** Status as the monochrome marks use it: on (indexed), half (indexing), off (empty), attention (failed or stale). */
+export function collectionGlyph(status: ReturnType<typeof collectionStatus>, documents: number): "on" | "half" | "off" | "attention" {
+  if (status === "failed" || status === "needs re-index") return "attention";
+  if (status === "indexing") return "half";
+  return documents ? "on" : "off";
+}
+
+export const COLLECTION_STATUS_LABEL: Record<ReturnType<typeof collectionStatus>, string> = {
+  ready: "Indexed",
+  indexing: "Indexing",
+  "needs re-index": "Needs reindex",
+  failed: "Failed",
+};
+
+/** Searches, searches that found something, and chunks handed to models, from a collection's daily counters. */
+export function retrievalUse(item: { days: { counts: Record<string, number> }[] } | undefined): { searches: number; hits: number; chunks: number } {
+  const sum = (k: string) => (item?.days ?? []).reduce((n, d) => n + (d.counts[k] ?? 0), 0);
+  return { searches: sum("searches"), hits: sum("hits"), chunks: sum("chunks") };
+}

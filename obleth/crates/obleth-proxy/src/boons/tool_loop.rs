@@ -981,6 +981,7 @@ pub(super) async fn execute_call(
     let Some(server) = crate::mcp::resolve_mcp(state, server_name).await else {
         return format!("Error: tool server `{server_name}` is unavailable.");
     };
+    let started = std::time::Instant::now();
     let session = match sessions
         .get_or_open(server_name, || {
             mcp_tools::open_session(state, &server, timeout)
@@ -989,11 +990,26 @@ pub(super) async fn execute_call(
     {
         Ok(session) => session,
         Err(e) => {
+            crate::mcp::record_call(
+                state,
+                server_name,
+                true,
+                false,
+                started.elapsed().as_millis() as u64,
+            );
             return format!("Error: could not reach tool server `{server_name}`: {e}");
         }
     };
-    match mcp_tools::call_tool_in(state, session, &call.name, call.arguments.clone(), timeout).await
-    {
+    let result =
+        mcp_tools::call_tool_in(state, session, &call.name, call.arguments.clone(), timeout).await;
+    crate::mcp::record_call(
+        state,
+        server_name,
+        true,
+        result.is_ok(),
+        started.elapsed().as_millis() as u64,
+    );
+    match result {
         Ok(text) => {
             let mut text = text;
             if text.len() > TOOL_RESULT_MAX_CHARS {

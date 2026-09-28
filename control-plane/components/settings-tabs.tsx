@@ -19,7 +19,6 @@ import {
   BoonsSettingsForm,
   CharoSettingsForm,
   CompressionSettingsForm,
-  KnowledgeSettingsForm,
   SlurmSettingsForm,
   ResolverCacheCard,
   UsageRetentionForm,
@@ -27,6 +26,9 @@ import {
 import { EnergySettingsForm } from "@/components/energy-settings-form";
 import { BackupRestore } from "@/components/backup-restore";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import Link from "next/link";
+import { Button } from "@/components/ui/button";
+import { Card, CardContent } from "@/components/ui/card";
 import type {
   AlertSettingsView,
   AutoRouterSettingsView,
@@ -137,7 +139,15 @@ export function SettingsTabs({
       </TabsContent>
 
       <TabsContent value="knowledge">
-        <KnowledgeSettingsForm settings={knowledge} />
+        <Card>
+          <CardContent className="flex flex-wrap items-center justify-between gap-3 py-5 text-sm">
+            <span className="text-muted-foreground">
+              Retrieval settings live on the Knowledge page now, next to the collections they apply to.
+              {knowledge ? ` Retrieval is ${knowledge.enabled ? "on" : "off"}.` : ""}
+            </span>
+            <Button asChild size="sm" variant="outline"><Link href="/knowledge?tab=retrieval">Open retrieval settings</Link></Button>
+          </CardContent>
+        </Card>
       </TabsContent>
 
       <TabsContent value="energy">

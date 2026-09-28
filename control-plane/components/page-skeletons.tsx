@@ -261,6 +261,63 @@ export function DeploymentSkeleton() {
   );
 }
 
+/** MCP servers: header, four tiles, and the servers. */
+export function McpSkeleton() {
+  return (
+    <Loading label="Loading MCP servers">
+      <Header controls={1} />
+      <Skeleton className="h-4 w-[40rem] max-w-full" />
+      <Tiles count={4} className="grid grid-cols-2 gap-3 xl:grid-cols-4" />
+      <Table rows={4} filters={0} />
+    </Loading>
+  );
+}
+
+/** Knowledge: header, tabs, four tiles, and the collections. */
+export function KnowledgeSkeleton() {
+  return (
+    <Loading label="Loading knowledge">
+      <Header controls={1} />
+      <Skeleton className="h-9 w-72 rounded-lg" />
+      <Tiles count={4} className="grid grid-cols-2 gap-3 xl:grid-cols-4" />
+      <Table rows={3} filters={0} />
+    </Loading>
+  );
+}
+
+/** A collection: header, four tiles, documents and the search. */
+export function CollectionSkeleton() {
+  return (
+    <Loading label="Loading the collection">
+      <div className="space-y-2.5"><Skeleton className="h-3 w-28" /><Skeleton className="h-8 w-72" /><Skeleton className="h-5 w-80" /></div>
+      <Tiles count={4} className="grid grid-cols-2 gap-3 xl:grid-cols-4" />
+      <SkeletonPanel className="gap-3"><Skeleton className="h-4 w-32" /><Skeleton className="h-16 rounded-lg" /><Rows count={5} /></SkeletonPanel>
+      <SkeletonPanel className="h-[160px]" />
+    </Loading>
+  );
+}
+
+/** Audit: header, four tiles, filters, and the day-by-day list. */
+export function AuditSkeleton() {
+  return (
+    <Loading label="Loading the audit log">
+      <Header controls={1} />
+      <Tiles count={4} className="grid grid-cols-2 gap-3 xl:grid-cols-4" />
+      <div className="flex flex-wrap gap-2"><Skeleton className="h-9 w-80 rounded-lg" /><Skeleton className="h-9 w-72 rounded-lg" /><Skeleton className="h-9 w-32 rounded-lg" /><Skeleton className="h-9 w-32 rounded-lg" /></div>
+      <SkeletonPanel className="gap-0 p-0">
+        {Array.from({ length: 10 }, (_, i) => (
+          <div key={i} className="flex items-center gap-4 border-t border-border px-4 py-3 first:border-t-0">
+            <Skeleton className="h-3 w-10" />
+            <Skeleton className="h-6 w-6 rounded-full" />
+            <Skeleton className="h-4 w-[28rem] max-w-[60vw]" />
+            <Skeleton className="ml-auto h-3 w-14" />
+          </div>
+        ))}
+      </SkeletonPanel>
+    </Loading>
+  );
+}
+
 /** Request logs: header, search and filters, the per-minute strip, then rows. */
 export function LogsSkeleton() {
   return (

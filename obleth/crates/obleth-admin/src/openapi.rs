@@ -152,6 +152,7 @@ use obleth_config::{
         crate::delete_mcp_server,
         // audit & capacity
         crate::get_audit,
+        crate::get_daily_stats,
         crate::get_capacity,
         crate::set_capacity,
         // settings
@@ -232,6 +233,9 @@ use obleth_config::{
         WeeklyWindow,
         UpdateWeight,
         crate::MoveKey,
+        crate::DailyStatsView,
+        crate::DailyStatsItem,
+        crate::DailyStat,
         crate::BudgetUsage,
         UpdateQuota,
         UpdateTenantGroup,

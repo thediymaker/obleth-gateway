@@ -220,6 +220,8 @@ pub fn inject(json: &mut Value, block: &str, supports_system: bool) -> bool {
 pub struct Retrieval {
     pub outcome: &'static str,
     pub hits: Vec<Hit>,
+    /// Each collection searched, with how many of its chunks were injected.
+    pub collections: Vec<(uuid::Uuid, usize)>,
 }
 
 /// Retrieve and inject, given a query already extracted (in phase 1, before
@@ -248,6 +250,9 @@ pub async fn apply(
     // from "ran fine but nothing scored" (a "miss").
     let mut any_nonempty_slab = false;
     let mut any_embed_succeeded = false;
+    // Which collection each candidate chunk came from, to credit it after packing.
+    let mut searched: Vec<uuid::Uuid> = Vec::new();
+    let mut origin: std::collections::HashMap<uuid::Uuid, uuid::Uuid> = Default::default();
     for id in &route.knowledge_collections {
         let Some(slab) = slabs.get(id) else { continue };
         if slab.chunks.is_empty() || slab.embedding_model.is_empty() {
@@ -273,19 +278,38 @@ pub async fn apply(
             }
         };
         any_embed_succeeded = true;
-        all.extend(slab.retrieve(&vector, settings.top_k as usize, settings.min_score));
+        searched.push(*id);
+        let found = slab.retrieve(&vector, settings.top_k as usize, settings.min_score);
+        origin.extend(found.iter().map(|h| (h.id, *id)));
+        all.extend(found);
     }
+    let credit = |packed: &[Hit]| -> Vec<(uuid::Uuid, usize)> {
+        searched
+            .iter()
+            .map(|c| {
+                (
+                    *c,
+                    packed
+                        .iter()
+                        .filter(|h| origin.get(&h.id) == Some(c))
+                        .count(),
+                )
+            })
+            .collect()
+    };
 
     if any_nonempty_slab && !any_embed_succeeded {
         return Retrieval {
             outcome: "error",
             hits: Vec::new(),
+            collections: Vec::new(),
         };
     }
     if all.is_empty() {
         return Retrieval {
             outcome: "miss",
             hits: Vec::new(),
+            collections: credit(&[]),
         };
     }
     all.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -301,18 +325,22 @@ pub async fn apply(
         return Retrieval {
             outcome: "miss",
             hits: Vec::new(),
+            collections: credit(&[]),
         };
     }
     let block = render_block(&packed);
     if inject(json, &block, route.supports_system_messages) {
+        let collections = credit(&packed);
         Retrieval {
             outcome: "hit",
             hits: packed,
+            collections,
         }
     } else {
         Retrieval {
             outcome: "miss",
             hits: Vec::new(),
+            collections: credit(&[]),
         }
     }
 }
