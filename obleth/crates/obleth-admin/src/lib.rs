@@ -8699,7 +8699,14 @@ mod tests {
                 .expect("admitted");
             permits.push(admitted);
         }
-        let live = t.fairshare.model_load();
+        // The scheduler answers an admission before it publishes the load map,
+        // so the second permit can arrive a moment before the map counts it.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut live = t.fairshare.model_load();
+        while live.get(&name).copied() != Some(2) && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            live = t.fairshare.model_load();
+        }
         assert_eq!(
             live.get(&name).copied(),
             Some(2),

@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from "react";
 import { z } from "zod";
 import { ArrowDownToLine, Code2, PanelLeft, PanelRight } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { uuid } from "@/lib/uuid";
 import { generationSchema } from "@/lib/charo/chat-request";
 import { useEnabledModels } from "@/components/charo/use-enabled-models";
 import { UnifiedWorkspace } from "./workspaces";
@@ -89,7 +90,7 @@ export type PlaygroundSession = z.infer<typeof sessionSchema>;
 export type PendingAction = { kind: "send" | "activity"; value: string };
 
 const fresh = (): PlaygroundSession => ({
-  id: crypto.randomUUID(), title: "Untitled session", mode: "compare", models: ["auto"], generation: { systemPrompt: "" },
+  id: uuid(), title: "Untitled session", mode: "compare", models: ["auto"], generation: { systemPrompt: "" },
   launcher: true, updatedAt: Date.now(),
 });
 
@@ -183,7 +184,7 @@ export function Playground({ scope, gatewayBase = "http://localhost:8080", openM
       const data = JSON.parse(await file.text()) as { session?: unknown; conversations?: Record<string, unknown> };
       const parsed = sessionSchema.safeParse(data.session);
       if (!parsed.success) { setNotice("That file is not a Playground session export."); return; }
-      const next = { ...parsed.data, id: crypto.randomUUID(), updatedAt: Date.now() };
+      const next = { ...parsed.data, id: uuid(), updatedAt: Date.now() };
       for (const [key, value] of Object.entries(data.conversations ?? {})) {
         // Only conversation lanes; images are not persisted anyway.
         if (/^compare:\d$/.test(key) && value) localStorage.setItem(`${root}:${next.id}:${key}`, JSON.stringify(value));

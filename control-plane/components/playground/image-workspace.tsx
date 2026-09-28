@@ -6,6 +6,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Select } from "@/components/ui/select";
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from "@/components/ui/dropdown-menu";
+import { uuid } from "@/lib/uuid";
 import type { ModelRoute } from "@/lib/obleth";
 import { cn } from "@/lib/utils";
 import type { PlaygroundSession } from "./playground";
@@ -125,7 +126,7 @@ export function ImageWorkspace({
     setRuns((all) => all.map((r) => (r.id === id ? { ...r, ...next } : r)));
 
   async function generate(params: RunParams) {
-    const id = `${Date.now()}-${crypto.randomUUID()}`;
+    const id = `${Date.now()}-${uuid()}`;
     setRuns((all) => [...all, { ...params, id, status: "busy", images: [] }]);
     try {
       const res = await fetch("/api/live/playground/images", {
