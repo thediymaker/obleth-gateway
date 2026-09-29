@@ -906,6 +906,53 @@ pub struct ModelReplica {
     pub updated_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// One past or current launch of a Slurm-backed replica, from the durable
+/// launch history (`deployment_launches`). Outlives the replica row, which is
+/// garbage-collected. `id` is the replica id.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct DeploymentLaunch {
+    #[schema(value_type = String)]
+    pub id: Uuid,
+    #[schema(value_type = String)]
+    pub model_id: Uuid,
+    pub model_name: String,
+    /// `launcher_spec.recipe_id` at submit time, when launched from a recipe.
+    pub recipe_id: Option<String>,
+    pub slurm_job_id: String,
+    // Managed spec as submitted.
+    pub partition: Option<String>,
+    pub account: Option<String>,
+    pub qos: Option<String>,
+    pub time_limit: Option<String>,
+    pub gres: Option<String>,
+    pub nodes_requested: Option<i64>,
+    pub cpus_per_task: Option<i64>,
+    pub mem: Option<String>,
+    pub exclude: Option<String>,
+    pub constraints: Option<String>,
+    #[schema(value_type = Option<Object>)]
+    pub launcher_spec: Option<serde_json::Value>,
+    /// Allocated node hostnames (comma-separated), once the job ran.
+    pub nodes: Option<String>,
+    pub submitted_at: chrono::DateTime<chrono::Utc>,
+    pub started_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub healthy_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub ended_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Slurm's terminal state (`TIMEOUT`, `OUT_OF_MEMORY`, `NODE_FAIL`,
+    /// `FAILED`, ...), `gone` when the job vanished from slurmrestd,
+    /// `cancelled:scale-down|restart|probe-failed` when obleth cancelled it,
+    /// or `deleted` when the replica row was removed while still open.
+    pub end_state: Option<String>,
+    pub end_reason: Option<String>,
+    pub updated_at: chrono::DateTime<chrono::Utc>,
+    /// Seconds from submit to start (time in the queue).
+    pub queued_secs: Option<i64>,
+    /// Seconds from start to healthy (weights load and warm-up).
+    pub load_secs: Option<i64>,
+    /// Seconds from start to end, or to now while still running.
+    pub ran_secs: Option<i64>,
+}
+
 /// Valid `ModelReplica::state` values, in lifecycle order.
 pub const REPLICA_STATES: [&str; 5] = ["pending", "starting", "healthy", "draining", "lost"];
 
