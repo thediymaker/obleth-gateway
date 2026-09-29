@@ -246,8 +246,14 @@ async fn tick(
             ) {
                 let msg = slurm::job_status_message(&job.raw_state, job.reason.as_deref());
                 if r.last_message.as_deref() != Some(msg.as_str()) {
+                    // Once the job runs, record its allocation: the gateway
+                    // stamps the launch's start time when nodes first arrive,
+                    // which is what splits queue time from load time in the
+                    // launch history.
+                    let nodes = (job.state == domain::JobState::Running && !job.nodes.is_empty())
+                        .then(|| job.nodes.join(","));
                     if let Err(e) = obleth
-                        .patch_replica(r.id, None, None, None, Some(&msg))
+                        .patch_replica(r.id, None, nodes.as_deref(), None, Some(&msg))
                         .await
                     {
                         tracing::warn!(replica_id = %r.id, error = %e, "failed to annotate replica status");

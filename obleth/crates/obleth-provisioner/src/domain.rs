@@ -136,9 +136,14 @@ pub enum Action {
     /// Job is running + healthy: register endpoint + mark replica healthy.
     Promote { replica_id: Uuid, api_base: String },
     /// Job vanished/terminal: deregister endpoint (if any) + mark replica lost.
+    /// `raw_state`/`reason` are Slurm's terminal state and reason when the job
+    /// is still visible in slurmrestd (e.g. `TIMEOUT`, `OUT_OF_MEMORY`); both
+    /// `None` when the job is gone from the listing. See [`lost_message`].
     MarkLost {
         replica_id: Uuid,
         endpoint_id: Option<Uuid>,
+        raw_state: Option<String>,
+        reason: Option<String>,
     },
     /// Excess/restarted replica: deregister its endpoint, cancel its job, mark
     /// draining. `endpoint_id` is the linked endpoint to remove from rotation up
@@ -151,6 +156,20 @@ pub enum Action {
     },
     /// GC a long-dead `lost` replica row.
     Delete { replica_id: Uuid },
+}
+
+/// The replica message recorded with a `lost` state: `job ended: <STATE>`,
+/// plus ` (<reason>)` when Slurm gave one, while the job is still visible in
+/// slurmrestd; `job gone` once it is not. The store parses this into the
+/// launch history's `end_state`/`end_reason`, so keep the two in step.
+pub fn lost_message(raw_state: Option<&str>, reason: Option<&str>) -> String {
+    match raw_state.map(str::trim).filter(|s| !s.is_empty()) {
+        None => "job gone".to_string(),
+        Some(state) => match reason.map(str::trim).filter(|r| !r.is_empty()) {
+            Some(r) => format!("job ended: {state} ({r})"),
+            None => format!("job ended: {state}"),
+        },
+    }
 }
 
 /// Why a replica's job is being cancelled — recorded on the replica row so the

@@ -641,6 +641,9 @@ pub struct MockObleth {
     pub updated_endpoints: std::sync::Mutex<Vec<(Uuid, String)>>, // (endpoint_id, new api_base)
     pub deleted_replicas: std::sync::Mutex<Vec<Uuid>>,
     pub patched: std::sync::Mutex<Vec<(Uuid, Option<String>)>>, // (replica_id, state)
+    /// Every replica patch in full: (replica_id, state, nodes, message).
+    #[allow(clippy::type_complexity)]
+    pub patches: std::sync::Mutex<Vec<(Uuid, Option<String>, Option<String>, Option<String>)>>,
     pub provision_errors: std::sync::Mutex<Vec<(Uuid, Option<String>)>>,
     /// When set, `create_replica` returns an error — drives the compensating
     /// "cancel the orphan job" path in the Submit executor.
@@ -699,14 +702,20 @@ impl OblethClient for MockObleth {
         &self,
         replica_id: Uuid,
         state: Option<&str>,
-        _nodes: Option<&str>,
+        nodes: Option<&str>,
         _endpoint_id: Option<Uuid>,
-        _message: Option<&str>,
+        message: Option<&str>,
     ) -> anyhow::Result<()> {
         self.patched
             .lock()
             .unwrap()
             .push((replica_id, state.map(|s| s.to_string())));
+        self.patches.lock().unwrap().push((
+            replica_id,
+            state.map(str::to_string),
+            nodes.map(str::to_string),
+            message.map(str::to_string),
+        ));
         Ok(())
     }
     async fn delete_replica(&self, replica_id: Uuid) -> anyhow::Result<()> {
